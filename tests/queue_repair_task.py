@@ -3434,6 +3434,9 @@ class SandboxedBuilds(Fixture):
         self.assertIn((str(HOME / ".elan"), str(HOME / ".elan")), read_only)
         self.assertIn((str(seed), str(seed)), read_only, "the shared Mathlib packages are read-only")
         self.assertIn((env["LAKE_CONFIG"], env["LAKE_CONFIG"]), read_only)
+        self.assertIn((str(REPO / "scripts/tauceti-lean"), repair_sandbox.PRESSURE_WRAPPER), read_only)
+        self.assertIn(("/sys/fs/cgroup", "/sys/fs/cgroup"), read_only)
+        self.assertNotIn("--unshare-cgroup", argv, "the guard must see the caller's capped ancestors")
         self.assertEqual(sorted(writable), sorted([(str(worktree / ".lake"),) * 2, (env["LAKE_CACHE_DIR"],) * 2]))
         self.assertNotIn(str(HOME), [source for source, _ in read_only + writable])
         self.assertIn(("/tmp",), [(argv[i + 1],) for i, a in enumerate(argv) if a == "--tmpfs"])
@@ -3441,6 +3444,9 @@ class SandboxedBuilds(Fixture):
         setenv = dict(pairs(argv, "--setenv"))
         self.assertEqual(setenv["LAKE_NO_CACHE"], "true")
         self.assertEqual(setenv["LAKE_CACHE_DIR"], env["LAKE_CACHE_DIR"])
+        self.assertEqual(setenv["LAKE_OVERRIDE_LEAN"], "true")
+        self.assertEqual(setenv["LEAN"], repair_sandbox.PRESSURE_WRAPPER)
+        self.assertEqual(setenv["XDG_CACHE_HOME"], str(worktree / ".lake/pressure-cache"))
         self.assertTrue(setenv["PATH"].startswith(f"{HOME / '.elan' / 'bin'}:"))
         self.assertNotIn(str(BIN), setenv["PATH"], "nothing writable or test-local is on the sandbox PATH")
         self.assertNotIn("GH_TOKEN", setenv)
@@ -3473,7 +3479,20 @@ class SandboxedBuilds(Fixture):
         os.environ[repair_sandbox.DISABLE_VARIABLE] = "0"
         with self.assertLogs(repair_sandbox.LOGGER, "WARNING") as logs:
             argv = repair_sandbox.sandboxed_lake(["lake", "build", "--iofail"], worktree, env)
-        self.assertEqual(argv, ["lake", "build", "--iofail"])
+        self.assertEqual(argv[-3:], ["lake", "build", "--iofail"])
+        self.assertIn("LEAN_SYSROOT", argv)
+        self.assertIn(f"LEAN={REPO / 'scripts/tauceti-lean'}", argv)
+        self.assertIn("LAKE_OVERRIDE_LEAN=true", argv)
+        run = subprocess.run(
+            repair_sandbox.sandboxed_lake(
+                ["sh", "-c", 'test -z "${LEAN_SYSROOT:-}" && test "$LAKE_OVERRIDE_LEAN" = true && test -f "$LEAN"'],
+                worktree,
+                env,
+            ),
+            cwd=worktree,
+            env={**env, "LEAN_SYSROOT": "/incorrect/inherited/sysroot"},
+        )
+        self.assertEqual(run.returncode, 0)
         self.assertIn("WITHOUT the bwrap sandbox", logs.output[0])
         ok, detail = repair_sandbox.check(self.root)
         self.assertTrue(ok)

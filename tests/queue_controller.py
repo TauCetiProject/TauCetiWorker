@@ -2149,6 +2149,66 @@ class EditSummary(ControllerCase):
 
 
 class StatusShape(ControllerCase):
+    def test_unclaimed_head_task_stalls_without_being_masked_by_other_admissions(self):
+        self.failing_head()
+        task = self.controller.status()["head"]["task"]
+        interval = self.controller.setting("stall_interval_seconds")
+        self.clock.advance(interval - 1)
+        self.assertIsNone(self.controller.status()["head"]["stall"])
+        self.clock.advance(1)
+        stalled = self.controller.status()
+        self.assertEqual(
+            stalled["head"]["stall"],
+            {
+                "kind": "task_unclaimed",
+                "since": task["created_at"] + interval,
+                "silence_seconds": interval,
+                "phase": "repair",
+            },
+        )
+        self.assertEqual(stalled["alerts"], [])
+        self.approve(102, {"Unrelated.lean": "more work\n"})
+        self.controller.tick()
+        self.clock.advance(interval)
+        stalled = self.controller.status()
+        self.assertEqual(stalled["head"]["task"]["task_id"], task["task_id"])
+        self.assertEqual(stalled["head"]["stall"]["silence_seconds"], 2 * interval)
+        self.assertTrue(any(" unclaimed for " in alert for alert in stalled["alerts"]))
+
+    def test_claim_clears_unclaimed_stall_and_expiry_uses_ownership_end_before_cleanup(self):
+        self.failing_head()
+        interval = self.controller.setting("stall_interval_seconds")
+        self.clock.advance(2 * interval)
+        self.assertIsNotNone(self.controller.status()["head"]["stall"])
+        task = self.controller.claim_task("repair-worker", "admin-worker")
+        self.assertIsNotNone(task)
+        self.assertIsNone(self.controller.status()["head"]["stall"])
+        self.assertEqual(self.controller.status()["alerts"], [])
+        self.clock.advance(task.expires_at - self.clock() + interval - 1)
+        self.assertIsNone(self.controller.status()["head"]["stall"])
+        self.clock.advance(1)
+        stalled = self.controller.status()["head"]["stall"]
+        self.assertEqual(stalled["since"], task.expires_at + interval)
+        self.assertEqual(stalled["silence_seconds"], interval)
+        self.clock.advance(interval)
+        self.controller._expire_claims(self.clock())
+        # Cleanup is late; it must not restart the timer at released_at.
+        stalled = self.controller.status()["head"]["stall"]
+        self.assertEqual(stalled["since"], task.expires_at + interval)
+        self.assertEqual(stalled["silence_seconds"], 2 * interval)
+
+    def test_released_task_wait_starts_at_release_not_the_future_lease_expiry(self):
+        self.failing_head()
+        task = self.controller.claim_task("repair-worker", "admin-worker")
+        self.clock.advance(10)
+        self.controller.release_task(task.task_id, task.claim_token, "worker-stopped")
+        released_at = self.clock()
+        interval = self.controller.setting("stall_interval_seconds")
+        self.clock.advance(interval)
+        stalled = self.controller.status()["head"]["stall"]
+        self.assertEqual(stalled["since"], released_at + interval)
+        self.assertEqual(stalled["silence_seconds"], interval)
+
     def test_status_is_json_serialisable_and_stable_when_empty(self):
         status = self.controller.status()
         json.dumps(status)

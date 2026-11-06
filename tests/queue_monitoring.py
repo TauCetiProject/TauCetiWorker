@@ -234,6 +234,34 @@ url = "https://private.invalid"
         self.assertEqual([c["kind"] for c in value["conditions"]], ["inference_hold", "promotion_failed"])
         self.assertNotIn("secret provider token", json.dumps(value))
 
+    def test_unclaimed_head_task_is_distinct_from_build_silence_without_duplicate_alert(self):
+        head = self.controller.status()["head"]
+        value = self.export(
+            status={
+                "head": {
+                    "id": head["id"],
+                    "stall": {
+                        "kind": "task_unclaimed",
+                        "since": self.clock() - 900,
+                        "silence_seconds": 1800,
+                        "phase": "repair",
+                    },
+                },
+                "alerts": [f"head {head['id']} task 15 (repair) unclaimed for 1800s"],
+            }
+        )
+        self.assertEqual(
+            value["conditions"],
+            [
+                {
+                    "kind": "task_unclaimed",
+                    "since": monitoring.iso(self.clock() - 900),
+                    "batch_id": str(head["id"]),
+                    "seconds": 1800,
+                }
+            ],
+        )
+
     def test_a_public_commit_link_cannot_point_to_an_arbitrary_origin(self):
         with self.assertRaises(ValueError):
             monitoring.public_url("https://private.example", "commit", "a" * 40)
