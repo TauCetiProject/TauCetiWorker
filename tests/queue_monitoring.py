@@ -3,6 +3,7 @@
 
 import io
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -313,6 +314,109 @@ class ParallelTaskObservations(unittest.TestCase):
             self.assertEqual(observer.observe(roots, tasks, claims=claims, observed_at=201)[19]["state"], "released")
             tasks[0]["state"] = "submitted"
             self.assertEqual(observer.observe(roots, tasks, claims=claims, observed_at=130)[19]["state"], "released")
+
+
+class BuildObservations(unittest.TestCase):
+    def test_build_counters_follow_the_current_claim_not_the_newest_worker_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            roots = [Path(directory) / str(i) for i in range(2)]
+            for root, token, updated, count in zip(roots, ["ACTIVE", "OLD"], [100, 120], [10, 99], strict=True):
+                task = root / "tasks/21"
+                (task / "logs").mkdir(parents=True)
+                (task / "task.json").write_text(
+                    json.dumps(
+                        {
+                            "task": {"task_id": "21", "claim_token": token},
+                            "state": "sources_ready",
+                            "updated_at": updated,
+                        }
+                    )
+                )
+                (task / "logs/prepare-build.log").write_text(f"[{count}/100] Built private\n")
+            value = monitoring.TaskObservations().observe(
+                roots,
+                [{"id": 21, "state": "open"}],
+                claims=[{"task_id": 21, "token": "ACTIVE", "expires_at": 200}],
+                observed_at=130,
+            )[21]
+            self.assertEqual(value["build"]["completed_tasks"], 10)
+            self.assertEqual(value["observed_at"], monitoring.iso(100))
+
+    def test_numeric_tail_progress_is_independent_of_checkpoint_and_heartbeat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task = root / "tasks/21"
+            (task / "logs").mkdir(parents=True)
+            checkpoint = task / "task.json"
+            checkpoint.write_text(
+                json.dumps(
+                    {
+                        "task": {"task_id": "21", "claim_token": "PRIVATE_TOKEN"},
+                        "state": "sources_ready",
+                        "updated_at": 100,
+                    }
+                )
+            )
+            log = task / "logs/prepare-build.log"
+            log.write_text("PRIVATE_LOG /private/path\n[58742/60357] Built Private.Module\n")
+            os.utime(log, (105, 105))
+            observer = monitoring.TaskObservations()
+            tasks = [{"id": 21, "state": "open"}]
+            first = observer.observe([root], tasks, observed_at=110)[21]
+            self.assertEqual(first["observed_at"], monitoring.iso(100))
+            self.assertEqual(first["build"]["completed_tasks"], 58742)
+            self.assertIsNone(first["build"]["last_progress_at"])
+            with log.open("a") as output:
+                output.write("[58743/60357] Built Private.Next\n")
+            os.utime(log, (115, 115))
+            second = observer.observe([root], tasks, observed_at=120)[21]
+            self.assertEqual(second["build"]["last_progress_at"], monitoring.iso(120))
+            self.assertEqual(second["observed_at"], monitoring.iso(100))
+            with log.open("a") as output:
+                output.write("heartbeat PRIVATE_LOG\n")
+            os.utime(log, (125, 125))
+            third = observer.observe([root], tasks, observed_at=130)[21]
+            self.assertEqual(third["build"]["sampled_at"], monitoring.iso(130))
+            self.assertEqual(third["build"]["log_updated_at"], monitoring.iso(125))
+            self.assertEqual(third["build"]["last_progress_at"], monitoring.iso(120))
+            self.assertNotIn("PRIVATE", json.dumps(third))
+            self.assertNotIn("Private", json.dumps(third))
+            self.assertNotIn("/private", json.dumps(third))
+            tasks[0]["state"] = "adopted"
+            self.assertNotIn("build", observer.observe([root], tasks, observed_at=140)[21])
+
+    def test_tail_is_bounded_and_resets_do_not_invent_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            task = Path(directory)
+            (task / "logs").mkdir()
+            log = task / "logs/verify-build.log"
+            # A giant earlier count outside the bounded tail is not evidence.
+            log.write_bytes(b"[999/999] old\n" + b"private\n" * 10000)
+            observer = monitoring.BuildObservations()
+            self.assertIsNone(observer.observe(task, "verifying", "token", 100, 0))
+            with log.open("ab") as output:
+                output.write(b"[1/10] Built private\n[999/1] invalid\n[1234567890/1234567890] invalid\n")
+            first = observer.observe(task, "verifying", "token", 110, 0)
+            self.assertEqual((first["completed_tasks"], first["total_tasks"]), (1, 10))
+            log.write_text("[0/10] restarted\n")
+            reset = observer.observe(task, "verifying", "token", 120, 0)
+            self.assertIsNone(reset["last_progress_at"])
+            with log.open("a") as output:
+                output.write("[2/10] Built private\n")
+            self.assertEqual(
+                observer.observe(task, "verifying", "token", 130, 0)["last_progress_at"], monitoring.iso(130)
+            )
+            self.assertIsNone(observer.observe(task, "verifying", "new-token", 140, 0)["last_progress_at"])
+            self.assertIsNone(observer.observe(task, "verifying", "new-token", 150, 1)["last_progress_at"])
+            self.assertIsNone(observer.observe(task, "verifying", "new-token", 160, log.stat().st_mtime + 1))
+            log.unlink()
+            target = task / "secret"
+            target.write_text("[5/10] PRIVATE\n")
+            log.symlink_to(target)
+            self.assertIsNone(observer.observe(task, "verifying", "token", 170, 0))
+            log.unlink()
+            os.mkfifo(log)
+            self.assertIsNone(observer.observe(task, "verifying", "token", 180, 0))
 
 
 class LargeTaskCheckpoint(unittest.TestCase):
