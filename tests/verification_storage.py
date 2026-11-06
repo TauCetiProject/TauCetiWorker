@@ -615,18 +615,29 @@ class Storage(Receipts):
         self.assertFalse(cache.exists())
 
     def test_slow_ownership_inspection_leaves_budget_for_real_deletion(self):
+        from tauceti_worker import work_recovery
+
         _, _, tree = self.pending()
         cache = write(tree, ".lake/build/cache", "generated")
+        clock = [100.0]
+        work_type = work_recovery.Work
 
         def slow_users(path):
-            time.sleep(0.3)
+            clock[0] += 0.5  # Longer than the unchanged 0.25-second deletion allowance.
             return []
 
-        with patch("tauceti_worker.work_recovery.live_users", side_effect=slow_users):
+        with (
+            patch.object(storage.time, "monotonic", side_effect=lambda: clock[0]),
+            # Work's dataclass default factory captured monotonic at definition time.
+            patch.object(work_recovery, "Work", side_effect=lambda **limits: work_type(started=clock[0], **limits)),
+            patch.object(work_recovery, "live_users", side_effect=slow_users),
+        ):
             report = storage.housekeep((self.state,), now=time.time() + 90000)
         self.assertFalse(cache.exists(), report)
-        self.assertGreaterEqual(report["work"]["ownership_seconds"], 0.3)
-        self.assertLess(report["work"]["seconds"], 0.25)
+        self.assertEqual(report["work"]["ownership_seconds"], 0.5)
+        self.assertEqual(report["work"]["wall_seconds"], 0.5)
+        self.assertEqual(report["work"]["seconds"], 0)
+        self.assertEqual(report["work"]["limits"]["seconds"], 0.25)
 
     def test_inventory_observer_does_not_hold_a_false_live_workspace_reference(self):
         _, _, tree = self.pending()
