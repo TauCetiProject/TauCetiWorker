@@ -9,7 +9,7 @@ the final fleet-wide accounting and completion check remain open.
   per-invocation native selection, private fallback, runtime installation/router,
   isolation at existing verification boundaries, and optional background cleanup.
 - [Native Lake fixes](https://github.com/leanprover/lean4/pull/16301), with a
-  [v4.36.0-rc2 backport](https://github.com/kim-em/lean4/commit/2fab607f76571f4f399e2332e69d674b98277d64).
+  [v4.36.0-rc2 backport](https://github.com/kim-em/lean4/commit/32e42ebe30ab58b6c4d3afac46222c9dac66eac3).
 - [Production worker pin](https://github.com/TauCetiProject/TauCetiFleet/pull/126).
   Production uses a backport retaining the existing legacy-data-root support
   and deployed Lean-pressure changes. Fleet source files were preserved byte
@@ -43,14 +43,18 @@ libraries and therefore shares the release's native namespace.
 | Live rollout preserves useful work | Both manager replacements preserved all 40 independent worker scopes. Only idle/backoff boundaries with no round children permit worker restarts. Ongoing paid rounds are left running. |
 
 Both native branches pass the 20 real shared-cache regressions and standalone
-Lake builds. The upstream [Linux CI run](https://github.com/leanprover/lean4/actions/runs/42165034905)
+Lake builds. The upstream [Linux CI run](https://github.com/leanprover/lean4/actions/runs/42169213507)
 passed its full build/test suite, including 4,831 tests. The Worker integration's
 functional [CI run](https://github.com/TauCetiProject/TauCetiWorker/actions/runs/42160999154)
 passed. The final extensionless-executable cleanup change adds a regression,
 passes all 26 machine-cache tests locally, and passes the complete
 [Worker CI run](https://github.com/TauCetiProject/TauCetiWorker/actions/runs/42167078533).
-The additional native race tests are also passing locally; their new upstream CI
-run is pending. They do not change the installed native executable.
+The additional native race tests pass both locally and in that upstream run.
+They do not change the installed native executable. Documentation revision
+`30d733e` also passes the complete
+[Worker CI run](https://github.com/TauCetiProject/TauCetiWorker/actions/runs/42169322712),
+and the production pin passes
+[Fleet PR CI](https://github.com/TauCetiProject/TauCetiFleet/actions/runs/42167638777).
 
 Focused Worker validation also covers retention, expanded caches, host warming,
 Mathlib, verification, recovery and native filesystem behavior. A local full
@@ -64,6 +68,13 @@ seconds in the second workspace. The second build performed no module
 compilation. Both `Example.olean` paths have inode `5508880673`; the cache and
 both outputs are aliases of one complete artifact. This fixture requires no
 artifact downloads and measures local reuse, not production network savings.
+
+A repeat used distinct worker-private fallback paths in the two workspaces.
+The first build took 5.575 seconds under host pressure; the second took 0.328
+seconds without compilation. Both workspaces shared the public, server and
+private artifact inodes, and evaluating the exported definition returned the
+expected value in both. These timings are small-fixture observations, not an
+estimate for an entire worker checkout.
 
 A separate local HTTP fixture transferred one 4,096-byte artifact on the cold
 native batch fetch (0.416 seconds), then made zero HTTP requests and transferred
@@ -83,12 +94,46 @@ Sampling real worker checkouts found ten shared module artifacts after checking
 in workers 9, 17 and 25 and the store. These observations demonstrate actual
 cross-worker reuse; they do not establish host-wide physical savings.
 
-The latest native-store inventory reported 19,701,616,640 allocated bytes, of
-which 19,382,083,584 bytes had additional links. Both retention targets were
-unset, no files were removed and no collection errors were recorded. The store
+The latest native-store inventory reported 23,486,054,400 allocated bytes, of
+which 23,314,382,848 bytes had additional links. Both retention targets were
+unset and no collection errors were recorded. The dry run found 38 abandoned
+staging files eligible for removal; it did not remove completed artifacts. The store
 is growing as more workers adopt it. These are inode-deduplicated inventory estimates, not newly
 allocated bytes or bytes saved. XFS reflinks, existing CI aliases and concurrent
 writes prevent those interpretations.
+
+## Other measured storage
+
+The existing current-worker collector inventoried 520,146,571,264 allocated bytes
+across the private caches, current workspace build trees and existing publication
+pool. Of these, 460,229,029,888 bytes were protected by live workspaces and
+38,390,059,008 bytes had links outside that inventory. This is a long-running,
+inode-deduplicated estimate during live work, not an instantaneous physical total.
+It overlaps the new native store where workspace aliases refer to native payloads.
+The sweep completed successfully with no errors; it did not discard unfinished
+source. Its observed RAM usage reached 4.8 GB, so repeating this broad legacy
+sweep during host memory pressure is inappropriate.
+
+A separate scan measured 118,520,356,864 allocated bytes under `/tmp`, including
+98,777,571,328 bytes in 184 `tauceti-review-*` scratch directories. Another
+3,197,337,600 bytes were under Nix shell/development directories. Scratch and
+retained source trees were not bulk-deleted to satisfy a cache target.
+
+QEMU's disk information showed three busy CI overlays at approximately 31.6,
+32.7 and 32.3 GB allocated, and the idle overlay at 89 MB. Each has a 64 GiB
+virtual capacity and references the same prepared base image. The image directory
+accounts for another 4.08 GB. These are observed per-runner costs that vary with
+job activity, rather than preallocated 64 GiB per runner.
+
+A host snapshot measured 3,811,084,533,760 bytes used of 3,837,570,154,496 bytes,
+with 119,971,144 inodes in use. Free space fluctuates as active work and existing
+cleanup proceed. The overall scan of retained roots is still pending, so these
+component inventories do not yet close the host-wide accounting. They must not
+be summed as disjoint physical allocations.
+
+The existing Fleet memory-pressure guard temporarily held new rounds during
+validation. Configuration still has workers enabled, `draining = false`, and
+40 science slots. The deployment did not change that guard or its thresholds.
 
 ## Remaining validation
 

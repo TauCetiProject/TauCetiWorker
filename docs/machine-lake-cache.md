@@ -49,7 +49,7 @@ same-user process that deliberately changes permissions and edits their bytes.
 The worker also supports an isolated standalone runtime for toolchains whose
 distributed Lake does not yet have the native fixes. Build the matching Lake
 source with the native patch, then install it using the project interpreter.
-The [v4.36.0-rc2 backport](https://github.com/kim-em/lean4/commit/2fab607f76571f4f399e2332e69d674b98277d64)
+The [v4.36.0-rc2 backport](https://github.com/kim-em/lean4/commit/32e42ebe30ab58b6c4d3afac46222c9dac66eac3)
 is built from its `tests/lake` directory with
 `ELAN_TOOLCHAIN=leanprover/lean4:v4.36.0-rc2 lake build Lake lake`.
 Its executable is `tests/lake/.lake/build/bin/lake`, and the matching source is
