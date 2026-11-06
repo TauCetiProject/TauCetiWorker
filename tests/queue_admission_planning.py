@@ -2,6 +2,7 @@
 """Real Git evidence and speculative repair races, with no inference or network."""
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -28,6 +29,131 @@ def collision():
 
 def knowledge():
     return {"kind": "admission_predictions", "records": [collision()], "complete": True}
+
+
+class ImportGaps(unittest.TestCase):
+    """`admission_planning.import_gaps`: the whole-tree scan the insertion probe compares across tips."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.controller, self.github, self.repo, self.clock = make_controller(Path(self.tmp.name))
+        self.addCleanup(self.controller.store.close)
+        self.planner = admission_planning.Planner(self.repo.clone)
+
+    def tree(self, files, start=None):
+        sha = self.repo.commit_branch(files, "tree", start=start, push_to="refs/heads/scratch")
+        subprocess.run(
+            ["git", "-C", str(self.repo.clone), "fetch", "-q", "origin", "+refs/heads/scratch:refs/heads/scratch"],
+            check=True,
+        )
+        return subprocess.run(
+            ["git", "-C", str(self.repo.clone), "rev-parse", f"{sha}^{{tree}}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip(), sha
+
+    def gaps(self, tree):
+        return admission_planning.import_gaps(self.planner, tree)
+
+    def test_removed_source_bad_import_and_base_gaps(self):
+        base, base_sha = self.tree(
+            {
+                "TauCeti/Provider.lean": "module\ndef x := 1\n",
+                "TauCeti/Importer.lean": "module\npublic import TauCeti.Provider\nimport Mathlib.Logic.Basic\ndef y := 1\n",
+                "TauCeti.lean": "import TauCeti.Provider\nimport TauCeti.Importer\n",
+            }
+        )
+        self.assertEqual(self.gaps(base), (frozenset(), None))
+        removed, removed_sha = self.tree({"TauCeti/Provider.lean": None}, start=base_sha)
+        self.assertEqual(
+            self.gaps(removed),
+            (frozenset({("TauCeti/Importer.lean", "TauCeti.Provider"), ("TauCeti.lean", "TauCeti.Provider")}), None),
+        )
+        bad, _ = self.tree({"TauCeti/Consumer.lean": "module\nimport TauCeti.Gone\n"}, start=base_sha)
+        self.assertEqual(self.gaps(bad), (frozenset({("TauCeti/Consumer.lean", "TauCeti.Gone")}), None))
+        # A gap already present is the base's own: the probe subtracts the current tip's gaps.
+        fixed, _ = self.tree({"TauCeti/Other.lean": "module\ndef z := 1\n"}, start=removed_sha)
+        self.assertEqual(self.gaps(fixed)[0] - self.gaps(removed)[0], frozenset())
+        # Non-project imports and files outside the inventory are not inspected.
+        outside, _ = self.tree({"Scripts/Tool.lean": "import TauCeti.Nothing\n"}, start=base_sha)
+        self.assertEqual(self.gaps(outside), (frozenset(), None))
+
+    def test_scan_is_memoised_and_reads_only_new_blobs(self):
+        base, base_sha = self.tree({f"TauCeti/M{n}.lean": f"module\ndef m{n} := {n}\n" for n in range(12)})
+        with patch.object(self.planner, "git", wraps=self.planner.git) as git:
+            self.assertEqual(self.gaps(base), (frozenset(), None))
+            first = [c.args[0] for c in git.call_args_list]
+            self.assertEqual(first.count("cat-file"), 2)  # one size check, one batch read
+            self.gaps(base)
+            self.assertEqual(len(git.call_args_list), len(first))  # memoised per tree
+            nxt, _ = self.tree({"TauCeti/M12.lean": "module\nimport TauCeti.M3\n"}, start=base_sha)
+            git.reset_mock()
+            self.assertEqual(self.gaps(nxt), (frozenset(), None))
+            batch_reads = [c for c in git.call_args_list if c.args[0] == "cat-file" and c.args[1] == "--batch"]
+            self.assertEqual(len(batch_reads), 1)
+            self.assertEqual(batch_reads[0].kwargs["data"].decode().count("\n"), 1)  # only the new blob
+
+    def test_unsupported_entries_and_oversize_sources(self):
+        base, base_sha = self.tree({"TauCeti/A.lean": "module\ndef a := 1\n"})
+        # A symlink under the inventory makes the scan unavailable, as it does the CI preflight.
+        link = self.repo.scratch / "TauCeti" / "Link.lean"
+        subprocess.run(["git", "-C", str(self.repo.scratch), "checkout", "-q", "--detach", base_sha], check=True)
+        link.symlink_to("A.lean")
+        subprocess.run(["git", "-C", str(self.repo.scratch), "add", "-A"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo.scratch),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "link",
+            ],
+            check=True,
+        )
+        sha = subprocess.run(
+            ["git", "-C", str(self.repo.scratch), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(self.repo.scratch), "push", "-q", "-f", "origin", f"{sha}:refs/heads/scratch"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo.clone), "fetch", "-q", "origin", "+refs/heads/scratch:refs/heads/scratch"],
+            check=True,
+        )
+        tree = subprocess.run(
+            ["git", "-C", str(self.repo.clone), "rev-parse", f"{sha}^{{tree}}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        gaps, reason = self.gaps(tree)
+        self.assertIsNone(gaps)
+        self.assertIn("unsupported source entry TauCeti/Link.lean", reason)
+        # An oversize source still provides its module; only its own imports are unknown.
+        big, _ = self.tree(
+            {
+                "TauCeti/Big.lean": "module\nimport TauCeti.Missing\n"
+                + "-- filler\n" * (admission_planning.MAX_FILE_BYTES // 10),
+                "TauCeti/User.lean": "module\nimport TauCeti.Big\n",
+            },
+            start=base_sha,
+        )
+        self.assertEqual(self.gaps(big), (frozenset(), None))
+
+    def test_gap_memo_is_bounded(self):
+        _, base_sha = self.tree({"TauCeti/A.lean": "module\n"})
+        for n in range(admission_planning.MAX_GAP_TREES + 3):
+            tree, _ = self.tree({f"TauCeti/T{n}.lean": "module\n"}, start=base_sha)
+            self.gaps(tree)
+        self.assertEqual(len(self.planner.gaps), admission_planning.MAX_GAP_TREES)
 
 
 class Planning(unittest.TestCase):
@@ -60,6 +186,12 @@ class Planning(unittest.TestCase):
         return batch, members, inputs
 
     def test_compiled_collisions_and_transitive_import_components(self):
+        # The providers already exist on main (an approved PR importing a module no source provides
+        # is refused at insertion, scenario 25); each PR edits its own module, so the import edges
+        # between members are ownership edges.
+        self.repo.advance_main(
+            {"TauCeti/A.lean": "def a := 0\n", "TauCeti/B.lean": "def b := 0\n", "TauCeti/C.lean": "def c := 0\n"}
+        )
         self.approve(101, {"TauCeti/A.lean": "def a := 1\n"})
         self.approve(102, {"TauCeti/B.lean": "public import TauCeti.A\ndef b := 1\n"})
         self.approve(103, {"TauCeti/C.lean": "import TauCeti.B\ndef c := 1\n"})
@@ -109,6 +241,9 @@ class Planning(unittest.TestCase):
         )
 
     def test_budget_failure_keeps_known_paths_and_marks_unknown(self):
+        self.repo.advance_main(
+            {"TauCeti/A.lean": "def a := 0\n", "TauCeti/B.lean": "def b := 0\n", "TauCeti/C.lean": "def c := 0\n"}
+        )
         self.approve(101, {"TauCeti/A.lean": "x" * (admission_planning.MAX_FILE_BYTES + 1)})
         self.approve(102, {"TauCeti/B.lean": "import TauCeti.C\ndef b := 1\n"})
         self.approve(103, {"TauCeti/C.lean": "def c := 1\n"})

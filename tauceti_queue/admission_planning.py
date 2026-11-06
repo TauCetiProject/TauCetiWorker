@@ -23,6 +23,9 @@ MAX_RECORDS = 4096
 MAX_NAMES = 262144
 MAX_EDGES = 2048
 MAX_CONTEXT_BYTES = 512 * 1024
+PROJECT_MODULE_PREFIX = "TauCeti."
+MAX_GAP_TREES = 64  # memoised whole-tree import scans, keyed by tree id
+MAX_GAP_PASSES = 8  # byte-budgeted header reads one whole-tree scan may take when cold
 
 
 def imports(text: str) -> list[str]:
@@ -59,6 +62,7 @@ class Planner:
         self.headers: dict[str, list[str]] = {}
         self.omitted: dict[str, str] = {}
         self.pending = False
+        self.gaps: dict[str, tuple[frozenset[tuple[str, str]] | None, str | None]] = {}
 
     def git(self, *args: str, data: bytes | None = None) -> bytes:
         return subprocess.run(
@@ -99,6 +103,14 @@ class Planner:
                     pos += 2
                 self.changes[sha] = changes
         blobs = sorted({b for sha in commits for p, b in self.changes[sha] if p.endswith(".lean") and b})
+        self.read_headers(blobs)
+
+    def read_headers(self, blobs: list[str]) -> None:
+        """Parse the import headers of `blobs` not yet cached, within one byte-budgeted pass.
+
+        Blobs over `MAX_FILE_BYTES` or non-text are recorded in `omitted`; blobs beyond the pass's
+        `MAX_BLOB_BYTES` budget are left for another pass and `pending` is set.
+        """
         blobs = [b for b in blobs if b not in self.headers and b not in self.omitted]
         if not blobs:
             return
@@ -281,6 +293,68 @@ class Planner:
             else:
                 break
         return context
+
+
+def project_source(path: str) -> bool:
+    """A project module path, the inventory the CI import-header preflight checks."""
+    return path == "TauCeti.lean" or (path.startswith("TauCeti/") and path.endswith(".lean"))
+
+
+def import_gaps(planner: Planner, tree: str) -> tuple[frozenset[tuple[str, str]] | None, str | None]:
+    """Every project import in `tree` with no source, as `(importer_path, module)`; memoised per tree.
+
+    The listing is the project inventory the CI preflight checks (regular blobs under `TauCeti/`
+    and `TauCeti.lean`); any other kind of entry there makes the scan unavailable, as it does the
+    preflight. Headers come from the planner's blob cache, so a tree sharing almost every blob with
+    the last scanned tip reads only the changed files. A blob the cache omits (oversize or non-text)
+    still counts as a source; its own imports are unknown, which can hide a gap but never invent
+    one. Returns `(None, reason)` when the scan is unavailable.
+    """
+    if tree in planner.gaps:
+        return planner.gaps[tree]
+    result: tuple[frozenset[tuple[str, str]] | None, str | None]
+    try:
+        listing = planner.git("ls-tree", "-r", "-z", tree).decode().split("\0")
+        files: dict[str, str] = {}
+        reason = None
+        for entry in listing:
+            if not entry:
+                continue
+            meta, path = entry.split("\t", 1)
+            mode, kind, oid = meta.split()
+            if not project_source(path):
+                continue
+            if kind != "blob" or mode != "100644":
+                reason = f"unsupported source entry {path}"
+                break
+            files[path] = oid
+        if reason is not None:
+            result = (None, reason)
+        else:
+            blobs = sorted(set(files.values()))
+            complete = False
+            for _ in range(MAX_GAP_PASSES):
+                planner.pending = False
+                planner.read_headers(blobs)
+                if not planner.pending:
+                    complete = True
+                    break
+            planner.pending = False
+            if not complete:
+                result = (None, "import context byte budget exceeded")
+            else:
+                gaps = set()
+                for path, blob in files.items():
+                    for module in planner.headers.get(blob, []):
+                        if module.startswith(PROJECT_MODULE_PREFIX) and module.replace(".", "/") + ".lean" not in files:
+                            gaps.add((path, module))
+                result = (frozenset(gaps), None)
+    except (ValueError, UnicodeError, subprocess.SubprocessError) as error:
+        result = (None, type(error).__name__ + ": " + str(error)[:200])
+    planner.gaps[tree] = result
+    while len(planner.gaps) > MAX_GAP_TREES:
+        del planner.gaps[next(iter(planner.gaps))]
+    return result
 
 
 def task_context(context: dict) -> dict:

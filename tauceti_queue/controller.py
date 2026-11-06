@@ -25,6 +25,7 @@ import logging
 import random
 import re
 import secrets
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -125,6 +126,7 @@ INPUT_RESERVED = "reserved"
 INPUT_INSERTED = "inserted"
 INPUT_LANDED = "landed"
 INPUT_CANCELLED = "cancelled"
+MISSING_SOURCE_IN_FLIGHT = "missing-source-in-flight"  # `last_probe` of an input waiting for a source in the head
 # The cancellation reason of a `no_repair` member the agent emptied: withdrawn until the PR it
 # interacts with lands on `main` (then `needs-rebase`) or leaves the queue (then re-admitted).
 PROBLEM_ANTICIPATED = "problem-anticipated"
@@ -2285,10 +2287,8 @@ class Controller:
         prior = self._state(key, {})
         if prior.get("signature") == signature and (not prior.get("retryable") or now < prior.get("retry_after", 0)):
             return prior
-        if not hasattr(self, "_admission_planner"):
-            self._admission_planner = admission_planning.Planner(self.clone)
         try:
-            context = self._admission_planner.context(members, inputs, tip=batch["tip"])
+            context = self._planner().context(members, inputs, tip=batch["tip"])
         except Exception as error:  # optional navigation must never strand a reservation or stop CI
             context = {
                 "kind": "admission_predictions",
@@ -2532,6 +2532,8 @@ class Controller:
         return loads(row["probe_conflicts"], {}).get(str(batch["id"])) == batch["base"]
 
     def _probe_eligible(self, row: dict[str, Any], batch: dict[str, Any]) -> bool:
+        if row["last_probe"] == MISSING_SOURCE_IN_FLIGHT and row["last_probe_base"] == batch["base"]:
+            return False  # the source it imports is still in flight; no batch on this base has it
         return (
             row["last_probe_tip"] != batch["tip"]
             and not self._conflicted_with(row, batch)
@@ -2615,11 +2617,16 @@ class Controller:
         chain_id = f"probe-{batch['id']}-{secrets.token_hex(4)}"
         failure: chain.ChainError | None = None
         result: chain.ChainResult | None = None
+        gaps: list[tuple[str, str]] = []
+        scan_unavailable: str | None = None
         try:
             with self._lock.unlocked():
                 if not self._fetch_head(row["number"], row["head_sha"]):
                     raise chain.ChainError(f"accepted head {row['head_sha']} is not available")
                 result = chain.build(self.clone, batch["tip"], [member], chain_id=chain_id)
+                gaps, scan_unavailable = (
+                    self._new_import_gaps(batch["tip"], result) if result.status == chain.CLEAN else ([], None)
+                )
         except chain.ChainError as error:
             failure = error
         finally:
@@ -2719,6 +2726,75 @@ class Controller:
                 )
             return False
         record = result.commits[0]
+        if scan_unavailable is not None:
+            self.store.journal(
+                now, "probe-import-scan-unavailable", batch["id"], number=row["number"], reason=scan_unavailable
+            )
+        if gaps:
+            # The replay is clean but the prospective tree has an import with no source that the
+            # current tip does not have: this PR removed the source or added the import. CI's
+            # import-header preflight would fail the whole head for it; refuse the PR instead,
+            # the way a conflict with the canonical branch is refused.
+            changed = self._changed_paths(record.sha)
+            listed = [{"path": path, "module": module, "changed": path in changed} for path, module in gaps[:8]]
+            in_flight = self._providers_in_flight(batch, gaps)
+            if in_flight is not None:
+                # Every missing source is in the head or another open batch: the PR is early, not
+                # wrong. It waits, and is not probed against any batch on this base again (a fresh
+                # open batch on the same canonical commit lacks the source just the same, so unlike
+                # a conflict this is no reason to open one); it is probed once a base moves, by which
+                # time the provider has landed or left the queue.
+                with self.store.transaction():
+                    self.store.update(
+                        "inputs",
+                        {"id": row["id"]},
+                        state=INPUT_WAITING,
+                        batch_id=None,
+                        last_probe=MISSING_SOURCE_IN_FLIGHT,
+                        last_probe_tip=batch["tip"],
+                        last_probe_base=batch["base"],
+                    )
+                    self._release_claim(claim, "missing-source-in-flight", now)
+                    self.store.journal(
+                        now,
+                        "probe-missing-source-waiting",
+                        batch["id"],
+                        number=row["number"],
+                        gaps=listed,
+                        providers_in=in_flight,
+                    )
+                return False
+            evidence = loads(row.get("evidence"), {})
+            evidence["merge_selection"] = [
+                *evidence.get("merge_selection", []),
+                {
+                    "kind": "missing_source",
+                    "pr": row["number"],
+                    "batch_id": batch["id"],
+                    "base": batch["base"],
+                    "tip": batch["tip"],
+                    "gaps": listed,
+                    "at": now,
+                },
+            ][-8:]
+            with self.store.transaction():
+                self.store.update(
+                    "inputs",
+                    {"id": row["id"]},
+                    evidence=dumps(evidence),
+                    state=INPUT_CANCELLED,
+                    batch_id=None,
+                    reason="missing-source",
+                    last_probe=dumps(listed),
+                    last_probe_base="",
+                )
+                self._missing_source_request(row, listed)
+                self._release_claim(claim, "missing-source", now)
+                self._count("missing_source_refusals")
+                self.store.journal(
+                    now, "probe-missing-source", batch["id"], number=row["number"], tip=batch["tip"], gaps=listed
+                )
+            return False
         version = batch["version"] + 1
         with self.store.transaction():
             if self.admission is not None and not self.admission.is_current(row["number"], row["head_sha"]):
@@ -2767,6 +2843,83 @@ class Controller:
             )
         self._admission_context(self.store.row("batches", {"id": batch["id"]}) or batch, now)
         return True
+
+    def _planner(self) -> admission_planning.Planner:
+        if not hasattr(self, "_admission_planner"):
+            self._admission_planner = admission_planning.Planner(self.clone)
+        return self._admission_planner
+
+    def _new_import_gaps(self, tip: str, result: chain.ChainResult) -> tuple[list[tuple[str, str]], str | None]:
+        """Project imports with no source in the prospective tree that the current tip does not have.
+
+        Comparing the two trees charges every new gap to the PR being inserted: a gap already on the
+        batch's base appears in both scans, and a batch-mate that removed a source was refused at its
+        own insertion. Returns the sorted new gaps, or `([], reason)` when either scan is unavailable,
+        in which case the insertion proceeds and the CI preflight remains the authority.
+        """
+        planner = self._planner()
+        before, why = admission_planning.import_gaps(planner, chain.tree_of(self.clone, tip))
+        if before is None:
+            return [], why
+        after, why = admission_planning.import_gaps(planner, chain.tree_of(self.clone, result.tip))
+        if after is None:
+            return [], why
+        return sorted(after - before), None
+
+    def _providers_in_flight(self, batch: dict[str, Any], gaps: list[tuple[str, str]]) -> list[int] | None:
+        """The batches (head or other open ones) whose tips provide every missing source, else None."""
+        candidates = [b for b in [self._head(), *self._open_batches()] if b is not None and b["id"] != batch["id"]]
+        found: list[int] = []
+        for _, module in gaps:
+            provider = module.replace(".", "/") + ".lean"
+            holder = next((b for b in candidates if b["tip"] and self._tree_has(b["tip"], provider)), None)
+            if holder is None:
+                return None
+            if holder["id"] not in found:
+                found.append(holder["id"])
+        return found
+
+    def _tree_has(self, commit: str, path: str) -> bool:
+        """Whether `commit` carries a blob at `path` (`rev:path` cannot take a `^{blob}` peel)."""
+        return chain._git(self.clone, "cat-file", "-e", f"{commit}:{path}").returncode == 0
+
+    def _changed_paths(self, sha: str) -> set[str]:
+        planner = self._planner()
+        try:
+            planner.load([sha])
+        except (ValueError, UnicodeError, subprocess.SubprocessError):
+            return set()
+        return {path for path, _ in planner.changes.get(sha, [])}
+
+    def _missing_source_request(self, row: dict[str, Any], gaps: list[dict[str, Any]]) -> None:
+        if not self.setting("publication_enabled"):
+            return
+        removal = any(not gap["changed"] for gap in gaps)
+        lines = []
+        for gap in gaps:
+            provider = gap["module"].replace(".", "/") + ".lean"
+            if gap["changed"]:
+                lines.append(f"- `{gap['path']}` imports `{gap['module']}`, but no source provides it (`{provider}`).")
+            else:
+                lines.append(
+                    f"- `{gap['path']}` still imports `{gap['module']}`, whose source `{provider}` this PR removes."
+                )
+        if removal:
+            summary = "This PR removes or renames a module that other sources still import."
+            next_step = "Keep the module or update every importer, then approve it again."
+        else:
+            summary = "This PR imports a module that no source provides."
+            next_step = "Fix the import, then approve it again."
+        body = summary + "\n\n" + "\n".join(lines) + "\n\n" + next_step
+        self._enqueue(
+            "comment",
+            f"missing-source:{row['number']}:{row['head_sha']}",
+            {
+                "number": row["number"],
+                "body": body,
+                "marker": f"<!-- {COMMENT_MARKER} missing-source:{row['head_sha']} -->",
+            },
+        )
 
     def _conflict_request(self, row: dict[str, Any], paths: list[str], now: float) -> None:
         if not self.setting("publication_enabled"):

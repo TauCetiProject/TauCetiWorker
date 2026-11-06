@@ -12,11 +12,12 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from tauceti_queue import chain, feeds  # noqa: E402
+from tauceti_queue import admission_planning, chain, feeds  # noqa: E402
 from tauceti_queue.controller import MERGED_TITLE_PREFIX, ControllerError, TaskError  # noqa: E402
 from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller  # noqa: E402
 from tauceti_queue.loop import ReconciliationLoop  # noqa: E402
@@ -881,6 +882,102 @@ class HeadOperations(QueueFixture):
         self.tick()
         self.assertIn("conflicts with `main`", self.github.comments_for(101)[0]["body"])
         self.assertIsNone(self.head())
+
+
+class MissingSource(QueueFixture):
+    """Scenario 25: an insertion that strands an importer is refused from the import headers."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.advance_main(
+            {
+                "TauCeti/Provider.lean": "module\ndef provider := 1\n",
+                "TauCeti/Importer.lean": "module\npublic import TauCeti.Provider\ndef importer := provider\n",
+            }
+        )
+
+    def refused(self, number):
+        rows = [r for r in self.controller.inputs() if r["number"] == number]
+        return rows[-1]["state"] == "cancelled" and rows[-1]["reason"] == "missing-source"
+
+    def test_s25_removal_that_strands_an_importer_is_refused_at_insertion(self):
+        self.approve(101, {"TauCeti/Provider.lean": None})
+        self.tick()
+        self.assertTrue(self.refused(101))
+        self.assertIsNone(self.head())
+        self.assertEqual(self.controller.store.count("journal", {"kind": "probe-missing-source"}), 1)
+        self.assertEqual(self.controller.status()["counters"].get("missing_source_refusals"), 1)
+        entry = self.controller.store.rows("journal", {"kind": "probe-missing-source"})[0]
+        self.assertEqual(
+            json.loads(entry["detail"])["gaps"],
+            [{"path": "TauCeti/Importer.lean", "module": "TauCeti.Provider", "changed": False}],
+        )
+        self.tick()
+        body = self.github.comments_for(101)[0]["body"]
+        self.assertIn("removes or renames a module that other sources still import", body)
+        self.assertIn(
+            "`TauCeti/Importer.lean` still imports `TauCeti.Provider`, whose source `TauCeti/Provider.lean` this PR removes.",
+            body,
+        )
+        self.assertIn("Keep the module or update every importer, then approve it again.", body)
+        self.assertEqual(self.controller.store.count("members", {}), 0)
+        # The same removal with every importer updated inserts.
+        self.approve(102, {"TauCeti/Provider.lean": None, "TauCeti/Importer.lean": "module\ndef importer := 1\n"})
+        self.tick()
+        self.assertEqual([r["state"] for r in self.controller.inputs() if r["number"] == 102], ["inserted"])
+
+    def test_s25_bad_import_is_refused_and_a_batch_mates_module_is_a_source(self):
+        self.approve(101, {"TauCeti/New.lean": "module\ndef new := 1\n"})
+        self.approve(102, {"TauCeti/Consumer.lean": "module\nimport TauCeti.New\nimport TauCeti.Gone\n"})
+        self.tick()
+        # The gap no batch provides decides: 102 is refused even though a batch-mate provides New.
+        self.assertTrue(self.refused(102))
+        self.tick()
+        body = self.github.comments_for(102)[0]["body"]
+        self.assertIn("imports a module that no source provides", body)
+        self.assertIn(
+            "`TauCeti/Consumer.lean` imports `TauCeti.Gone`, but no source provides it (`TauCeti/Gone.lean`).", body
+        )
+        # Importing only a batch-mate's module waits while that module is in the head, then lands.
+        self.approve(103, {"TauCeti/Other.lean": "module\nimport TauCeti.New\n"})
+        for _ in range(3):
+            self.drive()
+        self.assertEqual([r["state"] for r in self.controller.inputs() if r["number"] == 103], ["landed"])
+        self.assertIsNotNone(self.repo.file_at("main", "TauCeti/Other.lean"))
+
+    def test_s25_import_of_a_module_in_the_head_waits_and_inserts_once_it_lands(self):
+        self.approve(101, {"TauCeti/New.lean": "module\ndef new := 1\n"})
+        self.tick()
+        self.assertEqual(self.head()["size"] if "size" in self.head() else len(self.members(self.head())), 1)
+        self.approve(102, {"TauCeti/Consumer.lean": "module\nimport TauCeti.New\n"})
+        self.tick()
+        rows = [r for r in self.controller.inputs() if r["number"] == 102]
+        self.assertEqual(rows[-1]["state"], "waiting")
+        # One entry per open batch probed in the pass (a second open batch is tried, as for conflicts).
+        waited = self.controller.store.count("journal", {"kind": "probe-missing-source-waiting"})
+        self.assertGreaterEqual(waited, 1)
+        self.assertEqual(self.controller.store.count("journal", {"kind": "probe-missing-source"}), 0)
+        self.assertEqual(self.github.comments_for(102), [])
+        # Not probed again while the open batches keep their base; inserted and landed once the head lands.
+        self.tick()
+        self.assertEqual(self.controller.store.count("journal", {"kind": "probe-missing-source-waiting"}), waited)
+        for _ in range(3):
+            self.drive()
+        self.assertEqual([r["state"] for r in self.controller.inputs() if r["number"] == 102], ["landed"])
+        self.assertIsNotNone(self.repo.file_at("main", "TauCeti/Consumer.lean"))
+
+    def test_s25_gap_already_on_main_and_unavailable_scan_do_not_refuse(self):
+        self.repo.advance_main({"TauCeti/Stale.lean": "module\nimport TauCeti.Gone\n"})
+        self.approve(101, {"TauCeti/A.lean": "module\ndef a := 1\n"})
+        self.tick()
+        self.assertEqual([r["state"] for r in self.controller.inputs() if r["number"] == 101], ["inserted"])
+        self.assertEqual(self.controller.store.count("journal", {"kind": "probe-missing-source"}), 0)
+        with patch.object(admission_planning, "import_gaps", return_value=(None, "scan broken")):
+            self.approve(102, {"TauCeti/Provider.lean": None})
+            self.tick()
+        self.assertEqual([r["state"] for r in self.controller.inputs() if r["number"] == 102], ["inserted"])
+        entry = self.controller.store.rows("journal", {"kind": "probe-import-scan-unavailable"})[-1]
+        self.assertEqual(json.loads(entry["detail"])["reason"], "scan broken")
 
 
 class OpenBatches(QueueFixture):

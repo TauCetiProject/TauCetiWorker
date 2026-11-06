@@ -582,6 +582,7 @@ Tests are `tests/queue_fixture.py` (F), `tests/queue_controller.py` (C) and `tes
 | 20 urgent lane | F `test_s20_urgent_pr_is_in_the_next_head_without_cancelling_the_running_one` |
 | 21 closing or relabelling a member changes nothing | F `test_s16_s21_...`; C `test_waiting_inputs_react_to_events_and_members_do_not` |
 | 22 status names runner, host, phases, stall, revision | F `test_s22_status_names_runner_host_phase_progress_stall_and_revision`; C `StatusShape` |
+| 25 a removal that strands an importer is refused at insertion | F `MissingSource` (`test_s25_removal_that_strands_an_importer_is_refused_at_insertion`, `test_s25_bad_import_is_refused_and_a_batch_mates_module_is_a_source`, `test_s25_gap_already_on_main_and_unavailable_scan_do_not_refuse`); `tests/queue_admission_planning.py` `ImportGaps` |
 | 23, 24 increment 0 and transition | not expressible here; `tests/queue_rehearsal.py` runs the cutover rehearsal's scenario script over these fakes (`docs/queue/rehearsal.md`); `tests/queue_bors_import.py` covers the import of Bors's state over a reduced production feed and the first-head rule; `tests/queue_approval_poll.py` the approval poll |
 
 Repair or reject is F `RepairOrReject` (a landing comment with the edit summary and the diff; a
