@@ -342,10 +342,8 @@ class LargeTaskCheckpoint(unittest.TestCase):
             wire = json.dumps(value)
             self.assertNotIn("PRIVATE", wire)
             self.assertLess(len(wire), 4096)
-            # A corrupt or excessive local input is still bounded and cannot
-            # stop the queue task; only this observer returns unavailable.
-            with patch.object(monitoring, "TASK_CHECKPOINT_BYTES", 1024):
-                self.assertEqual(monitoring.TaskObservations().observe([root], [{"id": 21, "state": "open"}]), {})
+            checkpoint.write_text("corrupt private checkpoint")
+            self.assertEqual(monitoring.TaskObservations().observe([root], [{"id": 21, "state": "open"}]), {})
 
 
 class PublisherCadence(unittest.TestCase):

@@ -48,6 +48,16 @@ for each token category; absent usage is not zero. The canonical tip comes from
 the existing controller status fact, without another Git scan. No raw task payload, claim token, worker path, prompt, model response,
 process command, environment or private error is exported.
 
+Repair workers write an optional atomic `progress.json` beside each private checkpoint. It contains
+the sanitized summary and a local lease binding; the exporter omits that binding. When this file is
+present, monitoring never opens the task or outcome payload, so member context, prompts and final
+diagnostics can grow without making progress unavailable. Accounting includes every recorded attempt
+once; only the model-name display is sampled (with `models_truncated`), independently of cost and
+token totals. A failed progress write leaves the last observation in place and cannot fail a repair.
+Older running workers and historical tasks remain readable without an immediate worker restart.
+That compatibility path loads trusted local checkpoints/outcomes with memory proportional to their
+size; it has no task-size cutoff. Public frame and transport bounds remain unchanged.
+
 A separate hourly report reuses the existing pilot calculations:
 
 ```sh
