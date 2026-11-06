@@ -16,7 +16,7 @@ from .runtime_status import atomic_json, read_json
 
 _FALSE = {"0", "false", "off", "no", "n", "f"}
 _IDENTITY = re.compile(r"[0-9a-f]{16,64}")
-_ARTIFACT = re.compile(r"[0-9a-f]{16}\.[A-Za-z0-9_.-]+")
+_ARTIFACT = re.compile(r"[0-9a-f]{16}(?:\.[A-Za-z0-9_.-]+)?")
 _TEMPORARY = re.compile(r"\.lake-cache-([0-9]+)-[0-9-]+\.tmp")
 
 
