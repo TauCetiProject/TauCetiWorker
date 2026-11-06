@@ -350,6 +350,7 @@ class AdmissionPoller:
             except Exception as error:
                 next_at = retry_at = self._retry_at(error)
                 if isinstance(error, RequestDeferred):
+                    self.state.record_resource_wait(error.resource, error.retry_at)
                     summary["deferred"] += 1
                 else:
                     summary["errors"].append(f"discovery: {error}")

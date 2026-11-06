@@ -139,10 +139,15 @@ class AdmissionState:
             )
             if resource != "source":
                 # Capacity belongs to the installation, even if this PR changed during the read.
-                deadlines = self.store.get_setting(self.resource_key, {})
-                deadlines[resource] = max(deadlines.get(resource, 0), until)
-                self.store.set_setting(self.resource_key, deadlines, "admission", self.clock())
+                self.record_resource_wait(resource, until)
             return bool(updated)
+
+    def record_resource_wait(self, resource: str, until: float) -> None:
+        """Discovery and individual reads share the same observed absolute deadline."""
+        with self.store.transaction():
+            deadlines = self.store.get_setting(self.resource_key, {})
+            deadlines[resource] = max(deadlines.get(resource, 0), until)
+            self.store.set_setting(self.resource_key, deadlines, "admission", self.clock())
 
     def summary(self) -> dict:
         query, params = self._pending_query(

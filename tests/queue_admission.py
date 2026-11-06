@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_queue import webhook
 from tauceti_queue.admission import AdmissionPolicy, AdmissionPoller
 from tauceti_queue.fakes import make_controller, reopen_controller
-from tauceti_queue.github_adapter import RateLimited
+from tauceti_queue.github_adapter import GitHubClient, RateLimited
 from tauceti_queue.ports import Status
 
 REPO = "TauCetiProject/TauCeti"
@@ -281,6 +281,50 @@ class AdmissionTests(unittest.TestCase):
         self.github.admission_snapshot = original
         self.clock.advance(7200)
         self.assertEqual(self.intake.run_once()["approved"], 1)
+
+    def test_discovery_server_cooldown_protects_new_dirty_work_after_restart(self):
+        self.ready()
+        until = self.clock() + 7200
+        calls = []
+
+        def limited_transport(*args):
+            calls.append(args)
+            return 403, {"retry-after": "7200"}, b'{"message":"secondary rate limit"}'
+
+        self.github.client = GitHubClient(None, limited_transport, clock=self.clock)
+        original_listing = self.github.list_open_pull_requests
+
+        def discovery(*args, **kwargs):
+            self.github.client.get_json("discovery")
+            return []
+
+        self.github.list_open_pull_requests = discovery
+        self.assertEqual(self.intake.run_once()["deferred"], 1)
+        self.assertIsNone(self.intake.state.get(1), "discovery failed before observing any PR")
+        self.assertEqual(self.controller.store.get_setting(self.intake.state.resource_key), {"secondary": until})
+
+        def recovered_transport(*args):
+            calls.append(args)
+            return 200, {}, b"{}"
+
+        self.github.client = GitHubClient(None, recovered_transport, clock=self.clock)
+        self.restart()
+        original_snapshot = self.github.admission_snapshot
+
+        def snapshot(*args, **kwargs):
+            self.github.client.get_json("new-dirty-head")
+            return original_snapshot(*args, **kwargs)
+
+        self.github.admission_snapshot = snapshot
+        self.intake.invalidate(1)
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(len(calls), 1, "new PR reads must respect the restored discovery cooldown")
+        self.assertEqual(self.intake.state.summary()["next_attempt_at"], until)
+        self.assertEqual(self.controller.store.get_setting(self.intake.state.resource_key), {"secondary": until})
+        self.clock.advance(7200)
+        self.github.list_open_pull_requests = original_listing
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.assertEqual(len(calls), 2)
 
     def test_poison_pr_does_not_block_other_prs_and_failure_is_not_completed(self):
         self.ready(1)
