@@ -1,8 +1,9 @@
 # Native Lake cache implementation validation
 
 Evidence recorded on tauchonki on 6 November 2026. The implementation and live
-rollout are verified across all 40 enabled workers. The broader retained-data
-accounting scan is still running.
+rollout are verified across all 40 enabled workers. Measured native reuse is
+established; total physical disk savings and a complete host-wide storage
+breakdown are not established by these inventories.
 
 ## Delivered changes
 
@@ -140,9 +141,14 @@ job activity, rather than preallocated 64 GiB per runner.
 A host snapshot at 07:19 UTC measured 3,691,381,080,064 bytes used of
 3,837,570,154,496 bytes, with 146,189,074,432 bytes available and 119,238,533
 inodes in use. Free space fluctuates as active work and existing
-cleanup proceed. The overall scan of retained roots is still pending, so these
-component inventories do not yet close the host-wide accounting. They must not
-be summed as disjoint physical allocations.
+cleanup proceed. A broad metadata walk of `/home/kim`, `/nix` and `/var` was
+stopped after more than two hours, at least 321 GB of metadata reads and over
+1 GB of resident memory, while the existing host memory-pressure guard was
+holding new rounds. That diagnostic produced no aggregate for the retained
+roots. Separate targeted scans also encountered inaccessible overlay work
+directories. These component inventories do not close the host-wide accounting
+and must not be summed as disjoint physical allocations. The diagnostic was
+stopped without signalling any worker, CI runner or cleanup service.
 
 The existing Fleet memory-pressure guard temporarily held new rounds during
 validation. Configuration still has workers enabled, `draining = false`, and
@@ -165,11 +171,12 @@ installed native executable hash match. Normal worker and CI admissions remain
 configured as enabled; the existing memory-pressure guard can temporarily hold
 new rounds without a deployment drain. The subscription pool remains inactive.
 
-The retained-data scan is the only outstanding measurement. Representative
-private-cache, dependency-source, retained-build, download and build observations
-are recorded above. Disk pressure arose during rollout: host free space fell
-below 30 GB while the shared store was below 10 GB. That observation alone does
-not identify the other growth or prove disk relief from this feature.
+The implementation measurements cover native reuse, remaining private artifacts,
+representative dependency-source and retained-build costs, download reuse,
+preparation/build timings, and host allocated bytes/inodes. Disk pressure arose
+during rollout: host free space fell below 30 GB while the shared store was below
+10 GB. That observation alone does not identify the other growth or prove disk
+relief from this feature. Broader physical attribution remains unresolved.
 
 Dependency source trees, Git checkouts, recovery snapshots and existing private
 aliases remain substantial separate costs. This implementation does not provide
