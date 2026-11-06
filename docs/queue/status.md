@@ -32,8 +32,30 @@ The remaining deployment gap is boot supervision on chungus: `Linger=no`, enabli
 and the service unit remains disabled while the detached supervisor owns the running process.
 The supervisor recovers process crashes but cannot start after a host reboot. The backup timer
 is enabled and active, with a successful November 6 run, but has the same user-session limitation.
-An administrator must enable lingering before supervision is transferred to systemd, or the
-service must move to the dedicated host. See [the operations runbook](operations.md#current-deployment).
+This host constraint does not prevent normal supervision by the running user manager; it remains
+relevant to reboot startup. See [the operations runbook](operations.md#current-deployment).
+
+## Repair memory-pressure incident (2026-11-06)
+
+At 05:47:40 UTC, `systemd-oomd` killed `session-1994.scope`, containing both repair workers and
+their shell supervisors. The journal records memory pressure of 98.04% for over 30 seconds; the
+session reached 50 GB of memory and 14.7 GB of swap. Both builds stopped, claims expired around
+05:58, and head 34's 141 PRs had no repair worker. Restarting the same shell loops at 06:55
+repeated the failure. `nohup` did not move the supervisors out of the killable login scope.
+
+Repair builds also bypassed the existing compiler pressure gate, and their sandbox hid capped
+cgroup ancestors. The account's existing limit is approximately 50.2 GiB, below host RAM. Builds
+now reuse the trusted bundled gate, with cgroups visible read-only and their namespace retained;
+there is no new memory cap. A real sandbox compilation and ancestor-visibility test passed, and
+the guard correctly waited under measured 94% account memory use.
+
+At 07:04 UTC both workers moved to separate systemd user services outside the login scope, with
+native restart and whole-worker OOM policy. A local full-cgroup SIGKILL fixture verified a new
+worker process resumed the same claim/session and produced one submission. The existing status
+path now exposes unclaimed head tasks after the configured stall interval; previously it only
+covered CI silence, which left this failure invisible while admissions continued. Normal worker
+and CI admissions remained enabled throughout. Live revisions and subsequent progress must be
+checked through status and the two repair journals.
 
 ## Increment 0
 

@@ -5597,7 +5597,7 @@ class Controller:
                 "repair_outputs_revs": loads(attempt.get("repair_outputs_revs"), []),
             }
             info["ci"] = ci
-            if attempt["outcome"] == OUTCOME_PENDING and attempt["last_progress_at"]:
+            if task is None and attempt["outcome"] == OUTCOME_PENDING and attempt["last_progress_at"]:
                 silence = now - attempt["last_progress_at"]
                 interval = int(settings["stall_interval_seconds"])
                 if silence >= interval:
@@ -5611,6 +5611,25 @@ class Controller:
                         alerts.append(
                             f"head {head['id']} build stalled for {silence:.0f}s on {attempt['runner_name'] or 'unknown runner'} ({attempt['host'] or 'unknown host'})"
                         )
+        if task is not None and not info["task"]["active_claims"]:
+            unclaimed_at = task["created_at"]
+            for claim in self.store.rows("claims", {"task_id": task["id"]}):
+                ended_at = claim["expires_at"]
+                if claim["released_at"] is not None:
+                    ended_at = min(ended_at, claim["released_at"])
+                if ended_at <= now:
+                    unclaimed_at = max(unclaimed_at, ended_at)
+            silence = now - unclaimed_at
+            interval = int(settings["stall_interval_seconds"])
+            if silence >= interval:
+                info["stall"] = {
+                    "kind": "task_unclaimed",
+                    "since": unclaimed_at + interval,
+                    "silence_seconds": silence,
+                    "phase": task["kind"],
+                }
+                if silence >= 2 * interval:
+                    alerts.append(f"head {head['id']} task {task['id']} ({task['kind']}) unclaimed for {silence:.0f}s")
         info["cancelled_runs"] = [
             {
                 "attempt_id": a["id"],

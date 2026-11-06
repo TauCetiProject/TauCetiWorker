@@ -531,7 +531,7 @@ def project(
     if head.get("stall") and head.get("id") in batch_map:
         conditions.append(
             {
-                "kind": "build_silence",
+                "kind": "task_unclaimed" if head["stall"].get("kind") == "task_unclaimed" else "build_silence",
                 "since": iso(head["stall"].get("since")),
                 "batch_id": str(head["id"]),
                 "seconds": numeric(head["stall"].get("silence_seconds")),
@@ -547,7 +547,9 @@ def project(
             if "submitted chain failed validation" in str(alert)
             else "source_condition"
         )
-        if kind != "source_condition" or not any(x in str(alert) for x in ("build stalled", "inference hold")):
+        if kind != "source_condition" or not any(
+            x in str(alert) for x in ("build stalled", "inference hold", " unclaimed for ")
+        ):
             conditions.append({"kind": kind})
     observation = {
         "schema": SCHEMA,

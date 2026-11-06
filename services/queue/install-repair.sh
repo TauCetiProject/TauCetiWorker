@@ -13,12 +13,13 @@
 # and checkpoint and resumes the same session when it comes back (SIGTERM handling in
 # tauceti_queue/repair_task.py).
 #
-# Usage: services/queue/install-repair.sh [--revision REF] [--checkout DIR] [--no-restart] [--wait SECONDS]
+# Usage: services/queue/install-repair.sh [--revision REF] [--checkout DIR] [--instance NAME] [--no-restart] [--wait SECONDS]
 #
 #   --revision REF   commit, branch or tag to install (default: origin/main). The checkout's
 #                    branch is fast-forwarded to it; a revision that is not a descendant fails
 #                    rather than being forced.
 #   --checkout DIR   where the checkout lives (default: ~/TauCetiQueue).
+#   --instance NAME  another worker, using repair-environment-NAME and its own task root.
 #   --no-restart     install files and the unit but leave a running worker alone (the next
 #                    restart picks up the new revision).
 #   --wait SECONDS   how long to wait for the restarted worker to report serving (default: 60).
@@ -32,6 +33,7 @@ CHECKOUT="${TAUCETI_QUEUE_CHECKOUT:-$HOME/TauCetiQueue}"
 REVISION="origin/main"
 RESTART=1
 WAIT=60
+INSTANCE=""
 UNIT="tauceti-queue-repair.service"
 UNIT_DIR="$HOME/.config/systemd/user"
 CONFIG_DIR="$HOME/.config/tauceti-queue"
@@ -41,6 +43,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --revision) REVISION="$2"; shift 2 ;;
     --checkout) CHECKOUT="$2"; shift 2 ;;
+    --instance) INSTANCE="$2"; shift 2 ;;
     --no-restart) RESTART=0; shift ;;
     --wait) WAIT="$2"; shift 2 ;;
     -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
@@ -50,6 +53,12 @@ done
 
 log() { echo "install-repair.sh: $*" >&2; }
 die() { log "$*"; exit 1; }
+
+if [ -n "$INSTANCE" ]; then
+  [[ "$INSTANCE" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || die "invalid instance name: $INSTANCE"
+  UNIT="tauceti-queue-repair@$INSTANCE.service"
+  ENV_FILE="$CONFIG_DIR/repair-environment-$INSTANCE"
+fi
 
 command -v git >/dev/null || die "git is required"
 command -v uv >/dev/null || die "uv is required (https://docs.astral.sh/uv/)"
@@ -86,7 +95,17 @@ uv sync --quiet
 # --- configuration --------------------------------------------------------------------------------
 mkdir -p "$CONFIG_DIR" && chmod 0700 "$CONFIG_DIR"
 if [ ! -f "$ENV_FILE" ]; then
-  sed "s|/home/operator|$HOME|g; s|repair@tauchonki|repair@$(hostname -s)|" services/queue/repair-environment.example > "$ENV_FILE.tmp"
+  if [ -n "$INSTANCE" ] && [ -f "$CONFIG_DIR/repair-environment" ]; then
+    # Preserve provider configuration and credential locations without printing their values.
+    cp "$CONFIG_DIR/repair-environment" "$ENV_FILE.tmp"
+  else
+    sed "s|/home/operator|$HOME|g; s|repair@tauchonki|repair@$(hostname -s)|" services/queue/repair-environment.example > "$ENV_FILE.tmp"
+  fi
+  if [ -n "$INSTANCE" ]; then
+    # Shared clone/cache configuration is safe; identities and checkpoints must be separate.
+    printf '\nTAUCETI_QUEUE_WORKER=repair-%s@%s\nTAUCETI_QUEUE_TASK_ROOT=%s/TauCetiQueue-data/repair-%s\n' \
+      "$INSTANCE" "$(hostname -s)" "$HOME" "$INSTANCE" >> "$ENV_FILE.tmp"
+  fi
   chmod 0600 "$ENV_FILE.tmp"
   mv "$ENV_FILE.tmp" "$ENV_FILE"
   log "wrote $ENV_FILE from the example; review it (service URL, worker name, clone, task root, credentials)"
@@ -122,7 +141,9 @@ fi
 
 # --- unit -----------------------------------------------------------------------------------------
 mkdir -p "$UNIT_DIR"
-install -m 0644 "services/queue/$UNIT" "$UNIT_DIR/$UNIT"
+for unit_file in tauceti-queue-repair.service tauceti-queue-repair@.service; do
+  install -m 0644 "services/queue/$unit_file" "$UNIT_DIR/$unit_file"
+done
 systemctl --user daemon-reload
 systemctl --user enable --quiet "$UNIT"
 

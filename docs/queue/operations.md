@@ -189,14 +189,16 @@ became authoritative on November 6 at 04:25 UTC with Worker revision `9d7180a97a
 TauCetiReview policy `7fd3a39e02c5`; subsequent live revisions are reported by `/status`. Both
 `queue.taucetiproject.org` and `bors.taucetiproject.org` report `service.host` `chungus` since
 01:13:33 UTC. The operator has no root on chungus and lingering is not enabled for the account
-(`loginctl enable-linger` is denied), so the service, the tunnel and the repair worker run as detached
-supervised processes started by hand (Hosts without lingering below); the units are installed but
-disabled. **chungus is a temporary host too.** A fresh dedicated machine is expected about eight hours
-after the move; the service moves there by the procedure below, restoring the systemd units and the
-backup timer.
+(`loginctl enable-linger` is denied). This is a fixed host constraint. The queue service and tunnel
+retain their detached supervisors; since November 6 at 07:04 UTC, both repair workers run under
+separate systemd user services, `tauceti-queue-repair.service` and `tauceti-queue-repair@2.service`.
+Their supervisor is outside the workers' killable cgroups. These user services recover process
+and worker-cgroup failures without root; they do not provide startup after a host reboot or loss
+of the user manager. A dedicated host is planned; its availability and hostname remain outstanding.
 
-The user units for the service and the repair worker stay **disabled** while the `nohup` supervisors
-run; check `systemctl --user list-units 'tauceti-queue*'` after any move or install. On 2026-11-05
+The queue service and tunnel units stay **disabled** while their `nohup` supervisors run. The repair
+units are enabled; do not start the old `run-worker*.sh` loops alongside them. Check
+`systemctl --user list-units 'tauceti-queue*'` after any move or install. On 2026-11-05
 `tauceti-queue.service` had been left enabled: it restarted about every 6 s (737 restarts), and each
 attempt seeded the file's `[settings]` into the shared store before failing to bind port 8780, which
 reverted the live `repair_concurrency` from 2 to 1 and left worker 2 refused every claim from 07:04 to
@@ -229,28 +231,28 @@ Paths on chungus, where they differ from the layout table:
 | `~/TauCetiQueue-data/logs` | the service's own files (`log_dir`) |
 | `~/TauCetiQueue-data/run-service.sh`, `service.log` | the service supervisor loop (`uv run tauceti-queue serve`) and the process log, which replaces journald |
 | `~/TauCetiQueue-data/run-tunnel.sh`, `tunnel.log` | the tunnel supervisor loop (`cloudflared tunnel ... run`) and its log |
-| `~/TauCetiQueue-data/repair-clone`, `~/TauCetiQueue-data/repair`, `repair-worker.log` | the repair worker's content clone, task root and log |
+| `~/TauCetiQueue-data/repair-clone`, `~/TauCetiQueue-data/repair`, `~/TauCetiQueue-data/repair-2` | shared repair clone and separate worker checkpoints; current logs are in the two repair units' journals |
 | `~/.local/state/tauceti-queue/backups/` | online backups; daily timer active as of November 6, plus backups before deployments |
 | `127.0.0.1:8780` | the listen address |
 | `~/.cloudflared/cert.pem`, `config.yml`, `<tunnel id>.json` | the Cloudflare origin certificate, tunnel configuration and tunnel credentials, copied from tauchonki |
-| `~/.config/systemd/user/tauceti-queue.service`, `tauceti-queue-repair.service` | installed, disabled while the detached supervisors own the processes |
+| `~/.config/systemd/user/tauceti-queue.service` | disabled while its detached supervisor owns the process |
+| `~/.config/systemd/user/tauceti-queue-repair.service`, `tauceti-queue-repair@.service` | singleton and instance 2 enabled and active; each has its own worker identity and task root |
 | `~/.config/systemd/user/tauceti-queue-backup.{service,timer}` | installed; timer enabled and active as of November 6 |
 
 ### Hosts without lingering
 
-Without lingering (`loginctl enable-linger` needs an administrator) systemd user units die when the
-account's last login session ends, so the three processes run detached under `nohup setsid`, each from
-a login shell on the host. The installers still run with `--no-restart` so the checkout, the
-configuration and the units are in place; the units stay disabled.
+Without lingering, user services are not guaranteed to survive loss of the user manager or start
+after reboot. They still provide normal crash and OOM recovery while the manager runs. Repair
+workers must use those services: putting the worker and a shell restart loop in one login scope
+lets `systemd-oomd` kill both together. `nohup` and a new session ID do not change cgroup ownership.
+The queue and tunnel retain their existing detached deployment path below; do not run their
+installer beneath those supervisors, even with `--no-restart`, because it starts a second owner.
 
 ```sh
 cd ~/TauCetiQueue-data
 nohup setsid ./run-service.sh >/dev/null 2>&1 &      # loops `uv run tauceti-queue serve`; log service.log
 nohup setsid ./run-tunnel.sh >/dev/null 2>&1 &       # loops `cloudflared tunnel ... run`; log tunnel.log
-cd ~/TauCetiQueue && nohup setsid uv run python -m tauceti_queue.repair_task \
-  --service https://queue.taucetiproject.org --worker repair@chungus \
-  --clone ~/TauCetiQueue-data/repair-clone --root ~/TauCetiQueue-data/repair \
-  >~/TauCetiQueue-data/repair-worker.log 2>&1 &
+systemctl --user start tauceti-queue-repair.service tauceti-queue-repair@2.service
 pgrep -af 'run-service.sh|run-tunnel.sh|tauceti-queue serve|cloudflared tunnel|repair_task'
 ```
 
@@ -258,10 +260,10 @@ Consequences:
 
 - **File-descriptor limit.** Detached processes do not get the units' `LimitNOFILE=65536`; they
   inherit the login's limit of 1,024, which a large repair exhausts. The supervisor scripts run
-  `ulimit -n 65536` first; start the repair worker from a shell that has done the same.
+  `ulimit -n 65536` first. Repair services get that limit from their units.
 - **No restart after a reboot.** After a reboot of chungus, or whenever `pgrep` shows a process
-  missing, the operator or an agent starts the three again by hand as above. The repair worker has no
-  loop around it, so a crash leaves it down until restarted.
+  missing, the operator or an agent starts the queue/tunnel loops and repair units as above.
+  Worker process and cgroup kills recover automatically while the user manager remains available.
 - **Backups.** The daily timer is enabled and active; its November 6 run succeeded at 03:19 UTC.
   Without lingering, this does not guarantee recovery after logout or reboot. Run
   `~/TauCetiQueue/services/queue/backup.sh` before any risky change and verify the timer after a
@@ -271,21 +273,21 @@ Consequences:
   its revision into `_revision.py`, and send SIGTERM to the existing service process; the supervisor
   loop restarts it on the new revision with the same graceful shutdown as the unit. Verify as in "Verification after a deploy", reading `service.log` instead
   of `journalctl`.
-- **Keep systemd disabled on this host.** The installer currently enables and starts units even
+- **Keep queue/tunnel ownership singular.** The queue installer enables and starts units even
   with `--no-restart`; do not run it beneath the detached supervisors. Use the deployed
   `deploy-queue.sh` / `deploy-service.sh` scripts, or fast-forward the checkout to a verified
   revision, bake `_revision.py`, and restart the existing supervisors. Confirm the service and
-  repair units remain disabled afterward. The installer is appropriate on the dedicated host
-  once systemd owns those processes.
+  queue/tunnel units remain disabled afterward. Repair units already own their workers, so
+  `install-repair.sh` is appropriate for those units on this host.
 - **Baked revision.** `tauceti_queue/_revision.py` is written by `install.sh` only. After a plain
   `git pull` in `~/TauCetiQueue`, rewrite it by hand before restarting, or the status page reports the
   old revision:
   `printf 'SHA = "%s"\nDIRTY = False\n' "$(git rev-parse HEAD)" > tauceti_queue/_revision.py`.
 - **Repair workers.** The workers share the checkout, so a deploy that changes it needs each worker
-  restarted (a running task is checkpointed and resumed). Restart one worker by killing its
-  supervisor (`run-worker.sh`) and then its child, both by PID. `restart-worker.sh` kills every
-  `repair_task` process, the other worker's included, so it is not used while another worker is busy.
-  `restart-worker-1.sh` restarts worker 1 alone and refuses while worker 1 holds a claim.
+  restarted (a running task is checkpointed and resumed). Use
+  `systemctl --user restart tauceti-queue-repair.service` and, separately,
+  `systemctl --user restart tauceti-queue-repair@2.service`. Do not use the old detached-worker
+  scripts, which no longer own these processes.
   Never put a process pattern (`pkill -f`, `pgrep -f`, or the pattern as any argument) in an ssh
   command line: the pattern matches the ssh session's own shell, which on 2026-11-05 killed the
   operator's shell twice. Use the scripts above, or find the PIDs in a login shell on the host.
@@ -431,6 +433,7 @@ had 0.154.0, which failed this way; 0.166.0 answers normally on the same Pro acc
 git clone https://github.com/TauCetiProject/TauCetiWorker.git ~/TauCetiQueue   # if not already present
 ~/TauCetiQueue/services/queue/install-repair.sh                   # origin/main
 ~/TauCetiQueue/services/queue/install-repair.sh --revision <sha>  # a pinned revision
+~/TauCetiQueue/services/queue/install-repair.sh --instance 2      # another worker
 ```
 
 `install-repair.sh` is idempotent and live. It fast-forwards the checkout, runs `uv sync`, writes
@@ -442,6 +445,12 @@ restarts it, and verifies that the unit is active and that the restarted process
 1 a setup or host-check failure; 2 an inactive or silent unit, and the next step is
 `journalctl --user -u tauceti-queue-repair -n 50`. `--no-restart` installs without interrupting a
 running task. The queue service, its backup timer and the fleet units are not touched.
+
+An instance uses `tauceti-queue-repair@NAME.service` and `repair-environment-NAME`. When that file
+is absent, the installer copies the singleton's provider/cache configuration and supplies a distinct
+worker identity and task root. Both service forms execute the virtual environment's Python directly,
+so `MainPID` matches `worker.json`. `Restart=always`, `OOMPolicy=kill` and disabled start-rate limiting
+keep worker-cgroup kills recoverable without an external restart loop or a new memory cap.
 
 A restart (or `systemctl --user stop`) sends SIGTERM: a running agent is stopped, its claim and
 checkpoint are kept (`tasks/<id>/task.json` in state `interrupted`, the worktree in place), and the
@@ -471,9 +480,14 @@ the status document. Each task's record is `<task root>/tasks/<id>/` (`task.json
 To stop the worker: `systemctl --user stop tauceti-queue-repair` (a running task is interrupted and
 resumed at the next start, as above); to stop it from coming back, `systemctl --user disable --now
 tauceti-queue-repair`. To stop without interrupting a task (finish the current one, claim no more),
-stop it right after `worker.json` reports `idle`. On a host without lingering (Current deployment) the
-worker is a detached process: its log is `~/TauCetiQueue-data/repair-worker.log`, it is stopped with
-`pkill -f tauceti_queue.repair_task` (the same SIGTERM path) and started again by hand.
+stop it right after `worker.json` reports `idle`. For instance 2, use
+`tauceti-queue-repair@2.service` in the same commands. Current repair workers use these units even
+without lingering; the host limitation concerns user-manager loss and reboot startup.
+
+If a head repair task has no live claim for `stall_interval_seconds`, `/status` reports
+`head.stall.kind = "task_unclaimed"`; after two intervals it also raises an alert. The clock starts
+from task creation or the last actual claim end. New admissions cannot reset it. The existing
+monitoring projection publishes the same condition.
 
 ## Public endpoint
 

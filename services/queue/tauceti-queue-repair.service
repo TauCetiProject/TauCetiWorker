@@ -15,6 +15,8 @@ Description=Tau Ceti AI merge queue repair worker
 Documentation=https://github.com/TauCetiProject/TauCetiWorker/blob/main/docs/queue/operations.md
 After=network-online.target
 Wants=network-online.target
+# Memory pressure must remain a recoverable failure, even after repeated kills.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -23,7 +25,7 @@ EnvironmentFile=%h/.config/tauceti-queue/repair-environment
 Environment=PATH=%h/.local/bin:%h/.elan/bin:%h/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
 Environment=UV_NO_SYNC=1
-ExecStart=/usr/bin/env uv run python -m tauceti_queue.repair_task
+ExecStart=%h/TauCetiQueue/.venv/bin/python -m tauceti_queue.repair_task
 # SIGTERM stops a running agent and keeps its claim and checkpoint; the restarted worker renews the
 # claim and resumes the same session. A task past validation finishes its push and submission first.
 KillSignal=SIGTERM
@@ -31,6 +33,9 @@ KillMode=mixed
 TimeoutStopSec=300
 Restart=always
 RestartSec=30
+# Keep the user manager outside this worker's OOM victim group. Kill orphaned build/agent
+# children together with the worker, then recover the task through the ordinary restart path.
+OOMPolicy=kill
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=tauceti-queue-repair
