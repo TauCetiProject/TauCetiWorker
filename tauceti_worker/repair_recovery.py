@@ -59,15 +59,19 @@ CONTINUATION_BLOCKS = {"profile-missing", "unsupported-continuation-provider", "
 
 
 def verification_tools_changed(journal):
-    if not journal.get("failed_source"):
+    if not journal.get("failed_source") or journal.get("state") != "blocked":
         return False
     code = (journal.get("reason") or {}).get("code")
-    if code in PERMANENT_BLOCKS and code not in CONTINUATION_BLOCKS:
+    if code not in CONTINUATION_BLOCKS:
         return False
-    from .verification_tools import identity
+    from .verification import Incomplete
+    from .verification_tools import Unavailable, identity
 
     previous = journal.get("verification_retry_identity", journal.get("failed_tool_identity"))
-    return previous != identity()
+    try:
+        return previous != identity()
+    except (OSError, Unavailable, Incomplete):
+        return False  # An optional scheduling hint must not stop unrelated work.
 
 
 class Wait(Exception):
@@ -236,6 +240,8 @@ class Recovery:
 
     def run(self):
         """One owned invocation; caller holds the worker round lock and record flock."""
+        from .verification_tools import identity as tool_identity
+
         m, b, j = self.manifest, self.backend, self.journal
         if not (self.record / "recovery.json").exists():
             self.transition("retained")
@@ -329,9 +335,7 @@ class Recovery:
                 )
             b.policy(m, facts)
             if changed_tools:
-                from .verification_tools import identity
-
-                self.transition(j["state"], verification_retry_identity=identity(), retry_at=0)
+                self.transition(j["state"], verification_retry_identity=tool_identity(), retry_at=0)
             if (m.get("round_outcome") or {}).get("published_head") not in (None, m.get("expected_remote_head")):
                 raise Obsolete(
                     "post-publication-leftovers",
@@ -359,7 +363,7 @@ class Recovery:
                 j.get("failed_head") == facts["head"]
                 and (j.get("reason") or {}).get("code") != "content-allowance"
                 and j.get("failed_source")
-                and not changed_tools
+                and j.get("failed_tool_identity") == tool_identity()
                 and j.get("failed_recheck_at", 0) > time.time()
                 and (prior_checkout / ".git").exists()
                 and saved.inspect(prior_checkout).fingerprint == j["failed_source"]
@@ -1266,7 +1270,7 @@ class WorkerBackend:
     def check_verification_tools(self, checkout):
         from .verification_tools import check
 
-        check(checkout)
+        check(checkout, required=True)
 
     def continuation_admission(self, record, m, j):
         from .agents import AuthoringProfile

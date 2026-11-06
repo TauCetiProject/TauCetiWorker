@@ -475,6 +475,20 @@ class Fixture(unittest.TestCase):
         with patch.object(rr.Recovery, "run", side_effect=AssertionError("unchanged blocked record retried")):
             self.assertFalse(rr.recover(self.w, self.opts))
 
+    def test_unreadable_tool_identity_does_not_crash_scheduler(self):
+        rr.write(
+            self.record,
+            {},
+            "blocked",
+            failed_source="saved source",
+            reason=dict(code="profile-missing"),
+            retry_at=10**12,
+            probe_at=10**12,
+        )
+        with patch.object(verification_tools, "identity", side_effect=PermissionError("temporarily unreadable")):
+            self.assertFalse(rr.due(self.cfg))
+            self.assertFalse(rr.recover(self.w, self.opts))
+
     def test_tool_change_does_not_reopen_unrelated_permanent_authorization_block(self):
         rr.write(
             self.record,
@@ -494,10 +508,10 @@ class Fixture(unittest.TestCase):
         rr.write(
             self.record,
             {},
-            "eligible",
+            "blocked",
             failed_source="saved source",
             failed_tool_identity="old Tools",
-            reason=dict(code="invocation-failed"),
+            reason=dict(code="profile-missing"),
             retry_at=10**12,
         )
         with patch.object(
@@ -507,6 +521,40 @@ class Fixture(unittest.TestCase):
         self.assertFalse(rr.due(self.cfg))
         with patch.object(self.backend, "check_verification_tools", side_effect=AssertionError("ignored retry time")):
             self.assertFalse(self.run_recovery())
+
+    def test_reopened_check_survives_claim_wait_before_verification(self):
+        FakeVerification.failures = 1
+        with patch.object(self.backend, "continuation_admission", side_effect=rr.Block("profile-missing", "no model")):
+            self.assertFalse(self.run_recovery())
+        j = self.journal()
+        j.pop("failed_tool_identity")
+        rr.write(self.record, j, "blocked", retry_at=10**12)
+        with patch.object(self.backend, "acquire", side_effect=rr.Wait("claim-unavailable", "busy")):
+            self.assertFalse(self.run_recovery())
+        self.retry_now()
+        with patch.object(self.backend, "continuation_admission", side_effect=AssertionError("stale source verdict")):
+            self.assertTrue(self.run_recovery())
+        self.assertEqual(FakeVerification.calls, 2)
+
+    def test_changed_tools_do_not_bypass_metadata_or_infrastructure_retry_times(self):
+        for code, state in [
+            ("pr-held", "blocked"),
+            ("ownership-changed", "blocked"),
+            ("invocation-failed", "eligible"),
+        ]:
+            rr.write(
+                self.record,
+                {},
+                state,
+                failed_source="old source",
+                failed_tool_identity="old Tools",
+                reason=dict(code=code),
+                retry_at=10**12,
+                probe_at=10**12,
+            )
+            self.assertFalse(rr.due(self.cfg), code)
+            with patch.object(rr.Recovery, "run", side_effect=AssertionError("ignored external wait")):
+                self.assertFalse(rr.recover(self.w, self.opts), code)
 
     def test_verified_provider_outage_refunds_content_but_counts_infrastructure(self):
         FakeVerification.failures = 1

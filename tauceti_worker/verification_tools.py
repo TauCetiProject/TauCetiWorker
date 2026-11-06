@@ -11,19 +11,30 @@ from pathlib import Path
 
 
 class Unavailable(RuntimeError):
-    pass
+    def __init__(self, message, *, reason="tool-missing"):
+        super().__init__(message)
+        self.reason = reason
 
 
 def root():
-    import tauceti_tools
+    try:
+        import tauceti_tools
 
-    return Path(tauceti_tools.__file__).parent
+        directory = Path(tauceti_tools.__file__).parent
+        if not (directory / "templates.py").is_file():
+            raise ImportError("installed tauceti_tools.templates is absent")
+        return directory
+    except (ImportError, TypeError) as error:
+        raise Unavailable(f"installed verification Tools unavailable: {error}") from error
 
 
 def files():
     from .verification import files_under
 
-    return list(files_under(root()))
+    try:
+        return list(files_under(root()))
+    except Unavailable:
+        return []  # Readiness changes when the installation becomes available again.
 
 
 def configuration():
@@ -36,18 +47,26 @@ def identity():
     from .paths import HERE
     from .verification import stamps
 
-    paths = [Path(sys.executable), *Path(__file__).parent.glob("verification*.py"), *files()]
-    paths += [Path(__file__).with_name("repair_recovery.py"), HERE / "scripts/tauceti-verify"]
+    paths = {"python": Path(sys.executable).resolve(), "wrapper": HERE / "scripts/tauceti-verify"}
+    paths.update({"verifier/" + p.name: p for p in Path(__file__).parent.glob("verification*.py")})
+    try:
+        directory = root()
+        paths.update({"tools/" + str(p.relative_to(directory)): p for p in files()})
+    except Unavailable:
+        pass
     if config := configuration():
-        paths.append(config)
-    return _identity(tuple(sorted(stamps(paths).items())))
+        paths["configuration"] = config
+    current = stamps(paths.values())
+    return _identity(tuple((name, str(path), current[str(path)]) for name, path in sorted(paths.items())))
 
 
 @lru_cache(maxsize=1)
 def _identity(entries):
     from .verification import digest, file_record
 
-    return digest({path: file_record(Path(path)) for path, _ in entries})
+    # Paths/stat keys invalidate this process-local memo; only logical names and bytes
+    # enter the durable identity. Identical runtime/snapshot copies are equivalent.
+    return digest({name: file_record(Path(path)) for name, path, _ in entries})
 
 
 def needs_tools(checkout):
@@ -65,19 +84,18 @@ def needs_tools(checkout):
     )
 
 
-def check(checkout, *, env=None):
-    """Probe the wrapper's real child environment, including Bubble's mounted Tools."""
+def check(checkout, *, env=None, required=False):
+    """Probe installed tooling with the inherited environment, not candidate imports."""
     from . import processes
 
-    if not needs_tools(checkout):
+    if not required and not needs_tools(checkout):
         return
     try:
         result = processes.run(
             [
                 sys.executable,
                 "-c",
-                "import sys; sys.path[0] = sys.argv[1]; import tauceti_tools.templates",
-                str((Path(checkout) / "scripts").absolute()),
+                "import sys; del sys.path[0]; import tauceti_tools.templates",
             ],
             cwd=checkout,
             env=env,
@@ -87,7 +105,10 @@ def check(checkout, *, env=None):
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise Unavailable(f"verification Python tooling unavailable: {error}") from error
+        raise Unavailable(f"verification Python tooling probe deferred: {error}", reason="verification-busy") from error
     if result.returncode:
         detail = (result.stderr or result.stdout).strip()[-2000:]
-        raise Unavailable(f"verification Python tooling unavailable with {sys.executable}: {detail}")
+        raise Unavailable(
+            f"verification Python tooling unavailable with {sys.executable}: {detail}",
+            reason="verification-busy" if result.returncode < 0 else "tool-missing",
+        )
