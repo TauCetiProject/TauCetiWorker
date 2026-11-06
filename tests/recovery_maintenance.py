@@ -872,6 +872,33 @@ print(json.dumps(dict(owner=owner, child=child)), flush=True)
         saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
         self.restored(saved, expected)
 
+    def test_expired_owned_retained_tree_needs_no_git_salvage(self):
+        self.dirty()
+        tree = self.retained()
+        shutil.rmtree(tree / ".git")
+        job = maintenance._job_path(self.cfg.state, tree)
+        maintenance._write_job(
+            job, dict(tree=str(tree), phase="save", created_at=time.time() - maintenance.RECOVERY_RECORD_TTL - 1)
+        )
+        with patch.object(wr, "inspect", side_effect=AssertionError("abandoned task must not need salvage")):
+            self.tick()
+        self.assertFalse(tree.exists())
+        owner = maintenance._metadata(tree.with_name(tree.name + ".owner.json"))
+        self.assertEqual(owner["abandonment_reason"], "recovery-lifetime-exhausted")
+        self.assertFalse(job.exists())
+
+    def test_expired_retained_tree_still_waits_for_owner_evidence(self):
+        self.dirty()
+        tree = self.retained()
+        tree.with_name(tree.name + ".owner.json").unlink()
+        job = maintenance._job_path(self.cfg.state, tree)
+        maintenance._write_job(
+            job, dict(tree=str(tree), phase="save", created_at=time.time() - maintenance.RECOVERY_RECORD_TTL - 1)
+        )
+        self.tick()
+        self.assertTrue(tree.exists())
+        self.assertEqual(maintenance._read_job(job)["next_action"], "await-owner")
+
     def test_parked_candidates_do_not_repeat_source_analysis(self):
         self.dirty()
         (self.co / ".env").write_text("fixture secret")
