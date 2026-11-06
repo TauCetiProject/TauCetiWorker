@@ -233,8 +233,9 @@ class TaskObservations:
     def __init__(self):
         self.cache = {}
 
-    def observe(self, roots, tasks):
+    def observe(self, roots, tasks, *, claims=(), observed_at=None):
         result = {}
+        observed_at = time.time() if observed_at is None else observed_at
         for task in sorted(tasks, key=lambda t: (t["state"] != "open", -t["id"]))[:100]:
             candidates = []
             for root in roots:
@@ -298,12 +299,26 @@ class TaskObservations:
                                 "coverage": "recorded_subtotal_only",
                             },
                         }
-                        self.cache[key] = (fingerprint, observation)
-                    candidates.append(self.cache[key][1])
+                        self.cache[key] = (fingerprint, observation, (raw.get("task") or {}).get("claim_token"))
+                    candidates.append(self.cache[key][1:])
                 except (OSError, ValueError, TypeError, AttributeError):
                     continue
             if candidates:
-                result[task["id"]] = max(candidates, key=lambda v: v["observed_at"] or "")
+                # Parallel workers may release one attempt while another still
+                # holds this task. Tokens bind checkpoints to the current lease
+                # locally; only the sanitized observation leaves the exporter.
+                live_tokens = (
+                    {
+                        claim["token"]
+                        for claim in claims
+                        if claim.get("task_id") == task["id"] and claim.get("expires_at", 0) > observed_at
+                    }
+                    if task["state"] == "open"
+                    else set()
+                )
+                result[task["id"]] = max(
+                    candidates, key=lambda item: (item[1] in live_tokens, item[0]["observed_at"] or "")
+                )[0]
         if len(self.cache) > 1000:
             self.cache = dict(list(self.cache.items())[-500:])
         return result
@@ -360,7 +375,7 @@ def project(
             (LIMIT + 1,),
         )
         claims = rows(
-            "SELECT batch_id,task_id,operation,worker,created_at,expires_at FROM claims "
+            "SELECT batch_id,task_id,operation,worker,created_at,expires_at,token FROM claims "
             "WHERE released_at IS NULL ORDER BY id DESC LIMIT 1001"
         )
         events = rows("SELECT id,at,kind,batch_id FROM journal ORDER BY id DESC LIMIT 3001")
@@ -414,7 +429,9 @@ def project(
     input_map = {r["id"]: r for r in inputs}
     batch_map = {r["id"]: r for r in batches}
     task_progress = (
-        task_observations.observe(worker_roots, [t for t in tasks if t["batch_id"] in batch_map])
+        task_observations.observe(
+            worker_roots, [t for t in tasks if t["batch_id"] in batch_map], claims=claims, observed_at=captured
+        )
         if task_observations
         else {}
     )
