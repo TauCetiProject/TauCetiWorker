@@ -2092,6 +2092,10 @@ class NoRepair(ControllerCase):
             lambda task: {f"{PROJECT}#102": Resolution(empty=True, explanation="Emptied; it would not build.")},
         )
         self.assertTrue(agent.run(self.controller).accepted)
+        reductions = self.controller.store.rows("journal", {"kind": "member-reduced-to-empty"})
+        self.assertEqual(len(reductions), 1)
+        reduced = loads(reductions[0]["detail"])
+        self.assertTrue(self.controller._commit_empty(reduced["commit"]))
         self.assertEqual({m.number: m.no_repair for m in agent.tasks[0].members}, {101: False, 102: True})
         record = loads(self.controller.input_for(PROJECT, 102)["anticipated"])
         self.assertEqual((record["stage"], record["interacting"]), ("unattributed", None))

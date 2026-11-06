@@ -27,7 +27,7 @@ COLUMNS = {
     "tasks": "id kind batch_id state created_at resolved_at resolution ci_attempt_id claims submissions",
     "claims": "id batch_id operation task_id created_at released_at release_reason",
     "members": "id batch_id input_id number accepted_head position commit_sha provenance task_id added_at removed withdrawn no_repair",
-    "inputs": "id number head_sha approved_at state reason batch_id landed_at passes_waited probes no_repair",
+    "inputs": "id repository number head_sha approved_at state reason batch_id landed_at passes_waited probes no_repair",
 }
 JOURNAL_KINDS = {
     "landed",

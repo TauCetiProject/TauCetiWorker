@@ -1586,6 +1586,15 @@ class Controller:
                         provenance="edited", task_id=task["id"], explanation=explanation, edited_shas=dumps(edited)
                     )
                     if record is not None and record.empty:
+                        if not chain.landed_commit(landed, member["source_pr"]):
+                            self.store.journal(
+                                now,
+                                "member-reduced-to-empty",
+                                batch["id"],
+                                member_id=member["id"],
+                                task_id=task["id"],
+                                commit=new_sha,
+                            )
                         if (
                             member["no_repair"]
                             and not member["withdrawn"]
@@ -3807,6 +3816,15 @@ class Controller:
                         edited_shas=dumps(loads(member["edited_shas"], []) + [sha]),
                     )
                 self.store.update("members", {"id": member["id"]}, **values)
+                if edit and self._commit_empty(sha) and not chain.landed_commit(landed, member["source_pr"]):
+                    self.store.journal(
+                        now,
+                        "member-reduced-to-empty",
+                        head["id"],
+                        member_id=member["id"],
+                        task_id=edit.get("task_id"),
+                        commit=sha,
+                    )
                 if (
                     edit
                     and member["no_repair"]
