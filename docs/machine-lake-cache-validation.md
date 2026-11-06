@@ -1,7 +1,8 @@
 # Native Lake cache implementation validation
 
-Evidence recorded on tauchonki on 6 November 2026. Deployment is in progress;
-the final fleet-wide accounting and completion check remain open.
+Evidence recorded on tauchonki on 6 November 2026. The implementation and live
+rollout are verified across all 40 enabled workers. The broader retained-data
+accounting scan is still running.
 
 ## Delivered changes
 
@@ -35,26 +36,30 @@ libraries and therefore shares the release's native namespace.
 | Warm existing outputs without bulk migration | A real up-to-date private build seeds and joins the native store; production workers populate it through ordinary work. Existing multiply linked private aliases remain for ordinary cleanup. |
 | No new retention or admission policy | Both new age/size settings are unset in production. Tests cover unset, independent age/size, zero, invalid, dry-run and pinned-data cases. No new worker-count or admission limit is introduced. |
 | Optional collection stays off paid startup/status paths | Existing background cleanup entry point performs inventory and selective collection. Detection shares the existing cache-preparation deadline. |
-| Collection races do not become work failures | Controlled native disappearance tests plus eight native builds with the real Worker collector running concurrently (530 passes, 17 names removed, no errors). The zero-size target was confined to disposable test roots. |
+| Collection races do not become work failures | Controlled native disappearance tests plus eight native builds with the corrected Worker collector running concurrently (370 passes, 17 names removed, no errors). The zero-size target was confined to disposable test roots. |
 | Abandoned temporary files do not accumulate by default | Dead-owner staging is removed even with retention settings unset; live and malformed owners remain untouched. |
+| Removing staging aliases preserves accounting and complete winners | Three regressions cover a killed publisher's remaining staging link, a staging name whose only other alias is outside the managed store, and the retained-size calculation after alias removal. All fail against the preceding collector and pass with the fix. Removing an extra name does not report its still-linked payload as reclaimed blocks. |
 | Clearing the disposable root needs no manual repair | Recognized native layout is adopted after recreation; unknown/foreign layouts remain untouched. |
 | Isolation and source preservation | Verification and recovery warming select their existing private path; Bubble strips the opt-in; trusted Mathlib publication remains separate. Recovery source/Git data is outside this collector. Snapshot copying does not certify CI provenance. |
 | Private fallback and rollback | Real native private-rollback/old-child tests and router missing/broken/changed-registration tests pass. Rollback does not delete shared data. |
-| Live rollout preserves useful work | Both manager replacements preserved all 40 independent worker scopes. Only idle/backoff boundaries with no round children permit worker restarts. Ongoing paid rounds are left running. |
+| Live rollout preserves useful work | All manager handovers preserved the 40 independent worker scopes. All 40 enabled workers now run the cache integration; a separate process audit found exactly 40 loops, no duplicate or unexpected IDs, matching configurations, and the original state-lock inodes still open. Worker replacements used idle/backoff boundaries with no round children. |
 
 Both native branches pass the 20 real shared-cache regressions and standalone
 Lake builds. The upstream [Linux CI run](https://github.com/leanprover/lean4/actions/runs/42169213507)
 passed its full build/test suite, including 4,831 tests. The Worker integration's
 functional [CI run](https://github.com/TauCetiProject/TauCetiWorker/actions/runs/42160999154)
 passed. The final extensionless-executable cleanup change adds a regression,
-passes all 26 machine-cache tests locally, and passes the complete
+passes the complete
 [Worker CI run](https://github.com/TauCetiProject/TauCetiWorker/actions/runs/42167078533).
+The staging-alias accounting fix brings the machine-cache suite to 29 passing
+tests; the 62 retention tests pass too. The final fix passes the complete
+[Worker CI run](https://github.com/TauCetiProject/TauCetiWorker/actions/runs/42175130857).
 The additional native race tests pass both locally and in that upstream run.
 They do not change the installed native executable. Documentation revision
 `30d733e` also passes the complete
 [Worker CI run](https://github.com/TauCetiProject/TauCetiWorker/actions/runs/42169322712),
 and the production pin passes
-[Fleet PR CI](https://github.com/TauCetiProject/TauCetiFleet/actions/runs/42167638777).
+[Fleet PR CI](https://github.com/TauCetiProject/TauCetiFleet/actions/runs/42175762332).
 
 Focused Worker validation also covers retention, expanded caches, host warming,
 Mathlib, verification, recovery and native filesystem behavior. A local full
@@ -94,10 +99,10 @@ Sampling real worker checkouts found ten shared module artifacts after checking
 in workers 9, 17 and 25 and the store. These observations demonstrate actual
 cross-worker reuse; they do not establish host-wide physical savings.
 
-The latest native-store inventory reported 23,486,054,400 allocated bytes, of
-which 23,314,382,848 bytes had additional links. Both retention targets were
-unset and no collection errors were recorded. The dry run found 38 abandoned
-staging files eligible for removal; it did not remove completed artifacts. The store
+The corrected live collector reported 24,772,435,968 retained allocated bytes, of
+which 24,133,988,352 bytes had additional links. Both retention targets were
+unset and no collection errors were recorded. It removed four abandoned
+temporary names and reported zero estimated payload blocks reclaimed. The store
 is growing as more workers adopt it. These are inode-deduplicated inventory estimates, not newly
 allocated bytes or bytes saved. XFS reflinks, existing CI aliases and concurrent
 writes prevent those interpretations.
@@ -113,6 +118,18 @@ It overlaps the new native store where workspace aliases refer to native payload
 The sweep completed successfully with no errors; it did not discard unfinished
 source. Its observed RAM usage reached 4.8 GB, so repeating this broad legacy
 sweep during host memory pressure is inappropriate.
+
+One retained Mathlib checkout still contains a `build-before-sharing` tree with
+7,218,102,272 allocated bytes alongside 5,826,269,184 bytes in its current build
+tree. This is one concrete example, not an estimate for every retained checkout.
+The visible allocation estimate for that `.lake` subtree is 13,044,375,552 bytes;
+kernel-owned overlay work areas could not be traversed with the available
+account. Reflink sharing can also make the physical cost smaller than these
+inode-based estimates. Existing retained build trees are outside the new native
+collector, and their source-preservation rules remain in force.
+Excluding `.lake`, the same Mathlib checkout has 172,437,504 allocated bytes,
+including 45,948,928 bytes of Git data. Source/Git sharing and removal of retained
+build generations remain separate from native artifact-cache selection.
 
 A separate scan measured 118,520,356,864 allocated bytes under `/tmp`, including
 98,777,571,328 bytes in 184 `tauceti-review-*` scratch directories. Another
@@ -137,9 +154,13 @@ validation. Configuration still has workers enabled, `draining = false`, and
 
 ## Remaining validation
 
-Finish the boundary rollout across the 40 enabled science workers and observe
-useful completions. The 16 configured subscription slots are explicitly stopped
-and remain stopped. No account or worker-count changes are part of this rollout.
+The boundary rollout is complete across the 40 enabled science workers. The
+manager and background collector now use worker revision `cbf2b2da4c2359603bb69eea4064e670c4213cee`;
+existing worker loops retain compatible earlier revisions with identical
+per-round cache integration. All 40 scopes survived the final manager handover,
+and dependency versions match the previous production runtime. The 16 configured
+subscription slots remain explicitly stopped. Host and worker configuration
+hashes are unchanged by the rollout.
 
 Record final cache inventory, host allocated blocks/inodes, remaining private and
 retained-workspace storage, and representative preparation/download/build
