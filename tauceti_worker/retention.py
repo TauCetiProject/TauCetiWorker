@@ -679,6 +679,28 @@ def pressure_cleanup():
         log(f"retention: disk-pressure cleanup deferred: {error}")
 
 
+def free_bytes(path):
+    while not path.exists():
+        path = path.parent
+    return shutil.disk_usage(path).free
+
+
+def pending_work(base):
+    """Prepared counts and immediate queue entries, never materialized-tree walks."""
+    from .recovery_maintenance import cached_summary
+
+    result = dict(recovery_backlog=cached_summary(base)["cleanup_backlog"], discarded_trees=0, verification_jobs=0)
+    for state in base.iterdir() if base.is_dir() else ():
+        if state.is_symlink() or not state.is_dir():
+            continue
+        for member in (state, state / "verification-state"):
+            result["discarded_trees"] += sum(
+                path.is_dir() and not path.is_symlink() for path in (member / "recovery-cleanup/discarded").glob("*")
+            )
+            result["verification_jobs"] += sum(1 for _ in (member / "verification-pending").glob("*.json"))
+    return result
+
+
 def drain_pending(reports, *, once=False):
     """Round-robin existing deletion slices without repeating expensive inventories."""
     from . import recovery_maintenance, verification_storage
@@ -749,9 +771,13 @@ def run(*, dry=False, diagnostics_only=False):
 
     pin_root()
     with locked(root() / "cleanup.lock", dry=dry):
+        before = free_bytes(worker_state_root())
         report = sweep(dry=dry, diagnostics_only=diagnostics_only)
+        report["free_before_bytes"] = before
         if not dry and not diagnostics_only:
             drain_pending([(legacy_data_root(HERE), report)])
+            report["pending_work"] = pending_work(worker_state_root())
+            report["free_bytes"] = free_bytes(worker_state_root())
             atomic_json(root() / "cleanup.json", report)
         return report
 
@@ -849,6 +875,7 @@ def run_all(*, dry=False):
     previous = os.environ.get("TAUCETI_LEGACY_DATA_ROOT")
     report = fresh_report()
     report["roots"] = []
+    report["free_before_bytes"] = free_bytes(worker_state_root())
     with locked(root() / "cleanup.lock", dry=dry):
         try:
             paths = data_roots()
@@ -856,7 +883,7 @@ def run_all(*, dry=False):
             for path in paths:
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
                 configs.extend(worker_configs())
-            initial = {path: {} for path in paths}
+            initial = {path: dict(free_before_bytes=free_bytes(path)) for path in paths}
             if not dry:
                 # Exact queued disposal must not wait behind shared-cache inventory.
                 drain_pending(list(initial.items()), once=True)
@@ -867,19 +894,26 @@ def run_all(*, dry=False):
                 except Exception as error:
                     result = fresh_report()
                     note(result, "errors", str(error))
+                result["free_before_bytes"] = initial[path]["free_before_bytes"]
                 if "drain" in initial[path]:
                     result["drain"] = initial[path]["drain"]
                 report["roots"].append(dict(path=str(path), **result))
             if not dry:
                 drain_pending([(Path(result["path"]), result) for result in report["roots"]])
             for result in report["roots"]:
+                base = Path(result["path"]) / "state"
+                try:
+                    result["pending_work"] = pending_work(base)
+                    result["free_bytes"] = free_bytes(base)
+                except (OSError, ValueError, TypeError) as error:
+                    note(result, "errors", f"pending-work report: {error}")
                 merge_report(report, result)
         finally:
             if previous is None:
                 os.environ.pop("TAUCETI_LEGACY_DATA_ROOT", None)
             else:
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = previous
-        report["free_bytes"] = shutil.disk_usage(Config.resolve().home).free
+        report["free_bytes"] = free_bytes(worker_state_root())
         if not dry:
             atomic_json(root() / "cleanup.json", report)
     return report
