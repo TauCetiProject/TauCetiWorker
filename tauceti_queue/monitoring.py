@@ -34,6 +34,9 @@ LIMIT = 20_000
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 MAX_BYTES = 2_000_000
+# Private worker checkpoints include member context and prompts. They may be
+# larger than a public frame; the projection below still emits only its allowlist.
+TASK_CHECKPOINT_BYTES = 16_000_000
 
 
 def iso(value):
@@ -249,7 +252,7 @@ class TaskObservations:
                     )
                     key = str(directory)
                     if self.cache.get(key, (None,))[0] != fingerprint:
-                        raw = json_read(checkpoint)
+                        raw = json_read(checkpoint, limit=TASK_CHECKPOINT_BYTES)
                         final = json_read(outcome) if outcome.exists() else (raw.get("outcome") or {})
                         # The task itself carries a claim token. Never copy it.
                         if str((raw.get("task") or {}).get("task_id")) != str(task["id"]):

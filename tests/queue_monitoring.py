@@ -315,6 +315,39 @@ class ParallelTaskObservations(unittest.TestCase):
             self.assertEqual(observer.observe(roots, tasks, claims=claims, observed_at=130)[19]["state"], "released")
 
 
+class LargeTaskCheckpoint(unittest.TestCase):
+    def test_large_private_context_does_not_erase_bounded_public_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task_dir = root / "tasks/21"
+            task_dir.mkdir(parents=True)
+            checkpoint = task_dir / "task.json"
+            private = "PRIVATE_CONTEXT_DO_NOT_PUBLISH" * 120000
+            checkpoint.write_text(
+                json.dumps(
+                    {
+                        "task": {"task_id": "21", "claim_token": "PRIVATE_CLAIM"},
+                        "state": "sources_ready",
+                        "updated_at": 100,
+                        "prompt": private,
+                    }
+                )
+            )
+            self.assertGreater(checkpoint.stat().st_size, monitoring.MAX_BYTES)
+            with self.assertRaises(ValueError):
+                monitoring.json_read(checkpoint)  # Public/default readers retain their existing cap.
+            observer = monitoring.TaskObservations()
+            value = observer.observe([root], [{"id": 21, "state": "open"}], observed_at=110)
+            self.assertEqual(value[21]["state"], "sources_ready")
+            wire = json.dumps(value)
+            self.assertNotIn("PRIVATE", wire)
+            self.assertLess(len(wire), 4096)
+            # A corrupt or excessive local input is still bounded and cannot
+            # stop the queue task; only this observer returns unavailable.
+            with patch.object(monitoring, "TASK_CHECKPOINT_BYTES", 1024):
+                self.assertEqual(monitoring.TaskObservations().observe([root], [{"id": 21, "state": "open"}]), {})
+
+
 class PublisherCadence(unittest.TestCase):
     def test_upload_duration_is_included_without_execution_deadlines_or_hot_retries(self):
         for duration, failed, expected_wait in [(7, False, 3), (21, False, 1), (21, True, 20)]:
