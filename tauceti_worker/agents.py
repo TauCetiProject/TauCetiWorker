@@ -883,6 +883,10 @@ def host_agent_argv(
         if profile.effort:
             argv += ["--effort", profile.effort]
         argv += ["--dangerously-skip-permissions"]
+        if shell_env := env.get("TAUCETI_REPAIR_CLAUDE_ENV_FILE"):
+            # Queue-owned startup configuration must beat project/user env settings.
+            # Explicit command redirections still override this default Bash stdin.
+            argv += ["--settings", json.dumps({"env": {"CLAUDE_ENV_FILE": shell_env}})]
     return argv, env
 
 

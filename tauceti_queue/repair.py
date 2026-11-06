@@ -37,6 +37,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -2000,6 +2001,24 @@ def prepare_codex_home(root: Path) -> Path:
     return iso
 
 
+def prepare_claude_shell_env(config: Path) -> Path:
+    """Keep unattended Bash stdin at EOF, including commands with heredocs.
+
+    Claude's native guard misses compound commands: anthropics/claude-code#84424.
+    The CLI re-reads this file after cwd changes, so keep it in persistent config,
+    and replace atomically because parallel repair agents share that config.
+    """
+    path = config.resolve() / "bash-env.sh"
+    fd, name = tempfile.mkstemp(prefix=".bash-env-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write("exec </dev/null\n")
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+    return path
+
+
 def isolation_env(
     root: Path, env_lake: dict | None = None, provider: str = "claude", *, api_key: str | None = None
 ) -> dict:
@@ -2025,6 +2044,10 @@ def isolation_env(
             changes["CODEX_HOME"] = str(prepare_codex_home(root))
         else:
             changes["CLAUDE_CONFIG_DIR"] = str(prepare_claude_config(root))
+    if provider != "codex":
+        # The host launcher supplies this through --settings, above project/user
+        # settings and inherited CLAUDE_ENV_FILE; this private queue config owns it.
+        changes["TAUCETI_REPAIR_CLAUDE_ENV_FILE"] = str(prepare_claude_shell_env(Path(changes["CLAUDE_CONFIG_DIR"])))
     changes["GH_TOKEN"] = None
     changes["GITHUB_TOKEN"] = None
     empty_gh = root / "gh-config-empty"
@@ -2046,13 +2069,10 @@ def agent_environment(
     None because the prompt is in argv."""
     os.environ["TAUCETI_ROUND_DEADLINE"] = str(time.time() + deadline_seconds)
     from tauceti_worker.agents import host_agent_launch
+    from tauceti_worker.repair_recovery import environment
 
-    argv, env, stdin_text = host_agent_launch(prompt, claude_profile())
-    for key, value in isolation_env(root, env_lake).items():
-        if value is None:
-            env.pop(key, None)
-        else:
-            env[key] = value
+    with environment(**isolation_env(root, env_lake)):
+        argv, env, stdin_text = host_agent_launch(prompt, claude_profile())
     return argv, env, stdin_text
 
 

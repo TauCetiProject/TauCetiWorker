@@ -341,6 +341,18 @@ stops it, and `--check` reports the cached verification's age. The worker runs
 on the service host today; it only needs the service URL, so it can run on any host meeting the
 requirements below (the service's `repair_concurrency` setting bounds how many hold a task at once).
 
+Queue repair sessions using Claude (subscription or API) give Bash EOF on its default stdin.
+The worker atomically writes `bash-env.sh` beside its persistent private Claude config and selects
+it with the CLI's session `--settings` override. This intentionally overrides inherited, user and
+project `CLAUDE_ENV_FILE` settings for these repair sessions, without editing those settings files.
+Explicit input redirections, pipelines and heredocs still supply input normally. This works around
+[Claude's compound-command stdin bug](https://github.com/anthropics/claude-code/issues/84424), where
+a diagnostic filter without a filename could otherwise wait until the shell timeout. Codex and
+other worker sessions keep their existing configuration. To run the native regression without
+inference or credentials, use `TAUCETI_TEST_CLAUDE=claude uv run python tests/queue_claude_stdin.py`;
+it drives the production repair launcher against a scripted local API, including cwd changes,
+conflicting settings and a resumed session.
+
 The service resolves each worker's bearer token through `GET /user`, which spends the token owner's
 user quota, shared with any other tooling on that account. What GitHub answered is kept in the
 store's `identity_cache` table (the SHA-256 fingerprint of the token, never the token, with the login
