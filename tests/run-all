@@ -295,6 +295,8 @@ run_one() {
   export TAUCETI_FLEET_EVENTS="$d/activity/worker-events.jsonl"
   export TAUCETI_SHARED_MATHLIB_ROOT="$d/activity/mathlib-builds"
   export TAUCETI_BUILD_CACHE_ROOT="$d/activity/builds"
+  export TAUCETI_MACHINE_LAKE_CACHE_ROOT="$d/activity/native-lake"
+  export TAUCETI_MACHINE_LAKE_RUNTIME_ROOT="$d/activity/native-lake-runtime"
   export TAUCETI_VERIFY_STORAGE_DIR="$d/activity/verification-storage"
   start=$SECONDS
   case "$t" in
