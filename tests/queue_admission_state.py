@@ -70,6 +70,53 @@ class AdmissionStateTests(unittest.TestCase):
             self.state.complete(row, "v1", "review", "waiting")
         self.assertEqual(self.state.summary()["pending"], 0)
 
+    def test_shared_deadline_avoids_retrying_every_waiter_and_survives_restart(self):
+        for number in range(1, 5):
+            self.state.observe(number, "head", "v1")
+        self.state.defer(self.state.get(1), self.now + 10, "paced", "core:background")
+        self.state.defer(self.state.get(2), self.now + 10, "paced", "graphql:background")
+        self.state.defer(self.state.get(3), self.now + 10, "git unavailable")
+        self.state.defer(self.state.get(4), self.now + 20, "next core read", "core:background")
+        self.now += 10
+        self.assertEqual([r["number"] for r in self.state.due()], [2, 3])
+        pending = {r["number"]: r for r in self.state.summary()["pending_prs"]}
+        self.assertEqual(pending[1]["next_attempt_at"], self.now + 10)
+        self.assertEqual(self.state.get(1)["attempted_at"], 0, "a peer's wait is not another PR attempt")
+        self.store.close()
+        self.store = Store(self.path)
+        self.state = AdmissionState(self.store, "o/r", clock=lambda: self.now)
+        self.assertEqual([r["number"] for r in self.state.due()], [2, 3])
+
+    def test_new_source_and_urgent_revocations_do_not_inherit_background_waits(self):
+        for number in range(1, 4):
+            self.state.observe(number, "head", "v1")
+            self.state.defer(self.state.get(number), self.now + 10, "paced", "core:background")
+        self.store.insert("inputs", repository="o/r", number=2, head_sha="head", state="waiting", approved_at=self.now)
+        self.state.dirty(2, urgent=True)
+        self.state.defer(self.state.get(2), self.now + 10, "paced", "core:background")
+        self.state.defer(self.state.get(3), self.now + 20, "next core read", "core:background")
+        self.now += 10
+        self.assertEqual([r["number"] for r in self.state.due()], [2])
+        self.state.dirty(1)
+        self.assertEqual(self.state.get(1)["retry_resource"], "")
+        self.assertEqual([r["number"] for r in self.state.due()], [2, 1])
+
+    def test_urgent_revocations_still_obey_actual_server_deadlines_after_restart(self):
+        for number, resource in enumerate(("core", "graphql", "secondary"), start=1):
+            self.state.observe(number, "head", "v1", urgent=True)
+            self.store.insert(
+                "inputs", repository="o/r", number=number, head_sha="head", state="waiting", approved_at=self.now
+            )
+            self.state.defer(self.state.get(number), self.now + 10, "server deadline", resource)
+            self.state.observe(number + 10, "head", "v1")
+            self.state.defer(self.state.get(number + 10), self.now + 20, "new server deadline", resource)
+        self.now += 10
+        self.assertEqual(self.state.due(), [])
+        self.store.close()
+        self.store = Store(self.path)
+        self.state = AdmissionState(self.store, "o/r", clock=lambda: self.now)
+        self.assertEqual(self.state.due(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -626,6 +626,12 @@ other runnable work proceeds. Resident pagination buffers retain pages already r
 wait. After a process restart the database still owns pending work and deadlines, and source
 reconciliation restores observations. There are no admission workflow reruns or cache handoffs.
 
+PRs waiting for the same API resource share its observed deadline in the existing database.
+Advancing that deadline does not create another attempt or write for every waiting PR. Source
+failures remain local to their PR, and urgent revocations can bypass background pacing while still
+respecting actual server cooldowns. Startup restores these waits into the shared client, including
+for newly observed PRs. Expected resource waits count as `deferred`, rather than poll errors.
+
 Background reads are paced across each resource's remaining window, using REST requests and
 reported GraphQL point costs separately. Queue/CI calls, queued-review revocations and final
 head/CI fences receive priority. Source preparation resumes at the next eligible read without

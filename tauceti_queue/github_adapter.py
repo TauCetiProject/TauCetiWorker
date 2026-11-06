@@ -232,6 +232,18 @@ class GitHubClient:
 
     # -- bookkeeping
 
+    def restore_deadlines(self, deadlines: dict[str, float]) -> None:
+        """Retain observed resource waits across restart, including for newly dirty PRs."""
+        with self._lock:
+            for resource, deadline in deadlines.items():
+                if not isinstance(deadline, int | float) or deadline <= self._clock():
+                    continue
+                if resource.endswith(":background"):
+                    target, key = self._background_at, resource.removesuffix(":background")
+                else:
+                    target, key = self._blocked_until, resource
+                target[key] = max(target.get(key, 0), deadline)
+
     def stats(self) -> dict:
         with self._lock:
             return {

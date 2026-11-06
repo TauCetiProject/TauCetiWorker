@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
-from .store import Store
+from .store import Store, dumps
 
 
 class AdmissionState:
@@ -13,6 +13,7 @@ class AdmissionState:
         self.store = store
         self.repository = repository
         self.clock = clock
+        self.resource_key = f"state:admission_resources:{repository}"
 
     def get(self, number: int) -> dict | None:
         return self.store.row("admission_work", {"repository": self.repository, "number": number})
@@ -56,14 +57,31 @@ class AdmissionState:
             urgent=int(urgent or row["urgent"]),
             first_pending_at=row["first_pending_at"] if pending else self.clock(),
             next_attempt_at=0,
+            retry_resource="",
         )
+
+    def _pending_query(self, columns="a.*"):
+        # A shared resource wait is one deadline, not a new failed attempt for every PR.
+        # Urgent revocations use essential priority and may bypass background pacing.
+        ready = (
+            "CASE WHEN a.urgent=1 AND a.retry_resource LIKE '%:background' "
+            "AND EXISTS(SELECT 1 FROM inputs i WHERE i.repository=a.repository "
+            "AND i.number=a.number AND i.state IN ('waiting','reserved')) THEN a.next_attempt_at "
+            "ELSE MAX(a.next_attempt_at,COALESCE(d.value,0)) END"
+        )
+        query = (
+            f"SELECT {columns}, {ready} AS ready_at FROM admission_work a "
+            "LEFT JOIN json_each(?) d ON d.key=a.retry_resource "
+            "WHERE a.repository=? AND a.generation!=a.evaluated_generation "
+        )
+        return query, (dumps(self.store.get_setting(self.resource_key, {})), self.repository)
 
     def due(self) -> list[dict]:
         """A finite current generation; no PR-count ceiling and no lifetime retry limit."""
+        query, params = self._pending_query()
         return self.store.query(
-            "SELECT * FROM admission_work WHERE repository=? AND generation!=evaluated_generation "
-            "AND next_attempt_at<=? ORDER BY urgent DESC, attempted_at, first_pending_at, id",
-            (self.repository, self.clock()),
+            query + "AND ready_at<=? ORDER BY a.urgent DESC,a.attempted_at,a.first_pending_at,a.id",
+            (*params, self.clock()),
         )
 
     def attempted(self, work: dict) -> None:
@@ -74,13 +92,14 @@ class AdmissionState:
         behind a stale copy of the backlog. Alternating priority and oldest-work selections
         gives both revocations and ordinary pending PRs service under continuing traffic.
         """
-        order = "urgent DESC, " if prefer_urgent else ""
+        order = "a.urgent DESC, " if prefer_urgent else ""
+        query, params = self._pending_query()
         rows = self.store.query(
-            "SELECT * FROM admission_work WHERE repository=? AND generation!=evaluated_generation "
-            "AND next_attempt_at<=? "
-            + ("AND urgent=1 " if urgent_only else "")
-            + f"ORDER BY {order}attempted_at, first_pending_at, id LIMIT 1",
-            (self.repository, self.clock()),
+            query
+            + "AND ready_at<=? "
+            + ("AND a.urgent=1 " if urgent_only else "")
+            + f"ORDER BY {order}a.attempted_at,a.first_pending_at,a.id LIMIT 1",
+            (*params, self.clock()),
         )
         return rows[0] if rows else None
 
@@ -103,22 +122,27 @@ class AdmissionState:
 
     def defer(self, work: dict, until: float, error: str, resource: str = "source") -> bool:
         """Preserve the actual deadline, without postponing newly invalidated work."""
-        return bool(
-            self.store.update(
+        with self.store.transaction():
+            updated = self.store.update(
                 "admission_work",
                 {"id": work["id"], "generation": work["generation"]},
                 next_attempt_at=until,
                 last_error=error,
                 retry_resource=resource,
             )
-        )
+            if updated and resource != "source":
+                deadlines = self.store.get_setting(self.resource_key, {})
+                deadlines[resource] = max(deadlines.get(resource, 0), until)
+                self.store.set_setting(self.resource_key, deadlines, "admission", self.clock())
+            return bool(updated)
 
     def summary(self) -> dict:
-        pending = self.store.query(
-            "SELECT number, head_sha, attempted_at, first_pending_at, next_attempt_at, last_error, retry_resource "
-            "FROM admission_work WHERE repository=? AND generation!=evaluated_generation",
-            (self.repository,),
+        query, params = self._pending_query(
+            "a.number,a.head_sha,a.attempted_at,a.first_pending_at,a.last_error,a.retry_resource"
         )
+        pending = self.store.query(query, params)
+        for row in pending:
+            row["next_attempt_at"] = row.pop("ready_at")
         return {
             "pending": len(pending),
             "oldest_pending_at": min((r["first_pending_at"] for r in pending), default=None),

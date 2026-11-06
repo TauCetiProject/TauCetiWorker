@@ -78,6 +78,30 @@ def fence_document(raw, *, build="SUCCESS"):
 
 
 class SourceTests(unittest.TestCase):
+    def test_restored_server_deadlines_protect_new_reads_and_both_api_resources(self):
+        transport = FakeTransport()
+        c, clock = client(transport)
+        c.restore_deadlines({"core": clock.now + 3600, "secondary": clock.now + 60})
+        with c.deferred_requests(urgent=True):
+            with self.assertRaises(ga.RequestDeferred) as blocked:
+                c.get_json("new-head")
+            self.assertEqual(blocked.exception.retry_at, clock.now + 3600)
+            with self.assertRaises(ga.RequestDeferred) as blocked:
+                c.graphql("query { ready }")
+            self.assertEqual(blocked.exception.retry_at, clock.now + 60)
+        self.assertEqual(transport.calls, [])
+
+    def test_restored_background_deadline_preserves_essential_priority(self):
+        transport = FakeTransport()
+        c, clock = client(transport)
+        c.restore_deadlines({"core:background": clock.now + 10})
+        with c.deferred_requests(), self.assertRaises(ga.RequestDeferred):
+            c.get_json("background")
+        transport.add("GET", "https://api.github.com/essential", 200, {})
+        with c.deferred_requests(urgent=True):
+            c.get_json("essential")
+        self.assertEqual(len(transport.calls), 1)
+
     def test_graphql_bot_identity_matches_rest_for_recovery_holds_and_source_versions(self):
         body = f"Merge-queue recovery for head `{HEAD}`: repair needed\n<!--tauceti-rebase:v1 {HEAD}-->"
         transport = FakeTransport()
