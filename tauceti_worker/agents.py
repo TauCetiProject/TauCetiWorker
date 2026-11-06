@@ -1593,7 +1593,9 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None, d
                     from .expanded_cache import measured
 
                     with measured(report, label.lower().replace(" ", "_") + "_fetch"):
-                        rc = _cache_fetch([*prefix, *command], cwd, env if fetch_env is None else fetch_env, output, remaining)
+                        rc = _cache_fetch(
+                            [*prefix, *command], cwd, env if fetch_env is None else fetch_env, output, remaining
+                        )
                 except (OSError, subprocess.TimeoutExpired) as e:
                     output.write(f"cache command failed: {e}\n".encode())
                     rc = 1
@@ -1710,12 +1712,14 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None, d
         toolchain = git("show", base_ref + ":lean-toolchain")
         main_fetch_env = (
             dict(env if main_env is None else main_env, ELAN_TOOLCHAIN=toolchain)
-            if toolchain and env.get("LAKE_SHARED_CACHE_ROOT") else env
+            if toolchain and env.get("LAKE_SHARED_CACHE_ROOT")
+            else env
         )
         revisions = git("rev-list", *([] if max_revs == "0" else [f"--max-count={max_revs}"]), base_ref)
         for revision in revisions.splitlines():
             status = fetch(
-                "TauCeti main", [*base, "--rev", revision, *(["--toolchain", toolchain] if toolchain else [])],
+                "TauCeti main",
+                [*base, "--rev", revision, *(["--toolchain", toolchain] if toolchain else [])],
                 fetch_env=main_fetch_env,
             )
             if status != "miss":
