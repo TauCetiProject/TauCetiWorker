@@ -233,8 +233,11 @@ copy keeps them working, and measured on a 1500-declaration module, returning to
 a previously built state still fell from 4s of recompilation to 0s of restore.
 An explicit value in a worker's `env` table overrides either default.
 
-The trade is disk: old build generations remain in the store, and Lake supplies
-no selective eviction — `lake cache clean` empties it all or nothing. TauCeti
+Old build generations remain in the store, and Lake supplies
+no selective eviction — `lake cache clean` empties it all or nothing. Compatible
+native executables can instead use the [machine Lake cache](machine-lake-cache.md),
+with optional operator-selected reclamation targets. Older executables retain
+their private store. For those private stores, TauCeti
 records the toolchain on canonical `main` for each worker and clears that
 worker's default Lake cache when the pin changes. The first observed pin only
 seeds that record. Worker-private build/cache generations also expire after
@@ -522,10 +525,10 @@ and a worker downloads only what nobody on the machine has. Left per-worker
 entirely, half of one week's 10.2 GB of `.ltar` traffic was a file another worker
 already had.
 
-`$LAKE_CACHE_DIR` stays per-worker too. It normally sits under the toolchain
-directory, and would otherwise follow `$ELAN_HOME` into the pool, but unlike an
-install it is written throughout every build. That keeps the default
-`LAKE_ARTIFACT_CACHE` store private to the worker that fills it. Once canonical
+`$LAKE_CACHE_DIR` remains the per-worker fallback. Compatible hardened Lake
+executables can select the [machine store](machine-lake-cache.md) through a
+separate native opt-in; older executables continue using the private path.
+Once canonical
 `main` moves to a different `lean-toolchain`, the next host checkout preparation
 clears this private store while no agent is
 running. Switching between PR branches does not count as a bump and therefore

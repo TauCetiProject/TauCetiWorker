@@ -1,0 +1,49 @@
+#!/usr/bin/env -S python3 -I
+"""Select an installed hardened Lake only for its matching original toolchain."""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def signature(path):
+    info = path.stat()
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]
+
+
+def main():
+    directory = Path(__file__).resolve().parent
+    search = os.pathsep.join(
+        part for part in os.environ.get("PATH", "").split(os.pathsep) if Path(part or ".").resolve() != directory
+    )
+    original = shutil.which("lake", path=search)
+    if not original:
+        print("lake: original executable is unavailable on PATH", file=sys.stderr)
+        return 127
+    selected = original
+    if os.environ.get("LAKE_SHARED_CACHE_ROOT") and not (len(sys.argv) > 1 and sys.argv[1].startswith("+")):
+        try:
+            env = dict(os.environ, PATH=search)
+            found = subprocess.run(["elan", "which", "lake"], env=env, capture_output=True, text=True)
+            if found.returncode == 0:
+                executable = Path(found.stdout.strip()).resolve(strict=True)
+                registry = json.loads((directory / "registry.json").read_text())
+                runtime = registry.get(str(executable), {})
+                candidate = Path(runtime.get("executable", "/nonexistent"))
+                if runtime.get("original_signature") == signature(executable) and candidate.is_file():
+                    selected = str(candidate)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    try:
+        os.execv(selected, [selected, *sys.argv[1:]])
+    except OSError:
+        if selected != original:
+            os.execv(original, [original, *sys.argv[1:]])
+        raise
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

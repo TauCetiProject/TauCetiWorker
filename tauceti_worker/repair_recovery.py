@@ -1170,6 +1170,7 @@ class WorkerBackend:
             (self.record / "cache-evicted.json").unlink(missing_ok=True)
         with environment(**self.verification_environment(checkout)):
             cache_env = dict(os.environ)
+            cache_env.pop("LAKE_SHARED_CACHE_ROOT", None)
             with host_build_cache_context(checkout, cache_env, self.w.cfg.logdir) as prefix:
                 if getattr(self, "record", None):
                     self.prepare_source(checkout, self.record, m, self.journal)
