@@ -419,7 +419,9 @@ source recovery becomes obsolete and its private materialization is discarded by
 the existing collector. Exhausted content allowances use the same abandonment
 path. Fresh normal work continues. Active handoffs remain owned by the receiving
 round; uncertain publication retains its intent and reconciliation evidence and
-cannot authorize a new content attempt.
+cannot authorize a new content attempt. The existing source lifetime still ends
+source repair: derived checkouts enter discarded storage while immutable source
+records and uncertain publication intent remain as compact evidence.
 Claim, capacity, policy, budget and content waits do not consume infrastructure
 attempts. Content remains bounded by the original workflow's existing counters.
 Consumer protocol 3 automatically re-evaluates older operator-dependent blocks

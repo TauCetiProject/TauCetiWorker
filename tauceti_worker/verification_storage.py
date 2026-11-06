@@ -766,27 +766,7 @@ def _compact(state, identifier, work, *, now, row, drop_dependencies=False, evic
                 _SCANS.pop(identity, None)
 
 
-def _unused_checkpoint(state, target):
-    """A complete orphan has no receipt or pending consumer, unlike retained evidence."""
-    from . import recovery_maintenance as maintenance
-
-    if not read_json(target / "checkpoint.json") or maintenance._referenced(state, target):
-        return False
-    for receipt in (state / "verification").glob("*/receipt.json"):
-        value = read_json(receipt)
-        if not value:
-            return False
-        source = value.get("source_checkpoint")
-        if source:
-            path = Path(source)
-            if path.is_relative_to("/opt/verification-state"):
-                path = state / path.relative_to("/opt/verification-state")
-            if path.resolve().is_relative_to(target.resolve()):
-                return False
-    return True
-
-
-def _measure_checkpoint(state, row, work, *, retire=False):
+def _measure_checkpoint(state, row, work):
     from .retention import locked
 
     target = state / "verification-checkpoints" / row["id"]
@@ -796,37 +776,6 @@ def _measure_checkpoint(state, row, work, *, retire=False):
         if not target.exists():
             release(state, row["id"])
             return "absent"
-        if (
-            retire
-            and time.time() - row["last_used"] >= setting("COMPLETED_CACHE_SECONDS", 900)
-            and _unused_checkpoint(state, target)
-        ):
-            from . import recovery_maintenance as maintenance
-
-            if _observe_users(target, work):
-                return "active"
-            from .retention import mount_points
-
-            mounts = mount_points()
-            if mounts is None or any(p == target.resolve() or p.is_relative_to(target.resolve()) for p in mounts):
-                return "mounted"
-            journal = state / "verification-storage" / f"{row['id']}.json"
-            progress = read_json(journal)
-            deletion = progress.setdefault(
-                "unused-checkpoint", dict(tree_identity=[target.stat().st_dev, target.stat().st_ino], stack=[""])
-            )
-            try:
-                atomic_json(journal, progress)
-                if maintenance._remove(target, deletion, work):
-                    release(state, row["id"])
-                    journal.unlink(missing_ok=True)
-                    return "unused-checkpoint-retired"
-                return "resume-checkpoint-retirement"
-            finally:
-                if target.exists():
-                    atomic_json(journal, progress)
-        if row.get("compact") and row.get("settled"):
-            return "source-checkpoint-retained"
         return _measure(state, row, target, work, compact=True)
 
 
@@ -874,9 +823,7 @@ def _prune_scans(entries):
             _SCANS.pop(identity)[0].close()
 
 
-def _housekeep(
-    states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 1024**2, now=None, retire_checkpoints=False
-):
+def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 1024**2, now=None):
     """Ordinary supervisor/activity ticks own cleanup. No timer, model or GitHub reads."""
     from . import work_recovery as wr
 
@@ -982,12 +929,11 @@ def _housekeep(
                         data["candidates"].pop(identity, None)
                 continue
             if row.get("kind") == "checkpoint":
-                if row.get("compact") and row.get("settled") and not retire_checkpoints:
-                    continue
-                try:
-                    report["candidates"][identity] = _measure_checkpoint(state, row, work, retire=retire_checkpoints)
-                except BlockingIOError:
-                    report["candidates"][identity] = "active"
+                if row.get("legacy") or not row.get("settled"):
+                    try:
+                        report["candidates"][identity] = _measure_checkpoint(state, row, work)
+                    except BlockingIOError:
+                        report["candidates"][identity] = "active"
                 continue
             # Prefer terminal/own-build reclamation. If that cannot make room, release older
             # idle dependency caches from other jobs while keeping the oldest runnable job

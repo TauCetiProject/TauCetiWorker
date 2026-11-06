@@ -32,6 +32,9 @@ age threshold, recovery service, or adoption campaign. A transient claim/capacit
 wait alone is not an exhausted task. Keep currently running work and active handoffs
 with their existing owner. Abandoning source repair must not replay an uncertain
 publication or erase the small intent/accounting evidence needed to reconcile it.
+When the existing source lifetime expires, release derived recovery checkouts but
+retain immutable source records and uncertain publication intent as evidence.
+Their eventual history archival remains in #597.
 
 Prefer an existing compact source record and a small abandonment reason over a
 full retained checkout. For explicitly abandoned work, preserving every unfinished
@@ -116,7 +119,8 @@ fallback timer also recovers a crash or a request arriving as the service exits.
 Bound individual slices with existing budgets and keep progressing in the
 background. Do not introduce a new overall runtime cutoff, job-age gate, global
 work lock, or independent collector. Stop or yield when existing scheduling says no
-eligible work can progress. After a full round makes no eligible progress, return;
+eligible work can progress. A new request may get one final pass after progress stops. After that full round
+makes no eligible progress, return even if low-space admission keeps requesting cleanup;
 repeatedly observing the same blocked owners is not progress. Cleanup failure
 cannot reverse useful completed work.
 

@@ -1138,7 +1138,7 @@ class Sweep:
                 return  # Temporary writes are not recovery records or operator tasks.
             consumer = read_json(path / "recovery.json")
             if abandonment_reason(path, consumer):
-                self.cleanup_pending = True
+                self.cleanup_pending |= disposal_pending(path, consumer)
                 if self.cleanup and discard_record(state, path):
                     return
             from .repair_recovery import ACTIVE_HANDOFF, RETRYABLE, write
@@ -1157,7 +1157,7 @@ class Sweep:
                     # Migrate old infrastructure pauses to ordinary automatic retries.
                     write(path, consumer, "eligible")
                 else:
-                    self.cleanup_pending = True
+                    self.cleanup_pending |= disposal_pending(path, consumer)
                     if self.cleanup:
                         discard_record(state, path)
                     return  # Done records never remain in the operator's task inventory.
@@ -1329,7 +1329,7 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup
                     and not handed_off
                     and code not in RETRYABLE
                 ):
-                    sweep.cleanup_pending = True
+                    sweep.cleanup_pending |= disposal_pending(record, consumer)
                     if cleanup:
                         discard_record(state, record)
             while True:
@@ -1382,23 +1382,41 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup
     return report
 
 
-def abandonment_reason(record, consumer):
-    """A fixed source lifetime, independent of retries, journals, funding and worker admission."""
-    from .repair_recovery import RETRIES, normal_publication, uncertain_publication
+def publication_pending(record, consumer):
+    from .repair_recovery import normal_publication, uncertain_publication
 
-    # Small publication evidence must remain available to reconciliation, even when
-    # source recovery is no longer worth continuing.
-    manifest = _metadata(record / "manifest.json")
-    if (
+    return (
         consumer.get("state") != "published"
         and not consumer.get("normal_publication_confirmed")
-        and (uncertain_publication(consumer) or normal_publication(record, manifest, consumer))
-    ):
-        return None
+        and (
+            uncertain_publication(consumer) or normal_publication(record, _metadata(record / "manifest.json"), consumer)
+        )
+    )
+
+
+def disposal_pending(record, consumer):
+    if publication_pending(record, consumer):
+        return any(
+            child.is_dir()
+            and not child.is_symlink()
+            and (child.name == "checkout" or child.name.startswith(("restore-", "interrupted-restore-")))
+            for child in record.iterdir()
+        )
+    return True
+
+
+def abandonment_reason(record, consumer):
+    """A fixed source lifetime, independent of retries, journals, funding and worker admission."""
+    from .repair_recovery import RETRIES
+
     code = (consumer.get("reason") or {}).get("code")
-    if code in {"content-allowance", "recovery-exhausted"}:
-        return code + "-exhausted"
-    if code == "invocation-failed" and consumer.get("attempts", 0) >= len(RETRIES):
+    if not publication_pending(record, consumer) and code in {"content-allowance", "recovery-exhausted"}:
+        return code
+    if (
+        not publication_pending(record, consumer)
+        and code == "invocation-failed"
+        and consumer.get("attempts", 0) >= len(RETRIES)
+    ):
         return "recovery-exhausted"
     manifest = _metadata(record / "manifest.json")
     try:
@@ -1430,17 +1448,7 @@ def discard_record(state, record):
         consumer = _metadata(record / "recovery.json")
         code = (consumer.get("reason") or {}).get("code")
         abandon = abandonment_reason(record, consumer)
-        from .repair_recovery import normal_publication, uncertain_publication
-
-        if (
-            consumer.get("state") != "published"
-            and not consumer.get("normal_publication_confirmed")
-            and (
-                uncertain_publication(consumer)
-                or normal_publication(record, _metadata(record / "manifest.json"), consumer)
-            )
-        ):
-            return False
+        pending_publication = publication_pending(record, consumer)
         if not abandon:
             if consumer.get("state") not in {"published", "obsolete", "blocked"} or code in RETRYABLE:
                 return False
@@ -1477,6 +1485,30 @@ def discard_record(state, record):
                         return False
             except (OSError, IndexError):
                 return False
+        if pending_publication:
+            # Immutable bundles, patches and intent remain evidence; an abandoned
+            # derived checkout is no longer a consumer and can use ordinary trash.
+            directory = state / "recovery-cleanup/discarded"
+            moved = False
+            for child in record.iterdir():
+                if not (child.name == "checkout" or child.name.startswith(("restore-", "interrupted-restore-"))):
+                    continue
+                if child.is_symlink() or not child.is_dir():
+                    continue
+                directory.mkdir(parents=True, exist_ok=True)
+                child.rename(directory / ("publication-" + record.name + "-" + uuid.uuid4().hex))
+                moved = True
+            if moved:
+                atomic_json(
+                    record / "recovery.json",
+                    dict(consumer, state="obsolete", forensic_only=True, materialization_retired_at=time.time()),
+                )
+                wr._fsync_dir(record)
+                wr._fsync_dir(directory)
+                if work := wr._WORK.get():
+                    work.removed_entries += 1
+                retention.request_cleanup()
+            return moved
         manifest = _metadata(record / "manifest.json")
         directory = state / "recovery-cleanup" / "discarded"
         directory.mkdir(parents=True, exist_ok=True)

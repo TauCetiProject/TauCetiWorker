@@ -467,7 +467,7 @@ def referenced_attempt(cfg, attempt):
     return False
 
 
-def sweep(*, dry=False, now=None, diagnostics_only=False):
+def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_configs=None):
     from . import activity, shared_mathlib
 
     now = time.time() if now is None else now
@@ -506,21 +506,32 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
                     note(report, "errors", "recovery trash: " + error)
             except Exception as error:
                 note(report, "errors", f"recovery trash cleanup: {error}")
-        from .cache_storage import collect
+        if shared:
+            from .cache_storage import collect
 
-        try:
-            storage = collect(configs, dry=dry, now=now, opened=opened)
-            merge_report(report, storage)
-            report.update(
-                {
-                    key: value
-                    for key, value in storage.items()
-                    if key
-                    not in ("at", "removed", "protected", "errors", "removed_count", "protected_count", "errors_count")
-                }
-            )
-        except (OSError, ValueError) as error:
-            note(report, "errors", f"shared cache cleanup: {error}")
+            try:
+                storage = collect(
+                    configs if shared_configs is None else shared_configs, dry=dry, now=now, opened=opened
+                )
+                merge_report(report, storage)
+                report.update(
+                    {
+                        key: value
+                        for key, value in storage.items()
+                        if key
+                        not in (
+                            "at",
+                            "removed",
+                            "protected",
+                            "errors",
+                            "removed_count",
+                            "protected_count",
+                            "errors_count",
+                        )
+                    }
+                )
+            except (OSError, ValueError) as error:
+                note(report, "errors", f"shared cache cleanup: {error}")
         from . import verification_storage
 
         states = [state for cfg in configs for state in (cfg.state, cfg.state / "verification-state")]
@@ -598,35 +609,36 @@ def sweep(*, dry=False, now=None, diagnostics_only=False):
     try:
         for key in (
             ()
-            if diagnostics_only or not (shared_mathlib.root() / "entries").is_dir()
+            if not shared or diagnostics_only or not (shared_mathlib.root() / "entries").is_dir()
             else shared_mathlib.collect(shared_mathlib.root(), max_age=LIFETIME, now=now, dry_run=dry)
         ):
             note(report, "removed", str(shared_mathlib.root() / "entries" / key))
     except OSError as error:
         note(report, "errors", str(error))
-    from .worker_manager import workers_state_dir
+    if shared:
+        from .worker_manager import workers_state_dir
 
-    log_root = workers_state_dir().resolve() / "logs"
-    if opened is None:
-        note(report, "protected", str(log_root))
-    else:
-        for directory in children(log_root, report):
-            try:
-                if directory.is_symlink() or not directory.is_dir():
-                    continue
-            except OSError as error:
-                note(report, "errors", f"{directory}: {error}")
-                continue
-            for path in children(directory, report):
+        log_root = workers_state_dir().resolve() / "logs"
+        if opened is None:
+            note(report, "protected", str(log_root))
+        else:
+            for directory in children(log_root, report):
                 try:
-                    if not path.name.startswith("work-") or path.suffix != ".log":
+                    if directory.is_symlink() or not directory.is_dir():
                         continue
-                    if not path.is_symlink() and path.is_file() and now - path.stat().st_mtime >= LIFETIME:
-                        remove(path, log_root, report, dry=dry, opened=opened, mounts=mounts)
-                except FileNotFoundError:
-                    continue
                 except OSError as error:
-                    note(report, "errors", f"{path}: {error}")
+                    note(report, "errors", f"{directory}: {error}")
+                    continue
+                for path in children(directory, report):
+                    try:
+                        if not path.name.startswith("work-") or path.suffix != ".log":
+                            continue
+                        if not path.is_symlink() and path.is_file() and now - path.stat().st_mtime >= LIFETIME:
+                            remove(path, log_root, report, dry=dry, opened=opened, mounts=mounts)
+                    except FileNotFoundError:
+                        continue
+                    except OSError as error:
+                        note(report, "errors", f"{path}: {error}")
     if not dry:
         base = worker_state_root()
         while not base.exists():
@@ -681,6 +693,7 @@ def drain_pending(reports):
     previous = os.environ.get("TAUCETI_LEGACY_DATA_ROOT")
     requested_at = time.time()
     pending = list(reports)
+    extra_requested = False
     try:
         while pending:
             again = []
@@ -704,7 +717,7 @@ def drain_pending(reports):
                         seconds=1,
                         entries=8192,
                         removal_bytes=1024**3,
-                        retire_checkpoints=True,
+                        now=time.time(),
                     )
                     totals["slices"] += 1
                     progress = 0
@@ -722,8 +735,9 @@ def drain_pending(reports):
                 except Exception as error:
                     note(report, "errors", f"{path}: {error}")
             requested = read_json(root() / "cleanup-request.json").get("at", 0)
-            if requested > requested_at:
+            if requested > requested_at and (again or not extra_requested):
                 requested_at = requested
+                extra_requested = not bool(again)
                 pending = list(reports)
             else:
                 pending = again
@@ -844,10 +858,15 @@ def run_all(*, dry=False):
     report["roots"] = []
     with locked(root() / "cleanup.lock", dry=dry):
         try:
-            for path in data_roots():
+            paths = data_roots()
+            configs = []
+            for path in paths:
+                os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
+                configs.extend(worker_configs())
+            for index, path in enumerate(paths):
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
                 try:
-                    result = sweep(dry=dry)
+                    result = sweep(dry=dry, shared=index == 0, shared_configs=configs)
                 except Exception as error:
                     result = fresh_report()
                     note(result, "errors", str(error))

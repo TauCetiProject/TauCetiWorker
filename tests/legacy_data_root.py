@@ -76,15 +76,18 @@ class LegacyDataRoot(unittest.TestCase):
                 (installed / "state/w").mkdir(parents=True)
                 self.assertEqual(set(retention.data_roots()), {current, old, installed})
                 seen = []
+                shared = []
 
                 def collect(**kwargs):
                     seen.append(paths.legacy_data_root())
+                    shared.append(kwargs["shared"])
                     return retention.fresh_report()
 
                 with patch.object(retention, "sweep", side_effect=collect):
                     report = retention.run_all(dry=True)
                 self.assertEqual(set(seen), {current, old, installed})
                 self.assertEqual(len(report["roots"]), 3)
+                self.assertEqual(shared, [True, False, False])
                 self.assertEqual(paths.legacy_data_root(), current)
 
     def test_default_and_invalid_override(self):
