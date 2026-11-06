@@ -130,6 +130,26 @@ class RecoveryMaintenance(unittest.TestCase):
         self.assertTrue(maintenance.discard_record(self.cfg.state, record))
         self.assertFalse(record.exists())
 
+    def test_legacy_blocked_publication_reconciles_before_lifetime_expiry(self):
+        for code in ("content-allowance", "recovery-exhausted"):
+            self.dirty()
+            record = wr.guard(self.cfg, self.co).record
+            journal = dict(
+                state="blocked", reason=dict(code=code), publication=dict(oid="unconfirmed", push_started=True)
+            )
+            maintenance.atomic_json(record / "recovery.json", journal)
+            checkout = record / "checkout"
+            checkout.mkdir(exist_ok=True)
+            with patch.object(wr, "live_users", side_effect=AssertionError("not ready for disposal")):
+                self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+            self.tick()
+            self.assertTrue(checkout.exists())
+            self.assertEqual(maintenance._metadata(record / "recovery.json")["state"], "eligible")
+            self.expire_record(record)
+            self.assertTrue(maintenance.discard_record(self.cfg.state, record))
+            with patch.object(wr, "live_users", side_effect=AssertionError("evidence needs no process scan")):
+                self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+
     def test_native_cleanup_restart_progresses_past_slow_fresh_records(self):
         base = self.cfg.state.parent
         for name in ("a", "b", "c"):
@@ -872,6 +892,22 @@ print(json.dumps(dict(owner=owner, child=child)), flush=True)
         saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
         self.restored(saved, expected)
 
+    def test_recent_retention_of_old_directory_saves_source_before_abandonment(self):
+        expected = self.dirty()
+        old = time.time() - 3 * maintenance.RECOVERY_RECORD_TTL
+        os.utime(self.co, (old, old))
+        tree = self.retained()
+        # Old collector versions also derived the job clock from the root mtime.
+        maintenance._write_job(
+            maintenance._job_path(self.cfg.state, tree),
+            dict(tree=str(tree), phase="save", created_at=old, stack=[""]),
+        )
+        self.tick()
+        saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
+        self.restored(saved, expected)
+        owner = maintenance._metadata(tree.with_name(tree.name + ".owner.json"))
+        self.assertNotIn("abandonment_reason", owner)
+
     def test_expired_intent_cannot_abandon_a_younger_replacement(self):
         self.dirty()
         tree = self.retained()
@@ -913,6 +949,8 @@ print(json.dumps(dict(owner=owner, child=child)), flush=True)
                 tree_identity=[tree.stat().st_dev, tree.stat().st_ino],
             ),
         )
+        old = time.time() - maintenance.RECOVERY_RECORD_TTL - 1
+        os.utime(tree.with_name(tree.name + ".owner.json"), (old, old))
         with patch.object(wr, "inspect", side_effect=AssertionError("abandoned task must not need salvage")):
             self.tick()
         self.assertFalse(tree.exists())

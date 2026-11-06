@@ -581,6 +581,7 @@ class Retention(unittest.TestCase):
             )
         )
         atomic_json(sidecar, dict(pr=42, round_id="old-round", work="fix", process=dead))
+        os.utime(sidecar, (0, 0))
         os.utime(retained, (0, 0))
         retention.sweep(now=self.clock)
         # The existing collector now owns retained work too, without waiting for
