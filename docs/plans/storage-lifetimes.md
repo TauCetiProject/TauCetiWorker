@@ -94,6 +94,9 @@ recovery inventory and pending verification/outbox records in the same pass.
 Separate active consumers and uncertain publication from failed, exhausted, or
 permanently blocked source-repair attempts. Retire the latter through the existing
 abandonment/discard path; do not start consumers merely to rescue all old work.
+Apply the same existing 24-hour source lifetime to owned retained checkouts even
+when Git/source preservation never succeeds. Keep their small owner/publication
+metadata while retiring the private tree under the existing ownership checks.
 Still-useful active work keeps its original claims and authorization.
 
 A root can leave compatibility discovery after its remaining active consumers and

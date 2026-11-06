@@ -655,6 +655,25 @@ def _cleanup(state, tree, root, work, observation=None):
     saving_source = False
     validating_source = False
     try:
+        if time.time() - job.get("created_at", tree.stat().st_mtime) >= RECOVERY_RECORD_TTL:
+            if reason := _safe(state, tree, owner):
+                job["next_action"] = reason
+                return
+            # The same source lifetime applies before preservation succeeds. An
+            # exhausted owned task need not repair Git metadata to release its copy.
+            directory = state / "recovery-cleanup/discarded"
+            directory.mkdir(parents=True, exist_ok=True)
+            target = directory / ("abandoned-" + original.name + "-" + uuid.uuid4().hex)
+            atomic_json(
+                sidecar, dict(owner, abandonment_reason="recovery-lifetime-exhausted", abandoned_at=time.time())
+            )
+            tree.rename(target)
+            wr._fsync_dir(original.parent)
+            wr._fsync_dir(directory)
+            path.unlink(missing_ok=True)
+            work.removed_entries += 1
+            retention.request_cleanup()
+            return
         if (
             job.get("parked")
             and job["parked"] == _park_signature(tree, sidecar)
