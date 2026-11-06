@@ -1,5 +1,13 @@
 # Persistent workers
 
+For the legacy TauCeti project, `TAUCETI_LEGACY_DATA_ROOT` selects an absolute
+directory containing `state/`, `checkouts/`, and `logs/`. Set it before starting
+a worker to reuse its existing credentials, recovery records, and checkouts
+with a different installed code revision. Round, verification, and cleanup
+subprocesses inherit the same location; bundled scripts and prompts remain with
+the code. Without this setting, the existing installation-relative layout is
+preserved. Changing the setting does not move data or merge worker histories.
+
 ## Fleet admission and reporting
 
 TauCetiFleet can supervise a separate worker configuration without adopting this

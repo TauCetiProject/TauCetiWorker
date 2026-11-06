@@ -40,7 +40,7 @@ from .constants import (
     TAUCETI,
 )
 from .github import me
-from .paths import HERE
+from .paths import HERE, legacy_data_root
 from .processes import PARENT_BOUND_AGENT as _PARENT_BOUND_AGENT
 from .processes import owned_process
 from .processes import run as run_process
@@ -968,7 +968,7 @@ def run_agent_host(
 
         with contextlib.suppress(ValueError, subprocess.CalledProcessError):
             env["TAUCETI_VERIFY_BASE"] = local_main(cwd)
-    env.setdefault("TAUCETI_VERIFY_STATE", str(HERE / "state" / env.get("TAUCETI_WORKER_ID", "local")))
+    env.setdefault("TAUCETI_VERIFY_STATE", str(legacy_data_root(HERE) / "state" / env.get("TAUCETI_WORKER_ID", "local")))
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
@@ -2834,7 +2834,7 @@ def _worker_iso_home(wid: str, _base: Path | None = None) -> Path:
     if project and not project.legacy:
         return project.state_root / "workers" / wid / "home"
     if sys.platform != "darwin":
-        return HERE / "state" / wid / "home"
+        return legacy_data_root(HERE) / "state" / wid / "home"
     base = _base
     if base is None:
         try:

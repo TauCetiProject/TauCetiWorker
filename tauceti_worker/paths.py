@@ -18,6 +18,22 @@ from pathlib import Path
 _pkg = Path(__file__).resolve().parent  # …/tauceti_worker
 HERE = _pkg if (_pkg / "prompts").is_dir() else _pkg.parent
 
+
+def legacy_data_root(default: Path | None = None) -> Path:
+    """Keep existing worker data when changing the installed code revision.
+
+    Assets stay beside the code. An explicit data root is inherited by round,
+    verification and cleanup subprocesses, including isolated worker homes.
+    """
+    raw = os.environ.get("TAUCETI_LEGACY_DATA_ROOT")
+    if not raw:
+        return HERE if default is None else default
+    root = Path(raw).expanduser()
+    if not root.is_absolute():
+        raise ValueError("TAUCETI_LEGACY_DATA_ROOT must be an absolute path")
+    return root.resolve()
+
+
 # The branch-lease helper the agents run on PATH inside a round. Overridable for tests.
 CLAIM_SH = os.environ.get("TAUCETI_CLAIM_SH") or str(HERE / "scripts" / "claim.sh")
 
