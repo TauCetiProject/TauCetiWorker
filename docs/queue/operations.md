@@ -184,8 +184,9 @@ uv run tauceti-queue status --url https://queue.taucetiproject.org   # through t
 
 ## Current deployment
 
-Running on `chungus` since 2026-11-05 01:13 UTC, as the account `kim`; installed at revision
-`d84649118232`, the service and repair worker 1 updated to `9d2643f` at 09:38 to 09:41 UTC. Both
+Running on `chungus` since 2026-11-05 01:13 UTC, as the account `kim`. Service-owned policy intake
+became authoritative on November 6 at 04:25 UTC with Worker revision `9d7180a97aac` and the pinned
+TauCetiReview policy `7fd3a39e02c5`; subsequent live revisions are reported by `/status`. Both
 `queue.taucetiproject.org` and `bors.taucetiproject.org` report `service.host` `chungus` since
 01:13:33 UTC. The operator has no root on chungus and lingering is not enabled for the account
 (`loginctl enable-linger` is denied), so the service, the tunnel and the repair worker run as detached
@@ -229,10 +230,11 @@ Paths on chungus, where they differ from the layout table:
 | `~/TauCetiQueue-data/run-service.sh`, `service.log` | the service supervisor loop (`uv run tauceti-queue serve`) and the process log, which replaces journald |
 | `~/TauCetiQueue-data/run-tunnel.sh`, `tunnel.log` | the tunnel supervisor loop (`cloudflared tunnel ... run`) and its log |
 | `~/TauCetiQueue-data/repair-clone`, `~/TauCetiQueue-data/repair`, `repair-worker.log` | the repair worker's content clone, task root and log |
-| `~/.local/state/tauceti-queue/backups/` | backups, taken by hand (no timer) |
+| `~/.local/state/tauceti-queue/backups/` | online backups; daily timer active as of November 6, plus backups before deployments |
 | `127.0.0.1:8780` | the listen address |
 | `~/.cloudflared/cert.pem`, `config.yml`, `<tunnel id>.json` | the Cloudflare origin certificate, tunnel configuration and tunnel credentials, copied from tauchonki |
-| `~/.config/systemd/user/tauceti-queue.service`, `tauceti-queue-backup.{service,timer}`, `tauceti-queue-repair.service` | installed by the installers, disabled |
+| `~/.config/systemd/user/tauceti-queue.service`, `tauceti-queue-repair.service` | installed, disabled while the detached supervisors own the processes |
+| `~/.config/systemd/user/tauceti-queue-backup.{service,timer}` | installed; timer enabled and active as of November 6 |
 
 ### Hosts without lingering
 
@@ -260,8 +262,10 @@ Consequences:
 - **No restart after a reboot.** After a reboot of chungus, or whenever `pgrep` shows a process
   missing, the operator or an agent starts the three again by hand as above. The repair worker has no
   loop around it, so a crash leaves it down until restarted.
-- **No daily backup.** The timer is disabled; run `~/TauCetiQueue/services/queue/backup.sh` by hand
-  before any risky change, or from a cron entry (`17 3 * * * ~/TauCetiQueue/services/queue/backup.sh`).
+- **Backups.** The daily timer is enabled and active; its November 6 run succeeded at 03:19 UTC.
+  Without lingering, this does not guarantee recovery after logout or reboot. Run
+  `~/TauCetiQueue/services/queue/backup.sh` before any risky change and verify the timer after a
+  host restart. Restore ordinary systemd supervision with lingering on the dedicated host.
 - **Deploy** with the scripts in `~/TauCetiQueue-data`: `deploy-queue.sh` updates the service and
   both repair workers, `deploy-service.sh` the service only. These fast-forward the checkout, bake
   its revision into `_revision.py`, and send SIGTERM to the existing service process; the supervisor
@@ -512,9 +516,9 @@ Cloudflare Access policy is needed for increment 1.
 `services/queue/backup.sh` takes an online SQLite backup (the backup API through Python's stdlib, so
 the service keeps running and the copy is a consistent snapshot), verifies it with `PRAGMA
 integrity_check` and keeps the newest 14 copies in `~/.local/state/tauceti-queue/backups/`. The
-installer enables `tauceti-queue-backup.timer`, which runs it daily at 03:17 UTC; on a host without
-lingering the timer stays disabled and the backup runs by hand or from cron (Current deployment). Run it
-by hand before any risky change:
+installer enables `tauceti-queue-backup.timer`, which runs it daily at 03:17 UTC. Without lingering,
+an enabled user timer is not guaranteed to survive logout or recover after reboot; inspect its actual
+state (Current deployment). Run the backup by hand before any risky change:
 
 ```sh
 ~/TauCetiQueue/services/queue/backup.sh            # configured database, default directory
@@ -625,6 +629,17 @@ GraphQL waits retain their absolute server deadline. Intake does not sleep on an
 other runnable work proceeds. Resident pagination buffers retain pages already read during a quota
 wait. After a process restart the database still owns pending work and deadlines, and source
 reconciliation restores observations. There are no admission workflow reruns or cache handoffs.
+
+PRs waiting for the same API resource share its observed deadline in the existing database.
+Advancing that deadline does not create another attempt or write for every waiting PR. Source
+failures remain local to their PR, and urgent revocations can bypass background pacing while still
+respecting actual server cooldowns. Startup restores these waits into the shared client, including
+for newly observed PRs. Expected resource waits count as `deferred`, rather than poll errors.
+
+An evaluation retains its FIFO place across resource waits, so completing a PR's source reads
+does not require repeated rounds through the entire backlog. New input and genuine source
+failures rejoin at the current time; a changing or failing PR therefore lets other work proceed.
+The last-attempt timestamp and oldest-pending age remain separate diagnostics.
 
 Background reads are paced across each resource's remaining window, using REST requests and
 reported GraphQL point costs separately. Queue/CI calls, queued-review revocations and final

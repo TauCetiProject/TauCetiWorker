@@ -51,7 +51,8 @@ def source_version(source: dict, revision: str, no_repair_labels=()) -> str:
             **{key: source.get(key) for key in ("head", "base_ref", "state", "draft", "body")},
             "diff": source.get("diff_version") or source.get("merge_base"),
             "labels": sorted(
-                {s.lower() for s in source.get("labels", ())} & (KEEP | set(no_repair_labels) | {"needs-rebase"})
+                {s.lower() for s in source.get("labels", ())}
+                & (KEEP | {s.lower() for s in no_repair_labels} | {"needs-rebase"})
             ),
             "comments": [
                 {
@@ -160,6 +161,9 @@ class AdmissionPoller:
         self.policy = policy_config
         self.clock = clock
         self.state = AdmissionState(controller.store, repo, clock=clock)
+        client = getattr(adapter, "client", None)
+        if client is not None:
+            client.restore_deadlines(controller.store.get_setting(self.state.resource_key, {}))
         self._lock = threading.Lock()
         self._discovery_lock = threading.Lock()
         self._discovery_serial = 0
@@ -224,6 +228,17 @@ class AdmissionPoller:
         """Persist before webhook acknowledgement. No GitHub call or policy evaluation here."""
         pull = payload.get("pull_request") or {}
         number = payload.get("number") or pull.get("number") or (payload.get("issue") or {}).get("number")
+        if kind == "pull_request":
+            if payload.get("action") in ("labeled", "unlabeled"):
+                label_payload = payload.get("label")
+                label = label_payload.get("name") if isinstance(label_payload, dict) else None
+                relevant_labels = KEEP | self.controller._no_repair_labels() | {"needs-rebase"}
+                if isinstance(label, str) and label and label.lower() not in relevant_labels:
+                    return  # membership and repair labels are queue output, not admission evidence
+            elif payload.get("action") == "edited":
+                changes = payload.get("changes")
+                if isinstance(changes, dict) and changes and set(changes) <= {"title"}:
+                    return
         if kind == "issue_comment":
             comment = payload.get("comment") or {}
             previous_body = ((payload.get("changes") or {}).get("body") or {}).get("from") or ""
@@ -300,6 +315,7 @@ class AdmissionPoller:
             "approved": 0,
             "revoked": 0,
             "unchanged": 0,
+            "deferred": 0,
             "errors": [],
         }
         while not self.stopping.is_set():
@@ -333,7 +349,11 @@ class AdmissionPoller:
                 next_at = self.clock() + self.controller.setting("approval_poll_interval_seconds")
             except Exception as error:
                 next_at = retry_at = self._retry_at(error)
-                summary["errors"].append(f"discovery: {error}")
+                if isinstance(error, RequestDeferred):
+                    self.state.record_resource_wait(error.resource, error.retry_at)
+                    summary["deferred"] += 1
+                else:
+                    summary["errors"].append(f"discovery: {error}")
             with self._discovery_lock:
                 self._discovery_at = next_at if serial == self._discovery_serial else 0
             self.controller.store.set_setting(
@@ -372,8 +392,12 @@ class AdmissionPoller:
                 str(error),
                 error.resource if isinstance(error, RequestDeferred) else "source",
             )
-            log.warning("admission #%s pending: %s", work["number"], error)
-            summary["errors"].append(f"#{work['number']}: {error}")
+            if isinstance(error, RequestDeferred):
+                summary["deferred"] += 1
+                log.debug("admission #%s waiting: %s", work["number"], error)
+            else:
+                log.warning("admission #%s pending: %s", work["number"], error)
+                summary["errors"].append(f"#{work['number']}: {error}")
         return True
 
     def _legacy_withdrawal(self, current):

@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS admission_work (
     urgent INTEGER NOT NULL DEFAULT 0,
     first_pending_at REAL NOT NULL DEFAULT 0,
     attempted_at REAL NOT NULL DEFAULT 0,
+    queue_at REAL,
     next_attempt_at REAL NOT NULL DEFAULT 0,
     last_error TEXT NOT NULL DEFAULT '',
     retry_resource TEXT NOT NULL DEFAULT '',

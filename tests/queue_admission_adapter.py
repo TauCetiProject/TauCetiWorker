@@ -78,6 +78,30 @@ def fence_document(raw, *, build="SUCCESS"):
 
 
 class SourceTests(unittest.TestCase):
+    def test_restored_server_deadlines_protect_new_reads_and_both_api_resources(self):
+        transport = FakeTransport()
+        c, clock = client(transport)
+        c.restore_deadlines({"core": clock.now + 3600, "secondary": clock.now + 60})
+        with c.deferred_requests(urgent=True):
+            with self.assertRaises(ga.RequestDeferred) as blocked:
+                c.get_json("new-head")
+            self.assertEqual(blocked.exception.retry_at, clock.now + 3600)
+            with self.assertRaises(ga.RequestDeferred) as blocked:
+                c.graphql("query { ready }")
+            self.assertEqual(blocked.exception.retry_at, clock.now + 60)
+        self.assertEqual(transport.calls, [])
+
+    def test_restored_background_deadline_preserves_essential_priority(self):
+        transport = FakeTransport()
+        c, clock = client(transport)
+        c.restore_deadlines({"core:background": clock.now + 10})
+        with c.deferred_requests(), self.assertRaises(ga.RequestDeferred):
+            c.get_json("background")
+        transport.add("GET", "https://api.github.com/essential", 200, {})
+        with c.deferred_requests(urgent=True):
+            c.get_json("essential")
+        self.assertEqual(len(transport.calls), 1)
+
     def test_graphql_bot_identity_matches_rest_for_recovery_holds_and_source_versions(self):
         body = f"Merge-queue recovery for head `{HEAD}`: repair needed\n<!--tauceti-rebase:v1 {HEAD}-->"
         transport = FakeTransport()
@@ -347,6 +371,50 @@ class SourceTests(unittest.TestCase):
             clock.now += 7200
             self.assertEqual(c.paginate("items", per_page=2, progress=progress), [1, 2, 3])
         self.assertEqual(len(transport.calls), 3)
+
+    def test_label_pages_resume_under_pacing_in_discovery_and_final_fence(self):
+        for final_fence in (False, True):
+            with self.subTest(final_fence=final_fence):
+                transport = FakeTransport()
+                raw = pr_json()
+                if final_fence:
+                    document = fence_document(raw)
+                    document["data"]["repository"]["pullRequest"]["labels"]["pageInfo"]["hasNextPage"] = True
+                else:
+                    pull = node(42)
+                    pull["labels"]["pageInfo"]["hasNextPage"] = True
+                    document = graph_page([pull])
+                transport.add("POST", "https://api.github.com/graphql", 200, document)
+                if final_fence:
+                    transport.add("POST", "https://api.github.com/graphql", 200, document)
+                url = f"https://api.github.com/repos/{TAUCETI}/issues/42/labels?per_page=100&page="
+                transport.add(
+                    "GET",
+                    url + "1",
+                    200,
+                    [{"name": f"label-{n}"} for n in range(100)],
+                    {"x-ratelimit-remaining": "10", "x-ratelimit-reset": "1800000010"},
+                )
+                transport.add("GET", url + "2", 200, [{"name": "keep"}])
+                c, clock = client(transport)
+                adapter = ga.GitHubAdapter(c, repo=TAUCETI)
+                progress = {}
+
+                def read_labels(final_fence=final_fence, adapter=adapter, raw=raw, progress=progress):
+                    if final_fence:
+                        return adapter._admission_fence(
+                            TAUCETI, 42, ga.PullRequest.from_json(raw), labels_progress=progress
+                        )[0].labels
+                    return adapter.list_open_pull_requests(TAUCETI, review_app_id=0, admission=True)[0].admission[
+                        "labels"
+                    ]
+
+                with c.deferred_requests():
+                    with self.assertRaises(ga.RequestDeferred) as paused:
+                        read_labels()
+                    clock.now = paused.exception.retry_at
+                    self.assertIn("keep", read_labels())
+                self.assertEqual([call[1] for call in transport.calls if call[0] == "GET"], [url + "1", url + "2"])
 
     def test_real_diff_includes_old_rename_path_and_source_versions_match_discovery(self):
         with tempfile.TemporaryDirectory() as directory:
