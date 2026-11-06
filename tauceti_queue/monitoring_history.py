@@ -54,6 +54,24 @@ def load_reporter():
     return module
 
 
+def read_baseline(path, reporter):
+    """Accept the frozen numeric report or the original retained Bors feed."""
+    value = json.loads(path.read_text())
+    if "landed_prs_per_hour" not in value:
+        import sys
+
+        script = Path(reporter.__file__).with_name("staging_journal_report.py")
+        spec = importlib.util.spec_from_file_location("staging_journal_report", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules["staging_journal_report"] = module
+        value = reporter.baseline_report([path], 1833, 1932)
+    rate = value.get("landed_prs_per_hour")
+    if type(rate) not in (int, float) or not math.isfinite(rate) or rate <= 0:
+        raise ValueError("Bors baseline needs a positive recorded landing rate")
+    return value
+
+
 def number(value):
     return value if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
 
@@ -190,7 +208,7 @@ def main(argv=None):
     reporter = load_reporter()
     value = prepare(
         reporter.export(args.database, args.worker_root, args.clone),
-        json.loads(args.baseline.read_text()),
+        read_baseline(args.baseline, reporter),
         reporter,
         args.public_repository or ("TauCetiProject/TauCeti",),
     )

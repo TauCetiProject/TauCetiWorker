@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tauceti_queue.monitoring_history import load_reporter, prepare
+from tauceti_queue.monitoring_history import load_reporter, prepare, read_baseline
 
 PROJECT = "TauCetiProject/TauCeti"
 
@@ -23,6 +23,13 @@ def snapshot():
 
 
 class History(unittest.TestCase):
+    def test_original_frozen_bors_feed_is_accepted_without_a_separate_conversion(self):
+        reporter = load_reporter()
+        baseline = read_baseline(Path(__file__).with_name("fixtures") / "staging-journal-fixture.json", reporter)
+        self.assertGreater(baseline["landed_prs_per_hour"], 0)
+        self.assertEqual(baseline["candidate_range"], [1833, 1932])
+        self.assertTrue(prepare(snapshot(), baseline, reporter)["windows"])
+
     def test_mixed_repository_measurements_never_appear_under_public_scope(self):
         value = snapshot()
         before = prepare(value, {"landed_prs_per_hour": 1}, load_reporter())
