@@ -511,11 +511,14 @@ class Verification:
         from . import verification_tools
 
         config = verification_tools.configuration()
-        return dict(
-            root=str(verification_tools.root()),
-            files=self.installations.inventory(verification_tools.root()),
-            configuration=file_record(config) if config else None,
-        )
+        try:
+            return dict(
+                root=str(verification_tools.root()),
+                files=self.installations.inventory(verification_tools.root()),
+                configuration=file_record(config) if config else None,
+            )
+        except verification_tools.Unavailable as error:
+            raise Incomplete(str(error), reason=error.reason) from error
 
     def validate_inputs(self, inputs, *, full=False):
         self.at_boundary = True
@@ -696,7 +699,7 @@ class Verification:
         try:
             verification_tools.check(self.root)
         except verification_tools.Unavailable as error:
-            raise Incomplete(str(error), reason="tool-missing") from error
+            raise Incomplete(str(error), reason=error.reason) from error
 
     def run(self):
         self.save()

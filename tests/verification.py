@@ -553,6 +553,57 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result["status"], "incomplete", result.get("error"))
         self.assertEqual(result["incomplete_reason"], "tool-missing")
 
+    def test_temporary_probe_failures_are_retryable_not_blocked_tools(self):
+        write(self.root, "scripts/check-expired-mathlib-shims.py", "from tauceti_tools import templates\n")
+        for failure in (OSError("temporary process exhaustion"), subprocess.TimeoutExpired("probe", 30)):
+            with patch("tauceti_worker.processes.run", side_effect=failure):
+                result = self.verify(stage="shim-expiry")
+            self.assertEqual(result["status"], "incomplete")
+            self.assertEqual(result["incomplete_reason"], "verification-busy")
+        self.assertEqual(self.verify(stage="shim-expiry")["status"], "success")
+
+    def test_candidate_import_shadowing_is_source_failure_not_missing_worker_tools(self):
+        write(self.root, "scripts/ast.py", "raise RuntimeError('candidate module shadow')\n")
+        write(
+            self.root,
+            "scripts/check-expired-mathlib-shims.py",
+            "from tauceti_tools import templates\nimport ast\n",
+        )
+        result = self.verify(stage="shim-expiry")
+        self.assertEqual(result["status"], "failed", result.get("error"))
+
+    def test_missing_parent_tools_do_not_crash_identity_readiness_or_json_receipt(self):
+        from tauceti_worker.verification_jobs import tool_readiness
+
+        with patch.object(verification_tools, "root", side_effect=verification_tools.Unavailable("Tools removed")):
+            self.assertIsInstance(verification_tools.identity(), str)
+            self.assertIsInstance(tool_readiness({}), str)
+            result = self.verify(stage="build")
+        self.assertEqual(result["status"], "incomplete", result.get("error"))
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+
+    def test_recovery_tool_identity_ignores_runtime_and_config_snapshot_paths(self):
+        import shutil
+
+        first = self.home / "runtime-one"
+        second = self.home / "runtime-two"
+        write(first, "tools/templates.py", "# identical installed Tools\n")
+        write(first, "snapshot-one.toml", "# identical project policy\n")
+        executable = first / "bin/python"
+        executable.parent.mkdir()
+        shutil.copy2(Path(sys.executable).resolve(), executable)
+        shutil.copytree(first, second)
+        (second / "snapshot-one.toml").rename(second / "snapshot-two.toml")
+        identities = []
+        for runtime, snapshot in ((first, "snapshot-one.toml"), (second, "snapshot-two.toml")):
+            with (
+                patch.object(verification_tools, "root", return_value=runtime / "tools"),
+                patch.object(sys, "executable", str(runtime / "bin/python")),
+                patch.dict(os.environ, TAUCETI_CONF_SNAPSHOT=str(runtime / snapshot)),
+            ):
+                identities.append(verification_tools.identity())
+        self.assertEqual(*identities)
+
     def test_shim_failure_codes_remain_source_failures_with_working_tools(self):
         for code in (1, 2, 3, 75):
             write(
