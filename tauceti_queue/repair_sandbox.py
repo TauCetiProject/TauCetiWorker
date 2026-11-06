@@ -23,9 +23,12 @@ build ...`` runs one command under the sandbox (the helper scripts' entry point)
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -135,9 +138,49 @@ def _pressure_source() -> Path:
     source = root / "scripts" / "tauceti-lean"
     if not source.is_file():
         raise SandboxUnavailable(f"the worker's bundled compiler pressure wrapper is missing: {source}")
-    if not os.access(source, os.X_OK):  # wheel installs drop the execute bit
-        source.chmod(source.stat().st_mode | 0o111)
     return source
+
+
+def _pressure_executable(worktree: Path) -> Path:
+    source = _pressure_source()
+    if os.access(source, os.X_OK):
+        return source
+    # Wheel assets may be read-only and lack execute permission. Never modify the installation.
+    content = source.read_bytes()
+    name = "tauceti-lean-" + hashlib.sha256(content).hexdigest()
+    cache = worktree / ".lake" / "pressure-cache"
+    # Candidate build state is writable: do not follow symlinks when creating the trusted copy.
+    lake_fd = os.open(worktree / ".lake", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            os.mkdir("pressure-cache", 0o700, dir_fd=lake_fd)
+        except FileExistsError:
+            pass
+        cache_fd = os.open("pressure-cache", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=lake_fd)
+    finally:
+        os.close(lake_fd)
+    temporary = ".wrapper-" + secrets.token_hex(12)
+    try:
+        try:
+            existing_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=cache_fd)
+            with os.fdopen(existing_fd, "rb") as existing:
+                mode = os.fstat(existing.fileno()).st_mode
+                if stat.S_ISREG(mode) and mode & stat.S_IXUSR and existing.read(len(content) + 1) == content:
+                    return cache / name
+        except OSError:
+            pass
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=cache_fd)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content)
+            os.fchmod(output.fileno(), 0o755)
+        os.replace(temporary, name, src_dir_fd=cache_fd, dst_dir_fd=cache_fd)
+        return cache / name
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=cache_fd)
+        except FileNotFoundError:
+            pass
+        os.close(cache_fd)
 
 
 def sandbox_argv(
@@ -163,7 +206,7 @@ def sandbox_argv(
     home = env.get("HOME") or os.path.expanduser("~")
     args = [shutil.which("env") or "/usr/bin/env", "-i", bwrap, "--tmpfs", "/", *_system_binds()]
     args += ["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
-    args += ["--ro-bind", str(_pressure_source()), PRESSURE_WRAPPER]
+    args += ["--ro-bind", str(_pressure_executable(worktree)), PRESSURE_WRAPPER]
     if Path("/sys/fs/cgroup").is_dir():
         args += ["--ro-bind", "/sys/fs/cgroup", "/sys/fs/cgroup"]
     if elan.is_dir():
@@ -212,7 +255,7 @@ def sandboxed_lake(
             shutil.which("env") or "/usr/bin/env",
             "-u",
             "LEAN_SYSROOT",
-            *(f"{key}={value}" for key, value in _pressure_env(worktree, str(_pressure_source())).items()),
+            *(f"{key}={value}" for key, value in _pressure_env(worktree, str(_pressure_executable(worktree))).items()),
             *argv,
         ]
     return sandbox_argv(argv, worktree, env, extra_env=extra_env)
