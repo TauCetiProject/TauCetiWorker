@@ -1601,6 +1601,63 @@ class InferenceUnavailable(Fixture):
         self.assertEqual(self.service.results, [])
 
 
+class ScopeOnlyRepair(Fixture):
+    BROKEN = ()
+
+    def scope_failure(self):
+        self.service.tasks[1]["diagnostics"] = [
+            {"kind": "status", "context": "scope", "message": "scope approval unavailable"},
+            {"kind": "admission_predictions", "complete": True, "records": []},
+        ]
+        os.environ["STUB_AGENT_MODE"] = "noop"
+
+    def test_unchanged_scope_only_chain_is_verified_and_submitted_for_fresh_ci(self):
+        self.scope_failure()
+        cfg = self.config(agent_attempts=1)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(outcome["tip"], self.content.tip)
+        self.assertEqual(len(self.service.results), 1)
+        self.assertEqual(json.loads(self.service.results[0]["worker_notes"])["edited"], [])
+        self.assertEqual(len(outcome["verification"]), 1)
+        self.assertTrue(outcome["verification"][0]["ok"])
+        prompt = self.agent_calls()[0]["prompt"]
+        self.assertIn("This is not a failed Lean build", prompt)
+        self.assertIn("fresh normal CI; no check is waived", prompt)
+
+    def test_local_verification_failure_still_prevents_submission(self):
+        self.scope_failure()
+        cfg = self.config(agent_attempts=1, verify_retries=0)
+        result = {
+            "ok": False,
+            "diagnostics": [{"kind": "compiler", "message": "broken"}],
+            "checks": {"status": "failed"},
+        }
+        with patch.object(repair_audit, "verify", return_value=result):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["reason"], "agent_failed", outcome)
+        self.assertEqual(self.service.results, [])
+
+    def test_other_findings_and_converted_predictions_keep_the_changed_result_rule(self):
+        self.scope_failure()
+        record = self.service.task_record(1, self.service.preclaim(1, "token", "worker"))
+        task = repair_task.Task.from_json(record)
+        self.assertTrue(repair_task.scope_only_repair(task))
+        for finding in [
+            {"kind": "compiler"},
+            {"kind": "status", "context": "build"},
+            {"kind": "status", "context": "bump-guard"},
+            None,
+            {"kind": "admission_predictions", "was_proactive": True},
+        ]:
+            original = list(task.diagnostics)
+            task.diagnostics.append(finding)
+            self.assertFalse(repair_task.scope_only_repair(task))
+            task.diagnostics[:] = original
+        task.diagnostics[:] = [{"kind": "admission_predictions"}]
+        self.assertFalse(repair_task.scope_only_repair(task))
+
+
 class PredictedRepair(Fixture):
     BROKEN = ()
 

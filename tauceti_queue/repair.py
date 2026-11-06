@@ -1013,6 +1013,7 @@ class PromptContext:
     rebase_options: str = "--keep-empty --empty=keep --reapply-cherry-picks"  # the replay's git options
     repair_context: object | None = None  # ``repair_context.compute``'s result: ownership, collisions and ripples
     pre_rebased: bool = False  # prepare: the chain is the batch's pre-rebase on the head's tip ``base``
+    scope_failure_only: bool = False  # compilation passed; only the trusted scope-policy verdict failed
 
 
 def _pr_list(prs: list[int]) -> str:
@@ -1710,6 +1711,19 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
             "checks pass and no edit is needed, leave the chain unchanged; the controller keeps its existing CI.",
             "",
             "## Admission and build evidence",
+            "",
+        ]
+    elif context.scope_failure_only:
+        lines += [
+            "## What happened",
+            "",
+            f"This batch of {len(chain)} attributed PR commits on `{base_short}` passed compilation, but its "
+            "scope-policy verdict failed. This is not a failed Lean build. Inspect the recorded policy finding; "
+            "the necessary correction may be in trusted tooling outside this candidate. If no source edit is "
+            "needed, leave the valid chain clean and unchanged. The worker may submit that same tip for fresh "
+            "normal CI; no check is waived. Do not manufacture an edit or remove human-owned contributions.",
+            "",
+            "## CI policy evidence",
             "",
         ]
     elif context.kind == "prepare" and context.pre_rebased:
