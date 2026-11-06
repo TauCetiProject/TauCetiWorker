@@ -160,6 +160,16 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert rc == 0 and len(launched) == 1
     assert all(r["toolchain"] == "leanprover/lean4:v4.35.0-rc3" for r in records[2:])
     assert all(r["toolchain"] is None for r in records[:2])
+
+    @contextlib.contextmanager
+    def private_preparation(cwd, environment, **kwargs):
+        yield dict(environment, LAKE_CACHE_DIR=str(root / "temporary-downloads"))
+
+    with patch("tauceti_worker.expanded_cache.preparation", side_effect=private_preparation):
+        rc, records, text = run("rebase", LAKE_SHARED_CACHE_ROOT=str(root / "native"))
+    assert rc == 0 and len(launched) == 1
+    assert all(r["cache_dir"] == str(root / "temporary-downloads") for r in records[:2])
+    assert all(r["cache_dir"] == env["LAKE_CACHE_DIR"] for r in records[2:])
     rc, records, text = run("workspace-error")
     assert rc == 0 and len(launched) == 1 and len(records) == 1
     for mode in ("dependency-error", "invalid-toolchain"):
