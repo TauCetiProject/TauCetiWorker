@@ -5,6 +5,36 @@ Running record for the work plan in
 what is blocked on which operator item, and the latest experiment numbers. Updated by the
 orchestrating session as streams land.
 
+## Primary admission cutover (2026-11-06)
+
+The queue service became the authoritative automatic admission owner at 04:25 UTC, through
+[Worker PR 572](https://github.com/TauCetiProject/TauCetiWorker/pull/572). It evaluates the pure
+policy pinned at TauCetiReview `7fd3a39e02c5`, using the existing approval-poll thread and SQLite
+database. [Worker PR 577](https://github.com/TauCetiProject/TauCetiWorker/pull/577) fixes shared
+resource waits, FIFO progress for whole evaluations, resumed label pagination, and invalidations
+from the queue's own output. All nine final CI jobs passed; merged revision `bb451e63e5a0` was
+deployed live at 05:55:01 UTC. Both public hostnames reported that revision.
+
+[TauCeti PR 29458](https://github.com/TauCetiProject/TauCeti/pull/29458) retired the separate
+auto-merge, merge-sweep and queue-release workflows and the control-batch merge caller. The local
+workflow backstop no longer dispatches admission workflows. Late legacy eligibility publications
+have no authority in policy mode. Normal review publication, worker admissions and CI remain
+enabled. Inference failure keeps work in this engine under the existing hold/retry behavior;
+inference-free splitting remains a deferred TODO.
+
+At 05:55:34 UTC, the service had recorded 263 admissions and 1,023 evaluations; 1,120 evaluations
+remained pending, down from 1,496 shortly after cutover. Independently audited PRs 28216, 28688
+and 28675 were all inserted with their exact accepted heads. Deployment preserved all 1,803
+existing membership records and runtime settings, and SQLite `quick_check` passed. These are
+point-in-time observations, not a full authorization audit of the ready-labelled backlog.
+
+The remaining deployment gap is boot supervision on chungus: `Linger=no`, enabling it is denied,
+and the service unit remains disabled while the detached supervisor owns the running process.
+The supervisor recovers process crashes but cannot start after a host reboot. The backup timer
+is enabled and active, with a successful November 6 run, but has the same user-session limitation.
+An administrator must enable lingering before supervision is transferred to systemd, or the
+service must move to the dedicated host. See [the operations runbook](operations.md#current-deployment).
+
 ## Increment 0
 
 | Stream | Branch | State |
@@ -199,7 +229,7 @@ Totals for the day: four heads landed through the queue (head 1 at 00:33, head 2
 1. Done: the `tauceti-queue` App is created and installed on `TauCetiProject/TauCeti`.
 2. Create `TauCetiProject/TauCetiQueueScratch` (stream I) and add it to the `tauceti-queue` App installation; optionally grant the App `checks: write` so the rehearsal can approve through `merge eligibility` checks (`docs/queue/rehearsal.md`). The rehearsal pushes the content itself.
 3. Staging capacity: no action for now (operator decision, 2026-11-04). Revisit from the pilot's measurements.
-4. Service host: chungus since 2026-11-05 01:13 UTC, temporary (moved from tauchonki, whose staging builds and Claude sessions held its load between 150 and 490 and stretched one controller pass to ten minutes). No root and no lingering there, so the service, the tunnel and the repair worker run as detached processes started by hand, with no restart after a reboot and no backup timer ([operations.md](operations.md), "Current deployment" and "Hosts without lingering"). A fresh dedicated machine is expected about eight hours after the move.
+4. Service host: chungus since 2026-11-05 01:13 UTC, temporary (moved from tauchonki, whose staging builds and Claude sessions held its load between 150 and 490 and stretched one controller pass to ten minutes). No root and no lingering there, so the service, the tunnel and the repair workers run under detached supervisors, with no automatic startup after a reboot. The backup timer is active as of November 6 but cannot be relied on after logout or reboot without lingering ([operations.md](operations.md), "Current deployment" and "Hosts without lingering"). The dedicated host's availability and hostname remain outstanding.
 5. Done: cutover approved ("go") and executed on 2026-11-04.
 
 ## Next steps
@@ -208,7 +238,7 @@ Totals for the day: four heads landed through the queue (head 1 at 00:33, head 2
 - Investigate why the concurrency group did not cancel the superseded run 42055229481.
 - The Zulip reply to Christian still awaits the operator.
 - The fresh machine for the service (below).
-- The service runs `ac2f078d` (PR 558) since 15:12; the next deploy needs only the ordinary scripts.
+- Read the current service revision from `/status`; use the live deployment procedure in the runbook.
 - Move the service and the repair worker from chungus to the dedicated machine when it arrives, restoring the systemd units and the backup timer ([operations.md](operations.md), "Moving to the dedicated host").
 - Pause the `tauceti-bors` Worker's cron once the operator agrees; delete it with its container after a week of queue operation.
 - Give Bors's admission-time checks (declaration collisions, merge-selection overlaps) to the agent as diagnostics, as described in the plan; streaming repair, the other follow-up there, is done (https://github.com/TauCetiProject/TauCetiWorker/pull/531).
