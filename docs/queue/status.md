@@ -57,6 +57,12 @@ covered CI silence, which left this failure invisible while admissions continued
 and CI admissions remained enabled throughout. Live revisions and subsequent progress must be
 checked through status and the two repair journals.
 
+The scheduler's former fallback allowed a spare worker to race an already-owned head task when
+no background task was claimable. This duplicated preparation builds and inference. The operator
+rejected that behavior on November 6: tasks now have one live owner, while a second worker takes
+distinct next-batch work or waits. The runtime concurrency setting still permits concurrent work
+on separate tasks; it is not a per-task replication count.
+
 ## Increment 0
 
 | Stream | Branch | State |

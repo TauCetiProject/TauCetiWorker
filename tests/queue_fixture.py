@@ -478,6 +478,7 @@ class Claims(QueueFixture):
         return self.head()
 
     def test_s6_s11_claims_expiry_late_results_and_second_claimants(self):
+        self.controller.set_setting("repair_concurrency", 2, "t")
         head = self.failing_head()
         self.assertIsNone(self.controller.claim_task("intruder", "not-an-admin"), "authorization is repository admin")
         first = self.agent(
@@ -492,8 +493,7 @@ class Claims(QueueFixture):
         )
         task = first.claim(self.controller)
         self.assertIsNotNone(task)
-        self.assertIsNone(second.claim(self.controller), "repair_concurrency 1: a second claimant is refused")
-        self.assertEqual(self.controller.status()["counters"]["claim_collisions"], 1)
+        self.assertIsNone(second.claim(self.controller), "a held head task has one owner despite spare capacity")
         # The first worker's claim expires; the second claims; the first's late result is rejected but retained.
         self.clock.advance(self.controller.setting("claim_ttl_seconds") + 1)
         self.tick()
@@ -528,6 +528,7 @@ class Claims(QueueFixture):
         self.assertIn(stale.reason, ("claim-superseded", "version-mismatch"))
 
     def test_s11_renewal_keeps_a_claim_alive_and_release_frees_the_task(self):
+        self.controller.set_setting("repair_concurrency", 2, "t")
         self.failing_head()
         agent = self.agent()
         task = agent.claim(self.controller)

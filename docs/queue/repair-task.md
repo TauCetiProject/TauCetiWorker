@@ -662,8 +662,10 @@ run, `resume_pending(cfg, client)` for checkpointed tasks. Integrating it as a w
   agent's shell limits, and a loop that owns the round should pass its remaining time as
   `agent_timeout`.
 
-The service's `repair_concurrency` setting bounds how many workers hold the head's repair task at
-once; the runner itself claims one task at a time.
+The service's `repair_concurrency` setting bounds live claims across distinct tasks. Each task has
+one live owner: one worker repairs the head while another prepares the next eligible batch. A spare
+worker waits if no separate task is claimable. Expiry or release allows another worker to take over;
+the runner itself claims one task at a time.
 
 ## Tests
 

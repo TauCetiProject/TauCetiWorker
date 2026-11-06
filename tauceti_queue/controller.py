@@ -1171,13 +1171,12 @@ class Controller:
         """Hand an open task to an authorized worker under a renewable claim, within `repair_concurrency`.
 
         `repair_concurrency` bounds the live task claims in total. Within it, tasks are offered in
-        three tiers, each by kind priority then age (`TASK_PRIORITY`): first a head task (`repair` or
-        `rebase_conflict`) nobody holds; then an open batch's background task (`pre_rebase`, then
-        `prepare`), one claim per batch and at most `repair_concurrency - 1` background claims in
-        total, so head work never waits behind background work; last a further claim on a head task
-        already held, up to `repair_concurrency` claims on it. So with two workers one repairs the
-        head while the other prepares or pre-rebases the next batch, and a second claim on the head's
-        task is only taken when no background task waits.
+        two tiers, each by kind priority then age (`TASK_PRIORITY`): first a head task (`repair` or
+        `rebase_conflict`); then an open batch's background task (`pre_rebase`, then `prepare`).
+        Each batch has at most one live worker claim, including when its task changes. Background
+        claims number at most `repair_concurrency - 1`, so head work never waits behind background
+        work. With two workers one repairs the head while the other prepares or pre-rebases the
+        next batch; a worker waits when no distinct batch needs work.
 
         The admin check (a cached GitHub read) runs before the lock is taken, and the claim takes the
         lock's priority lane, so a claim answers while a tick is running.
@@ -1237,26 +1236,22 @@ class Controller:
     def _choose_task(
         self, claimable: list[tuple[dict[str, Any], dict[str, Any]]], concurrency: int
     ) -> tuple[dict[str, Any], dict[str, Any]] | None:
-        """The next claim's task among `claimable` (ordered by kind priority, then age): an unheld
-        head task, else a background task on a batch no worker holds a background task of, while
+        """The next task on a batch without a live worker claim: a head task, else background while
         background claims number fewer than `concurrency - 1` (one slot is always left for head work,
-        so with `repair_concurrency` 1 nothing runs in the background), else a held head task with
-        fewer than `concurrency` claims."""
-        held: dict[int, int] = {}
-        for task, batch in claimable:
-            held[task["id"]] = len(self._active_claims(batch["id"], task_id=task["id"]))
-        head = [pair for pair in claimable if pair[0]["kind"] not in BACKGROUND_TASKS]
-        for pair in head:
-            if held[pair[0]["id"]] == 0:
+        so with `repair_concurrency` 1 nothing runs in the background). Selection and insertion of
+        the claim share the controller lock; concurrent requests cannot select the same batch.
+        """
+        active = self._active_task_claims()
+        held_batches = {claim["batch_id"] for claim in active}
+        unheld = [pair for pair in claimable if pair[1]["id"] not in held_batches]
+        for pair in unheld:
+            if pair[0]["kind"] not in BACKGROUND_TASKS:
                 return pair
-        background = [c for c in self._active_task_claims() if c["operation"] in BACKGROUND_OPERATIONS]
+        background = [claim for claim in active if claim["operation"] in BACKGROUND_OPERATIONS]
         if len(background) < concurrency - 1:
-            for task, batch in claimable:
-                if task["kind"] in BACKGROUND_TASKS and not self._background_claims(batch["id"]):
+            for task, batch in unheld:
+                if task["kind"] in BACKGROUND_TASKS:
                     return task, batch
-        for pair in head:
-            if held[pair[0]["id"]] < concurrency:
-                return pair
         return None
 
     def _background_claims(self, batch_id: int) -> list[dict[str, Any]]:
@@ -1293,11 +1288,10 @@ class Controller:
 
     def _active_task_claims(self) -> list[dict[str, Any]]:
         """Every worker's live task claim, on any batch: what `repair_concurrency` bounds."""
-        now = self.clock()
         return [
             row
-            for row in self.store.rows("claims", {"released_at": None})
-            if row["task_id"] is not None and row["expires_at"] > now
+            for row in self._live_claims(self.store.rows("claims", {"released_at": None}))
+            if row["task_id"] is not None
         ]
 
     def renew_task(self, task_id: int, claim_token: str) -> float:
@@ -1908,12 +1902,22 @@ class Controller:
 
     # --- claims ------------------------------------------------------------------------------------
 
-    def _active_claims(self, batch_id: int, task_id: int | None = None) -> list[dict[str, Any]]:
+    def _live_claims(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """A renewal delivered before expiry keeps ownership while it waits for the controller lock."""
         now = self.clock()
+        with self._renewing_guard:
+            renewing = dict(self._renewing)
+        return [
+            row
+            for row in rows
+            if row["expires_at"] > now or (row["token"] in renewing and renewing[row["token"]] < row["expires_at"])
+        ]
+
+    def _active_claims(self, batch_id: int, task_id: int | None = None) -> list[dict[str, Any]]:
         where: dict[str, Any] = {"batch_id": batch_id, "released_at": None}
         if task_id is not None:
             where["task_id"] = task_id
-        return [row for row in self.store.rows("claims", where) if row["expires_at"] > now]
+        return self._live_claims(self.store.rows("claims", where))
 
     def _expire_claims(self, now: float) -> None:
         """Release the claims past their expiry, except one whose renewal arrived in time and is waiting
