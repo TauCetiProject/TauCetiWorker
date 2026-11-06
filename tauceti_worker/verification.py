@@ -29,7 +29,7 @@ from pathlib import Path
 
 from .config import Die
 from .constants import LEAN_ROOT
-from .paths import HERE
+from .paths import HERE, legacy_data_root
 from .processes import owned_process
 from .runtime_status import read_json, report_runtime
 from .verification_installations import Installations
@@ -1012,7 +1012,8 @@ def add_parser(sub):
 
 def command(args):
     state = Path(
-        os.environ.get("TAUCETI_VERIFY_STATE") or HERE / "state" / os.environ.get("TAUCETI_WORKER_ID", "local")
+        os.environ.get("TAUCETI_VERIFY_STATE")
+        or legacy_data_root(HERE) / "state" / os.environ.get("TAUCETI_WORKER_ID", "local")
     )
     try:
         root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").decode().strip()).resolve()

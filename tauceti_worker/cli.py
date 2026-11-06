@@ -88,7 +88,7 @@ from .cost_model import analyze_review_archive, infrastructure_model, loc_cost_m
 from .cost_model import format_report as format_cost_report
 from .github import GitHub, pin_github_account, shared_claims_granted
 from .loop import cmd_loop, resolve_work_model
-from .paths import HERE, ensure_ssl_cert_file
+from .paths import HERE, ensure_ssl_cert_file, legacy_data_root
 from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, codex_dir, parse_pace_curve
 from .review_state import ReviewState
 from .round import Claims, RoundContext, cmd_heartbeat
@@ -623,6 +623,7 @@ def build_parser() -> argparse.ArgumentParser:
     recovery.add_argument("--json", action="store_true")
 
     cleanup = sub.add_parser("cleanup", help="reclaim disposable caches and expired diagnostics; local only")
+    cleanup.add_argument("--all-data-roots", action="store_true", help="include retired Fleet data roots")
     cleanup_mode = cleanup.add_mutually_exclusive_group()
     cleanup_mode.add_argument("--dry-run", action="store_true", help="report eligible paths without changing files")
     cleanup_mode.add_argument("--install-timer", action="store_true", help="install hourly systemd user cleanup")
@@ -679,8 +680,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="estimate local agent, CI, and Lake-cache compute costs from available logs",
     )
     c.add_argument("--json", action="store_true", help="emit machine-readable JSON")
-    c.add_argument("--logs-dir", type=Path, default=HERE / "logs", help="agent log root")
-    c.add_argument("--state-dir", type=Path, default=HERE / "state", help="worker state/transcript root")
+    c.add_argument("--logs-dir", type=Path, default=legacy_data_root(HERE) / "logs", help="agent log root")
+    c.add_argument(
+        "--state-dir", type=Path, default=legacy_data_root(HERE) / "state", help="worker state/transcript root"
+    )
     c.add_argument(
         "--review-data-dir",
         type=Path,

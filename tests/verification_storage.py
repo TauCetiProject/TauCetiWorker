@@ -99,6 +99,30 @@ class Storage(Receipts):
             job["source_digest"],
         )
 
+    def test_compacted_terminal_candidate_is_retired_but_pending_reference_survives(self):
+        pending, job, tree = self.pending()
+        terminal = self.state / "verification-jobs" / pending.name
+        v.atomic(terminal, {**job, "status": "success"})
+        pending.unlink()
+        self.collect()  # release build outputs first
+        self.assertTrue(tree.exists())
+        other = self.state / "verification-pending" / ("f" * 32 + ".json")
+        v.atomic(other, dict(root=str(tree), status="pending"))
+        self.collect()
+        self.assertTrue(tree.exists())
+        other.unlink()
+        with locked(self.state / "verification-jobs" / f"{job['id']}.lock"):
+            self.collect()
+            self.assertTrue(tree.exists())
+        for _ in range(6):
+            self.collect()
+            if not tree.exists():
+                break
+        self.assertFalse(tree.exists())
+        self.assertTrue(terminal.exists())
+        self.assertTrue(Path(job["receipt"]).exists())
+        self.assertTrue((self.root / "TauCeti/A.lean").exists())
+
     def test_active_job_and_receipt_leases_prevent_removal(self):
         write(self.root, ".lake/build/keep.olean", "active")
         _, job, tree = self.pending()
@@ -363,6 +387,20 @@ class Storage(Receipts):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertTrue(resume_pending(SimpleNamespace(state=self.state), seconds=10))
         self.assertEqual(v.read_json(self.state / "verification-jobs" / pending.name)["status"], "success")
+
+    def test_unused_complete_checkpoint_is_removed_but_receipt_evidence_survives(self):
+        verifier = v.Verification(self.root, self.state)
+        verifier.base = self.base
+        verifier.checkpoint_sources(dict(sources=v.inventory(self.root, self.base)))
+        target = Path(verifier.receipt["source_checkpoint"]).parent
+        receipt = verifier.path
+        receipt.unlink()
+        with storage.ledger() as data:
+            row = data["candidates"][storage.key(self.state, target.name)]
+            row["last_used"] = time.time() - 1000
+        self.collect(retire_checkpoints=True)
+        self.assertFalse(target.exists())
+        self.assertTrue((self.root / "TauCeti/A.lean").exists())
 
     def test_source_checkpoints_share_host_budget_and_never_expire(self):
         os.environ["TAUCETI_VERIFY_CHECKPOINT_BYTES"] = str(128 * 1024**2)
@@ -995,8 +1033,9 @@ class Storage(Receipts):
         self.assertTrue((tree / ".lake/build/oversized").exists())
         self.collect()
         self.collect()
-        self.assertFalse((tree / ".lake/build/oversized").exists())
-        self.assertTrue((tree / "TauCeti/A.lean").exists())
+        self.assertFalse(tree.exists())
+        self.assertTrue((self.root / "TauCeti/A.lean").exists())
+        self.assertTrue(Path(job["receipt"]).exists())
 
     def test_cleanup_target_combinations_do_not_restrict_admission(self):
         with patch.dict(

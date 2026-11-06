@@ -90,7 +90,6 @@ class RecoveryMaintenance(unittest.TestCase):
             {},
             dict(state="eligible", reason=dict(code="invocation-failed"), retry_at=time.time() + 999999),
             dict(state="resuming", handoff=dict(state="offered"), reason=dict(code="source-handoff-source-pending")),
-            dict(state="publication-pending", publication=dict(oid="unconfirmed", push_started=True)),
         ):
             with self.subTest(journal=journal):
                 self.dirty()
@@ -103,6 +102,25 @@ class RecoveryMaintenance(unittest.TestCase):
                     self.tick()
                 self.assertFalse(record.exists())
                 self.assertEqual(json.loads(outbox.read_text()), dict(pending=True))
+
+    def test_exhausted_recovery_retires_but_uncertain_publication_survives(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        exhausted = dict(state="eligible", attempts=3, reason=dict(code="invocation-failed"))
+        maintenance.atomic_json(record / "recovery.json", exhausted)
+        self.assertEqual(maintenance.abandonment_reason(record, exhausted), "recovery-exhausted")
+        for publication in [
+            dict(publication=dict(oid="unconfirmed", push_started=True)),
+            dict(normal_publication=dict(oid="unconfirmed", expected="old", ref="main")),
+        ]:
+            journal = exhausted | publication
+            maintenance.atomic_json(record / "recovery.json", journal)
+            self.expire_record(record)
+            self.assertIsNone(maintenance.abandonment_reason(record, journal))
+            self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+        maintenance.atomic_json(record / "recovery.json", exhausted)
+        self.assertTrue(maintenance.discard_record(self.cfg.state, record))
+        self.assertFalse(record.exists())
 
     def test_native_cleanup_restart_progresses_past_slow_fresh_records(self):
         base = self.cfg.state.parent

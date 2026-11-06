@@ -885,6 +885,90 @@ class Retention(unittest.TestCase):
                 config._LOG_FH.close()
             self.assertEqual((self.cfg.logdir / "work-20261021.log").read_text().count("concurrent rollover"), 8)
 
+    def test_managed_review_scratch_is_queued_after_failure_and_crash(self):
+        with self.assertRaisesRegex(RuntimeError, "review failed"):
+            with retention.review_workspace(self.cfg) as scratch:
+                (scratch / "mathlib").mkdir()
+                (scratch / "mathlib/Input.lean").write_text("disposable input")
+                report = retention.fresh_report()
+                retention.collect_review_scratch(self.cfg, report)
+                self.assertTrue(scratch.exists(), "active scratch must survive collection")
+                raise RuntimeError("review failed")
+        self.assertFalse(scratch.exists())
+        stale = self.cfg.state / "review-work/review-crashed"
+        stale.mkdir()
+        atomic_json(stale / "owner.json", dict(process=work_recovery.process_owner() | dict(pid=99999999)))
+        retention.collect_review_scratch(self.cfg, retention.fresh_report())
+        self.assertFalse(stale.exists())
+        discarded = self.cfg.state / "recovery-cleanup/discarded"
+        self.assertTrue(list(discarded.iterdir()))
+        from tauceti_worker.recovery_maintenance import collect_discarded
+
+        collect_discarded(self.cfg.state.parent)
+        self.assertFalse(list(discarded.iterdir()))
+
+    def test_requests_preserve_new_demand_while_debouncing_service_start(self):
+        directory = activity.root()
+        atomic_json(directory / "cleanup-service.json", dict(installed=True))
+        with patch.object(subprocess, "run") as run, patch.object(retention.time, "time", return_value=1000):
+            retention.request_cleanup()
+        with patch.object(subprocess, "run") as again, patch.object(retention.time, "time", return_value=1001):
+            retention.request_cleanup()
+        self.assertEqual(run.call_count, 1)
+        again.assert_not_called()
+        self.assertEqual(read_json(directory / "cleanup-request.json"), dict(at=1001, started_at=1000))
+
+    def test_one_service_run_drains_slices_and_observes_new_request(self):
+        from tauceti_worker import recovery_maintenance as maintenance
+        from tauceti_worker import verification_storage
+
+        reports = [
+            dict(removed_entries=1, sweep_complete=False, metadata_entries=2),
+            dict(removed_entries=1, sweep_complete=True),
+            dict(sweep_complete=True),
+            dict(sweep_complete=True),
+        ]
+
+        def prepare(*args, **kwargs):
+            result = reports.pop(0)
+            if len(reports) == 1:
+                atomic_json(activity.root() / "cleanup-request.json", dict(at=2000))
+            return result
+
+        with (
+            patch.object(retention, "sweep", return_value=retention.fresh_report()),
+            patch.object(retention.time, "time", return_value=1000),
+            patch.object(maintenance, "prepare", side_effect=prepare),
+            patch.object(maintenance, "collect_discarded", return_value=dict(errors=[])),
+            patch.object(verification_storage, "housekeep", return_value={}),
+        ):
+            report = retention.run()
+        self.assertFalse(reports)
+        self.assertEqual(report["drain"]["slices"], 4)
+        self.assertEqual(report["drain"]["removed_entries"], 2)
+
+    def test_drain_rotates_roots_before_repeating_progress(self):
+        from tauceti_worker import recovery_maintenance as maintenance
+        from tauceti_worker import verification_storage
+
+        first, second = self.root / "first", self.root / "second"
+        seen = []
+
+        def prepare(*args, **kwargs):
+            selected = Path(os.environ["TAUCETI_LEGACY_DATA_ROOT"])
+            seen.append(selected)
+            return dict(removed_entries=int(selected == first and seen.count(first) == 1))
+
+        with (
+            patch.object(maintenance, "prepare", side_effect=prepare),
+            patch.object(maintenance, "collect_discarded", return_value={}),
+            patch.object(verification_storage, "housekeep", return_value={}),
+            patch.object(retention, "worker_state_root", return_value=self.state),
+            patch.object(retention, "worker_configs", return_value=[]),
+        ):
+            retention.drain_pending([(first, {}), (second, {})])
+        self.assertEqual(seen, [first, second, first])
+
     def test_daily_timer_is_persistent_and_low_priority(self):
         with (
             patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "xdg")}),

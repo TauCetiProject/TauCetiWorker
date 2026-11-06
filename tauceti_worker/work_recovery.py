@@ -53,7 +53,7 @@ from pathlib import Path
 from . import recovery_index
 from .config import log
 from .constants import ROADMAP, TAUCETI
-from .paths import HERE, canonical_candidate
+from .paths import HERE, canonical_candidate, legacy_data_root
 from .runtime_status import atomic_json, read_json
 
 SCHEMA = "tauceti-work-recovery/v1"
@@ -125,6 +125,7 @@ class Work:
     read_bytes: int = 0
     hash_bytes: int = 0
     removed_bytes: int = 0
+    removed_entries: int = 0
     removal_bytes: int | None = None
     deadline: float = float("inf")
     adaptive: bool = False
@@ -158,6 +159,7 @@ class Work:
             read_bytes=self.read_bytes,
             hash_bytes=self.hash_bytes,
             removed_bytes=self.removed_bytes,
+            removed_entries=self.removed_entries,
             limits=dict(
                 seconds=None if self.seconds == float("inf") else self.seconds,
                 entries=self.entries,
@@ -1570,7 +1572,7 @@ def restore(record: Path, repo: Path) -> None:
 
 def records(state_root: Path | None = None, *, workers=None):
     """Yield (worker, record dir or None for an incomplete save, manifest or None, status) locally."""
-    base = state_root or HERE / "state"
+    base = state_root or legacy_data_root(HERE) / "state"
     with contextlib.suppress(OSError):
         for worker in sorted(p for p in base.iterdir() if p.is_dir()):
             if workers is not None and worker.name not in workers:
@@ -1616,4 +1618,4 @@ def summary(state_root: Path | None = None, *, workers=None) -> dict:
 def _state_root() -> Path:
     from .config import legacy_project, worker_state_root
 
-    return HERE / "state" if legacy_project() else worker_state_root()
+    return legacy_data_root(HERE) / "state" if legacy_project() else worker_state_root()

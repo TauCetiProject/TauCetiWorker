@@ -1001,6 +1001,14 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             workers_die("another worker manager is already running")
+        from .activity import root as activity_root
+        from .retention import install_timer
+
+        if read_json(activity_root() / "cleanup-service.json").get("installed"):
+            try:
+                install_timer()
+            except Exception as error:
+                print(f"warning: cleanup unit refresh deferred: {error}", file=sys.stderr)
         server_path = manager_socket(runtime_dir)
         server = _bind_socket(server_path)
         exiting = False
