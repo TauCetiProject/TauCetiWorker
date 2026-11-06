@@ -1360,8 +1360,8 @@ class Tasks(ControllerCase):
         )
         self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["version"], head["version"])
 
-    def test_repair_concurrency_allows_parallel_claims_and_first_adoption_wins(self):
-        self.controller.set_setting("repair_concurrency", 2, "t")
+    def test_idle_capacity_never_duplicates_a_held_head_task(self):
+        self.controller.set_setting("repair_concurrency", 8, "t")
         self.github.admins.add("second-admin")
         self.failing_head()
         one = ScriptedAgent(
@@ -1379,17 +1379,85 @@ class Tasks(ControllerCase):
             lambda t: {f"{PROJECT}#101": Resolution({"A.lean": "two\n"}, explanation="Two.")},
         )
         task_one = one.claim(self.controller)
-        task_two = two.claim(self.controller)
-        self.assertIsNotNone(task_two)
-        self.assertEqual(task_one.task_id, task_two.task_id)
-        tip_two = two.produce(task_two)
+        self.assertIsNotNone(task_one)
+        self.assertIsNone(two.claim(self.controller))
+        self.assertIsNone(one.claim(self.controller), "a repeated claim request cannot duplicate its own work")
+        self.assertEqual(len(self.controller._active_task_claims()), 1)
         tip_one = one.produce(task_one)
-        self.assertTrue(self.controller.submit_task(task_two.task_id, task_two.claim_token, tip_two).accepted)
-        late = self.controller.submit_task(task_one.task_id, task_one.claim_token, tip_one)
-        self.assertEqual((late.accepted, late.reason), (False, "claim-superseded"))
+        self.assertTrue(self.controller.submit_task(task_one.task_id, task_one.claim_token, tip_one).accepted)
         self.assertEqual(
-            self.repo.file_at(self.controller.store.row("batches", {"state": "head"})["tip"], "A.lean"), "two\n"
+            self.repo.file_at(self.controller.store.row("batches", {"state": "head"})["tip"], "A.lean"), "one\n"
         )
+
+    def test_simultaneous_claim_requests_assign_one_owner_with_spare_capacity(self):
+        self.controller.set_setting("repair_concurrency", 8, "t")
+        self.failing_head()
+        barrier = threading.Barrier(2)
+        admin = self.controller._repository_admin
+
+        def together(login):
+            allowed = admin(login)
+            barrier.wait(timeout=5)
+            return allowed
+
+        self.controller._repository_admin = together
+        results, errors = [], []
+
+        def claim(worker):
+            try:
+                results.append(self.controller.claim_task(worker, "admin-worker"))
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=claim, args=(worker,)) for worker in ("one", "two")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(sum(task is not None for task in results), 1)
+        self.assertEqual(len(self.controller._active_task_claims()), 1)
+        [task] = self.controller.store.rows("tasks", {"state": "open"})
+        self.assertEqual(task["claims"], 1)
+        self.assertEqual(len(self.controller.store.journal_entries("claimed")), 1)
+
+    def test_restart_preserves_owner_and_renewal_then_release_or_expiry_allows_replacement(self):
+        self.controller.set_setting("repair_concurrency", 8, "t")
+        self.failing_head()
+        first = self.controller.claim_task("one", "admin-worker")
+        self.controller.store.close()
+        self.controller = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(self.controller.store.close)
+        self.assertIsNone(self.controller.claim_task("two", "admin-worker"))
+        self.clock.advance(self.controller.setting("claim_ttl_seconds") - 1)
+        renewed = self.controller.renew_task(first.task_id, first.claim_token)
+        self.clock.advance(2)
+        self.assertIsNone(self.controller.claim_task("two", "admin-worker"), "renewed owner still holds the task")
+        self.assertGreater(renewed, self.clock())
+        self.controller.release_task(first.task_id, first.claim_token, "worker-stopped")
+        second = self.controller.claim_task("two", "admin-worker")
+        self.assertEqual(second.task_id, first.task_id)
+        self.assertNotEqual(second.claim_token, first.claim_token)
+        with self.assertRaisesRegex(TaskError, "claim-superseded"):
+            self.controller.renew_task(first.task_id, first.claim_token)
+        self.clock.advance(self.controller.setting("claim_ttl_seconds"))
+        third = self.controller.claim_task("three", "admin-worker")
+        self.assertEqual(third.task_id, first.task_id)
+        self.assertNotEqual(third.claim_token, second.claim_token)
+        self.assertEqual(len(self.controller._active_task_claims()), 1)
+        with self.assertRaisesRegex(TaskError, "claim-expired"):
+            self.controller.renew_task(second.task_id, second.claim_token)
+
+    def test_replacing_a_task_cannot_assign_another_worker_to_its_held_batch(self):
+        self.controller.set_setting("repair_concurrency", 8, "t")
+        head = self.failing_head()
+        first = self.controller.claim_task("one", "admin-worker")
+        replacement = self.controller._create_task(head, "repair", head["base"], [], self.clock())
+        self.assertNotEqual(replacement, first.task_id)
+        self.assertIsNone(self.controller.claim_task("two", "admin-worker"), "ownership is per batch, not task id")
+        self.controller.release_task(first.task_id, first.claim_token, "worker-stopped")
+        self.assertEqual(self.controller.claim_task("two", "admin-worker").task_id, replacement)
 
 
 class Preparation(ControllerCase):
@@ -1551,9 +1619,9 @@ class Preparation(ControllerCase):
         first = self.controller.claim_task("worker-1", "admin-worker")
         self.assertEqual((first.kind, first.batch_id), ("repair", head["id"]))
         second = self.controller.claim_task("worker-2", "admin-worker")
-        self.assertEqual((second.kind, second.batch_id), ("prepare", batch["id"]), "before a second head claim")
+        self.assertEqual((second.kind, second.batch_id), ("prepare", batch["id"]))
         third = self.controller.claim_task("worker-3", "admin-worker")
-        self.assertEqual(third.kind, "repair", "then the head's task takes the claims left")
+        self.assertIsNone(third, "unused capacity cannot duplicate either batch's work")
         self.assertIsNone(self.controller.claim_task("worker-4", "admin-worker"))
 
     def test_the_submission_adopts_repaired_commits_and_keeps_the_batch_open(self):
@@ -2455,22 +2523,27 @@ class WorkerEndpointsDuringTick(ControllerCase):
         self.assertEqual(self.controller.store.row("outbox", {"key": "comment:0"})["state"], "done")
 
     def test_a_renewal_kept_waiting_past_the_expiry_still_extends_the_claim(self):
+        self.controller.set_setting("repair_concurrency", 2, "t")
         self.failing_head()
         task = self.controller.claim_task("worker-1", "admin-worker")
         held = threading.Event()
         proceed = threading.Event()
+        answer = {}
 
         def busy_tick():
             with self.controller._lock:
                 held.set()
                 proceed.wait(10)
                 self.controller._expire_claims(self.clock())  # the tick sees the claim past its expiry
+                answer["active_task_claims"] = len(self.controller._active_task_claims())
+                answer["active_batch_claims"] = len(self.controller._active_claims(task.batch_id))
+                # Another endpoint may get the lock before the already-waiting renewal.
+                answer["replacement"] = self.controller.claim_task("worker-2", "admin-worker")
 
         holder = threading.Thread(target=busy_tick)
         holder.start()
         self.addCleanup(holder.join)
         self.assertTrue(held.wait(5))
-        answer = {}
         renewal = threading.Thread(
             target=lambda: answer.update(expires=self.controller.renew_task(task.task_id, task.claim_token))
         )
@@ -2482,6 +2555,11 @@ class WorkerEndpointsDuringTick(ControllerCase):
         self.clock.advance(self.controller.setting("claim_ttl_seconds") + 60)
         proceed.set()
         renewal.join(5)
+        holder.join(5)
+        self.assertFalse(renewal.is_alive())
+        self.assertFalse(holder.is_alive())
+        self.assertEqual((answer.get("active_task_claims"), answer.get("active_batch_claims")), (1, 1))
+        self.assertIsNone(answer.get("replacement"), "a timely renewal retains its batch even before extension")
         self.assertEqual(answer.get("expires"), self.clock() + self.controller.setting("claim_ttl_seconds"))
         claim = self.controller.store.row("claims", {"token": task.claim_token})
         self.assertIsNone(claim["released_at"], "the waiting renewal kept the claim")

@@ -464,13 +464,13 @@ predicate, repository admin permission (`security_audit.require_admin`), checked
 
 - `claim_task(worker_identity, github_login) -> Task | None`: an open task under a new claim
   (`claim_token`, `expires_at` = now + `claim_ttl_seconds`) when the login is an admin. Tasks are
-  offered within `repair_concurrency` live task claims in total, in three tiers, each by kind
+  offered within `repair_concurrency` live task claims in total, in two tiers, each by kind
   priority then age: a head `repair` or `rebase_conflict` task nobody holds; then an open batch's
   background task (`pre_rebase` (above), then `prepare` (above)) on a batch where no worker holds
   one, while background claims number fewer than `repair_concurrency - 1`, so one slot is always
-  free for head work and with `repair_concurrency` 1 nothing runs in the background; last a further
-  claim on a head task already held (parallel head work), up to `repair_concurrency` claims on it,
-  taken only when no background task waits.
+  free for head work and with `repair_concurrency` 1 nothing runs in the background.
+  A task has one live owner. A spare worker waits when no distinct task is claimable; it never
+  races another worker on the head. Expiry or release permits a replacement owner.
   A refusal because the total is reached while a head task waits counts in `claim_collisions`.
   The `Task` carries kind, batch and version,
   `base` and `tip` (the chain to start from), `onto` (the commit the replacement must be based on:
@@ -570,7 +570,7 @@ Tests are `tests/queue_fixture.py` (F), `tests/queue_controller.py` (C) and `tes
 | 8 open batch never launches CI; settings change without a PR | F `test_s8_open_batch_never_launches_ci_and_settings_change_without_a_pr`; C `Settings` |
 | 9 a conflicting PR is probed again and inserts once its batch-mate landed | F `test_s9_conflicting_pr_is_probed_again_and_inserts_once_its_batch_mate_landed`, `test_conflicting_pr_is_not_probed_again_until_the_batch_base_changes` (both with `open_batch_limit` 1), `test_pr_conflicting_with_main_itself_gets_the_conflict_request` |
 | 10 admin advances, lost promotion responses, no merge commit, stale CI | F `test_s10_admin_advance_...`, `test_s10_promotion_refused_after_an_advance_between_pass_and_push`, `test_s10_lost_promotion_response_is_reconciled_from_main`, `test_s10_s19_stale_status_cannot_approve_changed_source` |
-| 11 authorized claim, second claimant and late result cannot compete | F `test_s6_s11_...`, `test_s11_renewal_keeps_a_claim_alive_and_release_frees_the_task`; C `test_repair_concurrency_allows_parallel_claims_and_first_adoption_wins` (warm artifacts are stream G's) |
+| 11 authorized claim, second claimant and late result cannot compete | F `test_s6_s11_...`, `test_s11_renewal_keeps_a_claim_alive_and_release_frees_the_task`; C one-owner claim, expiry and release regressions (warm artifacts are stream G's) |
 | 12 restart recovers outbox, claims and CI state before repeating work | F `test_s12_restart_recovers_pending_outbox_expired_claim_and_repeats_no_work`, `test_s12_loop_runs_passes_on_wake_and_on_the_polling_interval` |
 | 13 inference hold | F `test_s13_inference_hold_stops_sealing_keeps_the_head_and_resumes_on_success`, `test_s13_hold_without_a_head_prevents_sealing_until_a_provider_call_succeeds`; C `Holds` |
 | 14 shrink to green | F `test_s14_shrink_to_green_lands_with_an_empty_commit_and_names_what_was_dropped` |

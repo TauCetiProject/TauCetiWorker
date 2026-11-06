@@ -58,7 +58,9 @@ tasks as navigation; overlap alone does not imply a source failure.
 A predicted compiled collision makes an open batch eligible for preparation without waiting for
 the usual size and quiet thresholds. On a head, the controller dispatches the first CI attempt
 and exposes a repair task alongside it. A collision digest bypasses preparation thresholds once
-per base, so each insertion does not trigger another speculative build. The candidate build continues while the worker repairs
+per base once a worker actually claims it, so each insertion does not trigger another speculative
+build. An unclaimed offer superseded by insertion remains eligible at the new version; creating
+a task is not an attempted build. The candidate build continues while the worker repairs
 its private chain. CI observation and infrastructure retries continue while the agent works. A passing candidate
 retires even a claimed speculative task and lands immediately. The next batch can still pre-rebase
 speculatively; adoption of a changed head supersedes stale work. An adoption that
