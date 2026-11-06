@@ -167,6 +167,22 @@ def workers(roots):
     return result
 
 
+TOKEN_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens")
+
+
+def recorded_usage(records):
+    result = {}
+    for key in TOKEN_KEYS:
+        values = [r.get(key) for r in records]
+        known = [v for v in values if type(v) is int and 0 <= v <= 10**12]
+        result[key] = {
+            "recorded_tokens": sum(known),
+            "recorded_attempts": len(known),
+            "unknown_attempts": len(values) - len(known),
+        }
+    return result
+
+
 class TaskObservations:
     """Bounded cached projection of trusted worker checkpoints/outcomes."""
 
@@ -193,9 +209,9 @@ class TaskObservations:
                         # The task itself carries a claim token. Never copy it.
                         if str((raw.get("task") or {}).get("task_id")) != str(task["id"]):
                             continue
-                        costs, providers, models, nodes = [], set(), set(), 0
+                        costs, providers, models, usages, nodes = [], set(), set(), [], 0
 
-                        def walk(value, depth=0, *, costs=costs, providers=providers, models=models):
+                        def walk(value, depth=0, *, costs=costs, providers=providers, models=models, usages=usages):
                             nonlocal nodes
                             nodes += 1
                             if depth > 8 or nodes > 500:
@@ -206,6 +222,8 @@ class TaskObservations:
                             elif isinstance(value, dict):
                                 if "telemetry" in value or "estimated_cost_usd" in value:
                                     costs.append(numeric(value.get("estimated_cost_usd")))
+                                    usage = (value.get("telemetry") or {}).get("usage")
+                                    usages.append(usage if isinstance(usage, dict) else {})
                                     provider = value.get("provider")
                                     if provider in ("codex", "claude", "openai", "anthropic", "gemini"):
                                         providers.add(provider)
@@ -228,6 +246,7 @@ class TaskObservations:
                             "seconds": numeric(final.get("seconds")),
                             "providers": sorted(providers),
                             "models": sorted(models),
+                            "usage": recorded_usage(usages),
                             "cost": {
                                 "recorded_usd": sum(c for c in costs if c is not None),
                                 "recorded_attempts": sum(c is not None for c in costs),
@@ -490,6 +509,9 @@ def project(
         "schema": SCHEMA,
         "observed_at": iso(captured),
         "source_revision": text(service.get("revision"), 40),
+        "canonical_sha": status.get("canonical_sha")
+        if isinstance(status.get("canonical_sha"), str) and SHA.fullmatch(status["canonical_sha"])
+        else None,
         "coverage": "partial" if truncated else "observed",
         "truncated": truncated,
         "collection_complete": complete,

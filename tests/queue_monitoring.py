@@ -82,6 +82,11 @@ class Monitoring(unittest.TestCase):
         self.assertEqual(exported["workers"][0]["id"], monitoring.worker_alias("repair-a"))
         self.assertEqual(exported["workers"][0]["errors"], 0)
 
+    def test_canonical_tip_uses_the_existing_status_fact(self):
+        value = self.export(status={"canonical_sha": "a" * 40})
+        self.assertEqual(value["canonical_sha"], "a" * 40)
+        self.assertIsNone(self.export(status={"canonical_sha": "PRIVATE_PATH"})["canonical_sha"])
+
     def test_task_checkpoint_and_outcome_keep_only_recorded_public_progress(self):
         sentinel = "DO_NOT_PUBLISH_SECRET"
         head = self.controller._head()
@@ -111,7 +116,10 @@ class Monitoring(unittest.TestCase):
                                     "provider": "codex",
                                     "model": "gpt-6.1",
                                     "estimated_cost_usd": 1.25,
-                                    "telemetry": {"raw_prompt": sentinel},
+                                    "telemetry": {
+                                        "raw_prompt": sentinel,
+                                        "usage": {"input_tokens": 321, "output_tokens": 123, "private": sentinel},
+                                    },
                                 }
                             ]
                         }
@@ -123,6 +131,13 @@ class Monitoring(unittest.TestCase):
         value = self.export(worker_roots=[root], task_observations=monitoring.TaskObservations())
         progress = next(t for t in value["tasks"] if t["id"] == str(task_id))["progress"]
         self.assertEqual(progress["models"], ["gpt-6.1"])
+        self.assertEqual(
+            progress["usage"]["input_tokens"], {"recorded_tokens": 321, "recorded_attempts": 1, "unknown_attempts": 0}
+        )
+        self.assertEqual(
+            progress["usage"]["cached_input_tokens"],
+            {"recorded_tokens": 0, "recorded_attempts": 0, "unknown_attempts": 1},
+        )
         self.assertEqual(progress["cost"]["recorded_usd"], 1.25)
         self.assertEqual(progress["state"], "agent_running")
         self.assertNotIn(sentinel, json.dumps(value))
