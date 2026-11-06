@@ -84,6 +84,69 @@ class AdmissionTests(unittest.TestCase):
         self.event("status", {"sha": head, "context": "build"})
         self.assertEqual(self.intake.run_once()["approved"], 1)
 
+    def test_queue_output_labels_and_title_edits_do_not_dirty_completed_work(self):
+        head = self.ready()
+        self.intake.run_once()
+        completed = self.intake.state.get(1)
+        snapshots = sum(call[0] == "admission_snapshot" for call in self.github.calls)
+        for label in ("bors-staging", "repaired-in-queue", "unrelated-label"):
+            for action in ("labeled", "unlabeled"):
+                with self.subTest(label=label, action=action):
+                    self.event(
+                        "pull_request",
+                        {
+                            "number": 1,
+                            "action": action,
+                            "label": {"name": label},
+                            "pull_request": {"head": {"sha": head}},
+                        },
+                    )
+                    self.assertEqual(self.intake.state.get(1), completed)
+        self.event(
+            "pull_request",
+            {"number": 1, "action": "edited", "changes": {"title": {"from": "Old title"}}},
+        )
+        self.assertEqual(self.intake.state.get(1), completed)
+        self.assertEqual(self.intake.run_once()["evaluated"], 0)
+        self.assertEqual(sum(call[0] == "admission_snapshot" for call in self.github.calls), snapshots)
+
+    def test_policy_label_body_and_unknown_pr_events_still_dirty_work(self):
+        self.ready()
+        self.intake.run_once()
+        events = [
+            {"action": action, "label": {"name": label}}
+            for label in ("hold", "dont-repair-in-queue", "needs-rebase")
+            for action in ("labeled", "unlabeled")
+        ] + [
+            {"action": "edited", "changes": {"body": {"from": "Old body"}}},
+            {"action": "edited", "changes": {"title": {"from": "Old title"}, "base": {"ref": {"from": "main"}}}},
+            {"action": "edited"},
+            {"action": "labeled"},
+            {"action": "synchronize"},
+            {"action": "closed"},
+            {"action": "converted_to_draft"},
+            {"action": "unknown-action"},
+        ]
+        for event in events:
+            with self.subTest(event=event):
+                generation = self.intake.state.get(1)["generation"]
+                self.event("pull_request", {"number": 1, **event})
+                self.assertEqual(self.intake.state.get(1)["generation"], generation + 1)
+
+    def test_custom_no_repair_labels_match_case_insensitively_in_events_and_versions(self):
+        head = self.ready()
+        self.intake.run_once()
+        self.controller.set_setting("no_repair_labels", ["CUSTOM-NO-REPAIR"], "test")
+        self.github.labels[1].add("custom-no-repair")
+        generation = self.intake.state.get(1)["generation"]
+        self.event("pull_request", {"number": 1, "action": "labeled", "label": {"name": "custom-no-repair"}})
+        self.assertEqual(self.intake.state.get(1)["generation"], generation + 1)
+        self.assertEqual(self.controller.input_for(REPO, 1)["no_repair"], 1)
+        source = {"state": "open", "head": head}
+        self.assertNotEqual(
+            self.intake._version(source), self.intake._version(source | {"labels": ["custom-no-repair"]})
+        )
+
     def test_inference_outage_preserves_primary_intake_and_resumes_the_same_queue(self):
         for _ in range(self.controller.setting("inference_failure_threshold")):
             self.controller.report_inference("worker", False, "all providers unavailable")

@@ -51,7 +51,8 @@ def source_version(source: dict, revision: str, no_repair_labels=()) -> str:
             **{key: source.get(key) for key in ("head", "base_ref", "state", "draft", "body")},
             "diff": source.get("diff_version") or source.get("merge_base"),
             "labels": sorted(
-                {s.lower() for s in source.get("labels", ())} & (KEEP | set(no_repair_labels) | {"needs-rebase"})
+                {s.lower() for s in source.get("labels", ())}
+                & (KEEP | {s.lower() for s in no_repair_labels} | {"needs-rebase"})
             ),
             "comments": [
                 {
@@ -227,6 +228,17 @@ class AdmissionPoller:
         """Persist before webhook acknowledgement. No GitHub call or policy evaluation here."""
         pull = payload.get("pull_request") or {}
         number = payload.get("number") or pull.get("number") or (payload.get("issue") or {}).get("number")
+        if kind == "pull_request":
+            if payload.get("action") in ("labeled", "unlabeled"):
+                label_payload = payload.get("label")
+                label = label_payload.get("name") if isinstance(label_payload, dict) else None
+                relevant_labels = KEEP | self.controller._no_repair_labels() | {"needs-rebase"}
+                if isinstance(label, str) and label and label.lower() not in relevant_labels:
+                    return  # membership and repair labels are queue output, not admission evidence
+            elif payload.get("action") == "edited":
+                changes = payload.get("changes")
+                if isinstance(changes, dict) and changes and set(changes) <= {"title"}:
+                    return
         if kind == "issue_comment":
             comment = payload.get("comment") or {}
             previous_body = ((payload.get("changes") or {}).get("body") or {}).get("from") or ""
