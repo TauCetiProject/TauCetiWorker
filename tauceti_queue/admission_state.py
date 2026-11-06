@@ -60,15 +60,11 @@ class AdmissionState:
 
     def due(self) -> list[dict]:
         """A finite current generation; no PR-count ceiling and no lifetime retry limit."""
-        with self.store.transaction():
-            return [
-                dict(row)
-                for row in self.store.execute(
-                    "SELECT * FROM admission_work WHERE repository=? AND generation!=evaluated_generation "
-                    "AND next_attempt_at<=? ORDER BY urgent DESC, attempted_at, first_pending_at, id",
-                    (self.repository, self.clock()),
-                ).fetchall()
-            ]
+        return self.store.query(
+            "SELECT * FROM admission_work WHERE repository=? AND generation!=evaluated_generation "
+            "AND next_attempt_at<=? ORDER BY urgent DESC, attempted_at, first_pending_at, id",
+            (self.repository, self.clock()),
+        )
 
     def attempted(self, work: dict) -> None:
         self.store.update("admission_work", {"id": work["id"]}, attempted_at=self.clock())
@@ -86,10 +82,11 @@ class AdmissionState:
                 urgent=0,
                 next_attempt_at=0,
                 last_error="",
+                retry_resource="",
             )
         )
 
-    def defer(self, work: dict, until: float, error: str) -> bool:
+    def defer(self, work: dict, until: float, error: str, resource: str = "source") -> bool:
         """Preserve the actual deadline, without postponing newly invalidated work."""
         return bool(
             self.store.update(
@@ -97,17 +94,25 @@ class AdmissionState:
                 {"id": work["id"], "generation": work["generation"]},
                 next_attempt_at=until,
                 last_error=error,
+                retry_resource=resource,
             )
         )
 
     def summary(self) -> dict:
-        pending = [
-            r
-            for r in self.store.rows("admission_work", {"repository": self.repository})
-            if r["generation"] != r["evaluated_generation"]
-        ]
+        pending = self.store.query(
+            "SELECT number, head_sha, attempted_at, first_pending_at, next_attempt_at, last_error, retry_resource "
+            "FROM admission_work WHERE repository=? AND generation!=evaluated_generation",
+            (self.repository,),
+        )
         return {
             "pending": len(pending),
             "oldest_pending_at": min((r["first_pending_at"] for r in pending), default=None),
             "next_attempt_at": min((r["next_attempt_at"] for r in pending), default=None),
+            "pending_prs": [
+                {
+                    key: r[key]
+                    for key in ("number", "head_sha", "attempted_at", "next_attempt_at", "last_error", "retry_resource")
+                }
+                for r in pending
+            ],
         }

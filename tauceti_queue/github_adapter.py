@@ -51,7 +51,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 
-from . import declaration_names, diagnostics, github_app, ports
+from . import chain, declaration_names, diagnostics, github_app, ports
 from .ports import CandidatePhase, CandidateRun, FastForwardResult, Status
 
 API = github_app.API
@@ -107,6 +107,7 @@ class PullRequest(ports.PullRequest):
     author_id: int = 0
     head_repo: str = ""
     merged: bool = False
+    updated_at: str = ""
 
     @classmethod
     def from_json(cls, data: dict) -> PullRequest:
@@ -127,6 +128,7 @@ class PullRequest(ports.PullRequest):
             author_id=int(user.get("id") or 0),
             head_repo=str(((head.get("repo") or {}).get("full_name")) or ""),
             merged=bool(data.get("merged")),
+            updated_at=str(data.get("updated_at") or ""),
         )
 
 
@@ -178,7 +180,9 @@ class UrllibTransport:
                 return (
                     response.status,
                     {k.lower(): v for k, v in response.headers.items()},
-                    response.read(MAX_LOG_BYTES),
+                    response.read()
+                    if response.headers.get_content_type() == "application/json"
+                    else response.read(MAX_LOG_BYTES),
                 )
         except urllib.error.HTTPError as error:
             return error.code, {k.lower(): v for k, v in error.headers.items()}, error.read()
@@ -205,6 +209,9 @@ class GitHubClient:
         self._clock = clock
         self._sleep = sleep
         self._lock = threading.Lock()
+        self._priority = threading.Condition(self._lock)
+        self._essential: dict[str, int] = {}
+        self._resource_limits: dict[str, dict] = {}
         self._local = threading.local()
         self._blocked_until: dict[str, float] = {}
         self.requests = 0
@@ -229,25 +236,49 @@ class GitHubClient:
                 "rate_limit": self.limit,
                 "rate_limit_reset_at": self.reset_at,
                 "last_error": self.last_error,
+                "resources": {key: dict(value) for key, value in self._resource_limits.items()},
+                "blocked_until": dict(self._blocked_until),
             }
 
     def rate_limit(self) -> tuple[int | None, float | None]:
         with self._lock:
             return self.remaining, self.reset_at
 
-    def _record(self, headers: dict[str, str]) -> None:
+    def _record(self, headers: dict[str, str], resource="core") -> None:
         with self._lock:
+            record = self._resource_limits.setdefault(resource, {})
             try:
                 if "x-ratelimit-remaining" in headers:
-                    self.remaining = int(headers["x-ratelimit-remaining"])
+                    record["remaining"] = int(headers["x-ratelimit-remaining"])
                 if "x-ratelimit-limit" in headers:
-                    self.limit = int(headers["x-ratelimit-limit"])
+                    record["limit"] = int(headers["x-ratelimit-limit"])
                 if "x-ratelimit-reset" in headers:
-                    self.reset_at = float(headers["x-ratelimit-reset"])
+                    record["reset_at"] = float(headers["x-ratelimit-reset"])
             except ValueError:
                 pass
+            if resource == "core":
+                self.remaining = record.get("remaining")
+                self.limit = record.get("limit")
+                self.reset_at = record.get("reset_at")
 
     # -- requests
+
+    def _send(self, method, url, headers, body, *, resource, deferred):
+        # Essential queue/CI requests never wait for background intake. Before each intake
+        # request, let already-active essential work finish on that bucket. There is no fixed
+        # quota reserve; unrelated buckets and essential requests remain free to run.
+        with self._priority:
+            while deferred and self._essential.get(resource, 0):
+                self._priority.wait()
+            if not deferred:
+                self._essential[resource] = self._essential.get(resource, 0) + 1
+        try:
+            return self._transport(method, url, headers, body)
+        finally:
+            if not deferred:
+                with self._priority:
+                    self._essential[resource] -= 1
+                    self._priority.notify_all()
 
     @contextmanager
     def deferred_requests(self):
@@ -316,10 +347,14 @@ class GitHubClient:
                 used_installation = True
             with self._lock:
                 self.requests += 1
-            status, response_headers, data = self._transport(method, url, headers, body)
+            status, response_headers, data = self._send(
+                method, url, headers, body, resource=resource, deferred=deferred
+            )
             response_headers = {k.lower(): v for k, v in response_headers.items()}
-            if record_limit:
-                self._record(response_headers)
+            self._record(
+                response_headers,
+                response_headers.get("x-ratelimit-resource") or (resource if not record_limit else "core"),
+            )
             if status in accepted:
                 return Response(status, response_headers, data)
             if status == 401 and used_installation and attempt == 1:
@@ -385,10 +420,21 @@ class GitHubClient:
         response = self.request("GET", path, params=params, token=token, tolerate=tolerate)
         return response.status, response.json()
 
-    def paginate(self, path: str, *, params: dict | None = None, key: str | None = None, per_page: int = 100) -> list:
-        """Every item of a paginated list endpoint (array responses, or `key` of object responses)."""
-        items: list = []
-        page = 1
+    def paginate(
+        self,
+        path: str,
+        *,
+        params: dict | None = None,
+        key: str | None = None,
+        per_page: int = 100,
+        progress: dict | None = None,
+    ) -> list:
+        """Every page; an intake-owned progress object retains read pages across a resource wait."""
+        progress = {} if progress is None else progress
+        items = progress.setdefault("items", [])
+        page = progress.setdefault("page", 1)
+        if progress.get("done"):
+            return items
         while True:
             query = dict(params or {})
             query.update(per_page=per_page, page=page)
@@ -398,8 +444,10 @@ class GitHubClient:
                 raise GitHubError(f"unexpected page shape from {path}", status)
             items.extend(batch)
             if len(batch) < per_page:
+                progress["done"] = True
                 return items
             page += 1
+            progress["page"] = page
 
     def graphql(self, query: str, variables: dict | None = None) -> dict:
         """One GraphQL call (`POST /graphql`); returns `data`, raising `GitHubError` on `errors`."""
@@ -500,6 +548,12 @@ class GitHubAdapter:
             raise ValueError("GitHubAdapter needs the repository name")
         self.clone_dir = os.fspath(os.path.expanduser(clone_dir)) if clone_dir is not None else None
         self._git = git
+        # Resident API pagination, not an external work queue or an Actions checkpoint. The
+        # database owns PR work; these read buffers prevent exhausting quota from restarting
+        # a long listing at page one. A process restart uses normal source reconciliation.
+        self._admission_reads: dict = {}
+        self._admission_listing: dict = {}
+        self._admission_comment_pages: dict = {}
 
     # -- pull requests
 
@@ -887,7 +941,209 @@ class GitHubAdapter:
             key="check_runs",
         )
 
-    def list_open_pull_requests(self, repo: str, *, review_app_id: int) -> list[ports.OpenPullRequest]:
+    def _diff_version(self, base: str, head: str) -> str:
+        if (
+            not self.clone_dir
+            or not chain.object_exists(self.clone_dir, base)
+            or not chain.object_exists(self.clone_dir, head)
+        ):
+            return "unknown:" + base
+        bases = sorted(chain.git(self.clone_dir, "merge-base", "--all", base, head).split())
+        if not bases:
+            raise GitHubError("PR and target have no merge base")
+        # Advancing main normally leaves the reviewed diff unchanged. Multiple merge bases are
+        # ambiguous: retain the target identity and let the compare API resolve a fresh decision.
+        return bases[0] if len(bases) == 1 else ",".join([*bases, base])
+
+    def admission_snapshot(self, repo: str, number: int, *, generation=0) -> ports.AdmissionSnapshot:
+        """Read complete current inputs and the exact reviewed diff; never run a PR's code."""
+        pull = self.fetch_pr(repo, number)
+        if pull.state != "open" or pull.draft:
+            self._admission_reads.pop((repo, number), None)
+            return ports.AdmissionSnapshot(pull, "", (), (), {})
+        if not self.clone_dir or not SHA.fullmatch(pull.head_sha) or not SHA.fullmatch(pull.base_sha):
+            raise GitHubError("admission needs a clone and complete head/target identities")
+        missing = [sha for sha in (pull.base_sha, pull.head_sha) if not chain.object_exists(self.clone_dir, sha)]
+        if missing:
+            self.fetch_refs(repo, missing)
+        # The pending head stays reachable across local GC until it is replaced or closed.
+        chain.git(self.clone_dir, "update-ref", f"{chain.REF_NAMESPACE}/admission/{number}", pull.head_sha)
+        identity = (pull.head_sha, pull.base_sha, pull.updated_at, generation)
+        progress = self._admission_reads.setdefault((repo, number), {"identity": identity})
+        if progress["identity"] != identity:
+            progress = self._admission_reads[(repo, number)] = {"identity": identity}
+        if "merge_base" not in progress:
+            _, compare = self.client.get_json(
+                f"repos/{repo}/compare/{pull.base_sha}...{pull.head_sha}", params={"per_page": 1}
+            )
+            progress["merge_base"] = ((compare or {}).get("merge_base_commit") or {}).get("sha")
+        merge_base = progress["merge_base"]
+        if not isinstance(merge_base, str) or not SHA.fullmatch(merge_base):
+            raise GitHubError("compare did not return a complete merge base")
+        if not chain.object_exists(self.clone_dir, merge_base):
+            self.fetch_refs(repo, [merge_base])
+        paths = tuple(
+            p
+            for p in chain.git(
+                self.clone_dir,
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=none",
+                merge_base,
+                pull.head_sha,
+                "--",
+            ).split("\0")
+            if p
+        )
+        comments = tuple(
+            self.client.paginate(f"repos/{repo}/issues/{number}/comments", progress=progress.setdefault("comments", {}))
+        )
+        statuses = {}
+        for item in self.client.paginate(
+            f"repos/{repo}/commits/{pull.head_sha}/statuses", progress=progress.setdefault("statuses", {})
+        ):
+            if item.get("context") in ("build", "scope", "bump-guard"):
+                statuses.setdefault(item["context"], str(item.get("state") or "").lower())
+        fresh = self.fetch_pr(repo, number)
+        if (
+            fresh.head_sha,
+            fresh.base_sha,
+            fresh.base_ref,
+            fresh.state,
+            fresh.draft,
+            fresh.labels,
+            fresh.body,
+            fresh.updated_at,
+        ) != (
+            pull.head_sha,
+            pull.base_sha,
+            pull.base_ref,
+            pull.state,
+            pull.draft,
+            pull.labels,
+            pull.body,
+            pull.updated_at,
+        ):
+            self._admission_reads.pop((repo, number), None)
+            raise GitHubError("PR inputs changed while admission was reading source evidence")
+        self._admission_reads.pop((repo, number), None)
+        return ports.AdmissionSnapshot(
+            fresh, merge_base, paths, comments, statuses, self._diff_version(pull.base_sha, pull.head_sha)
+        )
+
+    def _admission_pulls(self, repo, on_page):
+        owner, name = repo.split("/", 1)
+        progress = self._admission_listing.setdefault(
+            repo, {"listed": [], "cursor": None, "connection": None, "index": 0, "batch": []}
+        )
+        while True:
+            cursor = progress["cursor"]
+            if progress["connection"] is None:
+                data = self.client.graphql(ADMISSION_PULLS_QUERY, {"owner": owner, "name": name, "after": cursor})
+                progress["connection"] = (data.get("repository") or {}).get("pullRequests")
+            connection = progress["connection"]
+            if not isinstance(connection, dict) or not isinstance(connection.get("nodes"), list):
+                raise GitHubError("incomplete PR discovery")
+            batch = progress["batch"]
+            for node in connection["nodes"][progress["index"] :]:
+                if not isinstance(node, dict) or not isinstance(node.get("number"), int):
+                    raise GitHubError("incomplete PR discovery node")
+                number, head, base = node["number"], node.get("headRefOid", ""), node.get("baseRefOid", "")
+                # Fetch a new target once, so a normal canonical advance doesn't invalidate every
+                # unchanged review. PR heads are fetched only when evaluating new/dirty work.
+                if self.clone_dir and SHA.fullmatch(base) and not chain.object_exists(self.clone_dir, base):
+                    self.fetch_refs(repo, [base])
+                comments = self._admission_comments(repo, number, node.get("comments"))
+                label_connection = node.get("labels") or {}
+                page = label_connection.get("pageInfo")
+                if not isinstance(page, dict):
+                    raise GitHubError("incomplete label connection")
+                labels = (
+                    self.labels(repo, number)
+                    if page.get("hasNextPage")
+                    else [s["name"] for s in label_connection.get("nodes", ())]
+                )
+                commits = (node.get("commits") or {}).get("nodes") or []
+                commit = (commits[-1].get("commit") or {}) if commits else {}
+                if commit.get("oid") != head:
+                    raise GitHubError("discovery commit does not match the PR head")
+                statuses = {
+                    s["context"]: str(s.get("state") or "").lower()
+                    for s in (commit.get("status") or {}).get("contexts", ())
+                    if s.get("context") in ("build", "scope", "bump-guard")
+                }
+                source = {
+                    "head": head,
+                    "base_ref": node.get("baseRefName", ""),
+                    "state": "open",
+                    "draft": bool(node.get("isDraft")),
+                    "body": node.get("body", ""),
+                    "labels": labels,
+                    "comments": comments,
+                    "statuses": statuses,
+                    "diff_version": self._diff_version(base, head),
+                }
+                batch.append(ports.OpenPullRequest(number, head, source["base_ref"], source["draft"], admission=source))
+                progress["index"] += 1
+            if on_page is not None:
+                on_page(batch)
+            progress["listed"].extend(batch)
+            page = connection.get("pageInfo")
+            if not isinstance(page, dict) or (page.get("hasNextPage") and not page.get("endCursor")):
+                raise GitHubError("incomplete PR pagination")
+            if not page.get("hasNextPage"):
+                self._admission_listing.pop(repo, None)
+                return progress["listed"]
+            if page["endCursor"] == cursor:
+                raise GitHubError("PR pagination did not advance")
+            progress.update(cursor=page["endCursor"], connection=None, index=0, batch=[])
+
+    def _admission_comments(self, repo, number, connection):
+        owner, name = repo.split("/", 1)
+        progress = self._admission_comment_pages.setdefault((repo, number), {"comments": [], "cursor": None})
+        comments, cursor = progress["comments"], progress["cursor"]
+        if cursor:
+            data = self.client.graphql(
+                ADMISSION_COMMENTS_QUERY, {"owner": owner, "name": name, "number": number, "after": cursor}
+            )
+            connection = ((data.get("repository") or {}).get("pullRequest") or {}).get("comments")
+        while True:
+            if not isinstance(connection, dict) or not isinstance(connection.get("nodes"), list):
+                raise GitHubError("incomplete review comments")
+            for comment in connection["nodes"]:
+                if not isinstance(comment, dict) or not isinstance(comment.get("databaseId"), int):
+                    raise GitHubError("incomplete review comment")
+                comments.append(
+                    {
+                        "id": comment["databaseId"],
+                        "body": comment.get("body", ""),
+                        "created_at": comment.get("createdAt", ""),
+                        "updated_at": comment.get("updatedAt", ""),
+                        "html_url": comment.get("url", ""),
+                    }
+                )
+            page = connection.get("pageInfo")
+            if not isinstance(page, dict) or (page.get("hasNextPage") and not page.get("endCursor")):
+                raise GitHubError("incomplete review comment pagination")
+            if not page.get("hasNextPage"):
+                self._admission_comment_pages.pop((repo, number), None)
+                return comments
+            if page["endCursor"] == cursor:
+                raise GitHubError("review comment pagination did not advance")
+            cursor = page["endCursor"]
+            progress["cursor"] = cursor
+            data = self.client.graphql(
+                ADMISSION_COMMENTS_QUERY, {"owner": owner, "name": name, "number": number, "after": cursor}
+            )
+            connection = ((data.get("repository") or {}).get("pullRequest") or {}).get("comments")
+
+    def list_open_pull_requests(
+        self, repo: str, *, review_app_id: int, admission=False, on_page=None
+    ) -> list[ports.OpenPullRequest]:
         """Every open PR with the review App's `merge eligibility` check runs on its head.
 
         One GraphQL page per 100 PRs: the PR's head, draft flag and base, and from the head commit
@@ -897,6 +1153,16 @@ class GitHubAdapter:
         with an installation token (observed on production, 2026-11-04), so the review App id the
         filter selected by is what the mapped records carry.
         """
+        if admission:
+            try:
+                return self._admission_pulls(repo, on_page)
+            except RateLimited:
+                raise
+            except Exception:
+                # Invalid/partial GraphQL data is never promoted into a completed source view.
+                self._admission_listing.pop(repo, None)
+                self._admission_comment_pages = {k: v for k, v in self._admission_comment_pages.items() if k[0] != repo}
+                raise
         owner, name = repo.split("/", 1)
         listed: list[ports.OpenPullRequest] = []
         cursor = None
@@ -1063,6 +1329,41 @@ query($owner: String!, $name: String!, $after: String, $appId: Int!) {
   }
 }
 """
+
+ADMISSION_COMMENT_FIELDS = """
+  pageInfo { hasNextPage endCursor }
+  nodes { databaseId body createdAt updatedAt url }
+"""
+ADMISSION_PULLS_QUERY = (
+    """
+query($owner: String!, $name: String!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, first: 100, after: $after, orderBy: {field: CREATED_AT, direction: ASC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number isDraft baseRefName baseRefOid headRefOid body
+        labels(first: 100) { pageInfo { hasNextPage } nodes { name } }
+        comments(first: 100) { """
+    + ADMISSION_COMMENT_FIELDS
+    + """ }
+        commits(last: 1) { nodes { commit { oid status { contexts { context state } } } } }
+      }
+    }
+  }
+}
+"""
+)
+ADMISSION_COMMENTS_QUERY = (
+    """
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) { comments(first: 100, after: $after) { """
+    + ADMISSION_COMMENT_FIELDS
+    + """ } }
+  }
+}
+"""
+)
 
 
 def _rest_check_run(run: dict, head_sha: str, app_id) -> dict:

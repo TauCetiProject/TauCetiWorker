@@ -338,6 +338,7 @@ class Controller:
         logger: logging.Logger | None = None,
     ) -> None:
         self.store = store
+        self.admission = None  # primary policy intake, attached by the service in policy mode
         self.github = github
         self.clone = clone
         self.repository = repository
@@ -710,6 +711,8 @@ class Controller:
                         changed["priority"] = priority
                     if changed:
                         self.store.update("inputs", {"id": existing["id"]}, **changed)
+                    if self.admission is not None and (evidence or {}).get("kind") != "admission_policy":
+                        self.admission.accept_manual(pr, head_sha)
                     return {"accepted": True, "reason": "already-approved", "input": self._input_for(pr)}
                 if existing["state"] == INPUT_INSERTED:
                     return {"accepted": False, "reason": "member", "input": existing}
@@ -748,6 +751,8 @@ class Controller:
                     retained_ref=ref,
                     no_repair=int(no_repair),
                 )
+                if self.admission is not None and (evidence or {}).get("kind") != "admission_policy":
+                    self.admission.accept_manual(pr, head_sha)
                 self.store.journal(
                     now,
                     "approved",
@@ -918,19 +923,31 @@ class Controller:
             "has not landed; the first head seals after that canonical advance or a release"
         )
 
-    def unapprove(self, repo: str, pr: int, actor: str = "") -> dict[str, Any]:
+    def unapprove(self, repo: str, pr: int, actor: str = "", *, head_sha: str = "") -> dict[str, Any]:
         """`bors r-`: a waiting input is withdrawn; a batch member is not (membership is fixed)."""
-        return self._withdraw(repo, pr, "unapproved", actor)
+        return self._withdraw(repo, pr, "unapproved", actor, head_sha=head_sha)
 
-    def cancel(self, repo: str, pr: int, actor: str = "") -> dict[str, Any]:
+    def cancel(self, repo: str, pr: int, actor: str = "", *, head_sha: str = "") -> dict[str, Any]:
         """`bors cancel`: the same as `unapprove`; the head is never cancelled."""
-        return self._withdraw(repo, pr, "cancelled", actor)
+        return self._withdraw(repo, pr, "cancelled", actor, head_sha=head_sha)
 
-    def _withdraw(self, repo: str, pr: int, reason: str, actor: str) -> dict[str, Any]:
+    def _withdraw(self, repo: str, pr: int, reason: str, actor: str, *, head_sha: str = "") -> dict[str, Any]:
         with self._lock:
             self._check_repo(repo)
             now = self.clock()
             current = self._input_for(pr)
+            if (
+                self.admission is not None
+                and reason in ("unapproved", "cancelled")
+                and (current is None or current["state"] != INPUT_INSERTED)
+            ):
+                with self.store.transaction():
+                    self.admission.withdraw(pr, head_sha or (current or {}).get("head_sha", ""))
+                    if current is not None and current["state"] in (INPUT_WAITING, INPUT_RESERVED):
+                        self.store.update("inputs", {"id": current["id"]}, state=INPUT_CANCELLED, reason=reason)
+                        self.store.journal(now, "withdrawn", number=pr, reason=reason, actor=actor)
+                        self._refresh_snapshot()
+                        return {"withdrawn": True, "reason": reason}
             if current is None or current["state"] in (INPUT_LANDED, INPUT_CANCELLED):
                 return {"withdrawn": False, "reason": "not-waiting"}
             if current["state"] == INPUT_INSERTED:
@@ -5128,6 +5145,13 @@ class Controller:
                     "polled": counters.get("approvals_polled", 0),
                     "revoked_by_poll": counters.get("approvals_revoked_by_poll", 0),
                     "last_poll": self._state("approval_poll"),
+                },
+                "admission": {"source": "eligibility"}
+                if self.admission is None
+                else {
+                    "source": "policy",
+                    "policy_digest": self.admission.policy.revision,
+                    **self.admission.state.summary(),
                 },
                 "anticipated": [
                     {

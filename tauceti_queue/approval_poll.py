@@ -280,6 +280,8 @@ class ApprovalPollLoop:
         self.stop_event = threading.Event()
         self.wake_event = threading.Event()
         self._thread: threading.Thread | None = None
+        if hasattr(poller, "wake"):
+            poller.wake = self.wake
 
     def interval(self) -> float:
         interval = self.poller.interval()
@@ -290,12 +292,12 @@ class ApprovalPollLoop:
     def run(self) -> None:
         reason = "start"
         while not self.stop_event.is_set():
+            self.wake_event.clear()
             try:
                 self.poller.run_once(reason=reason)
             except Exception:  # noqa: BLE001 - the loop must survive any adapter failure
                 log.exception("approval poll failed")
             woken = self.wake_event.wait(timeout=self.interval())
-            self.wake_event.clear()
             reason = "wake" if woken else "interval"
 
     def wake(self) -> None:

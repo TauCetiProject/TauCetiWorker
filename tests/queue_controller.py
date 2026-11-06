@@ -2168,6 +2168,7 @@ class StatusShape(ControllerCase):
                 "head",
                 "external_head",
                 "approvals",
+                "admission",
                 "anticipated",
                 "tasks",
                 "outbox",

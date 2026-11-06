@@ -1,0 +1,274 @@
+"""Primary intake with real controller/SQLite/git: safe decisions, fairness and crash recovery."""
+
+import json
+import sys
+import tempfile
+import threading
+import unittest
+from datetime import UTC, datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tauceti_queue import webhook
+from tauceti_queue.admission import AdmissionPolicy, AdmissionPoller
+from tauceti_queue.fakes import make_controller, reopen_controller
+from tauceti_queue.github_adapter import RateLimited
+from tauceti_queue.ports import Status
+
+REPO = "TauCetiProject/TauCeti"
+
+
+class AdmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.controller, self.github, self.repo, self.clock = make_controller(self.tmp.name)
+        self.addCleanup(lambda: self.controller.store.close())
+        self.config = AdmissionPolicy(rubrics=["correctness", "reuse"], prefix="TauCeti/", allow_files=[])
+        self.intake = AdmissionPoller(self.controller, self.github, REPO, self.config, clock=self.clock)
+
+    def review(self, number=1, *, state="green", round=1, comment=10):
+        head = self.github.prs[number]["head_sha"]
+        base = self.github.pr_merge_base(REPO, number, head)
+        ts = datetime.fromtimestamp(self.clock(), UTC).isoformat()
+        previous = self.github.review_comments.get(number, [{}])[0]
+        meta = {
+            "head_sha": head,
+            "merge_base_sha": base,
+            "round": round,
+            "ts": ts,
+            "mode": "commit",
+            "states": {r: state for r in self.config.rubrics},
+        }
+        self.github.review_comments[number] = [
+            {
+                "id": comment,
+                "created_at": previous.get("created_at", ts),
+                "updated_at": ts,
+                "body": "<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 " + json.dumps(meta) + "-->",
+            }
+        ]
+
+    def ready(self, number=1):
+        head = self.github.create_pr(number, {f"TauCeti/P{number}.lean": f"-- {number}\n"})
+        self.review(number)
+        for context in ("build", "scope"):
+            self.github.statuses[(head, context)] = Status("success", "", "", self.clock(), None)
+        return head
+
+    def event(self, kind, payload, delivery=""):
+        receiver = webhook.WebhookReceiver(self.controller, self.github, repositories=[REPO])
+        return receiver.handle(webhook.Delivery(kind, delivery, {**payload, "repository": {"full_name": REPO}}))
+
+    def restart(self):
+        self.controller.store.close()
+        self.controller = reopen_controller(self.tmp.name, self.github, self.repo, self.clock)
+        self.intake = AdmissionPoller(self.controller, self.github, REPO, self.config, clock=self.clock)
+
+    def test_primary_intake_uses_published_review_and_unchanged_inputs_cost_no_evaluation(self):
+        self.ready()
+        result = self.intake.run_once()
+        self.assertEqual(result["approved"], 1)
+        row = self.controller.inputs()[0]
+        self.assertEqual(json.loads(row["evidence"])["kind"], "admission_policy")
+        count = sum(call[0] == "admission_snapshot" for call in self.github.calls)
+        self.clock.advance(1000)
+        self.assertEqual(self.intake.run_once()["evaluated"], 0)
+        self.assertEqual(sum(call[0] == "admission_snapshot" for call in self.github.calls), count)
+
+    def test_build_change_without_pr_updated_at_creates_work(self):
+        head = self.ready()
+        self.github.statuses[(head, "build")] = Status("pending", "", "", self.clock(), None)
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.github.statuses[(head, "build")] = Status("success", "", "", self.clock(), None)
+        self.event("status", {"sha": head, "context": "build"})
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+
+    def test_unsafe_review_revokes_waiting_but_neutral_build_does_not(self):
+        head = self.ready()
+        self.intake.run_once()
+        self.github.statuses[(head, "build")] = Status("failure", "", "", self.clock(), None)
+        self.intake.invalidate(1)
+        self.intake.run_once()
+        self.assertEqual(self.controller.inputs()[0]["state"], "waiting")
+        self.review(state="blocking_block", round=2)
+        self.intake.invalidate(1)
+        self.intake.run_once()
+        self.assertEqual(self.controller.inputs()[0]["state"], "cancelled")
+        self.assertEqual(self.controller.inputs()[0]["reason"], "review-unsafe")
+
+    def test_cancel_survives_restart_ci_change_incidental_review_edit_and_late_legacy_check(self):
+        head = self.ready()
+        self.intake.run_once()
+        self.controller.unapprove(REPO, 1, "kim-em")
+        self.restart()
+        self.clock.advance(1000)
+        self.github.review_comments[1][0]["body"] += "\nAccounting corrected."
+        self.github.review_comments[1][0]["updated_at"] = datetime.fromtimestamp(self.clock(), UTC).isoformat()
+        check = self.github.publish_check(1)
+        self.event("check_run", {"check_run": check})
+        self.event("status", {"sha": head, "context": "build"})
+        self.intake.run_once()
+        self.assertEqual(len(self.controller.inputs()), 1)
+        self.assertEqual(self.controller.inputs()[0]["state"], "cancelled")
+        self.clock.advance(1)
+        self.review(round=2)
+        self.intake.invalidate(1)
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+
+    def test_cancel_before_initial_evaluation_is_durable(self):
+        head = self.ready()
+        self.controller.cancel(REPO, 1, "kim-em", head_sha=head)
+        self.restart()
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(self.controller.inputs(), [])
+        self.clock.advance(1)
+        self.review(round=2)
+        self.intake.invalidate(1)
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+
+    def test_event_during_read_prevents_old_commit_without_holding_controller_lock(self):
+        head = self.ready()
+        self.intake.state.dirty(1, head=head)
+        self.intake._discovery_at = self.clock() + 1000
+        original = self.github.admission_snapshot
+        started, release = threading.Event(), threading.Event()
+
+        def slow(*args, **kwargs):
+            snapshot = original(*args, **kwargs)
+            started.set()
+            self.assertTrue(release.wait(3))
+            return snapshot
+
+        self.github.admission_snapshot = slow
+        thread = threading.Thread(target=self.intake.run_once)
+        thread.start()
+        try:
+            self.assertTrue(started.wait(3))
+            self.assertFalse(self.controller.status().get("snapshot"))
+            self.controller.cancel(REPO, 1, "kim-em", head_sha=head)
+            self.event("status", {"sha": head, "context": "build"})
+        finally:
+            release.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.controller.inputs(), [])
+        self.assertEqual(self.intake.state.summary()["pending"], 1)
+        self.github.admission_snapshot = original
+        self.intake.run_once()
+        self.assertEqual(self.controller.inputs(), [])
+
+    def test_real_quota_deadline_survives_restart_and_resumes_same_owner(self):
+        self.ready()
+        original = self.github.admission_snapshot
+        until = self.clock() + 7200
+
+        def limited(*args, **kwargs):
+            raise RateLimited("core quota", retry_at=until, resource="core")
+
+        self.github.admission_snapshot = limited
+        self.intake.run_once()
+        self.restart()
+        self.assertEqual(self.intake.run_once()["evaluated"], 0)
+        self.assertEqual(self.intake.state.summary()["next_attempt_at"], until)
+        self.github.admission_snapshot = original
+        self.clock.advance(7200)
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+
+    def test_poison_pr_does_not_block_other_prs_and_failure_is_not_completed(self):
+        self.ready(1)
+        self.ready(2)
+        self.github.fail_next["admission_snapshot"] = 1
+        result = self.intake.run_once()
+        self.assertEqual((result["approved"], result["pending"]), (1, 1))
+        self.assertEqual(self.intake.state.get(1)["evaluated_generation"], 0)
+        self.clock.advance(31)
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+
+    def test_inference_hold_does_not_prevent_deterministic_intake(self):
+        self.ready()
+        self.controller._set_state("inference_hold", {"since": self.clock(), "last_error": "providers down"})
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.assertIsNotNone(self.controller.status()["inference_hold"])
+
+    def test_manual_priority_is_not_reset_by_policy_reevaluation(self):
+        self.ready()
+        self.intake.run_once()
+        self.controller.set_priority(REPO, 1, 42)
+        self.intake.invalidate(1)
+        self.intake.run_once()
+        self.assertEqual(self.controller.inputs()[0]["priority"], 42)
+
+    def test_policy_change_is_not_fresh_authorization_after_withdrawal(self):
+        self.ready()
+        self.intake.run_once()
+        self.controller.cancel(REPO, 1, "kim-em")
+        changed = AdmissionPolicy(rubrics=self.config.rubrics, prefix="TauCeti/", allow_files=["TauCeti.lean"])
+        self.intake = AdmissionPoller(self.controller, self.github, REPO, changed, clock=self.clock)
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(self.controller.inputs()[0]["state"], "cancelled")
+
+    def test_manual_reapproval_clears_withdrawal_intent(self):
+        head = self.ready()
+        self.intake.run_once()
+        self.controller.cancel(REPO, 1, "kim-em")
+        self.controller.approve(REPO, 1, head, "kim-em", evidence={"kind": "issue_comment"})
+        self.assertEqual(self.intake.state.get(1)["cancelled_head_sha"], "")
+        self.intake.run_once()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+
+    def test_main_event_during_source_read_fences_the_decision(self):
+        head = self.ready()
+        self.intake.state.dirty(1, head=head)
+        self.intake._discovery_at = self.clock() + 1000
+        original = self.github.admission_snapshot
+
+        def changed(*args, **kwargs):
+            snapshot = original(*args, **kwargs)
+            self.event("push", {"ref": "refs/heads/main", "after": "f" * 40})
+            return snapshot
+
+        self.github.admission_snapshot = changed
+        self.intake.run_once()
+        self.assertEqual(self.controller.inputs(), [])
+        self.assertEqual(self.intake.state.summary()["pending"], 1)
+
+    def test_normal_main_advance_does_not_reevaluate_an_unchanged_diff(self):
+        self.ready()
+        self.intake.run_once()
+        self.repo.commit_branch(
+            {"README.md": "new main\n"}, "advance", start=self.repo.main_sha(), push_to="refs/heads/main"
+        )
+        self.event("push", {"ref": "refs/heads/main", "after": self.repo.main_sha()})
+        self.assertEqual(self.intake.run_once()["evaluated"], 0)
+
+    def test_failed_atomic_admission_rolls_back_and_retries_without_duplicate_input(self):
+        self.ready()
+        complete = self.intake.state.complete
+
+        def interrupted(*args, **kwargs):
+            raise RuntimeError("interruption after input insert")
+
+        self.intake.state.complete = interrupted
+        self.intake.run_once()
+        self.assertEqual(self.controller.inputs(), [])
+        self.intake.state.complete = complete
+        self.clock.advance(31)
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.restart()
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(len(self.controller.inputs()), 1)
+
+    def test_primary_evaluation_progresses_beyond_the_old_invocation_cap(self):
+        self.ready()
+        for number in range(2, 152):
+            self.github.prs[number] = dict(self.github.prs[1], number=number)
+            self.github.labels[number] = set()
+            self.review(number, comment=1000 + number)
+        result = self.intake.run_once()
+        self.assertEqual((result["approved"], result["pending"]), (151, 0))
+        self.assertEqual(len(self.controller.inputs("waiting")), 151)
+
+
+if __name__ == "__main__":
+    unittest.main()
