@@ -64,6 +64,7 @@ RUN_STDLIB=(
   queue_repair_task.py
   expanded_cache.py
   cache_storage.py
+  machine_lake_cache.py
   local_lint.py
   lean_pressure.py
   shared_mathlib.py

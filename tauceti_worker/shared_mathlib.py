@@ -331,7 +331,14 @@ def signature(cwd, env):
         for name, value in env.items()
         if (
             name.startswith(("LAKE_", "MATHLIB_"))
-            and name not in {"LAKE_CONFIG", "LAKE_CACHE_DIR", "MATHLIB_CACHE_DIR"}
+            and name
+            not in {
+                "LAKE_CONFIG",
+                "LAKE_CACHE_DIR",
+                "MATHLIB_CACHE_DIR",
+                "LAKE_SHARED_CACHE_ROOT",
+                "LAKE_SHARED_CACHE_FALLBACK",
+            }
         )
         or name in {"ELAN_TOOLCHAIN", "LEAN_SYSROOT", "LEAN_PATH", "LEAN_SRC_PATH"}
     }
@@ -693,7 +700,8 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
                 str(project),
                 "--",
             ]
-            rc = fetch([*prefix, "lake", "exe", "cache", "get"], project, env, output, 1200)
+            trusted_env = {key: value for key, value in env.items() if key != "LAKE_SHARED_CACHE_ROOT"}
+            rc = fetch([*prefix, "lake", "exe", "cache", "get"], project, trusted_env, output, 1200)
         if rc:
             raise Unavailable(f"fresh Mathlib extraction failed (exit {rc}); see {log}")
         mathlib = project / ".lake/packages/mathlib"

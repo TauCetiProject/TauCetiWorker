@@ -106,6 +106,7 @@ class SharedTests(unittest.TestCase):
         self.assertEqual(command[-4:], ["lake", "exe", "cache", "get"])
         self.assertIn("--ro-bind", command)
         self.assertNotIn("TAUCETI_SHARED_MATHLIB_LEASE_FD", env)
+        self.assertNotIn("LAKE_SHARED_CACHE_ROOT", env)
         self.assertNotIn("--unshare-pid", command)
         self.assertNotEqual(cwd, self.cwd)
         self.assertFalse((cwd / ".lake/packages/mathlib/.lake/build/poison").exists())
@@ -138,6 +139,13 @@ class SharedTests(unittest.TestCase):
         (self.mathlib / "Mathlib/Test.lean").write_text("changed")
         with self.assertRaises(s.Unavailable):
             s.signature(self.cwd, self.env)
+
+    def test_native_lake_storage_paths_do_not_partition_mathlib_snapshots(self):
+        key, _ = s.signature(self.cwd, self.env)
+        self.env.update(LAKE_SHARED_CACHE_ROOT="/host/native-cache", LAKE_SHARED_CACHE_FALLBACK="/worker-one/private")
+        self.assertEqual(key, s.signature(self.cwd, self.env)[0])
+        self.env["LAKE_SHARED_CACHE_FALLBACK"] = "/worker-two/private"
+        self.assertEqual(key, s.signature(self.cwd, self.env)[0])
 
     def test_large_disk_can_publish_with_abundant_bytes_below_ten_percent(self):
         gib = 1024**3
@@ -406,6 +414,7 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
         self.assertEqual(git(target, "remote"), "")
 
     def test_publish_from_fresh_sources_and_reuse_without_agent_outputs(self):
+        self.env["LAKE_SHARED_CACHE_ROOT"] = str(self.root / "native-cache")
         poison = self.mathlib / ".lake/build/poison"
         poison.parent.mkdir(parents=True)
         poison.write_text("never publish this")

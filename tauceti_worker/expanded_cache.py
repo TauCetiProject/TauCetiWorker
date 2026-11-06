@@ -412,8 +412,13 @@ def transfer(download, private, seeded=(), *, manifest=None, private_mappings=No
 
 
 @contextlib.contextmanager
-def preparation(cwd, env, *, refetch=None, report=None):
+def preparation(cwd, env, *, refetch=None, report=None, deadline=None):
     """Use fresh CI metadata, reusing existing archive bytes without trusting agent mappings."""
+    from .machine_lake_cache import selected
+
+    if selected(cwd, env, deadline=deadline):
+        yield env
+        return
     if env.get("TAUCETI_SHARED_ARTIFACTS", "1") == "0" or not env.get("LAKE_CACHE_DIR"):
         yield env
         return

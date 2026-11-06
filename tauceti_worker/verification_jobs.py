@@ -122,7 +122,8 @@ def snapshot(root, target, names, *, immutable_packages=None, include_builds=Tru
 
             shared_mathlib.detach_upper(upper, upper.parent / "tauceti-shared-mathlib.json")
             try:
-                with host_build_cache_context(root, dict(os.environ), state / "verification-cache-prepare"):
+                cache_env = {key: value for key, value in os.environ.items() if key != "LAKE_SHARED_CACHE_ROOT"}
+                with host_build_cache_context(root, cache_env, state / "verification-cache-prepare"):
                     return snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=True)
             except Pressure:
                 raise

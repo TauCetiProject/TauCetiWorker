@@ -34,7 +34,8 @@ config = Path(os.environ['LAKE_CONFIG']).read_text() if label == 'TauCeti' else 
 with path.open('a') as f:
  f.write(json.dumps({'label': label, 'args': a, 'config': config,
                      'cache_dir': os.environ.get('LAKE_CACHE_DIR'),
-                     'restore': os.environ.get('LAKE_RESTORE_ARTIFACTS'), 'cwd': str(Path.cwd())}) + '\\n')
+                     'restore': os.environ.get('LAKE_RESTORE_ARTIFACTS'),
+                     'toolchain': os.environ.get('ELAN_TOOLCHAIN'), 'cwd': str(Path.cwd())}) + '\\n')
 mode = os.environ.get('CACHE_TEST_MODE', '')
 if mode == label + '-retry' and not any(c['label'] == label for c in prior):
  print('error: connection reset'); sys.exit(1)
@@ -154,6 +155,11 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert rc == 0 and len(launched) == 1 and len(records) == 4
     assert records[2]["args"][-4:] == ["--rev", "b" * 40, "--toolchain", "leanprover/lean4:v4.35.0-rc3"]
     assert records[3]["args"][-4:] == ["--rev", "c" * 40, "--toolchain", "leanprover/lean4:v4.35.0-rc3"]
+    with patch("tauceti_worker.machine_lake_cache.selected", return_value=True):
+        rc, records, text = run("rebase", LAKE_SHARED_CACHE_ROOT=str(root / "native"))
+    assert rc == 0 and len(launched) == 1
+    assert all(r["toolchain"] == "leanprover/lean4:v4.35.0-rc3" for r in records[2:])
+    assert all(r["toolchain"] is None for r in records[:2])
     rc, records, text = run("workspace-error")
     assert rc == 0 and len(launched) == 1 and len(records) == 1
     for mode in ("dependency-error", "invalid-toolchain"):

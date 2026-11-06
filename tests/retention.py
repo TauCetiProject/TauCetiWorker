@@ -114,6 +114,14 @@ class Retention(unittest.TestCase):
         self.assertIn(b"unfinished", (records[0][1] / "unstaged.patch").read_bytes())
         self.assertFalse(result["errors"])
 
+    def test_optional_native_collection_failure_does_not_stop_cleanup(self):
+        self.old()
+        cache = self.cache()
+        with patch("tauceti_worker.machine_lake_cache.collect", side_effect=OverflowError("bad cache entry")):
+            result = retention.sweep(now=self.clock)
+        self.assertFalse(cache.exists())
+        self.assertTrue(any("optional native Lake" in error for error in result["errors"]))
+
     def test_pressure_request_recycles_each_old_generation_once(self):
         build = self.cache()
         private = self.cfg.state / "home/.cache/lake/payload"
