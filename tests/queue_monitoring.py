@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Public export invariants using actual queue records and attributed Git history."""
 
+import io
 import json
 import sqlite3
 import sys
@@ -8,7 +9,8 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -286,6 +288,45 @@ url = "https://private.invalid"
         self.assertNotIn("PRIVATE", json.dumps(value))
         self.assertNotIn("OtherOrg", json.dumps(value))
         self.assertEqual(value["scope"]["repositories"], [PROJECT])
+
+
+class PublisherCadence(unittest.TestCase):
+    def test_upload_duration_is_included_without_execution_deadlines_or_hot_retries(self):
+        for duration, failed, expected_wait in [(7, False, 3), (21, False, 1), (21, True, 20)]:
+            with self.subTest(duration=duration, failed=failed), tempfile.TemporaryDirectory() as directory:
+                clock = [0]
+                token = Path(directory) / "token"
+                token.write_text("test-telemetry-only-token")
+                args = SimpleNamespace(
+                    interval=10,
+                    follow=True,
+                    status_url="http://status",
+                    database="unused",
+                    worker_root=[],
+                    public_repository=[],
+                    output=None,
+                    publish_url="https://receiver",
+                    token_file=token,
+                )
+                stop = Mock()
+                stop.is_set.return_value = False
+                stop.wait.return_value = True
+                publisher = Mock()
+
+                def publish(_observation, _send, clock=clock, duration=duration, failed=failed):
+                    clock[0] += duration
+                    if failed:
+                        raise OSError("receiver unavailable")
+
+                publisher.publish.side_effect = publish
+                with (
+                    patch.object(monitoring.time, "monotonic", side_effect=lambda clock=clock: clock[0]),
+                    patch.object(monitoring.urllib.request, "urlopen", return_value=io.BytesIO(b"{}")),
+                    patch.object(monitoring, "project", return_value={}),
+                ):
+                    self.assertEqual(monitoring.run(args, stop, None, None, publisher), 0)
+                publisher.publish.assert_called_once()
+                stop.wait.assert_called_once_with(expected_wait)
 
 
 if __name__ == "__main__":
