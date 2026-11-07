@@ -181,6 +181,7 @@ RUN_STDLIB=(
   quota_reason.py
   review_codex_model.py
   review_mathlib_source.py
+  review_source_cache.py
   review_diagnostics.py
   review_provider_down.py
   review_outcomes.py
@@ -309,6 +310,7 @@ run_one() {
   export TAUCETI_FLEET_EVENTS="$d/activity/worker-events.jsonl"
   export TAUCETI_SHARED_MATHLIB_ROOT="$d/activity/mathlib-builds"
   export TAUCETI_BUILD_CACHE_ROOT="$d/activity/builds"
+  export TAUCETI_REVIEW_MATHLIB_CACHE="$d/activity/review-sources"
   export TAUCETI_VERIFY_STORAGE_DIR="$d/activity/verification-storage"
   start=$SECONDS
   case "$t" in

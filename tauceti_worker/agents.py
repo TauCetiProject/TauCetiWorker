@@ -1359,6 +1359,9 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
             "TAUCETI_REVIEW_RESULT_FILE": str(logf.parent / "review-results" / (logf.stem + ".json")),
         }
         if "tauceti-review" in argv:
+            from .shared_repositories import review_mathlib_cache
+
+            api_env["TAUCETI_REVIEW_MATHLIB_CACHE"] = review_mathlib_cache()
             from .github import claims_repo
             from .paths import CLAIM_SH
 

@@ -609,6 +609,18 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
             note(report, "removed", str(shared_mathlib.root() / "entries" / key))
     except OSError as error:
         note(report, "errors", str(error))
+    if shared and not diagnostics_only:
+        from .shared_repositories import review_mathlib_cache
+
+        try:
+            from runner.source_cache import collect as collect_review_sources
+
+            sources = collect_review_sources(review_mathlib_cache(), now=now, dry=dry)
+            for category, values in sources.items():
+                for value in values:
+                    note(report, category, value)
+        except (ImportError, OSError, ValueError) as error:
+            note(report, "errors", f"review source cleanup: {error}")
     if shared:
         from .worker_manager import workers_state_dir
 
@@ -808,6 +820,9 @@ def install_timer():
             "TAUCETI_REPO",
             "TAUCETI_ACTIVITY_DIR",
             "TAUCETI_SHARED_MATHLIB_ROOT",
+            "TAUCETI_REVIEW_MATHLIB_CACHE",
+            "TAUCETI_SHARED_REPOSITORIES_DIR",
+            "TAUCETI_GITHUB_SHARED_DIR",
             "TAUCETI_WORKERS_STATE_DIR",
             "XDG_STATE_HOME",
             "PATH",

@@ -52,7 +52,7 @@ BUILD_CONTEXT = "build"
 # and `scope` the merge-policy verdict (restricted paths, diff size, oversized new files). A head
 # lands only when all three are bound to its run and `success`.
 VERDICT_CONTEXTS = (BUILD_CONTEXT, "bump-guard", "scope")
-LOG_GRACE_SECONDS = 600  # how long a failed run may go without a readable log before it counts as infrastructure
+LOG_GRACE_SECONDS = 600  # publication grace for a completed run's bound verdicts and failed-build log
 DISPATCH_EVENT = "tauceti-bors-staging"
 # How many of a batch's previous tips a CI dispatch names in `repair_outputs_revs`.
 REPAIR_OUTPUTS_PREVIOUS_TIPS = 4
@@ -126,7 +126,7 @@ INPUT_RESERVED = "reserved"
 INPUT_INSERTED = "inserted"
 INPUT_LANDED = "landed"
 INPUT_CANCELLED = "cancelled"
-MISSING_SOURCE_IN_FLIGHT = "missing-source-in-flight"  # `last_probe` of an input waiting for a source in the head
+MISSING_SOURCE_IN_FLIGHT = "missing-source-in-flight"  # an input waiting for a source or a newer canonical base
 # The cancellation reason of a `no_repair` member the agent emptied: withdrawn until the PR it
 # interacts with lands on `main` (then `needs-rebase`) or leaves the queue (then re-admitted).
 PROBLEM_ANTICIPATED = "problem-anticipated"
@@ -2754,11 +2754,9 @@ class Controller:
             listed = [{"path": path, "module": module, "changed": path in changed} for path, module in gaps[:8]]
             in_flight = self._providers_in_flight(batch, gaps)
             if in_flight is not None:
-                # Every missing source is in the head or another open batch: the PR is early, not
-                # wrong. It waits, and is not probed against any batch on this base again (a fresh
-                # open batch on the same canonical commit lacks the source just the same, so unlike
-                # a conflict this is no reason to open one); it is probed once a base moves, by which
-                # time the provider has landed or left the queue.
+                # Every missing source is in flight or already on a newer canonical base. Preserve
+                # the input until its batch base moves; merely appending on this old base cannot
+                # supply it. The canonical revision distinguishes refresh waits from live providers.
                 with self.store.transaction():
                     self.store.update(
                         "inputs",
@@ -2777,6 +2775,7 @@ class Controller:
                         number=row["number"],
                         gaps=listed,
                         providers_in=in_flight,
+                        canonical=self._canonical,
                     )
                 return False
             evidence = loads(row.get("evidence"), {})
@@ -2870,8 +2869,8 @@ class Controller:
         """Project imports with no source in the prospective tree that the current tip does not have.
 
         Comparing the two trees charges every new gap to the PR being inserted: a gap already on the
-        batch's base appears in both scans, and a batch-mate that removed a source was refused at its
-        own insertion. Returns the sorted new gaps, or `([], reason)` when either scan is unavailable,
+        batch's base appears in both scans, while adding an importer after a batch-mate removed its
+        source creates a new gap. Returns the sorted new gaps, or `([], reason)` when either scan is unavailable,
         in which case the insertion proceeds and the CI preflight remains the authority.
         """
         planner = self._planner()
@@ -2884,12 +2883,28 @@ class Controller:
         return sorted(after - before), None
 
     def _providers_in_flight(self, batch: dict[str, Any], gaps: list[tuple[str, str]]) -> list[int] | None:
-        """The batches (head or other open ones) whose tips provide every missing source, else None."""
+        """Batches or the current canonical tree supplying every missing source, else None.
+
+        A source the prospective PR removes from this batch cannot be supplied by waiting. A
+        different batch merely inheriting that source is not an incoming dependency either: after
+        it lands, replaying the removal (or a batch-mate's removal) still strands the importer.
+        """
         candidates = [b for b in [self._head(), *self._open_batches()] if b is not None and b["id"] != batch["id"]]
         found: list[int] = []
         for _, module in gaps:
             provider = module.replace(".", "/") + ".lean"
-            holder = next((b for b in candidates if b["tip"] and self._tree_has(b["tip"], provider)), None)
+            if self._tree_has(batch["tip"], provider) or self._tree_has(batch["base"], provider):
+                return None
+            if self._canonical and self._tree_has(self._canonical, provider):
+                continue  # an older open batch will acquire this source when its base refreshes
+            holder = next(
+                (
+                    b
+                    for b in candidates
+                    if b["tip"] and self._tree_has(b["tip"], provider) and not self._tree_has(b["base"], provider)
+                ),
+                None,
+            )
             if holder is None:
                 return None
             if holder["id"] not in found:
@@ -4388,6 +4403,8 @@ class Controller:
         )
         if moved:
             last_progress = now
+        same_run = run.run_id == attempt["run_id"] and run.attempt == attempt["run_attempt"]
+        completed_at = attempt["run_completed_at"] if same_run else None
         values.update(
             run_id=run.run_id,
             run_attempt=run.attempt,
@@ -4395,7 +4412,11 @@ class Controller:
             run_conclusion=run.conclusion,
             run_created_at=run.created_at,
             run_started_at=run.started_at,
-            run_completed_at=run.completed_at,
+            # Freeze the observed completion time for this run/attempt. The adapter may supply
+            # GitHub's updated_at, which can move after completion; missing timestamps use now.
+            run_completed_at=(completed_at or run.completed_at or now)
+            if run.status == "completed"
+            else run.completed_at,
             run_updated_at=run.updated_at if run.updated_at is not None else attempt["run_updated_at"],
             runner_name=run.runner_name,
             runner_labels=dumps(list(run.runner_labels)),
@@ -4443,6 +4464,18 @@ class Controller:
         status = statuses[BUILD_CONTEXT]
         if status is None or not bound[BUILD_CONTEXT]:
             # No status from the candidate's own completed run: never a verdict (scenario 19).
+            publication_failed = any(
+                d.get("kind") == "infrastructure"
+                and (
+                    d.get("reason") == "finalizer_failed"
+                    or (d.get("job") == "finalize-merge-group-build" and d.get("reason") in ("cancelled", "timed_out"))
+                )
+                for d in run.diagnostics
+            )
+            if not publication_failed and now - values["run_completed_at"] < LOG_GRACE_SECONDS:
+                self._reasons.append(f"head {head['id']}: run {run.run_id} completed, waiting for build status")
+                self.store.update("ci_attempts", {"id": attempt["id"]}, **values)
+                return
             values.update(
                 outcome=OUTCOME_INFRASTRUCTURE,
                 outcome_detail="missing-status: the completed run posted no bound build status",
@@ -4463,8 +4496,7 @@ class Controller:
                 # The finalizer posts all three statuses in the one step that posts `build`; a bound
                 # `build` with the others absent is that step still in flight (or a post that failed).
                 # Look again for a little while, then treat it as the missing `build` case above.
-                if now - (run.completed_at or now) < LOG_GRACE_SECONDS:
-                    values.update(needs_observation=1)
+                if now - values["run_completed_at"] < LOG_GRACE_SECONDS:
                     self._reasons.append(
                         f"head {head['id']}: run {run.run_id} posted build, waiting for {', '.join(unbound)}"
                     )
@@ -4520,12 +4552,11 @@ class Controller:
                 and infrastructure
                 and all(d.get("reason") == "log_unavailable" for d in infrastructure)
                 and not status.description.lower().startswith("infrastructure")
-                and now - (run.completed_at or now) < LOG_GRACE_SECONDS
+                and now - values["run_completed_at"] < LOG_GRACE_SECONDS
             )
             if log_pending:
                 # GitHub publishes a job's log a little after the run completes; a failed build whose log
                 # cannot be read yet is neither a source nor an infrastructure verdict. Look again.
-                values.update(needs_observation=1)
                 self._reasons.append(f"head {head['id']}: run {run.run_id} failed, waiting for its log")
                 self.store.update("ci_attempts", {"id": attempt["id"]}, **values)
                 return

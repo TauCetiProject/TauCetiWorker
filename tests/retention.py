@@ -51,6 +51,7 @@ class Retention(unittest.TestCase):
                 {
                     "TAUCETI_ACTIVITY_DIR": str(self.root / "activity"),
                     "TAUCETI_BUILD_CACHE_ROOT": str(self.root / "build-cache"),
+                    "TAUCETI_REVIEW_MATHLIB_CACHE": str(self.root / "review-sources"),
                     "TAUCETI_SHARED_MATHLIB_ROOT": str(self.root / "pool"),
                     "TAUCETI_WORKERS_STATE_DIR": str(self.root / "managed"),
                 },
@@ -71,6 +72,51 @@ class Retention(unittest.TestCase):
         self.git("add", ".")
         self.git("commit", "-qm", "seed")
         work_recovery.mark_published(self.checkout, "seed", self.git("rev-parse", "HEAD").strip())
+
+    def test_older_review_install_does_not_abort_other_cleanup(self):
+        with patch.dict(sys.modules, {"runner.source_cache": None}):
+            result = retention.sweep(now=self.clock)
+        self.assertTrue(any("review source cleanup:" in row for row in result["errors"]))
+        self.assertIn("removed_count", result)
+        self.assertIn("protected_count", result)
+
+    def test_review_source_collection_is_wired_to_sweep_and_dry_run(self):
+        from runner import source_cache
+
+        directory = Path(os.environ["TAUCETI_REVIEW_MATHLIB_CACHE"])
+        root = source_cache._root(directory, create=True)
+        pin = "a" * 40
+        with source_cache._lock(root, pin, write=True):
+            stage = root / (pin + ".staging")
+            stage.mkdir()
+            (stage / "partial").write_text("interrupted source publication")
+        report = retention.sweep(now=self.clock, dry=True)
+        self.assertTrue(stage.exists())
+        self.assertIn(str(stage), report["removed"])
+        report = retention.sweep(now=self.clock)
+        self.assertFalse(stage.exists())
+        self.assertIn(str(stage), report["removed"])
+        self.assertTrue((root / "locks" / pin).exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "systemd unit fixture")
+    def test_cleanup_unit_preserves_review_source_overrides(self):
+        from tauceti_worker import worker_manager
+
+        unit = self.root / "systemd/worker.service"
+        environment = {
+            "TAUCETI_REVIEW_MATHLIB_CACHE": "/custom/review-cache",
+            "TAUCETI_SHARED_REPOSITORIES_DIR": "/custom/repositories",
+            "TAUCETI_GITHUB_SHARED_DIR": "/custom/github",
+        }
+        with (
+            patch.object(retention, "self_env", return_value=environment),
+            patch.object(worker_manager, "_service_path", return_value=unit),
+            patch.object(retention.subprocess, "run"),
+        ):
+            retention.install_timer()
+        text = (unit.parent / "tauceti-cleanup.service").read_text()
+        for key, value in environment.items():
+            self.assertIn(key + "=" + value, text)
 
     def git(self, *args):
         return subprocess.run(
