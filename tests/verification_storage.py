@@ -71,6 +71,7 @@ class Storage(Receipts):
         git(dep, "add", ".")
         git(dep, "commit", "-qm", "dependency")
         write(dep, "Dependency.lean", "unpublished dependency edits\n")
+        write(dep, "build-shared-deltas/Source.lean", "dependency source, outside .lake\n")
         write(dep, ".lake/build/Dependency.olean", "dependency build output")
         write(self.root, "TauCeti/A.lean", "staged edit\n")
         git(self.root, "add", "TauCeti/A.lean")
@@ -81,14 +82,27 @@ class Storage(Receipts):
         v.atomic(self.state / "verification-jobs" / pending.name, {**job, "status": "success"})
         pending.unlink()
         before = v.inventory(tree, self.base)
+        for build in (tree / ".lake", tree / ".lake/packages/mathlib/.lake"):
+            (build / "build-shared-delta").mkdir(parents=True)
+            (build / "build-shared-delta/obsolete.olean").write_text("old sparse layer")
+            (build / "build-shared-deltas/generation/build").mkdir(parents=True)
+            (build / "build-shared-deltas/generation/build/obsolete.olean").write_text("old generation")
         index = git(tree, "diff", "--cached", "--binary")
         head = git(tree, "rev-parse", "HEAD")
         report = self.collect()
         self.assertFalse(report["errors"], report)
         self.assertFalse((tree / ".lake/build").exists())
         self.assertFalse((tree / ".lake/packages/mathlib/.lake/build").exists())
+        self.assertFalse((tree / ".lake/build-shared-delta").exists())
+        self.assertFalse((tree / ".lake/packages/mathlib/.lake/build-shared-delta").exists())
+        self.assertFalse((tree / ".lake/build-shared-deltas").exists())
+        self.assertFalse((tree / ".lake/packages/mathlib/.lake/build-shared-deltas").exists())
         self.assertEqual(
             (tree / ".lake/packages/mathlib/Dependency.lean").read_text(), "unpublished dependency edits\n"
+        )
+        self.assertEqual(
+            (tree / ".lake/packages/mathlib/build-shared-deltas/Source.lean").read_text(),
+            "dependency source, outside .lake\n",
         )
         self.assertEqual(v.inventory(tree, self.base), before)
         self.assertEqual(git(tree, "diff", "--cached", "--binary"), index)

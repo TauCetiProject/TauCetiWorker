@@ -519,6 +519,8 @@ def _builds(tree, work, *, dependencies=True):
     """Discover generated build roots, preserving dependency checkouts and their Git state."""
     yield tree, ".lake/build"
     yield tree, ".lake/build-before-sharing"
+    yield tree, ".lake/build-shared-delta"
+    yield tree, ".lake/build-shared-deltas"
     yield tree, "build"
     packages = tree / ".lake/packages"
     if dependencies and not (tree / ".lake").is_symlink() and not packages.is_symlink() and packages.is_dir():
@@ -528,6 +530,8 @@ def _builds(tree, work, *, dependencies=True):
                 if entry.is_dir(follow_symlinks=False):
                     yield Path(entry.path), ".lake/build"
                     yield Path(entry.path), ".lake/build-before-sharing"
+                    yield Path(entry.path), ".lake/build-shared-delta"
+                    yield Path(entry.path), ".lake/build-shared-deltas"
                     yield Path(entry.path), "build"
 
 

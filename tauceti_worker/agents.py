@@ -1481,7 +1481,7 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
                     env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)
         except shared_mathlib.Unavailable as error:
             raise BuildCacheUnavailable(
-                f"shared Mathlib required: {error}", log_file=logdir / "shared-mathlib-prepare.log"
+                f"shared Mathlib preparation unavailable: {error}", log_file=logdir / "shared-mathlib-prepare.log"
             ) from error
 
 
