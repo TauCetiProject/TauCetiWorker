@@ -88,14 +88,25 @@ ROOT_PATH = {root}/log
                 "--random-password",
                 "--must-change-password=false",
             )
+            admin(
+                "admin",
+                "user",
+                "create",
+                "--username",
+                "collaborator",
+                "--email",
+                "collaborator@example.invalid",
+                "--random-password",
+                "--must-change-password=false",
+            )
 
-            def token(name, scopes):
+            def token(name, scopes, username="operator"):
                 output = admin(
                     "admin",
                     "user",
                     "generate-access-token",
                     "--username",
-                    "operator",
+                    username,
                     "--token-name",
                     name,
                     "--scopes",
@@ -108,6 +119,8 @@ ROOT_PATH = {root}/log
 
             api = Forgejo(Forge("forgejo", origin), token=token("source", "all"), timeout=3)
             restricted = Forgejo(api.forge, token=token("identity-only", "read:user"), timeout=3)
+            readonly = Forgejo(api.forge, token=token("repo-reader", "read:user,read:repository"), timeout=3)
+            collaborator = Forgejo(api.forge, token=token("member", "all", "collaborator"), timeout=3)
             with (root / "server.log").open("w") as log:
                 process = subprocess.Popen([*base, "web"], stdout=log, stderr=subprocess.STDOUT)
                 try:
@@ -155,6 +168,8 @@ ROOT_PATH = {root}/log
                     shared_cache = BoundedReadCache(max_entries=4, max_bytes=64 * 1024)
                     source = GitHub.for_repository(repo, api=api, cache=shared_cache)
                     other = GitHub.for_repository(repo, api=restricted, cache=shared_cache)
+                    reader = GitHub.for_repository(repo, api=readonly, cache=shared_cache)
+                    member = GitHub.for_repository(repo, api=collaborator, cache=shared_cache)
                     with (
                         patch(
                             "tauceti_worker.github_state.read", side_effect=AssertionError("shared service consulted")
@@ -177,6 +192,60 @@ ROOT_PATH = {root}/log
                         state.observe([SimpleNamespace(number=number, updated_at=pull["updated_at"])])
                         self.assertEqual(state.gh_meta(number).provenance, "fresh")
                         self.assertEqual(ReviewState(cfg, source).gh_meta(number).provenance, "assumed")
+                        actor = source.authenticated_actor()
+                        self.assertEqual(actor.login, "operator")
+                        self.assertEqual(actor.principal.forge, api.forge)
+                        self.assertEqual(actor.principal.native_id, str(pull["user"]["id"]))
+                        self.assertEqual(other.authenticated_actor(), actor)
+                        access = source.repository_access()
+                        self.assertEqual(access.actor, actor)
+                        self.assertTrue(access.user_code_can_push)
+                        self.assertTrue(access.user_is_repo_admin)
+                        self.assertIsNone(other.repository_access())
+                        self.assertIn(other.last_failure.status, {401, 403, 404})
+                        read_access = reader.repository_access()
+                        self.assertEqual(read_access.actor, actor)
+                        self.assertTrue(read_access.user_code_can_push)
+                        print("Read-only token reports native push ACL:", read_access.user_code_can_push, flush=True)
+                        with self.assertRaises(ForgeError) as denied_write:
+                            readonly.request(
+                                "POST",
+                                "repos/operator/source/branches",
+                                {"new_branch_name": "must-not-write", "old_branch_name": "main"},
+                            )
+                        self.assertEqual(denied_write.exception.status, 403)
+                        member_actor = member.authenticated_actor()
+                        self.assertEqual(member_actor.login, "collaborator")
+                        self.assertNotEqual(member_actor, actor)
+                        self.assertFalse(collaborator.request("GET", "user")["is_admin"])
+                        self.assertIsNone(member.repository_access())
+                        self.assertEqual(member.last_failure.status, 404)
+                        api.request("PUT", "repos/operator/source/collaborators/collaborator", {"permission": "read"})
+                        member_read = member.repository_access()
+                        self.assertEqual(member_read.actor, member_actor)
+                        self.assertEqual(
+                            (
+                                member_read.user_code_can_read,
+                                member_read.user_code_can_push,
+                                member_read.user_is_repo_admin,
+                            ),
+                            (True, False, False),
+                        )
+                        api.request("PUT", "repos/operator/source/collaborators/collaborator", {"permission": "write"})
+                        member_write = member.repository_access()
+                        self.assertEqual(member_write.actor, member_actor)
+                        self.assertEqual(
+                            (
+                                member_write.user_code_can_read,
+                                member_write.user_code_can_push,
+                                member_write.user_is_repo_admin,
+                            ),
+                            (True, True, False),
+                        )
+                        api.request("DELETE", "repos/operator/source/collaborators/collaborator")
+                        self.assertIsNone(member.repository_access())
+                        self.assertEqual(member.last_failure.status, 404)
+                        self.assertEqual(member.authenticated_actor(), member_actor)
                         history = source.issue_comments(number)
                         self.assertEqual(len(history), 33)
                         self.assertEqual(len({row["id"] for row in history}), 33)
@@ -234,6 +303,11 @@ ROOT_PATH = {root}/log
                         )
                         self.assertLessEqual(shared_cache.stats()["entries"], 4)
                         self.assertLessEqual(shared_cache.stats()["bytes"], 64 * 1024)
+                        api.request("PATCH", "repos/operator/source", {"archived": True})
+                        archived = source.repository_access()
+                        self.assertTrue(archived.archived)
+                        self.assertFalse(archived.mirror)
+                        self.assertTrue(archived.user_code_can_push)
                 finally:
                     process.terminate()
                     try:

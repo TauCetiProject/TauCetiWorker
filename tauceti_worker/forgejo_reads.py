@@ -373,7 +373,7 @@ class ForgejoReadSource:
             self.repository.pull_url(number)
         self.cache.invalidate(scope=(self.repository.key, number))
 
-    def _read(self, operation, args, fetch, *, fresh=False, number=None):
+    def _read(self, operation, args, fetch, *, fresh=False, number=None, cacheable=True):
         from tauceti_tools.forge import ForgeError, Incomplete
 
         self._failure.value = None
@@ -398,9 +398,12 @@ class ForgejoReadSource:
                 return value
 
             key = (self.cache_namespace, operation, json.dumps(args, sort_keys=True), revision)
-            value, hit = self.cache.read(
-                key, bounded_fetch, ttl=self.ttl, fresh=fresh or force, scope=(self.repository.key, number)
-            )
+            if cacheable:
+                value, hit = self.cache.read(
+                    key, bounded_fetch, ttl=self.ttl, fresh=fresh or force, scope=(self.repository.key, number)
+                )
+            else:
+                value, hit = bounded_fetch(), False
             self._bound()
             if hit:
                 transport.note_cache_hit()
@@ -431,6 +434,55 @@ class ForgejoReadSource:
             lambda: self.reader.pull(self.repository, number, fields),
             fresh=fresh,
             number=number,
+        )
+
+    def authenticated_actor(self):
+        """Fresh native actor identity; never infer it from a login or GitHub."""
+        from .source_identity import SourceActor
+
+        def fetch():
+            self._bound()
+            actor = SourceActor.from_native(self.repository.forge, self.api.request("GET", "user"))
+            return {"id": int(actor.principal.native_id), "login": actor.login}
+
+        row = self._read("authenticated_actor", [], fetch, fresh=True, cacheable=False)
+        return None if row is None else SourceActor.from_native(self.repository.forge, row)
+
+    def repository_access(self):
+        """Fresh native actor and repository user ACL, without token-scope inference.
+
+        The server still enforces token scopes and permissions on each mutation.
+        This record alone grants no publication, approval or merge authority.
+        """
+        from .source_identity import SourceActor, SourceRepositoryAccess
+
+        def fetch():
+            self._bound()
+            actor = SourceActor.from_native(self.repository.forge, self.api.request("GET", "user"))
+            self._bound()
+            row = self.api.request("GET", "repos/" + self.repository.name)
+            access = SourceRepositoryAccess.from_native(self.repository, actor, row)
+            return {
+                "actor": {"id": int(actor.principal.native_id), "login": actor.login},
+                "repository": {
+                    "id": access.repository_id,
+                    "full_name": self.repository.name,
+                    "html_url": self.repository.url,
+                    "permissions": {
+                        "pull": access.user_code_can_read,
+                        "push": access.user_code_can_push,
+                        "admin": access.user_is_repo_admin,
+                    },
+                    "archived": access.archived,
+                    "mirror": access.mirror,
+                },
+            }
+
+        row = self._read("repository_access", [], fetch, fresh=True, cacheable=False)
+        if row is None:
+            return None
+        return SourceRepositoryAccess.from_native(
+            self.repository, SourceActor.from_native(self.repository.forge, row["actor"]), row["repository"]
         )
 
     @staticmethod
