@@ -232,6 +232,41 @@ covers the shared in-process memory cache; private disk observations in another
 credential scope can remain assumed until their TTL expires. Decisions requiring
 current state must force a source read.
 
+## Qualified actor and repository ACL reads
+
+The direct source's `authenticated_actor()` reads the native authenticated user;
+`repository_access()` reads that actor and the selected repository's native user
+ACL. Both bypass cache lookup, storage and coalescing on every call. PR-content
+invalidation does not interrupt these independent identity reads. Denied, malformed, imported
+or missing identities remain unavailable and never fall back to a GitHub account.
+Only the native ID and display login are retained from the user profile.
+Token-based actor reads require `read:user`; repository ACL reads also require
+`read:repository` or broader native scopes. A repository-only token cannot be
+substituted for an authenticated actor observation.
+
+`SourceActor` compares the qualified origin and native user ID; a rename does not
+change identity, and a reused login on another origin does not match. Native
+integer IDs and Tools' qualified projected IDs use distinct parsers. Nonpositive
+sentinel IDs cannot become authenticated native principals.
+
+`SourceRepositoryAccess` binds the actor, qualified repository, native repository
+ID, Code-unit read/write ACL, repository admin role and archive/mirror flags.
+`user_code_can_push` describes only Code-unit access; it certifies neither token
+write scopes, other units' permissions, branch protection nor publication/merge
+authority. Admin role does not imply that the Code unit is enabled.
+The disposable real-server fixture checks the distinction: an owner using a
+read-only token can see a true push ACL, while the native server denies its
+branch-write request. The user-only token can identify the actor while repository
+access remains denied. Each mutation must still pass its native scope and
+permission checks.
+The same fixture exercises a non-admin collaborator gaining read access, gaining
+write access and losing repository access, without reusing an earlier ACL. It
+also checks the explicit archive flag after the repository is archived.
+
+These are programmatic survey inputs. Production survey ownership and bot repair
+still use the existing GitHub helpers until qualified PR identities, source/CI
+status authority, inline contests and remaining source operations are integrated.
+
 ## Outstanding integration and completion criteria
 
 The worker's existing `gh` launcher, credentials, forks, claims, publication recovery
