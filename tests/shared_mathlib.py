@@ -1254,18 +1254,21 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
         original = s._scratch_unused
 
         def referenced(path):
-            return False if path == backup else original(path)
+            return False if path == backup or (path / "build/private.olean").exists() else original(path)
 
         with patch.object(s, "_scratch_unused", side_effect=referenced):
             with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
                 self.assertTrue(prefix)
             self.assertEqual((backup / "private.olean").read_text(), "possibly referenced private build")
             with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
-                self.assertEqual((backup / "private.olean").read_text(), "possibly referenced private build")
+                self.assertTrue(prefix)
+                retained = list(upper.with_name("build-shared-deltas").glob("*/build/private.olean"))
+                self.assertEqual(len(retained), 1)
+                self.assertEqual(retained[0].read_text(), "possibly referenced private build")
         with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
             self.assertTrue(prefix)
         self.assertFalse(backup.exists())
+        self.assertEqual(list(upper.with_name("build-shared-deltas").glob("*/build/private.olean")), [])
 
     def test_dangling_overlay_work_symlink_does_not_prevent_sharing(self):
         self.require_overlay()

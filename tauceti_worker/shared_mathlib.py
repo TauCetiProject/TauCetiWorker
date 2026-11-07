@@ -491,6 +491,16 @@ def _discard_scratch(path):
         return str(error)
 
 
+def _scratch_generation(upper):
+    discarded = upper.with_name("build-shared-deltas")
+    if discarded.is_symlink():
+        raise Unavailable("Mathlib build discard directory is a symlink; repair the owned checkout")
+    discarded.mkdir(exist_ok=True)
+    generation = discarded / uuid.uuid4().hex
+    generation.mkdir()
+    return generation
+
+
 def detach_upper(upper, marker):
     """Detach sparse layers before private warming, without waiting for old namespaces."""
     if not _build_parent_owned(upper):
@@ -513,9 +523,7 @@ def detach_upper(upper, marker):
     work = upper.with_name("tauceti-overlay-work")
     marked = marker.exists()
     if marked or work.exists() or work.is_symlink():
-        discarded.mkdir(exist_ok=True)
-        generation = discarded / uuid.uuid4().hex
-        generation.mkdir()
+        generation = _scratch_generation(upper)
         if marked and (upper.exists() or upper.is_symlink()):
             os.replace(upper, generation / "build")
         if work.exists() or work.is_symlink():
@@ -1003,9 +1011,12 @@ def view(cwd, env, logdir, fetch):
             _detach_for_view(upper, marker, pool, env)
             backup = upper.with_name("build-before-sharing")
             work = upper.with_name("tauceti-overlay-work")
-            _discard_scratch(backup)
             if backup.exists() or backup.is_symlink():
-                raise Unavailable("previous Mathlib build backup remains in use or could not be removed")
+                # Free the fixed rollback name without waiting for an old
+                # namespace or changing the next round's sharing mode.
+                generation = _scratch_generation(upper)
+                os.replace(backup, generation / "build")
+                _discard_scratch(generation)
             if upper.exists():
                 os.replace(upper, backup)
                 backup_created = True
