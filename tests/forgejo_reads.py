@@ -24,6 +24,15 @@ from tauceti_worker.github import GitHub
 from tauceti_worker.review_state import ReviewState
 
 
+def notify_wait(joined):
+    class Waitable(concurrent.futures.Future):
+        def result(self, *args, **kwargs):
+            joined.set()
+            return super().result(*args, **kwargs)
+
+    return patch("tauceti_worker.forgejo_reads.Future", Waitable)
+
+
 class CacheTests(unittest.TestCase):
     def test_disk_budget_covers_multiple_credentials_without_touching_other_state(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -124,10 +133,9 @@ class CacheTests(unittest.TestCase):
             return ["triage"]
 
         def second():
-            second_started.set()
             return cache.read(["key"], slow, ttl=15)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        with notify_wait(second_started), concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             first = executor.submit(cache.read, ["key"], slow, ttl=15)
             self.assertTrue(entered.wait(5))
             other = executor.submit(second)
@@ -206,7 +214,7 @@ class CacheTests(unittest.TestCase):
             self.assertEqual(first.result(timeout=5), (["earlier"], False))
         self.assertEqual(cache.read(["key"], lambda: self.fail("lost later result"), ttl=15), (["later"], True))
 
-    def test_distinct_keys_fetch_independently_even_with_identical_hashes(self):
+    def test_distinct_keys_fetch_independently(self):
         cache = BoundedReadCache()
         entered, release = threading.Event(), threading.Event()
 
@@ -215,7 +223,7 @@ class CacheTests(unittest.TestCase):
             self.assertTrue(release.wait(5))
             return ["slow"]
 
-        with patch("builtins.hash", return_value=0), concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             first = executor.submit(cache.read, ["one"], slow, ttl=15)
             self.assertTrue(entered.wait(5))
             try:
@@ -249,6 +257,60 @@ class CacheTests(unittest.TestCase):
 
         self.assertEqual(cache.read(["key"], slow, ttl=15), ([1], False))
         self.assertEqual(cache.stats()["entries"], 0)
+
+    def test_invalidation_releases_followers_and_allows_a_new_leader(self):
+        cache = BoundedReadCache()
+        entered, joined, release = threading.Event(), threading.Event(), threading.Event()
+
+        def slow():
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return ["old"]
+
+        with notify_wait(joined), concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            leader = executor.submit(cache.read, ["key"], slow, ttl=15, scope=("repo", 1))
+            self.assertTrue(entered.wait(5))
+            follower = executor.submit(cache.read, ["key"], slow, ttl=15, scope=("repo", 1))
+            self.assertTrue(joined.wait(5))
+            try:
+                cache.invalidate(scope=("repo", 1))
+                with self.assertRaises(ReadInvalidated):
+                    follower.result(timeout=2)
+                self.assertFalse(leader.done())
+                self.assertEqual(cache.read(["key"], lambda: ["new"], ttl=15, scope=("repo", 1)), (["new"], False))
+            finally:
+                release.set()
+            with self.assertRaises(ReadInvalidated):
+                leader.result(timeout=5)
+        self.assertEqual(cache.stats()["active"], 0)
+        self.assertEqual(
+            cache.read(["key"], lambda: self.fail("new result lost"), ttl=15, scope=("repo", 1)), (["new"], True)
+        )
+
+    def test_failed_and_interrupted_leaders_release_followers_without_cached_failure(self):
+        for error, expected in [(RuntimeError("offline"), RuntimeError), (KeyboardInterrupt(), ReadInvalidated)]:
+            with self.subTest(kind=type(error).__name__):
+                cache = BoundedReadCache()
+                entered, joined, release = threading.Event(), threading.Event(), threading.Event()
+
+                def failing(error=error, entered=entered, release=release):
+                    entered.set()
+                    self.assertTrue(release.wait(5))
+                    raise error
+
+                with notify_wait(joined), concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    leader = executor.submit(cache.read, ["key"], failing, ttl=15)
+                    self.assertTrue(entered.wait(5))
+                    follower = executor.submit(cache.read, ["key"], failing, ttl=15)
+                    self.assertTrue(joined.wait(5))
+                    release.set()
+                    with self.assertRaises(type(error)):
+                        leader.result(timeout=5)
+                    with self.assertRaises(expected):
+                        follower.result(timeout=5)
+                self.assertEqual(cache.stats()["entries"], 0)
+                self.assertEqual(cache.stats()["active"], 0)
+                self.assertEqual(cache.read(["key"], lambda: ["recovered"], ttl=15), (["recovered"], False))
 
 
 class SourceTests(unittest.TestCase):
@@ -327,9 +389,8 @@ class SourceTests(unittest.TestCase):
         state = self.state()
         self.api.comments.return_value = []
         for number in range(1, 201):
-            self.assertEqual(state._issue_comments(number), [])
+            self.assertEqual(state._issue_comments(number), ([], False))
         self.assertEqual(state._comments, {})
-        self.assertLessEqual(len(state._shared_issue_hit), 128)
         self.assertLessEqual(self.source.cache.stats()["entries"], 128)
 
     def test_normal_read_recovers_without_memoizing_failure(self):
@@ -354,6 +415,68 @@ class SourceTests(unittest.TestCase):
         with patch("tauceti_worker.review_state.time.time", return_value=wall + 16):
             result = state.gh_meta(12)
         self.assertEqual((result.data["head_sha"], result.provenance), ("b" * 40, "fresh"))
+
+    def test_source_disk_age_starts_before_fetch_and_older_writer_cannot_replace_newer(self):
+        state = self.state()
+        state.observe([SimpleNamespace(number=12, updated_at="unchanged")])
+        started = time.time()
+        wall = [started]
+
+        def slow(*args):
+            wall[0] += 20
+            return [self.comment()]
+
+        self.api.comments.side_effect = slow
+        with patch("tauceti_worker.review_state.time.time", side_effect=lambda: wall[0]):
+            self.assertEqual(state.gh_meta(12, force=True).provenance, "fresh")
+        self.assertEqual(json.loads(state._key_path(12).read_text())["fetched_at"], started)
+        self.assertAlmostEqual(state._cache_path(12).stat().st_mtime, started, places=4)
+        state._write_source_cache(state._cache_path(12), {"head_sha": "newer"}, observed_at=started + 10)
+        state._write_source_cache(state._cache_path(12), {"head_sha": "older"}, observed_at=started)
+        self.assertEqual(json.loads(state._cache_path(12).read_text())["head_sha"], "newer")
+
+    def test_concurrent_forced_states_return_their_reads_but_keep_the_later_disk_record(self):
+        state = self.state()
+        entered, release = threading.Event(), threading.Event()
+        calls = iter(["slow", "fast"])
+        lock = threading.Lock()
+
+        def fetch(*args):
+            with lock:
+                kind = next(calls)
+            if kind == "slow":
+                entered.set()
+                self.assertTrue(release.wait(5))
+            return [self.comment("a" * 40 if kind == "slow" else "b" * 40)]
+
+        self.api.comments.side_effect = fetch
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            slow = executor.submit(state.gh_meta, 12, force=True)
+            self.assertTrue(entered.wait(5))
+            try:
+                fast = executor.submit(state.gh_meta, 12, force=True).result(timeout=5)
+                self.assertEqual((fast.data["head_sha"], fast.provenance), ("b" * 40, "fresh"))
+            finally:
+                release.set()
+            slow = slow.result(timeout=5)
+            self.assertEqual((slow.data["head_sha"], slow.provenance), ("a" * 40, "fresh"))
+        self.assertEqual(json.loads(state._cache_path(12).read_text())["head_sha"], "b" * 40)
+        self.assertEqual(json.loads(state._key_path(12).read_text())["meta"]["head_sha"], "b" * 40)
+
+    def test_bust_targets_one_pr_across_credentials_without_touching_other_prs(self):
+        other_api = self.client(self.forge, "other-token")
+        other_api.comments.side_effect = lambda repo, number: [{**self.comment(), "html_url": repo.pull_url(number)}]
+        self.api.comments.side_effect = lambda repo, number: [{**self.comment(), "html_url": repo.pull_url(number)}]
+        other = ForgejoReadSource(self.repo, other_api, cache=self.source.cache)
+        for source in [self.source, other]:
+            source.issue_comments(12)
+            source.issue_comments(13)
+        self.state().bust(12)
+        for source in [self.source, other]:
+            source.issue_comments(12)
+            source.issue_comments(13)
+        self.assertEqual(self.api.comments.call_count, 3)
+        self.assertEqual(other_api.comments.call_count, 3)
 
     def test_service_facts_cannot_entitle_a_different_source(self):
         state = self.state()
@@ -481,6 +604,11 @@ class SourceTests(unittest.TestCase):
         self.api.comments.return_value = [{**self.comment(), "updated_at": "no offset or valid time"}]
         self.assertIsNone(self.source.issue_comments(12))
         self.assertEqual(self.source.last_failure.kind, "Incomplete")
+        self.api.pull.return_value = {"number": 12, "html_url": 42}
+        self.assertIsNone(self.source.pr_view(12, ["number"], fresh=True))
+        self.assertEqual(self.source.last_failure.kind, "Incomplete")
+        with self.assertRaises(ValueError):
+            self.source.pr_view(12, None)
         self.api.pull.return_value = {
             "number": 12,
             "title": "Wrong source",
@@ -524,10 +652,22 @@ repository="one/Project"
             cwd=root,
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=60,
         )
         self.assertEqual(result.returncode, 2)
+        # Tripwire for a Tools update enabling a consumer before Worker is ready.
         self.assertIn("GitHub-only bindings", result.stderr)
+        script = "import tauceti_tools.project as p; p.Project._legacy_bindings=lambda self:None; import tauceti_worker"
+        result = subprocess.run(
+            [sys.executable, "-c", script, "--conf", str(config)],
+            env=env,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Worker Forgejo activation", result.stderr)
 
     def test_generic_test_doubles_do_not_select_direct_source_by_truthiness(self):
         cfg = SimpleNamespace(sbcache=Path(self.root.name) / "legacy")

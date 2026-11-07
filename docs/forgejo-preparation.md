@@ -186,7 +186,9 @@ shared cache instance (128 entries, 4 MiB by default, 15-second TTL measured fro
 request start). Identical triage requests coalesce; unrelated requests fetch
 independently. Fresh reads bypass entries and coalescing. Concurrent fresh reads
 can both return, while only the latest-started request may publish its result.
-Write invalidation affects that source namespace and rejects its overlapping reads.
+Write invalidation targets that qualified repository and PR across credential
+scopes, including list observations, and rejects fetches overlapping the write.
+Other PRs continue independently; coalesced waiters are released immediately.
 Failed requests are not cached, and a verified empty list differs from an
 unavailable read. Cached review metadata retains assumed or stale provenance;
 it supplies no fresh approval authority. Revision-scoped read contexts use
@@ -197,6 +199,8 @@ leaf directories with atomic private-file replacement. Best-effort pruning bound
 recognized cache files across credential scopes to 384 files and 16 MiB after
 quiescent writes. It ignores unrelated files, outboxes and symlinks. These files
 are disposable observations, not publication journals or durable decisions.
+Source file ages start before the request. Atomic replacements take a short
+directory lock and retain a later observation when an older request finishes last.
 Source sidecars expire at the adapter's triage TTL even if the PR's update clock
 stays unchanged. Native Forgejo 17 does not move that clock for comment edits or
 deletions; forced reads bypass sidecars and the memory cache immediately.
@@ -218,6 +222,9 @@ HTTPS and fleet-load rehearsal.
 Inline thread/reply reads deliberately remain unavailable. Authoring, claims,
 reactions, trusted publication, scheduling and approval decisions still require
 their qualified adapters before production Forgejo bootstrap can be enabled.
+Worker owns an additional activation refusal so a Tools update cannot enable it
+implicitly. Large survey histories and fleet concurrency still require the
+representative load tests below; these cache bounds are not a capacity proof.
 
 ## Outstanding integration and completion criteria
 

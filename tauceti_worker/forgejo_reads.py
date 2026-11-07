@@ -142,19 +142,48 @@ class BoundedReadCache:
         self._generation = 0
 
     def invalidate(self, *, scope=None):
+        self._validate_scope(scope)
         with self._lock:
             self._generation += 1
             for key, slot in self._active.items():
-                if scope is None or key[0] == scope:
+                if self._affected(key[0], scope):
                     slot.epoch += 1
+                    if slot.flight is not None and not slot.flight.done():
+                        slot.flight.set_exception(ReadInvalidated("source changed during a coalesced read"))
                     slot.flight = None
             for key in list(self._entries):
-                if scope is None or key[0] == scope:
+                if self._affected(key[0], scope):
                     self._drop(key)
 
     @staticmethod
+    def _validate_scope(scope):
+        if (
+            scope is not None
+            and not isinstance(scope, str)
+            and not (
+                isinstance(scope, tuple)
+                and len(scope) == 2
+                and isinstance(scope[0], str)
+                and (scope[1] is None or (type(scope[1]) is int and scope[1] > 0))
+            )
+        ):
+            raise ValueError("cache scope must be a string or a qualified repository/PR pair")
+
+    @staticmethod
+    def _affected(candidate, target):
+        if target is None or candidate == target:
+            return True
+        # A PR write also invalidates lists, across isolated credential keys.
+        return (
+            isinstance(candidate, tuple)
+            and isinstance(target, tuple)
+            and candidate[0] == target[0]
+            and (candidate[1] is None or target[1] is None)
+        )
+
+    @staticmethod
     def _key_bytes(key):
-        return len(key[1]) + (len(key[0].encode()) if key[0] is not None else 0)
+        return len(key[1]) + len(json.dumps(key[0], ensure_ascii=False).encode())
 
     def _drop(self, key):
         old = self._entries.pop(key)
@@ -163,8 +192,7 @@ class BoundedReadCache:
     def read(self, key, fetch, *, ttl, fresh=False, scope=None):
         if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) or not math.isfinite(ttl) or ttl < 0:
             raise ValueError("cache TTL must be finite and nonnegative")
-        if scope is not None and not isinstance(scope, str):
-            raise ValueError("cache scope must be a string")
+        self._validate_scope(scope)
         key = (
             scope,
             json.dumps(key, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(),
@@ -209,8 +237,11 @@ class BoundedReadCache:
                     future.set_result(encoded)
             return (json.loads(encoded) if encoded is not None else None), not leader
         except BaseException as error:
-            if leader and future is not None and not future.done():
-                future.set_exception(error)
+            with self._lock:
+                if leader and future is not None and not future.done():
+                    future.set_exception(
+                        error if isinstance(error, Exception) else ReadInvalidated("coalesced read leader interrupted")
+                    )
             raise
         finally:
             with self._lock:
@@ -259,7 +290,9 @@ class _ProjectionAPI:
         row = self.api.pull(repository, number)
         if not isinstance(row, dict) or type(row.get("number")) is not int or row["number"] != number:
             raise Incomplete("PR projection did not identify its requested number")
-        parsed, expected = urlsplit(row.get("html_url", "")), urlsplit(repository.pull_url(number))
+        if not isinstance(row.get("html_url"), str):
+            raise Incomplete("PR projection discussion URL is unavailable")
+        parsed, expected = urlsplit(row["html_url"]), urlsplit(repository.pull_url(number))
         if (
             (parsed.scheme, parsed.netloc, parsed.path.casefold())
             != (expected.scheme, expected.netloc, expected.path.casefold())
@@ -335,10 +368,12 @@ class ForgejoReadSource:
             self._failure.value = ReadFailure("binding", 0, "SourceBindingChanged")
             return False
 
-    def invalidate(self):
-        self.cache.invalidate(scope=self.cache_namespace)
+    def invalidate(self, number=None):
+        if number is not None:
+            self.repository.pull_url(number)
+        self.cache.invalidate(scope=(self.repository.key, number))
 
-    def _read(self, operation, args, fetch, *, fresh=False):
+    def _read(self, operation, args, fetch, *, fresh=False, number=None):
         from tauceti_tools.forge import ForgeError, Incomplete
 
         self._failure.value = None
@@ -364,7 +399,7 @@ class ForgejoReadSource:
 
             key = (self.cache_namespace, operation, json.dumps(args, sort_keys=True), revision)
             value, hit = self.cache.read(
-                key, bounded_fetch, ttl=self.ttl, fresh=fresh or force, scope=self.cache_namespace
+                key, bounded_fetch, ttl=self.ttl, fresh=fresh or force, scope=(self.repository.key, number)
             )
             self._bound()
             if hit:
@@ -382,10 +417,20 @@ class ForgejoReadSource:
 
     def pr_view(self, number, fields, *, fresh=False):
         self.repository.pull_url(number)
+        if (
+            not isinstance(fields, (list, tuple))
+            or not fields
+            or not all(isinstance(field, str) and field for field in fields)
+        ):
+            raise ValueError("PR projections require an explicit nonempty field list")
         # Typed projections require the requested fields' proofs, rather than
         # all historical head/stat proofs needed for a whole raw REST record.
         return self._read(
-            "pr_view", [number, fields], lambda: self.reader.pull(self.repository, number, fields), fresh=fresh
+            "pr_view",
+            [number, fields],
+            lambda: self.reader.pull(self.repository, number, fields),
+            fresh=fresh,
+            number=number,
         )
 
     @staticmethod
@@ -416,7 +461,7 @@ class ForgejoReadSource:
                     row[field] = self._utc(row[field])
             return rows
 
-        return self._read("issue_comments", [number], fetch, fresh=fresh)
+        return self._read("issue_comments", [number], fetch, fresh=fresh, number=number)
 
     def reviews(self, number, *, fresh=False):
         self.repository.pull_url(number)
@@ -438,7 +483,7 @@ class ForgejoReadSource:
                         row[field] = self._utc(row[field])
             return rows
 
-        return self._read("reviews", [number], fetch, fresh=fresh)
+        return self._read("reviews", [number], fetch, fresh=fresh, number=number)
 
     def review_comments(self, number):
         self.repository.pull_url(number)

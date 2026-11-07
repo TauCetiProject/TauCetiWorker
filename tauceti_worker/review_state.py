@@ -3,6 +3,7 @@ behind a short-TTL cache, with the predicates the cascade gates on."""
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -59,9 +60,8 @@ class ReviewState:
             if not re.fullmatch(r"[0-9a-f]{64}", gh.cache_namespace):
                 raise ValueError("direct source cache namespace must be a qualified identity digest")
             self.sbcache = self.sbcache / "sources" / gh.cache_namespace
-        self._comments: dict[int, tuple[float, list[dict] | None]] = {}
+        self._comments: dict[int, tuple[float, list[dict] | None, bool]] = {}
         self._observed: dict[int, str] = {}
-        self._shared_issue_hit: dict[int, bool] = {}
         self._survey_facts: dict[int, dict] = {}
 
     def seed_survey(self, rows=()):
@@ -137,14 +137,18 @@ class ReviewState:
             return None  # also rejects a future timestamp: a clock we cannot place is not a fresh one
         return sc if not self._direct_source or self.gh.binding_current() else None
 
-    def _write_sidecar(self, path: Path, pr: int, payload: dict) -> None:
+    def _write_sidecar(self, path: Path, pr: int, payload: dict, *, observed_at=None) -> None:
         """Atomically, and only ever after a SUCCESSFUL read. A failed fetch must leave the previous key
         in place: advancing it would let the next pass treat the failure as a confirmed answer."""
-        payload = {**payload, "updated_at": self._observed.get(pr, ""), "fetched_at": time.time()}
+        fetched = time.time() if observed_at is None else observed_at
+        payload = {**payload, "updated_at": self._observed.get(pr, ""), "fetched_at": fetched}
         try:
             if self._direct_source:
                 self._write_source_cache(
-                    path, payload, prune=path != self._key_path(pr) or payload.get("status") != "present"
+                    path,
+                    payload,
+                    prune=path != self._key_path(pr) or payload.get("status") != "present",
+                    observed_at=fetched,
                 )
                 return
             self.sbcache.mkdir(parents=True, exist_ok=True)
@@ -163,18 +167,28 @@ class ReviewState:
 
             prune_state_cache(self.sbcache.parent)
 
-    def _write_source_cache(self, path, value, *, prune=True):
+    def _write_source_cache(self, path, value, *, prune=True, observed_at=None):
         """Private atomic source cache writes, without following a target symlink."""
         self.sbcache.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory = os.open(self.sbcache, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp").name
+        observed_at = time.time() if observed_at is None else observed_at
         try:
             os.fchmod(directory, 0o700)
+            # Serialize only local atomic replacements. No network read holds
+            # this lock; using the directory avoids persistent lock files.
+            fcntl.flock(directory, fcntl.LOCK_EX)
+            try:
+                if os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mtime > observed_at:
+                    return  # An independently fetched later observation won.
+            except FileNotFoundError:
+                pass
             descriptor = os.open(
                 temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory
             )
-            with os.fdopen(descriptor, "w") as output:
-                output.write(json.dumps(value) + "\n")
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                output.write(json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n")
+            os.utime(temporary, (observed_at, observed_at), dir_fd=directory, follow_symlinks=False)
             os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
         finally:
             try:
@@ -187,24 +201,21 @@ class ReviewState:
         if prune:
             self._prune_source_cache()
 
-    def _issue_comments(self, pr: int, *, force: bool = False) -> list[dict] | None:
+    def _issue_comments(self, pr: int, *, force: bool = False) -> tuple[list[dict] | None, bool]:
         """Memoize legacy reads within a pass; direct sources own their bounded cache."""
         if self._direct_source and not self.gh.binding_current():
-            return None
+            return None, False
         # Direct sources already provide bounded coalescing and failure handling.
         # Retaining whole histories here would defeat that cache's byte bound.
         hit = None if force or self._direct_source else self._comments.get(pr)
         if hit and time.time() - hit[0] < COMMENTS_MEMO_S:
-            return hit[1]
+            return hit[1], hit[2]
         with read_context(fresh=force, revision=self._observed.get(pr, "")):
             cs = self.gh.issue_comments(pr)
-            self._shared_issue_hit[pr] = cache_hit()
-        if self._direct_source:
-            while len(self._shared_issue_hit) > 128:
-                self._shared_issue_hit.pop(next(iter(self._shared_issue_hit)))
-        else:
-            self._comments[pr] = (time.time(), cs)
-        return cs
+            reused = cache_hit()
+        if not self._direct_source:
+            self._comments[pr] = (time.time(), cs, reused)
+        return cs, reused
 
     def _uses_state_service(self):
         return not self._direct_source and github_state_enabled()
@@ -231,6 +242,7 @@ class ReviewState:
         returns '{}' even with a cache, so a scoreboard that was deleted/edited away (or a forged one a
         worker briefly cached) can't be served as fresh past the TTL.
         """
+        started = time.time()
         if self._direct_source and not self.gh.binding_current():
             return self._meta({}, "fetch_failed")
         if force:
@@ -259,7 +271,7 @@ class ReviewState:
             if age < ttl and cached is not None and (not self._direct_source or age >= 0):
                 return self._meta(cached, "assumed")
 
-        comments = self._issue_comments(pr, force=force)
+        comments, reused = self._issue_comments(pr, force=force)
         fetch_failed = comments is None
         # Source timestamps are normalized to fixed-width UTC by the adapter.
         # Stable timestamp sorting in the reducer then breaks ties by native ID.
@@ -277,16 +289,26 @@ class ReviewState:
                 # A confirmed absence is worth caching: without it, every pass re-reads every PR that
                 # has no scoreboard yet, which is most of a healthy queue. Drop the payload with it —
                 # left behind, the TTL path would keep serving a board we just confirmed is gone.
-                if not self._direct_source or not self._shared_issue_hit.get(pr, True):
-                    self._write_sidecar(self._key_path(pr), pr, {"status": "missing"})
+                if not self._direct_source or not reused:
+                    self._write_sidecar(
+                        self._key_path(pr),
+                        pr,
+                        {"status": "missing"},
+                        observed_at=started if self._direct_source else None,
+                    )
                 cache.unlink(missing_ok=True)
             return self._meta({}, "fetch_failed" if fetch_failed else "missing")
-        if self._direct_source and self._shared_issue_hit.get(pr, True):
+        if self._direct_source and reused:
             return self._meta(data, "assumed")  # Do not reset a reused observation's disk TTL.
-        self._write_sidecar(self._key_path(pr), pr, {"status": "present", "meta": data})
+        self._write_sidecar(
+            self._key_path(pr),
+            pr,
+            {"status": "present", "meta": data},
+            observed_at=started if self._direct_source else None,
+        )
         try:  # the legacy copy: the stale-on-failure fallback reads it, nothing entitled does
             if self._direct_source:
-                self._write_source_cache(cache, data, prune=False)
+                self._write_source_cache(cache, data, prune=False, observed_at=started)
             else:
                 self.sbcache.mkdir(parents=True, exist_ok=True)
                 cache.write_text(json.dumps(data) + "\n")
@@ -294,7 +316,7 @@ class ReviewState:
             pass
         finally:
             self._prune_source_cache()
-        return self._meta(data, "assumed" if self._shared_issue_hit.get(pr, self._direct_source) else "fresh")
+        return self._meta(data, "assumed" if reused else "fresh")
 
     @staticmethod
     def _load(cache: Path) -> dict | None:
@@ -313,14 +335,13 @@ class ReviewState:
         and a memo left warm would rebuild the cache from the comments as they were BEFORE that post,
         re-caching the state we just invalidated."""
         if self._direct_source:
-            self.gh.invalidate()
+            self.gh.invalidate(pr)
         else:
             invalidate()
         self._cache_path(pr).unlink(missing_ok=True)
         self._key_path(pr).unlink(missing_ok=True)
         self._contest_path(pr).unlink(missing_ok=True)
         self._comments.pop(pr, None)
-        self._shared_issue_hit.pop(pr, None)
         self._survey_facts.pop(pr, None)
 
     # --- predicates over the meta (the cascade's clean-head / blocking rules) ---
