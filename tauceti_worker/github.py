@@ -660,7 +660,7 @@ class GitHub:
     def for_repository(cls, repository, *, api=None, cache=None, ttl=15):
         """Select a qualified read source; never guess its credential or mirror.
 
-        Forgejo currently supports the review-state metadata/discussion reads.
+        Forgejo supports metadata/discussion and read-only survey inventory.
         Full worker activation and writes retain their separate migration guard.
         """
         from tauceti_tools.forge import GITHUB, RepositoryRef

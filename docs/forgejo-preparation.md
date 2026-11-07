@@ -263,9 +263,33 @@ The same fixture exercises a non-admin collaborator gaining read access, gaining
 write access and losing repository access, without reusing an earlier ACL. It
 also checks the explicit archive flag after the repository is archived.
 
-These are programmatic survey inputs. Production survey ownership and bot repair
-still use the existing GitHub helpers until qualified PR identities, source/CI
-status authority, inline contests and remaining source operations are integrated.
+The source inventory consumer below uses these qualified actor inputs.
+Production still uses GitHub; bot repair, source/CI status authority, inline
+contests and remaining source operations require their integrated adapters.
+
+## Direct source inventory and ownership
+
+The ordinary `survey()` consumer accepts the direct source adapter. It exhausts
+bounded native open-PR pagination and reads the authenticated native actor fresh.
+Inventory reads share the source's bounded, credential-scoped triage cache and
+PR write invalidation. No GitHub identity, ACL, shared-state survey or per-PR
+history/status/diff hydration supplies this inventory. Pagination failure,
+malformed source identity, credential rotation or denied identity reads produce
+an explicit unavailable result, never a successful empty inventory.
+
+Source survey and PR records carry their qualified repository and principal
+identities. Ownership, roadmap pressure, status-label counts and repair ownership
+checks compare native IDs on the selected origin. A login rename preserves
+ownership; login reuse, unknown/ghost authors and another origin do not grant it.
+The existing GitHub survey JSON shape stays unchanged.
+
+Native `build` statuses are excluded from source survey CI classification. Native
+false mergeability remains unknown. This inventory provides no verified execution,
+claim or publication authority: its queues and next automatic stage remain empty,
+including after TUI rescoping, and it reports a source-scheduling dependency.
+Deep scheduling requests report unavailable until those adapters are integrated.
+Production bootstrap still refuses Forgejo activation. This read consumer is not
+the isolated author/review/CI/merge rehearsal or a capacity proof.
 
 ## Outstanding integration and completion criteria
 

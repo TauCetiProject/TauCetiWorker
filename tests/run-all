@@ -204,6 +204,7 @@ RUN_STDLIB=(
   shared_repositories.py
   source_argument.py
   source_identity.py
+  source_survey.py
   extra_roadmap_prompt.py
   spread_candidates.py
   ssl_cert_file.py
