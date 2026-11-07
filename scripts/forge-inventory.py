@@ -19,7 +19,7 @@ from pathlib import Path
 PATTERNS = {
     "github_origin": r"github\.com|githubusercontent\.com|ghcr\.io|github\.io",
     "graphql": r"graphql|GraphQL|resolveReviewThread|reviewThreads",
-    "gh_cli": r"\bgh\s+(?:-|api|pr|issue|repo|run|auth|release|workflow|label|search|secret|variable)\b|[\"']gh[\"']\s*,|\(\s*\[\s*[\"'](?:api|pr|issue|repo|label|run)[\"']\s*,",
+    "gh_cli": r"\bgh\s+(?:--?[A-Za-z]|(?:api|pr|issue|repo|run|auth|release|workflow|label|search|secret|variable)\b)|[\"']gh[\"']\s*,|\(\s*\[\s*[\"'](?:api|pr|issue|repo|label|run)[\"']\s*,",
     "credentials": r"GH_TOKEN|GITHUB_TOKEN|github_account|github_token_file|InstallationToken|github-app",
     "source_identity": r"TAUCETI_REPO|TAUCETI_FORK|Source-PR|repository_id|review_app_id",
     "org_slug": r"TauCetiProject/[\w.-]+",

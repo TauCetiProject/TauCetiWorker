@@ -1,12 +1,12 @@
 {
   "schema": "tauceti.forge-inventory/v1",
-  "generated_at": "2026-11-07T01:20:34.623345+00:00",
-  "scanner_sha256": "3127d04eab4eac8c0b662fb07c342a17c83f42ccfe28456005e629b15e372792",
+  "generated_at": "2026-11-07T01:25:06.638265+00:00",
+  "scanner_sha256": "89ba284fd030c136f25cdc8d2653d97238a8991dbfbe2f48c2205a87ea8825bd",
   "policy": {
     "patterns": {
       "github_origin": "github\\.com|githubusercontent\\.com|ghcr\\.io|github\\.io",
       "graphql": "graphql|GraphQL|resolveReviewThread|reviewThreads",
-      "gh_cli": "\\bgh\\s+(?:-|api|pr|issue|repo|run|auth|release|workflow|label|search|secret|variable)\\b|[\\\"']gh[\\\"']\\s*,|\\(\\s*\\[\\s*[\\\"'](?:api|pr|issue|repo|label|run)[\\\"']\\s*,",
+      "gh_cli": "\\bgh\\s+(?:--?[A-Za-z]|(?:api|pr|issue|repo|run|auth|release|workflow|label|search|secret|variable)\\b)|[\\\"']gh[\\\"']\\s*,|\\(\\s*\\[\\s*[\\\"'](?:api|pr|issue|repo|label|run)[\\\"']\\s*,",
       "credentials": "GH_TOKEN|GITHUB_TOKEN|github_account|github_token_file|InstallationToken|github-app",
       "source_identity": "TAUCETI_REPO|TAUCETI_FORK|Source-PR|repository_id|review_app_id",
       "org_slug": "TauCetiProject/[\\w.-]+",
@@ -5959,6 +5959,7 @@
             "gh_cli": [
               126,
               142,
+              188,
               194,
               202,
               212,
@@ -6233,6 +6234,7 @@
           "categories": {
             "gh_cli": [
               121,
+              144,
               184,
               213,
               216,
@@ -7252,7 +7254,7 @@
       "counts": {
         "github_origin": 11,
         "graphql": 0,
-        "gh_cli": 3,
+        "gh_cli": 4,
         "credentials": 10,
         "source_identity": 1,
         "org_slug": 15,
@@ -7658,6 +7660,10 @@
           "categories": {
             "github_origin": [
               192
+            ],
+            "gh_cli": [
+              202,
+              597
             ]
           }
         }
@@ -8201,9 +8207,11 @@
               391
             ],
             "gh_cli": [
+              33,
               56,
               161,
               203,
+              218,
               231,
               269,
               283,
@@ -9631,6 +9639,7 @@
           "path": ".github/workflows/fleet-smoke.yml",
           "categories": {
             "gh_cli": [
+              17,
               22
             ],
             "credentials": [
