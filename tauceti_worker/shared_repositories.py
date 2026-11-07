@@ -24,6 +24,11 @@ def root() -> Path:
     return Path(os.environ.get("TAUCETI_SHARED_REPOSITORIES_DIR", transport.root() / "repositories"))
 
 
+def review_mathlib_cache() -> str:
+    """Opaque Review-owned source store; an explicit empty override disables it."""
+    return os.environ.get("TAUCETI_REVIEW_MATHLIB_CACHE", str(root().absolute() / "review-mathlib"))
+
+
 def _git(*args) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *map(str, args)], capture_output=True, text=True, timeout=120)
 
