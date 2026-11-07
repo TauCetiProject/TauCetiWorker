@@ -9,11 +9,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tauceti_queue import webhook
+from tauceti_queue import feeds, webhook
 from tauceti_queue.admission import AdmissionPolicy, AdmissionPoller
 from tauceti_queue.fakes import make_controller, reopen_controller
-from tauceti_queue.github_adapter import GitHubClient, RateLimited
-from tauceti_queue.ports import Status
+from tauceti_queue.github_adapter import GitHubClient, RateLimited, RequestDeferred
+from tauceti_queue.ports import GitHubUnavailable, Status
 
 REPO = "TauCetiProject/TauCeti"
 
@@ -384,6 +384,151 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.intake.state.get(1)["cancelled_head_sha"], "")
         self.intake.run_once()
         self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+
+    def human_approval(self, *, files=None, admin=True):
+        head = self.github.create_pr(1, files or {"scripts/ci-helper.py": "# infrastructure\n"})
+        self.github.admins.add("human")
+        self.github.user_ids["human"] = 42
+        evidence = {
+            "kind": "issue_comment",
+            "admin": admin,
+            "actor_id": 42,
+            "actor_login": "human",
+            "head_sha": head,
+            "merge_base_sha": self.github.pr_merge_base(REPO, 1, head),
+        }
+        self.controller.approve(REPO, 1, head, "human", evidence=evidence)
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+        return head
+
+    def test_human_owned_pr_keeps_live_admin_approval_without_machine_scoreboard(self):
+        head = self.human_approval()
+        result = self.intake.run_once()
+        self.assertEqual(result["revoked"], 0)
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+        self.assertTrue(self.intake.is_current(1, head))
+        self.assertEqual(json.loads(self.controller.input_for(REPO, 1)["evidence"])["actor_id"], 42)
+        self.assertEqual(
+            json.loads(self.intake.state.get(1)["decision"])["reason"], "human-owned paths approved by repository admin"
+        )
+
+    def test_human_exception_does_not_waive_machine_review_or_stale_authority(self):
+        for case in (
+            "not-admin",
+            "role-removed",
+            "mathematics",
+            "mixed",
+            "stale-base",
+            "negative-review",
+            "wrong-head",
+            "reused-login",
+        ):
+            with self.subTest(case=case):
+                if self.controller.input_for(REPO, 1):
+                    self.controller.cancel(REPO, 1, "fixture")
+                self.github.review_comments.pop(1, None)
+                files = {"TauCeti/P1.lean": "-- math\n"} if case == "mathematics" else None
+                if case == "mixed":
+                    files = {"TauCeti/P1.lean": "-- math\n", "scripts/ci-helper.py": "# infra\n"}
+                self.human_approval(files=files, admin=case != "not-admin")
+                if case == "role-removed":
+                    self.github.admins.remove("human")
+                elif case == "reused-login":
+                    self.github.user_ids["human"] = 99
+                elif case in ("stale-base", "wrong-head"):
+                    current = self.controller.input_for(REPO, 1)
+                    evidence = json.loads(current["evidence"])
+                    evidence["merge_base_sha" if case == "stale-base" else "head_sha"] = "f" * 40
+                    self.controller.store.update("inputs", {"id": current["id"]}, evidence=json.dumps(evidence))
+                elif case == "negative-review":
+                    self.review(state="red")
+                self.intake.invalidate(1)
+                self.intake.run_once()
+                self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
+
+    def test_permission_read_failure_defers_human_approval_and_blocks_insertion(self):
+        head = self.human_approval()
+        original = self.github.repository_admin
+
+        def unavailable(*args, **kwargs):
+            raise GitHubUnavailable("permission service unavailable")
+
+        self.github.repository_admin = unavailable
+        self.addCleanup(setattr, self.github, "repository_admin", original)
+        self.assertTrue(self.intake.run_once()["errors"])
+        self.assertFalse(self.intake.is_current(1, head))
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+        self.github.repository_admin = original
+
+    def test_bookkeeping_during_permission_read_does_not_restart_human_evaluation(self):
+        self.human_approval()
+        original = self.github.repository_admin
+
+        def update_bookkeeping(*args, **kwargs):
+            current = self.controller.input_for(REPO, 1)
+            self.controller.store.update("inputs", {"id": current["id"]}, priority=7, passes_waited=3)
+            return original(*args, **kwargs)
+
+        self.github.repository_admin = update_bookkeeping
+        self.intake.run_once()
+        self.assertEqual(self.intake.state.get(1)["generation"], self.intake.state.get(1)["evaluated_generation"])
+        self.assertEqual(self.controller.input_for(REPO, 1)["priority"], 7)
+
+    def test_withdrawal_during_permission_read_cannot_be_reauthorized(self):
+        self.human_approval()
+        original = self.github.repository_admin
+
+        def withdraw(*args, **kwargs):
+            self.controller.cancel(REPO, 1, "human")
+            return original(*args, **kwargs)
+
+        self.github.repository_admin = withdraw
+        self.intake.run_once()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
+        self.assertFalse(json.loads(self.intake.state.get(1)["decision"])["review_safe"])
+
+    def test_permission_quota_wait_preserves_deadline_and_human_intent(self):
+        head = self.human_approval()
+        original = self.github.repository_admin
+        self.addCleanup(setattr, self.github, "repository_admin", original)
+        deadline = self.clock() + 600
+
+        def deferred(*args, **kwargs):
+            raise RequestDeferred("quota wait", retry_at=deadline, resource="core")
+
+        self.github.repository_admin = deferred
+        result = self.intake.run_once()
+        self.assertEqual(result["deferred"], 1)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(self.intake.state.get(1)["next_attempt_at"], deadline)
+        self.assertFalse(self.intake.is_current(1, head))
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+
+    def test_pin_only_pr_keeps_normal_machine_review_requirement(self):
+        self.config = AdmissionPolicy(rubrics=self.config.rubrics, prefix="TauCeti/", allow_files=["lean-toolchain"])
+        self.intake = AdmissionPoller(self.controller, self.github, REPO, self.config, clock=self.clock)
+        self.human_approval(files={"lean-toolchain": "leanprover/lean4:v4.36.0-rc2\n"})
+        self.intake.run_once()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
+
+    def test_human_approved_input_reaches_staging_but_failed_scope_cannot_publish(self):
+        head = self.human_approval()
+        self.intake.run_once()
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "inserted")
+        observation = feeds.observation_feed(feeds.feed_source(self.controller), REPO, "main")
+        self.assertEqual(
+            observation["scope_approvals"],
+            [{"pr": 1, "actor_id": 42, "head_sha": head, "merge_base_sha": self.github.pr_merge_base(REPO, 1, head)}],
+        )
+        self.assertEqual(len(self.github.runs), 1)
+        before = self.repo.main_sha()
+        self.github.complete_runs()
+        run = self.github.runs[0]
+        self.github.statuses[(run.head_sha, "scope")] = Status("failure", "", "", self.clock(), run.run_id)
+        self.controller.handle_event("status", {"sha": run.head_sha, "context": "scope"})
+        self.controller.tick()
+        self.assertEqual(self.repo.main_sha(), before)
 
     def test_main_event_during_source_read_fences_the_decision(self):
         head = self.ready()

@@ -639,6 +639,18 @@ It runs no model and executes no PR code. The resulting input records the source
 head, reviewed merge base and policy revision/digest as `admission_policy` evidence; it does not
 claim to be an approval signed by the review App.
 
+An infrastructure-only PR may instead carry a repository admin's explicit `bors r+`
+or `bors merge` approval. When it has no current AI scoreboard, intake preserves
+that recorded approval only while its exact head and merge base still match and
+the approving account ID still has effective admin permission. Every changed path
+must be outside the configured mathematics prefix and automatic allowed files;
+mixed mathematics/infrastructure and pin-only PRs retain ordinary machine review.
+A current negative scoreboard still rejects the PR. Permission-read failures leave
+evaluation pending and prevent insertion. The decision records the human approval
+and permission-check time, and the scope observation exposes its original evidence.
+All staging build, audit, pin and scope checks remain required before publication.
+An approval previously cancelled by policy needs a fresh operator command after repair.
+
 The existing approval-poll thread runs intake. Relevant authenticated webhooks persist dirty PRs
 in `admission_work` in the existing SQLite database before acknowledgment. Reads and git fetches
 happen outside the controller/database lock. Applying a result checks its generation and target
