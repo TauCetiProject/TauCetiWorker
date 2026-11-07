@@ -7,6 +7,7 @@ belongs to a temporary loopback-only instance; no installed worker is executed.
 
 import base64
 import getpass
+import importlib
 import json
 import os
 import re
@@ -164,7 +165,33 @@ ROOT_PATH = {root}/log
                     comment = api.post_comment(repo, number, board("a" * 40))
                     for i in range(32):
                         api.post_comment(repo, number, f"Discussion {i}")
-                    cfg = SimpleNamespace(sbcache=root / "review-state")
+                    api.request(
+                        "POST",
+                        "repos/operator/source/branches",
+                        {
+                            "new_branch_name": "second-proof",
+                            "old_branch_name": "main",
+                        },
+                    )
+                    api.request(
+                        "POST",
+                        "repos/operator/source/contents/Second.lean",
+                        {
+                            "branch": "second-proof",
+                            "message": "Second proof",
+                            "content": base64.b64encode(b"example : True := trivial\n").decode(),
+                        },
+                    )
+                    second = api.request(
+                        "POST",
+                        "repos/operator/source/pulls",
+                        {
+                            "head": "second-proof",
+                            "base": "main",
+                            "title": "Second proof",
+                        },
+                    )
+                    cfg = SimpleNamespace(sbcache=root / "review-state", wid="native-source-survey")
                     shared_cache = BoundedReadCache(max_entries=4, max_bytes=64 * 1024)
                     source = GitHub.for_repository(repo, api=api, cache=shared_cache)
                     other = GitHub.for_repository(repo, api=restricted, cache=shared_cache)
@@ -192,6 +219,27 @@ ROOT_PATH = {root}/log
                         state.observe([SimpleNamespace(number=number, updated_at=pull["updated_at"])])
                         self.assertEqual(state.gh_meta(number).provenance, "fresh")
                         self.assertEqual(ReviewState(cfg, source).gh_meta(number).provenance, "assumed")
+                        survey_module = importlib.import_module("tauceti_worker.survey")
+                        with (
+                            patch(
+                                "tauceti_worker.github_state.read_survey", side_effect=AssertionError("survey service")
+                            ),
+                            patch.object(survey_module, "me", side_effect=AssertionError("GitHub login")),
+                            patch.object(survey_module, "can_push", side_effect=AssertionError("GitHub permission")),
+                        ):
+                            inventory = survey_module.survey(
+                                cfg, source, state, None, deep=False, selected_roadmap="any"
+                            )
+                        self.assertFalse(inventory.github_failed)
+                        self.assertEqual({p.number for p in inventory.open_prs}, {number, second["number"]})
+                        self.assertTrue(all(inventory.owns(p) for p in inventory.open_prs))
+                        self.assertEqual(inventory.n_reviewable, 0)
+                        self.assertIsNone(inventory.next_auto_stage)
+                        # A one-page client cannot claim this two-PR inventory is complete.
+                        capped_api = Forgejo(api.forge, token=api._token, max_pages=1)
+                        capped = GitHub.for_repository(repo, api=capped_api)
+                        self.assertIsNone(capped.open_prs())
+                        self.assertEqual(capped.last_failure.kind, "Incomplete")
                         actor = source.authenticated_actor()
                         self.assertEqual(actor.login, "operator")
                         self.assertEqual(actor.principal.forge, api.forge)

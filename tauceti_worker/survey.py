@@ -361,6 +361,10 @@ class Survey:
         # it no work.
         self._review_throttled: dict[int, str] = {}
 
+    def owns(self, pr: PRInfo) -> bool:
+        # Qualified source records cannot fall back to a GitHub display login.
+        return not hasattr(pr, "source_repository") and pr.author == self.me_login
+
     def kind(self, name: str) -> WorkKind:
         return {
             "rebase": self.rebaseable,
@@ -399,7 +403,27 @@ class Survey:
         return ", ".join(parts)
 
 
-def bucket_status_labels(nondraft: list[PRInfo], me_login: str) -> tuple[list[tuple[str, int, int]], int]:
+def owns_pr(survey, pr: PRInfo, *, casefold_legacy=False) -> bool:
+    qualified = hasattr(pr, "source_repository") or hasattr(survey, "source_repository")
+    if casefold_legacy and not qualified:
+        author, login = getattr(pr, "author", ""), getattr(survey, "me_login", "")
+        return bool(author and login and author.casefold() == login.casefold())
+    if owns := getattr(survey, "owns", None):
+        return owns(pr)
+    return not qualified and pr.author == survey.me_login
+
+
+def owns_author(survey, author: dict | None) -> bool:
+    """Fresh projected author check; source identity never falls back to login."""
+    if hasattr(survey, "source_repository"):
+        check = getattr(survey, "owns_author", None)
+        return bool(check and check(author))
+    login = author.get("login") if isinstance(author, dict) else None
+    me_login = getattr(survey, "me_login", "")
+    return bool(isinstance(login, str) and login and me_login and login.casefold() == me_login.casefold())
+
+
+def bucket_status_labels(nondraft: list[PRInfo], me_login: str, *, owns=None) -> tuple[list[tuple[str, int, int]], int]:
     """Bucket open non-draft PRs by the STATUS_LABELS pipeline (fixed order). Returns
     (buckets, unlabeled) where each bucket is (label, total, mine) — total carrying that label, and the
     subset authored by `me_login` — and `unlabeled` counts PRs with none of the status labels. A PR
@@ -409,7 +433,12 @@ def bucket_status_labels(nondraft: list[PRInfo], me_login: str) -> tuple[list[tu
         (
             label,
             sum(1 for p in nondraft if label in p.labels),
-            sum(1 for p in nondraft if label in p.labels and p.author == me_login),
+            sum(
+                1
+                for p in nondraft
+                if label in p.labels
+                and (owns(p) if owns else not hasattr(p, "source_repository") and p.author == me_login)
+            ),
         )
         for label in STATUS_LABELS
     ]
@@ -718,6 +747,19 @@ def survey(
         roadmap_only=("auto" if _f is None else (_f or "any")),
         roadmap_skip=roadmap_skip(),
     )
+    if getattr(gh, "direct_source", False) is True:
+        from .source_survey import inventory_survey
+
+        return inventory_survey(
+            cfg,
+            gh,
+            roadmap=sv.roadmap_only,
+            skip=sv.roadmap_skip,
+            deep=deep,
+            stages=enabled,
+            numbers=numbers,
+            count_all_roadmaps=count_all_roadmaps,
+        )
     compact = []
     if seed := getattr(rs, "seed_survey", None):
         seed()
@@ -1034,7 +1076,7 @@ def survey(
                         budget=MAX_FIX_ATTEMPTS,
                         partial_history=True,
                     )
-                    c.final_resolution = c.attempts >= c.budget - 1 and p.author == me_login and not p.automatic_bump
+                    c.final_resolution = c.attempts >= c.budget - 1 and sv.owns(p) and not p.automatic_bump
                     (
                         sv.needs_fix.suppressed
                         if c.attempts >= c.budget and not c.final_resolution
@@ -1068,7 +1110,7 @@ def survey(
                     "blocking review at head",
                     attempts=per_head,
                     budget=MAX_FIX_ATTEMPTS,
-                    final_resolution=per_head >= MAX_FIX_ATTEMPTS - 1 and p.author == me_login and not p.automatic_bump,
+                    final_resolution=per_head >= MAX_FIX_ATTEMPTS - 1 and sv.owns(p) and not p.automatic_bump,
                 )
                 sv.needs_fix.actionable.append(c)
                 continue
@@ -1077,7 +1119,7 @@ def survey(
                 c = Candidate(
                     p.number, p.head_oid, "blocking review at head", attempts=per_head, budget=MAX_FIX_ATTEMPTS
                 )
-                if p.author == me_login and not p.automatic_bump:
+                if sv.owns(p) and not p.automatic_bump:
                     c.final_resolution = True
                     c.reason = "fix attempts spent; resolve or close the authored PR"
                     sv.needs_fix.actionable.append(c)
@@ -1197,6 +1239,8 @@ def survey(
 
 
 def _next_auto_stage(sv: Survey) -> str | None:
+    if hasattr(sv, "source_repository"):
+        return None  # Source inventory supplies no scheduling or publication authority.
     for stage in AUTO_STAGES:
         if sv.kind(stage).actionable:
             return stage

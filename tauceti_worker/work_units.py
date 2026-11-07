@@ -106,6 +106,8 @@ from .survey import (
     Survey,
     bust_progress_cache,
     fix_disposition,
+    owns_author,
+    owns_pr,
     prioritize_review_candidates,
     progress_argv,
     spread_candidates,
@@ -1057,7 +1059,7 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) ->
             unlimited=getattr(p, "automatic_bump", False),
         )
         c.final_resolution = (
-            attempts >= MAX_FIX_ATTEMPTS - 1 and p.author == sv.me_login and not getattr(p, "automatic_bump", False)
+            attempts >= MAX_FIX_ATTEMPTS - 1 and owns_pr(sv, p) and not getattr(p, "automatic_bump", False)
         )
         if disp != "actionable" and not (disp == "exhausted" and c.final_resolution):
             log(f"  fix #{c.pr}: not actionable on a fresh read ({why or disp}) — skipping")
@@ -1838,19 +1840,13 @@ def _do_fixlike(
                 "existing branch lease and starting-head CAS. A new head ends this authorization.\n"
             )
     # Every PR repair runs unattended: repair, answer the finding, or close owned work.
-    author = getattr(p, "author", "")
-    may_close = (
-        bool(author)
-        and not foreign
-        and not getattr(p, "automatic_bump", False)
-        and author.lower() == getattr(sv, "me_login", "").lower()
-    )
+    may_close = not foreign and not getattr(p, "automatic_bump", False) and owns_pr(sv, p, casefold_legacy=True)
     prompt += "\n" + fill_prompt(
         HERE / "prompts" / "pr-outcome.md",
         PR=pr,
         HEAD=head,
         CLOSE_AUTHORITY=(
-            "You may close this PR only while its live author is the authenticated GitHub account."
+            "You may close this PR only while its live author is the authenticated account on this source forge."
             if may_close
             else "You may NOT close this PR: it is not your authored PR or has a special repair scope."
         ),
@@ -1989,9 +1985,7 @@ def _do_fixlike(
             not foreign
             and label != "bump"
             and not getattr(p, "automatic_bump", False)
-            and getattr(p, "author", None)
-            and getattr(sv, "me_login", None)
-            and p.author.lower() == sv.me_login.lower()
+            and owns_pr(sv, p, casefold_legacy=True)
         ):
             from .repair_recovery import Wait as RecoveryWait
             from .repair_recovery import handoff_context
@@ -2090,7 +2084,7 @@ def _close_spent_pr(w, sv, c) -> int | None:
     p = next((p for p in sv.open_prs if p.number == c.pr), None)
     if (
         not p
-        or p.author != sv.me_login
+        or not owns_pr(sv, p)
         or p.automatic_bump
         or c.foreign_repair_base
         or w.counters.read(f"fix-{c.pr}-{c.head[:12]}") < MAX_FIX_ATTEMPTS
@@ -2108,7 +2102,7 @@ def _close_spent_pr(w, sv, c) -> int | None:
                 or live.get("state") != "OPEN"
                 or live.get("headRefOid") != c.head
                 or live.get("isDraft") is not False
-                or (live.get("author") or {}).get("login", "").lower() != sv.me_login.lower()
+                or not owns_author(sv, live.get("author"))
                 or {str(label.get("name", "")).lower() for label in live.get("labels", [])}
                 & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
             ):

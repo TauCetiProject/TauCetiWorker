@@ -285,9 +285,12 @@ class _ProjectionAPI:
         return getattr(self.api, name)
 
     def pull(self, repository, number):
+        return self.validate_pull(self.api.pull(repository, number), repository, number)
+
+    @staticmethod
+    def validate_pull(row, repository, number):
         from tauceti_tools.forge import Incomplete, Unsupported
 
-        row = self.api.pull(repository, number)
         if not isinstance(row, dict) or type(row.get("number")) is not int or row["number"] != number:
             raise Incomplete("PR projection did not identify its requested number")
         if not isinstance(row.get("html_url"), str):
@@ -312,12 +315,43 @@ class _ProjectionAPI:
             raise Incomplete("PR projection lifecycle is unavailable or inconsistent")
         return row
 
+    def pulls(self, repository, **filters):
+        from tauceti_tools.forge import Incomplete, RepositoryRef
+
+        rows = self.api.pulls(repository, **filters)
+        for row in rows:
+            number = row.get("number") if isinstance(row, dict) else None
+            if type(number) is not int or number < 1:
+                raise Incomplete("source inventory has no PR identity")
+            self.validate_pull(row, repository, number)
+            if row["state"] != "open" or row["merged"]:
+                raise Incomplete("source open inventory contains a closed PR")
+            head = row.get("head")
+            if not isinstance(head, dict) or "repo" not in head:
+                raise Incomplete("source inventory head repository is unavailable")
+            native = head["repo"]
+            if native is not None:
+                if not isinstance(native, dict) or type(native.get("id")) is not int or native["id"] < 1:
+                    raise Incomplete("source head repository identity is unavailable")
+                ref = RepositoryRef(repository.forge, native.get("full_name"))
+                if not isinstance(native.get("html_url"), str):
+                    raise Incomplete("source head repository URL is unavailable")
+                parsed, expected = urlsplit(native["html_url"]), urlsplit(ref.url)
+                if (
+                    (parsed.scheme, parsed.netloc, parsed.path.casefold())
+                    != (expected.scheme, expected.netloc, expected.path.casefold())
+                    or parsed.query
+                    or parsed.fragment
+                ):
+                    raise Incomplete("source head repository belongs to another origin")
+        return rows
+
 
 class ForgejoReadSource:
     """Worker-shaped PR metadata and discussion reads on one qualified source.
 
-    This is the review-state read adapter, not a full worker or CLI backend.
-    Inline thread semantics, claims/reactions, authorship and writes remain
+    This supplies review-state and survey inventory reads, not a full worker or CLI backend.
+    Inline thread semantics, claims/reactions, authoring and writes remain
     separate adapters. None signals unavailable; [] is a verified empty read.
     """
 
@@ -435,6 +469,29 @@ class ForgejoReadSource:
             fresh=fresh,
             number=number,
         )
+
+    def open_prs(self, *, fresh=False):
+        """Complete bounded open inventory, excluding unverified CI observations.
+
+        Exhaust native pagination. No per-PR history, status or diff hydration is
+        needed. Concurrent changes can still move rows between pages; this is a
+        short-lived discovery observation, not a source snapshot or merge proof.
+        """
+        fields = [
+            "number",
+            "title",
+            "body",
+            "headRefOid",
+            "headRefName",
+            "headRepository",
+            "headRepositoryOwner",
+            "isDraft",
+            "mergeable",
+            "author",
+            "labels",
+            "updatedAt",
+        ]
+        return self._read("open_prs", [], lambda: self.reader.pulls(self.repository, fields, state="open"), fresh=fresh)
 
     def authenticated_actor(self):
         """Fresh native actor identity; never infer it from a login or GitHub."""
