@@ -1409,8 +1409,24 @@ class GitHubAdapter:
         role = data.get("role_name") or data.get("permission")
         return str(role) if role else None
 
-    def repository_admin(self, login: str, repo: str | None = None) -> bool:
-        return self.collaborator_permission(repo or self.repo, login) == "admin"
+    def repository_admin(self, login: str, repo: str | None = None, *, actor_id: int | None = None) -> bool:
+        if actor_id is None:
+            return self.collaborator_permission(repo or self.repo, login) == "admin"
+        encoded = urllib.parse.quote(login, safe="")
+        try:
+            status, data = self.client.get_json(
+                f"repos/{repo or self.repo}/collaborators/{encoded}/permission", tolerate=(404,)
+            )
+        except RequestDeferred:
+            raise
+        except (GitHubError, OSError) as error:
+            raise ports.GitHubUnavailable(f"permission lookup for {login}: {error}") from error
+        return bool(
+            status == 200
+            and isinstance(data, dict)
+            and (data.get("role_name") or data.get("permission")) == "admin"
+            and (data.get("user") or {}).get("id") == actor_id
+        )
 
     def reviewer(self, login: str, repo: str | None = None) -> bool:
         """Bors's reviewer check: a collaborator with push access."""

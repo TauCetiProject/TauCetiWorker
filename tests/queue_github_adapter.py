@@ -914,6 +914,20 @@ class Adapter(unittest.TestCase):
         with self.assertRaises(ports.GitHubUnavailable):
             adapter(transport).repository_admin("kim-em")
 
+    def test_repository_admin_can_bind_the_effective_role_to_an_account_id(self):
+        for response, expected in [
+            ({"permission": "admin", "user": {"id": 42}}, True),
+            ({"permission": "admin", "user": {"id": 99}}, False),
+            ({"permission": "write", "user": {"id": 42}}, False),
+            ({"permission": "admin"}, False),
+        ]:
+            with self.subTest(response=response):
+                transport = FakeTransport()
+                transport.add(
+                    "GET", f"https://api.github.com/repos/{TAUCETI}/collaborators/human/permission", 200, response
+                )
+                self.assertEqual(adapter(transport).repository_admin("human", TAUCETI, actor_id=42), expected)
+
     def test_list_open_pull_requests_over_graphql(self):
         transport = FakeTransport()
         rest_headers = {"x-ratelimit-remaining": "4321", "x-ratelimit-limit": "5000", "x-ratelimit-reset": "1800003600"}

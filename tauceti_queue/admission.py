@@ -28,6 +28,22 @@ EXPLICIT_WITHDRAWALS = frozenset(
     {"unapproved", "cancelled", "conflicts-with-main", "missing-source", "landed-externally", "problem-anticipated"}
 )
 CONTEXTS = ("build", "scope", "bump-guard")
+HUMAN_INFRASTRUCTURE_APPROVAL_VERSION = 1
+
+
+def approval_binding(current):
+    if not current:
+        return None
+    evidence = loads(current["evidence"], {})
+    return (
+        current["id"],
+        current["state"],
+        current["head_sha"],
+        *(
+            evidence.get(key)
+            for key in ("kind", "admin", "actor_id", "actor_login", "head_sha", "merge_base_sha", "comment_id")
+        ),
+    )
 
 
 def digest(value) -> str:
@@ -98,6 +114,7 @@ class AdmissionPolicy:
                 "rubrics": self.rubrics,
                 "prefix": prefix,
                 "allow_files": self.allow_files,
+                "human_infrastructure_approval": HUMAN_INFRASTRUCTURE_APPROVAL_VERSION,
             }
         )
 
@@ -466,6 +483,26 @@ class AdmissionPoller:
         epoch = self._source_epoch()
         snapshot = self.adapter.admission_snapshot(self.repo, work["number"], generation=work["generation"])
         result, authorization, evidence, comment, meta = self.policy.evaluate(snapshot)
+        current_input = self.controller.input_for(self.repo, work["number"])
+        human_review = self._human_owned_approval(snapshot, current_input, comment)
+        if human_review:
+            # Human-owned infrastructure does not receive an automatic scoreboard.
+            # Preserve the operator's recorded intent; staging must still establish
+            # build, bump-guard and scope success before anything can be published.
+            result = {**result, "review_safe": True, "reason": "human-owned paths approved by repository admin"}
+            approval = loads(current_input["evidence"], {})
+            evidence = {
+                **evidence,
+                "command": result["reason"],
+                "human_approval": {
+                    **{
+                        key: approval.get(key)
+                        for key in ("actor_id", "actor_login", "comment_id", "head_sha", "merge_base_sha")
+                    },
+                    "effective_admin": True,
+                    "permission_checked_at": self.clock(),
+                },
+            }
         version = self._version(snapshot.source())
         # All reads/fetches, including the PR recheck inside the adapter, precede this lock.
         with self.controller._lock, self.controller.store.transaction():
@@ -478,6 +515,9 @@ class AdmissionPoller:
             disposition = "waiting"
             pull = snapshot.pull
             current = self.controller._input_for(work["number"])
+            if human_review and approval_binding(current) != approval_binding(current_input):
+                self.state.dirty(work["number"], urgent=True)
+                return
             requested = result["recovery_heads"]
             labels = {label.lower() for label in pull.labels}
             if (
@@ -574,3 +614,33 @@ class AdmissionPoller:
                 self.controller._count("admission_approvals")
             summary["evaluated"] += 1
         self.controller._wake.set()
+
+    def _human_owned_approval(self, snapshot, current, scoreboard):
+        """Keep an exact, live admin approval only where machine review is absent.
+
+        Never turn prose, an automatic approval, a stale revision or a negative
+        scoreboard into authority. Reads of effective admin permission happen
+        outside the controller lock and failures leave this evaluation pending.
+        """
+        if scoreboard or not current or current["state"] not in ("waiting", "reserved", "inserted"):
+            return False
+        pull = snapshot.pull
+        if pull.state != "open" or pull.draft or pull.base_ref != self.controller.canonical_branch:
+            return False
+        if not snapshot.paths or not all(
+            not path.startswith(self.policy.prefix) and path not in self.policy.allow_files for path in snapshot.paths
+        ):
+            return False
+        approval = loads(current["evidence"], {})
+        if (
+            approval.get("kind") not in ("issue_comment", "pull_request_review")
+            or approval.get("admin") is not True
+            or type(approval.get("actor_id")) is not int
+            or approval["actor_id"] <= 0
+            or not approval.get("actor_login")
+            or current["head_sha"] != pull.head_sha
+            or approval.get("head_sha") != pull.head_sha
+            or approval.get("merge_base_sha") != snapshot.merge_base_sha
+        ):
+            return False
+        return self.adapter.repository_admin(approval["actor_login"], self.repo, actor_id=approval["actor_id"])

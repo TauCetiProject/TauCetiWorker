@@ -223,6 +223,7 @@ class FakeGitHub:
         self.repository = repository
         self.prs: dict[int, dict[str, Any]] = {}
         self.admins: set[str] = set()
+        self.user_ids: dict[str, int] = {}
         # When set, `repository_admin` raises `GitHubUnavailable` (a quota outage) with this message.
         self.unavailable: str | None = None
         self.comments: list[dict[str, Any]] = []
@@ -656,12 +657,12 @@ class FakeGitHub:
             self.prs[number]["title"] = title
             self.closed[number] = title
 
-    def repository_admin(self, login: str) -> bool:
+    def repository_admin(self, login: str, repo: str | None = None, *, actor_id: int | None = None) -> bool:
         with self.lock:
             self._call("repository_admin", login)
             if self.unavailable:
                 raise GitHubUnavailable(f"fake outage: {self.unavailable}")
-            return login in self.admins
+            return login in self.admins and (actor_id is None or self.user_ids.get(login) == actor_id)
 
     def rate_limit(self) -> tuple[int, float]:
         with self.lock:
