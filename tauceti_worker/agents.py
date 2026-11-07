@@ -2722,7 +2722,7 @@ def _review_mathlib_staging(base):
             json.dump(dict(version=1, uid=os.getuid()), lease)
             lease.flush()
             source = staging / "source"
-            source.mkdir()
+            source.mkdir(mode=0o700)
             yield source, lease.fileno()
     finally:
         # Close this producer's descriptor first. A surviving Git child keeps

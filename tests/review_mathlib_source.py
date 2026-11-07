@@ -39,6 +39,7 @@ def test_sources_match_the_reviewed_head_and_cached_snapshots_are_reused():
         assert source == Path(tmp) / "refs" / f"mathlib-src-{REV}"
         assert (source / "Mathlib.lean").is_file() and not (source / ".git").exists()
         assert not (source / agents._REVIEW_SOURCE_STAGING).exists()
+        assert source.stat().st_mode & 0o777 == 0o700
         assert f"?ref={HEAD}" in api.call_args.args[0][2]
         assert any(command[-1] == REV and "fetch" in command for command in calls)
         assert agents._review_mathlib_source(cfg, HEAD) == source
