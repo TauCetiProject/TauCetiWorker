@@ -70,8 +70,27 @@ installed data-root and native Lake changes. Build on the existing mechanisms:
 - [Source records](../../tauceti_worker/work_recovery.py) preserve bundles,
   patches, untracked source, and manifests, and reuse matching records.
 - [Shared repository snapshots](../../tauceti_worker/shared_repositories.py) have
-  immutable trees and host process leases. Managed reviews already use ephemeral
-  Bubble containers with teardown in the Worker's completion path.
+  immutable trees and file-lock leases for borrowed readers and attached destinations.
+  The current protocol uses `snapshots-v3`, `snapshot_v3_ready`, and `locks-v3`,
+  separate from older collectors. The one-time retirement covers only
+  `<repository-root>/<sha256(repo)>/{snapshots-v2,leases}`, where `repository-root`
+  is `TAUCETI_SHARED_REPOSITORIES_DIR` when set, otherwise
+  `github_transport.root() / "repositories"`. Explicitly exclude the separate
+  overlap cache and its overrides; its default location is
+  `github_transport.root() / "overlap/repositories"`. Never recursively find
+  these directory names under the transport root. First confirm old callers
+  that can recreate v2 have transitioned or exited. Before retirement, join
+  managed destination symlinks, owning process/round
+  records and mount references to the old repository snapshots, then recheck
+  under that repository's existing `fetch.lock`. PID lease files alone cannot
+  prove release because PIDs can be reused. Preserve unresolved consumers while
+  new work continues in v3; selecting a newer runtime is not proof of release
+  and no fleet drain is needed. This migration
+  introduces no new retention setting. Local readers use `borrowed_snapshot`;
+  the compatible path-returning `snapshot` API retains inputs until process exit.
+  Callers needing shorter lifetimes use `borrowed_snapshot`.
+  Bubble reviews use ephemeral containers with Worker-owned teardown; host
+  review preparation follows the owned host subprocess lifetime.
 
 ## 1. Keep cleanup on the same roots and supported code as workers
 

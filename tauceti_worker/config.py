@@ -146,12 +146,12 @@ def roadmap_areas(gh) -> list[str]:
     """The roadmap areas a user can steer toward: the subdirectories of the roadmap repo (each
     holds a README.md + Suggested.lean). Listed over the API so the TUI can offer a picker. Returns []
     if it can't be fetched (the picker then falls back to free-text entry)."""
-    from .shared_repositories import snapshot
+    from .shared_repositories import borrowed_snapshot
 
     try:
-        tree = snapshot(ROADMAP, ttl=3600)
-        if tree:
-            return sorted(path.name for path in (tree / ROADMAP_DIR).iterdir() if path.is_dir())
+        with borrowed_snapshot(ROADMAP, ttl=3600) as tree:
+            if tree:
+                return sorted(path.name for path in (tree / ROADMAP_DIR).iterdir() if path.is_dir())
     except (OSError, TimeoutError, subprocess.SubprocessError):
         pass
     out = gh.api_jq(f"repos/{ROADMAP}/contents/{ROADMAP_DIR}", '.[] | select(.type=="dir") | .name')
@@ -161,13 +161,15 @@ def roadmap_areas(gh) -> list[str]:
 def roadmap_subareas(gh, area: str) -> list[str]:
     """The sub-roadmaps nested in `area`: its subdirectories holding a Suggested.lean (a references
     folder holds none). An intention may name only the sub-roadmap. Returns [] if it can't be fetched."""
-    from .shared_repositories import snapshot
+    from .shared_repositories import borrowed_snapshot
 
     try:
-        tree = snapshot(ROADMAP, ttl=3600)
-        if tree:
-            root = tree / ROADMAP_DIR / area
-            return sorted(p.name for p in root.iterdir() if (p / "Suggested.lean").is_file()) if root.is_dir() else []
+        with borrowed_snapshot(ROADMAP, ttl=3600) as tree:
+            if tree:
+                root = tree / ROADMAP_DIR / area
+                return (
+                    sorted(p.name for p in root.iterdir() if (p / "Suggested.lean").is_file()) if root.is_dir() else []
+                )
     except (OSError, TimeoutError, subprocess.SubprocessError):
         pass
     out = gh.api_jq(
