@@ -51,6 +51,7 @@ class Retention(unittest.TestCase):
                 {
                     "TAUCETI_ACTIVITY_DIR": str(self.root / "activity"),
                     "TAUCETI_BUILD_CACHE_ROOT": str(self.root / "build-cache"),
+                    "TAUCETI_REVIEW_MATHLIB_CACHE": str(self.root / "review-sources"),
                     "TAUCETI_SHARED_MATHLIB_ROOT": str(self.root / "pool"),
                     "TAUCETI_WORKERS_STATE_DIR": str(self.root / "managed"),
                 },
@@ -71,6 +72,13 @@ class Retention(unittest.TestCase):
         self.git("add", ".")
         self.git("commit", "-qm", "seed")
         work_recovery.mark_published(self.checkout, "seed", self.git("rev-parse", "HEAD").strip())
+
+    def test_older_review_install_does_not_abort_other_cleanup(self):
+        with patch.dict(sys.modules, {"runner.source_cache": None}):
+            result = retention.sweep(now=self.clock)
+        self.assertTrue(any("review source cleanup:" in row for row in result["errors"]))
+        self.assertIn("removed_count", result)
+        self.assertIn("protected_count", result)
 
     def git(self, *args):
         return subprocess.run(
