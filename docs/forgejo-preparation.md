@@ -199,8 +199,9 @@ leaf directories with atomic private-file replacement. Best-effort pruning bound
 recognized cache files across credential scopes to 384 files and 16 MiB after
 quiescent writes. It ignores unrelated files, outboxes and symlinks. These files
 are disposable observations, not publication journals or durable decisions.
-Source file ages start before the request. Atomic replacements take a short
-directory lock and retain a later observation when an older request finishes last.
+Source file ages start before the request. Atomic replacements attempt a
+nonblocking directory lock and retain a later existing record when an older
+request finishes last. Lock contention skips the cache write.
 Source sidecars expire at the adapter's triage TTL even if the PR's update clock
 stays unchanged. Native Forgejo 17 does not move that clock for comment edits or
 deletions; forced reads bypass sidecars and the memory cache immediately.
@@ -225,6 +226,11 @@ their qualified adapters before production Forgejo bootstrap can be enabled.
 Worker owns an additional activation refusal so a Tools update cannot enable it
 implicitly. Large survey histories and fleet concurrency still require the
 representative load tests below; these cache bounds are not a capacity proof.
+Cross-process cache deletion/order and invalidation still require tests and
+coordination before activation. Cross-credential write invalidation currently
+covers the shared in-process memory cache; private disk observations in another
+credential scope can remain assumed until their TTL expires. Decisions requiring
+current state must force a source read.
 
 ## Outstanding integration and completion criteria
 

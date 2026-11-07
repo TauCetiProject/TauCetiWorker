@@ -2,6 +2,7 @@
 """Qualified direct review-state reads never consult the shared service or gh."""
 
 import concurrent.futures
+import fcntl
 import json
 import os
 import subprocess
@@ -434,6 +435,32 @@ class SourceTests(unittest.TestCase):
         state._write_source_cache(state._cache_path(12), {"head_sha": "newer"}, observed_at=started + 10)
         state._write_source_cache(state._cache_path(12), {"head_sha": "older"}, observed_at=started)
         self.assertEqual(json.loads(state._cache_path(12).read_text())["head_sha"], "newer")
+
+    def test_nonfinite_or_surrogate_meta_cannot_turn_a_cache_write_into_a_read_failure(self):
+        for value in ['{"x":1e400}', '{"x":"\\ud800"}']:
+            with self.subTest(value=value):
+                comment = {**self.comment(), "body": "<!--tauceti-scoreboard--><!--tauceti-meta:v1 " + value + "-->"}
+                self.api.comments.return_value = [comment]
+                result = self.state().gh_meta(12, force=True)
+                self.assertEqual(result.provenance, "fresh")
+                self.assertIn("x", result.data)
+                self.assertFalse(self.state()._cache_path(12).exists())
+
+    def test_busy_directory_lock_skips_cache_write_without_blocking_a_fresh_read(self):
+        state = self.state()
+        state.sbcache.mkdir(mode=0o700, parents=True)
+        directory = os.open(state.sbcache, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(state.gh_meta, 12, force=True)
+                try:
+                    self.assertEqual(future.result(timeout=2).provenance, "fresh")
+                finally:
+                    fcntl.flock(directory, fcntl.LOCK_UN)
+            self.assertFalse(state._cache_path(12).exists())
+        finally:
+            os.close(directory)
 
     def test_concurrent_forced_states_return_their_reads_but_keep_the_later_disk_record(self):
         state = self.state()

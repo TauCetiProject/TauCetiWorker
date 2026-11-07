@@ -158,7 +158,7 @@ class ReviewState:
             tmp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
             tmp.write_text(json.dumps(payload) + "\n")
             os.replace(tmp, path)
-        except OSError:
+        except (OSError, ValueError):
             pass  # a cache we cannot write is a slow round, not a wrong one
 
     def _prune_source_cache(self):
@@ -177,7 +177,7 @@ class ReviewState:
             os.fchmod(directory, 0o700)
             # Serialize only local atomic replacements. No network read holds
             # this lock; using the directory avoids persistent lock files.
-            fcntl.flock(directory, fcntl.LOCK_EX)
+            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
                 if os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mtime > observed_at:
                     return  # An independently fetched later observation won.
@@ -312,7 +312,7 @@ class ReviewState:
             else:
                 self.sbcache.mkdir(parents=True, exist_ok=True)
                 cache.write_text(json.dumps(data) + "\n")
-        except OSError:
+        except (OSError, ValueError):
             pass
         finally:
             self._prune_source_cache()
