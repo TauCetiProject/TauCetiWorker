@@ -16,7 +16,10 @@ import stat
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import Future
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from urllib.parse import urlsplit
 
 from . import github_transport as transport
 
@@ -98,6 +101,10 @@ def prune_state_cache(root, *, max_files=384, max_bytes=16 * 1024 * 1024):
                 os.close(fd)
         for directory in directories:
             try:
+                # Another process may have just made an empty namespace and be
+                # about to open it for an atomic write. Leave recent ones alone.
+                if time.time() - os.stat(directory, dir_fd=root_fd, follow_symlinks=False).st_mtime < 30:
+                    continue
                 os.rmdir(directory, dir_fd=root_fd)
             except OSError:
                 pass
@@ -107,13 +114,20 @@ def prune_state_cache(root, *, max_files=384, max_bytes=16 * 1024 * 1024):
         os.close(root_fd)
 
 
-class BoundedReadCache:
-    """Process-local JSON cache; coalesce triage reads and never cache failures.
+@dataclass
+class _ReadSlot:
+    users: int = 0
+    epoch: int = 0
+    latest: int = 0
+    flight: Future | None = None
 
-    Fresh reads bypass entries and the triage lock. Generations prevent an
-    overlapping invalidation from publishing a pre-write result. Both stored
-    bytes and entries are bounded, and every returned value is an independent
-    JSON copy. Cache entries convey no fresh observation or approval authority.
+
+class BoundedReadCache:
+    """Bound persistent JSON observations and coalesce exact triage requests.
+
+    Active slots last only for running/waiting calls, with no persistent lock or
+    generation registry. Fresh reads bypass coalescing. Only a write invalidates
+    returned observations; the latest-started fetch wins cache publication.
     """
 
     def __init__(self, *, max_entries=128, max_bytes=4 * 1024 * 1024, clock=time.monotonic):
@@ -123,86 +137,147 @@ class BoundedReadCache:
         self._entries = OrderedDict()
         self._bytes = 0
         self._lock = threading.RLock()
-        self._triage = tuple(threading.Lock() for _ in range(64))
-        self._fresh_generations = [0] * len(self._triage)
+        self._active = {}
+        self._sequence = 0
         self._generation = 0
 
-    def invalidate(self):
+    def invalidate(self, *, scope=None):
         with self._lock:
             self._generation += 1
-            self._entries.clear()
-            self._bytes = 0
+            for key, slot in self._active.items():
+                if scope is None or key[0] == scope:
+                    slot.epoch += 1
+                    slot.flight = None
+            for key in list(self._entries):
+                if scope is None or key[0] == scope:
+                    self._drop(key)
 
-    def read(self, key, fetch, *, ttl, fresh=False):
+    @staticmethod
+    def _key_bytes(key):
+        return len(key[1]) + (len(key[0].encode()) if key[0] is not None else 0)
+
+    def _drop(self, key):
+        old = self._entries.pop(key)
+        self._bytes -= self._key_bytes(key) + len(old[0])
+
+    def read(self, key, fetch, *, ttl, fresh=False, scope=None):
         if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) or not math.isfinite(ttl) or ttl < 0:
             raise ValueError("cache TTL must be finite and nonnegative")
-        key = json.dumps(key, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-        bucket = hash(key) % len(self._triage)
-        if fresh or ttl == 0:
+        if scope is not None and not isinstance(scope, str):
+            raise ValueError("cache scope must be a string")
+        key = (
+            scope,
+            json.dumps(key, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(),
+        )
+        started = self.clock()
+        with self._lock:
+            for old_key, (_, saved_at, expires) in list(self._entries.items()):
+                if started >= expires or started < saved_at:
+                    self._drop(old_key)
+            item = self._entries.get(key)
+            if item is not None:
+                if not fresh and ttl > 0 and started - item[1] < ttl:
+                    self._entries.move_to_end(key)
+                    return json.loads(item[0]), True
+                self._drop(key)
+            slot = self._active.setdefault(key, _ReadSlot())
+            slot.users += 1
+            epoch = slot.epoch
+            future = slot.flight if not fresh and ttl > 0 else None
+            leader = future is None
+            if leader:
+                self._sequence += 1
+                sequence = slot.latest = self._sequence
+                if not fresh and ttl > 0:
+                    future = slot.flight = Future()
+        try:
+            if leader:
+                value = fetch()
+                encoded = (
+                    json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+                    if value is not None
+                    else None
+                )
+            else:
+                encoded = future.result()
             with self._lock:
-                epoch = self._generation
-                self._fresh_generations[bucket] += 1
-                fresh_epoch = self._fresh_generations[bucket]
-                old = self._entries.pop(key, None)
-                if old:
-                    self._bytes -= len(key) + len(old[0])
-            value = fetch()
-            encoded = (
-                json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8") if value is not None else None
-            )
+                if epoch != slot.epoch:
+                    raise ReadInvalidated("source changed during a read")
+                if leader and encoded is not None and ttl > 0 and sequence == slot.latest:
+                    self._publish(key, encoded, ttl, started)
+                if leader and future is not None:
+                    future.set_result(encoded)
+            return (json.loads(encoded) if encoded is not None else None), not leader
+        except BaseException as error:
+            if leader and future is not None and not future.done():
+                future.set_exception(error)
+            raise
+        finally:
             with self._lock:
-                if epoch != self._generation or fresh_epoch != self._fresh_generations[bucket]:
-                    raise ReadInvalidated("source changed during a fresh read")
-                if encoded is not None and ttl > 0:
-                    self._publish(key, encoded, ttl)
-            return (json.loads(encoded) if encoded is not None else None), False
-        # A fixed lock stripe set coalesces identical reads without an unbounded
-        # lock registry or serializing all independent repository operations.
-        with self._triage[bucket]:
-            now = self.clock()
-            with self._lock:
-                epoch = self._generation
-                fresh_epoch = self._fresh_generations[bucket]
-                for old_key, (saved, saved_at, expires) in list(self._entries.items()):
-                    if now >= expires or now < saved_at:
-                        self._bytes -= len(old_key) + len(saved)
-                        del self._entries[old_key]
-                item = self._entries.get(key)
-                if item is not None:
-                    if now - item[1] < ttl:
-                        self._entries.move_to_end(key)
-                        return json.loads(item[0]), True
-                    self._bytes -= len(key) + len(item[0])
-                    del self._entries[key]
-            value = fetch()
-            if value is None:
-                return None, False
-            encoded = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
-            with self._lock:
-                if epoch != self._generation or fresh_epoch != self._fresh_generations[bucket]:
-                    raise ReadInvalidated("source changed during a triage read")
-                self._publish(key, encoded, ttl)
-            return json.loads(encoded), False
+                if leader and future is not None and slot.flight is future:
+                    slot.flight = None
+                slot.users -= 1
+                if not slot.users:
+                    del self._active[key]
 
-    def _publish(self, key, encoded, ttl):
-        # Caller owns _lock. Successful fresh reads replace known stale triage
-        # entries; an older in-flight read cannot overwrite that observation.
-        size = len(key) + len(encoded)
-        if size > self.max_bytes:
+    def _publish(self, key, encoded, ttl, started):
+        # Caller owns _lock. A slow request cannot extend the observation's TTL
+        # or overwrite the result of a later-started fetch.
+        size = self._key_bytes(key) + len(encoded)
+        now = self.clock()
+        if size > self.max_bytes or now < started or now - started >= ttl:
             return
-        prior = self._entries.pop(key, None)
-        if prior:
-            self._bytes -= len(key) + len(prior[0])
+        if key in self._entries:
+            self._drop(key)
         while self._entries and (len(self._entries) >= self.max_entries or self._bytes + size > self.max_bytes):
-            removed_key, (removed, _, _) = self._entries.popitem(last=False)
-            self._bytes -= len(removed_key) + len(removed)
-        saved_at = self.clock()
-        self._entries[key] = (encoded, saved_at, saved_at + ttl)
+            self._drop(next(iter(self._entries)))
+        self._entries[key] = (encoded, started, started + ttl)
         self._bytes += size
 
     def stats(self):
         with self._lock:
-            return {"entries": len(self._entries), "bytes": self._bytes, "generation": self._generation}
+            return {
+                "entries": len(self._entries),
+                "bytes": self._bytes,
+                "generation": self._generation,
+                "active": len(self._active),
+            }
+
+
+class _ProjectionAPI:
+    """Validate native pull identity before Tools projects requested fields."""
+
+    def __init__(self, api):
+        self.api = api
+
+    def __getattr__(self, name):
+        return getattr(self.api, name)
+
+    def pull(self, repository, number):
+        from tauceti_tools.forge import Incomplete, Unsupported
+
+        row = self.api.pull(repository, number)
+        if not isinstance(row, dict) or type(row.get("number")) is not int or row["number"] != number:
+            raise Incomplete("PR projection did not identify its requested number")
+        parsed, expected = urlsplit(row.get("html_url", "")), urlsplit(repository.pull_url(number))
+        if (
+            (parsed.scheme, parsed.netloc, parsed.path.casefold())
+            != (expected.scheme, expected.netloc, expected.path.casefold())
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise Incomplete("PR projection belongs to another source discussion")
+        if type(row.get("flow")) is not int:
+            raise Incomplete("PR projection flow is unavailable")
+        if row["flow"] != 0:
+            raise Unsupported("AGit PR projections require their source adapter")
+        if (
+            type(row.get("merged")) is not bool
+            or row.get("state") not in {"open", "closed"}
+            or (row["merged"] and row["state"] != "closed")
+        ):
+            raise Incomplete("PR projection lifecycle is unavailable or inconsistent")
+        return row
 
 
 class ForgejoReadSource:
@@ -228,7 +303,7 @@ class ForgejoReadSource:
         if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) or not math.isfinite(ttl) or not 0 <= ttl <= 300:
             raise ValueError("triage TTL must be finite and between zero and 300 seconds")
         self.repository, self.api = repository, api
-        self.reader = ForgejoReader(api)
+        self.reader = ForgejoReader(_ProjectionAPI(api))
         self.cache = cache if cache is not None else BoundedReadCache()
         self.ttl = ttl
         self._credential = self._credential_identity()
@@ -261,7 +336,7 @@ class ForgejoReadSource:
             return False
 
     def invalidate(self):
-        self.cache.invalidate()
+        self.cache.invalidate(scope=self.cache_namespace)
 
     def _read(self, operation, args, fetch, *, fresh=False):
         from tauceti_tools.forge import ForgeError, Incomplete
@@ -272,7 +347,10 @@ class ForgejoReadSource:
             force, revision = transport.read_policy()
 
             def bounded_fetch():
-                value = fetch()
+                try:
+                    value = fetch()
+                except (ValueError, TypeError, KeyError):
+                    raise Incomplete("direct source response does not satisfy its read contract") from None
                 self._bound()
                 try:
                     if (
@@ -285,7 +363,9 @@ class ForgejoReadSource:
                 return value
 
             key = (self.cache_namespace, operation, json.dumps(args, sort_keys=True), revision)
-            value, hit = self.cache.read(key, bounded_fetch, ttl=self.ttl, fresh=fresh or force)
+            value, hit = self.cache.read(
+                key, bounded_fetch, ttl=self.ttl, fresh=fresh or force, scope=self.cache_namespace
+            )
             self._bound()
             if hit:
                 transport.note_cache_hit()
@@ -301,9 +381,19 @@ class ForgejoReadSource:
             return None
 
     def pr_view(self, number, fields, *, fresh=False):
+        self.repository.pull_url(number)
+        # Typed projections require the requested fields' proofs, rather than
+        # all historical head/stat proofs needed for a whole raw REST record.
         return self._read(
             "pr_view", [number, fields], lambda: self.reader.pull(self.repository, number, fields), fresh=fresh
         )
+
+    @staticmethod
+    def _utc(value):
+        moment = datetime.fromisoformat(value)
+        if moment.tzinfo is None or moment.utcoffset() is None:
+            raise ValueError("source timestamp has no UTC offset")
+        return moment.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
     def issue_comments(self, number, *, fresh=False):
         self.repository.pull_url(number)
@@ -320,7 +410,11 @@ class ForgejoReadSource:
                 )
             )
             output, _, _ = execute(request, self.api)
-            return [row for page in json.loads(output) for row in page]
+            rows = [row for page in json.loads(output) for row in page]
+            for row in rows:
+                for field in ("created_at", "updated_at"):
+                    row[field] = self._utc(row[field])
+            return rows
 
         return self._read("issue_comments", [number], fetch, fresh=fresh)
 
@@ -337,16 +431,17 @@ class ForgejoReadSource:
                 )
             )
             output, _, _ = execute(request, self.api)
-            return [row for page in json.loads(output) for row in page]
+            rows = [row for page in json.loads(output) for row in page]
+            for row in rows:
+                for field in ("submitted_at", "updated_at"):
+                    if row.get(field) is not None:
+                        row[field] = self._utc(row[field])
+            return rows
 
         return self._read("reviews", [number], fetch, fresh=fresh)
 
     def review_comments(self, number):
-        from tauceti_tools.forge import Unsupported
-
         self.repository.pull_url(number)
-
-        def unavailable():
-            raise Unsupported("inline thread/reply identities need their source adapter")
-
-        return self._read("review_comments", [number], unavailable, fresh=True)
+        if self.binding_current():
+            self._failure.value = ReadFailure("review_comments", 0, "Unsupported")
+        return None

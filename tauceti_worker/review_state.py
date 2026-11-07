@@ -132,7 +132,8 @@ class ReviewState:
         if not isinstance(sc, dict) or sc.get("updated_at") != key:
             return None
         fetched = sc.get("fetched_at")
-        if not isinstance(fetched, (int, float)) or not 0 <= time.time() - fetched < SBCACHE_BACKSTOP_S:
+        backstop = min(SBCACHE_BACKSTOP_S, self.gh.ttl) if self._direct_source else SBCACHE_BACKSTOP_S
+        if not isinstance(fetched, (int, float)) or not 0 <= time.time() - fetched < backstop:
             return None  # also rejects a future timestamp: a clock we cannot place is not a fresh one
         return sc if not self._direct_source or self.gh.binding_current() else None
 
@@ -142,7 +143,9 @@ class ReviewState:
         payload = {**payload, "updated_at": self._observed.get(pr, ""), "fetched_at": time.time()}
         try:
             if self._direct_source:
-                self._write_source_cache(path, payload)
+                self._write_source_cache(
+                    path, payload, prune=path != self._key_path(pr) or payload.get("status") != "present"
+                )
                 return
             self.sbcache.mkdir(parents=True, exist_ok=True)
             # A temp name unique per WRITE, not per process: `status`, the dashboard and a round can
@@ -160,7 +163,7 @@ class ReviewState:
 
             prune_state_cache(self.sbcache.parent)
 
-    def _write_source_cache(self, path, value):
+    def _write_source_cache(self, path, value, *, prune=True):
         """Private atomic source cache writes, without following a target symlink."""
         self.sbcache.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory = os.open(self.sbcache, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -181,18 +184,17 @@ class ReviewState:
                     pass
             finally:
                 os.close(directory)
-        self._prune_source_cache()
+        if prune:
+            self._prune_source_cache()
 
     def _issue_comments(self, pr: int, *, force: bool = False) -> list[dict] | None:
-        """Memoize PR comment reads briefly within a survey pass, including failures."""
+        """Memoize legacy reads within a pass; direct sources own their bounded cache."""
         if self._direct_source and not self.gh.binding_current():
             return None
         # Direct sources already provide bounded coalescing and failure handling.
         # Retaining whole histories here would defeat that cache's byte bound.
         hit = None if force or self._direct_source else self._comments.get(pr)
         if hit and time.time() - hit[0] < COMMENTS_MEMO_S:
-            if self._direct_source:
-                self._shared_issue_hit[pr] = True
             return hit[1]
         with read_context(fresh=force, revision=self._observed.get(pr, "")):
             cs = self.gh.issue_comments(pr)
@@ -253,11 +255,16 @@ class ReviewState:
             # word the mutating path trusts.
             age = time.time() - cache.stat().st_mtime
             cached = self._load(cache)
-            if age < SBCACHE_TTL and cached is not None:
+            ttl = min(SBCACHE_TTL, self.gh.ttl) if self._direct_source else SBCACHE_TTL
+            if age < ttl and cached is not None and (not self._direct_source or age >= 0):
                 return self._meta(cached, "assumed")
 
         comments = self._issue_comments(pr, force=force)
         fetch_failed = comments is None
+        # Source timestamps are normalized to fixed-width UTC by the adapter.
+        # Stable timestamp sorting in the reducer then breaks ties by native ID.
+        if self._direct_source and comments is not None:
+            comments = sorted(comments, key=lambda comment: comment["id"], reverse=True)
         data = scoreboard(comments)
 
         if data is None:
@@ -270,18 +277,23 @@ class ReviewState:
                 # A confirmed absence is worth caching: without it, every pass re-reads every PR that
                 # has no scoreboard yet, which is most of a healthy queue. Drop the payload with it —
                 # left behind, the TTL path would keep serving a board we just confirmed is gone.
-                self._write_sidecar(self._key_path(pr), pr, {"status": "missing"})
+                if not self._direct_source or not self._shared_issue_hit.get(pr, True):
+                    self._write_sidecar(self._key_path(pr), pr, {"status": "missing"})
                 cache.unlink(missing_ok=True)
             return self._meta({}, "fetch_failed" if fetch_failed else "missing")
+        if self._direct_source and self._shared_issue_hit.get(pr, True):
+            return self._meta(data, "assumed")  # Do not reset a reused observation's disk TTL.
         self._write_sidecar(self._key_path(pr), pr, {"status": "present", "meta": data})
         try:  # the legacy copy: the stale-on-failure fallback reads it, nothing entitled does
             if self._direct_source:
-                self._write_source_cache(cache, data)
+                self._write_source_cache(cache, data, prune=False)
             else:
                 self.sbcache.mkdir(parents=True, exist_ok=True)
                 cache.write_text(json.dumps(data) + "\n")
         except OSError:
             pass
+        finally:
+            self._prune_source_cache()
         return self._meta(data, "assumed" if self._shared_issue_hit.get(pr, self._direct_source) else "fresh")
 
     @staticmethod

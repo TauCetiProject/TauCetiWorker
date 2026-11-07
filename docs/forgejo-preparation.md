@@ -181,19 +181,32 @@ unavailable until a new adapter is constructed, including reads from existing
 memory or disk. Tokens and server error bodies are not persisted in cache keys or
 failure records.
 
-Triage reads use a bounded process-local JSON cache (128 entries, 4 MiB by
-default, 15-second TTL). Fresh reads bypass cached entries and coalescing locks;
-invalidation prevents an overlapping older request from publishing its result.
+Triage reads use a bounded process-local JSON cache per adapter or explicitly
+shared cache instance (128 entries, 4 MiB by default, 15-second TTL measured from
+request start). Identical triage requests coalesce; unrelated requests fetch
+independently. Fresh reads bypass entries and coalescing. Concurrent fresh reads
+can both return, while only the latest-started request may publish its result.
+Write invalidation affects that source namespace and rejects its overlapping reads.
 Failed requests are not cached, and a verified empty list differs from an
 unavailable read. Cached review metadata retains assumed or stale provenance;
 it supplies no fresh approval authority. Revision-scoped read contexts use
 separate cache keys.
 
 Disposable review-state sidecars live below `sbcache/sources/<digest>/`, in private
-directories with atomic private-file replacement. Best-effort pruning bounds
+leaf directories with atomic private-file replacement. Best-effort pruning bounds
 recognized cache files across credential scopes to 384 files and 16 MiB after
 quiescent writes. It ignores unrelated files, outboxes and symlinks. These files
 are disposable observations, not publication journals or durable decisions.
+Source sidecars expire at the adapter's triage TTL even if the PR's update clock
+stays unchanged. Native Forgejo 17 does not move that clock for comment edits or
+deletions; forced reads bypass sidecars and the memory cache immediately.
+
+The adapter normalizes discussion/review timestamps to fixed-width UTC. Scoreboard
+selection orders equal timestamps by native comment ID. Typed PR projections
+validate native number, discussion URL, flow and lifecycle, then require the
+requested fields' proofs; they do not require all historical head/stat proofs of
+a whole raw REST record. Neither projection nor mergeability observations supply
+approval or exact-candidate merge authority.
 
 `tests/integration_forgejo_reads.py`, when given `FORGEJO_BINARY`, starts an
 isolated temporary server and exercises the actual adapter and `ReviewState`
@@ -224,5 +237,5 @@ GitHub CI, exact-revision merge, main mirroring, cache/docs, archives and progre
 repeat across faults and restarts with the shared state endpoint blocked. Load tests
 must use representative PR histories and fleet concurrency before service retirement.
 
-No production pins, development forge, admission settings, mirror configuration or
-shared-state lifecycle have changed as part of this foundation.
+Installed production environments, development forge, admission settings, mirror
+configuration and shared-state lifecycle are unchanged by this preparation.

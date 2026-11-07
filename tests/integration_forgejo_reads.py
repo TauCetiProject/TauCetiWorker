@@ -164,8 +164,17 @@ ROOT_PATH = {root}/log
                             side_effect=AssertionError("shared service selected"),
                         ),
                         patch("tauceti_worker.github.gh_run", side_effect=AssertionError("native GitHub CLI fallback")),
+                        patch(
+                            "tauceti_worker.review_state.invalidate",
+                            side_effect=AssertionError("GitHub invalidation fallback"),
+                        ),
+                        patch(
+                            "tauceti_worker.github_transport.shared_read",
+                            side_effect=AssertionError("GitHub read-cache fallback"),
+                        ),
                     ):
                         state = ReviewState(cfg, source)
+                        state.observe([SimpleNamespace(number=number, updated_at=pull["updated_at"])])
                         self.assertEqual(state.gh_meta(number).provenance, "fresh")
                         self.assertEqual(ReviewState(cfg, source).gh_meta(number).provenance, "assumed")
                         history = source.issue_comments(number)
@@ -194,13 +203,30 @@ ROOT_PATH = {root}/log
                         self.assertNotEqual(denied.sbcache, state.sbcache)
                         self.assertEqual(denied.gh_meta(number, force=True).provenance, "fetch_failed")
                         self.assertIn(other.last_failure.status, {401, 403, 404})
+                        before_edit = api.pull(repo, number)["updated_at"]
+                        state.observe([SimpleNamespace(number=number, updated_at=before_edit)])
+                        self.assertEqual(state.gh_meta(number, force=True).data["head_sha"], "a" * 40)
+                        time.sleep(1.05)  # Cross native second-resolution timestamps.
                         api.edit_comment(repo, comment["id"], board("b" * 40))
+                        after_edit = api.pull(repo, number)["updated_at"]
+                        print("Comment edit moved PR.updated_at:", before_edit != after_edit, flush=True)
+                        state.observe([SimpleNamespace(number=number, updated_at=after_edit)])
+                        triage = state.gh_meta(number)
+                        if before_edit == after_edit:
+                            self.assertEqual(triage.provenance, "assumed")
+                            self.assertEqual(triage.data["head_sha"], "a" * 40)
+                        else:
+                            self.assertEqual((triage.provenance, triage.data["head_sha"]), ("fresh", "b" * 40))
                         fresh = state.gh_meta(number, force=True)
                         self.assertEqual(fresh.provenance, "fresh")
                         self.assertEqual(fresh.data["head_sha"], "b" * 40)
                         state.bust(number)
                         self.assertEqual(state.gh_meta(number).data["head_sha"], "b" * 40)
+                        before_delete = api.pull(repo, number)["updated_at"]
+                        time.sleep(1.05)
                         api.request("DELETE", f"repos/operator/source/issues/comments/{comment['id']}")
+                        after_delete = api.pull(repo, number)["updated_at"]
+                        print("Comment deletion moved PR.updated_at:", before_delete != after_delete, flush=True)
                         self.assertEqual(state.gh_meta(number, force=True).provenance, "missing")
                         self.assertEqual(
                             source.pr_view(number, ["number", "title"], fresh=True),

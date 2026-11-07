@@ -4,9 +4,11 @@
 import concurrent.futures
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -96,6 +98,7 @@ class CacheTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             cache.read(["key"], lambda: (_ for _ in ()).throw(RuntimeError("offline")), ttl=15)
         self.assertEqual(cache.stats()["entries"], 0)
+        self.assertEqual(cache.stats()["active"], 0)
 
     def test_invalidation_during_any_read_refuses_the_observation(self):
         for fresh in [False, True]:
@@ -151,8 +154,7 @@ class CacheTests(unittest.TestCase):
                 self.assertEqual(fresh.result(timeout=5), (["fresh"], False))
             finally:
                 release.set()
-            with self.assertRaises(ReadInvalidated):
-                old.result(timeout=5)
+            self.assertEqual(old.result(timeout=5), (["old"], False))
         self.assertEqual(cache.read(["key"], lambda: self.fail("new observation lost"), ttl=15), (["fresh"], True))
 
     def test_invalid_bounds_and_ttls_are_rejected(self):
@@ -162,6 +164,91 @@ class CacheTests(unittest.TestCase):
         for ttl in [-1, float("inf"), float("nan"), True]:
             with self.subTest(ttl=ttl), self.assertRaises(ValueError):
                 BoundedReadCache().read(["key"], lambda: [], ttl=ttl)
+
+    def test_concurrent_fresh_reads_both_return_and_later_start_wins(self):
+        cache = BoundedReadCache()
+        entered, release = threading.Event(), threading.Event()
+
+        def slow():
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return ["earlier"]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(cache.read, ["key"], slow, ttl=15, fresh=True)
+            self.assertTrue(entered.wait(5))
+            try:
+                later = executor.submit(cache.read, ["key"], lambda: ["later"], ttl=15, fresh=True)
+                self.assertEqual(later.result(timeout=5), (["later"], False))
+            finally:
+                release.set()
+            self.assertEqual(first.result(timeout=5), (["earlier"], False))
+        self.assertEqual(cache.read(["key"], lambda: self.fail("lost later result"), ttl=15), (["later"], True))
+        self.assertEqual(cache.stats()["active"], 0)
+
+    def test_later_triage_wins_over_slow_fresh_without_canceling_it(self):
+        cache = BoundedReadCache()
+        entered, release = threading.Event(), threading.Event()
+
+        def slow():
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return ["earlier"]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(cache.read, ["key"], slow, ttl=15, fresh=True)
+            self.assertTrue(entered.wait(5))
+            try:
+                later = executor.submit(cache.read, ["key"], lambda: ["later"], ttl=15)
+                self.assertEqual(later.result(timeout=5), (["later"], False))
+            finally:
+                release.set()
+            self.assertEqual(first.result(timeout=5), (["earlier"], False))
+        self.assertEqual(cache.read(["key"], lambda: self.fail("lost later result"), ttl=15), (["later"], True))
+
+    def test_distinct_keys_fetch_independently_even_with_identical_hashes(self):
+        cache = BoundedReadCache()
+        entered, release = threading.Event(), threading.Event()
+
+        def slow():
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return ["slow"]
+
+        with patch("builtins.hash", return_value=0), concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(cache.read, ["one"], slow, ttl=15)
+            self.assertTrue(entered.wait(5))
+            try:
+                second = executor.submit(cache.read, ["two"], lambda: ["other"], ttl=15)
+                self.assertEqual(second.result(timeout=5), (["other"], False))
+            finally:
+                release.set()
+            self.assertEqual(first.result(timeout=5), (["slow"], False))
+
+    def test_scoped_write_does_not_invalidate_other_inflight_or_cached_reads(self):
+        cache = BoundedReadCache()
+        cache.read(["cached"], lambda: [1], ttl=15, scope="other")
+
+        def fetch():
+            cache.invalidate(scope="written")
+            return [2]
+
+        self.assertEqual(cache.read(["active"], fetch, ttl=15, scope="other"), ([2], False))
+        self.assertEqual(
+            cache.read(["cached"], lambda: self.fail("other namespace cleared"), ttl=15, scope="other"), ([1], True)
+        )
+        self.assertEqual(cache.stats()["active"], 0)
+
+    def test_slow_fetch_does_not_extend_ttl_past_its_start(self):
+        now = [10.0]
+        cache = BoundedReadCache(clock=lambda: now[0])
+
+        def slow():
+            now[0] += 20
+            return [1]
+
+        self.assertEqual(cache.read(["key"], slow, ttl=15), ([1], False))
+        self.assertEqual(cache.stats()["entries"], 0)
 
 
 class SourceTests(unittest.TestCase):
@@ -230,8 +317,11 @@ class SourceTests(unittest.TestCase):
     def test_memory_memo_does_not_relabel_cached_metadata_as_fresh(self):
         state = self.state()
         self.assertEqual(state.gh_meta(12).provenance, "fresh")
+        fetched = json.loads(state._key_path(12).read_text())["fetched_at"]
         state._cache_path(12).unlink()
         self.assertEqual(state.gh_meta(12).provenance, "assumed")
+        self.assertFalse(state._cache_path(12).exists())
+        self.assertEqual(json.loads(state._key_path(12).read_text())["fetched_at"], fetched)
 
     def test_review_state_does_not_retain_histories_beyond_source_cache_bounds(self):
         state = self.state()
@@ -250,6 +340,20 @@ class SourceTests(unittest.TestCase):
         self.api.comments.return_value = []
         self.assertEqual(state.gh_meta(12).provenance, "missing")
         self.assertEqual(self.api.comments.call_count, 2)
+
+    def test_source_sidecar_expires_at_triage_ttl_even_if_pr_clock_stays_put(self):
+        now = [10.0]
+        self.source.cache.clock = lambda: now[0]
+        state = self.state()
+        state.observe([SimpleNamespace(number=12, updated_at="unchanged")])
+        wall = time.time()
+        with patch("tauceti_worker.review_state.time.time", return_value=wall):
+            self.assertEqual(state.gh_meta(12).data["head_sha"], "a" * 40)
+        self.api.comments.return_value = [self.comment("b" * 40)]
+        now[0] += 16
+        with patch("tauceti_worker.review_state.time.time", return_value=wall + 16):
+            result = state.gh_meta(12)
+        self.assertEqual((result.data["head_sha"], result.provenance), ("b" * 40, "fresh"))
 
     def test_service_facts_cannot_entitle_a_different_source(self):
         state = self.state()
@@ -331,8 +435,11 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(state.gh_meta(12).data["head_sha"], "b" * 40)
 
     def test_partial_thread_support_is_explicitly_unavailable(self):
+        self.source.issue_comments(12)
+        before = self.source.cache.stats()
         self.assertIsNone(self.source.review_comments(12))
         self.assertEqual(self.source.last_failure.kind, "Unsupported")
+        self.assertEqual(self.source.cache.stats(), before)
 
     def test_credential_change_during_fetch_cannot_publish_a_cache_entry(self):
         def changed(*args):
@@ -352,10 +459,35 @@ class SourceTests(unittest.TestCase):
             "body": "",
             "state": "open",
             "user": {"id": 2, "login": "operator"},
+            "html_url": self.repo.pull_url(12),
+            "flow": 0,
+            "merged": False,
         }
         self.assertEqual(self.source.pr_view(12, ["number", "title"]), {"number": 12, "title": "Proof"})
         self.api.pull.side_effect = Incomplete("unavailable")
         self.assertIsNone(self.source.pr_view(12, ["number", "title"], fresh=True))
+
+    def test_scoreboard_order_handles_timezone_offsets_and_same_second_ids(self):
+        older = {**self.comment("a" * 40), "updated_at": "2026-04-05T01:50:00+11:00"}
+        later = {**self.comment("b" * 40), "id": 8, "updated_at": "2026-04-05T01:10:00+10:00"}
+        self.api.comments.return_value = [older, later]
+        state = self.state()
+        self.assertEqual(state.gh_meta(12, force=True).data["head_sha"], "b" * 40)
+        tied = {**later, "id": 9, "body": self.comment("c" * 40)["body"]}
+        self.api.comments.return_value = [older, later, tied]
+        self.assertEqual(state.gh_meta(12, force=True).data["head_sha"], "c" * 40)
+
+    def test_invalid_timestamp_and_malformed_projection_are_unavailable(self):
+        self.api.comments.return_value = [{**self.comment(), "updated_at": "no offset or valid time"}]
+        self.assertIsNone(self.source.issue_comments(12))
+        self.assertEqual(self.source.last_failure.kind, "Incomplete")
+        self.api.pull.return_value = {
+            "number": 12,
+            "title": "Wrong source",
+            "html_url": "https://evil.example/pulls/12",
+        }
+        self.assertIsNone(self.source.pr_view(12, ["number", "title"], fresh=True))
+        self.assertEqual(self.source.last_failure.kind, "Incomplete")
 
     def test_factory_and_constructor_reject_ambiguous_bindings(self):
         with self.assertRaises(ValueError):
@@ -367,6 +499,35 @@ class SourceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             GitHub.for_repository("one/project", api=self.api)
         self.assertIsInstance(GitHub.for_repository(RepositoryRef(GITHUB, self.repo.name)), GitHub)
+
+    def test_real_worker_bootstrap_refuses_incomplete_forgejo_activation(self):
+        root = Path(self.root.name)
+        config = root / "project.toml"
+        config.write_text("""schema_version=2
+[forges.source]
+kind="forgejo"
+url="https://git.example.org"
+[repositories]
+content={forge="source",name="one/Project"}
+roadmap="one/Roadmap"
+[ci]
+backend="github-actions"
+repository="one/Project"
+""")
+        env = os.environ.copy()
+        for key in ("TAUCETI_CONF", "TAUCETI_CONF_SOURCE", "TAUCETI_CONF_SNAPSHOT"):
+            env.pop(key, None)
+        env["XDG_STATE_HOME"] = str(root / "state")
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parents[1] / "tauceti"), "--conf", str(config), "--help"],
+            env=env,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("GitHub-only bindings", result.stderr)
 
     def test_generic_test_doubles_do_not_select_direct_source_by_truthiness(self):
         cfg = SimpleNamespace(sbcache=Path(self.root.name) / "legacy")
