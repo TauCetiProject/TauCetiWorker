@@ -100,8 +100,9 @@ applies to a green `build` with companion verdicts still missing. The completion
 at the first completed observation for that run/attempt (the adapter reports GitHub's `updated_at`);
 if unavailable, the observation time is used. It persists across restarts, and later polls or status
 callbacks do not extend grace. Normal polling intervals still apply, with webhooks permitting prompt
-observation. Explicit finalizer failure or cancelled/timed-out job findings bypass the wait. Late
-bound verdicts can settle the original attempt without another dispatch. Stale statuses never supply a verdict, and cancelled
+observation. Explicit finalizer failure, cancellation or timeout bypasses the wait; an unrelated
+job's cancellation does not establish that publication failed. Late bound verdicts can settle the
+original attempt without another dispatch. Stale statuses never supply a verdict, and cancelled
 runs retain their separate infrastructure recovery path. `status.head.ci.verdicts` reports each
 context's state.
 

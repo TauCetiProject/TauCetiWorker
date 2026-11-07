@@ -983,6 +983,26 @@ class MissingSource(QueueFixture):
         row = next(r for r in self.controller.inputs() if r["number"] == 104)
         self.assertEqual(row["state"], "inserted")
 
+    def test_old_open_batch_does_not_supply_a_module_deleted_on_main(self):
+        self.controller.set_setting("repair_concurrency", 2, "t")
+        self.controller.set_setting("prepare_min_members", 1, "t")
+        self.controller.set_setting("prepare_quiet_seconds", 0, "t")
+        self.approve(101, {"TauCeti/Provider.lean": None, "TauCeti/Importer.lean": None})
+        self.tick()
+        self.approve(102, {"TauCeti/Unrelated.lean": "module\ndef unrelated := 1\n"})
+        self.tick()
+        claim = self.controller.claim_task("preparer", "admin-worker")
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.kind, "prepare")
+        self.run_ci()
+        self.tick()
+        self.assertIsNone(self.repo.file_at("main", "TauCeti/Provider.lean"))
+        # Preparation keeps the old open batch on its old base; insertion uses new open capacity.
+        self.approve(103, {"TauCeti/Consumer.lean": "module\nimport TauCeti.Provider\n"})
+        self.tick()
+        self.assertTrue(self.refused(103), "the old batch only inherited the deleted source")
+        self.assertEqual(self.controller.store.count("journal", {"kind": "probe-missing-source-waiting"}), 0)
+
     def test_s25_bad_import_is_refused_and_a_batch_mates_module_is_a_source(self):
         self.approve(101, {"TauCeti/New.lean": "module\ndef new := 1\n"})
         self.approve(102, {"TauCeti/Consumer.lean": "module\nimport TauCeti.New\nimport TauCeti.Gone\n"})

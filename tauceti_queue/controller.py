@@ -126,7 +126,7 @@ INPUT_RESERVED = "reserved"
 INPUT_INSERTED = "inserted"
 INPUT_LANDED = "landed"
 INPUT_CANCELLED = "cancelled"
-MISSING_SOURCE_IN_FLIGHT = "missing-source-in-flight"  # `last_probe` of an input waiting for a source in the head
+MISSING_SOURCE_IN_FLIGHT = "missing-source-in-flight"  # an input waiting for a source or a newer canonical base
 # The cancellation reason of a `no_repair` member the agent emptied: withdrawn until the PR it
 # interacts with lands on `main` (then `needs-rebase`) or leaves the queue (then re-admitted).
 PROBLEM_ANTICIPATED = "problem-anticipated"
@@ -2754,11 +2754,9 @@ class Controller:
             listed = [{"path": path, "module": module, "changed": path in changed} for path, module in gaps[:8]]
             in_flight = self._providers_in_flight(batch, gaps)
             if in_flight is not None:
-                # Every missing source is in the head or another open batch: the PR is early, not
-                # wrong. It waits, and is not probed against any batch on this base again (a fresh
-                # open batch on the same canonical commit lacks the source just the same, so unlike
-                # a conflict this is no reason to open one); it is probed once a base moves, by which
-                # time the provider has landed or left the queue.
+                # Every missing source is in flight or already on a newer canonical base. Preserve
+                # the input until its batch base moves; merely appending on this old base cannot
+                # supply it. The canonical revision distinguishes refresh waits from live providers.
                 with self.store.transaction():
                     self.store.update(
                         "inputs",
@@ -2777,6 +2775,7 @@ class Controller:
                         number=row["number"],
                         gaps=listed,
                         providers_in=in_flight,
+                        canonical=self._canonical,
                     )
                 return False
             evidence = loads(row.get("evidence"), {})
@@ -2899,7 +2898,11 @@ class Controller:
             if self._canonical and self._tree_has(self._canonical, provider):
                 continue  # an older open batch will acquire this source when its base refreshes
             holder = next(
-                (b for b in candidates if b["tip"] and self._tree_has(b["tip"], provider)),
+                (
+                    b
+                    for b in candidates
+                    if b["tip"] and self._tree_has(b["tip"], provider) and not self._tree_has(b["base"], provider)
+                ),
                 None,
             )
             if holder is None:
@@ -4462,7 +4465,11 @@ class Controller:
         if status is None or not bound[BUILD_CONTEXT]:
             # No status from the candidate's own completed run: never a verdict (scenario 19).
             publication_failed = any(
-                d.get("kind") == "infrastructure" and d.get("reason") in ("finalizer_failed", "cancelled", "timed_out")
+                d.get("kind") == "infrastructure"
+                and (
+                    d.get("reason") == "finalizer_failed"
+                    or (d.get("job") == "finalize-merge-group-build" and d.get("reason") in ("cancelled", "timed_out"))
+                )
                 for d in run.diagnostics
             )
             if not publication_failed and now - values["run_completed_at"] < LOG_GRACE_SECONDS:

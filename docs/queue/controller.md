@@ -154,8 +154,9 @@ path and its conflicts become `rebase_conflict` tasks for the agent, which is th
 them. The urgent lane still inserts into the first open batch, which seals when the head lands.
 
 Missing-source insertion probes wait only for sources absent from the probed batch's base and tip
-that another active batch or the current canonical tree supplies. An older open batch can therefore
-wait to refresh its base after a module lands. A head merely inheriting a module is not a dependency if the proposed
+that another active batch introduces or the current canonical tree supplies. An older open batch
+can therefore wait to refresh its base after a module lands. A head merely inheriting a module is
+not a dependency if the proposed
 PR removes that module, or imports it after a batch-mate removed it, landing the inherited copy
 cannot repair the prospective tree. Those cases receive the ordinary missing-source request.
 A genuinely new module in another batch still waits for that batch to land before re-probing.

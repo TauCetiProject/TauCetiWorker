@@ -294,6 +294,18 @@ class Verdicts(ControllerCase):
         self.assertEqual(self.attempt(head)["outcome"], "infrastructure")
         self.assertEqual(self.controller.store.count("tasks", {}), 0)
 
+    def test_an_unrelated_cancelled_job_does_not_skip_publication_grace(self):
+        self.github.ci_policy = lambda *_: (
+            "no-status",
+            [{"kind": "infrastructure", "reason": "cancelled", "job": "sandboxed-build", "message": "cancelled"}],
+        )
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "pending", "the always-run finalizer can still publish")
+
     def test_later_updated_completion_timestamp_does_not_extend_grace(self):
         head, attempt = self.observe("no-status")
         completed_at = attempt["run_completed_at"]
