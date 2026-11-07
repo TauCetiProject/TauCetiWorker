@@ -1,7 +1,73 @@
 {
   "schema": "tauceti.forge-inventory/v1",
-  "generated_at": "2026-11-07T00:46:37.471476+00:00",
-  "scope": "Tracked executable/configuration/template/prompt sources; excludes tests, docs, fixtures, and vendored dependencies.",
+  "generated_at": "2026-11-07T01:20:34.623345+00:00",
+  "scanner_sha256": "3127d04eab4eac8c0b662fb07c342a17c83f42ccfe28456005e629b15e372792",
+  "policy": {
+    "patterns": {
+      "github_origin": "github\\.com|githubusercontent\\.com|ghcr\\.io|github\\.io",
+      "graphql": "graphql|GraphQL|resolveReviewThread|reviewThreads",
+      "gh_cli": "\\bgh\\s+(?:-|api|pr|issue|repo|run|auth|release|workflow|label|search|secret|variable)\\b|[\\\"']gh[\\\"']\\s*,|\\(\\s*\\[\\s*[\\\"'](?:api|pr|issue|repo|label|run)[\\\"']\\s*,",
+      "credentials": "GH_TOKEN|GITHUB_TOKEN|github_account|github_token_file|InstallationToken|github-app",
+      "source_identity": "TAUCETI_REPO|TAUCETI_FORK|Source-PR|repository_id|review_app_id",
+      "org_slug": "TauCetiProject/[\\w.-]+",
+      "actions_context": "github\\.(?:repository|event|sha|ref|token|workflow|run)|GITHUB_(?:REPOSITORY|SHA|OUTPUT|API_URL|EVENT|REF|TOKEN)",
+      "workflow_event": "pull_request|repository_dispatch|merge_group|issue_comment|workflow_(?:dispatch|call|run)|pull_request_review|check_(?:run|suite)|\\b(?:push|schedule)\\b",
+      "workflow_uses": "\\buses\\s*:",
+      "shared_state": "github[.-]state|github_state|GITHUB_STATE"
+    },
+    "extensions": [
+      ".cjs",
+      ".conf",
+      ".example",
+      ".ini",
+      ".js",
+      ".json",
+      ".jsonc",
+      ".md",
+      ".mjs",
+      ".nix",
+      ".py",
+      ".service",
+      ".sh",
+      ".socket",
+      ".timer",
+      ".toml",
+      ".ts",
+      ".yaml",
+      ".yml"
+    ],
+    "excluded_parts": [
+      ".lake",
+      "build",
+      "db",
+      "docs",
+      "fixtures",
+      "logs",
+      "node_modules",
+      "records",
+      "test",
+      "tests",
+      "vendor"
+    ],
+    "max_bytes": 2097152,
+    "canonical_names": [
+      "TauCetiTools"
+    ],
+    "extra_inclusions": [
+      "executable Git blobs",
+      "extensionless shebang scripts",
+      "Dockerfile*",
+      "all .github/workflows files"
+    ],
+    "extra_exclusions": [
+      "README.md",
+      "test_*.py",
+      "*.test.ts",
+      "*.spec.ts",
+      "mathematical Markdown"
+    ]
+  },
+  "scope": "Tracked executable/configuration/template/prompt sources, including extensionless scripts, Dockerfiles, service units, JSON/JSONC and example configurations; excludes archived records, tests, docs, fixtures, build artifacts and vendored dependencies. Matching workflows are enumerated unconditionally.",
   "limitations": "Lexical findings guide manual contract review; absence is not proof of provider independence. Dynamic commands require inspection.",
   "repositories": [
     {
@@ -9,12 +75,15 @@
       "source_revision": "ec07db61af85d7f6c0f619ec49abd5d03050ac6f",
       "canonical_shared_assets": false,
       "counts": {
-        "github_origin": 52,
+        "github_origin": 59,
         "graphql": 16,
-        "gh_cli": 28,
-        "credentials": 17,
+        "gh_cli": 34,
+        "credentials": 18,
         "source_identity": 21,
-        "workflow_event": 18,
+        "org_slug": 51,
+        "actions_context": 12,
+        "workflow_event": 67,
+        "workflow_uses": 3,
         "shared_state": 20
       },
       "files": [
@@ -23,6 +92,75 @@
           "categories": {
             "github_origin": [
               256
+            ],
+            "org_slug": [
+              144,
+              154
+            ],
+            "actions_context": [
+              12,
+              25,
+              30,
+              33,
+              36,
+              46,
+              57,
+              99,
+              138,
+              161,
+              185,
+              219,
+              235,
+              305
+            ],
+            "workflow_event": [
+              4,
+              6,
+              7,
+              21,
+              30,
+              33,
+              36,
+              178,
+              227,
+              235,
+              305
+            ],
+            "workflow_uses": [
+              29,
+              63,
+              64,
+              84,
+              85,
+              120,
+              121,
+              140,
+              142,
+              163,
+              164,
+              187,
+              188,
+              222,
+              225,
+              227
+            ]
+          }
+        },
+        {
+          "path": "Dockerfile",
+          "categories": {
+            "github_origin": [
+              22,
+              24,
+              92,
+              93,
+              94
+            ],
+            "gh_cli": [
+              94
+            ],
+            "workflow_event": [
+              89
             ]
           }
         },
@@ -34,6 +172,17 @@
             ],
             "gh_cli": [
               17
+            ],
+            "org_slug": [
+              1,
+              17,
+              25
+            ],
+            "workflow_event": [
+              18,
+              46,
+              59,
+              61
             ]
           }
         },
@@ -46,6 +195,18 @@
             "gh_cli": [
               5,
               6
+            ],
+            "org_slug": [
+              1,
+              5,
+              6,
+              36
+            ],
+            "workflow_event": [
+              28,
+              45,
+              53,
+              55
             ]
           }
         },
@@ -59,6 +220,19 @@
               5,
               6,
               19
+            ],
+            "org_slug": [
+              1,
+              5,
+              6,
+              19,
+              27
+            ],
+            "workflow_event": [
+              28,
+              35,
+              43,
+              45
             ]
           }
         },
@@ -70,6 +244,16 @@
             ],
             "gh_cli": [
               25
+            ],
+            "org_slug": [
+              1,
+              25,
+              36
+            ],
+            "workflow_event": [
+              26,
+              51,
+              53
             ]
           }
         },
@@ -78,6 +262,31 @@
           "categories": {
             "github_origin": [
               49
+            ],
+            "org_slug": [
+              27,
+              52,
+              57
+            ]
+          }
+        },
+        {
+          "path": "prompts/overlap-fix.md",
+          "categories": {
+            "org_slug": [
+              1,
+              34
+            ],
+            "workflow_event": [
+              33
+            ]
+          }
+        },
+        {
+          "path": "prompts/overlap-scan.md",
+          "categories": {
+            "workflow_event": [
+              2
             ]
           }
         },
@@ -88,6 +297,16 @@
               12,
               27,
               28
+            ],
+            "org_slug": [
+              12,
+              18,
+              27,
+              28
+            ],
+            "workflow_event": [
+              32,
+              42
             ]
           }
         },
@@ -96,6 +315,17 @@
           "categories": {
             "github_origin": [
               42
+            ],
+            "org_slug": [
+              1,
+              28
+            ],
+            "workflow_event": [
+              21,
+              31,
+              37,
+              45,
+              47
             ]
           }
         },
@@ -109,6 +339,20 @@
               12,
               15,
               97
+            ],
+            "org_slug": [
+              1,
+              12,
+              15,
+              48,
+              86,
+              95
+            ],
+            "workflow_event": [
+              76,
+              86,
+              90,
+              92
             ]
           }
         },
@@ -120,6 +364,17 @@
             ],
             "gh_cli": [
               21
+            ],
+            "org_slug": [
+              1,
+              21,
+              29
+            ],
+            "workflow_event": [
+              22,
+              50,
+              64,
+              66
             ]
           }
         },
@@ -132,6 +387,18 @@
             "gh_cli": [
               5,
               6
+            ],
+            "org_slug": [
+              1,
+              5,
+              6,
+              53
+            ],
+            "workflow_event": [
+              45,
+              63,
+              71,
+              73
             ]
           }
         },
@@ -145,6 +412,19 @@
               5,
               6,
               19
+            ],
+            "org_slug": [
+              1,
+              5,
+              6,
+              19,
+              27
+            ],
+            "workflow_event": [
+              28,
+              34,
+              43,
+              45
             ]
           }
         },
@@ -156,6 +436,30 @@
             ],
             "gh_cli": [
               28
+            ],
+            "org_slug": [
+              1,
+              28,
+              39
+            ],
+            "workflow_event": [
+              26,
+              29,
+              63,
+              71,
+              73
+            ]
+          }
+        },
+        {
+          "path": "prompts/v0/overlap-fix.md",
+          "categories": {
+            "org_slug": [
+              1,
+              35
+            ],
+            "workflow_event": [
+              34
             ]
           }
         },
@@ -164,6 +468,17 @@
           "categories": {
             "github_origin": [
               45
+            ],
+            "org_slug": [
+              1,
+              28
+            ],
+            "workflow_event": [
+              21,
+              31,
+              39,
+              48,
+              50
             ]
           }
         },
@@ -177,6 +492,20 @@
               12,
               15,
               98
+            ],
+            "org_slug": [
+              1,
+              12,
+              15,
+              48,
+              87,
+              96
+            ],
+            "workflow_event": [
+              77,
+              87,
+              91,
+              93
             ]
           }
         },
@@ -184,6 +513,11 @@
           "path": "pyproject.toml",
           "categories": {
             "github_origin": [
+              11,
+              12
+            ],
+            "org_slug": [
+              8,
               11,
               12
             ],
@@ -200,6 +534,78 @@
             ],
             "source_identity": [
               31
+            ],
+            "org_slug": [
+              26,
+              31
+            ],
+            "workflow_event": [
+              6,
+              13,
+              80,
+              83,
+              98,
+              100
+            ]
+          }
+        },
+        {
+          "path": "scripts/docker-entrypoint",
+          "categories": {
+            "github_origin": [
+              12
+            ],
+            "gh_cli": [
+              5,
+              7,
+              8,
+              9
+            ]
+          }
+        },
+        {
+          "path": "scripts/gh-safe-pr-create",
+          "categories": {
+            "gh_cli": [
+              5,
+              13,
+              23,
+              59,
+              60
+            ],
+            "workflow_event": [
+              5
+            ]
+          }
+        },
+        {
+          "path": "scripts/git-safe-push",
+          "categories": {
+            "workflow_event": [
+              2,
+              8,
+              12,
+              16,
+              19,
+              26,
+              28,
+              37,
+              40,
+              44,
+              59,
+              63,
+              68,
+              69,
+              74,
+              75,
+              76,
+              77,
+              83,
+              84,
+              95,
+              110,
+              114,
+              118
             ]
           }
         },
@@ -225,7 +631,12 @@
               238
             ],
             "workflow_event": [
-              117
+              112,
+              117,
+              137,
+              155,
+              200,
+              216
             ],
             "shared_state": [
               188,
@@ -236,6 +647,9 @@
         {
           "path": "scripts/staging_journal_report.py",
           "categories": {
+            "actions_context": [
+              31
+            ],
             "workflow_event": [
               31
             ]
@@ -254,14 +668,28 @@
               73,
               82
             ],
+            "org_slug": [
+              27,
+              89
+            ],
             "workflow_event": [
-              41
+              30,
+              39,
+              40,
+              41,
+              43,
+              44,
+              45,
+              46
             ]
           }
         },
         {
           "path": "services/github-state/scripts/observe_reconciliation.py",
           "categories": {
+            "org_slug": [
+              24
+            ],
             "shared_state": [
               22,
               24,
@@ -291,6 +719,10 @@
           "categories": {
             "workflow_event": [
               58,
+              75,
+              77,
+              172,
+              295,
               362
             ],
             "shared_state": [
@@ -313,6 +745,10 @@
             "github_origin": [
               44
             ],
+            "org_slug": [
+              24,
+              44
+            ],
             "shared_state": [
               25,
               30,
@@ -326,12 +762,24 @@
           }
         },
         {
+          "path": "services/queue/config.toml.example",
+          "categories": {
+            "org_slug": [
+              5
+            ]
+          }
+        },
+        {
           "path": "services/queue/install-repair.sh",
           "categories": {
             "github_origin": [
               31,
               129,
               131
+            ],
+            "org_slug": [
+              31,
+              127
             ]
           }
         },
@@ -342,6 +790,88 @@
               25,
               104,
               106
+            ],
+            "org_slug": [
+              25
+            ]
+          }
+        },
+        {
+          "path": "services/queue/repair-environment.example",
+          "categories": {
+            "gh_cli": [
+              25
+            ],
+            "credentials": [
+              24
+            ],
+            "org_slug": [
+              17,
+              24
+            ]
+          }
+        },
+        {
+          "path": "services/queue/tauceti-queue-repair.service",
+          "categories": {
+            "github_origin": [
+              15
+            ],
+            "org_slug": [
+              15
+            ],
+            "workflow_event": [
+              6,
+              30
+            ]
+          }
+        },
+        {
+          "path": "services/queue/tauceti-queue-repair@.service",
+          "categories": {
+            "github_origin": [
+              5
+            ],
+            "org_slug": [
+              5
+            ]
+          }
+        },
+        {
+          "path": "services/queue/tauceti-queue.service",
+          "categories": {
+            "github_origin": [
+              11
+            ],
+            "org_slug": [
+              11
+            ]
+          }
+        },
+        {
+          "path": "services/workflow-backstop/tauceti-workflow-backstop.service",
+          "categories": {
+            "org_slug": [
+              7
+            ]
+          }
+        },
+        {
+          "path": "tauceti",
+          "categories": {
+            "github_origin": [
+              4
+            ],
+            "org_slug": [
+              4
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/__init__.py",
+          "categories": {
+            "org_slug": [
+              1
             ]
           }
         },
@@ -366,6 +896,18 @@
             ],
             "source_identity": [
               164
+            ],
+            "actions_context": [
+              26,
+              388,
+              389,
+              393,
+              541,
+              559,
+              565
+            ],
+            "workflow_event": [
+              146
             ]
           }
         },
@@ -376,8 +918,19 @@
               339
             ],
             "workflow_event": [
+              229,
+              231,
               242,
-              251
+              245,
+              251,
+              257,
+              262,
+              273,
+              337,
+              505,
+              506,
+              511,
+              515
             ]
           }
         },
@@ -394,6 +947,16 @@
               124,
               196,
               217
+            ],
+            "workflow_event": [
+              4,
+              8,
+              13,
+              41,
+              124,
+              166,
+              170,
+              240
             ]
           }
         },
@@ -424,6 +987,9 @@
               776,
               823,
               935
+            ],
+            "org_slug": [
+              7
             ]
           }
         },
@@ -431,8 +997,12 @@
           "path": "tauceti_queue/commands.py",
           "categories": {
             "workflow_event": [
+              16,
               334,
-              360
+              360,
+              366,
+              375,
+              408
             ]
           }
         },
@@ -451,6 +1021,10 @@
               99,
               262,
               263
+            ],
+            "org_slug": [
+              14,
+              87
             ]
           }
         },
@@ -468,8 +1042,29 @@
               2266,
               4807
             ],
+            "actions_context": [
+              356
+            ],
             "workflow_event": [
-              1014
+              1005,
+              1010,
+              1011,
+              1012,
+              1014,
+              1018,
+              1020,
+              1059,
+              1090,
+              1094,
+              1097,
+              1100,
+              1101,
+              1324,
+              4226,
+              5069,
+              5133,
+              5134,
+              5142
             ]
           }
         },
@@ -486,6 +1081,10 @@
               132,
               157,
               171
+            ],
+            "workflow_event": [
+              24,
+              166
             ]
           }
         },
@@ -496,6 +1095,30 @@
               727,
               730,
               738
+            ],
+            "org_slug": [
+              220,
+              878,
+              909
+            ],
+            "workflow_event": [
+              102,
+              133,
+              142,
+              599,
+              616,
+              726,
+              730,
+              823,
+              857
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/feeds.py",
+          "categories": {
+            "workflow_event": [
+              475
             ]
           }
         },
@@ -548,11 +1171,29 @@
               1310,
               1327
             ],
+            "org_slug": [
+              59
+            ],
             "workflow_event": [
+              26,
               29,
+              66,
               99,
+              704,
+              722,
+              729,
+              739,
+              743,
               768,
-              812
+              812,
+              813,
+              936,
+              1010,
+              1282,
+              1330,
+              1416,
+              1523,
+              1524
             ]
           }
         },
@@ -580,6 +1221,29 @@
           "categories": {
             "github_origin": [
               75
+            ],
+            "org_slug": [
+              115,
+              405,
+              650,
+              853
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/monitoring_history.py",
+          "categories": {
+            "org_slug": [
+              79,
+              213
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/monitoring_protocol.py",
+          "categories": {
+            "workflow_event": [
+              120
             ]
           }
         },
@@ -593,7 +1257,10 @@
               258
             ],
             "workflow_event": [
-              178
+              178,
+              221,
+              222,
+              258
             ]
           }
         },
@@ -637,17 +1304,122 @@
               1534,
               1695
             ],
+            "org_slug": [
+              8,
+              57,
+              58,
+              102,
+              126,
+              198,
+              200,
+              205,
+              399,
+              401,
+              406,
+              472,
+              474,
+              496
+            ],
+            "actions_context": [
+              150,
+              164,
+              165,
+              166,
+              167,
+              168,
+              169,
+              170,
+              174,
+              192,
+              207,
+              208,
+              209,
+              222,
+              223,
+              224,
+              225,
+              226,
+              227,
+              228,
+              229,
+              230,
+              233,
+              266,
+              270,
+              283,
+              319,
+              328,
+              329,
+              355,
+              358,
+              368,
+              376,
+              381,
+              382,
+              383,
+              384,
+              389,
+              408,
+              409,
+              410,
+              425,
+              428,
+              433,
+              451,
+              1211,
+              1212,
+              1324,
+              3204
+            ],
             "workflow_event": [
+              12,
               104,
               130,
+              146,
               150,
+              153,
               155,
               164,
+              170,
               174,
+              226,
+              227,
+              228,
+              229,
+              230,
+              328,
               368,
               381,
+              1225,
+              1226,
+              1266,
               1276,
-              1868
+              1301,
+              1306,
+              1313,
+              1317,
+              1333,
+              1606,
+              1624,
+              1868,
+              1873,
+              1899,
+              1905,
+              1914,
+              1935,
+              1943
+            ],
+            "workflow_uses": [
+              128,
+              190,
+              198,
+              205,
+              288,
+              298,
+              387,
+              399,
+              406,
+              449
             ]
           }
         },
@@ -675,6 +1447,17 @@
               1390,
               1624,
               1939
+            ],
+            "org_slug": [
+              47
+            ],
+            "actions_context": [
+              2052
+            ],
+            "workflow_event": [
+              1626,
+              2025,
+              2058
             ]
           }
         },
@@ -700,6 +1483,23 @@
           }
         },
         {
+          "path": "tauceti_queue/repair_parallel.py",
+          "categories": {
+            "workflow_event": [
+              402
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/repair_publish.py",
+          "categories": {
+            "workflow_event": [
+              30,
+              62
+            ]
+          }
+        },
+        {
           "path": "tauceti_queue/repair_task.py",
           "categories": {
             "github_origin": [
@@ -714,6 +1514,28 @@
             "credentials": [
               538,
               557
+            ],
+            "actions_context": [
+              538,
+              557
+            ],
+            "workflow_event": [
+              116,
+              1597,
+              1601,
+              1614,
+              1619,
+              1691,
+              2110,
+              2121,
+              2122,
+              2123,
+              2125,
+              2128,
+              2130,
+              2150,
+              2162,
+              2204
             ]
           }
         },
@@ -724,6 +1546,9 @@
               95,
               193,
               770
+            ],
+            "workflow_uses": [
+              465
             ]
           }
         },
@@ -739,12 +1564,36 @@
             ],
             "workflow_event": [
               6,
+              9,
               11,
+              12,
+              34,
+              35,
               36,
+              38,
+              39,
+              40,
+              41,
               119,
               120,
+              121,
+              123,
+              124,
+              128,
+              132,
               141,
-              162
+              145,
+              162,
+              173,
+              184
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/__init__.py",
+          "categories": {
+            "org_slug": [
+              6
             ]
           }
         },
@@ -753,6 +1602,9 @@
           "categories": {
             "github_origin": [
               386,
+              408
+            ],
+            "org_slug": [
               408
             ],
             "shared_state": [
@@ -802,6 +1654,29 @@
               2413,
               2414,
               3078
+            ],
+            "actions_context": [
+              950
+            ],
+            "workflow_event": [
+              410,
+              423,
+              427,
+              429,
+              459,
+              835,
+              1766,
+              1865,
+              1879,
+              1927,
+              1934,
+              2297,
+              2298,
+              2407,
+              2408,
+              2412,
+              2418,
+              2731
             ]
           }
         },
@@ -851,6 +1726,22 @@
               1609,
               1724
             ],
+            "org_slug": [
+              6,
+              166,
+              311,
+              595,
+              1552,
+              1773
+            ],
+            "workflow_event": [
+              1704,
+              1740,
+              1745,
+              1775,
+              1874,
+              1877
+            ],
             "shared_state": [
               172,
               177,
@@ -865,6 +1756,10 @@
             "gh_cli": [
               114,
               118
+            ],
+            "workflow_event": [
+              250,
+              253
             ],
             "shared_state": [
               465,
@@ -885,6 +1780,14 @@
             ],
             "source_identity": [
               10
+            ],
+            "org_slug": [
+              10,
+              17,
+              19,
+              25,
+              53,
+              113
             ]
           }
         },
@@ -894,6 +1797,12 @@
             "github_origin": [
               27,
               42
+            ],
+            "org_slug": [
+              28,
+              31,
+              42,
+              138
             ]
           }
         },
@@ -906,6 +1815,12 @@
             ],
             "graphql": [
               85
+            ],
+            "org_slug": [
+              110
+            ],
+            "actions_context": [
+              110
             ]
           }
         },
@@ -973,7 +1888,13 @@
               687,
               690,
               759,
-              785
+              785,
+              796,
+              807,
+              930,
+              1160,
+              1189,
+              1277
             ],
             "credentials": [
               39,
@@ -998,7 +1919,25 @@
               396,
               412
             ],
+            "actions_context": [
+              49,
+              81,
+              88,
+              92,
+              110,
+              203
+            ],
             "workflow_event": [
+              274,
+              275,
+              278,
+              299,
+              302,
+              303,
+              317,
+              329,
+              385,
+              386,
               940,
               949,
               958,
@@ -1022,10 +1961,23 @@
           }
         },
         {
+          "path": "tauceti_worker/github_catalog.json",
+          "categories": {
+            "workflow_event": [
+              10,
+              14,
+              15
+            ]
+          }
+        },
+        {
           "path": "tauceti_worker/github_catalog.py",
           "categories": {
             "graphql": [
               15
+            ],
+            "gh_cli": [
+              27
             ]
           }
         },
@@ -1034,6 +1986,9 @@
           "categories": {
             "graphql": [
               42
+            ],
+            "workflow_event": [
+              106
             ]
           }
         },
@@ -1055,14 +2010,19 @@
               554
             ],
             "gh_cli": [
+              42,
               87,
               427,
               498,
+              518,
               525,
               552,
               617,
               649,
               774
+            ],
+            "workflow_event": [
+              623
             ]
           }
         },
@@ -1077,6 +2037,10 @@
             ],
             "source_identity": [
               165
+            ],
+            "org_slug": [
+              36,
+              451
             ],
             "workflow_event": [
               275
@@ -1127,14 +2091,22 @@
               1254
             ],
             "gh_cli": [
+              508,
               630,
               677,
+              1177,
               1188,
               1265,
               1286
             ],
             "credentials": [
               43
+            ],
+            "actions_context": [
+              35,
+              43,
+              1100,
+              1120
             ],
             "workflow_event": [
               150,
@@ -1174,10 +2146,22 @@
           }
         },
         {
+          "path": "tauceti_worker/oauth.py",
+          "categories": {
+            "workflow_event": [
+              312
+            ]
+          }
+        },
+        {
           "path": "tauceti_worker/overlap_state.py",
           "categories": {
             "github_origin": [
               41
+            ],
+            "workflow_event": [
+              85,
+              93
             ]
           }
         },
@@ -1190,6 +2174,12 @@
               213
             ],
             "credentials": [
+              33
+            ],
+            "org_slug": [
+              154
+            ],
+            "actions_context": [
               33
             ]
           }
@@ -1206,6 +2196,15 @@
             "graphql": [
               150
             ],
+            "gh_cli": [
+              159,
+              255,
+              269,
+              328
+            ],
+            "workflow_event": [
+              143
+            ],
             "shared_state": [
               125,
               154
@@ -1218,6 +2217,10 @@
             "github_origin": [
               770,
               793
+            ],
+            "workflow_event": [
+              1881,
+              2286
             ]
           }
         },
@@ -1228,6 +2231,37 @@
               161,
               999
             ],
+            "workflow_event": [
+              39,
+              284,
+              292,
+              294,
+              295,
+              338,
+              421,
+              628,
+              629,
+              745,
+              1351,
+              1353,
+              1591,
+              1595,
+              1598,
+              1603,
+              1611,
+              1622,
+              1659,
+              1660,
+              1664,
+              1671,
+              1907,
+              1986,
+              2053,
+              2081,
+              2142,
+              2233,
+              2235
+            ],
             "shared_state": [
               555
             ]
@@ -1237,6 +2271,7 @@
           "path": "tauceti_worker/repair_route.py",
           "categories": {
             "workflow_event": [
+              75,
               90
             ]
           }
@@ -1277,6 +2312,16 @@
           "categories": {
             "github_origin": [
               256
+            ],
+            "workflow_event": [
+              220,
+              221,
+              239,
+              244,
+              245,
+              260,
+              268,
+              269
             ]
           }
         },
@@ -1292,6 +2337,15 @@
             ],
             "workflow_event": [
               218
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/shared_mathlib.py",
+          "categories": {
+            "workflow_event": [
+              617,
+              621
             ]
           }
         },
@@ -1323,6 +2377,13 @@
             "gh_cli": [
               587
             ],
+            "workflow_event": [
+              147,
+              210,
+              518,
+              809,
+              913
+            ],
             "shared_state": [
               51,
               336,
@@ -1340,6 +2401,37 @@
               168,
               177,
               844
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/verification_scope.py",
+          "categories": {
+            "org_slug": [
+              40
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/verification_storage.py",
+          "categories": {
+            "workflow_event": [
+              1061,
+              1062,
+              1069
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/work_recovery.py",
+          "categories": {
+            "workflow_event": [
+              25,
+              26,
+              858,
+              859,
+              860,
+              965
             ]
           }
         },
@@ -1371,6 +2463,43 @@
               1928,
               2003,
               2124
+            ],
+            "org_slug": [
+              1594,
+              1651
+            ],
+            "workflow_event": [
+              675,
+              855,
+              872,
+              1357,
+              1368,
+              1514,
+              1520,
+              1582,
+              1583,
+              1589,
+              1592,
+              1663,
+              1718,
+              1814,
+              1837,
+              1861,
+              1863,
+              1869,
+              1875,
+              1878,
+              1902,
+              1981,
+              2075,
+              2212,
+              2229,
+              2230,
+              2764,
+              2848,
+              2908,
+              2910,
+              2987
             ],
             "shared_state": [
               88,
@@ -1405,6 +2534,9 @@
               1976,
               2161
             ],
+            "org_slug": [
+              105
+            ],
             "shared_state": [
               48,
               49,
@@ -1435,24 +2567,37 @@
               61
             ],
             "workflow_event": [
-              19
+              19,
+              106
+            ]
+          }
+        },
+        {
+          "path": "workers.toml.example",
+          "categories": {
+            "github_origin": [
+              21
             ]
           }
         }
-      ]
+      ],
+      "skipped": []
     },
     {
       "repository": "TauCetiTools",
       "source_revision": "37e8186971d249763bea9761f256a35daf997413",
       "canonical_shared_assets": true,
       "counts": {
-        "github_origin": 62,
-        "graphql": 24,
-        "gh_cli": 51,
+        "github_origin": 82,
+        "graphql": 29,
+        "gh_cli": 52,
         "credentials": 47,
         "source_identity": 23,
-        "workflow_event": 59,
-        "shared_state": 20
+        "org_slug": 86,
+        "actions_context": 57,
+        "workflow_event": 115,
+        "workflow_uses": 38,
+        "shared_state": 41
       },
       "files": [
         {
@@ -1461,17 +2606,55 @@
             "credentials": [
               49,
               60
+            ],
+            "workflow_uses": [
+              49,
+              60
+            ]
+          }
+        },
+        {
+          "path": ".github/actions/setup/action.yml",
+          "categories": {
+            "workflow_uses": [
+              13
             ]
           }
         },
         {
           "path": ".github/workflows/checks.yml",
           "categories": {
+            "actions_context": [
+              11,
+              23,
+              33,
+              36
+            ],
+            "workflow_event": [
+              2,
+              33
+            ],
+            "workflow_uses": [
+              13,
+              14,
+              25,
+              26,
+              43,
+              44
+            ],
             "shared_state": [
               20,
               30,
               32,
               48
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/pick-runner.yml",
+          "categories": {
+            "workflow_event": [
+              3
             ]
           }
         },
@@ -1501,10 +2684,94 @@
             "source_identity": [
               55
             ],
+            "org_slug": [
+              1516
+            ],
+            "actions_context": [
+              2,
+              52,
+              53,
+              54,
+              55,
+              56,
+              57,
+              58,
+              63,
+              79,
+              82,
+              182,
+              183,
+              184,
+              197,
+              198,
+              199,
+              200,
+              201,
+              203,
+              208,
+              209,
+              214,
+              215,
+              218,
+              219,
+              234,
+              235,
+              236,
+              237,
+              238,
+              240,
+              245,
+              259,
+              263,
+              277,
+              301,
+              302,
+              303,
+              347,
+              350,
+              354,
+              355,
+              356,
+              357,
+              458,
+              490,
+              553,
+              796,
+              984,
+              985,
+              1157,
+              1245,
+              1246,
+              1319,
+              1320,
+              1442,
+              1499,
+              1511,
+              1529,
+              1530,
+              1535,
+              1536,
+              1547,
+              1553,
+              1580,
+              1590,
+              1628,
+              1636,
+              1641,
+              1642,
+              1643,
+              1644,
+              1677,
+              1678,
+              1679,
+              1698
+            ],
             "workflow_event": [
               2,
+              8,
               20,
               21,
+              24,
               52,
               58,
               63,
@@ -1517,17 +2784,52 @@
               215,
               218,
               234,
+              235,
+              236,
+              237,
+              238,
+              240,
+              301,
+              302,
+              303,
               347,
               354,
               355,
               443,
               444,
               481,
+              970,
+              1004,
+              1328,
+              1370,
               1530,
               1542,
               1628,
               1636,
               1641
+            ],
+            "workflow_uses": [
+              80,
+              154,
+              163,
+              180,
+              287,
+              503,
+              514,
+              890,
+              917,
+              1031,
+              1250,
+              1497,
+              1509,
+              1559,
+              1578,
+              1588,
+              1607,
+              1647,
+              1659,
+              1675,
+              1696
             ]
           }
         },
@@ -1539,6 +2841,26 @@
             ],
             "source_identity": [
               52
+            ],
+            "actions_context": [
+              52,
+              56,
+              121,
+              195,
+              211,
+              221,
+              231,
+              233,
+              255
+            ],
+            "workflow_event": [
+              10
+            ],
+            "workflow_uses": [
+              69,
+              77,
+              91,
+              253
             ]
           }
         },
@@ -1550,10 +2872,62 @@
               137,
               178
             ],
-            "workflow_event": [
+            "actions_context": [
+              31,
               32,
               33,
+              35,
+              40,
+              41,
+              74,
+              75,
+              81,
+              98,
+              110,
+              111,
+              112,
+              123,
+              124,
+              125,
+              156,
+              157,
+              178,
+              179
+            ],
+            "workflow_event": [
+              6,
+              31,
+              32,
+              33,
+              35,
+              40,
+              41,
+              112,
+              156,
               157
+            ],
+            "workflow_uses": [
+              47,
+              55,
+              107,
+              121,
+              170
+            ]
+          }
+        },
+        {
+          "path": "examples/disposable-project/content/lake-manifest.json",
+          "categories": {
+            "github_origin": [
+              6,
+              18,
+              30,
+              42,
+              54,
+              66,
+              78,
+              90,
+              102
             ]
           }
         },
@@ -1568,12 +2942,42 @@
         {
           "path": "examples/disposable-project/content/tauceti.toml",
           "categories": {
+            "github_origin": [
+              69,
+              78
+            ],
             "gh_cli": [
               27
+            ],
+            "org_slug": [
+              12,
+              27,
+              29,
+              32,
+              35,
+              84,
+              88,
+              92
             ],
             "shared_state": [
               61,
               63
+            ]
+          }
+        },
+        {
+          "path": "examples/disposable-project/roadmap/lake-manifest.json",
+          "categories": {
+            "github_origin": [
+              6,
+              18,
+              30,
+              42,
+              54,
+              66,
+              78,
+              90,
+              102
             ]
           }
         },
@@ -1589,13 +2993,23 @@
           "path": "examples/epsilon-eridani.toml",
           "categories": {
             "github_origin": [
-              26
+              26,
+              74,
+              83
             ],
             "gh_cli": [
               29
             ],
             "source_identity": [
               73
+            ],
+            "org_slug": [
+              12,
+              29,
+              31,
+              34,
+              37,
+              97
             ],
             "shared_state": [
               65,
@@ -1606,15 +3020,224 @@
         {
           "path": "examples/tauceti.toml",
           "categories": {
+            "github_origin": [
+              70,
+              86
+            ],
             "gh_cli": [
               27
             ],
             "source_identity": [
               69
             ],
+            "org_slug": [
+              10,
+              11,
+              12,
+              14,
+              15,
+              16,
+              27,
+              29,
+              32,
+              35
+            ],
             "shared_state": [
               61,
               63
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/package-lock.json",
+          "categories": {
+            "github_origin": [
+              1255,
+              1303,
+              1500
+            ],
+            "shared_state": [
+              2,
+              7
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/package.json",
+          "categories": {
+            "shared_state": [
+              2
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/benchmark-baseline.mjs",
+          "categories": {
+            "shared_state": [
+              13
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/benchmark-history-demand.mjs",
+          "categories": {
+            "graphql": [
+              77
+            ],
+            "workflow_event": [
+              29,
+              38,
+              49,
+              59,
+              69,
+              87
+            ],
+            "shared_state": [
+              15
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/benchmark-ingest.mjs",
+          "categories": {
+            "workflow_event": [
+              23,
+              25,
+              26,
+              27,
+              28,
+              40,
+              57
+            ],
+            "shared_state": [
+              15
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/benchmark-migration-bytes.mjs",
+          "categories": {
+            "workflow_event": [
+              40
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/benchmark-postgres.mjs",
+          "categories": {
+            "workflow_event": [
+              21,
+              36,
+              38,
+              40,
+              61,
+              80,
+              92,
+              100
+            ],
+            "shared_state": [
+              12
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/benchmark-publication-sustained.mjs",
+          "categories": {
+            "graphql": [
+              57
+            ],
+            "workflow_event": [
+              30,
+              48,
+              56,
+              72,
+              73,
+              75,
+              76,
+              77,
+              85,
+              88,
+              93
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/benchmark-publication.mjs",
+          "categories": {
+            "graphql": [
+              68
+            ],
+            "workflow_event": [
+              38,
+              43,
+              48,
+              61,
+              71,
+              87,
+              94
+            ],
+            "shared_state": [
+              16
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/benchmark-refill.mjs",
+          "categories": {
+            "workflow_event": [
+              33,
+              41,
+              57
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/benchmark-shared-installation.mjs",
+          "categories": {
+            "github_origin": [
+              16
+            ],
+            "workflow_event": [
+              24,
+              29,
+              33,
+              41,
+              53,
+              58,
+              63,
+              65,
+              79
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/benchmark-status-dormancy.mjs",
+          "categories": {
+            "graphql": [
+              21
+            ],
+            "workflow_event": [
+              20,
+              31
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/benchmark-write-submissions.mjs",
+          "categories": {
+            "workflow_event": [
+              20,
+              21,
+              22,
+              23,
+              32,
+              35,
+              41,
+              52,
+              55,
+              58,
+              70,
+              80
             ]
           }
         },
@@ -1624,10 +3247,32 @@
             "github_origin": [
               53
             ],
+            "org_slug": [
+              53
+            ],
             "workflow_event": [
               81,
+              87,
               89,
               103
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/deployed-provider-drill.mjs",
+          "categories": {
+            "workflow_event": [
+              41,
+              46,
+              50,
+              53,
+              73,
+              75
+            ],
+            "shared_state": [
+              15,
+              16,
+              38
             ]
           }
         },
@@ -1641,7 +3286,10 @@
             "workflow_event": [
               34,
               35,
-              38
+              36,
+              38,
+              42,
+              44
             ],
             "shared_state": [
               66,
@@ -1655,6 +3303,10 @@
           "categories": {
             "github_origin": [
               40
+            ],
+            "org_slug": [
+              40,
+              42
             ],
             "workflow_event": [
               111,
@@ -1672,6 +3324,10 @@
             "github_origin": [
               116
             ],
+            "org_slug": [
+              116,
+              146
+            ],
             "shared_state": [
               101,
               102
@@ -1679,12 +3335,64 @@
           }
         },
         {
+          "path": "services/github-state/scripts/observe-provider.mjs",
+          "categories": {
+            "github_origin": [
+              15
+            ]
+          }
+        },
+        {
           "path": "services/github-state/scripts/observe_reconciliation.py",
           "categories": {
+            "org_slug": [
+              24
+            ],
             "shared_state": [
               22,
               24,
               88
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/outage-drill.mjs",
+          "categories": {
+            "shared_state": [
+              14
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/postgres-schema.mjs",
+          "categories": {
+            "shared_state": [
+              6
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/prepare-postgres-statistics.mjs",
+          "categories": {
+            "shared_state": [
+              8,
+              10,
+              11
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/restore-postgres-drill.mjs",
+          "categories": {
+            "workflow_event": [
+              28,
+              29,
+              30,
+              66
+            ],
+            "shared_state": [
+              26,
+              27
             ]
           }
         },
@@ -1714,13 +3422,39 @@
               235,
               312
             ],
+            "org_slug": [
+              174,
+              183
+            ],
             "workflow_event": [
+              25,
+              26,
+              27,
+              28,
               30,
-              42
+              33,
+              38,
+              39,
+              40,
+              42,
+              46
             ],
             "shared_state": [
               180,
               181
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/src/activity_landings.ts",
+          "categories": {
+            "org_slug": [
+              5,
+              23
+            ],
+            "workflow_event": [
+              13,
+              16
             ]
           }
         },
@@ -1743,8 +3477,12 @@
             "workflow_event": [
               15,
               53,
+              65,
               88,
-              90
+              90,
+              132,
+              133,
+              137
             ]
           }
         },
@@ -1761,8 +3499,13 @@
               196,
               203
             ],
+            "org_slug": [
+              70,
+              295
+            ],
             "workflow_event": [
-              68
+              68,
+              217
             ],
             "shared_state": [
               65,
@@ -1778,6 +3521,17 @@
               40,
               187,
               619
+            ],
+            "workflow_event": [
+              61,
+              242,
+              365,
+              412,
+              413,
+              414,
+              627,
+              628,
+              629
             ]
           }
         },
@@ -1824,8 +3578,11 @@
               548
             ],
             "workflow_event": [
+              298,
               327,
-              342
+              342,
+              442,
+              481
             ],
             "shared_state": [
               155
@@ -1841,8 +3598,19 @@
           }
         },
         {
+          "path": "services/github-state/src/migration_target.ts",
+          "categories": {
+            "workflow_event": [
+              127
+            ]
+          }
+        },
+        {
           "path": "services/github-state/src/monitoring.ts",
           "categories": {
+            "workflow_event": [
+              135
+            ],
             "shared_state": [
               112,
               114
@@ -1850,11 +3618,42 @@
           }
         },
         {
+          "path": "services/github-state/src/pr_updates.ts",
+          "categories": {
+            "workflow_event": [
+              15
+            ]
+          }
+        },
+        {
           "path": "services/github-state/src/protocol.ts",
           "categories": {
             "workflow_event": [
+              88,
+              89,
               90,
               104
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/src/provider_monitoring.ts",
+          "categories": {
+            "workflow_event": [
+              37,
+              69,
+              137,
+              138,
+              139,
+              141
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/src/reconciliation.ts",
+          "categories": {
+            "workflow_event": [
+              16
             ]
           }
         },
@@ -1870,14 +3669,37 @@
             "graphql": [
               1883
             ],
+            "gh_cli": [
+              897,
+              1167,
+              1199,
+              2505,
+              2591
+            ],
             "source_identity": [
               3031,
               3153
             ],
+            "org_slug": [
+              2912
+            ],
             "workflow_event": [
               24,
+              350,
+              359,
+              432,
+              491,
+              497,
               542,
+              544,
+              545,
+              548,
+              551,
               577,
+              580,
+              601,
+              610,
+              692,
               702,
               714,
               722,
@@ -1887,37 +3709,130 @@
               777,
               784,
               785,
+              786,
+              806,
               830,
+              837,
+              879,
+              892,
+              915,
+              916,
+              1049,
+              1050,
+              1060,
+              1064,
               1068,
+              1070,
+              1074,
+              1081,
               1083,
               1084,
               1085,
+              1086,
+              1090,
+              1091,
+              1093,
+              1094,
+              1095,
+              1100,
               1102,
+              1103,
+              1108,
+              1116,
+              1123,
+              1183,
               1193,
               1195,
               1197,
+              1200,
+              1202,
               1254,
               1255,
+              1281,
               1301,
               1368,
+              1423,
+              1426,
               1457,
+              1683,
+              1727,
+              1749,
+              1817,
               1820,
+              1827,
+              1830,
+              1835,
+              1836,
+              1905,
               1973,
+              1974,
+              1975,
               1985,
+              1991,
+              1993,
               1998,
+              2071,
+              2251,
+              2253,
+              2254,
+              2255,
+              2256,
+              2307,
+              2311,
+              2312,
+              2314,
+              2315,
+              2316,
+              2317,
+              2319,
+              2324,
               2476,
               2544,
+              2546,
               2591,
-              2710
+              2592,
+              2598,
+              2710,
+              2711,
+              2767,
+              3662,
+              3665
             ]
           }
         },
         {
           "path": "services/github-state/src/repository_store.ts",
           "categories": {
+            "workflow_event": [
+              257,
+              268,
+              316,
+              395,
+              507,
+              511,
+              517,
+              520,
+              522,
+              524,
+              526,
+              528,
+              531,
+              535,
+              537
+            ],
             "shared_state": [
               133,
               358
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/src/retention.ts",
+          "categories": {
+            "workflow_event": [
+              72,
+              74,
+              104
             ]
           }
         },
@@ -1934,6 +3849,525 @@
               147,
               177,
               226
+            ],
+            "workflow_event": [
+              26,
+              29,
+              49,
+              50,
+              85,
+              119,
+              133,
+              135,
+              165,
+              168,
+              208,
+              210,
+              275,
+              281
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/src/storage.ts",
+          "categories": {
+            "workflow_event": [
+              51,
+              115,
+              116,
+              117
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/validation/ingest-batching-2026-10-31.json",
+          "categories": {
+            "workflow_event": [
+              10,
+              22,
+              28,
+              34,
+              40,
+              61,
+              156,
+              168,
+              174,
+              180,
+              186,
+              207,
+              302,
+              314,
+              320,
+              326,
+              332,
+              353,
+              450,
+              462,
+              468,
+              474,
+              480,
+              501,
+              596,
+              608,
+              614,
+              620,
+              626,
+              647,
+              742,
+              754,
+              760,
+              766,
+              772,
+              793,
+              891,
+              897,
+              903,
+              909,
+              915,
+              921,
+              927,
+              933,
+              1166,
+              1172,
+              1178,
+              1184,
+              1190,
+              1196,
+              1202,
+              1208,
+              1441,
+              1447,
+              1453,
+              1459,
+              1465,
+              1471,
+              1477,
+              1483,
+              1718,
+              1724,
+              1730,
+              1736,
+              1742,
+              1748,
+              1754,
+              1760,
+              1993,
+              1999,
+              2005,
+              2011,
+              2017,
+              2023,
+              2029,
+              2035,
+              2268,
+              2274,
+              2280,
+              2286,
+              2292,
+              2298,
+              2304,
+              2310,
+              2563,
+              2573,
+              2578,
+              2583,
+              2588,
+              2600,
+              2610,
+              2615,
+              2620,
+              2625
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/validation/migration-client-compatibility-2026-10-23.json",
+          "categories": {
+            "github_origin": [
+              3,
+              20
+            ],
+            "org_slug": [
+              3,
+              8,
+              20
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/validation/migration-production-release-2026-10-26.json",
+          "categories": {
+            "github_origin": [
+              5,
+              53,
+              54
+            ],
+            "org_slug": [
+              5,
+              53,
+              54
+            ],
+            "workflow_event": [
+              401,
+              458,
+              468,
+              592
+            ],
+            "shared_state": [
+              46,
+              47,
+              105,
+              111,
+              742
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/validation/migration-shadow-abort-2026-10-21.json",
+          "categories": {
+            "org_slug": [
+              4
+            ],
+            "shared_state": [
+              19,
+              20,
+              21
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/validation/migration-test-checkpoint-2026-10-22.json",
+          "categories": {
+            "github_origin": [
+              411,
+              548,
+              549,
+              550
+            ],
+            "org_slug": [
+              4,
+              411,
+              548,
+              549,
+              550
+            ],
+            "workflow_event": [
+              512,
+              535,
+              548,
+              549
+            ],
+            "shared_state": [
+              24,
+              25,
+              26,
+              443
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/validation/migration-test-release-2026-10-25.json",
+          "categories": {
+            "github_origin": [
+              4
+            ],
+            "org_slug": [
+              4
+            ],
+            "workflow_event": [
+              429,
+              527,
+              583,
+              916
+            ],
+            "shared_state": [
+              198,
+              199,
+              698,
+              842,
+              970,
+              1005
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/validation/neon-provisioning-2026-10-20.json",
+          "categories": {
+            "shared_state": [
+              5,
+              61,
+              68
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/validation/neon-s2-capacity-2026-10-20.json",
+          "categories": {
+            "shared_state": [
+              5,
+              23,
+              24,
+              30,
+              31,
+              37,
+              38
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/validation/publication-efficiency.json",
+          "categories": {
+            "workflow_event": [
+              101,
+              103,
+              171,
+              173,
+              238,
+              240,
+              305,
+              307,
+              429,
+              431,
+              507,
+              509,
+              582,
+              584,
+              657,
+              659,
+              735,
+              737,
+              813,
+              815,
+              937,
+              939,
+              1015,
+              1017,
+              1090,
+              1092,
+              1165,
+              1167,
+              1292,
+              1294,
+              1370,
+              1372,
+              1445,
+              1447,
+              1520,
+              1522,
+              1647,
+              1649,
+              1725,
+              1727,
+              1849,
+              1851,
+              1928,
+              1930,
+              2051,
+              2053,
+              2128,
+              2130,
+              2357,
+              2372,
+              2381,
+              2396,
+              2576,
+              2664,
+              2697,
+              2719,
+              2796
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/validation/publication-memory-native-2026-10-20.json",
+          "categories": {
+            "github_origin": [
+              36
+            ],
+            "org_slug": [
+              4,
+              36
+            ],
+            "shared_state": [
+              190,
+              191,
+              195,
+              196,
+              197,
+              198,
+              199,
+              200,
+              201,
+              202,
+              203,
+              204,
+              205,
+              214,
+              215,
+              218,
+              221,
+              222,
+              223,
+              224,
+              225,
+              226,
+              227,
+              228,
+              229,
+              230,
+              231,
+              232,
+              233,
+              234,
+              235,
+              236
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/validation/write-submissions-2026-11-01.json",
+          "categories": {
+            "workflow_event": [
+              452,
+              460,
+              510,
+              517,
+              524,
+              531,
+              981,
+              989,
+              1039,
+              1046,
+              1053,
+              1060,
+              1510,
+              1518,
+              1568,
+              1575,
+              1582,
+              1589,
+              1942,
+              1950,
+              1988,
+              1995,
+              2002,
+              2009,
+              2360,
+              2368,
+              2406,
+              2413,
+              2420,
+              2427,
+              2778,
+              2786,
+              2824,
+              2831,
+              2838,
+              2845,
+              3335,
+              3347,
+              3393,
+              3400,
+              3407,
+              3414,
+              3864,
+              3868,
+              3922,
+              3929,
+              3936,
+              3943,
+              4393,
+              4397,
+              4451,
+              4458,
+              4465,
+              4472,
+              4851,
+              4859,
+              4889,
+              4896,
+              4903,
+              4910,
+              5279,
+              5283,
+              5325,
+              5332,
+              5339,
+              5346,
+              5715,
+              5719,
+              5761,
+              5768,
+              5775,
+              5782,
+              6272,
+              6280,
+              6330,
+              6337,
+              6344,
+              6351,
+              6801,
+              6809,
+              6859,
+              6866,
+              6873,
+              6880,
+              7330,
+              7338,
+              7388,
+              7395,
+              7402,
+              7409,
+              7762,
+              7770,
+              7808,
+              7815,
+              7822,
+              7829,
+              8180,
+              8188,
+              8226,
+              8233,
+              8240,
+              8247,
+              8598,
+              8606,
+              8644,
+              8651,
+              8658,
+              8665
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/wrangler.example.jsonc",
+          "categories": {
+            "shared_state": [
+              3,
+              37,
+              44,
+              48,
+              53,
+              58,
+              61
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/wrangler.jsonc",
+          "categories": {
+            "org_slug": [
+              8
+            ],
+            "shared_state": [
+              3,
+              5,
+              13,
+              14,
+              17,
+              21,
+              23,
+              24
             ]
           }
         },
@@ -1944,8 +4378,24 @@
               40,
               58
             ],
+            "actions_context": [
+              38,
+              47,
+              53,
+              58,
+              79
+            ],
             "workflow_event": [
-              13
+              8,
+              11,
+              13,
+              66
+            ],
+            "workflow_uses": [
+              30,
+              40,
+              50,
+              76
             ]
           }
         },
@@ -1960,8 +4410,26 @@
             "credentials": [
               41
             ],
+            "actions_context": [
+              25,
+              41
+            ],
             "workflow_event": [
-              14
+              8,
+              12,
+              14,
+              25
+            ],
+            "workflow_uses": [
+              29
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/data/schema/scrape_event.v1.json",
+          "categories": {
+            "graphql": [
+              19
             ]
           }
         },
@@ -1976,8 +4444,59 @@
             "credentials": [
               72
             ],
+            "actions_context": [
+              47,
+              72,
+              73,
+              74
+            ],
             "workflow_event": [
+              4,
               13
+            ],
+            "workflow_uses": [
+              27,
+              31,
+              36,
+              53,
+              69
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/actions/checkout-merge-policy/action.yml",
+          "categories": {
+            "org_slug": [
+              19
+            ],
+            "workflow_uses": [
+              6,
+              17
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/actions/restore-lean-toolchain/action.yml",
+          "categories": {
+            "actions_context": [
+              35,
+              36
+            ],
+            "workflow_uses": [
+              40
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/actions/restore-mathlib-ltars/action.yml",
+          "categories": {
+            "actions_context": [
+              44,
+              45,
+              46
+            ],
+            "workflow_uses": [
+              54
             ]
           }
         },
@@ -1985,7 +4504,8 @@
           "path": "tauceti_tools/assets/project/.github/workflows/api-docs.yml",
           "categories": {
             "github_origin": [
-              89
+              89,
+              183
             ],
             "gh_cli": [
               224
@@ -1994,8 +4514,34 @@
               218,
               259
             ],
+            "actions_context": [
+              36,
+              121,
+              194,
+              197,
+              218,
+              219,
+              220,
+              221,
+              228,
+              230,
+              240,
+              249,
+              259,
+              260,
+              265
+            ],
             "workflow_event": [
-              29
+              22,
+              27,
+              29,
+              252
+            ],
+            "workflow_uses": [
+              73,
+              118,
+              237,
+              246
             ]
           }
         },
@@ -2008,14 +4554,48 @@
             "credentials": [
               60
             ],
-            "workflow_event": [
-              21,
-              28,
+            "org_slug": [
+              84
+            ],
+            "actions_context": [
+              36,
               45,
+              46,
+              47,
+              48,
               49,
               50,
+              51,
+              52,
+              53,
+              60,
+              61,
+              64,
+              66,
+              68,
+              70,
+              72,
+              75
+            ],
+            "workflow_event": [
+              21,
+              24,
+              28,
+              36,
+              45,
+              47,
+              48,
+              49,
+              50,
+              51,
               65,
-              67
+              67,
+              68,
+              70,
+              72
+            ],
+            "workflow_uses": [
+              84
             ]
           }
         },
@@ -2028,6 +4608,41 @@
             "credentials": [
               59,
               267
+            ],
+            "actions_context": [
+              59,
+              165,
+              170,
+              267,
+              268,
+              270,
+              271,
+              316,
+              319,
+              333,
+              335,
+              339,
+              399,
+              400,
+              428
+            ],
+            "workflow_event": [
+              6,
+              65,
+              174,
+              261,
+              264,
+              269,
+              410
+            ],
+            "workflow_uses": [
+              56,
+              71,
+              100,
+              151,
+              167,
+              404,
+              424
             ]
           }
         },
@@ -2038,8 +4653,22 @@
               52,
               64
             ],
+            "org_slug": [
+              3,
+              17
+            ],
+            "actions_context": [
+              64,
+              66
+            ],
             "workflow_event": [
+              9,
+              22,
               24
+            ],
+            "workflow_uses": [
+              52,
+              60
             ]
           }
         },
@@ -2050,8 +4679,35 @@
               79,
               91
             ],
+            "org_slug": [
+              31,
+              46,
+              48
+            ],
+            "actions_context": [
+              26,
+              31,
+              38,
+              54,
+              55,
+              67,
+              90,
+              91,
+              92,
+              93,
+              94,
+              103
+            ],
             "workflow_event": [
+              5,
               8
+            ],
+            "workflow_uses": [
+              36,
+              46,
+              72,
+              79,
+              101
             ]
           }
         },
@@ -2062,8 +4718,17 @@
               32,
               53
             ],
+            "actions_context": [
+              54
+            ],
             "workflow_event": [
+              17,
               19
+            ],
+            "workflow_uses": [
+              32,
+              43,
+              46
             ]
           }
         },
@@ -2082,6 +4747,7 @@
               261,
               262,
               264,
+              266,
               276
             ],
             "credentials": [
@@ -2089,8 +4755,25 @@
               215,
               228
             ],
+            "actions_context": [
+              49,
+              192,
+              196,
+              198,
+              203,
+              229,
+              232
+            ],
             "workflow_event": [
-              16
+              14,
+              16,
+              123
+            ],
+            "workflow_uses": [
+              47,
+              57,
+              86,
+              215
             ]
           }
         },
@@ -2105,21 +4788,46 @@
               69,
               98
             ],
+            "org_slug": [
+              63
+            ],
+            "actions_context": [
+              52,
+              63,
+              99
+            ],
             "workflow_event": [
               6,
               7,
+              39,
               45,
               82
+            ],
+            "workflow_uses": [
+              69,
+              85,
+              91
             ]
           }
         },
         {
           "path": "tauceti_tools/assets/project/.github/workflows/merge-sweep.yml",
           "categories": {
+            "org_slug": [
+              45
+            ],
+            "actions_context": [
+              51
+            ],
             "workflow_event": [
+              4,
+              17,
               19,
               21,
               51
+            ],
+            "workflow_uses": [
+              45
             ]
           }
         },
@@ -2130,9 +4838,47 @@
               347,
               582
             ],
+            "org_slug": [
+              65,
+              75,
+              550,
+              582
+            ],
+            "actions_context": [
+              62,
+              65,
+              75,
+              132,
+              420,
+              422,
+              445,
+              446,
+              451,
+              452,
+              454,
+              455,
+              457,
+              458,
+              460,
+              461,
+              526,
+              533,
+              550,
+              570
+            ],
             "workflow_event": [
+              6,
+              40,
               42,
-              175
+              175,
+              549,
+              586
+            ],
+            "workflow_uses": [
+              66,
+              116,
+              138,
+              358
             ]
           }
         },
@@ -2166,14 +4912,86 @@
               381,
               964
             ],
+            "org_slug": [
+              160
+            ],
+            "actions_context": [
+              131,
+              141,
+              170,
+              222,
+              231,
+              236,
+              268,
+              270,
+              281,
+              295,
+              332,
+              340,
+              364,
+              381,
+              446,
+              448,
+              459,
+              548,
+              707,
+              723,
+              770,
+              920,
+              922,
+              957,
+              964,
+              966,
+              967
+            ],
             "workflow_event": [
-              52
+              24,
+              26,
+              30,
+              50,
+              52,
+              82,
+              738,
+              921
+            ],
+            "workflow_uses": [
+              105,
+              126,
+              173,
+              217,
+              278,
+              291,
+              456,
+              462,
+              498,
+              514,
+              545,
+              564,
+              571,
+              720,
+              731,
+              764,
+              784,
+              830,
+              848
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/pick-runner.yml",
+          "categories": {
+            "workflow_event": [
+              3
             ]
           }
         },
         {
           "path": "tauceti_tools/assets/project/.github/workflows/pr-build.yml",
           "categories": {
+            "actions_context": [
+              3,
+              37
+            ],
             "workflow_event": [
               3,
               5,
@@ -2181,6 +4999,9 @@
               14,
               17,
               19
+            ],
+            "workflow_uses": [
+              32
             ]
           }
         },
@@ -2200,14 +5021,56 @@
               127,
               157
             ],
+            "org_slug": [
+              41
+            ],
+            "actions_context": [
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              48,
+              49,
+              50,
+              51,
+              52,
+              53,
+              104,
+              105,
+              127,
+              131,
+              138,
+              144,
+              158,
+              164
+            ],
             "workflow_event": [
+              6,
+              22,
               24,
               25,
+              27,
               30,
               42,
               43,
+              45,
+              46,
               47,
-              50
+              48,
+              49,
+              50,
+              51,
+              111,
+              132,
+              164
+            ],
+            "workflow_uses": [
+              76,
+              90,
+              98,
+              174
             ]
           }
         },
@@ -2219,14 +5082,45 @@
             ],
             "source_identity": [
               52
+            ],
+            "org_slug": [
+              12
+            ],
+            "actions_context": [
+              52,
+              56,
+              121,
+              195,
+              211,
+              221,
+              231,
+              233,
+              255
+            ],
+            "workflow_event": [
+              10
+            ],
+            "workflow_uses": [
+              69,
+              77,
+              91,
+              253
             ]
           }
         },
         {
           "path": "tauceti_tools/assets/project/.github/workflows/retry-ci-status.yml",
           "categories": {
+            "actions_context": [
+              24
+            ],
             "workflow_event": [
+              5,
+              8,
               10
+            ],
+            "workflow_uses": [
+              20
             ]
           }
         },
@@ -2238,10 +5132,30 @@
               49,
               86
             ],
+            "org_slug": [
+              75
+            ],
+            "actions_context": [
+              28,
+              38,
+              48,
+              84,
+              87,
+              88
+            ],
             "workflow_event": [
               15,
               22,
-              46
+              27,
+              28,
+              46,
+              88
+            ],
+            "workflow_uses": [
+              49,
+              61,
+              68,
+              73
             ]
           }
         },
@@ -2251,8 +5165,19 @@
             "credentials": [
               52
             ],
+            "org_slug": [
+              42
+            ],
+            "actions_context": [
+              42,
+              52
+            ],
             "workflow_event": [
+              22,
               24
+            ],
+            "workflow_uses": [
+              46
             ]
           }
         },
@@ -2262,10 +5187,29 @@
             "credentials": [
               76
             ],
+            "org_slug": [
+              58
+            ],
+            "actions_context": [
+              58,
+              59,
+              76,
+              85,
+              86
+            ],
             "workflow_event": [
+              6,
+              7,
+              10,
+              23,
+              28,
               33,
               35,
-              55
+              55,
+              86
+            ],
+            "workflow_uses": [
+              67
             ]
           }
         },
@@ -2286,8 +5230,21 @@
               77,
               86
             ],
+            "actions_context": [
+              75,
+              82,
+              83,
+              87
+            ],
             "workflow_event": [
-              3
+              3,
+              4,
+              101
+            ],
+            "workflow_uses": [
+              19,
+              22,
+              77
             ]
           }
         },
@@ -2303,16 +5260,41 @@
               90,
               112
             ],
+            "actions_context": [
+              45,
+              81
+            ],
             "workflow_event": [
+              6,
               8
+            ],
+            "workflow_uses": [
+              33,
+              38,
+              56,
+              61,
+              90,
+              99,
+              105
             ]
           }
         },
         {
           "path": "tauceti_tools/assets/project/.github/workflows/zulip-healthcheck.yml",
           "categories": {
+            "org_slug": [
+              24
+            ],
+            "actions_context": [
+              24
+            ],
             "workflow_event": [
+              3,
+              11,
               13
+            ],
+            "workflow_uses": [
+              27
             ]
           }
         },
@@ -2334,6 +5316,36 @@
             "github_origin": [
               66,
               99
+            ],
+            "actions_context": [
+              32
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/scripts/env-lint-locations-evidence.json",
+          "categories": {
+            "github_origin": [
+              7
+            ],
+            "org_slug": [
+              5,
+              7
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/scripts/publication_capacity_fixture.json",
+          "categories": {
+            "github_origin": [
+              4
+            ],
+            "org_slug": [
+              4
+            ],
+            "actions_context": [
+              17,
+              31
             ]
           }
         },
@@ -2341,15 +5353,29 @@
           "path": "tauceti_tools/assets/roadmap/.github/workflows/ci.yml",
           "categories": {
             "workflow_event": [
+              3,
+              5,
               6
+            ],
+            "workflow_uses": [
+              13,
+              17
             ]
           }
         },
         {
           "path": "tauceti_tools/assets/roadmap/.github/workflows/progress-announce.yml",
           "categories": {
+            "org_slug": [
+              27
+            ],
             "workflow_event": [
+              5,
+              11,
               19
+            ],
+            "workflow_uses": [
+              27
             ]
           }
         },
@@ -2363,12 +5389,43 @@
             "credentials": [
               54
             ],
+            "org_slug": [
+              130
+            ],
+            "actions_context": [
+              54,
+              55,
+              56,
+              57,
+              60,
+              62,
+              72,
+              73,
+              78,
+              80,
+              82,
+              116
+            ],
             "workflow_event": [
               11,
               20,
+              23,
+              24,
+              26,
+              28,
               31,
+              60,
+              62,
               66,
-              81
+              72,
+              80,
+              81,
+              83,
+              88,
+              91
+            ],
+            "workflow_uses": [
+              130
             ]
           }
         },
@@ -2377,6 +5434,14 @@
           "categories": {
             "workflow_event": [
               32
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/bors_observation.py",
+          "categories": {
+            "org_slug": [
+              7
             ]
           }
         },
@@ -2402,6 +5467,69 @@
               55,
               335,
               427
+            ],
+            "org_slug": [
+              38
+            ],
+            "actions_context": [
+              478,
+              479
+            ],
+            "workflow_event": [
+              116,
+              273,
+              274,
+              294,
+              295,
+              349,
+              401
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/bump_manifest_fixtures/base.json",
+          "categories": {
+            "github_origin": [
+              4,
+              14,
+              24,
+              34,
+              44,
+              54,
+              64,
+              74,
+              84
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/bump_manifest_fixtures/mathlib.json",
+          "categories": {
+            "github_origin": [
+              4,
+              14,
+              24,
+              34,
+              44,
+              54,
+              64,
+              74
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/bump_manifest_fixtures/pr.json",
+          "categories": {
+            "github_origin": [
+              4,
+              14,
+              24,
+              34,
+              44,
+              54,
+              64,
+              74,
+              84
             ]
           }
         },
@@ -2416,6 +5544,12 @@
             ],
             "source_identity": [
               66
+            ],
+            "org_slug": [
+              14
+            ],
+            "actions_context": [
+              192
             ],
             "workflow_event": [
               86,
@@ -2440,6 +5574,18 @@
             ],
             "source_identity": [
               84
+            ],
+            "org_slug": [
+              84
+            ],
+            "workflow_event": [
+              21,
+              156,
+              158,
+              170,
+              171,
+              174,
+              175
             ]
           }
         },
@@ -2449,6 +5595,13 @@
             "github_origin": [
               377,
               455
+            ],
+            "org_slug": [
+              377,
+              455
+            ],
+            "workflow_event": [
+              217
             ]
           }
         },
@@ -2465,6 +5618,14 @@
           }
         },
         {
+          "path": "tauceti_tools/assets/scripts/ci_live_progress.py",
+          "categories": {
+            "github_origin": [
+              168
+            ]
+          }
+        },
+        {
           "path": "tauceti_tools/assets/scripts/ci_live_summary.py",
           "categories": {
             "github_origin": [
@@ -2473,6 +5634,10 @@
             ],
             "credentials": [
               152
+            ],
+            "org_slug": [
+              151,
+              171
             ]
           }
         },
@@ -2483,7 +5648,13 @@
               51,
               90
             ],
+            "actions_context": [
+              176
+            ],
             "workflow_event": [
+              71,
+              79,
+              80,
               116
             ]
           }
@@ -2498,6 +5669,11 @@
             "gh_cli": [
               360
             ],
+            "org_slug": [
+              6,
+              360,
+              369
+            ],
             "workflow_event": [
               98
             ]
@@ -2509,6 +5685,9 @@
             "github_origin": [
               66,
               99
+            ],
+            "actions_context": [
+              32
             ]
           }
         },
@@ -2520,6 +5699,18 @@
             ],
             "source_identity": [
               31
+            ],
+            "org_slug": [
+              26,
+              31
+            ],
+            "workflow_event": [
+              6,
+              13,
+              80,
+              83,
+              86,
+              88
             ]
           }
         },
@@ -2528,7 +5719,10 @@
           "categories": {
             "gh_cli": [
               52,
-              59
+              59,
+              91,
+              175,
+              182
             ],
             "credentials": [
               27,
@@ -2536,6 +5730,25 @@
               52,
               91,
               192
+            ],
+            "org_slug": [
+              6,
+              41
+            ],
+            "workflow_event": [
+              6,
+              115,
+              141,
+              149
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/compare-build-outputs.py",
+          "categories": {
+            "actions_context": [
+              24,
+              114
             ]
           }
         },
@@ -2543,6 +5756,13 @@
           "path": "tauceti_tools/assets/scripts/dependency-warming.md",
           "categories": {
             "gh_cli": [
+              39,
+              40,
+              41,
+              42,
+              46
+            ],
+            "org_slug": [
               39,
               40,
               41,
@@ -2560,6 +5780,32 @@
             ],
             "graphql": [
               159
+            ],
+            "org_slug": [
+              240
+            ],
+            "workflow_uses": [
+              205
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/env-lint-locations-evidence.json",
+          "categories": {
+            "github_origin": [
+              7
+            ],
+            "org_slug": [
+              5,
+              7
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/env-lint-locations.md",
+          "categories": {
+            "org_slug": [
+              3
             ]
           }
         },
@@ -2570,6 +5816,9 @@
               27,
               221,
               255
+            ],
+            "actions_context": [
+              66
             ]
           }
         },
@@ -2577,6 +5826,11 @@
           "path": "tauceti_tools/assets/scripts/fleet_recovery.py",
           "categories": {
             "github_origin": [
+              218
+            ],
+            "org_slug": [
+              34,
+              46,
               218
             ],
             "workflow_event": [
@@ -2595,6 +5849,19 @@
             ],
             "credentials": [
               392
+            ],
+            "org_slug": [
+              106
+            ],
+            "actions_context": [
+              124,
+              384,
+              467,
+              476
+            ],
+            "workflow_event": [
+              264,
+              265
             ],
             "shared_state": [
               148,
@@ -2645,6 +5912,15 @@
               245,
               246,
               251
+            ],
+            "actions_context": [
+              36,
+              96,
+              140,
+              144,
+              202,
+              246,
+              251
             ]
           }
         },
@@ -2671,6 +5947,9 @@
             ],
             "credentials": [
               38
+            ],
+            "actions_context": [
+              38
             ]
           }
         },
@@ -2679,11 +5958,22 @@
           "categories": {
             "gh_cli": [
               126,
+              142,
               194,
-              212
+              202,
+              212,
+              239,
+              247,
+              265,
+              290,
+              322,
+              334
             ],
             "credentials": [
               54
+            ],
+            "workflow_event": [
+              233
             ]
           }
         },
@@ -2693,6 +5983,18 @@
             "github_origin": [
               37,
               38
+            ],
+            "org_slug": [
+              38,
+              100
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/lake-cache-services.sh",
+          "categories": {
+            "workflow_event": [
+              6
             ]
           }
         },
@@ -2700,6 +6002,9 @@
           "path": "tauceti_tools/assets/scripts/lake_cache_probe.py",
           "categories": {
             "source_identity": [
+              29
+            ],
+            "org_slug": [
               29
             ]
           }
@@ -2710,6 +6015,15 @@
             "github_origin": [
               12,
               13
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/lint-env.sh",
+          "categories": {
+            "workflow_event": [
+              356,
+              384
             ]
           }
         },
@@ -2753,15 +6067,30 @@
             ],
             "credentials": [
               19
+            ],
+            "org_slug": [
+              336
+            ],
+            "workflow_event": [
+              191
             ]
           }
         },
         {
           "path": "tauceti_tools/assets/scripts/maintenance_builds.py",
           "categories": {
+            "org_slug": [
+              15
+            ],
             "workflow_event": [
               43,
-              49
+              44,
+              46,
+              49,
+              52,
+              53,
+              89,
+              92
             ]
           }
         },
@@ -2775,6 +6104,12 @@
             ],
             "gh_cli": [
               64
+            ],
+            "org_slug": [
+              26,
+              27,
+              28,
+              29
             ]
           }
         },
@@ -2787,6 +6122,22 @@
           }
         },
         {
+          "path": "tauceti_tools/assets/scripts/pipeline_health.py",
+          "categories": {
+            "org_slug": [
+              772
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/pr_lifecycle.py",
+          "categories": {
+            "workflow_event": [
+              19
+            ]
+          }
+        },
+        {
           "path": "tauceti_tools/assets/scripts/pr_stats_graphs.md",
           "categories": {
             "graphql": [
@@ -2794,6 +6145,13 @@
             ],
             "credentials": [
               12
+            ],
+            "org_slug": [
+              8,
+              73
+            ],
+            "actions_context": [
+              13
             ]
           }
         },
@@ -2814,6 +6172,13 @@
             "gh_cli": [
               178,
               198
+            ],
+            "org_slug": [
+              1688
+            ],
+            "workflow_event": [
+              167,
+              590
             ]
           }
         },
@@ -2821,6 +6186,9 @@
           "path": "tauceti_tools/assets/scripts/pr_status/batch.py",
           "categories": {
             "workflow_event": [
+              122,
+              130,
+              158,
               166,
               167,
               175,
@@ -2838,14 +6206,25 @@
             "gh_cli": [
               117,
               206,
-              211
+              211,
+              238,
+              253,
+              255
             ],
             "credentials": [
               59
             ],
+            "org_slug": [
+              58
+            ],
+            "actions_context": [
+              59
+            ],
             "workflow_event": [
               6,
-              7
+              7,
+              78,
+              88
             ]
           }
         },
@@ -2866,11 +6245,23 @@
               55,
               78
             ],
+            "org_slug": [
+              27,
+              43,
+              44
+            ],
+            "actions_context": [
+              55,
+              273
+            ],
             "workflow_event": [
+              249,
+              273,
               275,
               307,
               334,
               357,
+              368,
               467
             ]
           }
@@ -2927,9 +6318,30 @@
             "credentials": [
               102
             ],
+            "org_slug": [
+              101
+            ],
+            "actions_context": [
+              102
+            ],
             "workflow_event": [
+              47,
               406,
-              739
+              422,
+              448,
+              519,
+              658,
+              685,
+              739,
+              740,
+              742,
+              743,
+              759,
+              802,
+              804,
+              831,
+              850,
+              852
             ]
           }
         },
@@ -2955,6 +6367,12 @@
             ],
             "credentials": [
               62
+            ],
+            "org_slug": [
+              61
+            ],
+            "actions_context": [
+              62
             ]
           }
         },
@@ -2969,9 +6387,20 @@
           }
         },
         {
+          "path": "tauceti_tools/assets/scripts/prepare_pr_integration.py",
+          "categories": {
+            "actions_context": [
+              242
+            ]
+          }
+        },
+        {
           "path": "tauceti_tools/assets/scripts/probe_dependency_sandbox.sh",
           "categories": {
             "credentials": [
+              28
+            ],
+            "actions_context": [
               28
             ]
           }
@@ -2986,6 +6415,30 @@
               104,
               105,
               107
+            ],
+            "org_slug": [
+              50,
+              104,
+              105,
+              107
+            ],
+            "actions_context": [
+              9
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/publication_capacity_fixture.json",
+          "categories": {
+            "github_origin": [
+              4
+            ],
+            "org_slug": [
+              4
+            ],
+            "actions_context": [
+              17,
+              31
             ]
           }
         },
@@ -2997,6 +6450,17 @@
             ],
             "gh_cli": [
               14
+            ],
+            "actions_context": [
+              52
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/repair-cache-get.sh",
+          "categories": {
+            "org_slug": [
+              195
             ]
           }
         },
@@ -3029,6 +6493,10 @@
               19,
               20
             ],
+            "actions_context": [
+              12,
+              20
+            ],
             "workflow_event": [
               22
             ]
@@ -3042,6 +6510,14 @@
             ],
             "credentials": [
               40
+            ],
+            "org_slug": [
+              29,
+              289,
+              559
+            ],
+            "workflow_event": [
+              509
             ]
           }
         },
@@ -3055,6 +6531,9 @@
             "gh_cli": [
               603,
               629
+            ],
+            "org_slug": [
+              756
             ]
           }
         },
@@ -3062,7 +6541,9 @@
           "path": "tauceti_tools/assets/scripts/stack-policy.md",
           "categories": {
             "workflow_event": [
-              57
+              57,
+              206,
+              245
             ]
           }
         },
@@ -3091,8 +6572,19 @@
             "credentials": [
               92
             ],
+            "org_slug": [
+              27
+            ],
             "workflow_event": [
-              200
+              191,
+              200,
+              270,
+              271,
+              272,
+              277,
+              282,
+              756,
+              1070
             ]
           }
         },
@@ -3101,6 +6593,10 @@
           "categories": {
             "github_origin": [
               49
+            ],
+            "org_slug": [
+              49,
+              247
             ]
           }
         },
@@ -3110,6 +6606,14 @@
             "github_origin": [
               52,
               53
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/toolchain_snapshot.py",
+          "categories": {
+            "org_slug": [
+              18
             ]
           }
         },
@@ -3128,6 +6632,19 @@
             ],
             "credentials": [
               49
+            ],
+            "org_slug": [
+              50,
+              75
+            ],
+            "actions_context": [
+              49
+            ],
+            "workflow_event": [
+              136,
+              208,
+              641,
+              643
             ]
           }
         },
@@ -3136,6 +6653,13 @@
           "categories": {
             "gh_cli": [
               61
+            ],
+            "org_slug": [
+              54
+            ],
+            "workflow_event": [
+              66,
+              72
             ]
           }
         },
@@ -3144,6 +6668,9 @@
           "categories": {
             "gh_cli": [
               190
+            ],
+            "org_slug": [
+              71
             ],
             "workflow_event": [
               33,
@@ -3167,6 +6694,13 @@
           "path": "tauceti_tools/collector/build_db.py",
           "categories": {
             "workflow_event": [
+              25,
+              27,
+              174,
+              176,
+              182,
+              192,
+              202,
               230
             ]
           }
@@ -3176,6 +6710,11 @@
           "categories": {
             "github_origin": [
               24
+            ],
+            "workflow_event": [
+              32,
+              44,
+              46
             ]
           }
         },
@@ -3186,11 +6725,19 @@
               31,
               32
             ],
+            "org_slug": [
+              31,
+              32
+            ],
             "workflow_event": [
               81,
               83,
+              85,
+              86,
               87,
               89,
+              148,
+              149,
               220
             ]
           }
@@ -3207,6 +6754,9 @@
             "credentials": [
               1,
               24
+            ],
+            "actions_context": [
+              24
             ]
           }
         },
@@ -3215,6 +6765,18 @@
           "categories": {
             "source_identity": [
               628
+            ],
+            "workflow_event": [
+              123,
+              124,
+              129,
+              149,
+              241,
+              246,
+              261,
+              618,
+              631,
+              635
             ]
           }
         },
@@ -3235,6 +6797,11 @@
               25,
               26,
               29
+            ],
+            "org_slug": [
+              9,
+              11,
+              25
             ]
           }
         },
@@ -3243,6 +6810,12 @@
           "categories": {
             "source_identity": [
               51
+            ],
+            "org_slug": [
+              51
+            ],
+            "workflow_event": [
+              64
             ]
           }
         },
@@ -3251,6 +6824,13 @@
           "categories": {
             "source_identity": [
               24,
+              114,
+              134
+            ],
+            "org_slug": [
+              24,
+              53,
+              54,
               114,
               134
             ],
@@ -3271,7 +6851,8 @@
               72
             ],
             "gh_cli": [
-              38
+              38,
+              74
             ]
           }
         },
@@ -3287,8 +6868,22 @@
             "source_identity": [
               204
             ],
+            "org_slug": [
+              155
+            ],
             "workflow_event": [
+              14,
+              23,
+              27,
+              34,
+              47,
+              48,
+              49,
               51,
+              52,
+              53,
+              55,
+              57,
               59
             ],
             "shared_state": [
@@ -3402,9 +6997,32 @@
               1077,
               1081
             ],
+            "org_slug": [
+              915,
+              963,
+              980,
+              997,
+              1288,
+              1300
+            ],
+            "actions_context": [
+              134,
+              537,
+              1191
+            ],
             "workflow_event": [
               325,
-              328
+              328,
+              512,
+              654,
+              656,
+              666,
+              677,
+              701,
+              734,
+              742,
+              747,
+              1212
             ],
             "shared_state": [
               909,
@@ -3436,12 +7054,25 @@
           }
         },
         {
+          "path": "tauceti_tools/github_catalog.json",
+          "categories": {
+            "workflow_event": [
+              10,
+              14,
+              15
+            ]
+          }
+        },
+        {
           "path": "tauceti_tools/github_state_setup.py",
           "categories": {
             "github_origin": [
               30
             ],
             "gh_cli": [
+              75
+            ],
+            "org_slug": [
               75
             ],
             "shared_state": [
@@ -3469,6 +7100,12 @@
               34,
               36,
               37
+            ],
+            "org_slug": [
+              23
+            ],
+            "workflow_event": [
+              30
             ]
           }
         },
@@ -3487,6 +7124,14 @@
               136,
               172
             ],
+            "org_slug": [
+              27,
+              28,
+              124,
+              138,
+              139,
+              157
+            ],
             "shared_state": [
               123,
               124,
@@ -3498,13 +7143,23 @@
           "path": "tauceti_tools/scaffold.py",
           "categories": {
             "github_origin": [
-              44
+              44,
+              94,
+              105
             ],
             "gh_cli": [
               47
             ],
             "source_identity": [
               93
+            ],
+            "org_slug": [
+              30,
+              47,
+              49,
+              52,
+              55,
+              86
             ],
             "shared_state": [
               85,
@@ -3526,6 +7181,7 @@
           "path": "tauceti_tools/templates.py",
           "categories": {
             "github_origin": [
+              174,
               533,
               546,
               575
@@ -3544,6 +7200,34 @@
             ],
             "source_identity": [
               168
+            ],
+            "org_slug": [
+              157,
+              158,
+              159,
+              160,
+              161,
+              162
+            ],
+            "actions_context": [
+              21,
+              135,
+              548,
+              589
+            ],
+            "workflow_event": [
+              516,
+              523,
+              541,
+              544,
+              550
+            ],
+            "workflow_uses": [
+              442,
+              451,
+              461,
+              593,
+              610
             ]
           }
         },
@@ -3558,19 +7242,23 @@
             ]
           }
         }
-      ]
+      ],
+      "skipped": []
     },
     {
       "repository": "TauCetiFleet",
       "source_revision": "6bdeb3184caad241a88e2ee51b3ef5b4add0ab2b",
       "canonical_shared_assets": false,
       "counts": {
-        "github_origin": 8,
+        "github_origin": 11,
         "graphql": 0,
         "gh_cli": 3,
         "credentials": 10,
         "source_identity": 1,
-        "workflow_event": 5,
+        "org_slug": 15,
+        "actions_context": 6,
+        "workflow_event": 13,
+        "workflow_uses": 1,
         "shared_state": 4
       },
       "files": [
@@ -3578,7 +7266,44 @@
           "path": ".github/workflows/ci-broker-health.yml",
           "categories": {
             "workflow_event": [
+              3,
               5
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/ci.yml",
+          "categories": {
+            "actions_context": [
+              9,
+              25
+            ],
+            "workflow_event": [
+              2
+            ],
+            "workflow_uses": [
+              14,
+              15,
+              30,
+              31
+            ]
+          }
+        },
+        {
+          "path": "experiments/worker_capacity_20261018.py",
+          "categories": {
+            "org_slug": [
+              42
+            ]
+          }
+        },
+        {
+          "path": "services/ci-broker/package-lock.json",
+          "categories": {
+            "github_origin": [
+              1232,
+              1280,
+              1455
             ]
           }
         },
@@ -3603,6 +7328,105 @@
             ],
             "source_identity": [
               105
+            ],
+            "org_slug": [
+              96,
+              97,
+              99,
+              100,
+              101,
+              190
+            ]
+          }
+        },
+        {
+          "path": "services/ci-broker/src/capacity.mjs",
+          "categories": {
+            "workflow_event": [
+              28,
+              29
+            ]
+          }
+        },
+        {
+          "path": "services/ci-broker/src/github.mjs",
+          "categories": {
+            "github_origin": [
+              16
+            ],
+            "org_slug": [
+              49,
+              65,
+              66,
+              67
+            ],
+            "workflow_event": [
+              57
+            ]
+          }
+        },
+        {
+          "path": "services/ci-broker/src/index.mjs",
+          "categories": {
+            "github_origin": [
+              33,
+              109,
+              122
+            ],
+            "org_slug": [
+              33,
+              367
+            ],
+            "actions_context": [
+              264
+            ],
+            "workflow_event": [
+              78,
+              268,
+              292,
+              335,
+              392
+            ]
+          }
+        },
+        {
+          "path": "services/ci-broker/src/monitoring.mjs",
+          "categories": {
+            "workflow_event": [
+              17
+            ]
+          }
+        },
+        {
+          "path": "services/ci-broker/src/recovery.mjs",
+          "categories": {
+            "org_slug": [
+              52,
+              55
+            ],
+            "actions_context": [
+              48
+            ],
+            "workflow_event": [
+              24,
+              85
+            ]
+          }
+        },
+        {
+          "path": "services/ci-broker/src/suspension.mjs",
+          "categories": {
+            "org_slug": [
+              17
+            ],
+            "actions_context": [
+              12
+            ],
+            "workflow_event": [
+              21,
+              28,
+              36,
+              37
             ]
           }
         },
@@ -3614,6 +7438,9 @@
             ],
             "credentials": [
               58
+            ],
+            "org_slug": [
+              73
             ]
           }
         },
@@ -3640,6 +7467,11 @@
               199,
               208
             ],
+            "org_slug": [
+              130,
+              199,
+              207
+            ],
             "workflow_event": [
               132
             ]
@@ -3662,6 +7494,9 @@
               228,
               358
             ],
+            "org_slug": [
+              16
+            ],
             "workflow_event": [
               321
             ]
@@ -3678,6 +7513,15 @@
               185,
               194,
               249
+            ],
+            "org_slug": [
+              21
+            ],
+            "actions_context": [
+              254
+            ],
+            "workflow_event": [
+              168
             ],
             "shared_state": [
               107,
@@ -3699,6 +7543,10 @@
         {
           "path": "tauceti_fleet/ci_priority.py",
           "categories": {
+            "org_slug": [
+              89,
+              95
+            ],
             "workflow_event": [
               92
             ]
@@ -3716,6 +7564,15 @@
               109,
               148,
               162
+            ],
+            "org_slug": [
+              51,
+              81,
+              84,
+              85,
+              107,
+              147,
+              157
             ]
           }
         },
@@ -3728,8 +7585,16 @@
               285,
               356
             ],
+            "org_slug": [
+              573,
+              590
+            ],
+            "actions_context": [
+              833
+            ],
             "workflow_event": [
-              593
+              593,
+              714
             ],
             "shared_state": [
               105,
@@ -3771,6 +7636,9 @@
             "credentials": [
               74,
               91
+            ],
+            "org_slug": [
+              136
             ]
           }
         },
@@ -3778,6 +7646,9 @@
           "path": "tauceti_fleet/update.py",
           "categories": {
             "github_origin": [
+              54
+            ],
+            "org_slug": [
               54
             ]
           }
@@ -3790,7 +7661,8 @@
             ]
           }
         }
-      ]
+      ],
+      "skipped": []
     },
     {
       "repository": "TauCetiReview",
@@ -3799,10 +7671,13 @@
       "counts": {
         "github_origin": 8,
         "graphql": 6,
-        "gh_cli": 12,
+        "gh_cli": 14,
         "credentials": 9,
         "source_identity": 6,
-        "workflow_event": 5,
+        "org_slug": 14,
+        "actions_context": 8,
+        "workflow_event": 12,
+        "workflow_uses": 5,
         "shared_state": 0
       },
       "files": [
@@ -3843,8 +7718,46 @@
               199,
               344
             ],
+            "org_slug": [
+              19,
+              42,
+              60
+            ],
+            "actions_context": [
+              42,
+              81,
+              82,
+              95,
+              97,
+              99,
+              101,
+              110,
+              113,
+              116,
+              127,
+              132,
+              146,
+              159,
+              171,
+              185,
+              193,
+              200,
+              204,
+              239,
+              242,
+              291,
+              345
+            ],
             "workflow_event": [
-              307
+              17,
+              307,
+              313
+            ],
+            "workflow_uses": [
+              58,
+              71,
+              79,
+              167
             ]
           }
         },
@@ -3859,6 +7772,32 @@
               124,
               125,
               143
+            ],
+            "org_slug": [
+              18,
+              45,
+              59
+            ],
+            "actions_context": [
+              45,
+              87,
+              88,
+              106,
+              124,
+              125,
+              130,
+              143
+            ],
+            "workflow_event": [
+              16
+            ],
+            "workflow_uses": [
+              57,
+              77,
+              85,
+              102,
+              119,
+              138
             ]
           }
         },
@@ -3883,6 +7822,8 @@
               148,
               157,
               163,
+              331,
+              333,
               337,
               341,
               367,
@@ -3913,9 +7854,62 @@
               386,
               389
             ],
+            "org_slug": [
+              6,
+              21,
+              56,
+              110,
+              170,
+              364,
+              389
+            ],
+            "actions_context": [
+              78,
+              79,
+              115,
+              117,
+              121,
+              123,
+              135,
+              141,
+              144,
+              151,
+              157,
+              163,
+              192,
+              200,
+              205,
+              211,
+              221,
+              277,
+              296,
+              309,
+              328,
+              355,
+              381,
+              408,
+              419
+            ],
             "workflow_event": [
+              4,
               19,
-              270
+              270,
+              397
+            ],
+            "workflow_uses": [
+              54,
+              57,
+              68,
+              76,
+              93,
+              108,
+              188,
+              209,
+              230,
+              292,
+              351,
+              377,
+              404
             ]
           }
         },
@@ -3938,8 +7932,37 @@
               63,
               155
             ],
+            "org_slug": [
+              39,
+              48
+            ],
+            "actions_context": [
+              49,
+              58,
+              63,
+              65,
+              67,
+              69,
+              79,
+              83,
+              85,
+              91,
+              100,
+              140,
+              159,
+              169
+            ],
             "workflow_event": [
               8
+            ],
+            "workflow_uses": [
+              37,
+              46,
+              56,
+              89,
+              108,
+              155,
+              174
             ]
           }
         },
@@ -3948,6 +7971,21 @@
           "categories": {
             "github_origin": [
               21
+            ],
+            "org_slug": [
+              13,
+              21
+            ],
+            "actions_context": [
+              13
+            ],
+            "workflow_event": [
+              4,
+              6
+            ],
+            "workflow_uses": [
+              15,
+              16
             ]
           }
         },
@@ -3955,6 +7993,9 @@
           "path": "pyproject.toml",
           "categories": {
             "github_origin": [
+              9
+            ],
+            "org_slug": [
               9
             ]
           }
@@ -3995,6 +8036,24 @@
             "github_origin": [
               207,
               241
+            ],
+            "org_slug": [
+              6,
+              30
+            ],
+            "workflow_event": [
+              6,
+              7,
+              133,
+              142,
+              199,
+              203,
+              243,
+              244,
+              247,
+              248,
+              249,
+              255
             ]
           }
         },
@@ -4007,11 +8066,18 @@
               90
             ],
             "gh_cli": [
-              31
+              31,
+              47
             ],
             "source_identity": [
               22,
               121
+            ],
+            "org_slug": [
+              22
+            ],
+            "actions_context": [
+              208
             ]
           }
         },
@@ -4052,9 +8118,23 @@
             "source_identity": [
               60
             ],
+            "org_slug": [
+              59,
+              60,
+              61,
+              718,
+              1069,
+              1070
+            ],
             "workflow_event": [
               468,
-              858
+              658,
+              664,
+              669,
+              844,
+              858,
+              1065,
+              1067
             ]
           }
         },
@@ -4062,7 +8142,37 @@
           "path": "runner/costs.py",
           "categories": {
             "gh_cli": [
-              470
+              470,
+              680
+            ],
+            "org_slug": [
+              64,
+              302
+            ]
+          }
+        },
+        {
+          "path": "runner/direct_merge.py",
+          "categories": {
+            "gh_cli": [
+              20
+            ]
+          }
+        },
+        {
+          "path": "runner/eligibility.py",
+          "categories": {
+            "gh_cli": [
+              43,
+              52,
+              57,
+              72,
+              79,
+              82
+            ],
+            "workflow_event": [
+              60,
+              62
             ]
           }
         },
@@ -4073,6 +8183,9 @@
               62
             ],
             "source_identity": [
+              74
+            ],
+            "org_slug": [
               74
             ]
           }
@@ -4102,6 +8215,13 @@
               195,
               525,
               526
+            ],
+            "actions_context": [
+              195,
+              209
+            ],
+            "workflow_event": [
+              443
             ]
           }
         },
@@ -4119,6 +8239,12 @@
               300
             ],
             "credentials": [
+              64
+            ],
+            "org_slug": [
+              36
+            ],
+            "actions_context": [
               64
             ]
           }
@@ -4138,6 +8264,12 @@
               76,
               77,
               86
+            ],
+            "org_slug": [
+              73
+            ],
+            "workflow_event": [
+              124
             ]
           }
         },
@@ -4146,6 +8278,14 @@
           "categories": {
             "source_identity": [
               557
+            ],
+            "org_slug": [
+              557,
+              588
+            ],
+            "workflow_event": [
+              989,
+              1036
             ]
           }
         },
@@ -4164,17 +8304,58 @@
               104,
               118,
               119,
-              874
+              284,
+              314,
+              340,
+              371,
+              382,
+              384,
+              386,
+              423,
+              430,
+              433,
+              462,
+              483,
+              502,
+              507,
+              509,
+              511,
+              540,
+              562,
+              689,
+              694,
+              743,
+              748,
+              750,
+              857,
+              863,
+              874,
+              877,
+              906,
+              908
             ],
             "credentials": [
               41
             ],
             "workflow_event": [
-              21
+              4,
+              7,
+              10,
+              21,
+              95,
+              99,
+              153,
+              154,
+              175,
+              422,
+              456,
+              520,
+              922
             ]
           }
         }
-      ]
+      ],
+      "skipped": []
     },
     {
       "repository": "TauCetiProgress",
@@ -4183,10 +8364,13 @@
       "counts": {
         "github_origin": 6,
         "graphql": 3,
-        "gh_cli": 5,
+        "gh_cli": 6,
         "credentials": 2,
         "source_identity": 2,
-        "workflow_event": 3,
+        "org_slug": 10,
+        "actions_context": 3,
+        "workflow_event": 11,
+        "workflow_uses": 5,
         "shared_state": 0
       },
       "files": [
@@ -4211,6 +8395,46 @@
             ],
             "source_identity": [
               53
+            ],
+            "org_slug": [
+              53
+            ],
+            "workflow_event": [
+              10,
+              108,
+              408,
+              410,
+              412,
+              418,
+              444,
+              448
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/announce.yml",
+          "categories": {
+            "org_slug": [
+              23,
+              69
+            ],
+            "actions_context": [
+              59,
+              114,
+              140
+            ],
+            "workflow_event": [
+              10,
+              19,
+              96,
+              110,
+              113
+            ],
+            "workflow_uses": [
+              31,
+              67,
+              76,
+              99
             ]
           }
         },
@@ -4249,6 +8473,39 @@
               271,
               397,
               453
+            ],
+            "org_slug": [
+              34,
+              115
+            ],
+            "actions_context": [
+              17,
+              148,
+              150,
+              164,
+              177,
+              183,
+              187,
+              194,
+              210,
+              212,
+              241,
+              242,
+              273,
+              380,
+              384,
+              399,
+              455
+            ],
+            "workflow_event": [
+              22,
+              30
+            ],
+            "workflow_uses": [
+              46,
+              113,
+              122,
+              237
             ]
           }
         },
@@ -4256,7 +8513,12 @@
           "path": ".github/workflows/tests.yml",
           "categories": {
             "workflow_event": [
+              7,
+              9,
               10
+            ],
+            "workflow_uses": [
+              19
             ]
           }
         },
@@ -4264,6 +8526,9 @@
           "path": "progress/announce.py",
           "categories": {
             "github_origin": [
+              60
+            ],
+            "org_slug": [
               60
             ]
           }
@@ -4279,7 +8544,44 @@
               165
             ],
             "gh_cli": [
-              10
+              10,
+              112,
+              165,
+              300,
+              302,
+              363
+            ],
+            "org_slug": [
+              98
+            ],
+            "workflow_event": [
+              10,
+              15,
+              55,
+              118,
+              346,
+              352,
+              354,
+              361,
+              363,
+              390,
+              398,
+              453,
+              584,
+              585,
+              593,
+              596,
+              598,
+              603,
+              605
+            ]
+          }
+        },
+        {
+          "path": "progress/cli.py",
+          "categories": {
+            "workflow_event": [
+              228
             ]
           }
         },
@@ -4287,6 +8589,9 @@
           "path": "progress/files.py",
           "categories": {
             "github_origin": [
+              91
+            ],
+            "org_slug": [
               91
             ]
           }
@@ -4296,6 +8601,22 @@
           "categories": {
             "graphql": [
               42
+            ],
+            "workflow_event": [
+              103
+            ]
+          }
+        },
+        {
+          "path": "progress/gate.py",
+          "categories": {
+            "workflow_event": [
+              353,
+              370,
+              385,
+              428,
+              486,
+              555
             ]
           }
         },
@@ -4319,13 +8640,33 @@
               272
             ],
             "gh_cli": [
+              43,
+              74,
               77,
+              87,
+              93,
               125,
               150,
-              203
+              203,
+              350
             ],
             "source_identity": [
               26
+            ],
+            "org_slug": [
+              25,
+              26
+            ]
+          }
+        },
+        {
+          "path": "progress/plan.py",
+          "categories": {
+            "gh_cli": [
+              262
+            ],
+            "workflow_event": [
+              30
             ]
           }
         },
@@ -4334,14 +8675,25 @@
           "categories": {
             "github_origin": [
               10
+            ],
+            "org_slug": [
+              10
             ]
           }
         },
         {
           "path": "roadmap-workflows/progress-announce.yml",
           "categories": {
+            "org_slug": [
+              27
+            ],
             "workflow_event": [
+              5,
+              11,
               19
+            ],
+            "workflow_uses": [
+              27
             ]
           }
         },
@@ -4356,28 +8708,67 @@
             "credentials": [
               54
             ],
+            "org_slug": [
+              158
+            ],
+            "actions_context": [
+              54,
+              55,
+              56,
+              57,
+              60,
+              61,
+              62,
+              64,
+              74,
+              75,
+              80,
+              82,
+              84,
+              144
+            ],
             "workflow_event": [
               11,
               20,
+              23,
+              24,
+              26,
+              28,
               31,
+              60,
+              61,
+              62,
+              64,
               68,
-              83
+              74,
+              82,
+              83,
+              85,
+              90,
+              93
+            ],
+            "workflow_uses": [
+              158
             ]
           }
         }
-      ]
+      ],
+      "skipped": []
     },
     {
       "repository": "TauCetiCI",
       "source_revision": "44dccf74ac2ded451b8060834291dfedfdde5122",
       "canonical_shared_assets": false,
       "counts": {
-        "github_origin": 10,
+        "github_origin": 12,
         "graphql": 0,
         "gh_cli": 4,
         "credentials": 7,
         "source_identity": 0,
-        "workflow_event": 9,
+        "org_slug": 15,
+        "actions_context": 10,
+        "workflow_event": 21,
+        "workflow_uses": 8,
         "shared_state": 0
       },
       "files": [
@@ -4387,8 +8778,47 @@
             "credentials": [
               42
             ],
+            "org_slug": [
+              28
+            ],
+            "actions_context": [
+              38,
+              42,
+              63
+            ],
             "workflow_event": [
-              6
+              6,
+              51
+            ],
+            "workflow_uses": [
+              22,
+              26,
+              35,
+              60
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/benchmark-tests.yml",
+          "categories": {
+            "org_slug": [
+              22,
+              38,
+              44
+            ],
+            "actions_context": [
+              51
+            ],
+            "workflow_event": [
+              3,
+              5
+            ],
+            "workflow_uses": [
+              16,
+              20,
+              28,
+              36,
+              42
             ]
           }
         },
@@ -4399,8 +8829,46 @@
               46,
               64
             ],
+            "org_slug": [
+              34
+            ],
+            "actions_context": [
+              44,
+              53,
+              59,
+              64,
+              87
+            ],
             "workflow_event": [
-              9
+              9,
+              74
+            ],
+            "workflow_uses": [
+              27,
+              32,
+              46,
+              56,
+              84
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/live-ci-tests.yml",
+          "categories": {
+            "org_slug": [
+              22
+            ],
+            "actions_context": [
+              13
+            ],
+            "workflow_event": [
+              3,
+              5
+            ],
+            "workflow_uses": [
+              18,
+              20,
+              28
             ]
           }
         },
@@ -4415,8 +8883,18 @@
             "credentials": [
               40
             ],
+            "org_slug": [
+              25
+            ],
+            "actions_context": [
+              40
+            ],
             "workflow_event": [
               5
+            ],
+            "workflow_uses": [
+              19,
+              23
             ]
           }
         },
@@ -4430,8 +8908,23 @@
               40,
               50
             ],
+            "org_slug": [
+              29
+            ],
+            "actions_context": [
+              39,
+              47,
+              50
+            ],
             "workflow_event": [
-              5
+              5,
+              55,
+              66
+            ],
+            "workflow_uses": [
+              25,
+              27,
+              40
             ]
           }
         },
@@ -4445,8 +8938,85 @@
               35,
               119
             ],
+            "org_slug": [
+              15,
+              27,
+              63,
+              71,
+              77,
+              107,
+              120
+            ],
+            "actions_context": [
+              15,
+              22,
+              35,
+              38,
+              46,
+              58,
+              85,
+              97,
+              102,
+              119,
+              120
+            ],
             "workflow_event": [
               4
+            ],
+            "workflow_uses": [
+              20,
+              25,
+              39,
+              56,
+              61,
+              69,
+              75,
+              89,
+              100,
+              105,
+              113,
+              123
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/tests.yml",
+          "categories": {
+            "org_slug": [
+              19
+            ],
+            "actions_context": [
+              13
+            ],
+            "workflow_event": [
+              3,
+              5
+            ],
+            "workflow_uses": [
+              15,
+              17,
+              25
+            ]
+          }
+        },
+        {
+          "path": "analysis/replay.py",
+          "categories": {
+            "workflow_event": [
+              203
+            ]
+          }
+        },
+        {
+          "path": "analysis/report.py",
+          "categories": {
+            "workflow_event": [
+              72,
+              101,
+              220,
+              223,
+              481,
+              483
             ]
           }
         },
@@ -4456,8 +9026,25 @@
             "gh_cli": [
               174
             ],
-            "workflow_event": [
+            "org_slug": [
               175
+            ],
+            "actions_context": [
+              177
+            ],
+            "workflow_event": [
+              175,
+              176
+            ]
+          }
+        },
+        {
+          "path": "benchmarks/plan.json",
+          "categories": {
+            "org_slug": [
+              3,
+              12,
+              19
             ]
           }
         },
@@ -4469,6 +9056,30 @@
             ],
             "credentials": [
               99
+            ],
+            "actions_context": [
+              99
+            ]
+          }
+        },
+        {
+          "path": "services/live-ci/package-lock.json",
+          "categories": {
+            "github_origin": [
+              1245,
+              1293,
+              1474
+            ]
+          }
+        },
+        {
+          "path": "services/live-ci/scripts/bootstrap.py",
+          "categories": {
+            "org_slug": [
+              183,
+              190,
+              212,
+              337
             ]
           }
         },
@@ -4484,6 +9095,25 @@
             "credentials": [
               73,
               83
+            ],
+            "org_slug": [
+              105,
+              166
+            ]
+          }
+        },
+        {
+          "path": "services/live-ci/src/charts.ts",
+          "categories": {
+            "workflow_event": [
+              99,
+              188,
+              412,
+              413,
+              414,
+              416,
+              417,
+              418
             ]
           }
         },
@@ -4492,6 +9122,17 @@
           "categories": {
             "github_origin": [
               467
+            ],
+            "org_slug": [
+              850,
+              977,
+              1045
+            ],
+            "workflow_event": [
+              693,
+              722,
+              1219,
+              1227
             ]
           }
         },
@@ -4500,6 +9141,9 @@
           "categories": {
             "github_origin": [
               47
+            ],
+            "workflow_event": [
+              83
             ]
           }
         },
@@ -4511,6 +9155,21 @@
               153,
               176,
               203
+            ],
+            "org_slug": [
+              137,
+              153,
+              300,
+              402
+            ],
+            "workflow_event": [
+              35,
+              146,
+              293,
+              294,
+              298,
+              302,
+              331
             ]
           }
         },
@@ -4524,19 +9183,35 @@
               115,
               117,
               124,
-              261
+              185,
+              249,
+              261,
+              455,
+              458,
+              464
             ]
           }
         },
         {
           "path": "services/live-ci/src/oidc.ts",
           "categories": {
+            "github_origin": [
+              71,
+              86
+            ],
+            "org_slug": [
+              18,
+              22
+            ],
             "workflow_event": [
+              20,
+              27,
               38,
               46,
               47,
               48,
-              49
+              49,
+              52
             ]
           }
         },
@@ -4548,6 +9223,7 @@
               89
             ],
             "workflow_event": [
+              79,
               86
             ]
           }
@@ -4563,34 +9239,119 @@
           }
         },
         {
+          "path": "services/live-ci/src/operations.ts",
+          "categories": {
+            "workflow_event": [
+              110,
+              153,
+              658,
+              928,
+              984,
+              1013,
+              1034,
+              1399,
+              1522,
+              1571,
+              1620,
+              1885,
+              1903,
+              1916,
+              1924,
+              2398,
+              2416,
+              2430,
+              2433,
+              2460,
+              2505,
+              2544,
+              2550
+            ]
+          }
+        },
+        {
+          "path": "services/live-ci/src/policy.ts",
+          "categories": {
+            "workflow_event": [
+              27
+            ]
+          }
+        },
+        {
           "path": "services/live-ci/src/storage.ts",
           "categories": {
             "github_origin": [
               513
+            ],
+            "workflow_event": [
+              163,
+              208
             ]
           }
         }
-      ]
+      ],
+      "skipped": []
     },
     {
       "repository": "TauCeti",
       "source_revision": "1b8cb46b5f15ee7b88a66ea05471a460ba2c58d7",
       "canonical_shared_assets": false,
       "counts": {
-        "github_origin": 30,
+        "github_origin": 45,
         "graphql": 4,
-        "gh_cli": 15,
+        "gh_cli": 16,
         "credentials": 27,
         "source_identity": 3,
-        "workflow_event": 28,
+        "org_slug": 51,
+        "actions_context": 37,
+        "workflow_event": 39,
+        "workflow_uses": 35,
         "shared_state": 3
       },
       "files": [
         {
+          "path": ".github/actions/checkout-merge-policy/action.yml",
+          "categories": {
+            "org_slug": [
+              20
+            ],
+            "workflow_uses": [
+              6,
+              18
+            ]
+          }
+        },
+        {
+          "path": ".github/actions/restore-lean-toolchain/action.yml",
+          "categories": {
+            "actions_context": [
+              35,
+              36
+            ],
+            "workflow_uses": [
+              40
+            ]
+          }
+        },
+        {
+          "path": ".github/actions/restore-mathlib-ltars/action.yml",
+          "categories": {
+            "actions_context": [
+              42,
+              45,
+              46,
+              47
+            ],
+            "workflow_uses": [
+              55
+            ]
+          }
+        },
+        {
           "path": ".github/workflows/api-docs.yml",
           "categories": {
             "github_origin": [
-              98
+              98,
+              199
             ],
             "gh_cli": [
               262
@@ -4599,8 +9360,40 @@
               256,
               297
             ],
+            "org_slug": [
+              87,
+              89
+            ],
+            "actions_context": [
+              36,
+              51,
+              131,
+              210,
+              213,
+              256,
+              257,
+              258,
+              259,
+              266,
+              268,
+              278,
+              287,
+              297,
+              298,
+              303
+            ],
             "workflow_event": [
-              29
+              22,
+              27,
+              29,
+              290
+            ],
+            "workflow_uses": [
+              76,
+              87,
+              128,
+              275,
+              284
             ]
           }
         },
@@ -4613,8 +9406,27 @@
             "source_identity": [
               8
             ],
+            "org_slug": [
+              13,
+              33,
+              35
+            ],
+            "actions_context": [
+              2,
+              8,
+              13,
+              14,
+              15,
+              16,
+              26,
+              40
+            ],
             "workflow_event": [
               4
+            ],
+            "workflow_uses": [
+              24,
+              33
             ]
           }
         },
@@ -4624,8 +9436,42 @@
             "credentials": [
               33
             ],
+            "org_slug": [
+              26,
+              28
+            ],
+            "actions_context": [
+              20,
+              33,
+              34
+            ],
             "workflow_event": [
               5
+            ],
+            "workflow_uses": [
+              18,
+              26
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/ci-live-tests.yml",
+          "categories": {
+            "org_slug": [
+              29,
+              31
+            ],
+            "actions_context": [
+              25
+            ],
+            "workflow_event": [
+              3,
+              11
+            ],
+            "workflow_uses": [
+              27,
+              29,
+              36
             ]
           }
         },
@@ -4638,6 +9484,46 @@
             "credentials": [
               63,
               278
+            ],
+            "org_slug": [
+              75,
+              77
+            ],
+            "actions_context": [
+              40,
+              63,
+              170,
+              175,
+              278,
+              279,
+              281,
+              282,
+              327,
+              330,
+              344,
+              346,
+              350,
+              410,
+              411,
+              437
+            ],
+            "workflow_event": [
+              6,
+              69,
+              179,
+              272,
+              275,
+              280,
+              421
+            ],
+            "workflow_uses": [
+              60,
+              75,
+              105,
+              156,
+              172,
+              415,
+              435
             ]
           }
         },
@@ -4648,8 +9534,25 @@
               52,
               70
             ],
+            "org_slug": [
+              3,
+              17,
+              63,
+              65
+            ],
+            "actions_context": [
+              70,
+              72
+            ],
             "workflow_event": [
+              9,
+              22,
               24
+            ],
+            "workflow_uses": [
+              52,
+              60,
+              63
             ]
           }
         },
@@ -4660,8 +9563,36 @@
               79,
               91
             ],
+            "org_slug": [
+              31,
+              46,
+              48
+            ],
+            "actions_context": [
+              26,
+              31,
+              32,
+              38,
+              54,
+              55,
+              67,
+              90,
+              91,
+              92,
+              93,
+              94,
+              103
+            ],
             "workflow_event": [
+              5,
               8
+            ],
+            "workflow_uses": [
+              36,
+              46,
+              72,
+              79,
+              101
             ]
           }
         },
@@ -4671,8 +9602,28 @@
             "credentials": [
               38
             ],
+            "org_slug": [
+              31,
+              33
+            ],
+            "actions_context": [
+              12,
+              16,
+              19,
+              24,
+              38,
+              39,
+              43
+            ],
             "workflow_event": [
-              16
+              3,
+              12,
+              16,
+              43
+            ],
+            "workflow_uses": [
+              22,
+              31
             ]
           }
         },
@@ -4683,6 +9634,12 @@
               22
             ],
             "credentials": [
+              22
+            ],
+            "org_slug": [
+              22
+            ],
+            "actions_context": [
               22
             ],
             "workflow_event": [
@@ -4700,8 +9657,16 @@
             "credentials": [
               23
             ],
+            "actions_context": [
+              18,
+              23,
+              24,
+              25
+            ],
             "workflow_event": [
-              10
+              5,
+              10,
+              25
             ]
           }
         },
@@ -4712,8 +9677,21 @@
               32,
               53
             ],
+            "org_slug": [
+              46,
+              48
+            ],
+            "actions_context": [
+              54
+            ],
             "workflow_event": [
+              17,
               19
+            ],
+            "workflow_uses": [
+              32,
+              43,
+              46
             ]
           }
         },
@@ -4723,6 +9701,36 @@
             "github_origin": [
               95,
               138
+            ],
+            "org_slug": [
+              30,
+              32,
+              62,
+              64,
+              82,
+              84,
+              127,
+              129
+            ],
+            "actions_context": [
+              16,
+              23,
+              75,
+              120
+            ],
+            "workflow_event": [
+              6,
+              9
+            ],
+            "workflow_uses": [
+              26,
+              30,
+              55,
+              62,
+              78,
+              82,
+              123,
+              127
             ]
           }
         },
@@ -4741,6 +9749,7 @@
               262,
               263,
               265,
+              267,
               277
             ],
             "credentials": [
@@ -4748,8 +9757,29 @@
               216,
               229
             ],
+            "org_slug": [
+              57,
+              59
+            ],
+            "actions_context": [
+              49,
+              193,
+              197,
+              199,
+              204,
+              230,
+              233
+            ],
             "workflow_event": [
-              16
+              14,
+              16,
+              124
+            ],
+            "workflow_uses": [
+              47,
+              57,
+              87,
+              216
             ]
           }
         },
@@ -4764,11 +9794,29 @@
               71,
               100
             ],
+            "org_slug": [
+              64,
+              93,
+              95
+            ],
+            "actions_context": [
+              53,
+              64,
+              66,
+              101
+            ],
             "workflow_event": [
               6,
               7,
+              39,
+              41,
               46,
               84
+            ],
+            "workflow_uses": [
+              71,
+              87,
+              93
             ]
           }
         },
@@ -4780,9 +9828,61 @@
               460,
               663
             ],
+            "org_slug": [
+              63,
+              105,
+              107,
+              207,
+              218,
+              245,
+              247,
+              629,
+              663
+            ],
+            "actions_context": [
+              63,
+              74,
+              116,
+              117,
+              207,
+              218,
+              219,
+              491,
+              493,
+              518,
+              519,
+              524,
+              525,
+              527,
+              528,
+              530,
+              531,
+              533,
+              534,
+              605,
+              612,
+              629,
+              651
+            ],
             "workflow_event": [
+              6,
+              39,
               41,
-              291
+              291,
+              628,
+              667
+            ],
+            "workflow_uses": [
+              96,
+              105,
+              136,
+              195,
+              208,
+              238,
+              245,
+              254,
+              468,
+              589
             ]
           }
         },
@@ -4816,8 +9916,80 @@
               390,
               992
             ],
+            "org_slug": [
+              129,
+              131,
+              169,
+              526,
+              528
+            ],
+            "actions_context": [
+              95,
+              140,
+              150,
+              179,
+              231,
+              240,
+              245,
+              277,
+              279,
+              290,
+              304,
+              341,
+              349,
+              373,
+              390,
+              455,
+              457,
+              468,
+              486,
+              568,
+              727,
+              743,
+              777,
+              792,
+              865,
+              902,
+              946,
+              948,
+              983,
+              986,
+              992,
+              994,
+              995
+            ],
             "workflow_event": [
-              52
+              24,
+              26,
+              30,
+              50,
+              52,
+              82,
+              758,
+              947
+            ],
+            "workflow_uses": [
+              108,
+              129,
+              135,
+              182,
+              226,
+              287,
+              300,
+              465,
+              471,
+              512,
+              526,
+              534,
+              565,
+              584,
+              591,
+              740,
+              751,
+              786,
+              806,
+              852,
+              872
             ]
           }
         },
@@ -4826,6 +9998,24 @@
           "categories": {
             "credentials": [
               86
+            ],
+            "org_slug": [
+              78,
+              80
+            ],
+            "actions_context": [
+              30,
+              36,
+              56,
+              71,
+              86
+            ],
+            "workflow_event": [
+              11
+            ],
+            "workflow_uses": [
+              69,
+              78
             ],
             "shared_state": [
               27,
@@ -4859,8 +10049,107 @@
             "source_identity": [
               56
             ],
+            "org_slug": [
+              160,
+              162,
+              167,
+              1312,
+              1540,
+              1674,
+              1676,
+              1681
+            ],
+            "actions_context": [
+              2,
+              53,
+              54,
+              55,
+              56,
+              57,
+              58,
+              59,
+              64,
+              78,
+              79,
+              80,
+              113,
+              154,
+              169,
+              170,
+              171,
+              184,
+              185,
+              186,
+              187,
+              188,
+              190,
+              195,
+              196,
+              201,
+              202,
+              205,
+              206,
+              221,
+              222,
+              223,
+              224,
+              225,
+              227,
+              232,
+              246,
+              250,
+              264,
+              289,
+              290,
+              291,
+              335,
+              338,
+              342,
+              343,
+              344,
+              345,
+              446,
+              478,
+              541,
+              608,
+              968,
+              969,
+              1115,
+              1118,
+              1164,
+              1252,
+              1253,
+              1314,
+              1315,
+              1316,
+              1340,
+              1341,
+              1470,
+              1523,
+              1535,
+              1550,
+              1555,
+              1556,
+              1557,
+              1562,
+              1594,
+              1604,
+              1641,
+              1644,
+              1651,
+              1656,
+              1657,
+              1658,
+              1659,
+              1664,
+              1683,
+              1684,
+              1685,
+              1704
+            ],
             "workflow_event": [
               2,
+              8,
               20,
               21,
               24,
@@ -4873,6 +10162,7 @@
               64,
               78,
               79,
+              80,
               107,
               109,
               113,
@@ -4883,17 +10173,52 @@
               202,
               205,
               221,
+              222,
+              223,
+              224,
+              225,
+              227,
+              289,
+              290,
+              291,
               335,
               342,
               343,
               431,
               432,
               469,
+              954,
+              988,
               1115,
+              1349,
               1550,
               1641,
               1651,
               1656
+            ],
+            "workflow_uses": [
+              76,
+              152,
+              160,
+              167,
+              274,
+              491,
+              502,
+              701,
+              897,
+              1013,
+              1257,
+              1312,
+              1521,
+              1533,
+              1573,
+              1592,
+              1602,
+              1622,
+              1662,
+              1674,
+              1681,
+              1702
             ],
             "shared_state": [
               86
@@ -4912,11 +10237,46 @@
               118,
               146
             ],
+            "org_slug": [
+              32,
+              91,
+              93,
+              110,
+              136,
+              138
+            ],
+            "actions_context": [
+              23,
+              32,
+              33,
+              49,
+              50,
+              56,
+              102,
+              110,
+              111,
+              112,
+              147,
+              148
+            ],
             "workflow_event": [
+              13,
               16,
               33,
               54,
+              111,
               112
+            ],
+            "workflow_uses": [
+              38,
+              71,
+              83,
+              91,
+              97,
+              118,
+              128,
+              136,
+              142
             ]
           }
         },
@@ -4945,6 +10305,71 @@
               703,
               725
             ],
+            "org_slug": [
+              195,
+              197
+            ],
+            "actions_context": [
+              37,
+              38,
+              39,
+              40,
+              42,
+              43,
+              44,
+              74,
+              75,
+              76,
+              77,
+              78,
+              79,
+              80,
+              81,
+              94,
+              95,
+              98,
+              101,
+              103,
+              109,
+              110,
+              111,
+              112,
+              114,
+              117,
+              123,
+              150,
+              155,
+              158,
+              161,
+              165,
+              172,
+              180,
+              187,
+              263,
+              265,
+              269,
+              271,
+              278,
+              285,
+              297,
+              310,
+              312,
+              509,
+              530,
+              539,
+              546,
+              559,
+              601,
+              641,
+              696,
+              703,
+              710,
+              714,
+              716,
+              725,
+              758,
+              760
+            ],
             "workflow_event": [
               19,
               21,
@@ -4954,18 +10379,32 @@
               38,
               39,
               40,
+              42,
               43,
               74,
               75,
               76,
               77,
+              78,
               99,
               101,
               103,
               108,
+              109,
+              110,
+              111,
+              112,
+              114,
               116,
               119,
               123
+            ],
+            "workflow_uses": [
+              185,
+              195,
+              201,
+              209,
+              217
             ]
           }
         },
@@ -4985,14 +10424,60 @@
               132,
               162
             ],
+            "org_slug": [
+              41,
+              97,
+              99
+            ],
+            "actions_context": [
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              48,
+              49,
+              50,
+              51,
+              52,
+              53,
+              55,
+              109,
+              110,
+              132,
+              136,
+              143,
+              149,
+              163,
+              169
+            ],
             "workflow_event": [
+              6,
+              22,
               24,
               25,
+              27,
               30,
               42,
               43,
+              45,
+              46,
               47,
-              50
+              48,
+              49,
+              50,
+              51,
+              116,
+              137,
+              169
+            ],
+            "workflow_uses": [
+              75,
+              89,
+              97,
+              103,
+              179
             ]
           }
         },
@@ -5001,6 +10486,32 @@
           "categories": {
             "github_origin": [
               119
+            ],
+            "org_slug": [
+              89,
+              91,
+              229
+            ],
+            "actions_context": [
+              47,
+              54,
+              77,
+              139,
+              213,
+              239,
+              249,
+              251,
+              273
+            ],
+            "workflow_event": [
+              10
+            ],
+            "workflow_uses": [
+              67,
+              75,
+              89,
+              96,
+              271
             ]
           }
         },
@@ -5012,11 +10523,57 @@
               125,
               168
             ],
-            "workflow_event": [
-              11,
+            "org_slug": [
+              53,
+              55,
+              109,
+              162
+            ],
+            "actions_context": [
+              27,
               28,
               29,
+              31,
+              35,
+              39,
+              40,
+              47,
+              62,
+              63,
+              69,
+              86,
+              98,
+              99,
+              100,
+              111,
+              112,
+              113,
+              144,
+              145,
+              156,
+              168,
+              169
+            ],
+            "workflow_event": [
+              6,
+              9,
+              11,
+              27,
+              28,
+              29,
+              31,
+              39,
+              40,
+              100,
+              144,
               145
+            ],
+            "workflow_uses": [
+              45,
+              53,
+              95,
+              109,
+              160
             ]
           }
         },
@@ -5030,11 +10587,43 @@
             "credentials": [
               35
             ],
-            "workflow_event": [
-              7,
+            "org_slug": [
+              85,
+              88
+            ],
+            "actions_context": [
+              24,
+              25,
               26,
               27,
-              54
+              28,
+              29,
+              35,
+              37,
+              38,
+              39,
+              42,
+              43,
+              61,
+              66,
+              68,
+              70,
+              91
+            ],
+            "workflow_event": [
+              4,
+              7,
+              24,
+              25,
+              26,
+              27,
+              28,
+              54,
+              66,
+              68
+            ],
+            "workflow_uses": [
+              85
             ]
           }
         },
@@ -5055,11 +10644,38 @@
               92,
               106
             ],
+            "org_slug": [
+              32,
+              55,
+              57,
+              62
+            ],
+            "actions_context": [
+              32,
+              33,
+              34,
+              35,
+              36,
+              39,
+              70,
+              71,
+              104,
+              107
+            ],
             "workflow_event": [
               7,
+              10,
               12,
               33,
-              35
+              35,
+              76
+            ],
+            "workflow_uses": [
+              48,
+              55,
+              60,
+              92,
+              136
             ]
           }
         },
@@ -5069,8 +10685,38 @@
             "github_origin": [
               58
             ],
+            "org_slug": [
+              47,
+              49
+            ],
+            "actions_context": [
+              31,
+              225,
+              235,
+              241,
+              246
+            ],
             "workflow_event": [
-              5
+              5,
+              6,
+              18,
+              225,
+              235,
+              241,
+              246
+            ],
+            "workflow_uses": [
+              42,
+              47,
+              257
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/stack-policy-wake.yml",
+          "categories": {
+            "workflow_event": [
+              7
             ]
           }
         },
@@ -5087,17 +10733,54 @@
               89,
               124
             ],
+            "org_slug": [
+              33,
+              43,
+              71,
+              73,
+              104,
+              108
+            ],
+            "actions_context": [
+              33,
+              35,
+              36,
+              37,
+              43,
+              44,
+              45,
+              46,
+              58,
+              61,
+              89,
+              90,
+              125,
+              135,
+              140,
+              143,
+              171
+            ],
             "workflow_event": [
               4,
+              7,
+              10,
               13,
               35,
               44,
               45,
               58,
               61,
+              98,
               106,
               107,
               135
+            ],
+            "workflow_uses": [
+              63,
+              71,
+              76,
+              149,
+              168
             ]
           }
         },
@@ -5107,8 +10790,23 @@
             "credentials": [
               58
             ],
+            "org_slug": [
+              42,
+              50,
+              52
+            ],
+            "actions_context": [
+              42,
+              43,
+              58
+            ],
             "workflow_event": [
+              22,
               24
+            ],
+            "workflow_uses": [
+              46,
+              50
             ]
           }
         },
@@ -5118,10 +10816,32 @@
             "credentials": [
               82
             ],
+            "org_slug": [
+              58,
+              75,
+              77
+            ],
+            "actions_context": [
+              58,
+              59,
+              82,
+              91,
+              92
+            ],
             "workflow_event": [
+              6,
+              7,
+              10,
+              23,
+              28,
               33,
               35,
-              55
+              55,
+              92
+            ],
+            "workflow_uses": [
+              67,
+              75
             ]
           }
         },
@@ -5137,8 +10857,33 @@
               90,
               112
             ],
+            "org_slug": [
+              38,
+              40,
+              61,
+              63,
+              105,
+              107
+            ],
+            "actions_context": [
+              26,
+              45,
+              49,
+              81,
+              87
+            ],
             "workflow_event": [
+              6,
               8
+            ],
+            "workflow_uses": [
+              33,
+              38,
+              56,
+              61,
+              90,
+              99,
+              105
             ]
           }
         },
@@ -5155,9 +10900,40 @@
             "credentials": [
               64
             ],
+            "org_slug": [
+              40,
+              57,
+              59,
+              71,
+              76,
+              78
+            ],
+            "actions_context": [
+              2,
+              35,
+              40,
+              52,
+              64,
+              65,
+              66,
+              90,
+              117
+            ],
             "workflow_event": [
+              2,
+              8,
               11,
-              14
+              14,
+              35,
+              65
+            ],
+            "workflow_uses": [
+              50,
+              57,
+              107,
+              125,
+              132,
+              153
             ]
           }
         },
@@ -5166,14 +10942,41 @@
           "categories": {
             "github_origin": [
               36
+            ],
+            "actions_context": [
+              14,
+              21
+            ],
+            "workflow_event": [
+              4,
+              7
+            ],
+            "workflow_uses": [
+              27,
+              43,
+              49
             ]
           }
         },
         {
           "path": ".github/workflows/zulip-healthcheck.yml",
           "categories": {
+            "org_slug": [
+              24,
+              31,
+              33
+            ],
+            "actions_context": [
+              24
+            ],
             "workflow_event": [
+              3,
+              11,
               13
+            ],
+            "workflow_uses": [
+              27,
+              31
             ]
           }
         },
@@ -5188,8 +10991,23 @@
               58,
               70
             ],
+            "org_slug": [
+              34,
+              51,
+              53,
+              73
+            ],
+            "actions_context": [
+              34,
+              70
+            ],
             "workflow_event": [
               9
+            ],
+            "workflow_uses": [
+              38,
+              47,
+              51
             ]
           }
         },
@@ -5200,6 +11018,58 @@
               9,
               114,
               131
+            ],
+            "org_slug": [
+              9,
+              114,
+              131
+            ],
+            "workflow_event": [
+              116
+            ]
+          }
+        },
+        {
+          "path": "TauCeti/mathlib-shims.json",
+          "categories": {
+            "github_origin": [
+              3,
+              12,
+              61,
+              77,
+              86,
+              95,
+              106,
+              117,
+              128,
+              139,
+              150,
+              161,
+              172,
+              181,
+              190,
+              202
+            ]
+          }
+        },
+        {
+          "path": "docbuild/lake-manifest.json",
+          "categories": {
+            "github_origin": [
+              11,
+              21,
+              31,
+              41,
+              51,
+              61,
+              71,
+              81,
+              91,
+              101,
+              111,
+              121,
+              131,
+              141
             ]
           }
         },
@@ -5220,6 +11090,26 @@
               26,
               30,
               92
+            ],
+            "org_slug": [
+              26,
+              92
+            ]
+          }
+        },
+        {
+          "path": "lake-manifest.json",
+          "categories": {
+            "github_origin": [
+              6,
+              18,
+              30,
+              42,
+              54,
+              66,
+              78,
+              90,
+              102
             ]
           }
         },
@@ -5236,6 +11126,9 @@
           "categories": {
             "github_origin": [
               3
+            ],
+            "org_slug": [
+              3
             ]
           }
         },
@@ -5244,6 +11137,9 @@
           "categories": {
             "github_origin": [
               3
+            ],
+            "org_slug": [
+              3
             ]
           }
         },
@@ -5251,6 +11147,9 @@
           "path": "scripts/build-lint-driver.sh",
           "categories": {
             "github_origin": [
+              3
+            ],
+            "org_slug": [
               3
             ]
           }
@@ -5264,9 +11163,59 @@
           }
         },
         {
+          "path": "scripts/bump_manifest_fixtures/base.json",
+          "categories": {
+            "github_origin": [
+              4,
+              14,
+              24,
+              34,
+              44,
+              54,
+              64,
+              74,
+              84
+            ]
+          }
+        },
+        {
+          "path": "scripts/bump_manifest_fixtures/mathlib.json",
+          "categories": {
+            "github_origin": [
+              4,
+              14,
+              24,
+              34,
+              44,
+              54,
+              64,
+              74
+            ]
+          }
+        },
+        {
+          "path": "scripts/bump_manifest_fixtures/pr.json",
+          "categories": {
+            "github_origin": [
+              4,
+              14,
+              24,
+              34,
+              44,
+              54,
+              64,
+              74,
+              84
+            ]
+          }
+        },
+        {
           "path": "scripts/check-bump.sh",
           "categories": {
             "github_origin": [
+              3
+            ],
+            "org_slug": [
               3
             ]
           }
@@ -5281,9 +11230,32 @@
           }
         },
         {
+          "path": "scripts/docs_facts_fixture/facts.json",
+          "categories": {
+            "github_origin": [
+              1
+            ]
+          }
+        },
+        {
+          "path": "scripts/env-lint-locations-evidence.json",
+          "categories": {
+            "github_origin": [
+              7
+            ],
+            "org_slug": [
+              5,
+              7
+            ]
+          }
+        },
+        {
           "path": "scripts/lake-cache-get.sh",
           "categories": {
             "github_origin": [
+              3
+            ],
+            "org_slug": [
               3
             ]
           }
@@ -5293,6 +11265,9 @@
           "categories": {
             "github_origin": [
               3
+            ],
+            "org_slug": [
+              3
             ]
           }
         },
@@ -5300,6 +11275,9 @@
           "path": "scripts/lint-scope.sh",
           "categories": {
             "github_origin": [
+              3
+            ],
+            "org_slug": [
               3
             ]
           }
@@ -5309,6 +11287,9 @@
           "categories": {
             "github_origin": [
               3
+            ],
+            "org_slug": [
+              3
             ]
           }
         },
@@ -5317,6 +11298,33 @@
           "categories": {
             "github_origin": [
               3
+            ],
+            "org_slug": [
+              3
+            ]
+          }
+        },
+        {
+          "path": "scripts/publication_capacity_fixture.json",
+          "categories": {
+            "github_origin": [
+              4
+            ],
+            "org_slug": [
+              4
+            ],
+            "actions_context": [
+              17,
+              31
+            ]
+          }
+        },
+        {
+          "path": "scripts/roadmap_links.json",
+          "categories": {
+            "github_origin": [
+              4,
+              7
             ]
           }
         },
@@ -5324,6 +11332,9 @@
           "path": "scripts/sandbox-build.sh",
           "categories": {
             "github_origin": [
+              3
+            ],
+            "org_slug": [
               3
             ]
           }
@@ -5333,21 +11344,52 @@
           "categories": {
             "github_origin": [
               3
+            ],
+            "org_slug": [
+              3
             ]
           }
         },
         {
           "path": "tauceti.toml",
           "categories": {
+            "github_origin": [
+              105
+            ],
             "gh_cli": [
               27
             ],
             "source_identity": [
               59
             ],
+            "org_slug": [
+              7,
+              10,
+              11,
+              12,
+              14,
+              15,
+              16,
+              27,
+              111,
+              114,
+              117
+            ],
             "shared_state": [
               52,
               54
+            ]
+          }
+        },
+        {
+          "path": "web/lake-manifest.json",
+          "categories": {
+            "github_origin": [
+              4,
+              14,
+              24,
+              34,
+              44
             ]
           }
         },
@@ -5358,23 +11400,118 @@
               6
             ]
           }
+        },
+        {
+          "path": "web/static_files/ci-live.js",
+          "categories": {
+            "workflow_event": [
+              191,
+              217
+            ]
+          }
+        },
+        {
+          "path": "web/static_files/ci-operations.js",
+          "categories": {
+            "github_origin": [
+              90,
+              119,
+              198,
+              201,
+              206,
+              225,
+              234
+            ],
+            "workflow_event": [
+              63,
+              371
+            ]
+          }
+        },
+        {
+          "path": "web/static_files/pr-stats.json",
+          "categories": {
+            "org_slug": [
+              1
+            ]
+          }
+        },
+        {
+          "path": "web/static_files/progress.js",
+          "categories": {
+            "github_origin": [
+              21,
+              22
+            ],
+            "org_slug": [
+              21,
+              22
+            ],
+            "workflow_event": [
+              115,
+              122,
+              150,
+              162,
+              313,
+              314,
+              315,
+              316,
+              389,
+              390,
+              391,
+              392,
+              394,
+              395,
+              396,
+              455,
+              457,
+              463,
+              469,
+              527,
+              537,
+              538
+            ]
+          }
+        },
+        {
+          "path": "web/static_files/progress.json",
+          "categories": {
+            "github_origin": [
+              1
+            ],
+            "gh_cli": [
+              1
+            ]
+          }
         }
-      ]
+      ],
+      "skipped": []
     },
     {
       "repository": "TauCetiRoadmap",
       "source_revision": "eaf17b10d9267c0e3cdd3b62dd5e8983e47c690d",
       "canonical_shared_assets": false,
       "counts": {
-        "github_origin": 2,
+        "github_origin": 3,
         "graphql": 0,
         "gh_cli": 5,
         "credentials": 7,
         "source_identity": 0,
-        "workflow_event": 9,
+        "org_slug": 5,
+        "actions_context": 7,
+        "workflow_event": 10,
+        "workflow_uses": 9,
         "shared_state": 0
       },
       "files": [
+        {
+          "path": ".claude/CLAUDE.md",
+          "categories": {
+            "workflow_event": [
+              6
+            ]
+          }
+        },
         {
           "path": ".github/workflows/auto-merge.yml",
           "categories": {
@@ -5391,18 +11528,50 @@
               41,
               51
             ],
+            "actions_context": [
+              4,
+              35,
+              36,
+              52,
+              53
+            ],
             "workflow_event": [
+              10,
               12,
               14,
-              16
+              16,
+              20,
+              22,
+              25,
+              35,
+              52,
+              75
+            ],
+            "workflow_uses": [
+              41
             ]
           }
         },
         {
           "path": ".github/workflows/ci.yml",
           "categories": {
+            "org_slug": [
+              99
+            ],
+            "actions_context": [
+              66,
+              117,
+              125
+            ],
             "workflow_event": [
+              4,
+              6,
+              12,
               21
+            ],
+            "workflow_uses": [
+              30,
+              45
             ]
           }
         },
@@ -5417,10 +11586,18 @@
               46,
               55
             ],
+            "actions_context": [
+              58,
+              59
+            ],
             "workflow_event": [
               11,
               26,
-              30
+              30,
+              59
+            ],
+            "workflow_uses": [
+              46
             ]
           }
         },
@@ -5430,7 +11607,11 @@
             "workflow_event": [
               4,
               10,
+              12,
               16
+            ],
+            "workflow_uses": [
+              23
             ]
           }
         },
@@ -5446,6 +11627,17 @@
               18,
               41,
               51
+            ],
+            "actions_context": [
+              17,
+              18,
+              35,
+              36,
+              53,
+              54
+            ],
+            "workflow_uses": [
+              41
             ]
           }
         },
@@ -5455,16 +11647,40 @@
             "credentials": [
               22
             ],
+            "actions_context": [
+              22,
+              44,
+              52,
+              53,
+              54,
+              57
+            ],
             "workflow_event": [
-              42
+              10,
+              26,
+              41,
+              42,
+              44,
+              52,
+              53,
+              54,
+              57
             ]
           }
         },
         {
           "path": ".github/workflows/progress-announce.yml",
           "categories": {
+            "org_slug": [
+              27
+            ],
             "workflow_event": [
+              5,
+              11,
               19
+            ],
+            "workflow_uses": [
+              27
             ]
           }
         },
@@ -5479,12 +11695,47 @@
             "credentials": [
               54
             ],
+            "org_slug": [
+              158
+            ],
+            "actions_context": [
+              54,
+              55,
+              56,
+              57,
+              60,
+              61,
+              62,
+              64,
+              74,
+              75,
+              80,
+              82,
+              84,
+              144
+            ],
             "workflow_event": [
               11,
               20,
+              23,
+              24,
+              26,
+              28,
               31,
+              60,
+              61,
+              62,
+              64,
               68,
-              83
+              74,
+              82,
+              83,
+              85,
+              90,
+              93
+            ],
+            "workflow_uses": [
+              158
             ]
           }
         },
@@ -5500,12 +11751,24 @@
               34,
               43
             ],
+            "actions_context": [
+              28,
+              29,
+              47,
+              49,
+              50
+            ],
             "workflow_event": [
               7,
               15,
               17,
               28,
+              29,
+              50,
               74
+            ],
+            "workflow_uses": [
+              34
             ]
           }
         },
@@ -5519,7 +11782,37 @@
               42
             ],
             "workflow_event": [
-              23
+              16,
+              23,
+              28,
+              51,
+              58,
+              71,
+              77
+            ],
+            "workflow_uses": [
+              42,
+              47
+            ]
+          }
+        },
+        {
+          "path": "lake-manifest.json",
+          "categories": {
+            "github_origin": [
+              6,
+              18,
+              30,
+              42,
+              54,
+              66,
+              78,
+              90,
+              102,
+              114
+            ],
+            "org_slug": [
+              6
             ]
           }
         },
@@ -5528,10 +11821,14 @@
           "categories": {
             "github_origin": [
               8
+            ],
+            "org_slug": [
+              8
             ]
           }
         }
-      ]
+      ],
+      "skipped": []
     },
     {
       "repository": "TauCetiData",
@@ -5539,19 +11836,89 @@
       "canonical_shared_assets": false,
       "counts": {
         "github_origin": 2,
-        "graphql": 1,
+        "graphql": 2,
         "gh_cli": 5,
         "credentials": 0,
         "source_identity": 0,
-        "workflow_event": 0,
+        "org_slug": 5,
+        "actions_context": 0,
+        "workflow_event": 10,
+        "workflow_uses": 0,
         "shared_state": 0
       },
       "files": [
+        {
+          "path": "eval/judgments/j-1019d0a846eccd0e.json",
+          "categories": {
+            "workflow_event": [
+              17
+            ]
+          }
+        },
+        {
+          "path": "eval/judgments/j-14043f7b3b575f2f.json",
+          "categories": {
+            "workflow_event": [
+              17
+            ]
+          }
+        },
+        {
+          "path": "eval/judgments/j-5a28ec4ddd20cb35.json",
+          "categories": {
+            "workflow_event": [
+              17
+            ]
+          }
+        },
+        {
+          "path": "eval/judgments/j-6f747064d168efb4.json",
+          "categories": {
+            "workflow_event": [
+              17
+            ]
+          }
+        },
+        {
+          "path": "eval/judgments/j-9a6e9650335e9cb0.json",
+          "categories": {
+            "workflow_event": [
+              17
+            ]
+          }
+        },
+        {
+          "path": "eval/judgments/j-a450573a51fb4a1b.json",
+          "categories": {
+            "workflow_event": [
+              17
+            ]
+          }
+        },
+        {
+          "path": "eval/judgments/j-ad7963a13c7792d8.json",
+          "categories": {
+            "workflow_event": [
+              17
+            ]
+          }
+        },
+        {
+          "path": "schema/scrape_event.v1.json",
+          "categories": {
+            "graphql": [
+              19
+            ]
+          }
+        },
         {
           "path": "scripts/ab_fill.py",
           "categories": {
             "gh_cli": [
               100
+            ],
+            "org_slug": [
+              65
             ]
           }
         },
@@ -5565,6 +11932,10 @@
               13,
               37,
               41
+            ],
+            "org_slug": [
+              31,
+              32
             ]
           }
         },
@@ -5578,6 +11949,21 @@
               11,
               34,
               36
+            ],
+            "org_slug": [
+              182
+            ],
+            "workflow_event": [
+              119,
+              212
+            ]
+          }
+        },
+        {
+          "path": "scripts/reconcile_store.py",
+          "categories": {
+            "workflow_event": [
+              20
             ]
           }
         },
@@ -5585,6 +11971,10 @@
           "path": "scripts/recost.py",
           "categories": {
             "gh_cli": [
+              38
+            ],
+            "org_slug": [
+              26,
               38
             ]
           }
@@ -5599,10 +11989,17 @@
             "gh_cli": [
               39,
               41
+            ],
+            "org_slug": [
+              33
+            ],
+            "workflow_event": [
+              110
             ]
           }
         }
-      ]
+      ],
+      "skipped": []
     }
   ]
 }

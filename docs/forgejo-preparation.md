@@ -2,7 +2,7 @@
 
 Tracker: [Worker #602](https://github.com/TauCetiProject/TauCetiWorker/issues/602).
 Accepted architecture and ordered work packages:
-[TauCetiTools preparation document](https://github.com/TauCetiProject/TauCetiTools/blob/forgejo/preparation/docs/forgejo-preparation.md).
+[TauCetiTools preparation document](https://github.com/TauCetiProject/TauCetiTools/blob/ef2da2b5d52cefd36d5d9f0d79502cc3bc416c5e/docs/forgejo-preparation.md).
 
 Forgejo will own development and merges; GitHub Actions initially continues running
 CI and fetching retained candidates directly from Forgejo. Agents keep familiar
@@ -10,7 +10,7 @@ CI and fetching retained candidates directly from Forgejo. Agents keep familiar
 reads. The shared GitHub state service is retired after its production consumers
 migrate. Preparation includes a full isolated rehearsal before production cutover.
 
-## Delivered foundation
+## Foundation implementation
 
 [Tools PR #179](https://github.com/TauCetiProject/TauCetiTools/pull/179) introduces
 qualified identities, schema v2 with independent source and execution repositories,
@@ -32,20 +32,38 @@ This is a client/API smoke, not the complete migration rehearsal.
 
 [Machine-readable inventory](evidence/forgejo-integration-inventory-20261107.json)
 records immutable upstream revisions and line locations for forge URLs, GraphQL,
-CLI calls, credentials, source identity, workflow events and shared-state reads.
+CLI launch sites/literal commands, wrapper argument lists, credential references,
+source identities, workflow events, Actions context and shared-state mentions.
 It covers Worker, Tools, Fleet, Review, Progress, CI, content, Roadmap and Data.
+Extensionless executable/shebang scripts, Dockerfiles, service units, JSON/JSONC,
+lake manifests and example configurations are included. Every YAML workflow is
+listed even when no regex category matches. The report records its scanner digest,
+matching/filter policy, and any size/encoding omissions. Archived records and
+build artifacts are deliberately excluded.
 
 Regenerate after fetching each repository's default branch:
 
 ```sh
-python scripts/forge-inventory.py --output REPORT.json \
-  TauCetiWorker=/checkout/TauCetiWorker \
-  TauCetiTools=/checkout/TauCetiTools \
-  TauCetiFleet=/checkout/TauCetiFleet
+python scripts/forge-inventory.py \
+  --replay docs/evidence/forgejo-integration-inventory-20261107.json \
+  --output REPORT.json \
+  TauCetiWorker=/home/kim/TauCetiWorker \
+  TauCetiTools=/home/kim/TauCetiTools \
+  TauCetiFleet=/home/kim/TauCetiFleet \
+  TauCetiReview=/home/kim/TauCetiReview \
+  TauCetiProgress=/home/kim/TauCetiProgress \
+  TauCetiCI=/home/kim/TauCetiCI \
+  TauCeti=/home/kim/TauCeti \
+  TauCetiRoadmap=/home/kim/TauCetiRoadmap \
+  TauCetiData=/home/kim/TauCetiData
 ```
 
 Inputs are tracked files at the selected Git revision, not local modifications or
 credential files. Reports contain line numbers rather than source snippets.
+Change checkout paths for another machine. `--replay` selects the recorded commit
+for each repository; omit it to inventory current `origin/main` refs. Canonical
+shared assets default to the exact repository label `TauCetiTools`; use
+`--canonical-shared-assets NAME` when providing a different label.
 Lexical findings guide manual contract review: URLs can be intentional upstream or
 archive links, and dynamic command construction needs inspection. Tools' shared
 assets are canonical implementations; copies in downstream projects are callers
