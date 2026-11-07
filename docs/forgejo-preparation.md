@@ -165,6 +165,47 @@ fixtures. Conditional construction and unrecognized launch mechanisms require
 manual inspection. Compatibility or activation cannot be inferred from row counts
 or a clean scan.
 
+## Direct review-state reads
+
+`GitHub.for_repository(repository, api=api)` accepts an explicit Tools
+`RepositoryRef` and a Forgejo client bound to that origin. Its Forgejo result is a
+read adapter for PR metadata, issue discussion and reviews. It selects neither
+credentials nor a source from the environment. Existing GitHub construction and
+production bootstrap remain unchanged; this factory does not enable a complete
+Forgejo worker.
+
+`ReviewState` uses this adapter directly and never consults the shared-state
+service or unqualified survey seeds. Repository, origin and credential identity
+scope its caches. Rotating the client's credential or origin makes reads
+unavailable until a new adapter is constructed, including reads from existing
+memory or disk. Tokens and server error bodies are not persisted in cache keys or
+failure records.
+
+Triage reads use a bounded process-local JSON cache (128 entries, 4 MiB by
+default, 15-second TTL). Fresh reads bypass cached entries and coalescing locks;
+invalidation prevents an overlapping older request from publishing its result.
+Failed requests are not cached, and a verified empty list differs from an
+unavailable read. Cached review metadata retains assumed or stale provenance;
+it supplies no fresh approval authority. Revision-scoped read contexts use
+separate cache keys.
+
+Disposable review-state sidecars live below `sbcache/sources/<digest>/`, in private
+directories with atomic private-file replacement. Best-effort pruning bounds
+recognized cache files across credential scopes to 384 files and 16 MiB after
+quiescent writes. It ignores unrelated files, outboxes and symlinks. These files
+are disposable observations, not publication journals or durable decisions.
+
+`tests/integration_forgejo_reads.py`, when given `FORGEJO_BINARY`, starts an
+isolated temporary server and exercises the actual adapter and `ReviewState`
+against a private PR, multiple discussion pages, submitted and pending reviews,
+credential denial, comment edits and deletion. Shared-state and GitHub fallback
+calls fail the fixture. This loopback test is separate from the required hosted
+HTTPS and fleet-load rehearsal.
+
+Inline thread/reply reads deliberately remain unavailable. Authoring, claims,
+reactions, trusted publication, scheduling and approval decisions still require
+their qualified adapters before production Forgejo bootstrap can be enabled.
+
 ## Outstanding integration and completion criteria
 
 The worker's existing `gh` launcher, credentials, forks, claims, publication recovery
