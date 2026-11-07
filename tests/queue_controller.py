@@ -239,7 +239,7 @@ class Verdicts(ControllerCase):
     def test_build_alone_waits_for_the_other_verdicts_then_counts_as_a_missing_status(self):
         head, attempt = self.observe("build-only")
         self.assertEqual(attempt["outcome"], "pending", "a bound build with the others absent is not yet a verdict")
-        self.assertEqual(attempt["needs_observation"], 1)
+        self.assertEqual(attempt["needs_observation"], 0)
         self.assertEqual(self.verdict_states(), {"build": "success", "bump-guard": "absent", "scope": "absent"})
         self.assertIn("waiting for bump-guard, scope", " ".join(self.controller.status()["reasons"]))
         self.clock.advance(LOG_GRACE_SECONDS)
@@ -254,7 +254,7 @@ class Verdicts(ControllerCase):
     def test_delayed_build_status_can_land_without_redispatch(self):
         head, attempt = self.observe("no-status")
         self.assertEqual(attempt["outcome"], "pending")
-        self.assertEqual(attempt["needs_observation"], 1)
+        self.assertEqual(attempt["needs_observation"], 0)
         self.assertIn("waiting for build status", " ".join(self.controller.status()["reasons"]))
         self.clock.advance(LOG_GRACE_SECONDS - 1)
         self.controller.tick()
@@ -270,6 +270,47 @@ class Verdicts(ControllerCase):
         self.assertEqual(self.attempt(head)["outcome"], "pass")
         self.assertEqual(self.repo.main_sha(), head["tip"])
         self.assertEqual(len(self.github.dispatches), 1)
+
+    def test_publication_grace_obeys_polling_interval_and_webhooks(self):
+        head, attempt = self.observe("no-status")
+        calls = len(self.github.calls)
+        self.controller._observe_attempt(head, attempt, self.clock())
+        self.assertEqual(len(self.github.calls), calls, "another tick alone must not repeat GitHub reads")
+        self.controller.handle_event("status", {"sha": head["tip"], "context": "build"})
+        attempt = self.attempt(head)
+        self.controller._observe_attempt(head, attempt, self.clock())
+        self.assertGreater(len(self.github.calls), calls, "a status webhook can observe promptly")
+
+    def test_known_failed_publication_does_not_wait_for_grace(self):
+        self.github.ci_policy = lambda *_: (
+            "no-status",
+            [{"kind": "infrastructure", "reason": "finalizer_failed", "message": "publication job failed"}],
+        )
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "infrastructure")
+        self.assertEqual(self.controller.store.count("tasks", {}), 0)
+
+    def test_later_updated_completion_timestamp_does_not_extend_grace(self):
+        head, attempt = self.observe("no-status")
+        completed_at = attempt["run_completed_at"]
+        self.clock.advance(LOG_GRACE_SECONDS)
+        self.github.runs[0].completed_at = self.clock()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "infrastructure")
+        self.assertEqual(self.attempt(head)["run_completed_at"], completed_at)
+
+    def test_new_run_attempt_does_not_inherit_the_previous_completion_time(self):
+        head, _ = self.observe("no-status")
+        self.clock.advance(LOG_GRACE_SECONDS)
+        self.github.runs[0].attempt += 1
+        self.github.runs[0].completed_at = None
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "pending")
+        self.assertEqual(self.attempt(head)["run_completed_at"], self.clock())
 
     def test_unbound_and_pending_build_statuses_do_not_reset_the_publication_grace(self):
         head, attempt = self.observe("no-status")

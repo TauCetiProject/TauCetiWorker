@@ -96,10 +96,12 @@ passes only when all three are bound and `success`; a red `scope` or `bump-guard
 current admin approval, an oversized diff, a new file over 1000 lines, a failed pin validation), and a
 completed run with an absent, pending or unbound `build` status is observed again for
 `LOG_GRACE_SECONDS` (600 seconds) before it counts as infrastructure failure. The same grace
-applies to a green `build` with companion verdicts still missing. Grace runs from completion,
-not from the latest poll or status callback; if the completion timestamp is unavailable, its
-first completed observation is persisted across restarts. Late bound verdicts can settle the
-original attempt without another dispatch. Stale statuses never supply a verdict, and cancelled
+applies to a green `build` with companion verdicts still missing. The completion timestamp is frozen
+at the first completed observation for that run/attempt (the adapter reports GitHub's `updated_at`);
+if unavailable, the observation time is used. It persists across restarts, and later polls or status
+callbacks do not extend grace. Normal polling intervals still apply, with webhooks permitting prompt
+observation. Explicit finalizer failure or cancelled/timed-out job findings bypass the wait. Late
+bound verdicts can settle the original attempt without another dispatch. Stale statuses never supply a verdict, and cancelled
 runs retain their separate infrastructure recovery path. `status.head.ci.verdicts` reports each
 context's state.
 

@@ -959,6 +959,30 @@ class MissingSource(QueueFixture):
         self.assertTrue(self.refused(103))
         self.assertEqual(self.controller.store.count("journal", {"kind": "probe-missing-source-waiting"}), 0)
 
+    def test_import_on_an_old_open_base_waits_for_a_module_already_landed(self):
+        old_base = self.repo.main_sha()
+        self.approve(101, {"TauCeti/New.lean": "module\ndef new := 1\n"})
+        self.tick()
+        self.approve(102, {"Shared.lean": "line one\nline two by 102\nline three\n"})
+        self.tick()
+        self.approve(103, {"Shared.lean": "line one\nline two by 103\nline three\n"})
+        self.tick()
+        self.assertEqual(len(self.controller.batches("open")), 2)
+        self.run_ci()
+        self.tick(2)
+        # The next head inherited New from its new base, but the second open batch has not rebased.
+        self.assertIsNotNone(self.repo.file_at("main", "TauCeti/New.lean"))
+        self.assertNotEqual(self.open_batch()["base"], self.repo.main_sha())
+        self.approve(104, {"TauCeti/Consumer.lean": "module\nimport TauCeti.New\n"}, start=old_base)
+        self.tick()
+        row = next(r for r in self.controller.inputs() if r["number"] == 104)
+        self.assertEqual(row["state"], "waiting", "refreshing the batch base will supply the source")
+        self.assertEqual(self.github.comments_for(104), [])
+        self.run_ci()
+        self.tick(3)
+        row = next(r for r in self.controller.inputs() if r["number"] == 104)
+        self.assertEqual(row["state"], "inserted")
+
     def test_s25_bad_import_is_refused_and_a_batch_mates_module_is_a_source(self):
         self.approve(101, {"TauCeti/New.lean": "module\ndef new := 1\n"})
         self.approve(102, {"TauCeti/Consumer.lean": "module\nimport TauCeti.New\nimport TauCeti.Gone\n"})
