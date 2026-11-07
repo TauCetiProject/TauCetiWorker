@@ -1,0 +1,5608 @@
+{
+  "schema": "tauceti.forge-inventory/v1",
+  "generated_at": "2026-11-07T00:46:37.471476+00:00",
+  "scope": "Tracked executable/configuration/template/prompt sources; excludes tests, docs, fixtures, and vendored dependencies.",
+  "limitations": "Lexical findings guide manual contract review; absence is not proof of provider independence. Dynamic commands require inspection.",
+  "repositories": [
+    {
+      "repository": "TauCetiWorker",
+      "source_revision": "ec07db61af85d7f6c0f619ec49abd5d03050ac6f",
+      "canonical_shared_assets": false,
+      "counts": {
+        "github_origin": 52,
+        "graphql": 16,
+        "gh_cli": 28,
+        "credentials": 17,
+        "source_identity": 21,
+        "workflow_event": 18,
+        "shared_state": 20
+      },
+      "files": [
+        {
+          "path": ".github/workflows/ci.yml",
+          "categories": {
+            "github_origin": [
+              256
+            ]
+          }
+        },
+        {
+          "path": "prompts/bump.md",
+          "categories": {
+            "github_origin": [
+              56
+            ],
+            "gh_cli": [
+              17
+            ]
+          }
+        },
+        {
+          "path": "prompts/fix-ci.md",
+          "categories": {
+            "github_origin": [
+              50
+            ],
+            "gh_cli": [
+              5,
+              6
+            ]
+          }
+        },
+        {
+          "path": "prompts/fix.md",
+          "categories": {
+            "github_origin": [
+              40
+            ],
+            "gh_cli": [
+              5,
+              6,
+              19
+            ]
+          }
+        },
+        {
+          "path": "prompts/lint-repair.md",
+          "categories": {
+            "github_origin": [
+              48
+            ],
+            "gh_cli": [
+              25
+            ]
+          }
+        },
+        {
+          "path": "prompts/local-verification.md",
+          "categories": {
+            "github_origin": [
+              49
+            ]
+          }
+        },
+        {
+          "path": "prompts/pr-outcome.md",
+          "categories": {
+            "gh_cli": [
+              12,
+              27,
+              28
+            ]
+          }
+        },
+        {
+          "path": "prompts/rebase.md",
+          "categories": {
+            "github_origin": [
+              42
+            ]
+          }
+        },
+        {
+          "path": "prompts/roadmap.md",
+          "categories": {
+            "github_origin": [
+              87
+            ],
+            "gh_cli": [
+              12,
+              15,
+              97
+            ]
+          }
+        },
+        {
+          "path": "prompts/v0/bump.md",
+          "categories": {
+            "github_origin": [
+              61
+            ],
+            "gh_cli": [
+              21
+            ]
+          }
+        },
+        {
+          "path": "prompts/v0/fix-ci.md",
+          "categories": {
+            "github_origin": [
+              68
+            ],
+            "gh_cli": [
+              5,
+              6
+            ]
+          }
+        },
+        {
+          "path": "prompts/v0/fix.md",
+          "categories": {
+            "github_origin": [
+              40
+            ],
+            "gh_cli": [
+              5,
+              6,
+              19
+            ]
+          }
+        },
+        {
+          "path": "prompts/v0/lint-repair.md",
+          "categories": {
+            "github_origin": [
+              68
+            ],
+            "gh_cli": [
+              28
+            ]
+          }
+        },
+        {
+          "path": "prompts/v0/rebase.md",
+          "categories": {
+            "github_origin": [
+              45
+            ]
+          }
+        },
+        {
+          "path": "prompts/v0/roadmap.md",
+          "categories": {
+            "github_origin": [
+              88
+            ],
+            "gh_cli": [
+              12,
+              15,
+              98
+            ]
+          }
+        },
+        {
+          "path": "pyproject.toml",
+          "categories": {
+            "github_origin": [
+              11,
+              12
+            ],
+            "shared_state": [
+              59
+            ]
+          }
+        },
+        {
+          "path": "scripts/claim.sh",
+          "categories": {
+            "github_origin": [
+              32
+            ],
+            "source_identity": [
+              31
+            ]
+          }
+        },
+        {
+          "path": "scripts/github-state-capacity.py",
+          "categories": {
+            "github_origin": [
+              68
+            ],
+            "graphql": [
+              74,
+              75,
+              83,
+              91,
+              92,
+              93,
+              157,
+              159,
+              161,
+              233,
+              236,
+              237,
+              238
+            ],
+            "workflow_event": [
+              117
+            ],
+            "shared_state": [
+              188,
+              194
+            ]
+          }
+        },
+        {
+          "path": "scripts/staging_journal_report.py",
+          "categories": {
+            "workflow_event": [
+              31
+            ]
+          }
+        },
+        {
+          "path": "scripts/tauceti_queue_github_app.py",
+          "categories": {
+            "github_origin": [
+              27,
+              62,
+              89
+            ],
+            "credentials": [
+              72,
+              73,
+              82
+            ],
+            "workflow_event": [
+              41
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/observe_reconciliation.py",
+          "categories": {
+            "shared_state": [
+              22,
+              24,
+              88
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/rollout.py",
+          "categories": {
+            "credentials": [
+              49,
+              121
+            ],
+            "shared_state": [
+              29,
+              51,
+              54,
+              84,
+              106,
+              139
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/shadow.py",
+          "categories": {
+            "workflow_event": [
+              58,
+              362
+            ],
+            "shared_state": [
+              24,
+              30,
+              103,
+              226,
+              239,
+              258,
+              259,
+              307,
+              311,
+              373
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/storage_recovery.py",
+          "categories": {
+            "github_origin": [
+              44
+            ],
+            "shared_state": [
+              25,
+              30,
+              31,
+              79,
+              80,
+              81,
+              85,
+              87
+            ]
+          }
+        },
+        {
+          "path": "services/queue/install-repair.sh",
+          "categories": {
+            "github_origin": [
+              31,
+              129,
+              131
+            ]
+          }
+        },
+        {
+          "path": "services/queue/install.sh",
+          "categories": {
+            "github_origin": [
+              25,
+              104,
+              106
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/__main__.py",
+          "categories": {
+            "gh_cli": [
+              26,
+              391,
+              541,
+              559,
+              565
+            ],
+            "credentials": [
+              26,
+              388,
+              389,
+              393,
+              541,
+              559,
+              565
+            ],
+            "source_identity": [
+              164
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/admission.py",
+          "categories": {
+            "source_identity": [
+              339
+            ],
+            "workflow_event": [
+              242,
+              251
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/approval_poll.py",
+          "categories": {
+            "graphql": [
+              8,
+              19
+            ],
+            "source_identity": [
+              58,
+              65,
+              124,
+              196,
+              217
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/bors_import.py",
+          "categories": {
+            "source_identity": [
+              19
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/chain.py",
+          "categories": {
+            "github_origin": [
+              49,
+              137,
+              272
+            ],
+            "source_identity": [
+              7,
+              16,
+              45,
+              215,
+              222,
+              298,
+              775,
+              776,
+              823,
+              935
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/commands.py",
+          "categories": {
+            "workflow_event": [
+              334,
+              360
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/config.py",
+          "categories": {
+            "github_origin": [
+              307
+            ],
+            "credentials": [
+              60,
+              288
+            ],
+            "source_identity": [
+              26,
+              99,
+              262,
+              263
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/controller.py",
+          "categories": {
+            "github_origin": [
+              4422,
+              4698,
+              4711,
+              4719
+            ],
+            "source_identity": [
+              196,
+              2266,
+              4807
+            ],
+            "workflow_event": [
+              1014
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/eligibility.py",
+          "categories": {
+            "source_identity": [
+              55,
+              56,
+              69,
+              71,
+              119,
+              130,
+              132,
+              157,
+              171
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/fakes.py",
+          "categories": {
+            "source_identity": [
+              727,
+              730,
+              738
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/github_adapter.py",
+          "categories": {
+            "github_origin": [
+              59,
+              674,
+              683,
+              729,
+              743
+            ],
+            "graphql": [
+              26,
+              358,
+              362,
+              512,
+              513,
+              515,
+              519,
+              523,
+              524,
+              528,
+              530,
+              532,
+              535,
+              544,
+              1113,
+              1115,
+              1158,
+              1241,
+              1253,
+              1277,
+              1287,
+              1290,
+              1300,
+              1308,
+              1323,
+              1524
+            ],
+            "credentials": [
+              4,
+              205,
+              606
+            ],
+            "source_identity": [
+              26,
+              1283,
+              1310,
+              1327
+            ],
+            "workflow_event": [
+              29,
+              99,
+              768,
+              812
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/github_app.py",
+          "categories": {
+            "github_origin": [
+              39
+            ],
+            "credentials": [
+              7,
+              14,
+              72,
+              148,
+              159,
+              175,
+              199,
+              212,
+              234
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/monitoring.py",
+          "categories": {
+            "github_origin": [
+              75
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/ports.py",
+          "categories": {
+            "graphql": [
+              4
+            ],
+            "source_identity": [
+              258
+            ],
+            "workflow_event": [
+              178
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/rehearsal.py",
+          "categories": {
+            "github_origin": [
+              308,
+              1222,
+              1355,
+              1579,
+              1593,
+              1873,
+              1950
+            ],
+            "gh_cli": [
+              358,
+              425,
+              428,
+              3207,
+              3238
+            ],
+            "credentials": [
+              218,
+              327,
+              423,
+              442,
+              3204,
+              3210,
+              3238
+            ],
+            "source_identity": [
+              167,
+              463,
+              492,
+              580,
+              642,
+              652,
+              1164,
+              1440,
+              1534,
+              1695
+            ],
+            "workflow_event": [
+              104,
+              130,
+              150,
+              155,
+              164,
+              174,
+              368,
+              381,
+              1276,
+              1868
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/repair.py",
+          "categories": {
+            "credentials": [
+              2051,
+              2052
+            ],
+            "source_identity": [
+              55,
+              65,
+              299,
+              339,
+              352,
+              353,
+              366,
+              376,
+              1152,
+              1166,
+              1209,
+              1210,
+              1246,
+              1390,
+              1624,
+              1939
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/repair_audit.py",
+          "categories": {
+            "github_origin": [
+              64
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/repair_experiment.py",
+          "categories": {
+            "gh_cli": [
+              580
+            ],
+            "source_identity": [
+              16,
+              522,
+              543
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/repair_task.py",
+          "categories": {
+            "github_origin": [
+              679,
+              1604
+            ],
+            "gh_cli": [
+              541,
+              561,
+              2704
+            ],
+            "credentials": [
+              538,
+              557
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/server.py",
+          "categories": {
+            "source_identity": [
+              95,
+              193,
+              770
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/webhook.py",
+          "categories": {
+            "source_identity": [
+              71,
+              77,
+              132,
+              135,
+              150
+            ],
+            "workflow_event": [
+              6,
+              11,
+              36,
+              119,
+              120,
+              141,
+              162
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/activity.py",
+          "categories": {
+            "github_origin": [
+              386,
+              408
+            ],
+            "shared_state": [
+              451,
+              452,
+              976
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/activity_git.py",
+          "categories": {
+            "github_origin": [
+              93
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/agents.py",
+          "categories": {
+            "github_origin": [
+              617,
+              625,
+              626,
+              777,
+              1400,
+              2696,
+              2756
+            ],
+            "graphql": [
+              2409,
+              2521
+            ],
+            "gh_cli": [
+              1965,
+              2667,
+              2740,
+              3206
+            ],
+            "credentials": [
+              949,
+              950,
+              1769,
+              2273,
+              2274,
+              2275,
+              2413,
+              2414,
+              3078
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/audit_alerts.py",
+          "categories": {
+            "github_origin": [
+              113,
+              115
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/cli.py",
+          "categories": {
+            "github_origin": [
+              166,
+              311,
+              595,
+              1720
+            ],
+            "gh_cli": [
+              352,
+              1552,
+              1603,
+              1607,
+              1610,
+              1667,
+              1677,
+              1682
+            ],
+            "credentials": [
+              36,
+              89,
+              170,
+              211,
+              597,
+              644,
+              649,
+              654,
+              846,
+              873,
+              982,
+              984,
+              987,
+              1608,
+              1609,
+              1724
+            ],
+            "shared_state": [
+              172,
+              177,
+              949,
+              950
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/config.py",
+          "categories": {
+            "gh_cli": [
+              114,
+              118
+            ],
+            "shared_state": [
+              465,
+              472
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/constants.py",
+          "categories": {
+            "graphql": [
+              187,
+              205
+            ],
+            "gh_cli": [
+              182,
+              185
+            ],
+            "source_identity": [
+              10
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/cost_model.py",
+          "categories": {
+            "github_origin": [
+              27,
+              42
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/fleet_events.py",
+          "categories": {
+            "github_origin": [
+              55,
+              59
+            ],
+            "graphql": [
+              85
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/github.py",
+          "categories": {
+            "github_origin": [
+              97,
+              107,
+              109,
+              118,
+              137,
+              204,
+              221,
+              239,
+              240,
+              241,
+              243,
+              244,
+              245
+            ],
+            "graphql": [
+              264,
+              473,
+              508,
+              509,
+              519,
+              629,
+              630,
+              708,
+              717,
+              732,
+              959,
+              968,
+              1060,
+              1066,
+              1104,
+              1106,
+              1119,
+              1122,
+              1131,
+              1149
+            ],
+            "gh_cli": [
+              97,
+              107,
+              118,
+              256,
+              264,
+              269,
+              278,
+              347,
+              351,
+              362,
+              385,
+              393,
+              402,
+              408,
+              415,
+              514,
+              630,
+              664,
+              672,
+              673,
+              687,
+              690,
+              759,
+              785
+            ],
+            "credentials": [
+              39,
+              48,
+              49,
+              77,
+              81,
+              85,
+              88,
+              92,
+              109,
+              110,
+              126,
+              191,
+              202,
+              203,
+              263
+            ],
+            "source_identity": [
+              386,
+              392,
+              396,
+              412
+            ],
+            "workflow_event": [
+              940,
+              949,
+              958,
+              962,
+              965,
+              1014,
+              1018,
+              1037,
+              1152
+            ],
+            "shared_state": [
+              679,
+              744,
+              768,
+              791,
+              960,
+              1039,
+              1110,
+              1174
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/github_catalog.py",
+          "categories": {
+            "graphql": [
+              15
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/github_forks.py",
+          "categories": {
+            "graphql": [
+              42
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/github_outbox.py",
+          "categories": {
+            "github_origin": [
+              77,
+              286
+            ],
+            "graphql": [
+              336,
+              357,
+              362,
+              410,
+              415,
+              427,
+              525,
+              554
+            ],
+            "gh_cli": [
+              87,
+              427,
+              498,
+              525,
+              552,
+              617,
+              649,
+              774
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/github_state.py",
+          "categories": {
+            "github_origin": [
+              451
+            ],
+            "graphql": [
+              249
+            ],
+            "source_identity": [
+              165
+            ],
+            "workflow_event": [
+              275
+            ],
+            "shared_state": [
+              34,
+              35,
+              39,
+              41,
+              166,
+              199,
+              354,
+              358,
+              367
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/github_transport.py",
+          "categories": {
+            "github_origin": [
+              47,
+              64,
+              588
+            ],
+            "graphql": [
+              453,
+              507,
+              508,
+              514,
+              521,
+              737,
+              738,
+              740,
+              772,
+              837,
+              847,
+              860,
+              862,
+              878,
+              909,
+              1010,
+              1018,
+              1045,
+              1168,
+              1188,
+              1196,
+              1254
+            ],
+            "gh_cli": [
+              630,
+              677,
+              1188,
+              1265,
+              1286
+            ],
+            "credentials": [
+              43
+            ],
+            "workflow_event": [
+              150,
+              1011,
+              1165
+            ],
+            "shared_state": [
+              621
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/intentions.py",
+          "categories": {
+            "gh_cli": [
+              40,
+              97
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/loop.py",
+          "categories": {
+            "graphql": [
+              205,
+              216
+            ],
+            "credentials": [
+              286,
+              287,
+              288
+            ],
+            "shared_state": [
+              34,
+              206
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/overlap_state.py",
+          "categories": {
+            "github_origin": [
+              41
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/overlap_support.py",
+          "categories": {
+            "github_origin": [
+              37,
+              176,
+              213
+            ],
+            "credentials": [
+              33
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/overlaps.py",
+          "categories": {
+            "github_origin": [
+              53,
+              54,
+              216,
+              562
+            ],
+            "graphql": [
+              150
+            ],
+            "shared_state": [
+              125,
+              154
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/quota.py",
+          "categories": {
+            "github_origin": [
+              770,
+              793
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/repair_recovery.py",
+          "categories": {
+            "github_origin": [
+              161,
+              999
+            ],
+            "shared_state": [
+              555
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/repair_route.py",
+          "categories": {
+            "workflow_event": [
+              90
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/retention.py",
+          "categories": {
+            "source_identity": [
+              808
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/review_diagnostics.py",
+          "categories": {
+            "gh_cli": [
+              113
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/review_state.py",
+          "categories": {
+            "workflow_event": [
+              140,
+              146,
+              193
+            ],
+            "shared_state": [
+              15,
+              109,
+              184
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/round.py",
+          "categories": {
+            "github_origin": [
+              256
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/security_audit.py",
+          "categories": {
+            "github_origin": [
+              203,
+              266
+            ],
+            "gh_cli": [
+              203
+            ],
+            "workflow_event": [
+              218
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/shared_repositories.py",
+          "categories": {
+            "github_origin": [
+              41,
+              81
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/state_repair.py",
+          "categories": {
+            "shared_state": [
+              8,
+              28,
+              34
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/survey.py",
+          "categories": {
+            "github_origin": [
+              576
+            ],
+            "gh_cli": [
+              587
+            ],
+            "shared_state": [
+              51,
+              336,
+              673,
+              725,
+              740,
+              759
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/tui.py",
+          "categories": {
+            "credentials": [
+              168,
+              177,
+              844
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/work_units.py",
+          "categories": {
+            "github_origin": [
+              513,
+              534,
+              1296,
+              1446,
+              1617,
+              1719,
+              1828,
+              2583,
+              2913
+            ],
+            "graphql": [
+              141,
+              473,
+              1188
+            ],
+            "gh_cli": [
+              472,
+              1210,
+              1216,
+              1924,
+              1927,
+              1928,
+              2003,
+              2124
+            ],
+            "shared_state": [
+              88,
+              461,
+              1188,
+              1493
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/worker_manager.py",
+          "categories": {
+            "github_origin": [
+              105
+            ],
+            "credentials": [
+              35,
+              51,
+              273,
+              340,
+              368,
+              370,
+              372,
+              424,
+              483,
+              842,
+              1458,
+              1459,
+              1460,
+              1647,
+              1659,
+              1976,
+              2161
+            ],
+            "shared_state": [
+              48,
+              49,
+              271,
+              272,
+              334,
+              335,
+              336,
+              426,
+              427,
+              484,
+              485,
+              966,
+              975,
+              1977,
+              1978,
+              2042,
+              2043,
+              2162,
+              2163
+            ]
+          }
+        },
+        {
+          "path": "tauceti_worker/workflow_backstop.py",
+          "categories": {
+            "gh_cli": [
+              61
+            ],
+            "workflow_event": [
+              19
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "repository": "TauCetiTools",
+      "source_revision": "37e8186971d249763bea9761f256a35daf997413",
+      "canonical_shared_assets": true,
+      "counts": {
+        "github_origin": 62,
+        "graphql": 24,
+        "gh_cli": 51,
+        "credentials": 47,
+        "source_identity": 23,
+        "workflow_event": 59,
+        "shared_state": 20
+      },
+      "files": [
+        {
+          "path": ".github/actions/ci-credentials/action.yml",
+          "categories": {
+            "credentials": [
+              49,
+              60
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/checks.yml",
+          "categories": {
+            "shared_state": [
+              20,
+              30,
+              32,
+              48
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/pr-build.yml",
+          "categories": {
+            "github_origin": [
+              575,
+              1516
+            ],
+            "graphql": [
+              44
+            ],
+            "gh_cli": [
+              348
+            ],
+            "credentials": [
+              193,
+              297,
+              452,
+              485,
+              745,
+              980,
+              1307,
+              1689
+            ],
+            "source_identity": [
+              55
+            ],
+            "workflow_event": [
+              2,
+              20,
+              21,
+              52,
+              58,
+              63,
+              79,
+              82,
+              150,
+              203,
+              209,
+              214,
+              215,
+              218,
+              234,
+              347,
+              354,
+              355,
+              443,
+              444,
+              481,
+              1530,
+              1542,
+              1628,
+              1636,
+              1641
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/publish-lake-cache.yml",
+          "categories": {
+            "github_origin": [
+              114
+            ],
+            "source_identity": [
+              52
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/retry-ci-status.yml",
+          "categories": {
+            "credentials": [
+              74,
+              137,
+              178
+            ],
+            "workflow_event": [
+              32,
+              33,
+              157
+            ]
+          }
+        },
+        {
+          "path": "examples/disposable-project/content/lakefile.toml",
+          "categories": {
+            "github_origin": [
+              7
+            ]
+          }
+        },
+        {
+          "path": "examples/disposable-project/content/tauceti.toml",
+          "categories": {
+            "gh_cli": [
+              27
+            ],
+            "shared_state": [
+              61,
+              63
+            ]
+          }
+        },
+        {
+          "path": "examples/disposable-project/roadmap/lakefile.toml",
+          "categories": {
+            "github_origin": [
+              6
+            ]
+          }
+        },
+        {
+          "path": "examples/epsilon-eridani.toml",
+          "categories": {
+            "github_origin": [
+              26
+            ],
+            "gh_cli": [
+              29
+            ],
+            "source_identity": [
+              73
+            ],
+            "shared_state": [
+              65,
+              67
+            ]
+          }
+        },
+        {
+          "path": "examples/tauceti.toml",
+          "categories": {
+            "gh_cli": [
+              27
+            ],
+            "source_identity": [
+              69
+            ],
+            "shared_state": [
+              61,
+              63
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/deployed-outage-drill.py",
+          "categories": {
+            "github_origin": [
+              53
+            ],
+            "workflow_event": [
+              81,
+              89,
+              103
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/measure.py",
+          "categories": {
+            "graphql": [
+              42,
+              44
+            ],
+            "workflow_event": [
+              34,
+              35,
+              38
+            ],
+            "shared_state": [
+              66,
+              69,
+              76
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/measure_surveys.py",
+          "categories": {
+            "github_origin": [
+              40
+            ],
+            "workflow_event": [
+              111,
+              126
+            ],
+            "shared_state": [
+              36,
+              37
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/migrate.py",
+          "categories": {
+            "github_origin": [
+              116
+            ],
+            "shared_state": [
+              101,
+              102
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/observe_reconciliation.py",
+          "categories": {
+            "shared_state": [
+              22,
+              24,
+              88
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/scripts/setup.py",
+          "categories": {
+            "github_origin": [
+              86,
+              193,
+              194
+            ],
+            "gh_cli": [
+              190,
+              192,
+              220
+            ],
+            "credentials": [
+              66,
+              104,
+              145,
+              165,
+              215,
+              232
+            ],
+            "source_identity": [
+              134,
+              235,
+              312
+            ],
+            "workflow_event": [
+              30,
+              42
+            ],
+            "shared_state": [
+              180,
+              181
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/src/catalog.ts",
+          "categories": {
+            "graphql": [
+              4,
+              32,
+              43,
+              59,
+              81,
+              89,
+              92,
+              94,
+              110,
+              116,
+              119
+            ],
+            "workflow_event": [
+              15,
+              53,
+              88,
+              90
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/src/index.ts",
+          "categories": {
+            "github_origin": [
+              70
+            ],
+            "graphql": [
+              216
+            ],
+            "source_identity": [
+              196,
+              203
+            ],
+            "workflow_event": [
+              68
+            ],
+            "shared_state": [
+              65,
+              67,
+              68
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/src/ingress.ts",
+          "categories": {
+            "source_identity": [
+              40,
+              187,
+              619
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/src/installation.ts",
+          "categories": {
+            "github_origin": [
+              157,
+              424,
+              425
+            ],
+            "graphql": [
+              133,
+              164,
+              242,
+              254,
+              275,
+              277,
+              284,
+              289,
+              294,
+              296,
+              299,
+              304,
+              318,
+              323,
+              324,
+              325,
+              326,
+              330,
+              331,
+              342,
+              344,
+              345,
+              347,
+              348,
+              351,
+              363,
+              366,
+              368,
+              370,
+              541,
+              544,
+              548
+            ],
+            "workflow_event": [
+              327,
+              342
+            ],
+            "shared_state": [
+              155
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/src/migration_control.ts",
+          "categories": {
+            "workflow_event": [
+              28
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/src/monitoring.ts",
+          "categories": {
+            "shared_state": [
+              112,
+              114
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/src/protocol.ts",
+          "categories": {
+            "workflow_event": [
+              90,
+              104
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/src/repository.ts",
+          "categories": {
+            "github_origin": [
+              1104,
+              2998,
+              2999,
+              3000
+            ],
+            "graphql": [
+              1883
+            ],
+            "source_identity": [
+              3031,
+              3153
+            ],
+            "workflow_event": [
+              24,
+              542,
+              577,
+              702,
+              714,
+              722,
+              723,
+              729,
+              763,
+              777,
+              784,
+              785,
+              830,
+              1068,
+              1083,
+              1084,
+              1085,
+              1102,
+              1193,
+              1195,
+              1197,
+              1254,
+              1255,
+              1301,
+              1368,
+              1457,
+              1820,
+              1973,
+              1985,
+              1998,
+              2476,
+              2544,
+              2591,
+              2710
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/src/repository_store.ts",
+          "categories": {
+            "shared_state": [
+              133,
+              358
+            ]
+          }
+        },
+        {
+          "path": "services/github-state/src/runner-capacity.ts",
+          "categories": {
+            "github_origin": [
+              39,
+              50
+            ],
+            "graphql": [
+              29,
+              145,
+              147,
+              177,
+              226
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/ci/.github/workflows/collect.yml",
+          "categories": {
+            "credentials": [
+              40,
+              58
+            ],
+            "workflow_event": [
+              13
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/ci/.github/workflows/publish.yml",
+          "categories": {
+            "gh_cli": [
+              43,
+              44,
+              46
+            ],
+            "credentials": [
+              41
+            ],
+            "workflow_event": [
+              14
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/downstream/api-docs.yml",
+          "categories": {
+            "gh_cli": [
+              77,
+              79,
+              81
+            ],
+            "credentials": [
+              72
+            ],
+            "workflow_event": [
+              13
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/api-docs.yml",
+          "categories": {
+            "github_origin": [
+              89
+            ],
+            "gh_cli": [
+              224
+            ],
+            "credentials": [
+              218,
+              259
+            ],
+            "workflow_event": [
+              29
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/auto-merge.yml",
+          "categories": {
+            "gh_cli": [
+              72
+            ],
+            "credentials": [
+              60
+            ],
+            "workflow_event": [
+              21,
+              28,
+              45,
+              49,
+              50,
+              65,
+              67
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/ci.yml",
+          "categories": {
+            "github_origin": [
+              117
+            ],
+            "credentials": [
+              59,
+              267
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/claims-access.yml",
+          "categories": {
+            "credentials": [
+              52,
+              64
+            ],
+            "workflow_event": [
+              24
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/deprecated-prs.yml",
+          "categories": {
+            "credentials": [
+              79,
+              91
+            ],
+            "workflow_event": [
+              8
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/housekeeping.yml",
+          "categories": {
+            "credentials": [
+              32,
+              53
+            ],
+            "workflow_event": [
+              19
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/lint-full.yml",
+          "categories": {
+            "github_origin": [
+              103
+            ],
+            "gh_cli": [
+              245,
+              248,
+              253,
+              258,
+              259,
+              261,
+              262,
+              264,
+              276
+            ],
+            "credentials": [
+              49,
+              215,
+              228
+            ],
+            "workflow_event": [
+              16
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/merge-conflicts.yml",
+          "categories": {
+            "gh_cli": [
+              26
+            ],
+            "credentials": [
+              52,
+              69,
+              98
+            ],
+            "workflow_event": [
+              6,
+              7,
+              45,
+              82
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/merge-sweep.yml",
+          "categories": {
+            "workflow_event": [
+              19,
+              21,
+              51
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/nightly-verify.yml",
+          "categories": {
+            "github_origin": [
+              347,
+              582
+            ],
+            "workflow_event": [
+              42,
+              175
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/pages.yml",
+          "categories": {
+            "github_origin": [
+              160,
+              532
+            ],
+            "graphql": [
+              206,
+              376
+            ],
+            "gh_cli": [
+              247,
+              981,
+              989,
+              993,
+              1016,
+              1028
+            ],
+            "credentials": [
+              111,
+              114,
+              141,
+              231,
+              295,
+              332,
+              364,
+              381,
+              964
+            ],
+            "workflow_event": [
+              52
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/pr-build.yml",
+          "categories": {
+            "workflow_event": [
+              3,
+              5,
+              12,
+              14,
+              17,
+              19
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/pr-status.yml",
+          "categories": {
+            "gh_cli": [
+              110,
+              113,
+              115,
+              131,
+              138
+            ],
+            "credentials": [
+              76,
+              104,
+              127,
+              157
+            ],
+            "workflow_event": [
+              24,
+              25,
+              30,
+              42,
+              43,
+              47,
+              50
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/publish-lake-cache.yml",
+          "categories": {
+            "github_origin": [
+              114
+            ],
+            "source_identity": [
+              52
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/retry-ci-status.yml",
+          "categories": {
+            "workflow_event": [
+              10
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/roadmap-label.yml",
+          "categories": {
+            "credentials": [
+              48,
+              49,
+              86
+            ],
+            "workflow_event": [
+              15,
+              22,
+              46
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/stuck-alerts.yml",
+          "categories": {
+            "credentials": [
+              52
+            ],
+            "workflow_event": [
+              24
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/toolchain-tags.yml",
+          "categories": {
+            "credentials": [
+              76
+            ],
+            "workflow_event": [
+              33,
+              35,
+              55
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/update-upstreams.yml",
+          "categories": {
+            "github_origin": [
+              32,
+              97
+            ],
+            "gh_cli": [
+              93,
+              100,
+              104
+            ],
+            "credentials": [
+              75,
+              77,
+              86
+            ],
+            "workflow_event": [
+              3
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/update.yml",
+          "categories": {
+            "github_origin": [
+              72
+            ],
+            "credentials": [
+              45,
+              81,
+              90,
+              112
+            ],
+            "workflow_event": [
+              8
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/.github/workflows/zulip-healthcheck.yml",
+          "categories": {
+            "workflow_event": [
+              13
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/scripts/ci_git.py",
+          "categories": {
+            "github_origin": [
+              36,
+              54
+            ],
+            "credentials": [
+              208
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/project/scripts/ci_status.py",
+          "categories": {
+            "github_origin": [
+              66,
+              99
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/roadmap/.github/workflows/ci.yml",
+          "categories": {
+            "workflow_event": [
+              6
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/roadmap/.github/workflows/progress-announce.yml",
+          "categories": {
+            "workflow_event": [
+              19
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/roadmap/.github/workflows/progress-merge.yml",
+          "categories": {
+            "gh_cli": [
+              86,
+              107
+            ],
+            "credentials": [
+              54
+            ],
+            "workflow_event": [
+              11,
+              20,
+              31,
+              66,
+              81
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/attest-pr-config.sh",
+          "categories": {
+            "workflow_event": [
+              32
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/bors_scope_approval.py",
+          "categories": {
+            "gh_cli": [
+              26
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/bump_latest.py",
+          "categories": {
+            "github_origin": [
+              161,
+              257,
+              388,
+              389,
+              416
+            ],
+            "gh_cli": [
+              55,
+              335,
+              427
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/cancel_bors_candidate.py",
+          "categories": {
+            "github_origin": [
+              163
+            ],
+            "credentials": [
+              194
+            ],
+            "source_identity": [
+              66
+            ],
+            "workflow_event": [
+              86,
+              93,
+              111
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/check-bump.sh",
+          "categories": {
+            "github_origin": [
+              91
+            ],
+            "gh_cli": [
+              34,
+              138,
+              145,
+              170,
+              179,
+              207
+            ],
+            "source_identity": [
+              84
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/ci_daily_graphs.py",
+          "categories": {
+            "github_origin": [
+              377,
+              455
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/ci_git.py",
+          "categories": {
+            "github_origin": [
+              36,
+              54
+            ],
+            "credentials": [
+              208
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/ci_live_summary.py",
+          "categories": {
+            "github_origin": [
+              54,
+              151
+            ],
+            "credentials": [
+              152
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/ci_recovery.py",
+          "categories": {
+            "graphql": [
+              51,
+              90
+            ],
+            "workflow_event": [
+              116
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/ci_stats_graphs.py",
+          "categories": {
+            "github_origin": [
+              6,
+              369
+            ],
+            "gh_cli": [
+              360
+            ],
+            "workflow_event": [
+              98
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/ci_status.py",
+          "categories": {
+            "github_origin": [
+              66,
+              99
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/claim.sh",
+          "categories": {
+            "github_origin": [
+              32
+            ],
+            "source_identity": [
+              31
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/claims_access.py",
+          "categories": {
+            "gh_cli": [
+              52,
+              59
+            ],
+            "credentials": [
+              27,
+              39,
+              52,
+              91,
+              192
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/dependency-warming.md",
+          "categories": {
+            "gh_cli": [
+              39,
+              40,
+              41,
+              42,
+              46
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/deprecated_prs.py",
+          "categories": {
+            "github_origin": [
+              61,
+              266
+            ],
+            "graphql": [
+              159
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/finalize_batch.py",
+          "categories": {
+            "github_origin": [
+              27,
+              221,
+              255
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/fleet_recovery.py",
+          "categories": {
+            "github_origin": [
+              218
+            ],
+            "workflow_event": [
+              4,
+              41,
+              42
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/fleet_runner.py",
+          "categories": {
+            "github_origin": [
+              106,
+              200
+            ],
+            "credentials": [
+              392
+            ],
+            "shared_state": [
+              148,
+              399,
+              445
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/github_api.py",
+          "categories": {
+            "github_origin": [
+              520
+            ],
+            "graphql": [
+              119,
+              152,
+              165,
+              209,
+              213,
+              214,
+              215,
+              216,
+              299,
+              301,
+              388,
+              403,
+              437,
+              438,
+              444
+            ],
+            "gh_cli": [
+              53,
+              58,
+              182,
+              396
+            ],
+            "credentials": [
+              3,
+              36,
+              96,
+              110,
+              139,
+              140,
+              143,
+              144,
+              202,
+              245,
+              246,
+              251
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/github_api_report.py",
+          "categories": {
+            "graphql": [
+              40,
+              53,
+              56,
+              64,
+              120
+            ],
+            "gh_cli": [
+              6
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/github_app_token.py",
+          "categories": {
+            "github_origin": [
+              57
+            ],
+            "credentials": [
+              38
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/housekeeping.py",
+          "categories": {
+            "gh_cli": [
+              126,
+              194,
+              212
+            ],
+            "credentials": [
+              54
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/lake-cache-get.sh",
+          "categories": {
+            "github_origin": [
+              37,
+              38
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/lake_cache_probe.py",
+          "categories": {
+            "source_identity": [
+              29
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/lake_cache_reuse.py",
+          "categories": {
+            "github_origin": [
+              12,
+              13
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/lint-scope.sh",
+          "categories": {
+            "credentials": [
+              15
+            ],
+            "workflow_event": [
+              16,
+              18,
+              19,
+              50,
+              51,
+              60,
+              71
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/lint_scope_policy.py",
+          "categories": {
+            "graphql": [
+              48,
+              61,
+              63
+            ],
+            "gh_cli": [
+              48
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/loc_roadmap_graph.py",
+          "categories": {
+            "gh_cli": [
+              21,
+              60,
+              70
+            ],
+            "credentials": [
+              19
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/maintenance_builds.py",
+          "categories": {
+            "workflow_event": [
+              43,
+              49
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/participant_graph.py",
+          "categories": {
+            "graphql": [
+              32,
+              111,
+              135
+            ],
+            "gh_cli": [
+              64
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/pipeline_health.md",
+          "categories": {
+            "graphql": [
+              161
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/pr_stats_graphs.md",
+          "categories": {
+            "graphql": [
+              101
+            ],
+            "credentials": [
+              12
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/pr_stats_graphs.py",
+          "categories": {
+            "graphql": [
+              4,
+              169,
+              175,
+              205,
+              297,
+              298,
+              306,
+              322,
+              413
+            ],
+            "gh_cli": [
+              178,
+              198
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/pr_status/batch.py",
+          "categories": {
+            "workflow_event": [
+              166,
+              167,
+              175,
+              182
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/pr_status/conflicts.py",
+          "categories": {
+            "graphql": [
+              136,
+              142
+            ],
+            "gh_cli": [
+              117,
+              206,
+              211
+            ],
+            "credentials": [
+              59
+            ],
+            "workflow_event": [
+              6,
+              7
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/pr_status/core.py",
+          "categories": {
+            "gh_cli": [
+              121,
+              184,
+              213,
+              216,
+              232,
+              241,
+              251,
+              253
+            ],
+            "credentials": [
+              55,
+              78
+            ],
+            "workflow_event": [
+              275,
+              307,
+              334,
+              357,
+              467
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/pr_status/labels.py",
+          "categories": {
+            "gh_cli": [
+              46,
+              81,
+              109,
+              118
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/pr_status/readiness.py",
+          "categories": {
+            "github_origin": [
+              199
+            ],
+            "graphql": [
+              111,
+              120,
+              123,
+              127,
+              137,
+              153
+            ],
+            "gh_cli": [
+              123,
+              197
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/pr_status/stuck_alerts.py",
+          "categories": {
+            "github_origin": [
+              267,
+              302,
+              308,
+              403,
+              485,
+              516,
+              613,
+              625,
+              703
+            ],
+            "gh_cli": [
+              488,
+              738
+            ],
+            "credentials": [
+              102
+            ],
+            "workflow_event": [
+              406,
+              739
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/pr_status/stuck_snapshot.py",
+          "categories": {
+            "graphql": [
+              96,
+              139,
+              235,
+              288
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/pr_status/zulip.py",
+          "categories": {
+            "github_origin": [
+              149,
+              276,
+              349,
+              354
+            ],
+            "credentials": [
+              62
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/prepare_docs.py",
+          "categories": {
+            "github_origin": [
+              23,
+              31,
+              44
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/probe_dependency_sandbox.sh",
+          "categories": {
+            "credentials": [
+              28
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/publication-capacity.md",
+          "categories": {
+            "github_origin": [
+              50
+            ],
+            "gh_cli": [
+              104,
+              105,
+              107
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/queue_release.py",
+          "categories": {
+            "graphql": [
+              26
+            ],
+            "gh_cli": [
+              14
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/roadmap_label.md",
+          "categories": {
+            "github_origin": [
+              153,
+              154
+            ],
+            "graphql": [
+              13,
+              27,
+              36,
+              51,
+              78,
+              80,
+              129,
+              145,
+              154,
+              157,
+              159,
+              171
+            ],
+            "gh_cli": [
+              42
+            ],
+            "credentials": [
+              12,
+              19,
+              20
+            ],
+            "workflow_event": [
+              22
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/roadmap_label.py",
+          "categories": {
+            "github_origin": [
+              289
+            ],
+            "credentials": [
+              40
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/roadmap_progress.py",
+          "categories": {
+            "graphql": [
+              603,
+              629
+            ],
+            "gh_cli": [
+              603,
+              629
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/stack-policy.md",
+          "categories": {
+            "workflow_event": [
+              57
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/stack_policy.py",
+          "categories": {
+            "github_origin": [
+              137,
+              157,
+              189,
+              279,
+              307,
+              708,
+              710,
+              711,
+              713,
+              723
+            ],
+            "graphql": [
+              157,
+              164
+            ],
+            "gh_cli": [
+              92
+            ],
+            "credentials": [
+              92
+            ],
+            "workflow_event": [
+              200
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/structure_nudge.py",
+          "categories": {
+            "github_origin": [
+              49
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/sync_web_pins.py",
+          "categories": {
+            "github_origin": [
+              52,
+              53
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/toolchain_tags.py",
+          "categories": {
+            "github_origin": [
+              76,
+              242
+            ],
+            "gh_cli": [
+              184,
+              187,
+              609,
+              620
+            ],
+            "credentials": [
+              49
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/claims.py",
+          "categories": {
+            "gh_cli": [
+              61
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/cli.py",
+          "categories": {
+            "gh_cli": [
+              190
+            ],
+            "workflow_event": [
+              33,
+              188
+            ],
+            "shared_state": [
+              52,
+              56,
+              64,
+              69,
+              75,
+              76,
+              106,
+              107,
+              138,
+              139
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/collector/build_db.py",
+          "categories": {
+            "workflow_event": [
+              230
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/collector/checkpoint.py",
+          "categories": {
+            "github_origin": [
+              24
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/collector/collect.py",
+          "categories": {
+            "source_identity": [
+              31,
+              32
+            ],
+            "workflow_event": [
+              81,
+              83,
+              87,
+              89,
+              220
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/collector/gh.py",
+          "categories": {
+            "github_origin": [
+              16
+            ],
+            "gh_cli": [
+              28
+            ],
+            "credentials": [
+              1,
+              24
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/collector/incremental.py",
+          "categories": {
+            "source_identity": [
+              628
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/collector/merge_identity.py",
+          "categories": {
+            "workflow_event": [
+              12,
+              30
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/collector/observations.py",
+          "categories": {
+            "source_identity": [
+              9,
+              25,
+              26,
+              29
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/collector/refresh_resources.py",
+          "categories": {
+            "source_identity": [
+              51
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/collector/resources.py",
+          "categories": {
+            "source_identity": [
+              24,
+              114,
+              134
+            ],
+            "workflow_event": [
+              28,
+              29,
+              34
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/credentials.py",
+          "categories": {
+            "github_origin": [
+              12,
+              13,
+              64,
+              72
+            ],
+            "gh_cli": [
+              38
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/deployment.py",
+          "categories": {
+            "github_origin": [
+              65
+            ],
+            "gh_cli": [
+              217
+            ],
+            "source_identity": [
+              204
+            ],
+            "workflow_event": [
+              51,
+              59
+            ],
+            "shared_state": [
+              24,
+              46,
+              66,
+              236,
+              242
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/doctor.py",
+          "categories": {
+            "github_origin": [
+              130,
+              131,
+              167,
+              184,
+              197,
+              213,
+              247,
+              276,
+              338,
+              359,
+              397,
+              452,
+              555,
+              758,
+              798,
+              812,
+              840,
+              852,
+              879,
+              973,
+              980,
+              982,
+              997,
+              1053,
+              1079,
+              1197,
+              1198,
+              1232,
+              1245,
+              1246,
+              1257,
+              1258,
+              1266,
+              1288,
+              1300,
+              1341,
+              1357,
+              1381,
+              1401
+            ],
+            "gh_cli": [
+              55,
+              121,
+              131,
+              146,
+              158,
+              171,
+              174,
+              196,
+              212,
+              246,
+              249,
+              273,
+              274,
+              281,
+              387,
+              451,
+              487,
+              549,
+              748,
+              758,
+              806,
+              817,
+              897,
+              963,
+              1076,
+              1080,
+              1154,
+              1166,
+              1167,
+              1168,
+              1172,
+              1190,
+              1199,
+              1227,
+              1237,
+              1264,
+              1349,
+              1371,
+              1399,
+              1414,
+              1427
+            ],
+            "credentials": [
+              134,
+              537,
+              542,
+              1191
+            ],
+            "source_identity": [
+              698,
+              699,
+              700,
+              743,
+              1072,
+              1077,
+              1081
+            ],
+            "workflow_event": [
+              325,
+              328
+            ],
+            "shared_state": [
+              909,
+              913,
+              915,
+              917,
+              919,
+              953,
+              959,
+              962,
+              963,
+              1059,
+              1061,
+              1064,
+              1067,
+              1069,
+              1070,
+              1079,
+              1081,
+              1089,
+              1095,
+              1096,
+              1100,
+              1101,
+              1447,
+              1448,
+              1557
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/github_state_setup.py",
+          "categories": {
+            "github_origin": [
+              30
+            ],
+            "gh_cli": [
+              75
+            ],
+            "shared_state": [
+              23,
+              24,
+              38,
+              58,
+              59
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/onboarding.py",
+          "categories": {
+            "github_origin": [
+              23,
+              25,
+              28,
+              31
+            ],
+            "gh_cli": [
+              28,
+              29,
+              31,
+              34,
+              36,
+              37
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/project.py",
+          "categories": {
+            "github_origin": [
+              28,
+              314,
+              315
+            ],
+            "gh_cli": [
+              256
+            ],
+            "source_identity": [
+              136,
+              172
+            ],
+            "shared_state": [
+              123,
+              124,
+              164
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/scaffold.py",
+          "categories": {
+            "github_origin": [
+              44
+            ],
+            "gh_cli": [
+              47
+            ],
+            "source_identity": [
+              93
+            ],
+            "shared_state": [
+              85,
+              87
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/survey_facts.py",
+          "categories": {
+            "workflow_event": [
+              143,
+              145,
+              147
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/templates.py",
+          "categories": {
+            "github_origin": [
+              533,
+              546,
+              575
+            ],
+            "gh_cli": [
+              484,
+              500,
+              546,
+              547,
+              551,
+              556
+            ],
+            "credentials": [
+              34,
+              548
+            ],
+            "source_identity": [
+              168
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/upstreams.py",
+          "categories": {
+            "github_origin": [
+              43
+            ],
+            "gh_cli": [
+              18
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "repository": "TauCetiFleet",
+      "source_revision": "6bdeb3184caad241a88e2ee51b3ef5b4add0ab2b",
+      "canonical_shared_assets": false,
+      "counts": {
+        "github_origin": 8,
+        "graphql": 0,
+        "gh_cli": 3,
+        "credentials": 10,
+        "source_identity": 1,
+        "workflow_event": 5,
+        "shared_state": 4
+      },
+      "files": [
+        {
+          "path": ".github/workflows/ci-broker-health.yml",
+          "categories": {
+            "workflow_event": [
+              5
+            ]
+          }
+        },
+        {
+          "path": "services/ci-broker/scripts/setup.py",
+          "categories": {
+            "github_origin": [
+              49,
+              87,
+              94,
+              95,
+              99,
+              174,
+              190
+            ],
+            "credentials": [
+              77,
+              154,
+              167,
+              181,
+              195
+            ],
+            "source_identity": [
+              105
+            ]
+          }
+        },
+        {
+          "path": "tauceti_fleet/bors_history.py",
+          "categories": {
+            "github_origin": [
+              73
+            ],
+            "credentials": [
+              58
+            ]
+          }
+        },
+        {
+          "path": "tauceti_fleet/capabilities.py",
+          "categories": {
+            "gh_cli": [
+              333
+            ],
+            "credentials": [
+              432,
+              442,
+              451,
+              455,
+              456,
+              461
+            ]
+          }
+        },
+        {
+          "path": "tauceti_fleet/ci.py",
+          "categories": {
+            "credentials": [
+              199,
+              208
+            ],
+            "workflow_event": [
+              132
+            ]
+          }
+        },
+        {
+          "path": "tauceti_fleet/ci_autoscale.py",
+          "categories": {
+            "github_origin": [
+              224
+            ],
+            "gh_cli": [
+              224,
+              231
+            ],
+            "credentials": [
+              206,
+              211,
+              222,
+              228,
+              358
+            ],
+            "workflow_event": [
+              321
+            ]
+          }
+        },
+        {
+          "path": "tauceti_fleet/ci_overview.py",
+          "categories": {
+            "github_origin": [
+              143
+            ],
+            "credentials": [
+              126,
+              185,
+              194,
+              249
+            ],
+            "shared_state": [
+              107,
+              113,
+              250,
+              251
+            ]
+          }
+        },
+        {
+          "path": "tauceti_fleet/ci_pool.py",
+          "categories": {
+            "shared_state": [
+              48,
+              52
+            ]
+          }
+        },
+        {
+          "path": "tauceti_fleet/ci_priority.py",
+          "categories": {
+            "workflow_event": [
+              92
+            ]
+          }
+        },
+        {
+          "path": "tauceti_fleet/github.py",
+          "categories": {
+            "github_origin": [
+              24
+            ],
+            "credentials": [
+              52,
+              82,
+              109,
+              148,
+              162
+            ]
+          }
+        },
+        {
+          "path": "tauceti_fleet/host.py",
+          "categories": {
+            "credentials": [
+              101,
+              131,
+              285,
+              356
+            ],
+            "workflow_event": [
+              593
+            ],
+            "shared_state": [
+              105,
+              131,
+              288,
+              353
+            ]
+          }
+        },
+        {
+          "path": "tauceti_fleet/remote.py",
+          "categories": {
+            "gh_cli": [
+              164
+            ],
+            "credentials": [
+              127,
+              139,
+              153,
+              156,
+              163,
+              164,
+              166
+            ],
+            "shared_state": [
+              144,
+              145,
+              153,
+              156
+            ]
+          }
+        },
+        {
+          "path": "tauceti_fleet/report.py",
+          "categories": {
+            "github_origin": [
+              136
+            ],
+            "credentials": [
+              74,
+              91
+            ]
+          }
+        },
+        {
+          "path": "tauceti_fleet/update.py",
+          "categories": {
+            "github_origin": [
+              54
+            ]
+          }
+        },
+        {
+          "path": "tauceti_fleet/vm.py",
+          "categories": {
+            "github_origin": [
+              192
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "repository": "TauCetiReview",
+      "source_revision": "7fd3a39e02c5a16cf7be65508a7ffb2c336dcada",
+      "canonical_shared_assets": false,
+      "counts": {
+        "github_origin": 8,
+        "graphql": 6,
+        "gh_cli": 12,
+        "credentials": 9,
+        "source_identity": 6,
+        "workflow_event": 5,
+        "shared_state": 0
+      },
+      "files": [
+        {
+          "path": ".github/workflows/merge-only.yml",
+          "categories": {
+            "graphql": [
+              209,
+              218,
+              224,
+              320
+            ],
+            "gh_cli": [
+              97,
+              99,
+              101,
+              110,
+              113,
+              116,
+              126,
+              146,
+              204,
+              209,
+              218,
+              224,
+              239,
+              242,
+              289,
+              291,
+              320
+            ],
+            "credentials": [
+              95,
+              132,
+              167,
+              184,
+              192,
+              199,
+              344
+            ],
+            "workflow_event": [
+              307
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/merge-sweep.yml",
+          "categories": {
+            "credentials": [
+              102,
+              129
+            ],
+            "source_identity": [
+              124,
+              125,
+              143
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/review.yml",
+          "categories": {
+            "github_origin": [
+              173,
+              221,
+              225,
+              369,
+              394,
+              397
+            ],
+            "gh_cli": [
+              117,
+              121,
+              123,
+              135,
+              141,
+              144,
+              148,
+              157,
+              163,
+              337,
+              341,
+              367,
+              396,
+              419
+            ],
+            "credentials": [
+              115,
+              188,
+              198,
+              292,
+              306,
+              323,
+              351,
+              363,
+              366,
+              377,
+              388,
+              404,
+              415
+            ],
+            "source_identity": [
+              170,
+              349,
+              360,
+              376,
+              382,
+              386,
+              389
+            ],
+            "workflow_event": [
+              19,
+              270
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/shadow-review.yml",
+          "categories": {
+            "github_origin": [
+              100,
+              103,
+              169
+            ],
+            "gh_cli": [
+              65,
+              67,
+              69,
+              79,
+              85
+            ],
+            "credentials": [
+              63,
+              155
+            ],
+            "workflow_event": [
+              8
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/tests.yml",
+          "categories": {
+            "github_origin": [
+              21
+            ]
+          }
+        },
+        {
+          "path": "pyproject.toml",
+          "categories": {
+            "github_origin": [
+              9
+            ]
+          }
+        },
+        {
+          "path": "runner/admission_policy.py",
+          "categories": {
+            "gh_cli": [
+              130
+            ]
+          }
+        },
+        {
+          "path": "runner/api_budget.py",
+          "categories": {
+            "graphql": [
+              3,
+              26,
+              35,
+              36,
+              63,
+              78,
+              79,
+              83,
+              115,
+              116,
+              120,
+              122
+            ],
+            "gh_cli": [
+              109
+            ]
+          }
+        },
+        {
+          "path": "runner/archive.py",
+          "categories": {
+            "github_origin": [
+              207,
+              241
+            ]
+          }
+        },
+        {
+          "path": "runner/backend.py",
+          "categories": {
+            "graphql": [
+              42,
+              69,
+              90
+            ],
+            "gh_cli": [
+              31
+            ],
+            "source_identity": [
+              22,
+              121
+            ]
+          }
+        },
+        {
+          "path": "runner/cli.py",
+          "categories": {
+            "github_origin": [
+              128,
+              142,
+              219,
+              917,
+              939,
+              955
+            ],
+            "graphql": [
+              185
+            ],
+            "gh_cli": [
+              20,
+              151,
+              182,
+              184,
+              190,
+              241,
+              266,
+              289,
+              379,
+              470,
+              728,
+              743,
+              876,
+              1050,
+              1052
+            ],
+            "credentials": [
+              1054
+            ],
+            "source_identity": [
+              60
+            ],
+            "workflow_event": [
+              468,
+              858
+            ]
+          }
+        },
+        {
+          "path": "runner/costs.py",
+          "categories": {
+            "gh_cli": [
+              470
+            ]
+          }
+        },
+        {
+          "path": "runner/merge_from_scoreboard.py",
+          "categories": {
+            "gh_cli": [
+              62
+            ],
+            "source_identity": [
+              74
+            ]
+          }
+        },
+        {
+          "path": "runner/post.py",
+          "categories": {
+            "graphql": [
+              374,
+              376,
+              382,
+              390,
+              391
+            ],
+            "gh_cli": [
+              56,
+              161,
+              203,
+              231,
+              269,
+              283,
+              376,
+              391
+            ],
+            "credentials": [
+              4,
+              195,
+              525,
+              526
+            ]
+          }
+        },
+        {
+          "path": "runner/pr_diff.py",
+          "categories": {
+            "github_origin": [
+              319
+            ],
+            "gh_cli": [
+              6,
+              13,
+              294,
+              297,
+              300
+            ],
+            "credentials": [
+              64
+            ]
+          }
+        },
+        {
+          "path": "runner/queue_reservation.py",
+          "categories": {
+            "credentials": [
+              21
+            ]
+          }
+        },
+        {
+          "path": "runner/render.py",
+          "categories": {
+            "github_origin": [
+              76,
+              77,
+              86
+            ]
+          }
+        },
+        {
+          "path": "runner/review.py",
+          "categories": {
+            "source_identity": [
+              557
+            ]
+          }
+        },
+        {
+          "path": "runner/sweep.py",
+          "categories": {
+            "graphql": [
+              280,
+              292,
+              313,
+              314,
+              340,
+              462
+            ],
+            "gh_cli": [
+              104,
+              118,
+              119,
+              874
+            ],
+            "credentials": [
+              41
+            ],
+            "workflow_event": [
+              21
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "repository": "TauCetiProgress",
+      "source_revision": "bae9af5ba114a73e0cc15823f335f503618b327b",
+      "canonical_shared_assets": false,
+      "counts": {
+        "github_origin": 6,
+        "graphql": 3,
+        "gh_cli": 5,
+        "credentials": 2,
+        "source_identity": 2,
+        "workflow_event": 3,
+        "shared_state": 0
+      },
+      "files": [
+        {
+          "path": ".github/scripts/collect.py",
+          "categories": {
+            "github_origin": [
+              221
+            ],
+            "gh_cli": [
+              68,
+              70,
+              77,
+              83,
+              85,
+              112,
+              114,
+              152,
+              170,
+              183,
+              246
+            ],
+            "source_identity": [
+              53
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/merge.yml",
+          "categories": {
+            "gh_cli": [
+              224,
+              248,
+              303,
+              318,
+              334,
+              337,
+              338,
+              349,
+              354,
+              362,
+              404,
+              409,
+              412,
+              418,
+              424,
+              426,
+              428,
+              466,
+              481,
+              493,
+              510
+            ],
+            "credentials": [
+              17,
+              148,
+              164,
+              210,
+              237,
+              271,
+              397,
+              453
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/tests.yml",
+          "categories": {
+            "workflow_event": [
+              10
+            ]
+          }
+        },
+        {
+          "path": "progress/announce.py",
+          "categories": {
+            "github_origin": [
+              60
+            ]
+          }
+        },
+        {
+          "path": "progress/apply.py",
+          "categories": {
+            "github_origin": [
+              98,
+              393
+            ],
+            "graphql": [
+              165
+            ],
+            "gh_cli": [
+              10
+            ]
+          }
+        },
+        {
+          "path": "progress/files.py",
+          "categories": {
+            "github_origin": [
+              91
+            ]
+          }
+        },
+        {
+          "path": "progress/forks.py",
+          "categories": {
+            "graphql": [
+              42
+            ]
+          }
+        },
+        {
+          "path": "progress/gh.py",
+          "categories": {
+            "github_origin": [
+              98,
+              311
+            ],
+            "graphql": [
+              47,
+              134,
+              152,
+              153,
+              158,
+              160,
+              218,
+              241,
+              257,
+              272
+            ],
+            "gh_cli": [
+              77,
+              125,
+              150,
+              203
+            ],
+            "source_identity": [
+              26
+            ]
+          }
+        },
+        {
+          "path": "pyproject.toml",
+          "categories": {
+            "github_origin": [
+              10
+            ]
+          }
+        },
+        {
+          "path": "roadmap-workflows/progress-announce.yml",
+          "categories": {
+            "workflow_event": [
+              19
+            ]
+          }
+        },
+        {
+          "path": "roadmap-workflows/progress-merge.yml",
+          "categories": {
+            "gh_cli": [
+              88,
+              126,
+              128
+            ],
+            "credentials": [
+              54
+            ],
+            "workflow_event": [
+              11,
+              20,
+              31,
+              68,
+              83
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "repository": "TauCetiCI",
+      "source_revision": "44dccf74ac2ded451b8060834291dfedfdde5122",
+      "canonical_shared_assets": false,
+      "counts": {
+        "github_origin": 10,
+        "graphql": 0,
+        "gh_cli": 4,
+        "credentials": 7,
+        "source_identity": 0,
+        "workflow_event": 9,
+        "shared_state": 0
+      },
+      "files": [
+        {
+          "path": ".github/workflows/backfill.yml",
+          "categories": {
+            "credentials": [
+              42
+            ],
+            "workflow_event": [
+              6
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/collect.yml",
+          "categories": {
+            "credentials": [
+              46,
+              64
+            ],
+            "workflow_event": [
+              9
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/publish.yml",
+          "categories": {
+            "gh_cli": [
+              42,
+              43,
+              45
+            ],
+            "credentials": [
+              40
+            ],
+            "workflow_event": [
+              5
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/resources.yml",
+          "categories": {
+            "github_origin": [
+              59
+            ],
+            "credentials": [
+              40,
+              50
+            ],
+            "workflow_event": [
+              5
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/runner-benchmark.yml",
+          "categories": {
+            "gh_cli": [
+              120
+            ],
+            "credentials": [
+              35,
+              119
+            ],
+            "workflow_event": [
+              4
+            ]
+          }
+        },
+        {
+          "path": "benchmarks/experiment.py",
+          "categories": {
+            "gh_cli": [
+              174
+            ],
+            "workflow_event": [
+              175
+            ]
+          }
+        },
+        {
+          "path": "benchmarks/run.sh",
+          "categories": {
+            "github_origin": [
+              17
+            ],
+            "credentials": [
+              99
+            ]
+          }
+        },
+        {
+          "path": "services/live-ci/scripts/setup.py",
+          "categories": {
+            "github_origin": [
+              43
+            ],
+            "gh_cli": [
+              166
+            ],
+            "credentials": [
+              73,
+              83
+            ]
+          }
+        },
+        {
+          "path": "services/live-ci/src/control.ts",
+          "categories": {
+            "github_origin": [
+              467
+            ]
+          }
+        },
+        {
+          "path": "services/live-ci/src/github.ts",
+          "categories": {
+            "github_origin": [
+              47
+            ]
+          }
+        },
+        {
+          "path": "services/live-ci/src/index.ts",
+          "categories": {
+            "github_origin": [
+              137,
+              153,
+              176,
+              203
+            ]
+          }
+        },
+        {
+          "path": "services/live-ci/src/model.ts",
+          "categories": {
+            "github_origin": [
+              144
+            ],
+            "workflow_event": [
+              115,
+              117,
+              124,
+              261
+            ]
+          }
+        },
+        {
+          "path": "services/live-ci/src/oidc.ts",
+          "categories": {
+            "workflow_event": [
+              38,
+              46,
+              47,
+              48,
+              49
+            ]
+          }
+        },
+        {
+          "path": "services/live-ci/src/operations-jobs.ts",
+          "categories": {
+            "github_origin": [
+              88,
+              89
+            ],
+            "workflow_event": [
+              86
+            ]
+          }
+        },
+        {
+          "path": "services/live-ci/src/operations-model.ts",
+          "categories": {
+            "github_origin": [
+              140,
+              278,
+              281
+            ]
+          }
+        },
+        {
+          "path": "services/live-ci/src/storage.ts",
+          "categories": {
+            "github_origin": [
+              513
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "repository": "TauCeti",
+      "source_revision": "1b8cb46b5f15ee7b88a66ea05471a460ba2c58d7",
+      "canonical_shared_assets": false,
+      "counts": {
+        "github_origin": 30,
+        "graphql": 4,
+        "gh_cli": 15,
+        "credentials": 27,
+        "source_identity": 3,
+        "workflow_event": 28,
+        "shared_state": 3
+      },
+      "files": [
+        {
+          "path": ".github/workflows/api-docs.yml",
+          "categories": {
+            "github_origin": [
+              98
+            ],
+            "gh_cli": [
+              262
+            ],
+            "credentials": [
+              256,
+              297
+            ],
+            "workflow_event": [
+              29
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/cancel-bors-candidate.yml",
+          "categories": {
+            "credentials": [
+              40
+            ],
+            "source_identity": [
+              8
+            ],
+            "workflow_event": [
+              4
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/ci-live-summary.yml",
+          "categories": {
+            "credentials": [
+              33
+            ],
+            "workflow_event": [
+              5
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/ci.yml",
+          "categories": {
+            "github_origin": [
+              122
+            ],
+            "credentials": [
+              63,
+              278
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/claims-access.yml",
+          "categories": {
+            "credentials": [
+              52,
+              70
+            ],
+            "workflow_event": [
+              24
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/deprecated-prs.yml",
+          "categories": {
+            "credentials": [
+              79,
+              91
+            ],
+            "workflow_event": [
+              8
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/fleet-recovery.yml",
+          "categories": {
+            "credentials": [
+              38
+            ],
+            "workflow_event": [
+              16
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/fleet-smoke.yml",
+          "categories": {
+            "gh_cli": [
+              22
+            ],
+            "credentials": [
+              22
+            ],
+            "workflow_event": [
+              3
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/full-lint-label.yml",
+          "categories": {
+            "gh_cli": [
+              6,
+              26
+            ],
+            "credentials": [
+              23
+            ],
+            "workflow_event": [
+              10
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/housekeeping.yml",
+          "categories": {
+            "credentials": [
+              32,
+              53
+            ],
+            "workflow_event": [
+              19
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/infrastructure-tests.yml",
+          "categories": {
+            "github_origin": [
+              95,
+              138
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/lint-full.yml",
+          "categories": {
+            "github_origin": [
+              104
+            ],
+            "gh_cli": [
+              246,
+              249,
+              254,
+              259,
+              260,
+              262,
+              263,
+              265,
+              277
+            ],
+            "credentials": [
+              49,
+              216,
+              229
+            ],
+            "workflow_event": [
+              16
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/merge-conflicts.yml",
+          "categories": {
+            "gh_cli": [
+              26
+            ],
+            "credentials": [
+              53,
+              71,
+              100
+            ],
+            "workflow_event": [
+              6,
+              7,
+              46,
+              84
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/nightly-verify.yml",
+          "categories": {
+            "github_origin": [
+              127,
+              460,
+              663
+            ],
+            "workflow_event": [
+              41,
+              291
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/pages.yml",
+          "categories": {
+            "github_origin": [
+              169,
+              552
+            ],
+            "graphql": [
+              215,
+              385
+            ],
+            "gh_cli": [
+              256,
+              1009,
+              1017,
+              1021,
+              1044,
+              1056
+            ],
+            "credentials": [
+              114,
+              117,
+              150,
+              240,
+              304,
+              341,
+              373,
+              390,
+              992
+            ],
+            "workflow_event": [
+              52
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/pick-runner.yml",
+          "categories": {
+            "credentials": [
+              86
+            ],
+            "shared_state": [
+              27,
+              87
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/pr-build.yml",
+          "categories": {
+            "github_origin": [
+              690,
+              1540
+            ],
+            "graphql": [
+              45
+            ],
+            "gh_cli": [
+              336
+            ],
+            "credentials": [
+              180,
+              285,
+              440,
+              473,
+              557,
+              964,
+              1328,
+              1695
+            ],
+            "source_identity": [
+              56
+            ],
+            "workflow_event": [
+              2,
+              20,
+              21,
+              24,
+              31,
+              33,
+              36,
+              38,
+              53,
+              59,
+              64,
+              78,
+              79,
+              107,
+              109,
+              113,
+              148,
+              190,
+              196,
+              201,
+              202,
+              205,
+              221,
+              335,
+              342,
+              343,
+              431,
+              432,
+              469,
+              1115,
+              1550,
+              1641,
+              1651,
+              1656
+            ],
+            "shared_state": [
+              86
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/pr-labels.yml",
+          "categories": {
+            "credentials": [
+              23,
+              38,
+              48,
+              71,
+              101,
+              118,
+              146
+            ],
+            "workflow_event": [
+              16,
+              33,
+              54,
+              112
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/pr-profile.yml",
+          "categories": {
+            "github_origin": [
+              326
+            ],
+            "gh_cli": [
+              124,
+              133,
+              158,
+              172,
+              179,
+              710,
+              714,
+              716,
+              758
+            ],
+            "credentials": [
+              94,
+              155,
+              165,
+              285,
+              703,
+              725
+            ],
+            "workflow_event": [
+              19,
+              21,
+              23,
+              25,
+              37,
+              38,
+              39,
+              40,
+              43,
+              74,
+              75,
+              76,
+              77,
+              99,
+              101,
+              103,
+              108,
+              116,
+              119,
+              123
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/pr-status.yml",
+          "categories": {
+            "gh_cli": [
+              115,
+              118,
+              120,
+              136,
+              143
+            ],
+            "credentials": [
+              75,
+              109,
+              132,
+              162
+            ],
+            "workflow_event": [
+              24,
+              25,
+              30,
+              42,
+              43,
+              47,
+              50
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/publish-lake-cache.yml",
+          "categories": {
+            "github_origin": [
+              119
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/retry-ci-status.yml",
+          "categories": {
+            "credentials": [
+              62,
+              125,
+              168
+            ],
+            "workflow_event": [
+              11,
+              28,
+              29,
+              145
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/review.yml",
+          "categories": {
+            "gh_cli": [
+              49,
+              68
+            ],
+            "credentials": [
+              35
+            ],
+            "workflow_event": [
+              7,
+              26,
+              27,
+              54
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/roadmap-label-reconcile.yml",
+          "categories": {
+            "graphql": [
+              123
+            ],
+            "gh_cli": [
+              75,
+              79,
+              84,
+              123
+            ],
+            "credentials": [
+              70,
+              92,
+              106
+            ],
+            "workflow_event": [
+              7,
+              12,
+              33,
+              35
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/shadow-audits.yml",
+          "categories": {
+            "github_origin": [
+              58
+            ],
+            "workflow_event": [
+              5
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/stack-policy.yml",
+          "categories": {
+            "gh_cli": [
+              97,
+              103,
+              113
+            ],
+            "credentials": [
+              76,
+              89,
+              124
+            ],
+            "workflow_event": [
+              4,
+              13,
+              35,
+              44,
+              45,
+              58,
+              61,
+              106,
+              107,
+              135
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/stuck-alerts.yml",
+          "categories": {
+            "credentials": [
+              58
+            ],
+            "workflow_event": [
+              24
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/toolchain-tags.yml",
+          "categories": {
+            "credentials": [
+              82
+            ],
+            "workflow_event": [
+              33,
+              35,
+              55
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/update.yml",
+          "categories": {
+            "github_origin": [
+              72
+            ],
+            "credentials": [
+              45,
+              81,
+              90,
+              112
+            ],
+            "workflow_event": [
+              8
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/warm-dependencies.yml",
+          "categories": {
+            "github_origin": [
+              98
+            ],
+            "gh_cli": [
+              71,
+              76
+            ],
+            "credentials": [
+              64
+            ],
+            "workflow_event": [
+              11,
+              14
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/website-tests.yml",
+          "categories": {
+            "github_origin": [
+              36
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/zulip-healthcheck.yml",
+          "categories": {
+            "workflow_event": [
+              13
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/zulip-pr-backfill.yml",
+          "categories": {
+            "gh_cli": [
+              72
+            ],
+            "credentials": [
+              38,
+              58,
+              70
+            ],
+            "workflow_event": [
+              9
+            ]
+          }
+        },
+        {
+          "path": "AGENTS.md",
+          "categories": {
+            "github_origin": [
+              9,
+              114,
+              131
+            ]
+          }
+        },
+        {
+          "path": "docbuild/lakefile.toml",
+          "categories": {
+            "github_origin": [
+              10,
+              13,
+              23
+            ]
+          }
+        },
+        {
+          "path": "formalization.yaml",
+          "categories": {
+            "github_origin": [
+              26,
+              30,
+              92
+            ]
+          }
+        },
+        {
+          "path": "lakefile.toml",
+          "categories": {
+            "github_origin": [
+              15
+            ]
+          }
+        },
+        {
+          "path": "scripts/attest-pr-config.sh",
+          "categories": {
+            "github_origin": [
+              3
+            ]
+          }
+        },
+        {
+          "path": "scripts/build-audit-driver.sh",
+          "categories": {
+            "github_origin": [
+              3
+            ]
+          }
+        },
+        {
+          "path": "scripts/build-lint-driver.sh",
+          "categories": {
+            "github_origin": [
+              3
+            ]
+          }
+        },
+        {
+          "path": "scripts/bulk-unpack-cache.py",
+          "categories": {
+            "github_origin": [
+              9
+            ]
+          }
+        },
+        {
+          "path": "scripts/check-bump.sh",
+          "categories": {
+            "github_origin": [
+              3
+            ]
+          }
+        },
+        {
+          "path": "scripts/control_batches/roadmap_batch.py",
+          "categories": {
+            "graphql": [
+              59,
+              64
+            ]
+          }
+        },
+        {
+          "path": "scripts/lake-cache-get.sh",
+          "categories": {
+            "github_origin": [
+              3
+            ]
+          }
+        },
+        {
+          "path": "scripts/lint-env.sh",
+          "categories": {
+            "github_origin": [
+              3
+            ]
+          }
+        },
+        {
+          "path": "scripts/lint-scope.sh",
+          "categories": {
+            "github_origin": [
+              3
+            ]
+          }
+        },
+        {
+          "path": "scripts/lint-style.sh",
+          "categories": {
+            "github_origin": [
+              3
+            ]
+          }
+        },
+        {
+          "path": "scripts/probe_dependency_sandbox.sh",
+          "categories": {
+            "github_origin": [
+              3
+            ]
+          }
+        },
+        {
+          "path": "scripts/sandbox-build.sh",
+          "categories": {
+            "github_origin": [
+              3
+            ]
+          }
+        },
+        {
+          "path": "scripts/source-modules.sh",
+          "categories": {
+            "github_origin": [
+              3
+            ]
+          }
+        },
+        {
+          "path": "tauceti.toml",
+          "categories": {
+            "gh_cli": [
+              27
+            ],
+            "source_identity": [
+              59
+            ],
+            "shared_state": [
+              52,
+              54
+            ]
+          }
+        },
+        {
+          "path": "web/lakefile.toml",
+          "categories": {
+            "github_origin": [
+              6
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "repository": "TauCetiRoadmap",
+      "source_revision": "eaf17b10d9267c0e3cdd3b62dd5e8983e47c690d",
+      "canonical_shared_assets": false,
+      "counts": {
+        "github_origin": 2,
+        "graphql": 0,
+        "gh_cli": 5,
+        "credentials": 7,
+        "source_identity": 0,
+        "workflow_event": 9,
+        "shared_state": 0
+      },
+      "files": [
+        {
+          "path": ".github/workflows/auto-merge.yml",
+          "categories": {
+            "gh_cli": [
+              8,
+              14,
+              24,
+              59,
+              73,
+              94
+            ],
+            "credentials": [
+              4,
+              41,
+              51
+            ],
+            "workflow_event": [
+              12,
+              14,
+              16
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/ci.yml",
+          "categories": {
+            "workflow_event": [
+              21
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/grant-triage.yml",
+          "categories": {
+            "gh_cli": [
+              67,
+              72
+            ],
+            "credentials": [
+              46,
+              55
+            ],
+            "workflow_event": [
+              11,
+              26,
+              30
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/intentions.yml",
+          "categories": {
+            "workflow_event": [
+              4,
+              10,
+              16
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/label-intentions.yml",
+          "categories": {
+            "gh_cli": [
+              8,
+              53
+            ],
+            "credentials": [
+              17,
+              18,
+              41,
+              51
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/main-red.yml",
+          "categories": {
+            "credentials": [
+              22
+            ],
+            "workflow_event": [
+              42
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/progress-announce.yml",
+          "categories": {
+            "workflow_event": [
+              19
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/progress-merge.yml",
+          "categories": {
+            "gh_cli": [
+              88,
+              126,
+              128
+            ],
+            "credentials": [
+              54
+            ],
+            "workflow_event": [
+              11,
+              20,
+              31,
+              68,
+              83
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/promote-reviewers.yml",
+          "categories": {
+            "gh_cli": [
+              59,
+              62,
+              76
+            ],
+            "credentials": [
+              34,
+              43
+            ],
+            "workflow_event": [
+              7,
+              15,
+              17,
+              28,
+              74
+            ]
+          }
+        },
+        {
+          "path": ".github/workflows/sync-roadmap-dropdowns.yml",
+          "categories": {
+            "github_origin": [
+              55
+            ],
+            "credentials": [
+              42
+            ],
+            "workflow_event": [
+              23
+            ]
+          }
+        },
+        {
+          "path": "lakefile.toml",
+          "categories": {
+            "github_origin": [
+              8
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "repository": "TauCetiData",
+      "source_revision": "b000269bf519900d8ce43dc036b9dc80893dc86d",
+      "canonical_shared_assets": false,
+      "counts": {
+        "github_origin": 2,
+        "graphql": 1,
+        "gh_cli": 5,
+        "credentials": 0,
+        "source_identity": 0,
+        "workflow_event": 0,
+        "shared_state": 0
+      },
+      "files": [
+        {
+          "path": "scripts/ab_fill.py",
+          "categories": {
+            "gh_cli": [
+              100
+            ]
+          }
+        },
+        {
+          "path": "scripts/ingest_ledger.py",
+          "categories": {
+            "github_origin": [
+              155
+            ],
+            "gh_cli": [
+              13,
+              37,
+              41
+            ]
+          }
+        },
+        {
+          "path": "scripts/label.py",
+          "categories": {
+            "github_origin": [
+              182
+            ],
+            "gh_cli": [
+              11,
+              34,
+              36
+            ]
+          }
+        },
+        {
+          "path": "scripts/recost.py",
+          "categories": {
+            "gh_cli": [
+              38
+            ]
+          }
+        },
+        {
+          "path": "scripts/scrape_github.py",
+          "categories": {
+            "graphql": [
+              12,
+              60
+            ],
+            "gh_cli": [
+              39,
+              41
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
