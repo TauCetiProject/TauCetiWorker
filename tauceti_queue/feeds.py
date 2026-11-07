@@ -679,7 +679,10 @@ class ControllerFeedSource:
 
     def _batch_view(self, row: dict, inputs: dict[int, dict]) -> BatchView:
         attempts = [
-            a for a in self._attempts(row["id"]) if a.get("dispatch_state", "legacy") not in {"prepared", "rejected"}
+            a
+            for a in self._attempts(row["id"])
+            if a["batch_version"] == row["version"]
+            and a.get("dispatch_state", "legacy") not in {"prepared", "rejected"}
         ]
         latest = attempts[-1] if attempts else None
         state = BATCH_STATES.get(row["state"], row["state"])

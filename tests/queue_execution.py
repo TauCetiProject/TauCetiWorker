@@ -500,6 +500,77 @@ class Dispatches(unittest.TestCase):
         self.controller._observe_attempt(self.controller._head(), attempt, self.clock())
         self.assertEqual(self.attempt()["outcome"], "superseded")
 
+    def recover_aliased_run(self, *, observation, earlier_bound=True):
+        self.approve()
+        self.controller.tick()
+        earlier = self.attempt()
+        self.backend.start_runs()
+        if earlier_bound:
+            self.controller.tick()
+        self.controller.store.update(
+            "ci_attempts", {"id": earlier["id"]}, outcome="infrastructure", outcome_detail="lost-run"
+        )
+        find = self.backend.find_candidate_run
+        self.backend.find_candidate_run = lambda *_args, **_kwargs: None
+
+        def unknown(*_args, **_kwargs):
+            raise OSError("later send has no known outcome")
+
+        self.backend.dispatch_candidate = unknown
+        self.controller._dispatch(self.controller._head(), self.clock(), retry=1)
+        later = self.attempt()
+        self.assertGreater(later["id"], earlier["id"])
+        if not earlier_bound:
+            self.controller.store.update("ci_attempts", {"id": earlier["id"]}, outcome="pending")
+        self.backend.find_candidate_run = find
+        if observation:
+            self.controller._observe_attempt(self.controller._head(), later, self.clock())
+        else:
+            self.controller._readopt_live_run(self.controller._head(), self.clock())
+        self.assertEqual(self.attempt()["run_id"], self.backend.runs[0].run_id)
+        self.assertEqual(self.backend.runs[0].status, "in_progress")
+        self.assertFalse([call for call in self.backend.calls if call[0] == "cancel_run"])
+
+    def test_readoption_does_not_cancel_its_run_through_an_older_attempt(self):
+        self.recover_aliased_run(observation=False)
+
+    def test_observation_does_not_cancel_its_run_through_an_older_attempt(self):
+        self.recover_aliased_run(observation=True)
+
+    def test_cancel_lookup_cannot_cancel_the_current_attempts_run(self):
+        self.recover_aliased_run(observation=True, earlier_bound=False)
+
+    def test_feed_does_not_mix_an_old_generation_with_an_unsent_new_version(self):
+        self.approve()
+        self.controller.tick()
+        head = self.controller._head()
+        self.controller.store.update("batches", {"id": head["id"]}, version=head["version"] + 1)
+        head = self.controller._head()
+
+        def rejected(*_args, **_kwargs):
+            raise DispatchNotAccepted("missing workflow", retryable=False)
+
+        self.backend.dispatch_candidate = rejected
+        self.backend.find_candidate_run = lambda *_args, **_kwargs: None
+        self.controller._dispatch(head, self.clock(), retry=1)
+        feed = ControllerFeedSource(self.controller)._batch_view(head, {})
+        self.assertIsNone(feed.candidate_id)
+        self.assertIsNone(feed.generation)
+        self.assertIsNone(feed.staging_ref)
+
+    def test_late_proven_rejection_records_facts_without_reviving_a_superseded_send(self):
+        attempt = self.prepare()
+
+        def rejected(*_args, **_kwargs):
+            self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="superseded")
+            raise DispatchNotAccepted("refused", retryable=False)
+
+        self.backend.dispatch_candidate = rejected
+        self.controller._send_prepared(self.controller._head(), attempt, self.clock())
+        self.assertEqual(self.attempt()["outcome"], "superseded")
+        self.assertEqual(self.attempt()["dispatch_state"], "rejected")
+        self.assertFalse(self.backend.runs)
+
     def test_permanent_rejections_have_a_separate_finite_budget_and_alert(self):
         self.approve()
         calls = []

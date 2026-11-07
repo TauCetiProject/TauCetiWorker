@@ -4265,8 +4265,12 @@ class Controller:
         cancel = getattr(self.execution, "cancel_run", None)
         if cancel is None:
             return
+        adopted = self.store.row("ci_attempts", {"id": by}) if by is not None else None
+        protected_run = adopted["run_id"] if adopted is not None else None
         for attempt in self.store.rows("ci_attempts", {"batch_id": batch_id}, order="id"):
             if attempt["id"] == by or attempt["cancelled_at"] is not None:
+                continue
+            if protected_run and attempt["run_id"] == protected_run:
                 continue
             if (
                 not attempt["run_id"]
@@ -4295,6 +4299,8 @@ class Controller:
                             attempt = dict(attempt, run_id=run.run_id, run_status=run.status)
                     except Exception as error:  # noqa: BLE001 - supersession must not block the queue
                         self.log.warning("superseded dispatch %s lookup failed: %s", attempt["id"], error)
+            if protected_run and attempt["run_id"] == protected_run:
+                continue
             if not attempt["run_id"] or attempt["run_status"] == "completed":
                 continue
             run_id = str(attempt["run_id"])
@@ -4420,17 +4426,26 @@ class Controller:
         except Exception as error:  # noqa: BLE001
             uncertain = sending and not isinstance(error, DispatchNotAccepted)
             with self.store.transaction():
+                current = self.store.row("ci_attempts", {"id": attempt_id})
+                state = "sending" if sending else "prepared"
+                if current is None or current["dispatch_state"] != state:
+                    return
+                pending = current["outcome"] == OUTCOME_PENDING
                 changed = self.store.update(
                     "ci_attempts",
                     {
                         "id": attempt_id,
-                        "dispatch_state": "sending" if sending else "prepared",
-                        "outcome": OUTCOME_PENDING,
+                        "dispatch_state": state,
+                        "outcome": current["outcome"],
                     },
                     dispatch_state="uncertain" if uncertain else "rejected",
                     dispatch_error=type(error).__name__,
-                    outcome=OUTCOME_PENDING if uncertain else OUTCOME_INFRASTRUCTURE,
-                    outcome_detail="dispatch outcome unknown" if uncertain else "dispatch not accepted",
+                    outcome=(OUTCOME_PENDING if uncertain else OUTCOME_INFRASTRUCTURE)
+                    if pending
+                    else current["outcome"],
+                    outcome_detail=("dispatch outcome unknown" if uncertain else "dispatch not accepted")
+                    if pending
+                    else current["outcome_detail"],
                     dispatch_retry_at=getattr(error, "retry_at", None),
                     dispatch_retryable=int(getattr(error, "retryable", True)),
                     last_observed_at=self.clock(),
@@ -4453,7 +4468,13 @@ class Controller:
         self._settle_accepted(head, attempt, now, dispatch_id=dispatch_id)
 
     def _settle_accepted(
-        self, head: dict[str, Any], attempt: dict[str, Any], now: float, *, dispatch_id: str | None = None
+        self,
+        head: dict[str, Any],
+        attempt: dict[str, Any],
+        now: float,
+        *,
+        dispatch_id: str | None = None,
+        run_id: str | None = None,
     ) -> None:
         """Record acknowledgement or discovery once, preserving any superseded outcome."""
         attempt_id = attempt["id"]
@@ -4467,6 +4488,7 @@ class Controller:
                 dispatch_id=dispatch_id or current["dispatch_id"],
                 dispatch_state="accepted",
                 dispatch_error="",
+                run_id=run_id or current["run_id"],
             )
             if not changed:
                 return
@@ -4486,7 +4508,7 @@ class Controller:
                 head["id"],
                 version=head["version"],
                 tip=head["tip"],
-                dispatch_id=dispatch_id,
+                dispatch_id=dispatch_id or current["dispatch_id"],
                 attempt_id=attempt_id,
                 request_id=attempt["request_id"],
                 superseded=current["outcome"] != OUTCOME_PENDING,
@@ -4601,7 +4623,7 @@ class Controller:
                 )
             self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
             return
-        self._settle_accepted(head, attempt, now)
+        self._settle_accepted(head, attempt, now, run_id=run.run_id)
         progress = [t for t in (run.created_at, run.started_at, run.completed_at, run.updated_at) if t]
         for phase in run.phases:
             progress.extend(t for t in (phase.started_at, phase.completed_at) if t)
