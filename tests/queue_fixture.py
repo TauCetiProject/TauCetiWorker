@@ -18,7 +18,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from tauceti_queue import admission_planning, chain, feeds  # noqa: E402
-from tauceti_queue.controller import MERGED_TITLE_PREFIX, ControllerError, TaskError  # noqa: E402
+from tauceti_queue.controller import LOG_GRACE_SECONDS, MERGED_TITLE_PREFIX, ControllerError, TaskError  # noqa: E402
 from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller  # noqa: E402
 from tauceti_queue.loop import ReconciliationLoop  # noqa: E402
 
@@ -687,6 +687,10 @@ class HeadOperations(QueueFixture):
         self.tick()
         self.assertNotEqual(self.repo.main_sha(), head["tip"])
         attempt = self.controller.store.row("ci_attempts", {"batch_id": head["id"], "batch_version": head["version"]})
+        self.assertEqual(attempt["outcome"], "pending", "the stale status does not bypass publication grace")
+        self.clock.advance(LOG_GRACE_SECONDS)
+        self.tick()
+        attempt = self.controller.store.row("ci_attempts", {"batch_id": head["id"], "batch_version": head["version"]})
         self.assertEqual(attempt["outcome"], "infrastructure")
         self.assertIn("missing-status", attempt["outcome_detail"])
         self.assertEqual(self.controller.inputs()[0]["state"], "inserted", "the approval is intact")
@@ -749,6 +753,9 @@ class HeadOperations(QueueFixture):
         self.tick()
         self.assertEqual(len(self.github.dispatches), 3)
         self.run_ci()
+        self.tick()
+        self.assertEqual(self.controller.status()["head"]["ci"]["outcome"], "pending")
+        self.clock.advance(LOG_GRACE_SECONDS)
         self.tick()
         self.assertIn("missing-status", self.controller.status()["head"]["ci"]["outcome_detail"])
         self.clock.advance(4 * backoff + 1)
@@ -926,6 +933,31 @@ class MissingSource(QueueFixture):
         self.approve(102, {"TauCeti/Provider.lean": None, "TauCeti/Importer.lean": "module\ndef importer := 1\n"})
         self.tick()
         self.assertEqual([r["state"] for r in self.controller.inputs() if r["number"] == 102], ["inserted"])
+
+    def test_removal_is_not_a_dependency_on_a_head_that_inherited_the_source(self):
+        self.approve(101, {"TauCeti/Unrelated.lean": "module\ndef unrelated := 1\n"})
+        self.tick()
+        head = self.head()
+        self.approve(102, {"TauCeti/Provider.lean": None})
+        self.tick()
+        self.assertTrue(self.refused(102))
+        self.assertEqual(self.controller.store.count("journal", {"kind": "probe-missing-source-waiting"}), 0)
+        self.assertEqual(self.head()["tip"], head["tip"], "the running head is left alone")
+        self.assertIn("this PR removes", self.github.comments_for(102)[0]["body"])
+        self.run_ci()
+        self.tick()
+        self.assertEqual(self.repo.main_sha(), head["tip"])
+        self.assertTrue(self.refused(102), "landing the inherited module cannot fix the removal")
+
+    def test_import_after_a_batch_mate_removed_the_source_is_not_a_head_dependency(self):
+        self.approve(101, {"TauCeti/Unrelated.lean": "module\ndef unrelated := 1\n"})
+        self.tick()
+        self.approve(102, {"TauCeti/Provider.lean": None, "TauCeti/Importer.lean": "module\ndef importer := 1\n"})
+        self.tick()
+        self.approve(103, {"TauCeti/Consumer.lean": "module\nimport TauCeti.Provider\n"})
+        self.tick()
+        self.assertTrue(self.refused(103))
+        self.assertEqual(self.controller.store.count("journal", {"kind": "probe-missing-source-waiting"}), 0)
 
     def test_s25_bad_import_is_refused_and_a_batch_mates_module_is_a_source(self):
         self.approve(101, {"TauCeti/New.lean": "module\ndef new := 1\n"})

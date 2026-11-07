@@ -52,7 +52,7 @@ BUILD_CONTEXT = "build"
 # and `scope` the merge-policy verdict (restricted paths, diff size, oversized new files). A head
 # lands only when all three are bound to its run and `success`.
 VERDICT_CONTEXTS = (BUILD_CONTEXT, "bump-guard", "scope")
-LOG_GRACE_SECONDS = 600  # how long a failed run may go without a readable log before it counts as infrastructure
+LOG_GRACE_SECONDS = 600  # publication grace for a completed run's bound verdicts and failed-build log
 DISPATCH_EVENT = "tauceti-bors-staging"
 # How many of a batch's previous tips a CI dispatch names in `repair_outputs_revs`.
 REPAIR_OUTPUTS_PREVIOUS_TIPS = 4
@@ -2884,12 +2884,26 @@ class Controller:
         return sorted(after - before), None
 
     def _providers_in_flight(self, batch: dict[str, Any], gaps: list[tuple[str, str]]) -> list[int] | None:
-        """The batches (head or other open ones) whose tips provide every missing source, else None."""
+        """Batches introducing every missing source, else None.
+
+        A source the prospective PR removes from this batch cannot be supplied by waiting. A
+        different batch merely inheriting that source is not an incoming dependency either: after
+        it lands, replaying the removal (or a batch-mate's removal) still strands the importer.
+        """
         candidates = [b for b in [self._head(), *self._open_batches()] if b is not None and b["id"] != batch["id"]]
         found: list[int] = []
         for _, module in gaps:
             provider = module.replace(".", "/") + ".lean"
-            holder = next((b for b in candidates if b["tip"] and self._tree_has(b["tip"], provider)), None)
+            if self._tree_has(batch["tip"], provider):
+                return None
+            holder = next(
+                (
+                    b
+                    for b in candidates
+                    if b["tip"] and self._tree_has(b["tip"], provider) and not self._tree_has(b["base"], provider)
+                ),
+                None,
+            )
             if holder is None:
                 return None
             if holder["id"] not in found:
@@ -4395,7 +4409,11 @@ class Controller:
             run_conclusion=run.conclusion,
             run_created_at=run.created_at,
             run_started_at=run.started_at,
-            run_completed_at=run.completed_at,
+            # Persist the first completed observation if GitHub omitted its timestamp. A missing
+            # timestamp must neither expire publication grace immediately nor restart it per poll.
+            run_completed_at=(run.completed_at or attempt["run_completed_at"] or now)
+            if run.status == "completed"
+            else run.completed_at,
             run_updated_at=run.updated_at if run.updated_at is not None else attempt["run_updated_at"],
             runner_name=run.runner_name,
             runner_labels=dumps(list(run.runner_labels)),
@@ -4443,6 +4461,11 @@ class Controller:
         status = statuses[BUILD_CONTEXT]
         if status is None or not bound[BUILD_CONTEXT]:
             # No status from the candidate's own completed run: never a verdict (scenario 19).
+            if now - values["run_completed_at"] < LOG_GRACE_SECONDS:
+                values.update(needs_observation=1)
+                self._reasons.append(f"head {head['id']}: run {run.run_id} completed, waiting for build status")
+                self.store.update("ci_attempts", {"id": attempt["id"]}, **values)
+                return
             values.update(
                 outcome=OUTCOME_INFRASTRUCTURE,
                 outcome_detail="missing-status: the completed run posted no bound build status",
@@ -4463,7 +4486,7 @@ class Controller:
                 # The finalizer posts all three statuses in the one step that posts `build`; a bound
                 # `build` with the others absent is that step still in flight (or a post that failed).
                 # Look again for a little while, then treat it as the missing `build` case above.
-                if now - (run.completed_at or now) < LOG_GRACE_SECONDS:
+                if now - values["run_completed_at"] < LOG_GRACE_SECONDS:
                     values.update(needs_observation=1)
                     self._reasons.append(
                         f"head {head['id']}: run {run.run_id} posted build, waiting for {', '.join(unbound)}"
@@ -4520,7 +4543,7 @@ class Controller:
                 and infrastructure
                 and all(d.get("reason") == "log_unavailable" for d in infrastructure)
                 and not status.description.lower().startswith("infrastructure")
-                and now - (run.completed_at or now) < LOG_GRACE_SECONDS
+                and now - values["run_completed_at"] < LOG_GRACE_SECONDS
             )
             if log_pending:
                 # GitHub publishes a job's log a little after the run completes; a failed build whose log

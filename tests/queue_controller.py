@@ -251,6 +251,80 @@ class Verdicts(ControllerCase):
         )
         self.assertNotEqual(self.repo.main_sha(), head["tip"])
 
+    def test_delayed_build_status_can_land_without_redispatch(self):
+        head, attempt = self.observe("no-status")
+        self.assertEqual(attempt["outcome"], "pending")
+        self.assertEqual(attempt["needs_observation"], 1)
+        self.assertIn("waiting for build status", " ".join(self.controller.status()["reasons"]))
+        self.clock.advance(LOG_GRACE_SECONDS - 1)
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "pending")
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(self.controller.store.count("tasks", {}), 0)
+        run = self.github.runs[0]
+        run.conclusion = "success"
+        for context in VERDICT_CONTEXTS:
+            self.github.post_status(head["tip"], "success", run.run_id, context=context)
+            self.controller.handle_event("status", {"sha": head["tip"], "context": context})
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "pass")
+        self.assertEqual(self.repo.main_sha(), head["tip"])
+        self.assertEqual(len(self.github.dispatches), 1)
+
+    def test_unbound_and_pending_build_statuses_do_not_reset_the_publication_grace(self):
+        head, attempt = self.observe("no-status")
+        for delay, state, run_id in (
+            (LOG_GRACE_SECONDS - 1, "success", "another-run"),
+            (1, "pending", self.github.runs[0].run_id),
+        ):
+            self.clock.advance(delay)
+            self.github.post_status(head["tip"], state, run_id)
+            self.controller.handle_event("status", {"sha": head["tip"], "context": "build"})
+            self.controller.tick()
+            attempt = self.attempt(head)
+            self.assertEqual(attempt["outcome"], "pending" if delay > 1 else "infrastructure")
+        self.assertIn("missing-status", attempt["outcome_detail"])
+        self.assertNotEqual(self.repo.main_sha(), head["tip"])
+        self.assertEqual(len(self.github.dispatches), 1)
+
+    def test_late_bound_failure_keeps_its_source_diagnostics(self):
+        finding = {"kind": "compiler", "module": "TauCeti.A", "message": "source error"}
+        self.github.ci_policy = lambda *_: ("fail", [finding])
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        status = self.github.statuses.pop((head["tip"], "build"))
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "pending")
+        self.clock.advance(60)
+        self.github.statuses[(head["tip"], "build")] = status
+        self.controller.handle_event("status", {"sha": head["tip"], "context": "build"})
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "source-failure")
+        self.assertEqual(json.loads(self.attempt(head)["diagnostics"]), [finding])
+        self.assertEqual(self.controller.store.row("tasks", {"batch_id": head["id"]})["kind"], "repair")
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertNotEqual(self.repo.main_sha(), head["tip"])
+
+    def test_missing_completion_time_uses_persisted_first_completed_observation(self):
+        self.github.ci_policy = lambda *_: ("no-status", [])
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.github.runs[0].completed_at = None
+        self.controller.tick()
+        observed_at = self.clock()
+        self.assertEqual(self.attempt(head)["run_completed_at"], observed_at)
+        self.controller.store.close()
+        self.controller = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(self.controller.store.close)
+        self.clock.advance(LOG_GRACE_SECONDS)
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "infrastructure")
+        self.assertEqual(self.attempt(head)["run_completed_at"], observed_at)
+
 
 class Settings(ControllerCase):
     def test_defaults_and_validation(self):
