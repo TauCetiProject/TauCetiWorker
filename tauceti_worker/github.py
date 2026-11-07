@@ -656,7 +656,30 @@ def _pr_json_from_graphql(node: dict) -> dict:
 
 
 class GitHub:
+    @classmethod
+    def for_repository(cls, repository, *, api=None, cache=None, ttl=15):
+        """Select a qualified read source; never guess its credential or mirror.
+
+        Forgejo currently supports the review-state metadata/discussion reads.
+        Full worker activation and writes retain their separate migration guard.
+        """
+        from tauceti_tools.forge import GITHUB, RepositoryRef
+
+        if not isinstance(repository, RepositoryRef):
+            raise ValueError("source selection requires a qualified RepositoryRef")
+        if repository.forge == GITHUB:
+            if api is not None or cache is not None:
+                raise ValueError("GitHub reads use their existing transport")
+            return cls(repository.name)
+        if repository.forge.kind != "forgejo" or api is None:
+            raise ValueError("Forgejo reads require an explicitly bound direct client")
+        from .forgejo_reads import ForgejoReadSource
+
+        return ForgejoReadSource(repository, api, cache=cache, ttl=ttl)
+
     def __init__(self, repo: str = TAUCETI):
+        if not isinstance(repo, str):
+            raise ValueError("qualified repositories require GitHub.for_repository")
         self.repo = repo
         self._review_nodes = {}
 

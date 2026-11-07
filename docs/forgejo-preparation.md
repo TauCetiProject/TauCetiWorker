@@ -165,6 +165,73 @@ fixtures. Conditional construction and unrecognized launch mechanisms require
 manual inspection. Compatibility or activation cannot be inferred from row counts
 or a clean scan.
 
+## Direct review-state reads
+
+`GitHub.for_repository(repository, api=api)` accepts an explicit Tools
+`RepositoryRef` and a Forgejo client bound to that origin. Its Forgejo result is a
+read adapter for PR metadata, issue discussion and reviews. It selects neither
+credentials nor a source from the environment. Existing GitHub construction and
+production bootstrap remain unchanged; this factory does not enable a complete
+Forgejo worker.
+
+`ReviewState` uses this adapter directly and never consults the shared-state
+service or unqualified survey seeds. Repository, origin and credential identity
+scope its caches. Rotating the client's credential or origin makes reads
+unavailable until a new adapter is constructed, including reads from existing
+memory or disk. Tokens and server error bodies are not persisted in cache keys or
+failure records.
+
+Triage reads use a bounded process-local JSON cache per adapter or explicitly
+shared cache instance (128 entries, 4 MiB by default, 15-second TTL measured from
+request start). Identical triage requests coalesce; unrelated requests fetch
+independently. Fresh reads bypass entries and coalescing. Concurrent fresh reads
+can both return, while only the latest-started request may publish its result.
+Write invalidation targets that qualified repository and PR across credential
+scopes, including list observations, and rejects fetches overlapping the write.
+Other PRs continue independently; coalesced waiters are released immediately.
+Failed requests are not cached, and a verified empty list differs from an
+unavailable read. Cached review metadata retains assumed or stale provenance;
+it supplies no fresh approval authority. Revision-scoped read contexts use
+separate cache keys.
+
+Disposable review-state sidecars live below `sbcache/sources/<digest>/`, in private
+leaf directories with atomic private-file replacement. Best-effort pruning bounds
+recognized cache files across credential scopes to 384 files and 16 MiB after
+quiescent writes. It ignores unrelated files, outboxes and symlinks. These files
+are disposable observations, not publication journals or durable decisions.
+Source file ages start before the request. Atomic replacements attempt a
+nonblocking directory lock and retain a later existing record when an older
+request finishes last. Lock contention skips the cache write.
+Source sidecars expire at the adapter's triage TTL even if the PR's update clock
+stays unchanged. Native Forgejo 17 does not move that clock for comment edits or
+deletions; forced reads bypass sidecars and the memory cache immediately.
+
+The adapter normalizes discussion/review timestamps to fixed-width UTC. Scoreboard
+selection orders equal timestamps by native comment ID. Typed PR projections
+validate native number, discussion URL, flow and lifecycle, then require the
+requested fields' proofs; they do not require all historical head/stat proofs of
+a whole raw REST record. Neither projection nor mergeability observations supply
+approval or exact-candidate merge authority.
+
+`tests/integration_forgejo_reads.py`, when given `FORGEJO_BINARY`, starts an
+isolated temporary server and exercises the actual adapter and `ReviewState`
+against a private PR, multiple discussion pages, submitted and pending reviews,
+credential denial, comment edits and deletion. Shared-state and GitHub fallback
+calls fail the fixture. This loopback test is separate from the required hosted
+HTTPS and fleet-load rehearsal.
+
+Inline thread/reply reads deliberately remain unavailable. Authoring, claims,
+reactions, trusted publication, scheduling and approval decisions still require
+their qualified adapters before production Forgejo bootstrap can be enabled.
+Worker owns an additional activation refusal so a Tools update cannot enable it
+implicitly. Large survey histories and fleet concurrency still require the
+representative load tests below; these cache bounds are not a capacity proof.
+Cross-process cache deletion/order and invalidation still require tests and
+coordination before activation. Cross-credential write invalidation currently
+covers the shared in-process memory cache; private disk observations in another
+credential scope can remain assumed until their TTL expires. Decisions requiring
+current state must force a source read.
+
 ## Outstanding integration and completion criteria
 
 The worker's existing `gh` launcher, credentials, forks, claims, publication recovery
@@ -183,5 +250,5 @@ GitHub CI, exact-revision merge, main mirroring, cache/docs, archives and progre
 repeat across faults and restarts with the shared state endpoint blocked. Load tests
 must use representative PR histories and fleet concurrency before service retirement.
 
-No production pins, development forge, admission settings, mirror configuration or
-shared-state lifecycle have changed as part of this foundation.
+Installed production environments, development forge, admission settings, mirror
+configuration and shared-state lifecycle are unchanged by this preparation.

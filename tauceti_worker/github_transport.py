@@ -104,6 +104,16 @@ def cache_hit():
     return _cache_hit.get()
 
 
+def read_policy():
+    """Freshness and revision for direct source adapters sharing this read context."""
+    return _fresh.get(), _revision.get()
+
+
+def note_cache_hit():
+    """Mark a reused local observation so review-state cannot call it fresh."""
+    _cache_hit.set(True)
+
+
 @contextlib.contextmanager
 def locked(path: Path, *, timeout: float = 30):
     import fcntl
