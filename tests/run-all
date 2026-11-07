@@ -155,6 +155,7 @@ RUN_STDLIB=(
   queue_eligibility.py
   queue_diagnostics.py
   queue_controller.py
+  queue_execution.py
   queue_monitoring.py
   queue_task_progress.py
   queue_monitoring_protocol.py

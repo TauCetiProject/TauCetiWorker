@@ -51,6 +51,25 @@ class Monitoring(unittest.TestCase):
         self.assertEqual(attempt["version"], batch["version"])
         self.assertEqual(attempt["base"], batch["base"])
         self.assertEqual(batch["size"], 2)
+        self.assertEqual(attempt["dispatch_state"], "accepted")
+        self.assertRegex(attempt["request_id"], r"^[0-9a-f]{32}$")
+
+    def test_export_reads_an_unmigrated_dispatch_ledger_without_writing_it(self):
+        missing = (
+            "sent_at",
+            "dispatch_retry_at",
+            "request_id",
+            "dispatch_state",
+            "dispatch_error",
+            "dispatch_retryable",
+        )
+        for name in missing:
+            self.controller.store.execute(f"ALTER TABLE ci_attempts DROP COLUMN {name}")
+        value = self.export()
+        self.assertEqual(value["attempts"][0]["dispatch_state"], "legacy")
+        self.assertEqual(value["attempts"][0]["request_id"], "")
+        present = {r["name"] for r in self.controller.store.query("PRAGMA table_info(ci_attempts)")}
+        self.assertFalse(set(missing) & present)
 
     def test_dispatch_policy_is_allowlisted_cached_and_bound_to_the_canonical_commit(self):
         revision = self.repo.commit_branch(

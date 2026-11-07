@@ -706,7 +706,16 @@ class OlderStore(ControllerCase):
         # Rebuild `ci_attempts` at the older schema, keeping the dispatched attempt.
         connection = sqlite3.connect(str(self.root / "queue.sqlite"))
         columns = [row[1] for row in connection.execute("PRAGMA table_info(ci_attempts)")]
-        for column in ("repair_outputs_revs", *CANCEL_COLUMNS):
+        for column in (
+            "repair_outputs_revs",
+            "request_id",
+            "dispatch_state",
+            "dispatch_error",
+            "sent_at",
+            "dispatch_retry_at",
+            "dispatch_retryable",
+            *CANCEL_COLUMNS,
+        ):
             columns.remove(column)
         listed = ", ".join(columns)
         connection.executescript(
@@ -722,7 +731,16 @@ class OlderStore(ControllerCase):
         restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
         self.addCleanup(restarted.store.close)
         present = {row["name"] for row in restarted.store.execute("PRAGMA table_info(ci_attempts)")}
-        for column in ("repair_outputs_revs", *CANCEL_COLUMNS):
+        for column in (
+            "repair_outputs_revs",
+            "request_id",
+            "dispatch_state",
+            "dispatch_error",
+            "sent_at",
+            "dispatch_retry_at",
+            "dispatch_retryable",
+            *CANCEL_COLUMNS,
+        ):
             self.assertIn(column, present)
         for table, column in PRE_REBASED_CHAIN_COLUMNS:
             present = {row["name"] for row in restarted.store.execute(f"PRAGMA table_info({table})")}
@@ -809,7 +827,7 @@ class Dispatch(ControllerCase):
             },
         )
 
-    def test_failed_dispatch_leaves_no_attempt(self):
+    def test_failed_dispatch_preserves_uncertain_attempt(self):
         self.approve(101, {"A.lean": "a\n"})
 
         def refuse(*_args, **_kwargs):
@@ -818,7 +836,10 @@ class Dispatch(ControllerCase):
         self.github.dispatch_candidate = refuse
         self.controller.tick()
         head = self.controller.store.row("batches", {"state": "head"})
-        self.assertIsNone(self.controller.store.row("ci_attempts", {"batch_id": head["id"]}))
+        attempt = self.controller.store.row("ci_attempts", {"batch_id": head["id"]})
+        self.assertEqual(attempt["dispatch_state"], "uncertain")
+        self.assertEqual(attempt["outcome"], "pending")
+        self.assertEqual(len(attempt["request_id"]), 32)
         self.assertTrue(self.controller.store.journal_entries("dispatch-failed"))
         self.assertIn(
             "dispatch refused", self.controller.store.journal_entries("dispatch-failed")[-1]["detail"]["error"]

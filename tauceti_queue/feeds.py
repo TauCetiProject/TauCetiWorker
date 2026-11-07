@@ -678,10 +678,19 @@ class ControllerFeedSource:
         return self.store.rows("ci_attempts", {"batch_id": batch_id}, order="id")
 
     def _batch_view(self, row: dict, inputs: dict[int, dict]) -> BatchView:
-        attempts = self._attempts(row["id"])
+        attempts = [
+            a
+            for a in self._attempts(row["id"])
+            if not (a.get("dispatch_state") == "rejected" and a["outcome"] == "superseded")
+        ]
         latest = attempts[-1] if attempts else None
         state = BATCH_STATES.get(row["state"], row["state"])
-        if row["state"] == "head" and latest is not None and latest.get("outcome") == "pending":
+        if (
+            row["state"] == "head"
+            and latest is not None
+            and latest.get("outcome") == "pending"
+            and latest.get("dispatch_state") != "prepared"
+        ):
             state = "running"
         sealed = bool(row["sealed"])
         return BatchView(

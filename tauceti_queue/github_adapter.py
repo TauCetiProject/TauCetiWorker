@@ -352,6 +352,7 @@ class GitHubClient:
         ok: Iterable[int] = (200, 201, 202, 204),
         tolerate: Iterable[int] = (),
         record_limit: bool = True,
+        single_attempt: bool = False,
     ) -> Response:
         """One API call. Statuses in `ok` return; `tolerate` returns too (callers inspect); others raise.
 
@@ -393,7 +394,13 @@ class GitHubClient:
             if token is not None:
                 headers["Authorization"] = f"Bearer {token}"
             elif self._tokens is not None:
-                headers["Authorization"] = f"Bearer {self._tokens.token()}"
+                try:
+                    installation_token = self._tokens.token()
+                except Exception as error:  # noqa: BLE001 - dispatch transport has not been called
+                    if single_attempt:
+                        raise ports.DispatchNotAccepted("installation credential unavailable") from error
+                    raise
+                headers["Authorization"] = f"Bearer {installation_token}"
                 used_installation = True
             with self._lock:
                 self.requests += 1
@@ -412,8 +419,9 @@ class GitHubClient:
                 return Response(status, response_headers, data)
             if status == 401 and used_installation and attempt == 1:
                 self._tokens.invalidate()
-                self._retry()
-                continue
+                if not single_attempt:
+                    self._retry()
+                    continue
             wait = self._limit_wait(status, response_headers, data)
             if wait is not None:
                 blocked_resource = resource if response_headers.get("x-ratelimit-remaining") == "0" else "secondary"
@@ -421,7 +429,7 @@ class GitHubClient:
                 if token is None:
                     with self._lock:
                         self._blocked_until[blocked_resource] = deadline
-                if deferred or wait > self.MAX_WAIT_SECONDS or attempt >= self.MAX_ATTEMPTS:
+                if single_attempt or deferred or wait > self.MAX_WAIT_SECONDS or attempt >= self.MAX_ATTEMPTS:
                     self._fail(f"rate limited for {wait:.0f}s on {method} {path}")
                     raise RateLimited(
                         f"rate limited for {wait:.0f}s", status, data, retry_at=deadline, resource=blocked_resource
@@ -431,7 +439,7 @@ class GitHubClient:
                 self._retry()
                 self._sleep(wait)
                 continue
-            if status >= 500 and not deferred and attempt < self.MAX_ATTEMPTS:
+            if status >= 500 and not single_attempt and not deferred and attempt < self.MAX_ATTEMPTS:
                 self._retry()
                 self._sleep(min(2.0**attempt, 30.0))
                 continue
@@ -781,7 +789,16 @@ class GitHubAdapter:
                 "repair_outputs_revs": list(repair_outputs_revs),
             },
         }
-        self.client.request("POST", f"repos/{repo}/dispatches", json_body=payload, ok=(204,))
+        try:
+            self.client.request("POST", f"repos/{repo}/dispatches", json_body=payload, ok=(204,), single_attempt=True)
+        except GitHubError as error:
+            if isinstance(error, RequestDeferred) or error.status in {400, 401, 403, 404, 405, 410, 415, 422, 429}:
+                raise ports.DispatchNotAccepted(
+                    str(error),
+                    retry_at=getattr(error, "retry_at", None),
+                    retryable=isinstance(error, RequestDeferred),
+                ) from error
+            raise
         return dispatch_title(base_ref, _batch_id(batch_id), head_sha, base_sha)
 
     def find_candidate_run(

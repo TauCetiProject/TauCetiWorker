@@ -291,6 +291,57 @@ Deep scheduling requests report unavailable until those adapters are integrated.
 Production bootstrap still refuses Forgejo activation. This read consumer is not
 the isolated author/review/CI/merge rehearsal or a capacity proof.
 
+## Queue source and execution boundary
+
+The controller routes repository reads, refs, publication and repository authority
+through `SourcePort`; dispatches, workflow observations, cancellations, verdicts
+and compiled declaration evidence use `ExecutionPort`. The existing combined
+GitHub adapter supplies both by default. Its `github` attribute remains an alias
+for source-authentication callers. This separation does not select another
+execution repository or enable Forgejo: qualified bindings and versioned producer
+request/result contracts remain required.
+
+A CI attempt now persists a request identity before source or execution I/O.
+Preparation can resume the same attempt after a restart. Before the one dispatch
+send, its state becomes `sending`; acknowledgement records `accepted`, a proven
+rejection records `rejected`, and an ambiguous exception records `uncertain`.
+The GitHub dispatch transport does not automatically retransmit on server errors,
+401 or rate limits; rejected credentials are invalidated for a later attempt.
+
+Unknown sends retain their attempt ID and candidate branch for reconciliation.
+If the run becomes visible, the existing title/time lookup associates it with the
+attempt; this is not a producer-verified request binding. A missing run
+alone does not prove rejection, so normal ticks do not retransmit uncertain sends
+after a timeout. An explicit operator `retry_ci` can supersede one after the same
+live-run check and observation of any completed run. Ordinary source preparation
+failures and temporary dispatch rejections retry with capped exponential backoff,
+respecting a persisted server retry deadline. Permanent HTTP rejections use a
+separate finite budget and raise an operator alert. These non-sends do not exhaust
+the retry budget for failed CI runs. Credential preparation failures are proven
+non-sends; other transport failures remain uncertain unless the backend can prove
+rejection. Existing ledger rows migrate with the
+`legacy` dispatch state and retain their previous observation behavior.
+
+Resuming preparation respects publication-disabled mode, including while a
+prediction repair is available or claimed. Run lookup and the no-run timeout use
+the actual send time after a long interruption. Acknowledgement and discovery
+share one acceptance transition and its accounting. Supersession preserves the
+old outcome across a late acknowledgement or failure; unknown old sends get a
+best-effort lookup and cancellation. A run that appears only after that lookup
+still requires later cleanup in the integrated request/result reconciler.
+Late live runs attach to a previously sent attempt and its existing candidate ref;
+newer rejected receipts remain in history without hiding that active attempt.
+The monitoring exporter also reads older ledgers before controller migration.
+
+Before a future rollout, take a ledger backup and settle unresolved sends before
+rolling back to older queue code. Older code does not understand these dispatch
+states and can retransmit an unresolved send after its legacy no-run timeout.
+
+The new receipt ID is not yet a producer-verified execution proof. Binding it to
+qualified source/execution repositories, trusted workflow revisions, run IDs and
+attempts, plus automatic safe supersession, remains part of the request/result
+integration. No production deployment or admissions change is part of this work.
+
 ## Outstanding integration and completion criteria
 
 The worker's existing `gh` launcher, credentials, forks, claims, publication recovery
