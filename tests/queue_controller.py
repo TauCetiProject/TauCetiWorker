@@ -239,7 +239,7 @@ class Verdicts(ControllerCase):
     def test_build_alone_waits_for_the_other_verdicts_then_counts_as_a_missing_status(self):
         head, attempt = self.observe("build-only")
         self.assertEqual(attempt["outcome"], "pending", "a bound build with the others absent is not yet a verdict")
-        self.assertEqual(attempt["needs_observation"], 1)
+        self.assertEqual(attempt["needs_observation"], 0)
         self.assertEqual(self.verdict_states(), {"build": "success", "bump-guard": "absent", "scope": "absent"})
         self.assertIn("waiting for bump-guard, scope", " ".join(self.controller.status()["reasons"]))
         self.clock.advance(LOG_GRACE_SECONDS)
@@ -250,6 +250,133 @@ class Verdicts(ControllerCase):
             attempt["outcome_detail"], "missing-status: the completed run posted no bound bump-guard, scope status"
         )
         self.assertNotEqual(self.repo.main_sha(), head["tip"])
+
+    def test_delayed_build_status_can_land_without_redispatch(self):
+        head, attempt = self.observe("no-status")
+        self.assertEqual(attempt["outcome"], "pending")
+        self.assertEqual(attempt["needs_observation"], 0)
+        self.assertIn("waiting for build status", " ".join(self.controller.status()["reasons"]))
+        self.clock.advance(LOG_GRACE_SECONDS - 1)
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "pending")
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(self.controller.store.count("tasks", {}), 0)
+        run = self.github.runs[0]
+        run.conclusion = "success"
+        for context in VERDICT_CONTEXTS:
+            self.github.post_status(head["tip"], "success", run.run_id, context=context)
+            self.controller.handle_event("status", {"sha": head["tip"], "context": context})
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "pass")
+        self.assertEqual(self.repo.main_sha(), head["tip"])
+        self.assertEqual(len(self.github.dispatches), 1)
+
+    def test_publication_grace_obeys_polling_interval_and_webhooks(self):
+        head, attempt = self.observe("no-status")
+        calls = len(self.github.calls)
+        self.controller._observe_attempt(head, attempt, self.clock())
+        self.assertEqual(len(self.github.calls), calls, "another tick alone must not repeat GitHub reads")
+        self.controller.handle_event("status", {"sha": head["tip"], "context": "build"})
+        attempt = self.attempt(head)
+        self.controller._observe_attempt(head, attempt, self.clock())
+        self.assertGreater(len(self.github.calls), calls, "a status webhook can observe promptly")
+
+    def test_known_failed_publication_does_not_wait_for_grace(self):
+        self.github.ci_policy = lambda *_: (
+            "no-status",
+            [{"kind": "infrastructure", "reason": "finalizer_failed", "message": "publication job failed"}],
+        )
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "infrastructure")
+        self.assertEqual(self.controller.store.count("tasks", {}), 0)
+
+    def test_an_unrelated_cancelled_job_does_not_skip_publication_grace(self):
+        self.github.ci_policy = lambda *_: (
+            "no-status",
+            [{"kind": "infrastructure", "reason": "cancelled", "job": "sandboxed-build", "message": "cancelled"}],
+        )
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "pending", "the always-run finalizer can still publish")
+
+    def test_later_updated_completion_timestamp_does_not_extend_grace(self):
+        head, attempt = self.observe("no-status")
+        completed_at = attempt["run_completed_at"]
+        self.clock.advance(LOG_GRACE_SECONDS)
+        self.github.runs[0].completed_at = self.clock()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "infrastructure")
+        self.assertEqual(self.attempt(head)["run_completed_at"], completed_at)
+
+    def test_new_run_attempt_does_not_inherit_the_previous_completion_time(self):
+        head, _ = self.observe("no-status")
+        self.clock.advance(LOG_GRACE_SECONDS)
+        self.github.runs[0].attempt += 1
+        self.github.runs[0].completed_at = None
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "pending")
+        self.assertEqual(self.attempt(head)["run_completed_at"], self.clock())
+
+    def test_unbound_and_pending_build_statuses_do_not_reset_the_publication_grace(self):
+        head, attempt = self.observe("no-status")
+        for delay, state, run_id in (
+            (LOG_GRACE_SECONDS - 1, "success", "another-run"),
+            (1, "pending", self.github.runs[0].run_id),
+        ):
+            self.clock.advance(delay)
+            self.github.post_status(head["tip"], state, run_id)
+            self.controller.handle_event("status", {"sha": head["tip"], "context": "build"})
+            self.controller.tick()
+            attempt = self.attempt(head)
+            self.assertEqual(attempt["outcome"], "pending" if delay > 1 else "infrastructure")
+        self.assertIn("missing-status", attempt["outcome_detail"])
+        self.assertNotEqual(self.repo.main_sha(), head["tip"])
+        self.assertEqual(len(self.github.dispatches), 1)
+
+    def test_late_bound_failure_keeps_its_source_diagnostics(self):
+        finding = {"kind": "compiler", "module": "TauCeti.A", "message": "source error"}
+        self.github.ci_policy = lambda *_: ("fail", [finding])
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        status = self.github.statuses.pop((head["tip"], "build"))
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "pending")
+        self.clock.advance(60)
+        self.github.statuses[(head["tip"], "build")] = status
+        self.controller.handle_event("status", {"sha": head["tip"], "context": "build"})
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "source-failure")
+        self.assertEqual(json.loads(self.attempt(head)["diagnostics"]), [finding])
+        self.assertEqual(self.controller.store.row("tasks", {"batch_id": head["id"]})["kind"], "repair")
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertNotEqual(self.repo.main_sha(), head["tip"])
+
+    def test_missing_completion_time_uses_persisted_first_completed_observation(self):
+        self.github.ci_policy = lambda *_: ("no-status", [])
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.github.runs[0].completed_at = None
+        self.controller.tick()
+        observed_at = self.clock()
+        self.assertEqual(self.attempt(head)["run_completed_at"], observed_at)
+        self.controller.store.close()
+        self.controller = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(self.controller.store.close)
+        self.clock.advance(LOG_GRACE_SECONDS)
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "infrastructure")
+        self.assertEqual(self.attempt(head)["run_completed_at"], observed_at)
 
 
 class Settings(ControllerCase):

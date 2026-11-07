@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -47,7 +48,9 @@ EXPECTED = (
 class DryRun(unittest.TestCase):
     def test_every_scenario_passes_over_the_fakes(self):
         with tempfile.TemporaryDirectory(prefix="queue-rehearsal-") as tmp:
-            report = rehearsal.run_local(tmp, report_dir=os.path.join(tmp, "report"))
+            # Real-clock rehearsal: exercise delayed-status recovery without a ten-minute sleep.
+            with patch("tauceti_queue.controller.LOG_GRACE_SECONDS", 0.2):
+                report = rehearsal.run_local(tmp, report_dir=os.path.join(tmp, "report"))
             document = json.loads((Path(tmp) / "report" / "rehearsal-local.json").read_text())
             markdown = (Path(tmp) / "report" / "rehearsal-local.md").read_text()
         statuses = {s["id"]: (s["status"], s["detail"]) for s in document["scenarios"]}

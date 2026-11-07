@@ -94,8 +94,17 @@ attempt, or a `pull_request` event on a member branch is not the candidate's ver
 passes only when all three are bound and `success`; a red `scope` or `bump-guard` beside a green
 `build` is a source failure of the head carrying the status description (a restricted path without a
 current admin approval, an oversized diff, a new file over 1000 lines, a failed pin validation), and a
-bound `build` with the other two still absent is observed again for `LOG_GRACE_SECONDS` before it
-counts as a missing status. `status.head.ci.verdicts` reports each context's state.
+completed run with an absent, pending or unbound `build` status is observed again for
+`LOG_GRACE_SECONDS` (600 seconds) before it counts as infrastructure failure. The same grace
+applies to a green `build` with companion verdicts still missing. The completion timestamp is frozen
+at the first completed observation for that run/attempt (the adapter reports GitHub's `updated_at`);
+if unavailable, the observation time is used. It persists across restarts, and later polls or status
+callbacks do not extend grace. Normal polling intervals still apply, with webhooks permitting prompt
+observation. Explicit finalizer failure, cancellation or timeout bypasses the wait; an unrelated
+job's cancellation does not establish that publication failed. Late bound verdicts can settle the
+original attempt without another dispatch. Stale statuses never supply a verdict, and cancelled
+runs retain their separate infrastructure recovery path. `status.head.ci.verdicts` reports each
+context's state.
 
 Webhooks come first. `CandidatePoller.poll(refs)` is the fallback: for each pending candidate at most
 one run lookup and one status read per `interval` (60 s), and nothing at all while the remaining
