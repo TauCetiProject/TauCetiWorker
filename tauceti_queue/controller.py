@@ -3355,7 +3355,11 @@ class Controller:
         if self._active_claims(head["id"]) and not speculative:
             return f"head {head['id']} is claimed"
         attempt = self._current_attempt(head)
-        if attempt is None or attempt["head_sha"] != head["tip"]:
+        if (
+            attempt is None
+            or attempt["head_sha"] != head["tip"]
+            or attempt["dispatch_state"] in {"prepared", "rejected"}
+        ):
             return f"head {head['id']} v{head['version']} is not dispatched"
         if attempt["outcome"] not in (OUTCOME_PENDING, OUTCOME_PASS, OUTCOME_INFRASTRUCTURE):
             return f"head {head['id']} CI attempt {attempt['id']} is {attempt['outcome']}"
@@ -3940,6 +3944,15 @@ class Controller:
         else:
             self._observe_attempt(head, attempt, now)
 
+    def _recover_exhausted(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> bool:
+        """Keep looking for a late live run after exhaustion, at the normal poll rate."""
+        if now - (attempt["last_observed_at"] or attempt["dispatched_at"]) < int(
+            self.setting("polling_interval_seconds")
+        ):
+            return False
+        self.store.update("ci_attempts", {"id": attempt["id"]}, last_observed_at=now)
+        return self._readopt_live_run(head, now)
+
     def _ci(self, head: dict[str, Any], now: float) -> None:
         attempt = self._current_attempt(head)
         if attempt is None or attempt["outcome"] == OUTCOME_SUPERSEDED:
@@ -3962,11 +3975,15 @@ class Controller:
             )
             limit = int(self.setting("infrastructure_retry_limit"))
             if rejected and not attempt["dispatch_retryable"] and permanent_rejections > limit:
+                if self._recover_exhausted(head, attempt, now):
+                    return
                 self._reasons.append(
                     f"head {head['id']}: permanent dispatch rejections exhausted retries; repair configuration and use retry_ci"
                 )
                 return
             if not rejected and retries > limit:
+                if self._recover_exhausted(head, attempt, now):
+                    return
                 self._reasons.append(
                     f"head {head['id']}: {retries} infrastructure failures ({attempt['outcome_detail']}); retries exhausted, use retry_ci"
                 )
@@ -4191,7 +4208,6 @@ class Controller:
                 {"id": attempt["id"]},
                 outcome=OUTCOME_PENDING,
                 outcome_detail="",
-                dispatch_state="accepted",
                 run_id=run.run_id,
                 run_status=run.status,
                 last_progress_at=now,
@@ -4208,6 +4224,7 @@ class Controller:
                 previous_outcome=attempt["outcome"],
                 previous_detail=attempt["outcome_detail"],
             )
+        self._settle_accepted(head, attempt, now)
         self.log.info(
             "head %s: re-adopted live CI run %s (%s) instead of re-dispatching after %s %s",
             head["id"],
@@ -4444,25 +4461,9 @@ class Controller:
             current = self.store.row("ci_attempts", {"id": attempt_id})
             if current is None or current["dispatch_state"] not in {"sending", "uncertain"}:
                 return
-            if current["outcome"] != OUTCOME_PENDING:
-                self.store.update(
-                    "ci_attempts",
-                    {"id": attempt_id, "dispatch_state": current["dispatch_state"]},
-                    dispatch_state="accepted",
-                    dispatch_id=dispatch_id or current["dispatch_id"],
-                    dispatch_error="",
-                )
-                self.store.journal(
-                    now,
-                    "dispatch-accepted-after-supersession",
-                    head["id"],
-                    attempt_id=attempt_id,
-                    request_id=attempt["request_id"],
-                )
-                return
             changed = self.store.update(
                 "ci_attempts",
-                {"id": attempt_id, "dispatch_state": current["dispatch_state"], "outcome": OUTCOME_PENDING},
+                {"id": attempt_id, "dispatch_state": current["dispatch_state"], "outcome": current["outcome"]},
                 dispatch_id=dispatch_id or current["dispatch_id"],
                 dispatch_state="accepted",
                 dispatch_error="",
@@ -4488,10 +4489,12 @@ class Controller:
                 dispatch_id=dispatch_id,
                 attempt_id=attempt_id,
                 request_id=attempt["request_id"],
+                superseded=current["outcome"] != OUTCOME_PENDING,
                 retry=retry,
                 repair_outputs_revs=loads(attempt["repair_outputs_revs"], []),
             )
-        self._cancel_superseded_runs(head["id"], now, reason=f"superseded by attempt {attempt_id}", by=attempt_id)
+        if current["outcome"] == OUTCOME_PENDING and self.setting("publication_enabled"):
+            self._cancel_superseded_runs(head["id"], now, reason=f"superseded by attempt {attempt_id}", by=attempt_id)
 
     def _check_lost_run(
         self, head: dict[str, Any], attempt: dict[str, Any], run: CandidateRun, values: dict[str, Any], now: float

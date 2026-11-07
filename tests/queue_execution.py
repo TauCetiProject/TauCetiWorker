@@ -290,7 +290,7 @@ class Dispatches(unittest.TestCase):
                 self.backend.dispatch_candidate = superseded
                 self.controller._send_prepared(self.controller._head(), attempt, self.clock())
                 self.assertEqual(self.attempt()["outcome"], "superseded")
-                self.assertEqual(self.controller._state("counters", {}).get("ci_dispatches", 0), 0)
+                self.assertEqual(self.controller._state("counters", {}).get("ci_dispatches", 0), int(not fails))
 
     def test_operator_retry_observes_an_already_completed_unknown_send(self):
         self.approve()
@@ -378,6 +378,111 @@ class Dispatches(unittest.TestCase):
         self.assertEqual(len(self.backend.runs), 1)
         self.assertEqual(self.controller._current_attempt(head)["outcome"], "infrastructure")
         self.assertTrue(any("exhausted" in r for r in self.controller._reasons))
+
+    def test_late_live_run_is_readopted_after_permanent_rejections_exhaust_budget(self):
+        self.approve()
+        self.controller.tick()
+        sent = self.attempt()
+        find = self.backend.find_candidate_run
+        self.backend.find_candidate_run = lambda *_args, **_kwargs: None
+        self.clock.advance(1200)
+        self.controller.tick()
+
+        def rejected(*_args, **_kwargs):
+            raise DispatchNotAccepted("permission refused", retryable=False)
+
+        self.backend.dispatch_candidate = rejected
+        for _ in range(4):
+            self.controller._dispatch(self.controller._head(), self.clock(), retry=1)
+            self.clock.advance(600)
+        self.backend.find_candidate_run = find
+        self.controller.tick()
+        self.assertEqual(self.controller._current_attempt(self.controller._head())["id"], sent["id"])
+        self.assertEqual(
+            self.controller._current_attempt(self.controller._head())["run_id"], self.backend.runs[0].run_id
+        )
+        self.assertEqual(len(self.backend.runs), 1)
+
+    def test_late_live_run_is_readopted_after_ci_run_budget_exhaustion(self):
+        self.approve()
+        self.controller.set_setting("infrastructure_retry_limit", 0, "operator")
+        self.controller.tick()
+        find = self.backend.find_candidate_run
+        self.backend.find_candidate_run = lambda *_args, **_kwargs: None
+        self.clock.advance(1200)
+        self.controller.tick()
+        self.assertEqual(self.attempt()["outcome"], "infrastructure")
+        self.backend.find_candidate_run = find
+        self.clock.advance(600)
+        self.controller.tick()
+        self.assertEqual(self.attempt()["outcome"], "pending")
+        self.assertEqual(self.attempt()["run_id"], self.backend.runs[0].run_id)
+        self.assertEqual(len(self.backend.runs), 1)
+
+    def test_failed_source_preparation_cannot_hide_the_sent_candidate_in_the_feed(self):
+        self.approve()
+        self.controller.tick()
+        sent = self.attempt()
+        head = self.controller._head()
+        self.backend.find_candidate_run = lambda *_args, **_kwargs: None
+        update = self.backend.update_ref
+
+        def failed(*args, **kwargs):
+            if str(args[1]).startswith("refs/heads/staging-candidate-"):
+                raise OSError("source outage before candidate publication")
+            return update(*args, **kwargs)
+
+        self.backend.update_ref = failed
+        self.controller._dispatch(head, self.clock(), retry=1)
+        self.assertEqual(self.attempt()["dispatch_state"], "rejected")
+        self.assertIsNone(self.attempt()["sent_at"])
+        feed = ControllerFeedSource(self.controller)._batch_view(head, {})
+        self.assertEqual(feed.candidate_id, sent["id"])
+        self.assertEqual(feed.staging_ref, self.controller.staging_candidate_ref(sent["id"], head["version"]))
+
+    def test_readopted_uncertain_send_records_acceptance_once(self):
+        self.approve()
+        dispatch = self.backend.dispatch_candidate
+
+        def lost(*args, **kwargs):
+            dispatch(*args, **kwargs)
+            raise OSError("ack lost")
+
+        self.backend.dispatch_candidate = lost
+        self.controller.tick()
+        find = self.backend.find_candidate_run
+        self.backend.find_candidate_run = lambda *_args, **_kwargs: None
+        self.controller.retry_ci(PROJECT, "operator")
+        self.backend.find_candidate_run = find
+        self.controller.tick()
+        self.assertEqual(self.attempt()["dispatch_state"], "accepted")
+        self.assertEqual(self.controller._state("counters")["ci_dispatches"], 1)
+        self.assertIsNotNone(self.controller._head()["first_dispatch_at"])
+        self.clock.advance(60)
+        self.controller.tick()
+        self.assertEqual(self.controller._state("counters")["ci_dispatches"], 1)
+
+    def test_observing_an_accepted_send_in_shadow_mode_does_not_cancel_runs(self):
+        self.approve()
+        dispatch = self.backend.dispatch_candidate
+
+        def lost(*args, **kwargs):
+            dispatch(*args, **kwargs)
+            raise OSError("ack lost")
+
+        self.backend.dispatch_candidate = lost
+        self.controller.tick()
+        self.controller.set_setting("publication_enabled", False, "operator")
+        cancellations = []
+        self.controller._cancel_superseded_runs = lambda *args, **kwargs: cancellations.append((args, kwargs))
+        self.clock.advance(60)
+        self.controller.tick()
+        self.assertEqual(self.attempt()["dispatch_state"], "accepted")
+        self.assertFalse(cancellations)
+        self.assertIsNotNone(self.controller._head()["first_dispatch_at"])
+        self.clock.advance(60)
+        self.controller.tick()
+        self.assertEqual(self.controller._state("counters")["ci_dispatches"], 1)
 
     def test_a_late_observation_cannot_overwrite_supersession(self):
         self.approve()

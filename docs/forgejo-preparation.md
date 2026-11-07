@@ -332,6 +332,11 @@ still requires later cleanup in the integrated request/result reconciler.
 Late live runs attach to a previously sent attempt and its existing candidate ref;
 newer rejected receipts remain in history without hiding that active attempt.
 The monitoring exporter also reads older ledgers before controller migration.
+The candidate feed excludes preparations and rejected sends, so they cannot hide
+the retained ref of a late run. Exhausted retry budgets continue looking for late
+live runs at the normal observation interval. The intent compare-and-set prevents
+two connections from sending the same preparation; the service still requires a
+single active controller for its other operations.
 
 Before a future rollout, take a ledger backup and settle unresolved sends before
 rolling back to older queue code. Older code does not understand these dispatch
