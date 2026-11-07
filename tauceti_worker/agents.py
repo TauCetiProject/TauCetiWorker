@@ -4,12 +4,14 @@ argv path and the repo-scoped bubble sandbox path (plus per-worker $HOME isolati
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import functools
 import json
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2655,6 +2657,79 @@ def review_in_bubble(
             claim.release()
 
 
+_REVIEW_SOURCE_STAGING = ".tauceti-source-staging.json"
+
+
+def _prune_review_mathlib_staging(base):
+    """Only marked, unlocked temporary producers; published Bubble mounts stay alone."""
+    from . import retention, work_recovery
+
+    try:
+        candidates = list(base.glob("mathlib-src-tmp-*"))
+    except OSError as error:
+        log(f"review source staging inventory deferred: {error}")
+        return
+    observations = None
+    for path in candidates:
+        try:
+            if path.is_symlink() or not path.is_dir() or path.stat().st_uid != os.getuid():
+                continue
+            marker = path / _REVIEW_SOURCE_STAGING
+            with contextlib.ExitStack() as stack:
+                try:
+                    lease = stack.enter_context(os.fdopen(os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)))
+                except FileNotFoundError:
+                    if not path.name.endswith(".retention-deleting"):
+                        continue
+                    lease = None  # Its validated, released owner already committed disposal.
+                if lease is not None:
+                    if not stat.S_ISREG(os.fstat(lease.fileno()).st_mode):
+                        continue
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if json.load(lease) != dict(version=1, uid=os.getuid()):
+                        continue
+                original = path.stat()
+                if observations is None:
+                    observations = work_recovery.process_references(), retention.mount_points()
+                references, mounts = observations
+                if work_recovery.referenced_users(path, references) or mounts is None:
+                    continue
+                current = path.stat()
+                if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+                    continue
+                if lease is not None:
+                    locked = os.fstat(lease.fileno())
+                    current_lock = marker.lstat()
+                    if (locked.st_dev, locked.st_ino) != (current_lock.st_dev, current_lock.st_ino):
+                        continue
+                report = retention.fresh_report()
+                retention.remove(path, base, report, check_users=False, mounts=mounts)
+                for error in report["errors"]:
+                    log(f"review source staging cleanup deferred: {error}")
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as error:
+            if not isinstance(error, BlockingIOError):
+                log(f"review source staging cleanup deferred for {path}: {error}")
+
+
+@contextlib.contextmanager
+def _review_mathlib_staging(base):
+    staging = Path(tempfile.mkdtemp(prefix="mathlib-src-tmp-", dir=base))
+    try:
+        with (staging / _REVIEW_SOURCE_STAGING).open("x+") as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX)
+            json.dump(dict(version=1, uid=os.getuid()), lease)
+            lease.flush()
+            source = staging / "source"
+            source.mkdir()
+            yield source, lease.fileno()
+    finally:
+        # Close this producer's descriptor first. A surviving Git child keeps
+        # the inherited lock, so the ordinary prune will defer its staging.
+        _prune_review_mathlib_staging(base)
+
+
 def _review_mathlib_source(cfg: Config, head: str) -> Path | None:
     """Mathlib source at the reviewed head's pin, for the reviewers' greps. Staged host-side
     because the bubble's repo-scoped proxy cannot reach mathlib4; one snapshot per revision, the
@@ -2686,28 +2761,38 @@ def _review_mathlib_source(cfg: Config, head: str) -> Path | None:
     if not isinstance(rev, str) or not re.fullmatch(r"[0-9a-f]{40}", rev):
         raise NoProgress("review: Mathlib revision is not pinned to a commit; no review started")
     base = cfg.state / "refs"
+    _prune_review_mathlib_staging(base)
     src = base / f"mathlib-src-{rev}"
     if (src / "Mathlib.lean").is_file():
         return src
     base.mkdir(parents=True, exist_ok=True)
-    tmp = Path(tempfile.mkdtemp(prefix="mathlib-src-tmp-", dir=base))
-    steps = (
-        ["git", "init", "-q", str(tmp)],
-        ["git", "-C", str(tmp), "fetch", "-q", "--depth", "1", "https://github.com/leanprover-community/mathlib4", rev],
-        ["git", "-C", str(tmp), "checkout", "-q", "FETCH_HEAD"],
-    )
-    try:
-        failed = any(subprocess.run(step, timeout=600).returncode for step in steps)
-    except (OSError, subprocess.TimeoutExpired):
-        failed = True
-    if failed:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise NoProgress("review: could not stage the pinned Mathlib sources; no review started")
-    shutil.rmtree(tmp / ".git", ignore_errors=True)
-    try:
-        tmp.rename(src)
-    except OSError:  # a concurrent worker staged the same revision first
-        shutil.rmtree(tmp, ignore_errors=True)
+    with _review_mathlib_staging(base) as (tmp, lease_fd):
+        steps = (
+            ["git", "init", "-q", str(tmp)],
+            [
+                "git",
+                "-C",
+                str(tmp),
+                "fetch",
+                "-q",
+                "--depth",
+                "1",
+                "https://github.com/leanprover-community/mathlib4",
+                rev,
+            ],
+            ["git", "-C", str(tmp), "checkout", "-q", "FETCH_HEAD"],
+        )
+        try:
+            failed = any(subprocess.run(step, timeout=600, pass_fds=(lease_fd,)).returncode for step in steps)
+        except (OSError, subprocess.TimeoutExpired):
+            failed = True
+        if failed:
+            raise NoProgress("review: could not stage the pinned Mathlib sources; no review started")
+        shutil.rmtree(tmp / ".git", ignore_errors=True)
+        try:
+            tmp.rename(src)
+        except OSError:  # a concurrent worker staged the same revision first
+            pass  # This producer's private staging is removed before releasing its lease.
     snapshots = sorted(
         (p for p in base.glob("mathlib-src-*") if not p.name.startswith("mathlib-src-tmp-")),
         key=lambda p: p.stat().st_mtime,
