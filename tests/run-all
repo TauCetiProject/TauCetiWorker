@@ -92,6 +92,7 @@ RUN_STDLIB=(
   fix_diagnostic.py
   fork_authoring.py
   fleet_capacity.py
+  forge_inventory.py
   github_accounts.py
   github_failure_reason.py
   github_ratelimit.py
