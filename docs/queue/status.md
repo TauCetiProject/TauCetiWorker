@@ -5,6 +5,25 @@ Running record for the work plan in
 what is blocked on which operator item, and the latest experiment numbers. Updated by the
 orchestrating session as streams land.
 
+## Repair execution moved to chungus2 (2026-11-07)
+
+At the operator's request, both repair workers moved from chungus to chungus2 at 22:00 UTC,
+retaining revision `6348a0116c2c` and the existing provider/pacing/cache configuration. Both source
+workers were idle and had no unfinished checkpoints or active claims. The replacements serve as
+`repair@chungus2` and `repair-2@chungus2` under the same systemd user unit names. Old repair units
+on chungus are masked; their shell launchers refuse execution, and `deploy-queue.sh` there now
+updates only the controller. Old source history remains retained.
+
+The controller, SQLite store, tunnel, backups and public monitoring stayed on chungus. Controller
+PID/revision, runtime settings, admission and Fleet policies were unchanged. A private observation
+mirror keeps chungus's existing monitoring and hourly report supplied with chungus2 worker/task
+JSON and bounded build-log tails. Destination preflight, administrator authorization, TLS, stock
+Lean version, an offline sandbox compilation and public monitoring freshness were verified.
+The workers had completed idle claim polls without errors; no repair task was available to verify
+a new repair completion at cutover. See [the runbook](operations.md#repair-execution-on-chungus2)
+for cache seeding, deployment, monitoring and rollback. Neither host gained lingering or a reboot
+startup guarantee; the earlier controller-host/supervision postponement still applies.
+
 ## Primary admission cutover (2026-11-06)
 
 The queue service became the authoritative automatic admission owner at 04:25 UTC, through
