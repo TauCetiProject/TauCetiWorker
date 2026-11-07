@@ -62,7 +62,7 @@ def git(root, *args):
     return result.stdout
 
 
-def inspect(name, root, ref, canonical_names=("TauCetiTools",)):
+def inspect(name, root, ref, canonical_names=("TauCetiTools",), *, include_unmatched=False):
     commit = git(root, "rev-parse", ref + "^{commit}").decode().strip()
     files = git(root, "ls-tree", "-rlz", commit).split(b"\0")
     findings, skipped = [], []
@@ -122,7 +122,7 @@ def inspect(name, root, ref, canonical_names=("TauCetiTools",)):
         }
         matches = {category: numbers for category, numbers in matches.items() if numbers}
         workflow = any(parts[i] == ".github" and parts[i + 1] == "workflows" for i in range(len(parts) - 1))
-        if matches or workflow or forge_config or Path(file).name == "CODEOWNERS":
+        if include_unmatched or matches or workflow or forge_config or Path(file).name == "CODEOWNERS":
             findings.append({"path": file, "categories": matches})
     return {
         "repository": name,
