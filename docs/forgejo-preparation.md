@@ -2,7 +2,7 @@
 
 Tracker: [Worker #602](https://github.com/TauCetiProject/TauCetiWorker/issues/602).
 Accepted architecture and ordered work packages:
-[TauCetiTools preparation document](https://github.com/TauCetiProject/TauCetiTools/blob/ef2da2b5d52cefd36d5d9f0d79502cc3bc416c5e/docs/forgejo-preparation.md).
+[TauCetiTools preparation document](https://github.com/TauCetiProject/TauCetiTools/blob/8f30faab8f3545ce688c199c34efa780c0603111/docs/forgejo-preparation.md).
 
 Forgejo will own development and merges; GitHub Actions initially continues running
 CI and fetching retained candidates directly from Forgejo. Agents keep familiar
@@ -36,12 +36,15 @@ CLI launch sites/literal commands, wrapper argument lists, credential references
 source identities, workflow events, Actions context and shared-state mentions.
 It covers Worker, Tools, Fleet, Review, Progress, CI, content, Roadmap and Data.
 Extensionless executable/shebang scripts, Dockerfiles, service units, JSON/JSONC,
-lake manifests and example configurations are included. Every YAML workflow is
-listed even when no regex category matches. The report records its scanner digest,
+lake manifests/configuration and example configurations are included. Forge configuration
+directories (`.github/`, `.forgejo/`, `.gitea/`) and `CODEOWNERS` files are listed even
+when no regex category matches, including issue forms, PR templates, workflows,
+and `docs/CODEOWNERS`. The report records its scanner digest,
 matching/filter policy, and any size/encoding omissions. Archived records and
 build artifacts are deliberately excluded.
 
-Regenerate after fetching each repository's default branch:
+Fetch repositories so the recorded commits are available, then replay those pinned
+revisions. Omit `--replay` to inventory current default-branch refs instead:
 
 ```sh
 python scripts/forge-inventory.py \

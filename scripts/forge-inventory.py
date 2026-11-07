@@ -19,10 +19,11 @@ from pathlib import Path
 PATTERNS = {
     "github_origin": r"github\.com|githubusercontent\.com|ghcr\.io|github\.io",
     "graphql": r"graphql|GraphQL|resolveReviewThread|reviewThreads",
-    "gh_cli": r"\bgh\s+(?:--?[A-Za-z]|(?:api|pr|issue|repo|run|auth|release|workflow|label|search|secret|variable)\b)|[\"']gh[\"']\s*,|\(\s*\[\s*[\"'](?:api|pr|issue|repo|label|run)[\"']\s*,",
-    "credentials": r"GH_TOKEN|GITHUB_TOKEN|github_account|github_token_file|InstallationToken|github-app",
+    "gh_cli": r"\bgh\s+(?:--?[A-Za-z]|[a-z][\w-]*\b)|[\"']gh[\"']\s*,|\(\s*\[\s*[\"'](?:api|pr|issue|repo|label|run)[\"']\s*,",
+    "credentials": r"GH_(?:TOKEN|ENTERPRISE_TOKEN|HOST)|GITHUB_(?:TOKEN|ENTERPRISE_TOKEN)|github_account|github_token_file|InstallationToken|github-app|secrets\.\w+|APP_PRIVATE_KEY|APP_ID|CLAIMS_APP_",
     "source_identity": r"TAUCETI_REPO|TAUCETI_FORK|Source-PR|repository_id|review_app_id",
     "org_slug": r"TauCetiProject/[\w.-]+",
+    "forge_paths": r"\.(?:github|forgejo|gitea)/",
     "actions_context": r"github\.(?:repository|event|sha|ref|token|workflow|run)|GITHUB_(?:REPOSITORY|SHA|OUTPUT|API_URL|EVENT|REF|TOKEN)",
     "workflow_event": r"pull_request|repository_dispatch|merge_group|issue_comment|workflow_(?:dispatch|call|run)|pull_request_review|check_(?:run|suite)|\b(?:push|schedule)\b",
     "workflow_uses": r"\buses\s*:",
@@ -69,34 +70,49 @@ def inspect(name, root, ref, canonical_names=("TauCetiTools",)):
         if not entry:
             continue
         metadata, raw_name = entry.split(b"\t", 1)
-        mode, kind, _, size = metadata.split()
+        mode, kind, oid, size = metadata.split()
         if kind != b"blob":
             continue
         file = raw_name.decode(errors="surrogateescape")
         parts = Path(file).parts
-        if not parts or any(part in EXCLUDED_PARTS or part == "docs" for part in parts):
-            continue
-        if file.startswith("docs/") or file.endswith("README.md"):
-            continue
-        if Path(file).name.startswith("test_") or file.endswith((".test.ts", ".spec.ts")):
-            continue
-        if Path(file).suffix == ".md" and not (
-            "prompts" in parts
-            or Path(file).name in {"AGENTS.md", "CLAUDE.md", "SKILL.md"}
-            or file.startswith("tauceti_tools/assets/scripts/")
+        ownership = Path(file).name == "CODEOWNERS"
+        forge_config = any(part in {".github", ".forgejo", ".gitea"} for part in parts[:-1])
+        if not parts or (
+            not forge_config
+            and (any(part in EXCLUDED_PARTS for part in parts[:-1]) or ("docs" in parts[:-1] and not ownership))
         ):
             continue
-        known = Path(file).suffix in EXTENSIONS or Path(file).name.startswith("Dockerfile") or mode == b"100755"
+        if not forge_config and not ownership and (file.startswith("docs/") or file.endswith("README.md")):
+            continue
+        if not forge_config and (Path(file).name.startswith("test_") or file.endswith((".test.ts", ".spec.ts"))):
+            continue
+        if (
+            not forge_config
+            and Path(file).suffix == ".md"
+            and not (
+                "prompts" in parts
+                or Path(file).name in {"AGENTS.md", "CLAUDE.md", "SKILL.md"}
+                or file.startswith("tauceti_tools/assets/scripts/")
+            )
+        ):
+            continue
+        known = (
+            forge_config
+            or Path(file).name in {"CODEOWNERS", "lakefile.lean"}
+            or Path(file).suffix in EXTENSIONS
+            or Path(file).name.startswith("Dockerfile")
+            or mode == b"100755"
+        )
         if not known and Path(file).suffix:
             continue
         if int(size) > MAX_BYTES:
             skipped.append({"path": file, "reason": "exceeds_byte_limit", "size": int(size)})
             continue
-        data = git(root, "show", commit + ":" + file)
+        data = git(root, "cat-file", "blob", oid.decode("ascii"))
         if not known and not data.startswith(b"#!"):
             continue
         try:
-            lines = data.decode().splitlines()
+            lines = data.decode().split("\n")
         except UnicodeError:
             skipped.append({"path": file, "reason": "non_utf8", "size": len(data)})
             continue
@@ -106,7 +122,7 @@ def inspect(name, root, ref, canonical_names=("TauCetiTools",)):
         }
         matches = {category: numbers for category, numbers in matches.items() if numbers}
         workflow = any(parts[i] == ".github" and parts[i + 1] == "workflows" for i in range(len(parts) - 1))
-        if matches or workflow:
+        if matches or workflow or forge_config or Path(file).name == "CODEOWNERS":
             findings.append({"path": file, "categories": matches})
     return {
         "repository": name,
@@ -150,17 +166,23 @@ def main():
             "patterns": PATTERNS,
             "extensions": sorted(EXTENSIONS),
             "excluded_parts": sorted(EXCLUDED_PARTS | {"docs"}),
+            "exclusions_apply_to": "Directory components outside forge configuration; docs/CODEOWNERS is retained",
             "max_bytes": MAX_BYTES,
             "canonical_names": canonical_names,
             "extra_inclusions": [
                 "executable Git blobs",
                 "extensionless shebang scripts",
                 "Dockerfile*",
-                "all .github/workflows files",
+                "all files in .github/, .forgejo/ and .gitea/ configuration directories",
+                "CODEOWNERS, including docs/CODEOWNERS",
+                "lakefile.lean",
             ],
-            "extra_exclusions": ["README.md", "test_*.py", "*.test.ts", "*.spec.ts", "mathematical Markdown"],
+            "extra_exclusions": [
+                "Outside forge configuration: *README.md, basenames beginning test_, *.test.ts, *.spec.ts",
+                "Outside forge configuration: Markdown unless under prompts/, named AGENTS.md/CLAUDE.md/SKILL.md, or under tauceti_tools/assets/scripts/",
+            ],
         },
-        "scope": "Tracked executable/configuration/template/prompt sources, including extensionless scripts, Dockerfiles, service units, JSON/JSONC and example configurations; excludes archived records, tests, docs, fixtures, build artifacts and vendored dependencies. Matching workflows are enumerated unconditionally.",
+        "scope": "Selected tracked executable/configuration/template/prompt text sources under the recorded candidate policy, including extensionless scripts, Dockerfiles, service units, JSON/JSONC, CODEOWNERS and examples. Outside forge configuration, archived records, tests, docs (except CODEOWNERS), fixtures, build artifacts and vendored dependencies are excluded. Forge configuration directories are enumerated unconditionally, subject to recorded size/encoding skips.",
         "limitations": "Lexical findings guide manual contract review; absence is not proof of provider independence. Dynamic commands require inspection.",
         "repositories": repositories,
     }

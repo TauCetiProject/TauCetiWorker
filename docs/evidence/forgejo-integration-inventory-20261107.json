@@ -1,15 +1,16 @@
 {
   "schema": "tauceti.forge-inventory/v1",
-  "generated_at": "2026-11-07T01:25:06.638265+00:00",
-  "scanner_sha256": "89ba284fd030c136f25cdc8d2653d97238a8991dbfbe2f48c2205a87ea8825bd",
+  "generated_at": "2026-11-07T01:42:47.792307+00:00",
+  "scanner_sha256": "2aabeb305fc02f4732954b63093cf191a0eaaaa3164d1cdeb8d3d020af1be536",
   "policy": {
     "patterns": {
       "github_origin": "github\\.com|githubusercontent\\.com|ghcr\\.io|github\\.io",
       "graphql": "graphql|GraphQL|resolveReviewThread|reviewThreads",
-      "gh_cli": "\\bgh\\s+(?:--?[A-Za-z]|(?:api|pr|issue|repo|run|auth|release|workflow|label|search|secret|variable)\\b)|[\\\"']gh[\\\"']\\s*,|\\(\\s*\\[\\s*[\\\"'](?:api|pr|issue|repo|label|run)[\\\"']\\s*,",
-      "credentials": "GH_TOKEN|GITHUB_TOKEN|github_account|github_token_file|InstallationToken|github-app",
+      "gh_cli": "\\bgh\\s+(?:--?[A-Za-z]|[a-z][\\w-]*\\b)|[\\\"']gh[\\\"']\\s*,|\\(\\s*\\[\\s*[\\\"'](?:api|pr|issue|repo|label|run)[\\\"']\\s*,",
+      "credentials": "GH_(?:TOKEN|ENTERPRISE_TOKEN|HOST)|GITHUB_(?:TOKEN|ENTERPRISE_TOKEN)|github_account|github_token_file|InstallationToken|github-app|secrets\\.\\w+|APP_PRIVATE_KEY|APP_ID|CLAIMS_APP_",
       "source_identity": "TAUCETI_REPO|TAUCETI_FORK|Source-PR|repository_id|review_app_id",
       "org_slug": "TauCetiProject/[\\w.-]+",
+      "forge_paths": "\\.(?:github|forgejo|gitea)/",
       "actions_context": "github\\.(?:repository|event|sha|ref|token|workflow|run)|GITHUB_(?:REPOSITORY|SHA|OUTPUT|API_URL|EVENT|REF|TOKEN)",
       "workflow_event": "pull_request|repository_dispatch|merge_group|issue_comment|workflow_(?:dispatch|call|run)|pull_request_review|check_(?:run|suite)|\\b(?:push|schedule)\\b",
       "workflow_uses": "\\buses\\s*:",
@@ -49,6 +50,7 @@
       "tests",
       "vendor"
     ],
+    "exclusions_apply_to": "Directory components outside forge configuration; docs/CODEOWNERS is retained",
     "max_bytes": 2097152,
     "canonical_names": [
       "TauCetiTools"
@@ -57,17 +59,16 @@
       "executable Git blobs",
       "extensionless shebang scripts",
       "Dockerfile*",
-      "all .github/workflows files"
+      "all files in .github/, .forgejo/ and .gitea/ configuration directories",
+      "CODEOWNERS, including docs/CODEOWNERS",
+      "lakefile.lean"
     ],
     "extra_exclusions": [
-      "README.md",
-      "test_*.py",
-      "*.test.ts",
-      "*.spec.ts",
-      "mathematical Markdown"
+      "Outside forge configuration: *README.md, basenames beginning test_, *.test.ts, *.spec.ts",
+      "Outside forge configuration: Markdown unless under prompts/, named AGENTS.md/CLAUDE.md/SKILL.md, or under tauceti_tools/assets/scripts/"
     ]
   },
-  "scope": "Tracked executable/configuration/template/prompt sources, including extensionless scripts, Dockerfiles, service units, JSON/JSONC and example configurations; excludes archived records, tests, docs, fixtures, build artifacts and vendored dependencies. Matching workflows are enumerated unconditionally.",
+  "scope": "Selected tracked executable/configuration/template/prompt text sources under the recorded candidate policy, including extensionless scripts, Dockerfiles, service units, JSON/JSONC, CODEOWNERS and examples. Outside forge configuration, archived records, tests, docs (except CODEOWNERS), fixtures, build artifacts and vendored dependencies are excluded. Forge configuration directories are enumerated unconditionally, subject to recorded size/encoding skips.",
   "limitations": "Lexical findings guide manual contract review; absence is not proof of provider independence. Dynamic commands require inspection.",
   "repositories": [
     {
@@ -77,10 +78,11 @@
       "counts": {
         "github_origin": 59,
         "graphql": 16,
-        "gh_cli": 34,
-        "credentials": 18,
+        "gh_cli": 36,
+        "credentials": 28,
         "source_identity": 21,
         "org_slug": 51,
+        "forge_paths": 18,
         "actions_context": 12,
         "workflow_event": 67,
         "workflow_uses": 3,
@@ -92,6 +94,9 @@
           "categories": {
             "github_origin": [
               256
+            ],
+            "gh_cli": [
+              244
             ],
             "org_slug": [
               144,
@@ -178,6 +183,9 @@
               17,
               25
             ],
+            "forge_paths": [
+              21
+            ],
             "workflow_event": [
               18,
               46,
@@ -201,6 +209,9 @@
               5,
               6,
               36
+            ],
+            "forge_paths": [
+              32
             ],
             "workflow_event": [
               28,
@@ -228,6 +239,9 @@
               19,
               27
             ],
+            "forge_paths": [
+              23
+            ],
             "workflow_event": [
               28,
               35,
@@ -249,6 +263,10 @@
               1,
               25,
               36
+            ],
+            "forge_paths": [
+              1,
+              29
             ],
             "workflow_event": [
               26,
@@ -320,6 +338,9 @@
               1,
               28
             ],
+            "forge_paths": [
+              24
+            ],
             "workflow_event": [
               21,
               31,
@@ -348,6 +369,9 @@
               86,
               95
             ],
+            "forge_paths": [
+              43
+            ],
             "workflow_event": [
               76,
               86,
@@ -369,6 +393,9 @@
               1,
               21,
               29
+            ],
+            "forge_paths": [
+              25
             ],
             "workflow_event": [
               22,
@@ -393,6 +420,9 @@
               5,
               6,
               53
+            ],
+            "forge_paths": [
+              49
             ],
             "workflow_event": [
               45,
@@ -420,6 +450,9 @@
               19,
               27
             ],
+            "forge_paths": [
+              23
+            ],
             "workflow_event": [
               28,
               34,
@@ -441,6 +474,10 @@
               1,
               28,
               39
+            ],
+            "forge_paths": [
+              1,
+              32
             ],
             "workflow_event": [
               26,
@@ -473,6 +510,9 @@
               1,
               28
             ],
+            "forge_paths": [
+              24
+            ],
             "workflow_event": [
               21,
               31,
@@ -500,6 +540,9 @@
               48,
               87,
               96
+            ],
+            "forge_paths": [
+              43
             ],
             "workflow_event": [
               77,
@@ -941,6 +984,9 @@
               8,
               19
             ],
+            "credentials": [
+              58
+            ],
             "source_identity": [
               58,
               65,
@@ -975,6 +1021,9 @@
               49,
               137,
               272
+            ],
+            "credentials": [
+              490
             ],
             "source_identity": [
               7,
@@ -1037,6 +1086,15 @@
               4711,
               4719
             ],
+            "credentials": [
+              1209,
+              1944,
+              2630,
+              3060,
+              3472,
+              3836,
+              3970
+            ],
             "source_identity": [
               196,
               2266,
@@ -1071,6 +1129,14 @@
         {
           "path": "tauceti_queue/eligibility.py",
           "categories": {
+            "credentials": [
+              30,
+              55,
+              69,
+              119,
+              144,
+              157
+            ],
             "source_identity": [
               55,
               56,
@@ -1173,6 +1239,9 @@
             ],
             "org_slug": [
               59
+            ],
+            "forge_paths": [
+              980
             ],
             "workflow_event": [
               26,
@@ -1284,10 +1353,25 @@
               3238
             ],
             "credentials": [
+              59,
+              210,
+              211,
+              212,
+              213,
               218,
               327,
+              411,
+              412,
+              413,
+              414,
               423,
+              440,
+              441,
               442,
+              1164,
+              1282,
+              1302,
+              1695,
               3204,
               3210,
               3238
@@ -1319,6 +1403,15 @@
               472,
               474,
               496
+            ],
+            "forge_paths": [
+              126,
+              198,
+              205,
+              399,
+              406,
+              461,
+              538
             ],
             "actions_context": [
               150,
@@ -1451,6 +1544,9 @@
             "org_slug": [
               47
             ],
+            "forge_paths": [
+              987
+            ],
             "actions_context": [
               2052
             ],
@@ -1466,6 +1562,9 @@
           "categories": {
             "github_origin": [
               64
+            ],
+            "forge_paths": [
+              11
             ]
           }
         },
@@ -1496,6 +1595,17 @@
             "workflow_event": [
               30,
               62
+            ]
+          }
+        },
+        {
+          "path": "tauceti_queue/repair_sandbox.py",
+          "categories": {
+            "credentials": [
+              162
+            ],
+            "forge_paths": [
+              3
             ]
           }
         },
@@ -1542,6 +1652,10 @@
         {
           "path": "tauceti_queue/server.py",
           "categories": {
+            "credentials": [
+              95,
+              770
+            ],
             "source_identity": [
               95,
               193,
@@ -1555,6 +1669,10 @@
         {
           "path": "tauceti_queue/webhook.py",
           "categories": {
+            "credentials": [
+              44,
+              71
+            ],
             "source_identity": [
               71,
               77,
@@ -1639,9 +1757,16 @@
               2521
             ],
             "gh_cli": [
+              1395,
+              1396,
+              1936,
               1965,
+              1977,
+              1981,
               2667,
               2740,
+              3075,
+              3078,
               3206
             ],
             "credentials": [
@@ -1690,6 +1815,14 @@
           }
         },
         {
+          "path": "tauceti_worker/audit_reader_v3.py",
+          "categories": {
+            "credentials": [
+              140
+            ]
+          }
+        },
+        {
           "path": "tauceti_worker/cli.py",
           "categories": {
             "github_origin": [
@@ -1699,14 +1832,17 @@
               1720
             ],
             "gh_cli": [
+              186,
               352,
               1552,
               1603,
               1607,
+              1609,
               1610,
               1667,
               1677,
-              1682
+              1682,
+              1713
             ],
             "credentials": [
               36,
@@ -1755,7 +1891,8 @@
           "categories": {
             "gh_cli": [
               114,
-              118
+              118,
+              275
             ],
             "workflow_event": [
               250,
@@ -1776,7 +1913,8 @@
             ],
             "gh_cli": [
               182,
-              185
+              185,
+              203
             ],
             "source_identity": [
               10
@@ -1788,6 +1926,10 @@
               25,
               53,
               113
+            ],
+            "forge_paths": [
+              52,
+              117
             ]
           }
         },
@@ -1868,6 +2010,8 @@
               97,
               107,
               118,
+              181,
+              231,
               256,
               264,
               269,
@@ -1880,14 +2024,21 @@
               402,
               408,
               415,
+              467,
               514,
+              537,
+              545,
+              604,
               630,
+              633,
+              636,
               664,
               672,
               673,
               687,
               690,
               759,
+              766,
               785,
               796,
               807,
@@ -1900,6 +2051,7 @@
               39,
               48,
               49,
+              50,
               77,
               81,
               85,
@@ -1911,6 +2063,7 @@
               191,
               202,
               203,
+              204,
               263
             ],
             "source_identity": [
@@ -2091,16 +2244,22 @@
               1254
             ],
             "gh_cli": [
+              1,
               508,
+              517,
               630,
               677,
+              737,
+              1099,
               1177,
               1188,
               1265,
               1286
             ],
             "credentials": [
-              43
+              43,
+              47,
+              588
             ],
             "actions_context": [
               35,
@@ -2174,7 +2333,8 @@
               213
             ],
             "credentials": [
-              33
+              33,
+              37
             ],
             "org_slug": [
               154
@@ -2335,6 +2495,9 @@
             "gh_cli": [
               203
             ],
+            "credentials": [
+              1456
+            ],
             "workflow_event": [
               218
             ]
@@ -2397,6 +2560,9 @@
         {
           "path": "tauceti_worker/tui.py",
           "categories": {
+            "gh_cli": [
+              445
+            ],
             "credentials": [
               168,
               177,
@@ -2425,6 +2591,11 @@
         {
           "path": "tauceti_worker/work_recovery.py",
           "categories": {
+            "credentials": [
+              1013,
+              1014,
+              1280
+            ],
             "workflow_event": [
               25,
               26,
@@ -2455,9 +2626,11 @@
               1188
             ],
             "gh_cli": [
+              471,
               472,
               1210,
               1216,
+              1527,
               1924,
               1927,
               1928,
@@ -2564,6 +2737,9 @@
           "path": "tauceti_worker/workflow_backstop.py",
           "categories": {
             "gh_cli": [
+              45,
+              52,
+              59,
               61
             ],
             "workflow_event": [
@@ -2590,10 +2766,11 @@
       "counts": {
         "github_origin": 82,
         "graphql": 29,
-        "gh_cli": 52,
-        "credentials": 47,
+        "gh_cli": 58,
+        "credentials": 63,
         "source_identity": 23,
         "org_slug": 86,
+        "forge_paths": 43,
         "actions_context": 57,
         "workflow_event": 115,
         "workflow_uses": 38,
@@ -2604,6 +2781,7 @@
           "path": ".github/actions/ci-credentials/action.yml",
           "categories": {
             "credentials": [
+              45,
               49,
               60
             ],
@@ -2624,6 +2802,10 @@
         {
           "path": ".github/workflows/checks.yml",
           "categories": {
+            "credentials": [
+              40,
+              41
+            ],
             "actions_context": [
               11,
               23,
@@ -2653,6 +2835,10 @@
         {
           "path": ".github/workflows/pick-runner.yml",
           "categories": {
+            "credentials": [
+              8,
+              9
+            ],
             "workflow_event": [
               3
             ]
@@ -2672,13 +2858,35 @@
               348
             ],
             "credentials": [
+              33,
+              34,
+              37,
+              38,
+              39,
+              40,
+              87,
+              88,
+              89,
+              185,
+              186,
+              187,
+              188,
               193,
               297,
               452,
               485,
               745,
               980,
+              1304,
+              1305,
               1307,
+              1616,
+              1680,
+              1681,
+              1682,
+              1683,
+              1687,
+              1688,
               1689
             ],
             "source_identity": [
@@ -2686,6 +2894,16 @@
             ],
             "org_slug": [
               1516
+            ],
+            "forge_paths": [
+              80,
+              180,
+              322,
+              642,
+              890,
+              917,
+              1607,
+              1675
             ],
             "actions_context": [
               2,
@@ -2839,6 +3057,9 @@
             "github_origin": [
               114
             ],
+            "credentials": [
+              144
+            ],
             "source_identity": [
               52
             ],
@@ -2868,9 +3089,22 @@
           "path": ".github/workflows/retry-ci-status.yml",
           "categories": {
             "credentials": [
+              12,
+              13,
+              14,
+              15,
               74,
+              126,
+              127,
+              128,
+              129,
+              134,
+              135,
               137,
               178
+            ],
+            "forge_paths": [
+              121
             ],
             "actions_context": [
               31,
@@ -3414,8 +3648,11 @@
               104,
               145,
               165,
+              210,
               215,
-              232
+              232,
+              237,
+              272
             ],
             "source_identity": [
               134,
@@ -3577,6 +3814,9 @@
               544,
               548
             ],
+            "credentials": [
+              75
+            ],
             "workflow_event": [
               298,
               327,
@@ -3628,6 +3868,9 @@
         {
           "path": "services/github-state/src/protocol.ts",
           "categories": {
+            "credentials": [
+              5
+            ],
             "workflow_event": [
               88,
               89,
@@ -4375,8 +4618,15 @@
           "path": "tauceti_tools/assets/ci/.github/workflows/collect.yml",
           "categories": {
             "credentials": [
+              37,
+              38,
               40,
+              45,
+              46,
               58
+            ],
+            "forge_paths": [
+              10
             ],
             "actions_context": [
               38,
@@ -4444,6 +4694,10 @@
             "credentials": [
               72
             ],
+            "forge_paths": [
+              12,
+              31
+            ],
             "actions_context": [
               47,
               72,
@@ -4469,6 +4723,9 @@
             "org_slug": [
               19
             ],
+            "forge_paths": [
+              12
+            ],
             "workflow_uses": [
               6,
               17
@@ -4490,6 +4747,10 @@
         {
           "path": "tauceti_tools/assets/project/.github/actions/restore-mathlib-ltars/action.yml",
           "categories": {
+            "forge_paths": [
+              48,
+              49
+            ],
             "actions_context": [
               44,
               45,
@@ -4508,11 +4769,16 @@
               183
             ],
             "gh_cli": [
-              224
+              224,
+              265,
+              268
             ],
             "credentials": [
               218,
               259
+            ],
+            "forge_paths": [
+              26
             ],
             "actions_context": [
               36,
@@ -4552,9 +4818,15 @@
               72
             ],
             "credentials": [
-              60
+              60,
+              93,
+              94
             ],
             "org_slug": [
+              84
+            ],
+            "forge_paths": [
+              82,
               84
             ],
             "actions_context": [
@@ -4607,7 +4879,13 @@
             ],
             "credentials": [
               59,
-              267
+              267,
+              433
+            ],
+            "forge_paths": [
+              71,
+              100,
+              424
             ],
             "actions_context": [
               59,
@@ -4650,12 +4928,22 @@
           "path": "tauceti_tools/assets/project/.github/workflows/claims-access.yml",
           "categories": {
             "credentials": [
+              12,
+              18,
+              43,
+              45,
+              46,
               52,
+              55,
+              56,
               64
             ],
             "org_slug": [
               3,
               17
+            ],
+            "forge_paths": [
+              48
             ],
             "actions_context": [
               64,
@@ -4677,12 +4965,17 @@
           "categories": {
             "credentials": [
               79,
+              81,
+              82,
               91
             ],
             "org_slug": [
               31,
               46,
               48
+            ],
+            "forge_paths": [
+              46
             ],
             "actions_context": [
               26,
@@ -4716,7 +5009,12 @@
           "categories": {
             "credentials": [
               32,
+              35,
+              36,
               53
+            ],
+            "forge_paths": [
+              46
             ],
             "actions_context": [
               54
@@ -4753,7 +5051,13 @@
             "credentials": [
               49,
               215,
+              218,
+              219,
               228
+            ],
+            "forge_paths": [
+              57,
+              86
             ],
             "actions_context": [
               49,
@@ -4786,10 +5090,15 @@
             "credentials": [
               52,
               69,
+              72,
+              73,
               98
             ],
             "org_slug": [
               63
+            ],
+            "forge_paths": [
+              91
             ],
             "actions_context": [
               52,
@@ -4813,7 +5122,15 @@
         {
           "path": "tauceti_tools/assets/project/.github/workflows/merge-sweep.yml",
           "categories": {
+            "credentials": [
+              53,
+              54
+            ],
             "org_slug": [
+              45
+            ],
+            "forge_paths": [
+              43,
               45
             ],
             "actions_context": [
@@ -4838,11 +5155,20 @@
               347,
               582
             ],
+            "credentials": [
+              557,
+              558
+            ],
             "org_slug": [
               65,
               75,
               550,
               582
+            ],
+            "forge_paths": [
+              66,
+              241,
+              358
             ],
             "actions_context": [
               62,
@@ -4915,6 +5241,10 @@
             "org_slug": [
               160
             ],
+            "forge_paths": [
+              49,
+              291
+            ],
             "actions_context": [
               131,
               141,
@@ -4980,6 +5310,10 @@
         {
           "path": "tauceti_tools/assets/project/.github/workflows/pick-runner.yml",
           "categories": {
+            "credentials": [
+              8,
+              9
+            ],
             "workflow_event": [
               3
             ]
@@ -4988,6 +5322,20 @@
         {
           "path": "tauceti_tools/assets/project/.github/workflows/pr-build.yml",
           "categories": {
+            "credentials": [
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47,
+              48
+            ],
+            "forge_paths": [
+              15,
+              32
+            ],
             "actions_context": [
               3,
               37
@@ -5017,12 +5365,20 @@
             ],
             "credentials": [
               76,
+              79,
+              80,
               104,
               127,
-              157
+              157,
+              159,
+              160
             ],
             "org_slug": [
               41
+            ],
+            "forge_paths": [
+              95,
+              98
             ],
             "actions_context": [
               41,
@@ -5080,6 +5436,9 @@
             "github_origin": [
               114
             ],
+            "credentials": [
+              144
+            ],
             "source_identity": [
               52
             ],
@@ -5111,6 +5470,15 @@
         {
           "path": "tauceti_tools/assets/project/.github/workflows/retry-ci-status.yml",
           "categories": {
+            "credentials": [
+              26,
+              27,
+              28,
+              29
+            ],
+            "forge_paths": [
+              20
+            ],
             "actions_context": [
               24
             ],
@@ -5130,10 +5498,15 @@
             "credentials": [
               48,
               49,
+              52,
+              53,
               86
             ],
             "org_slug": [
               75
+            ],
+            "forge_paths": [
+              68
             ],
             "actions_context": [
               28,
@@ -5163,7 +5536,9 @@
           "path": "tauceti_tools/assets/project/.github/workflows/stuck-alerts.yml",
           "categories": {
             "credentials": [
-              52
+              52,
+              53,
+              54
             ],
             "org_slug": [
               42
@@ -5185,7 +5560,9 @@
           "path": "tauceti_tools/assets/project/.github/workflows/toolchain-tags.yml",
           "categories": {
             "credentials": [
-              76
+              76,
+              77,
+              78
             ],
             "org_slug": [
               58
@@ -5228,7 +5605,12 @@
             "credentials": [
               75,
               77,
+              80,
+              81,
               86
+            ],
+            "forge_paths": [
+              22
             ],
             "actions_context": [
               75,
@@ -5258,7 +5640,14 @@
               45,
               81,
               90,
+              93,
+              94,
               112
+            ],
+            "forge_paths": [
+              38,
+              61,
+              105
             ],
             "actions_context": [
               45,
@@ -5282,6 +5671,10 @@
         {
           "path": "tauceti_tools/assets/project/.github/workflows/zulip-healthcheck.yml",
           "categories": {
+            "credentials": [
+              34,
+              35
+            ],
             "org_slug": [
               24
             ],
@@ -5366,7 +5759,15 @@
         {
           "path": "tauceti_tools/assets/roadmap/.github/workflows/progress-announce.yml",
           "categories": {
+            "credentials": [
+              33,
+              34,
+              35
+            ],
             "org_slug": [
+              27
+            ],
+            "forge_paths": [
               27
             ],
             "workflow_event": [
@@ -5387,9 +5788,15 @@
               107
             ],
             "credentials": [
-              54
+              54,
+              139,
+              143,
+              145
             ],
             "org_slug": [
+              130
+            ],
+            "forge_paths": [
               130
             ],
             "actions_context": [
@@ -5548,6 +5955,9 @@
             "org_slug": [
               14
             ],
+            "forge_paths": [
+              94
+            ],
             "actions_context": [
               192
             ],
@@ -5600,6 +6010,9 @@
               377,
               455
             ],
+            "forge_paths": [
+              37
+            ],
             "workflow_event": [
               217
             ]
@@ -5638,6 +6051,9 @@
             "org_slug": [
               151,
               171
+            ],
+            "forge_paths": [
+              174
             ]
           }
         },
@@ -5720,6 +6136,7 @@
             "gh_cli": [
               52,
               59,
+              60,
               91,
               175,
               182
@@ -5784,6 +6201,9 @@
             "org_slug": [
               240
             ],
+            "forge_paths": [
+              191
+            ],
             "workflow_uses": [
               205
             ]
@@ -5832,6 +6252,9 @@
               34,
               46,
               218
+            ],
+            "forge_paths": [
+              45
             ],
             "workflow_event": [
               4,
@@ -5894,8 +6317,10 @@
               444
             ],
             "gh_cli": [
+              5,
               53,
               58,
+              112,
               182,
               396
             ],
@@ -5904,11 +6329,14 @@
               36,
               96,
               110,
+              136,
               139,
               140,
               143,
               144,
               202,
+              237,
+              244,
               245,
               246,
               251
@@ -5944,6 +6372,9 @@
           "categories": {
             "github_origin": [
               57
+            ],
+            "gh_cli": [
+              93
             ],
             "credentials": [
               38
@@ -5988,6 +6419,9 @@
             "org_slug": [
               38,
               100
+            ],
+            "forge_paths": [
+              3
             ]
           }
         },
@@ -6034,6 +6468,9 @@
             "credentials": [
               15
             ],
+            "forge_paths": [
+              9
+            ],
             "workflow_event": [
               16,
               18,
@@ -6054,6 +6491,7 @@
               63
             ],
             "gh_cli": [
+              40,
               48
             ]
           }
@@ -6064,7 +6502,8 @@
             "gh_cli": [
               21,
               60,
-              70
+              70,
+              101
             ],
             "credentials": [
               19
@@ -6104,6 +6543,7 @@
               135
             ],
             "gh_cli": [
+              60,
               64
             ],
             "org_slug": [
@@ -6172,7 +6612,8 @@
             ],
             "gh_cli": [
               178,
-              198
+              198,
+              203
             ],
             "org_slug": [
               1688
@@ -6186,6 +6627,12 @@
         {
           "path": "tauceti_tools/assets/scripts/pr_status/batch.py",
           "categories": {
+            "gh_cli": [
+              37
+            ],
+            "forge_paths": [
+              152
+            ],
             "workflow_event": [
               122,
               130,
@@ -6272,6 +6719,7 @@
           "path": "tauceti_tools/assets/scripts/pr_status/labels.py",
           "categories": {
             "gh_cli": [
+              8,
               46,
               81,
               109,
@@ -6314,6 +6762,7 @@
               703
             ],
             "gh_cli": [
+              199,
               488,
               738
             ],
@@ -6510,6 +6959,9 @@
             "github_origin": [
               289
             ],
+            "gh_cli": [
+              231
+            ],
             "credentials": [
               40
             ],
@@ -6536,6 +6988,25 @@
             ],
             "org_slug": [
               756
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/sandbox-build.sh",
+          "categories": {
+            "forge_paths": [
+              3
+            ]
+          }
+        },
+        {
+          "path": "tauceti_tools/assets/scripts/shadow_audits.py",
+          "categories": {
+            "credentials": [
+              174
+            ],
+            "forge_paths": [
+              331
             ]
           }
         },
@@ -6616,6 +7087,9 @@
           "categories": {
             "org_slug": [
               18
+            ],
+            "forge_paths": [
+              18
             ]
           }
         },
@@ -6695,6 +7169,11 @@
         {
           "path": "tauceti_tools/collector/build_db.py",
           "categories": {
+            "forge_paths": [
+              275,
+              276,
+              284
+            ],
             "workflow_event": [
               25,
               27,
@@ -6723,6 +7202,9 @@
         {
           "path": "tauceti_tools/collector/collect.py",
           "categories": {
+            "gh_cli": [
+              29
+            ],
             "source_identity": [
               31,
               32
@@ -6730,6 +7212,14 @@
             "org_slug": [
               31,
               32
+            ],
+            "forge_paths": [
+              43,
+              44,
+              45,
+              372,
+              386,
+              387
             ],
             "workflow_event": [
               81,
@@ -6765,6 +7255,9 @@
         {
           "path": "tauceti_tools/collector/incremental.py",
           "categories": {
+            "gh_cli": [
+              27
+            ],
             "source_identity": [
               628
             ],
@@ -6785,6 +7278,9 @@
         {
           "path": "tauceti_tools/collector/merge_identity.py",
           "categories": {
+            "forge_paths": [
+              12
+            ],
             "workflow_event": [
               12,
               30
@@ -6810,6 +7306,9 @@
         {
           "path": "tauceti_tools/collector/refresh_resources.py",
           "categories": {
+            "gh_cli": [
+              15
+            ],
             "source_identity": [
               51
             ],
@@ -6836,6 +7335,14 @@
               114,
               134
             ],
+            "forge_paths": [
+              28,
+              29,
+              34,
+              41,
+              53,
+              54
+            ],
             "workflow_event": [
               28,
               29,
@@ -6855,6 +7362,9 @@
             "gh_cli": [
               38,
               74
+            ],
+            "forge_paths": [
+              64
             ]
           }
         },
@@ -6866,6 +7376,11 @@
             ],
             "gh_cli": [
               217
+            ],
+            "credentials": [
+              149,
+              204,
+              228
             ],
             "source_identity": [
               204
@@ -6943,6 +7458,7 @@
             ],
             "gh_cli": [
               55,
+              60,
               121,
               131,
               146,
@@ -6986,9 +7502,32 @@
             ],
             "credentials": [
               134,
+              425,
+              427,
+              429,
+              431,
+              447,
+              459,
+              496,
               537,
               542,
-              1191
+              585,
+              590,
+              984,
+              1190,
+              1191,
+              1197,
+              1320,
+              1321,
+              1335,
+              1360,
+              1362,
+              1365,
+              1374,
+              1378,
+              1383,
+              1462,
+              1463
             ],
             "source_identity": [
               698,
@@ -7006,6 +7545,20 @@
               997,
               1288,
               1300
+            ],
+            "forge_paths": [
+              149,
+              289,
+              290,
+              291,
+              292,
+              295,
+              351,
+              503,
+              615,
+              619,
+              844,
+              1148
             ],
             "actions_context": [
               134,
@@ -7073,6 +7626,9 @@
             ],
             "gh_cli": [
               75
+            ],
+            "credentials": [
+              64
             ],
             "org_slug": [
               75
@@ -7198,6 +7754,7 @@
             ],
             "credentials": [
               34,
+              92,
               548
             ],
             "source_identity": [
@@ -7210,6 +7767,15 @@
               160,
               161,
               162
+            ],
+            "forge_paths": [
+              331,
+              339,
+              348,
+              403,
+              415,
+              421,
+              461
             ],
             "actions_context": [
               21,
@@ -7255,9 +7821,10 @@
         "github_origin": 11,
         "graphql": 0,
         "gh_cli": 4,
-        "credentials": 10,
+        "credentials": 15,
         "source_identity": 1,
         "org_slug": 15,
+        "forge_paths": 5,
         "actions_context": 6,
         "workflow_event": 13,
         "workflow_uses": 1,
@@ -7324,9 +7891,14 @@
             "credentials": [
               77,
               154,
+              158,
+              161,
               167,
               181,
-              195
+              195,
+              196,
+              210,
+              215
             ],
             "source_identity": [
               105
@@ -7338,6 +7910,10 @@
               100,
               101,
               190
+            ],
+            "forge_paths": [
+              100,
+              101
             ]
           }
         },
@@ -7356,9 +7932,17 @@
             "github_origin": [
               16
             ],
+            "credentials": [
+              29,
+              35
+            ],
             "org_slug": [
               49,
               65,
+              66,
+              67
+            ],
+            "forge_paths": [
               66,
               67
             ],
@@ -7374,6 +7958,9 @@
               33,
               109,
               122
+            ],
+            "credentials": [
+              81
             ],
             "org_slug": [
               33,
@@ -7447,6 +8034,14 @@
           }
         },
         {
+          "path": "tauceti_fleet/broker.py",
+          "categories": {
+            "credentials": [
+              106
+            ]
+          }
+        },
+        {
           "path": "tauceti_fleet/capabilities.py",
           "categories": {
             "gh_cli": [
@@ -7473,6 +8068,9 @@
               130,
               199,
               207
+            ],
+            "forge_paths": [
+              131
             ],
             "workflow_event": [
               132
@@ -7518,6 +8116,9 @@
             ],
             "org_slug": [
               21
+            ],
+            "forge_paths": [
+              152
             ],
             "actions_context": [
               254
@@ -7575,6 +8176,10 @@
               107,
               147,
               157
+            ],
+            "forge_paths": [
+              84,
+              85
             ]
           }
         },
@@ -7603,6 +8208,14 @@
               131,
               288,
               353
+            ]
+          }
+        },
+        {
+          "path": "tauceti_fleet/lean_guest.py",
+          "categories": {
+            "credentials": [
+              83
             ]
           }
         },
@@ -7664,6 +8277,13 @@
             "gh_cli": [
               202,
               597
+            ],
+            "credentials": [
+              210,
+              211,
+              396,
+              606,
+              607
             ]
           }
         }
@@ -7678,15 +8298,24 @@
         "github_origin": 8,
         "graphql": 6,
         "gh_cli": 14,
-        "credentials": 9,
+        "credentials": 12,
         "source_identity": 6,
-        "org_slug": 14,
+        "org_slug": 15,
+        "forge_paths": 1,
         "actions_context": 8,
         "workflow_event": 12,
         "workflow_uses": 5,
         "shared_state": 0
       },
       "files": [
+        {
+          "path": ".github/CODEOWNERS",
+          "categories": {
+            "org_slug": [
+              2
+            ]
+          }
+        },
         {
           "path": ".github/workflows/merge-only.yml",
           "categories": {
@@ -7716,9 +8345,13 @@
               320
             ],
             "credentials": [
+              30,
+              31,
               95,
               132,
               167,
+              169,
+              170,
               184,
               192,
               199,
@@ -7771,7 +8404,11 @@
           "path": ".github/workflows/merge-sweep.yml",
           "categories": {
             "credentials": [
+              33,
+              34,
               102,
+              104,
+              105,
               129
             ],
             "source_identity": [
@@ -7839,16 +8476,28 @@
             "credentials": [
               115,
               188,
+              190,
+              191,
               198,
+              249,
+              250,
               292,
+              294,
+              295,
               306,
               323,
               351,
+              353,
+              354,
               363,
               366,
               377,
+              379,
+              380,
               388,
               404,
+              406,
+              407,
               415
             ],
             "source_identity": [
@@ -7936,7 +8585,12 @@
             ],
             "credentials": [
               63,
-              155
+              124,
+              125,
+              126,
+              155,
+              157,
+              158
             ],
             "org_slug": [
               39,
@@ -8032,7 +8686,10 @@
               122
             ],
             "gh_cli": [
-              109
+              3,
+              38,
+              109,
+              129
             ]
           }
         },
@@ -8149,6 +8806,7 @@
           "categories": {
             "gh_cli": [
               470,
+              488,
               680
             ],
             "org_slug": [
@@ -8175,6 +8833,10 @@
               72,
               79,
               82
+            ],
+            "credentials": [
+              12,
+              26
             ],
             "workflow_event": [
               60,
@@ -8262,6 +8924,9 @@
           "categories": {
             "credentials": [
               21
+            ],
+            "forge_paths": [
+              12
             ]
           }
         },
@@ -8284,6 +8949,9 @@
         {
           "path": "runner/review.py",
           "categories": {
+            "credentials": [
+              346
+            ],
             "source_identity": [
               557
             ],
@@ -8294,6 +8962,14 @@
             "workflow_event": [
               989,
               1036
+            ]
+          }
+        },
+        {
+          "path": "runner/sandbox_check.py",
+          "categories": {
+            "credentials": [
+              50
             ]
           }
         },
@@ -8373,9 +9049,10 @@
         "github_origin": 6,
         "graphql": 3,
         "gh_cli": 6,
-        "credentials": 2,
+        "credentials": 6,
         "source_identity": 2,
-        "org_slug": 10,
+        "org_slug": 11,
+        "forge_paths": 3,
         "actions_context": 3,
         "workflow_event": 11,
         "workflow_uses": 5,
@@ -8383,12 +9060,21 @@
       },
       "files": [
         {
+          "path": ".github/CODEOWNERS",
+          "categories": {
+            "org_slug": [
+              8
+            ]
+          }
+        },
+        {
           "path": ".github/scripts/collect.py",
           "categories": {
             "github_origin": [
               221
             ],
             "gh_cli": [
+              49,
               68,
               70,
               77,
@@ -8422,6 +9108,11 @@
         {
           "path": ".github/workflows/announce.yml",
           "categories": {
+            "credentials": [
+              145,
+              146,
+              147
+            ],
             "org_slug": [
               23,
               69
@@ -8474,10 +9165,13 @@
             ],
             "credentials": [
               17,
+              54,
+              64,
               148,
               164,
               210,
               237,
+              240,
               271,
               397,
               453
@@ -8485,6 +9179,9 @@
             "org_slug": [
               34,
               115
+            ],
+            "forge_paths": [
+              153
             ],
             "actions_context": [
               17,
@@ -8618,6 +9315,10 @@
         {
           "path": "progress/gate.py",
           "categories": {
+            "credentials": [
+              60,
+              353
+            ],
             "workflow_event": [
               353,
               370,
@@ -8654,9 +9355,13 @@
               87,
               93,
               125,
+              147,
               150,
               203,
               350
+            ],
+            "credentials": [
+              98
             ],
             "source_identity": [
               26
@@ -8692,7 +9397,15 @@
         {
           "path": "roadmap-workflows/progress-announce.yml",
           "categories": {
+            "credentials": [
+              33,
+              34,
+              35
+            ],
             "org_slug": [
+              27
+            ],
+            "forge_paths": [
               27
             ],
             "workflow_event": [
@@ -8714,9 +9427,15 @@
               128
             ],
             "credentials": [
-              54
+              54,
+              167,
+              171,
+              173
             ],
             "org_slug": [
+              158
+            ],
+            "forge_paths": [
               158
             ],
             "actions_context": [
@@ -8771,9 +9490,10 @@
         "github_origin": 12,
         "graphql": 0,
         "gh_cli": 4,
-        "credentials": 7,
+        "credentials": 10,
         "source_identity": 0,
         "org_slug": 15,
+        "forge_paths": 7,
         "actions_context": 10,
         "workflow_event": 21,
         "workflow_uses": 8,
@@ -8814,6 +9534,10 @@
               38,
               44
             ],
+            "forge_paths": [
+              4,
+              6
+            ],
             "actions_context": [
               51
             ],
@@ -8834,7 +9558,11 @@
           "path": ".github/workflows/collect.yml",
           "categories": {
             "credentials": [
+              43,
+              44,
               46,
+              51,
+              52,
               64
             ],
             "org_slug": [
@@ -8865,6 +9593,10 @@
           "categories": {
             "org_slug": [
               22
+            ],
+            "forge_paths": [
+              4,
+              6
             ],
             "actions_context": [
               13
@@ -8913,7 +9645,11 @@
               59
             ],
             "credentials": [
+              38,
+              39,
               40,
+              45,
+              46,
               50
             ],
             "org_slug": [
@@ -8993,6 +9729,10 @@
             "org_slug": [
               19
             ],
+            "forge_paths": [
+              4,
+              6
+            ],
             "actions_context": [
               13
             ],
@@ -9018,6 +9758,17 @@
         {
           "path": "analysis/report.py",
           "categories": {
+            "forge_paths": [
+              23,
+              81,
+              86,
+              106,
+              111,
+              157,
+              238,
+              348,
+              349
+            ],
             "workflow_event": [
               72,
               101,
@@ -9101,8 +9852,10 @@
               166
             ],
             "credentials": [
+              64,
               73,
-              83
+              83,
+              161
             ],
             "org_slug": [
               105,
@@ -9131,6 +9884,11 @@
             "github_origin": [
               467
             ],
+            "credentials": [
+              422,
+              1527,
+              1584
+            ],
             "org_slug": [
               850,
               977,
@@ -9149,6 +9907,10 @@
           "categories": {
             "github_origin": [
               47
+            ],
+            "credentials": [
+              11,
+              31
             ],
             "workflow_event": [
               83
@@ -9187,6 +9949,9 @@
             "github_origin": [
               144
             ],
+            "forge_paths": [
+              68
+            ],
             "workflow_event": [
               115,
               117,
@@ -9210,6 +9975,11 @@
             "org_slug": [
               18,
               22
+            ],
+            "forge_paths": [
+              22,
+              37,
+              44
             ],
             "workflow_event": [
               20,
@@ -9279,6 +10049,11 @@
         {
           "path": "services/live-ci/src/policy.ts",
           "categories": {
+            "forge_paths": [
+              4,
+              5,
+              6
+            ],
             "workflow_event": [
               27
             ]
@@ -9295,6 +10070,14 @@
               208
             ]
           }
+        },
+        {
+          "path": "services/live-ci/src/types.ts",
+          "categories": {
+            "credentials": [
+              16
+            ]
+          }
         }
       ],
       "skipped": []
@@ -9304,12 +10087,13 @@
       "source_revision": "1b8cb46b5f15ee7b88a66ea05471a460ba2c58d7",
       "canonical_shared_assets": false,
       "counts": {
-        "github_origin": 45,
+        "github_origin": 46,
         "graphql": 4,
         "gh_cli": 16,
-        "credentials": 27,
+        "credentials": 30,
         "source_identity": 3,
-        "org_slug": 51,
+        "org_slug": 52,
+        "forge_paths": 38,
         "actions_context": 37,
         "workflow_event": 39,
         "workflow_uses": 35,
@@ -9317,10 +10101,24 @@
       },
       "files": [
         {
+          "path": ".github/CODEOWNERS",
+          "categories": {
+            "org_slug": [
+              9
+            ],
+            "forge_paths": [
+              6
+            ]
+          }
+        },
+        {
           "path": ".github/actions/checkout-merge-policy/action.yml",
           "categories": {
             "org_slug": [
               20
+            ],
+            "forge_paths": [
+              13
             ],
             "workflow_uses": [
               6,
@@ -9343,6 +10141,10 @@
         {
           "path": ".github/actions/restore-mathlib-ltars/action.yml",
           "categories": {
+            "forge_paths": [
+              49,
+              50
+            ],
             "actions_context": [
               42,
               45,
@@ -9355,6 +10157,10 @@
           }
         },
         {
+          "path": ".github/pull_request_template.md",
+          "categories": {}
+        },
+        {
           "path": ".github/workflows/api-docs.yml",
           "categories": {
             "github_origin": [
@@ -9362,7 +10168,9 @@
               199
             ],
             "gh_cli": [
-              262
+              262,
+              303,
+              306
             ],
             "credentials": [
               256,
@@ -9371,6 +10179,10 @@
             "org_slug": [
               87,
               89
+            ],
+            "forge_paths": [
+              26,
+              87
             ],
             "actions_context": [
               36,
@@ -9419,6 +10231,9 @@
               33,
               35
             ],
+            "forge_paths": [
+              33
+            ],
             "actions_context": [
               2,
               8,
@@ -9448,6 +10263,9 @@
               26,
               28
             ],
+            "forge_paths": [
+              26
+            ],
             "actions_context": [
               20,
               33,
@@ -9468,6 +10286,11 @@
             "org_slug": [
               29,
               31
+            ],
+            "forge_paths": [
+              9,
+              17,
+              29
             ],
             "actions_context": [
               25
@@ -9491,11 +10314,17 @@
             ],
             "credentials": [
               63,
-              278
+              278,
+              442
             ],
             "org_slug": [
               75,
               77
+            ],
+            "forge_paths": [
+              75,
+              105,
+              435
             ],
             "actions_context": [
               40,
@@ -9539,7 +10368,14 @@
           "path": ".github/workflows/claims-access.yml",
           "categories": {
             "credentials": [
+              12,
+              18,
+              43,
+              45,
+              46,
               52,
+              55,
+              56,
               70
             ],
             "org_slug": [
@@ -9547,6 +10383,10 @@
               17,
               63,
               65
+            ],
+            "forge_paths": [
+              48,
+              63
             ],
             "actions_context": [
               70,
@@ -9569,12 +10409,17 @@
           "categories": {
             "credentials": [
               79,
+              81,
+              82,
               91
             ],
             "org_slug": [
               31,
               46,
               48
+            ],
+            "forge_paths": [
+              46
             ],
             "actions_context": [
               26,
@@ -9613,6 +10458,9 @@
             "org_slug": [
               31,
               33
+            ],
+            "forge_paths": [
+              31
             ],
             "actions_context": [
               12,
@@ -9684,11 +10532,16 @@
           "categories": {
             "credentials": [
               32,
+              35,
+              36,
               53
             ],
             "org_slug": [
               46,
               48
+            ],
+            "forge_paths": [
+              46
             ],
             "actions_context": [
               54
@@ -9720,6 +10573,15 @@
               84,
               127,
               129
+            ],
+            "forge_paths": [
+              8,
+              10,
+              30,
+              55,
+              62,
+              82,
+              127
             ],
             "actions_context": [
               16,
@@ -9764,11 +10626,17 @@
             "credentials": [
               49,
               216,
+              219,
+              220,
               229
             ],
             "org_slug": [
               57,
               59
+            ],
+            "forge_paths": [
+              57,
+              87
             ],
             "actions_context": [
               49,
@@ -9801,12 +10669,17 @@
             "credentials": [
               53,
               71,
+              74,
+              75,
               100
             ],
             "org_slug": [
               64,
               93,
               95
+            ],
+            "forge_paths": [
+              93
             ],
             "actions_context": [
               53,
@@ -9837,6 +10710,10 @@
               460,
               663
             ],
+            "credentials": [
+              637,
+              638
+            ],
             "org_slug": [
               63,
               105,
@@ -9847,6 +10724,14 @@
               247,
               629,
               663
+            ],
+            "forge_paths": [
+              105,
+              136,
+              208,
+              245,
+              357,
+              468
             ],
             "actions_context": [
               63,
@@ -9932,6 +10817,12 @@
               526,
               528
             ],
+            "forge_paths": [
+              49,
+              129,
+              300,
+              526
+            ],
             "actions_context": [
               95,
               140,
@@ -10006,11 +10897,16 @@
           "path": ".github/workflows/pick-runner.yml",
           "categories": {
             "credentials": [
-              86
+              86,
+              87,
+              95
             ],
             "org_slug": [
               78,
               80
+            ],
+            "forge_paths": [
+              78
             ],
             "actions_context": [
               30,
@@ -10046,13 +10942,32 @@
               336
             ],
             "credentials": [
+              85,
+              86,
+              172,
+              173,
+              174,
+              175,
               180,
               285,
               440,
               473,
               557,
               964,
+              1317,
+              1318,
+              1319,
+              1320,
+              1326,
+              1327,
               1328,
+              1629,
+              1686,
+              1687,
+              1688,
+              1689,
+              1693,
+              1694,
               1695
             ],
             "source_identity": [
@@ -10066,6 +10981,20 @@
               1540,
               1674,
               1676,
+              1681
+            ],
+            "forge_paths": [
+              34,
+              76,
+              160,
+              167,
+              310,
+              701,
+              782,
+              897,
+              1312,
+              1622,
+              1674,
               1681
             ],
             "actions_context": [
@@ -10240,10 +11169,16 @@
             "credentials": [
               23,
               38,
+              41,
+              42,
               48,
               71,
+              74,
+              75,
               101,
               118,
+              121,
+              122,
               146
             ],
             "org_slug": [
@@ -10253,6 +11188,14 @@
               110,
               136,
               138
+            ],
+            "forge_paths": [
+              88,
+              91,
+              97,
+              133,
+              136,
+              142
             ],
             "actions_context": [
               23,
@@ -10317,6 +11260,10 @@
             "org_slug": [
               195,
               197
+            ],
+            "forge_paths": [
+              195,
+              393
             ],
             "actions_context": [
               37,
@@ -10429,14 +11376,23 @@
             ],
             "credentials": [
               75,
+              78,
+              79,
               109,
               132,
-              162
+              162,
+              164,
+              165
             ],
             "org_slug": [
               41,
               97,
               99
+            ],
+            "forge_paths": [
+              94,
+              97,
+              103
             ],
             "actions_context": [
               41,
@@ -10496,10 +11452,16 @@
             "github_origin": [
               119
             ],
+            "credentials": [
+              162
+            ],
             "org_slug": [
               89,
               91,
               229
+            ],
+            "forge_paths": [
+              89
             ],
             "actions_context": [
               47,
@@ -10529,6 +11491,12 @@
           "categories": {
             "credentials": [
               62,
+              114,
+              115,
+              116,
+              117,
+              122,
+              123,
               125,
               168
             ],
@@ -10537,6 +11505,10 @@
               55,
               109,
               162
+            ],
+            "forge_paths": [
+              53,
+              109
             ],
             "actions_context": [
               27,
@@ -10600,6 +11572,10 @@
               85,
               88
             ],
+            "forge_paths": [
+              82,
+              85
+            ],
             "actions_context": [
               24,
               25,
@@ -10651,6 +11627,8 @@
             "credentials": [
               70,
               92,
+              95,
+              96,
               106
             ],
             "org_slug": [
@@ -10658,6 +11636,9 @@
               55,
               57,
               62
+            ],
+            "forge_paths": [
+              55
             ],
             "actions_context": [
               32,
@@ -10697,6 +11678,12 @@
             "org_slug": [
               47,
               49
+            ],
+            "forge_paths": [
+              17,
+              27,
+              47,
+              118
             ],
             "actions_context": [
               31,
@@ -10739,6 +11726,8 @@
             ],
             "credentials": [
               76,
+              79,
+              80,
               89,
               124
             ],
@@ -10749,6 +11738,10 @@
               73,
               104,
               108
+            ],
+            "forge_paths": [
+              71,
+              105
             ],
             "actions_context": [
               33,
@@ -10797,12 +11790,17 @@
           "path": ".github/workflows/stuck-alerts.yml",
           "categories": {
             "credentials": [
-              58
+              58,
+              59,
+              60
             ],
             "org_slug": [
               42,
               50,
               52
+            ],
+            "forge_paths": [
+              50
             ],
             "actions_context": [
               42,
@@ -10823,12 +11821,17 @@
           "path": ".github/workflows/toolchain-tags.yml",
           "categories": {
             "credentials": [
-              82
+              82,
+              83,
+              84
             ],
             "org_slug": [
               58,
               75,
               77
+            ],
+            "forge_paths": [
+              75
             ],
             "actions_context": [
               58,
@@ -10864,6 +11867,8 @@
               45,
               81,
               90,
+              93,
+              94,
               112
             ],
             "org_slug": [
@@ -10873,6 +11878,11 @@
               63,
               105,
               107
+            ],
+            "forge_paths": [
+              38,
+              61,
+              105
             ],
             "actions_context": [
               26,
@@ -10917,6 +11927,12 @@
               76,
               78
             ],
+            "forge_paths": [
+              10,
+              57,
+              107,
+              132
+            ],
             "actions_context": [
               2,
               35,
@@ -10952,6 +11968,10 @@
             "github_origin": [
               36
             ],
+            "forge_paths": [
+              6,
+              8
+            ],
             "actions_context": [
               14,
               21
@@ -10970,10 +11990,17 @@
         {
           "path": ".github/workflows/zulip-healthcheck.yml",
           "categories": {
+            "credentials": [
+              40,
+              41
+            ],
             "org_slug": [
               24,
               31,
               33
+            ],
+            "forge_paths": [
+              31
             ],
             "actions_context": [
               24
@@ -10997,7 +12024,11 @@
             ],
             "credentials": [
               38,
+              41,
+              42,
               58,
+              59,
+              60,
               70
             ],
             "org_slug": [
@@ -11005,6 +12036,9 @@
               51,
               53,
               73
+            ],
+            "forge_paths": [
+              51
             ],
             "actions_context": [
               34,
@@ -11032,6 +12066,12 @@
               9,
               114,
               131
+            ],
+            "forge_paths": [
+              49,
+              91,
+              99,
+              128
             ],
             "workflow_event": [
               116
@@ -11127,6 +12167,9 @@
           "categories": {
             "github_origin": [
               15
+            ],
+            "forge_paths": [
+              28
             ]
           }
         },
@@ -11314,6 +12357,14 @@
           }
         },
         {
+          "path": "scripts/profile/render.py",
+          "categories": {
+            "forge_paths": [
+              4
+            ]
+          }
+        },
+        {
           "path": "scripts/publication_capacity_fixture.json",
           "categories": {
             "github_origin": [
@@ -11387,6 +12438,15 @@
             "shared_state": [
               52,
               54
+            ]
+          }
+        },
+        {
+          "path": "web/examples/lakefile.lean",
+          "categories": {
+            "github_origin": [
+              36,
+              44
             ]
           }
         },
@@ -11503,12 +12563,13 @@
       "counts": {
         "github_origin": 3,
         "graphql": 0,
-        "gh_cli": 5,
-        "credentials": 7,
+        "gh_cli": 6,
+        "credentials": 10,
         "source_identity": 0,
-        "org_slug": 5,
+        "org_slug": 6,
+        "forge_paths": 10,
         "actions_context": 7,
-        "workflow_event": 10,
+        "workflow_event": 11,
         "workflow_uses": 9,
         "shared_state": 0
       },
@@ -11518,6 +12579,80 @@
           "categories": {
             "workflow_event": [
               6
+            ]
+          }
+        },
+        {
+          "path": ".github/CODEOWNERS",
+          "categories": {
+            "org_slug": [
+              5,
+              8,
+              9,
+              10,
+              11
+            ],
+            "forge_paths": [
+              8
+            ]
+          }
+        },
+        {
+          "path": ".github/ISSUE_TEMPLATE/1-intention.yml",
+          "categories": {}
+        },
+        {
+          "path": ".github/ISSUE_TEMPLATE/2-roadmap-issue.yml",
+          "categories": {}
+        },
+        {
+          "path": ".github/ISSUE_TEMPLATE/3-meta.yml",
+          "categories": {}
+        },
+        {
+          "path": ".github/ISSUE_TEMPLATE/config.yml",
+          "categories": {}
+        },
+        {
+          "path": ".github/scripts/README.md",
+          "categories": {
+            "gh_cli": [
+              43,
+              44
+            ],
+            "credentials": [
+              43,
+              44
+            ],
+            "forge_paths": [
+              1,
+              11,
+              64
+            ],
+            "workflow_event": [
+              30,
+              50,
+              53
+            ]
+          }
+        },
+        {
+          "path": ".github/scripts/check_roadmap_areas.py",
+          "categories": {
+            "forge_paths": [
+              224
+            ]
+          }
+        },
+        {
+          "path": ".github/scripts/check_roadmap_topics.py",
+          "categories": {}
+        },
+        {
+          "path": ".github/scripts/test_check_roadmap_topics.py",
+          "categories": {
+            "forge_paths": [
+              8
             ]
           }
         },
@@ -11535,6 +12670,8 @@
             "credentials": [
               4,
               41,
+              43,
+              44,
               51
             ],
             "actions_context": [
@@ -11567,6 +12704,10 @@
             "org_slug": [
               99
             ],
+            "forge_paths": [
+              37,
+              40
+            ],
             "actions_context": [
               66,
               117,
@@ -11593,6 +12734,8 @@
             ],
             "credentials": [
               46,
+              48,
+              49,
               55
             ],
             "actions_context": [
@@ -11613,6 +12756,13 @@
         {
           "path": ".github/workflows/intentions.yml",
           "categories": {
+            "credentials": [
+              30,
+              32
+            ],
+            "forge_paths": [
+              23
+            ],
             "workflow_event": [
               4,
               10,
@@ -11635,7 +12785,12 @@
               17,
               18,
               41,
+              43,
+              44,
               51
+            ],
+            "forge_paths": [
+              6
             ],
             "actions_context": [
               17,
@@ -11654,7 +12809,10 @@
           "path": ".github/workflows/main-red.yml",
           "categories": {
             "credentials": [
-              22
+              22,
+              49,
+              50,
+              51
             ],
             "actions_context": [
               22,
@@ -11680,7 +12838,15 @@
         {
           "path": ".github/workflows/progress-announce.yml",
           "categories": {
+            "credentials": [
+              33,
+              34,
+              35
+            ],
             "org_slug": [
+              27
+            ],
+            "forge_paths": [
               27
             ],
             "workflow_event": [
@@ -11702,9 +12868,15 @@
               128
             ],
             "credentials": [
-              54
+              54,
+              167,
+              171,
+              173
             ],
             "org_slug": [
+              158
+            ],
+            "forge_paths": [
               158
             ],
             "actions_context": [
@@ -11758,6 +12930,8 @@
             ],
             "credentials": [
               34,
+              36,
+              37,
               43
             ],
             "actions_context": [
@@ -11788,7 +12962,18 @@
               55
             ],
             "credentials": [
-              42
+              12,
+              13,
+              42,
+              44,
+              45
+            ],
+            "forge_paths": [
+              13,
+              20,
+              21,
+              62,
+              67
             ],
             "workflow_event": [
               16,
@@ -11847,9 +13032,10 @@
         "github_origin": 2,
         "graphql": 2,
         "gh_cli": 5,
-        "credentials": 0,
+        "credentials": 1,
         "source_identity": 0,
         "org_slug": 5,
+        "forge_paths": 0,
         "actions_context": 0,
         "workflow_event": 10,
         "workflow_uses": 0,
@@ -11945,6 +13131,14 @@
             "org_slug": [
               31,
               32
+            ]
+          }
+        },
+        {
+          "path": "scripts/judge.py",
+          "categories": {
+            "credentials": [
+              148
             ]
           }
         },
