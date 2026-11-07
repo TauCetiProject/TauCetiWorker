@@ -1245,6 +1245,67 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
                     self.fail("round started after its private build restoration failed")
         self.assertEqual((backup / "private.olean").read_text(), "previous private build")
 
+    def test_live_private_backup_survives_sharing_and_later_rounds(self):
+        self.require_overlay()
+        upper = self.mathlib / ".lake/build"
+        backup = upper.with_name("build-before-sharing")
+        upper.mkdir(parents=True)
+        (upper / "private.olean").write_text("possibly referenced private build")
+        original = s._scratch_unused
+
+        def referenced(path):
+            return False if path == backup else original(path)
+
+        with patch.object(s, "_scratch_unused", side_effect=referenced):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertTrue(prefix)
+            self.assertEqual((backup / "private.olean").read_text(), "possibly referenced private build")
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+                self.assertEqual((backup / "private.olean").read_text(), "possibly referenced private build")
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            self.assertTrue(prefix)
+        self.assertFalse(backup.exists())
+
+    def test_dangling_overlay_work_symlink_does_not_prevent_sharing(self):
+        self.require_overlay()
+        upper = self.mathlib / ".lake/build"
+        upper.parent.mkdir(parents=True, exist_ok=True)
+        work = upper.with_name("tauceti-overlay-work")
+        work.symlink_to(self.root / "missing-work")
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            self.assertTrue(prefix)
+            self.assertFalse(work.is_symlink())
+
+    def test_rollback_detach_failure_keeps_backup_and_blocks_inference(self):
+        self.require_overlay()
+        upper = self.mathlib / ".lake/build"
+        upper.mkdir(parents=True)
+        (upper / "private.olean").write_text("complete private build")
+        original_overlay, original_detach = s.overlay_command, s.detach_upper
+
+        def fail_probe(lower, candidate_upper, work, target, pool, **kwargs):
+            if target == upper:
+                return ["false"]
+            return original_overlay(lower, candidate_upper, work, target, pool, **kwargs)
+
+        def fail_marked_detach(candidate_upper, marker):
+            if marker.exists():
+                raise OSError("probe namespace detachment temporarily unavailable")
+            return original_detach(candidate_upper, marker)
+
+        with (
+            patch.object(s, "overlay_command", side_effect=fail_probe),
+            patch.object(s, "detach_upper", side_effect=fail_marked_detach),
+        ):
+            with self.assertRaisesRegex(s.Unavailable, "detachment failed"):
+                with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+                    self.fail("inference started after rollback detachment failed")
+        self.assertEqual(
+            (upper.with_name("build-before-sharing") / "private.olean").read_text(), "complete private build"
+        )
+        self.assertTrue(upper.with_name("tauceti-shared-mathlib.json").exists())
+
     def test_auto_fallback_releases_snapshot_lock_before_private_round(self):
         self.require_overlay()
         key, _ = s.signature(self.cwd, self.env)

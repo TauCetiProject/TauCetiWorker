@@ -488,6 +488,7 @@ def _discard_scratch(path):
         remove_tree(path)
     except OSError as error:
         log(f"shared Mathlib: could not remove obsolete build scratch {path}: {error}")
+        return str(error)
 
 
 def detach_upper(upper, marker):
@@ -517,7 +518,7 @@ def detach_upper(upper, marker):
         generation.mkdir()
         if marked and (upper.exists() or upper.is_symlink()):
             os.replace(upper, generation / "build")
-        if work.exists():
+        if work.exists() or work.is_symlink():
             os.replace(work, generation / "work")
         if marked:
             upper.mkdir(parents=True, exist_ok=True)
@@ -932,8 +933,6 @@ def view(cwd, env, logdir, fetch):
         selected, selection_reason = selection(env)
     except Unavailable as error:
         report(pool, env, mode="blocked", reason=str(error))
-        if isinstance(error, OSError):
-            raise Unavailable(f"Mathlib build detachment failed: {error}") from error
         raise
     started = time.monotonic()
     upper = cwd / ".lake/packages/mathlib/.lake/build"
@@ -1004,8 +1003,9 @@ def view(cwd, env, logdir, fetch):
             _detach_for_view(upper, marker, pool, env)
             backup = upper.with_name("build-before-sharing")
             work = upper.with_name("tauceti-overlay-work")
-            if backup.exists():
-                remove_tree(backup)
+            _discard_scratch(backup)
+            if backup.exists() or backup.is_symlink():
+                raise Unavailable("previous Mathlib build backup remains in use or could not be removed")
             if upper.exists():
                 os.replace(upper, backup)
                 backup_created = True
@@ -1074,10 +1074,7 @@ def view(cwd, env, logdir, fetch):
         finally:
             if prefix:
                 if body_error is None and backup and backup.exists():
-                    try:
-                        remove_tree(backup)
-                    except OSError as error:
-                        cleanup_error = str(error)
+                    cleanup_error = _discard_scratch(backup)
                 stack.close()
                 record_result(
                     env,
@@ -1086,7 +1083,7 @@ def view(cwd, env, logdir, fetch):
                     backup_retained=bool(backup and backup.exists()),
                     body_error=body_error,
                     cleanup_error=cleanup_error,
-                    cleanup_success=body_error is None and cleanup_error is None,
+                    cleanup_success=body_error is None and cleanup_error is None and not (backup and backup.exists()),
                     safety_stop_recorded=safety_stop_recorded,
                     **upper_usage(upper),
                 )
