@@ -1,9 +1,20 @@
-You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The `build` check is red. Work autonomously to completion: make CI green without weakening the PR.
+You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib. You are in a checkout of the repo, already on the PR's branch. The `build` check is red, or the build job finished without posting it. Work autonomously to completion: make CI green without weakening the PR.
 
 ## Find out what's actually failing
 - See which checks failed and read their logs:
   - `gh pr checks __PR__ --repo TauCetiProject/TauCeti`
   - `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed` (use the run id from the failing check)
+- If the head has no `build` check at all, the `sandboxed-build` job ended before its report step, or
+  its only runs were cancelled and nothing rebuilt it. A log ending in `The runner has received a
+  shutdown signal` (exit code 143) during `lake build` means the runner was stopped, which happens when
+  the build runs the 16 GB runner out of memory; re-triggering CI then repeats it. Measure before you
+  decide. Once a changed file's imports are built,
+  `python3 -c 'import resource, subprocess, sys; subprocess.run(sys.argv[1:]); print(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)' lake lean <path/to/File.lean>`
+  recompiles the file and prints its peak memory (kilobytes on Linux); a `lake build` of an already-built
+  module would measure only Lake. If a changed file comes anywhere near 16 GB, bring it well under,
+  typically by restructuring a large `decide` over a finite type so that the kernel checks less at
+  once. If every changed file is well under and the build stage below passes locally, treat the stop as
+  transient.
 - The single `build` check runs these stages in order: the expired-shim check, `lake build --iofail`,
   the audit driver (global duplicate declarations, then axioms), the module-system audit, the
   environment lint (`lint-env`) and the source style lint (`lint-style`). Find the stage that failed
@@ -25,7 +36,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 ## Fix it on its merits
 - Diagnose the real cause (a broken proof, a renamed/missing Mathlib lemma, a linter error, an axiom-audit failure, a flaky/transient infra error). Fix the underlying problem.
 - If the shim-expiry command fails, its annotations name exact Mathlib replacements and affected sources. Migrate only the superseded declarations/imports, preserve or re-home source-only API, and update `TauCeti/mathlib-shims.json` in the same source-only change. The checker derives each inherited source's declaration surface from the PR merge base and ratchets its probes until that surface is migrated, deleted, or re-homed under an entry preserving those probes, so never make the check green by merely deleting probes or changing an exact target to a speculative/landing sentinel.
-- Only if the logs establish a transient infrastructure failure (e.g. cache fetch timeout), with no actionable source/audit violation, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`). A passing local axiom check is never evidence that a CI audit failure was transient.
+- Only if the logs establish a transient infrastructure failure (e.g. a cache fetch timeout, or a cancelled build that nothing replaced), with no actionable source/audit violation, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`). A runner shutdown counts only once you have measured memory as above. A passing local axiom check is never evidence that a CI audit failure was transient.
 - Prefer the smallest correct fix. If a declaration is unsalvageable, it is better to remove it than to leave the PR red — but never gut the PR into vacuity; if nothing useful survives, follow the durable PR outcome rules below rather than pushing an empty shell. Partial overlap does not justify deleting valuable remaining work.
 
 ## Rules of the repo (hard constraints)
