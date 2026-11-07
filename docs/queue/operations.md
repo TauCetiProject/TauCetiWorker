@@ -190,14 +190,17 @@ TauCetiReview policy `7fd3a39e02c5`; subsequent live revisions are reported by `
 `queue.taucetiproject.org` and `bors.taucetiproject.org` report `service.host` `chungus` since
 01:13:33 UTC. The operator has no root on chungus and lingering is not enabled for the account
 (`loginctl enable-linger` is denied). This is a fixed host constraint. The queue service and tunnel
-retain their detached supervisors; since November 6 at 07:04 UTC, both repair workers run under
-separate systemd user services, `tauceti-queue-repair.service` and `tauceti-queue-repair@2.service`.
-Their supervisor is outside the workers' killable cgroups. These user services recover process
-and worker-cgroup failures without root; they do not provide startup after a host reboot or loss
-of the user manager. A dedicated host is planned; its availability and hostname remain outstanding.
+retain their detached supervisors. Repair execution moved to `chungus2` at 22:00 UTC on November 7;
+the controller, database, tunnel, backup timer and public monitoring remain on chungus. Both repair
+workers run under separate systemd user services on chungus2, `tauceti-queue-repair.service` and
+`tauceti-queue-repair@2.service`, as `repair@chungus2` and `repair-2@chungus2`. Their supervisor is
+outside the workers' killable cgroups. Both hosts still have `Linger=no`; process/OOM recovery is
+available while their user managers run, but reboot startup is not guaranteed. Dedicated controller
+hosting and guaranteed reboot supervision remain postponed.
 
 The queue service and tunnel units stay **disabled** while their `nohup` supervisors run. The repair
-units are enabled; do not start the old `run-worker*.sh` loops alongside them. Check
+units are enabled on chungus2 and **masked/inactive on chungus**; do not start the old `run-worker*.sh`
+loops or install repair units on chungus. Check
 `systemctl --user list-units 'tauceti-queue*'` after any move or install. On 2026-11-05
 `tauceti-queue.service` had been left enabled: it restarted about every 6 s (737 restarts), and each
 attempt seeded the file's `[settings]` into the shared store before failing to bind port 8780, which
@@ -224,19 +227,19 @@ Paths on chungus, where they differ from the layout table:
 
 | Path | Content |
 | --- | --- |
-| `~/TauCetiQueue` | the checkout, shared by the service and the repair worker; `tauceti_queue/_revision.py` baked by the installer |
+| `~/TauCetiQueue` | the controller checkout; repair execution uses its separate checkout at the same path on chungus2 |
 | `~/.config/tauceti-queue/config.toml` | copied from tauchonki with `host = "chungus"`, `review_app_id = 3947238`, the data paths below |
 | `~/TauCetiQueue-data/clone` | the content clone of `TauCetiProject/TauCeti` (`content_clone`) |
 | `~/TauCetiQueue-data/queue.sqlite3` (+ `-wal`, `-shm`) | the database (`database`) |
 | `~/TauCetiQueue-data/logs` | the service's own files (`log_dir`) |
 | `~/TauCetiQueue-data/run-service.sh`, `service.log` | the service supervisor loop (`uv run tauceti-queue serve`) and the process log, which replaces journald |
 | `~/TauCetiQueue-data/run-tunnel.sh`, `tunnel.log` | the tunnel supervisor loop (`cloudflared tunnel ... run`) and its log |
-| `~/TauCetiQueue-data/repair-clone`, `~/TauCetiQueue-data/repair`, `~/TauCetiQueue-data/repair-2` | shared repair clone and separate worker checkpoints; current logs are in the two repair units' journals |
+| `~/TauCetiQueue-data/repair-clone`, `~/TauCetiQueue-data/repair`, `~/TauCetiQueue-data/repair-2` | retained old repair source/history on chungus; JSON observations from chungus2 are mirrored into the two roots for monitoring. Live clone, worktrees, caches and agent logs are on chungus2 |
 | `~/.local/state/tauceti-queue/backups/` | online backups; daily timer active as of November 6, plus backups before deployments |
 | `127.0.0.1:8780` | the listen address |
 | `~/.cloudflared/cert.pem`, `config.yml`, `<tunnel id>.json` | the Cloudflare origin certificate, tunnel configuration and tunnel credentials, copied from tauchonki |
 | `~/.config/systemd/user/tauceti-queue.service` | disabled while its detached supervisor owns the process |
-| `~/.config/systemd/user/tauceti-queue-repair.service`, `tauceti-queue-repair@.service` | singleton and instance 2 enabled and active; each has its own worker identity and task root |
+| `~/.config/systemd/user/tauceti-queue-repair.service`, `tauceti-queue-repair@2.service` | masked on chungus; enabled and active on chungus2, each with a distinct worker identity and task root |
 | `~/.config/systemd/user/tauceti-queue-backup.{service,timer}` | installed; timer enabled and active as of November 6 |
 
 ### Hosts without lingering
@@ -252,6 +255,7 @@ installer beneath those supervisors, even with `--no-restart`, because it starts
 cd ~/TauCetiQueue-data
 nohup setsid ./run-service.sh >/dev/null 2>&1 &      # loops `uv run tauceti-queue serve`; log service.log
 nohup setsid ./run-tunnel.sh >/dev/null 2>&1 &       # loops `cloudflared tunnel ... run`; log tunnel.log
+# On chungus2 only:
 systemctl --user start tauceti-queue-repair.service tauceti-queue-repair@2.service
 pgrep -af 'run-service.sh|run-tunnel.sh|tauceti-queue serve|cloudflared tunnel|repair_task'
 ```
@@ -268,8 +272,8 @@ Consequences:
   Without lingering, this does not guarantee recovery after logout or reboot. Run
   `~/TauCetiQueue/services/queue/backup.sh` before any risky change and verify the timer after a
   host restart. Restore ordinary systemd supervision with lingering on the dedicated host.
-- **Deploy** with the scripts in `~/TauCetiQueue-data`: `deploy-queue.sh` updates the service and
-  both repair workers, `deploy-service.sh` the service only. These fast-forward the checkout, bake
+- **Deploy the controller** with the scripts in `~/TauCetiQueue-data` on chungus: `deploy-queue.sh`
+  now delegates to `deploy-service.sh`, updating the service only. They fast-forward the checkout, bake
   its revision into `_revision.py`, and send SIGTERM to the existing service process; the supervisor
   loop restarts it on the new revision with the same graceful shutdown as the unit. Verify as in "Verification after a deploy", reading `service.log` instead
   of `journalctl`.
@@ -277,14 +281,14 @@ Consequences:
   with `--no-restart`; do not run it beneath the detached supervisors. Use the deployed
   `deploy-queue.sh` / `deploy-service.sh` scripts, or fast-forward the checkout to a verified
   revision, bake `_revision.py`, and restart the existing supervisors. Confirm the service and
-  queue/tunnel units remain disabled afterward. Repair units already own their workers, so
-  `install-repair.sh` is appropriate for those units on this host.
+  queue/tunnel units remain disabled afterward. Use `install-repair.sh` on chungus2 for repair
+  deployment; it must not resurrect the masked workers on chungus.
 - **Baked revision.** `tauceti_queue/_revision.py` is written by `install.sh` only. After a plain
   `git pull` in `~/TauCetiQueue`, rewrite it by hand before restarting, or the status page reports the
   old revision:
   `printf 'SHA = "%s"\nDIRTY = False\n' "$(git rev-parse HEAD)" > tauceti_queue/_revision.py`.
-- **Repair workers.** The workers share the checkout, so a deploy that changes it needs each worker
-  restarted (a running task is checkpointed and resumed). Use
+- **Repair workers, on chungus2.** They share that host's checkout, separate from the controller.
+  A repair deployment needs each worker restarted (a running task is checkpointed and resumed). Use
   `systemctl --user restart tauceti-queue-repair.service` and, separately,
   `systemctl --user restart tauceti-queue-repair@2.service`. Do not use the old detached-worker
   scripts, which no longer own these processes.
@@ -420,6 +424,43 @@ succeeds before then continues the claim.
 - **Parallel agents.** `TAUCETI_QUEUE_PARALLEL_AGENTS` (default 3) bounds the concurrent agents within
   one task ([repair-task.md](repair-task.md), "Parallel agents within one task").
 - The content clone named by `TAUCETI_QUEUE_CLONE` (the installer creates it).
+
+### Repair execution on chungus2
+
+The November 7 move changed only repair execution. The two idle source workers were stopped and
+disabled, with no unfinished checkpoint or active claim to transfer; old worktrees, outcomes and
+logs remain on chungus. The replacement workers run revision `6348a0116c2c` from `~/TauCetiQueue`
+on chungus2 and use its own GitHub administrator login and subscription credentials. The existing
+API-provider and repair-cache upload configuration were copied privately, without changing
+provider order, pacing, queue concurrency, admission or Fleet settings. The unit environment sets
+`SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` for Python's TLS verification on this NixOS host.
+
+Live state on chungus2 is under `~/TauCetiQueue-data/repair{,-2}`, with the common content clone at
+`repair-clone`. To avoid duplicating old caches on a nearly full filesystem, the two private cache
+directories were initially seeded with hardlinks from one fresh public-main fetch. Dependency
+sources and built outputs at `mathlib-packages` were hardlinked from a compatible local checkout;
+every package revision was checked against the current manifest, including Mathlib
+`1b1ccf4b088b32fa3f23f2de1127433254a81e1e`. Both environments set
+`TAUCETI_QUEUE_SEED_PACKAGES` to that dedicated directory. Revalidate or replace the seed when the
+manifest/toolchain changes. Builds still use stock Lean `v4.36.0-rc2`, the offline sandbox and the
+existing pressure gate. At activation approximately 46 GiB remained free; check disk before large
+repairs and retain the existing cache-pruning discipline.
+
+`tauceti-queue-repair-observations.service` on chungus2 runs
+`~/TauCetiQueue-data/sync-repair-observations.py` every ten seconds. It mirrors private worker/task
+JSON and at most 64 KiB of each preparation/streaming/verification build log to the existing roots
+on chungus over SSH; it does not copy worktrees, artifact pools, prompts or agent transcripts. The
+existing read-only monitoring publisher and hourly report keep running on chungus. Liveness is
+verified on chungus2 before refreshing the mirrored worker observation time, and its PID is omitted
+so the monitoring host cannot mistake a remote PID for a local process. Task progress timestamps
+are preserved. Mirror failure leaves the prior dated observation and never controls repair.
+
+The old source units are persistently masked. Old `run-worker*.sh` launchers refuse execution,
+and chungus's `deploy-queue.sh` now deploys only the controller. Their original files are retained
+under `~/TauCetiQueue-data/repair-moved-to-chungus2-20261107/` on chungus. To roll back execution,
+first stop the workers and observation mirror on chungus2, preserve any new claimed work, then
+restore/unmask the old workers and their identities on chungus. Never run both sets against the
+same task. Source history and new outcomes mirrored back to chungus remain available to reporting.
 
 The chain is tried in order for each task. A subscription provider is eligible only while the fleet
 pacer (`tauceti_worker.quota`, the same usage endpoints and `time%:budget%` curve the worker's `--pace`
