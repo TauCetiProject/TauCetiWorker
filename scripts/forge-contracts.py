@@ -724,6 +724,25 @@ def build_report(document, inventory_bytes, roots, pins):
     }
 
 
+def render_report(report):
+    """Keep each machine record on one line so source review remains manageable."""
+    header = {key: value for key, value in report.items() if key != "snapshots"}
+    parts = [json.dumps(header, indent=2, sort_keys=True)[:-2] + ',\n  "snapshots": [']
+    snapshots = []
+    for snapshot in report["snapshots"]:
+        meta = {key: value for key, value in snapshot.items() if key not in {"records", "scanned_files"}}
+        body = json.dumps(meta, indent=2, sort_keys=True)[:-2]
+        for key in ("records", "scanned_files"):
+            body += ",\n  " + json.dumps(key) + ": [\n"
+            body += ",\n".join("    " + json.dumps(row, sort_keys=True, separators=(",", ":")) for row in snapshot[key])
+            body += "\n  ]"
+        body += "\n}"
+        snapshots.append("\n".join("    " + line for line in body.split("\n")))
+    parts.append(",\n".join(snapshots))
+    parts.append("  ]\n}\n")
+    return "\n".join(parts)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inventory", type=Path, required=True)
@@ -761,7 +780,7 @@ def main():
     except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
         parser.error(str(exc))
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    args.output.write_text(render_report(result))
     for report in result["snapshots"]:
         print(
             f"{report['repository']}@{report['source_revision'][:12]} ({report['role']}): {len(report['records'])} records"
