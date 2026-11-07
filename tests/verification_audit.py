@@ -53,7 +53,9 @@ class Recovery(Receipts):
         # and the independent snapshot are exercised separately in the recovery fixtures.
         Path(waiting["continuation_job"]).unlink()
         manifest = self.home / "registered.json"
-        v.atomic(manifest, {str(self.prefix): "trusted-publisher-1"})
+        from tauceti_worker import verification_tools
+
+        v.atomic(manifest, {str(self.prefix): "trusted-publisher-1", str(verification_tools.root()): "tools-1"})
         real_digest, real_read = hashlib.file_digest, v.read_json
         hashed, reads = [], []
 
@@ -1105,10 +1107,13 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
             self.assertIsNone(mount_identity(self.prefix))
 
     def test_immutable_receipts_skip_walks_and_invalidate_provenance(self):
+        from tauceti_worker import verification_tools
+
         deps = self.root / ".lake/packages"
         write(deps, "mathlib/Mathlib/A.lean", "dependency")
         manifest = self.home / "installations.json"
-        v.atomic(manifest, {str(self.prefix): "lean-1", str(deps): "mathlib-1"})
+        tools = {str(verification_tools.root()): "tools-1"}
+        v.atomic(manifest, {str(self.prefix): "lean-1", str(deps): "mathlib-1", **tools})
         with (
             patch.dict(os.environ, TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS=str(manifest)),
             patch("tauceti_worker.verification_installations.mount_identity", return_value=["fixture-read-only-mount"]),
@@ -1124,7 +1129,7 @@ resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
             self.assertIn("reused_from", second["phases"]["build"])
             self.assertEqual(self.verify(stage="all")["status"], "success")
             write(self.prefix, "bin/lean", "publisher replaced toolchain")
-            v.atomic(manifest, {str(self.prefix): "lean-2", str(deps): "mathlib-1"})
+            v.atomic(manifest, {str(self.prefix): "lean-2", str(deps): "mathlib-1", **tools})
             third = self.verify(stage="build")
             self.assertNotIn("reused_from", third["phases"]["build"])
 

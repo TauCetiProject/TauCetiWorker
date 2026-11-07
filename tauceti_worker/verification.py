@@ -505,6 +505,19 @@ class Verification:
             }
         }
 
+    def tools_inputs(self):
+        from . import verification_tools
+
+        config = verification_tools.configuration()
+        try:
+            return dict(
+                root=str(verification_tools.root()),
+                files=self.installations.inventory(verification_tools.root()),
+                configuration=file_record(config) if config else None,
+            )
+        except verification_tools.Unavailable as error:
+            raise Incomplete(str(error), reason=error.reason) from error
+
     def validate_inputs(self, inputs, *, full=False):
         self.at_boundary = True
         try:
@@ -517,6 +530,7 @@ class Verification:
                     inventory(self.root, self.base) == inputs["sources"]
                     and scope(self.root, self.base, self.policy) == inputs["scope"]
                     and self.environment() == inputs["environment"]
+                    and self.tools_inputs() == inputs["tools"]
                     and (file_record(Path(config)) if config else None) == inputs["configuration"]
                     and (file_record(Path(self.lint_modules)) if self.lint_modules else None) == inputs["lint_modules"]
                     and POLICY_VERSION == inputs["policy_version"]
@@ -580,6 +594,7 @@ class Verification:
             policy_version=POLICY_VERSION,
             cache_generation=cache_generation(self.state, self.root),
             python=dict(version=sys.version, executable=file_record(Path(sys.executable))),
+            tools=self.tools_inputs(),
             lint_modules=file_record(Path(self.lint_modules)) if self.lint_modules else None,
         )
 
@@ -646,7 +661,8 @@ class Verification:
             merge = selected["merge_base"]
             if not merge:
                 raise Incomplete("shim-expiry: cannot determine merge-base registry")
-            args = ["python3", str(script), "--fail-on-available"]
+            self.check_tools()
+            args = [sys.executable, str(script), "--fail-on-available"]
             baseline = self.directory / "base"
             baseline.mkdir(exist_ok=True)
             try:
@@ -675,6 +691,14 @@ class Verification:
             return [(args, env)]
         raise ValueError(f"unknown verification phase {phase}")
 
+    def check_tools(self):
+        from . import verification_tools
+
+        try:
+            verification_tools.check(self.root)
+        except verification_tools.Unavailable as error:
+            raise Incomplete(str(error), reason=error.reason) from error
+
     def run(self):
         self.save()
         previous = {}
@@ -687,6 +711,8 @@ class Verification:
         )
         cache_token = _HASH_CACHE.set(cache)
         try:
+            if "shim-expiry" in self.requested:
+                self.check_tools()
 
             def interrupted(signum, _):
                 raise Incomplete(f"verification interrupted by signal {signum}", reason="signal")
@@ -747,6 +773,10 @@ class Verification:
                 if isinstance(entry, dict) and "path" in entry
             ]
             extra.append(Path(sys.executable))
+            from . import verification_tools
+
+            if config := verification_tools.configuration():
+                extra.append(config)
             self.static_names = {root: {str(p) for p in files_under(root)} for root in self.installations.walked}
             if os.environ.get("LAKE_CONFIG"):
                 extra.append(Path(os.environ["LAKE_CONFIG"]))
@@ -801,6 +831,8 @@ class Verification:
                     try:
                         self.command(phase, argv, env=env)
                     except subprocess.CalledProcessError as error:
+                        if phase == "shim-expiry":
+                            self.check_tools()  # A removed runtime dependency is not a source defect.
                         local_lint = any(str(arg).endswith("/scripts/tauceti-local-lint") for arg in error.cmd)
                         if (phase == "axioms" or local_lint) and error.returncode in {2, 75}:
                             raise Incomplete(

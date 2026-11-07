@@ -32,6 +32,16 @@ modules, `--lint-modules /absolute/list` adds validated existing dotted TauCeti 
 local lint list; its contents are fingerprinted. Use the same option for final verification. Write this
 list and any extra diagnostic logs outside the checkout; untracked checkout files are inputs.
 
+The shim wrapper runs with the verifier's Python interpreter and inherited environment, including
+Bubble's mounted Tools package and standalone checkers' sibling imports. Its installed TauCetiTools
+implementation and configuration are verification inputs. Local helpers use the Worker's Tools pin;
+CI may use the content repository's separate pin. A missing required Tools import yields
+`incomplete_reason: tool-missing`, rather than a source failure. Other checker exits retain their
+existing failure meaning. Recovery probes this prerequisite before claiming work or warming caches,
+so an unavailable Python dependency does not launch source repair. A changed verification-tool
+identity permits a fresh mechanical check of prior source failures, including records blocked only
+on continuation admission; publication scope, source ownership and model authorization still apply.
+
 Local environment lint uses the Worker-owned `LocalLint.lean` checker, compiled once and
 shared across workers with the same toolchain and dependency content. It imports only the
 explicit module list and checks declarations owned by those modules, including documentation
