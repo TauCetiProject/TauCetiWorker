@@ -80,6 +80,14 @@ def snapshot(root, target, names, *, immutable_packages=None, include_builds=Tru
         upper = root / ".lake/packages/mathlib/.lake/build"
         shared = read_json(upper.parent / "tauceti-shared-mathlib.json")
         if include_builds and shared and not upper.is_mount():
+            if not shared_mathlib._build_parent_owned(upper):
+                # A stale overlay under caller-owned dependency links must not
+                # be detached or repeatedly rehydrated. Preserve independent
+                # exact sources; normal verification warms the private cache.
+                from .config import log
+
+                log("verification: stale shared Mathlib build under linked packages; preserving private sources")
+                return _snapshot(root, target, names, immutable_packages=None, include_builds=False)
             key = shared.get("key", "")
             if not re.fullmatch("[0-9a-f]{64}", key):
                 raise Incomplete("invalid shared Mathlib snapshot identity", reason="preservation")
@@ -120,8 +128,8 @@ def snapshot(root, target, names, *, immutable_packages=None, include_builds=Tru
             # miss. Rehydrate normally, with the normal service config.
             from .agents import host_build_cache_context
 
-            shared_mathlib.detach_upper(upper, upper.parent / "tauceti-shared-mathlib.json")
             try:
+                shared_mathlib.detach_upper(upper, upper.parent / "tauceti-shared-mathlib.json")
                 with host_build_cache_context(root, dict(os.environ), state / "verification-cache-prepare"):
                     return snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=True)
             except Pressure:
@@ -227,6 +235,8 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
                         "build-before-sharing",
                         "build-shared-delta",
                     }
+                    or name == "build-shared-deltas"
+                    and Path(directory).name == ".lake"
                     or not include_builds
                     and name in {"build", "build-before-sharing"}
                     and Path(directory).name == ".lake"
@@ -237,6 +247,13 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
                 ]
 
             shutil.copytree(lake, target / ".lake", symlinks=False, copy_function=copy, ignore=ignore)
+            if not include_builds:
+                # Read-only installations can supply source inputs. Their new
+                # private directories must allow new cache files and Git lockfile
+                # operations; existing file bytes and modes remain unchanged.
+                for directory, _, _ in os.walk(target / ".lake", followlinks=False):
+                    path = Path(directory)
+                    path.chmod(path.stat().st_mode | 0o700)
         if immutable_packages is not None:
             (target / ".lake").mkdir(exist_ok=True)
             (target / ".lake/packages").symlink_to(immutable_packages, target_is_directory=True)

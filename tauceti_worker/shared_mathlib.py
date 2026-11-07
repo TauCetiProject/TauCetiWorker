@@ -7,6 +7,7 @@ Locks outside entries protect publication and leases against GC; no root or daem
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -412,17 +413,138 @@ def remove_tree(path):
     shutil.rmtree(path)
 
 
-def detach_upper(upper, marker):
-    """A sparse overlay delta, including whiteouts, is never a standalone build."""
-    if not marker.exists():
+def _build_parent_owned(upper):
+    # The four parents are Mathlib's .lake, checkout, packages and project .lake.
+    return not any(parent.is_symlink() for parent in list(upper.parents)[:4])
+
+
+def _scratch_unused(parent):
+    """Check old namespace mounts as well as ordinary process references."""
+    from .work_recovery import live_users
+
+    parent = parent.resolve()
+    if live_users(parent):
+        return False
+    if platform.system() != "Linux":
+        from .retention import mount_points
+
+        mounts = mount_points()
+        return mounts is not None and not any(point == parent or point.is_relative_to(parent) for point in mounts)
+    seen = set()
+    for process in Path("/proc").glob("[0-9]*"):
+        try:
+            # A non-dumpable same-user task's proc directory can be root-owned.
+            status = (process / "status").read_text()
+            uid = next(line.split()[1] for line in status.splitlines() if line.startswith("Uid:"))
+            if int(uid) != os.getuid():
+                continue
+            if (process / "stat").read_text().rsplit(")", 1)[1].split()[0] in {"Z", "X"}:
+                continue
+            try:
+                namespace = (process / "ns/mnt").stat().st_ino
+            except PermissionError:
+                # Non-dumpable same-user processes can still expose mountinfo.
+                namespace = process.name
+            if namespace in seen:
+                continue
+            seen.add(namespace)
+            for line in (process / "mountinfo").read_text().splitlines():
+                # Bind roots and mountpoints both follow a renamed generation.
+                for path in line.split()[3:5]:
+                    for escaped, literal in ((r"\040", " "), (r"\011", "\t"), (r"\012", "\n"), (r"\134", "\\")):
+                        path = path.replace(escaped, literal)
+                    point = Path(path)
+                    if point == parent or point.is_relative_to(parent):
+                        return False
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError as error:
+            if error.errno in {errno.EINVAL, errno.ESRCH}:
+                continue  # A task can exit between its status and mountinfo reads.
+            return False
+        except (ValueError, IndexError, StopIteration):
+            return False
+    return True
+
+
+def _discard_scratch(path):
+    """Released generated files can be retried without failing a useful round."""
+    from .config import log
+
+    if not path.exists() and not path.is_symlink():
         return
-    delta = upper.with_name("build-shared-delta")
-    remove_tree(delta)
-    if upper.exists():
-        os.replace(upper, delta)
-    upper.mkdir(parents=True, exist_ok=True)
-    remove_tree(upper.with_name("tauceti-overlay-work"))
-    marker.unlink(missing_ok=True)
+    # A legacy bare workdir is represented by its associated build mount, not
+    # necessarily by a mountpoint at the workdir's own pathname.
+    if path.name == "tauceti-overlay-work":
+        scope = path.parent
+    elif path.parent.name == "build-shared-deltas" and not (path / "build").exists():
+        scope = path.parent.parent  # legacy work-only generation
+    else:
+        scope = path
+    if not _scratch_unused(scope):
+        log(f"shared Mathlib: cleanup deferred for referenced or unverified build scratch: {path}")
+        return
+    try:
+        remove_tree(path)
+    except OSError as error:
+        log(f"shared Mathlib: could not remove obsolete build scratch {path}: {error}")
+        return str(error)
+
+
+def _scratch_generation(upper):
+    discarded = upper.with_name("build-shared-deltas")
+    if discarded.is_symlink():
+        raise Unavailable("Mathlib build discard directory is a symlink; repair the owned checkout")
+    discarded.mkdir(exist_ok=True)
+    generation = discarded / uuid.uuid4().hex
+    generation.mkdir()
+    return generation
+
+
+def detach_upper(upper, marker):
+    """Detach sparse layers before private warming, without waiting for old namespaces."""
+    if not _build_parent_owned(upper):
+        return
+    _discard_scratch(upper.with_name("build-shared-delta"))  # earlier single-generation layout
+    discarded = upper.with_name("build-shared-deltas")
+    if discarded.is_symlink() and not marker.exists():
+        return
+    if discarded.is_symlink():
+        raise Unavailable("Mathlib build discard directory is a symlink; repair the owned checkout")
+    if discarded.is_dir():
+        try:
+            for child in discarded.iterdir():
+                if re.fullmatch(r"[0-9a-f]{32}", child.name) and child.is_dir() and not child.is_symlink():
+                    _discard_scratch(child)
+        except OSError as error:
+            from .config import log
+
+            log(f"shared Mathlib: build scratch inventory deferred: {error}")
+    work = upper.with_name("tauceti-overlay-work")
+    marked = marker.exists()
+    if marked or work.exists() or work.is_symlink():
+        generation = _scratch_generation(upper)
+        if marked and (upper.exists() or upper.is_symlink()):
+            os.replace(upper, generation / "build")
+        if work.exists() or work.is_symlink():
+            os.replace(work, generation / "work")
+        if marked:
+            upper.mkdir(parents=True, exist_ok=True)
+            marker.unlink(missing_ok=True)
+        _discard_scratch(generation)
+    if discarded.is_dir():
+        with contextlib.suppress(OSError):
+            discarded.rmdir()  # Keep live generations; retry them at ordinary preparations.
+
+
+def _detach_for_view(upper, marker, pool, env):
+    try:
+        detach_upper(upper, marker)
+    except (OSError, Unavailable) as error:
+        report(pool, env, mode="blocked", reason=str(error))
+        if isinstance(error, OSError):
+            raise Unavailable(f"Mathlib build detachment failed: {error}") from error
+        raise
 
 
 def upper_usage(upper):
@@ -823,11 +945,17 @@ def view(cwd, env, logdir, fetch):
     started = time.monotonic()
     upper = cwd / ".lake/packages/mathlib/.lake/build"
     marker = upper.parent / "tauceti-shared-mathlib.json"
-    if selected == "off" or not (cwd / ".lake/packages/mathlib").is_dir():
+    owned = _build_parent_owned(upper)
+    if selected == "off" or not (cwd / ".lake/packages/mathlib").is_dir() or not owned:
         # Normal private cache warming reconstructs any files previously visible
         # only in the lower. Clearing the marker forces a fresh empty upper when
         # sharing is enabled again at a later idle boundary.
-        detach_upper(upper, marker)
+        if owned:
+            _detach_for_view(upper, marker, pool, env)
+            # Only an active preparation has a rollback window. Prior warm
+            # builds are rebuildable; optional disposal must not fail this round.
+            _discard_scratch(upper.with_name("build-before-sharing"))
+            _discard_scratch(upper.with_name("tauceti-overlay-work"))
         if selected != "off" and selected == "required":
             report(pool, env, mode="blocked", reason="Mathlib dependency is not available for sharing")
             raise Unavailable("Mathlib dependency is not available for sharing")
@@ -837,11 +965,13 @@ def view(cwd, env, logdir, fetch):
             mode="private",
             reason=selection_reason
             if selected == "off"
+            else "sharing was skipped because the Mathlib build parent is symlinked."
+            if not owned
             else "sharing was skipped because the Mathlib checkout was absent.",
         )
         yield []
         return
-    prefix, backup, backup_created, backup_sparse = [], None, False, False
+    prefix, backup, backup_created = [], None, False
     safety_stop_recorded = None
     with contextlib.ExitStack() as stack:
         try:
@@ -878,25 +1008,24 @@ def view(cwd, env, logdir, fetch):
                     raise IntegrityFailure(reason)
                 raise Unavailable(reason)
             # Prior copies and whiteouts must not shadow the lower next round.
-            detach_upper(upper, marker)
-            old = read_json(marker)
+            _detach_for_view(upper, marker, pool, env)
             backup = upper.with_name("build-before-sharing")
             work = upper.with_name("tauceti-overlay-work")
-            if old.get("key") != key:
-                if backup.exists():
-                    remove_tree(backup)
-                backup_sparse = marker.exists()
-                if upper.exists():
-                    os.replace(upper, backup)
-                    backup_created = True
-                upper.mkdir(parents=True)
-                if work.exists():
-                    remove_tree(work)
-                atomic_json(
-                    marker,
-                    dict(key=key, pool=str(pool), boot_id=boot_id(), activated_at=time.time()),
-                )
-            work.mkdir(exist_ok=True)
+            if backup.exists() or backup.is_symlink():
+                # Free the fixed rollback name without waiting for an old
+                # namespace or changing the next round's sharing mode.
+                generation = _scratch_generation(upper)
+                os.replace(backup, generation / "build")
+                _discard_scratch(generation)
+            if upper.exists():
+                os.replace(upper, backup)
+                backup_created = True
+            upper.mkdir(parents=True)
+            atomic_json(
+                marker,
+                dict(key=key, pool=str(pool), boot_id=boot_id(), activated_at=time.time()),
+            )
+            work.mkdir()
             candidate = overlay_command(entry / "build", upper, work, upper, pool, lease_fd=lease.fileno())
             probe = subprocess.run(
                 candidate + ["sh", "-c", 'test -f "$1/lib/lean/Mathlib.olean" || exit 42', "sh", str(upper)],
@@ -919,15 +1048,17 @@ def view(cwd, env, logdir, fetch):
         except (Unavailable, OSError, ValueError, subprocess.TimeoutExpired) as error:
             if isinstance(error, IntegrityFailure):
                 safety_stop_recorded = stop_sharing(pool, str(error))
-            if backup_created and backup and backup.exists():
-                remove_tree(upper)
-                if backup_sparse:
-                    upper.mkdir(parents=True)
-                else:
+            try:
+                if backup_created and backup and backup.exists():
+                    # A timed-out probe can retain its namespace. Move its upper
+                    # and work aside before restoring the complete private build.
+                    _detach_for_view(upper, marker, pool, env)
                     os.replace(backup, upper)
-                marker.unlink(missing_ok=True)
-            else:
-                detach_upper(upper, marker)
+                else:
+                    _detach_for_view(upper, marker, pool, env)
+            except OSError as restore_error:
+                report(pool, env, mode="blocked", reason=str(restore_error))
+                raise Unavailable(f"Mathlib build rollback failed: {restore_error}") from restore_error
             report(
                 pool,
                 env,
@@ -954,10 +1085,7 @@ def view(cwd, env, logdir, fetch):
         finally:
             if prefix:
                 if body_error is None and backup and backup.exists():
-                    try:
-                        remove_tree(backup)
-                    except OSError as error:
-                        cleanup_error = str(error)
+                    cleanup_error = _discard_scratch(backup)
                 stack.close()
                 record_result(
                     env,
@@ -966,7 +1094,7 @@ def view(cwd, env, logdir, fetch):
                     backup_retained=bool(backup and backup.exists()),
                     body_error=body_error,
                     cleanup_error=cleanup_error,
-                    cleanup_success=body_error is None and cleanup_error is None,
+                    cleanup_success=body_error is None and cleanup_error is None and not (backup and backup.exists()),
                     safety_stop_recorded=safety_stop_recorded,
                     **upper_usage(upper),
                 )
