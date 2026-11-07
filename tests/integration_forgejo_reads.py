@@ -219,6 +219,7 @@ ROOT_PATH = {root}/log
                         self.assertNotEqual(member_actor, actor)
                         self.assertFalse(collaborator.request("GET", "user")["is_admin"])
                         self.assertIsNone(member.repository_access())
+                        self.assertEqual(member.last_failure.status, 404)
                         api.request("PUT", "repos/operator/source/collaborators/collaborator", {"permission": "read"})
                         member_read = member.repository_access()
                         self.assertEqual(member_read.actor, member_actor)
@@ -243,6 +244,7 @@ ROOT_PATH = {root}/log
                         )
                         api.request("DELETE", "repos/operator/source/collaborators/collaborator")
                         self.assertIsNone(member.repository_access())
+                        self.assertEqual(member.last_failure.status, 404)
                         self.assertEqual(member.authenticated_actor(), member_actor)
                         history = source.issue_comments(number)
                         self.assertEqual(len(history), 33)
@@ -305,6 +307,7 @@ ROOT_PATH = {root}/log
                         archived = source.repository_access()
                         self.assertTrue(archived.archived)
                         self.assertFalse(archived.mirror)
+                        self.assertTrue(archived.user_code_can_push)
                 finally:
                     process.terminate()
                     try:
