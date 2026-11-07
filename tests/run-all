@@ -93,6 +93,7 @@ RUN_STDLIB=(
   fork_authoring.py
   fleet_capacity.py
   forge_inventory.py
+  forge_contracts.py
   github_accounts.py
   github_failure_reason.py
   github_ratelimit.py
@@ -229,7 +230,7 @@ NATIVE_FS=(cache_storage.py shared_mathlib.py verification_storage.py retention.
 # Modules that read README.md, docs/*.md or workers.toml.example and assert on their contents. A
 # change that touches only documentation can break these and nothing else, so CI runs just this
 # group for it. The guard below keeps the list honest.
-DOCS_CONTRACT=(pr_targeting.py review_throttles.py)
+DOCS_CONTRACT=(pr_targeting.py review_throttles.py forge_contracts.py)
 
 pass=0; fail=0; failed=()
 

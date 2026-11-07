@@ -1,7 +1,7 @@
 {
   "schema": "tauceti.forge-inventory/v1",
-  "generated_at": "2026-11-07T01:55:54.153148+00:00",
-  "scanner_sha256": "bdcb44649c12a2232bd564cee78e225bc84aaa04a350167d06cde457e14a2f04",
+  "generated_at": "2026-11-07T07:33:28.108264+00:00",
+  "scanner_sha256": "a333fe0e2a603d656a744bea42a7b251a16e093f1120f2ea14c40bc272a8fb0a",
   "policy": {
     "patterns": {
       "github_origin": "github\\.com|githubusercontent\\.com|ghcr\\.io|github\\.io",
