@@ -1,11 +1,10 @@
-"""The ports the queue controller depends on: GitHub as a protocol plus the records it exchanges.
+"""Queue source and execution ports, plus the records exchanged with them.
 
-The controller (`tauceti_queue.controller`) never talks to GitHub directly. It is handed an object
-implementing `GitHubPort`; the production adapter (App authentication, webhooks, REST and GraphQL
-calls) implements it, and `tauceti_queue.fakes.FakeGitHub` implements it over a local bare
-repository for the end-to-end fixture. Every method takes the repository as `owner/repo`.
-
-Timestamps are unix seconds (floats); `None` means unknown or not yet.
+Source reads/publication/authority and CI dispatch/verdicts/declarations are
+separate protocols. GitHubPort combines them for the existing adapter and local
+fixture. Repository arguments retain their legacy owner/name meaning until the
+qualified source/execution binding and request/result adapters are integrated.
+Timestamps are Unix seconds; None means unknown or not yet.
 """
 
 from __future__ import annotations
@@ -13,6 +12,15 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+
+class DispatchNotAccepted(RuntimeError):
+    """Execution backend proves this dispatch was not accepted; retry may be scheduled."""
+
+    def __init__(self, message: str, *, retry_at: float | None = None, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retry_at = retry_at
+        self.retryable = retryable
 
 
 class GitHubUnavailable(RuntimeError):
@@ -146,22 +154,79 @@ class GitHubRateLimit:
     reset_at: float
 
 
-class GitHubPort(Protocol):
-    """Everything the controller needs from GitHub.
+class SourcePort(Protocol):
+    """Source reads, retained refs, publication and repository authority.
 
-    Implementations must be safe to call from the controller loop thread and the HTTP server
-    thread concurrently. `post_comment` and `set_labels` are idempotent: a comment carrying `marker`
-    is updated rather than duplicated, and labels already in the requested state are left alone.
+    Calls retain their legacy repository argument; qualified source bindings and
+    execution request/result contracts are required before Forgejo activation.
+    Implementations must be safe across the loop and HTTP server threads.
     """
 
     def fetch_pr(self, repo: str, number: int) -> PullRequest: ...
 
-    def declaration_names(self, repo: str, head_sha: str) -> dict:
-        """Compiled added names from the exact accepted revision's trusted PR-build log, or unknown."""
-        ...
-
     def fetch_refs(self, repo: str, refspecs: Sequence[str]) -> None:
         """Bring the named objects into the service's local clone (`git fetch origin <refspec>...`)."""
+        ...
+
+    def fast_forward(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult: ...
+
+    def update_ref(self, repo: str, ref: str, sha: str) -> None:
+        """Create or move a ref (used for the retained `refs/tauceti-queue/...` namespace)."""
+        ...
+
+    def update_refs(self, repo: str, updates: Sequence[tuple[str, str]]) -> None:
+        """Create or move several refs in one push (`(ref, sha)` pairs); the controller falls back to
+        `update_ref` for each when the batched push fails, or when a port lacks this method."""
+        ...
+
+    def post_comment(self, repo: str, number: int, body: str, marker: str) -> str:
+        """Post (or update) the comment carrying `marker`; returns the comment id."""
+        ...
+
+    def set_labels(self, repo: str, number: int, add: Sequence[str], remove: Sequence[str]) -> None: ...
+
+    def ensure_label(self, repo: str, name: str, color: str, description: str) -> None:
+        """Create the repository label `name` unless it exists; an existing label is left as it is."""
+        ...
+
+    def close_pr(self, repo: str, number: int, title: str) -> None:
+        """`PATCH pulls/<number> {state: closed, title}`: how Bors closes a squash-landed member (not GitHub's merged state)."""
+        ...
+
+    def repository_admin(self, login: str) -> bool:
+        """Whether `login` has admin permission on the repository (the `security_audit.require_admin` predicate).
+
+        Raises `GitHubUnavailable` when GitHub could not answer; the controller then serves its cached answer.
+        """
+        ...
+
+    def rate_limit(self) -> tuple[int, float]:
+        """(remaining calls, unix time of the reset)."""
+        ...
+
+    def eligibility_checks(self, repo: str, head: str) -> list[dict[str, Any]]:
+        """Every `merge eligibility` check run on `head`, any App, as Bors lists them (`filter=all`)."""
+        ...
+
+    def pr_merge_base(self, repo: str, number: int, head_sha: str) -> str | None:
+        """The merge base of the PR's head and its base branch, or None when the head is no longer live."""
+        ...
+
+    def list_open_pull_requests(self, repo: str, *, review_app_id: int) -> list[OpenPullRequest]:
+        """Every open PR with the review App's `merge eligibility` check runs on its head (the approval poll's listing)."""
+        ...
+
+
+class ExecutionPort(Protocol):
+    """Candidate execution, observations, verdicts and compiled declarations.
+
+    This port supplies execution evidence, never source publication or approval.
+    Legacy implementations still receive the source repository name as context;
+    separating this interface alone does not bind another execution repository.
+    """
+
+    def declaration_names(self, repo: str, head_sha: str) -> dict:
+        """Compiled added names from the exact accepted revision's trusted PR-build log, or unknown."""
         ...
 
     def dispatch_candidate(
@@ -211,53 +276,9 @@ class GitHubPort(Protocol):
 
     def commit_status(self, repo: str, sha: str, context: str) -> Status | None: ...
 
-    def fast_forward(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult: ...
 
-    def update_ref(self, repo: str, ref: str, sha: str) -> None:
-        """Create or move a ref (used for the retained `refs/tauceti-queue/...` namespace)."""
-        ...
-
-    def update_refs(self, repo: str, updates: Sequence[tuple[str, str]]) -> None:
-        """Create or move several refs in one push (`(ref, sha)` pairs); the controller falls back to
-        `update_ref` for each when the batched push fails, or when a port lacks this method."""
-        ...
-
-    def post_comment(self, repo: str, number: int, body: str, marker: str) -> str:
-        """Post (or update) the comment carrying `marker`; returns the comment id."""
-        ...
-
-    def set_labels(self, repo: str, number: int, add: Sequence[str], remove: Sequence[str]) -> None: ...
-
-    def ensure_label(self, repo: str, name: str, color: str, description: str) -> None:
-        """Create the repository label `name` unless it exists; an existing label is left as it is."""
-        ...
-
-    def close_pr(self, repo: str, number: int, title: str) -> None:
-        """`PATCH pulls/<number> {state: closed, title}`: how Bors closes a squash-landed member (not GitHub's merged state)."""
-        ...
-
-    def repository_admin(self, login: str) -> bool:
-        """Whether `login` has admin permission on the repository (the `security_audit.require_admin` predicate).
-
-        Raises `GitHubUnavailable` when GitHub could not answer; the controller then serves its cached answer.
-        """
-        ...
-
-    def rate_limit(self) -> tuple[int, float]:
-        """(remaining calls, unix time of the reset)."""
-        ...
-
-    def eligibility_checks(self, repo: str, head: str) -> list[dict[str, Any]]:
-        """Every `merge eligibility` check run on `head`, any App, as Bors lists them (`filter=all`)."""
-        ...
-
-    def pr_merge_base(self, repo: str, number: int, head_sha: str) -> str | None:
-        """The merge base of the PR's head and its base branch, or None when the head is no longer live."""
-        ...
-
-    def list_open_pull_requests(self, repo: str, *, review_app_id: int) -> list[OpenPullRequest]:
-        """Every open PR with the review App's `merge eligibility` check runs on its head (the approval poll's listing)."""
-        ...
+class GitHubPort(SourcePort, ExecutionPort, Protocol):
+    """Compatibility protocol for the existing combined GitHub adapter."""
 
 
 # --- records exchanged with workers over the task API ---------------------------------------------

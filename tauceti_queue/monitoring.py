@@ -433,8 +433,23 @@ def project(
             "landed_at,landed_sha,no_repair FROM inputs ORDER BY CASE WHEN state IN ('waiting','reserved') THEN 0 ELSE 1 END,id DESC LIMIT ?",
             (LIMIT + 1,),
         )
+        # The exporter can start before the queue migrates an older ledger.
+        columns = {r["name"] for r in rows("PRAGMA table_info(ci_attempts)")}
+        dispatch_defaults = {
+            "sent_at": "NULL",
+            "dispatch_retry_at": "NULL",
+            "request_id": "''",
+            "dispatch_state": "'legacy'",
+            "dispatch_error": "''",
+            "dispatch_retryable": "1",
+        }
+        dispatch_columns = ",".join(
+            name if name in columns else f"{default} AS {name}" for name, default in dispatch_defaults.items()
+        )
         attempts = rows(
-            "SELECT id,batch_id,batch_version,head_sha,base_sha,dispatched_at,run_id,run_attempt,"
+            "SELECT id,batch_id,batch_version,head_sha,base_sha,dispatched_at,"
+            + dispatch_columns
+            + ",run_id,run_attempt,"
             "run_status,run_conclusion,run_started_at,run_completed_at,runner_name,runner_labels,"
             "host,phases,last_progress_at,last_observed_at,outcome,verdicts,cancelled_at "
             "FROM ci_attempts ORDER BY id DESC LIMIT ?",
@@ -568,6 +583,12 @@ def project(
                 "conclusion": row["run_conclusion"],
                 "outcome": row["outcome"],
                 "dispatched_at": iso(row["dispatched_at"]),
+                "sent_at": iso(row["sent_at"]),
+                "dispatch_retry_at": iso(row["dispatch_retry_at"]),
+                "request_id": text(row["request_id"], 64),
+                "dispatch_state": text(row["dispatch_state"], 32),
+                "dispatch_error": text(row["dispatch_error"], 100),
+                "dispatch_retryable": bool(row["dispatch_retryable"]),
                 "started_at": iso(row["run_started_at"]),
                 "completed_at": iso(row["run_completed_at"]),
                 "cancelled_at": iso(row["cancelled_at"]),

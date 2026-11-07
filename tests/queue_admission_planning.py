@@ -279,12 +279,33 @@ class Planning(unittest.TestCase):
         head, task = self.start_prediction()
         self.assertIsNotNone(task)
         self.assertEqual(len(self.github.runs), 1)
-
         self.assertEqual(task["tip"], head["tip"])
         self.assertTrue(self.controller._prediction_task(task))
         self.controller.tick()
         self.assertEqual(self.controller.store.count("tasks"), 1)
         self.assertEqual(len(self.github.runs), 1)
+
+    def prepared_prediction_resumes(self, *, claimed):
+        with patch.object(self.controller, "_send_prepared"):
+            head, task = self.start_prediction()
+        self.assertIsNotNone(task)
+        attempt = self.controller._current_attempt(head)
+        self.assertEqual(attempt["dispatch_state"], "prepared")
+        if claimed:
+            self.controller.claim_task("fixture", "admin-worker")
+        self.clock.advance(1200)
+        self.controller.tick()
+        self.assertEqual(len(self.github.runs), 1)
+        resumed = self.controller._current_attempt(head)
+        self.assertEqual(resumed["id"], attempt["id"])
+        self.assertEqual(resumed["dispatch_state"], "accepted")
+        self.assertEqual(resumed["sent_at"], self.clock())
+
+    def test_prepared_attempt_resumes_beside_unclaimed_prediction(self):
+        self.prepared_prediction_resumes(claimed=False)
+
+    def test_prepared_attempt_resumes_beside_claimed_prediction(self):
+        self.prepared_prediction_resumes(claimed=True)
 
     def test_stored_compiled_records_trigger_repair_and_reach_the_claimed_task(self):
         self.approve(101, {"TauCeti/A.lean": "def a := 1\n"})
