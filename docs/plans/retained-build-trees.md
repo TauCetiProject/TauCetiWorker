@@ -13,14 +13,25 @@ underlying lifetime and cleanup paths.
 
 Production acceptance on 7 November 2026 covered all seven known current and
 historical Worker data roots. The observed discard queues drained with no reported
-collector errors. Both live workers subsequently completed and published useful
-work, including PRs #29989 and #30153 on deployed Worker revision `8a00352ae`.
+collector errors. That earlier snapshot still listed 28 recovery-backlog records
+and 10 verification jobs; it did not claim all source/publication records were
+deleted. Both live workers subsequently completed and published useful work,
+including [TauCeti #29989](https://github.com/TauCetiProject/TauCeti/pull/29989) and
+[TauCeti #30153](https://github.com/TauCetiProject/TauCeti/pull/30153) on deployed
+Worker revision `8a00352ae`. Their publication and cleanup evidence is in
+`~/.local/state/tauceti-fleet/latest-worker-main-20261107/acceptance.json` and
+`final-work-evidence.json`.
 Normal worker and CI admissions stayed enabled.
 
 The one-time legacy review-source cleanup removed 78 abandoned Mathlib leaves
 while preserving their parent directories. Their named allocation was
 12,236,648,448 bytes; this is not a measurement of exclusive physical extents.
-The previously discussed PR #27907 recovery checkpoint is also absent.
+The identified [TauCeti #27907](https://github.com/TauCetiProject/TauCeti/pull/27907)
+checkpoint is absent, and its worker's discard queue was empty in the current
+`storage-completion-20261107/production-probe-corrected.json` observation. It had
+already been disposed of when deletion was requested; no further deletion is
+pending. Absence does not establish the root cause of its earlier verification
+input-guard failure. The older acceptance receipt predates this observation.
 
 There is no remaining implementation step in this plan. Ongoing cleanup is the
 normal collector's job, including interrupted deletion and release of readers at

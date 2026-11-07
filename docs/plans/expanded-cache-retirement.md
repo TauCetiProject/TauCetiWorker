@@ -19,7 +19,10 @@ named allocated bytes and a 14,667,259,904-byte final-link allocation estimate.
 These are different quantities. Neither is an exact physical saving: private hard
 links and shared extents can retain bytes, and other work changed free space during
 cleanup. The operation and acceptance receipts are under
-`~/.local/state/tauceti-fleet/storage-plans-implementation-20261107/`.
+`~/.local/state/tauceti-fleet/storage-plans-implementation-20261107/`. Current
+no-regrowth and stock-toolchain evidence is in
+`~/.local/state/tauceti-fleet/storage-completion-20261107/production-probe-corrected.json`
+and `stock-toolchain-proof.json`.
 
 ## Retain the verified expanded CI pool
 
@@ -31,7 +34,9 @@ working download/decompression reuse without an established stock replacement.
 
 A scoped 7 November inventory counted approximately 37.73 GB of allocated bytes
 across unique inodes within the pool, before accounting for shared physical extents
-or hard links outside the pool. The accounting order was entries, artifacts,
+or hard links outside the pool. The detailed receipt is
+`~/.local/state/tauceti-fleet/storage-completion-20261107/production-probe.json`.
+The accounting order was entries, artifacts,
 archives, helpers, Mathlib archives, revisions, downloads and staging:
 
 | Component | Allocated bytes on additional inodes |

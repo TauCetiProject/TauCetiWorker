@@ -22,9 +22,12 @@ deltas rather than retaining a second warm build indefinitely.
 ## Review source implementation awaiting merge approval
 
 [Review #218](https://github.com/TauCetiProject/TauCetiReview/pull/218) implements
-the exact-source cache and its actual consumer. Worker enables it for host reviews
-through an environment variable, pins the implementation dependency and calls the
-same collector from existing cleanup. Older explicitly selected Review versions
+the exact-source cache and its actual consumer.
+[Worker #609](https://github.com/TauCetiProject/TauCetiWorker/pull/609) enables it for
+host reviews through an environment variable, pins the installed collector
+dependency and calls that collector from existing cleanup. Host reviews continue
+to use Review main unless `TAUCETI_REVIEW_REF` selects another revision; the
+versioned `exact-sources-v1` contract keeps producer and collector compatible. Older explicitly selected Review versions
 ignore the environment variable and continue private preparation.
 
 Review reads the dependency pin from its already fetched PR-head manifest. There
@@ -54,11 +57,18 @@ Cleanup takes the same commit's EX lock without waiting, rechecks eligibility,
 detaches into owned trash and deletes it. Other commits remain available. Interrupted
 staging/trash is recoverable even if its payload marker was never written or has
 already been deleted. Later acquisitions and existing Worker cleanup use this same
-implementation. Unleased publications retain the existing repository-cache
-publication-age eligibility of one day; no new cap, last-use policy, daemon or
-admission restriction is introduced.
+implementation. The one-day threshold matches the repository snapshot age
+threshold. This exact-source cache has no selected-main pointer: an unleased pin
+can expire even if used recently, causing an ordinary private refetch on a later
+review. No new size/count cap, last-use policy, daemon or admission restriction is
+introduced. Cleanup unit installation preserves explicit Review and repository
+cache overrides; existing units receive these settings when reinstalled at rollout.
 
 ## Benefit and acceptance
+
+A warm host review avoids one Mathlib fetch (about eight seconds in the fixture)
+and shares about 105 MB of source payload with concurrent reviews. Finished review
+workspaces are still deleted; source sharing is not a permanent per-worker saving.
 
 An isolated tauchonki fixture retained 56 private inputs, using four concurrent
 preparations as benchmark load. It made no model calls and changed no fleet setting.
@@ -77,8 +87,10 @@ preparations as benchmark load. It made no model calls and changed no fleet sett
 The test suite covers exact-pin changes, concurrent versions, reader/GC exclusion,
 process death, partial publication/deletion, copy errors, unsupported reflinks,
 relative/unavailable cache paths and caller-workspace preservation. Before rollout,
-merge the Review implementation, then the Worker integration. Keep normal admissions
-on; verify an actual host review and a normal collector opportunity after approval.
+merge Review #218 with its reviewed commit preserved in main history, verify
+Worker's pinned commit is reachable there, then merge Worker #609. If Review is
+squashed instead, repin Worker to the resulting main commit and repeat CI before
+merging it. Keep normal admissions on; verify an actual host review and a normal collector opportunity after approval.
 
 ## Writable Git workspaces remain private
 
@@ -89,6 +101,17 @@ named about 171 MB. These are materially smaller than the build trees that domin
 worker storage, and named bytes do not establish exclusive physical duplication.
 The existing writable checkout and Lake package paths remain the supported design.
 They are a deliberate boundary, rather than a partly implemented Git-sharing path.
+
+Evidence is under
+`~/.local/state/tauceti-fleet/storage-completion-20261107/`: `production-probe.json`,
+`private-sources.json` and `source-benchmark-final.json`. The final benchmark used
+Review revision `ffcc3ae60a46065e1cdfc7ad22725003964953fd`, whose source copy/cache
+implementation is also present in the reviewed `5da3842` pin; the later changes
+add unsupported-platform guards and classify a failed partial-input cleanup before
+inference. `production-probe-corrected.json` uses each checkout as its toolchain
+working directory; `stock-toolchain-proof.json` shows the Lean wrapper's stock
+compiler target and Lake's direct stock binary identity. The first probe's compiler
+lookup in the package directory was not evidence of a production compiler failure.
 
 Current build-layer reuse, disposal and review-source sharing are the deliverables
 of this plan. There is no pending proposal to mutate an immutable version in place
