@@ -114,22 +114,22 @@ with tempfile.TemporaryDirectory() as tmp:
             peer = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review"])
         assert 1 not in [c.pr for c in peer.reviewable.actionable]
         # A verified local assertion admits review without inventing a green build;
-        # an unavailable author/team observation returns the PR to ordinary CI.
+        # missing dedicated policy evidence returns the PR to ordinary CI.
         old_rollup = compact[1]["pr"]["statusCheckRollup"]
-        compact[1]["pr"]["statusCheckRollup"] = [{"context": "build", "state": "FAILURE"}]
+        compact[1]["pr"]["statusCheckRollup"] = [
+            {"context": "build", "state": "FAILURE"},
+            {"context": "self-tested/2", "state": "SUCCESS"},
+        ]
         compact[1]["pr"]["labels"].append({"name": "self-tested"})
         with (
             patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)),
-            patch("tauceti_tools.self_tested.observe", return_value=True),
         ):
             local = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review", "fix-ci"])
         assert 2 in [c.pr for c in local.reviewable.actionable]
         assert not next(p for p in local.open_prs if p.number == 2).build_success
         assert 2 not in [c.pr for c in local.red_ci.actionable]
-        with (
-            patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)),
-            patch("tauceti_tools.self_tested.observe", return_value=False),
-        ):
+        compact[1]["pr"]["statusCheckRollup"].pop()
+        with patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)):
             ordinary = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review"])
         assert 2 not in [c.pr for c in ordinary.reviewable.actionable]
         compact[1]["pr"]["labels"].pop()

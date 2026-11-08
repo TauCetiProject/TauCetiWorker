@@ -12,7 +12,7 @@ import re
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import Config, log, roadmap_only, roadmap_skip
@@ -247,6 +247,14 @@ class PRInfo:
         # check-run collided with this status context; TauCeti#1156 renamed it to `sandboxed-build`, so
         # no check-run named `build` exists at all now.) A PR with no `build` status yet is pending —
         # neither success nor failed — and simply waits for the trusted build to post.
+        from tauceti_tools.self_tested import accepted, context
+
+        local = d.get("baseRefName", "main") == "main" and accepted(
+            d.get("labels"),
+            next((c.get("state") for c in rollup if c.get("context") == context(d["number"])), ""),
+            member=True,
+            branch=d.get("headRefName", ""),
+        )
         build_states = [c.get("state") for c in rollup if c.get("context") == "build"]
         # `gh` normalizes a StatusContext's createdAt to `startedAt`, so this is when the build status
         # was posted. With several `build` contexts the LATEST is when the head became fully green.
@@ -270,6 +278,7 @@ class PRInfo:
             labels=tuple((lb.get("name") or "") for lb in (d.get("labels") or [])),
             build_status_at=max([t for t in posted if t is not None], default=None),
             updated_at=str(d.get("updatedAt") or ""),
+            self_tested=local,
             bump_integration_failed=any(
                 c.get("context") == "bump-integration" and c.get("state") in BUILD_FAIL for c in rollup
             ),
@@ -819,20 +828,6 @@ def survey(
         sv.errors.append(str(e))
         return sv
     prs = [PRInfo.from_json(d) for d in raw]
-    from tauceti_tools.self_tested import observe, requested
-
-    def read_local_route(path):
-        value = gh.api_jq(path, ".")
-        if value is None:
-            raise RuntimeError("self-tested observation unavailable")
-        return json.loads(value)
-
-    prs = [
-        replace(p, self_tested=observe(gh.repo, p.number, p.head_oid, read_local_route))
-        if requested(p.labels, p.head_ref)
-        else p
-        for p in prs
-    ]
     if count_all_roadmaps:
         counts = getattr(compact, "author_counts", None)
         all_prs = prs if not available else ([] if counts is not None else [PRInfo.from_json(d) for d in gh.open_prs()])
