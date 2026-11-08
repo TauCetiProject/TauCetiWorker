@@ -14,6 +14,7 @@ defining module path):
 | `duplicate-declarations: name is declared in both M and N` | `audit` on the project modules |
 | `LINT-ENV-LOCATIONS {...}` (the environment linter's JSON findings) | `lint` on the defining path, `unknown` kept when the linter could not locate it |
 | `Some required targets logged failures:` followed by `- TauCeti.A.B` lines | `compiler` on each target, only when no located finding exists |
+| `TauCeti/A.lean: missing project import ...` and other located import-header findings | `compiler` on the importing module |
 
 Infrastructure findings come from the run and jobs rather than the log: a cancelled, timed out or
 startup-failed run, a lost runner (the job log says so), and a finalizer that failed to publish the
@@ -45,6 +46,11 @@ DUPLICATE = re.compile(
 )
 ENV_LOCATIONS = "LINT-ENV-LOCATIONS "
 ENV_PATH = re.compile(r"TauCeti(?:/[A-Za-z_][A-Za-z0-9_']*)+\.lean")
+IMPORT_HEADER = re.compile(
+    r"^(TauCeti(?:/[A-Za-z_][A-Za-z0-9_']*)*\.lean): "
+    r"(?:missing project import |Lean import header does not parse|Lake import header does not parse|"
+    r"does not opt into the module system|`meta import |direct metaprogramming import |ambiguous project imports:)"
+)
 FAILED_TARGETS_HEADER = "Some required targets logged failures:"
 FAILED_TARGET = re.compile(r"- (TauCeti(?:\.[A-Za-z_][A-Za-z0-9_']*)+)")
 RUNNER_LOST = re.compile(
@@ -81,6 +87,13 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
         if line.startswith(ENV_LOCATIONS):
             for finding in environment_findings(line[len(ENV_LOCATIONS) :]):
                 located.setdefault(("lint", finding["module"], finding.get("declaration")), finding)
+            continue
+        if (header := IMPORT_HEADER.match(line)) and len(header.group(1)) <= 512:
+            path = header.group(1)
+            located.setdefault(
+                ("compiler", path, line[:MAX_MESSAGE]),
+                _finding("compiler", module_of(path), line, path=path, reason="import_header"),
+            )
             continue
         if (audit := AUDIT.fullmatch(line)) and all(len(m) <= 512 for m in audit.groups()):
             for module in (audit.group(1), audit.group(3)):
