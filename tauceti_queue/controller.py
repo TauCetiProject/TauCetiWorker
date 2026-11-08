@@ -405,27 +405,29 @@ class Controller:
             if configure_publishers is not None:
                 with store.transaction():
                     if configure_publishers(store):
-                        # Rebind only the latest desired recovery fact for each
-                        # accepted head. Preserve row IDs as its durable order.
-                        latest = {}
+                        # A rotation/restore never re-signs a positive release.
+                        # Retired source history already holds affected heads;
+                        # no historical comments need to be replayed here.
                         for entry in store.rows("outbox", {"kind": "comment"}, order="id"):
                             body = loads(entry["payload"], {})
                             publication = body.get("publication") or {}
-                            if publication.get("kind") == "recovery":
-                                latest[(body["number"], publication["head"])] = (entry, body)
-                        for entry, body in latest.values():
-                            if body["publication"].get("clear"):
-                                continue  # Positive releases need a fresh explicit decision after rotation/restore.
-                            body.pop("native_intent", None)
-                            store.update(
-                                "outbox",
-                                {"id": entry["id"]},
-                                payload=dumps(body),
-                                state="pending",
-                                next_attempt_at=clock(),
-                                done_at=None,
-                                result="",
-                            )
+                            if (
+                                publication.get("kind") == "recovery"
+                                and publication.get("clear")
+                                and entry["state"] == "pending"
+                            ):
+                                store.update(
+                                    "outbox",
+                                    {"id": entry["id"]},
+                                    state="done",
+                                    done_at=clock(),
+                                    result="reconciliation-required: clear predates authority rotation",
+                                )
+                        store.journal(
+                            clock(),
+                            "native-publisher-rotation",
+                            generation=self.source.admission_policy.publishers.generation,
+                        )
         self.provenance_repository = source_identity.repository.key if self.native_source else repository
         self.revision = revision
         self.clock = clock
@@ -6154,16 +6156,19 @@ class Controller:
                 + f"\n\n<!--tauceti-rebase:v1 {head}-->"
             )
             outbox_key = "native-recovery:" + key
-            self._enqueue(
-                "comment",
-                outbox_key,
-                {
-                    "number": number,
-                    "body": body,
-                    "marker": outbox_key,
-                    "publication": {"kind": "recovery", "head": head, "clear": clear},
-                },
-            )
+            payload = {
+                "number": number,
+                "body": body,
+                "marker": outbox_key,
+                "publication": {"kind": "recovery", "head": head, "clear": clear},
+            }
+            existing = self.store.row("outbox", {"key": outbox_key})
+            if existing is not None:
+                previous = loads(existing["payload"], {})
+                previous.pop("native_intent", None)
+                if previous != payload:
+                    raise ValueError("native recovery key was reused for a different decision")
+            self._enqueue("comment", outbox_key, payload)
             return self.store.row("outbox", {"key": outbox_key})["id"]
 
     def reconcile_source_recovery(self, number, head, nonce):
@@ -6251,12 +6256,23 @@ class Controller:
             with self._lock.unlocked():
                 payload = loads(current["payload"], {})
                 prepare_comment = getattr(self.source, "prepare_outbox_comment", None)
+                if self.native_source and payload.get("publication") and not self.setting("publication_enabled"):
+                    return
                 frozen = payload.get("native_intent")
                 wrong_generation = bool(
                     frozen
                     and self.native_source
                     and frozen.get("generation") != self.source.admission_policy.publishers.generation
                 )
+                if wrong_generation and payload.get("publication", {}).get("clear"):
+                    with self._lock:
+                        self._outbox_done(
+                            current,
+                            loads(current["history"], []),
+                            "reconciliation-required: clear predates authority rotation",
+                            now,
+                        )
+                    return
                 if (
                     self.native_source
                     and current["kind"] == "comment"
@@ -6292,7 +6308,9 @@ class Controller:
             if current is None:
                 return
             if error is not None:
-                if self.native_source and current["kind"] == "comment" and isinstance(error, PermissionError):
+                from .forgejo_source import PublisherNotGranted
+
+                if self.native_source and current["kind"] == "comment" and isinstance(error, PublisherNotGranted):
                     self._outbox_done(
                         current,
                         loads(current["history"], []),
@@ -6377,7 +6395,21 @@ class Controller:
 
                 try:
                     return "comment " + str(self.source.publish(payload["native_intent"]))
-                except PublicationSuperseded:
+                except PublicationSuperseded as error:
+                    known = any(
+                        (loads(e["payload"], {}).get("native_intent") or {}).get("nonce") == error.nonce
+                        for e in self.store.rows("outbox", {"kind": "comment"})
+                    )
+                    if not known:
+                        with self._lock:
+                            self.store.journal(
+                                now,
+                                "native-publication-history-mismatch",
+                                number=payload["number"],
+                                remote_sequence=error.sequence,
+                                remote_nonce=error.nonce,
+                            )
+                        return "reconciliation-required: remote publication is absent from the local outbox; reconcile restore"
                     return "superseded native publication"
                 except PublicationDamaged:
                     repaired = self.reconcile_source_recovery(
