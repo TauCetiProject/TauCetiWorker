@@ -770,10 +770,6 @@ class Controller:
                     return {"accepted": True, "reason": "already-approved", "input": self._input_for(pr)}
                 if existing["state"] == INPUT_INSERTED:
                     return {"accepted": False, "reason": "member", "input": existing}
-                # A different head while waiting: the previous approval no longer describes the source.
-                self.store.update(
-                    "inputs", {"id": existing["id"]}, state=INPUT_CANCELLED, reason="superseded-by-new-approval"
-                )
             if pull is None or pull.head_sha != head_sha:
                 pull, reason = self.validate_pull(repo, pr, head_sha)
                 if reason is not None:
@@ -787,6 +783,11 @@ class Controller:
             no_repair = self._carries_no_repair(getattr(pull, "labels", None))
             ref = self.input_ref(pr, head_sha)
             with self.store.transaction():
+                if existing is not None and existing["state"] in (INPUT_WAITING, INPUT_RESERVED):
+                    # A validated new approval supersedes the old waiting revision, preserving terminal history.
+                    self.store.update(
+                        "inputs", {"id": existing["id"]}, state=INPUT_CANCELLED, reason="superseded-by-new-approval"
+                    )
                 self._retain(ref, head_sha)
                 input_id = self.store.insert(
                     "inputs",
@@ -2447,17 +2448,16 @@ class Controller:
 
     def _observe_canonical(self, canonical: str, now: float) -> None:
         previous = self._canonical
-        self._canonical = canonical
         self._set_state("canonical_stale", False)
-        if canonical != previous:
-            self._set_state("canonical_sha", canonical)
-            self.store.journal(now, "canonical-advance", previous=previous, current=canonical)
         head = self._head()
         if head is not None and chain.is_ancestor(self.clone, head["tip"], canonical):
             how = "promoted" if head["expected_parent"] else "external"
             self._landed(head, how, now)
+        self._canonical = canonical
         if canonical == previous:
             return
+        self._set_state("canonical_sha", canonical)
+        self.store.journal(now, "canonical-advance", previous=previous, current=canonical)
         if previous and chain.is_ancestor(self.clone, previous, canonical):
             landed_prs: set[int] = set()
             bors_landed: set[int] = set()
@@ -5439,7 +5439,9 @@ class Controller:
         for member in everyone:
             if member["withdrawn"]:
                 continue
-            if self._commit_empty(member["commit_sha"]) and not self._landed_outside_queue(member):
+            commit = chain.read_commit(self.clone, member["commit_sha"])
+            empty = len(commit.parents) == 1 and commit.tree == chain.tree_of(self.clone, commit.parents[0])
+            if empty and not chain.carries_landed_note(commit.message):
                 rejected.append(member)
             else:
                 members.append(member)
@@ -5468,6 +5470,8 @@ class Controller:
                     landed_sha=member["commit_sha"],
                 )
             for member in rejected:
+                if self.admission is not None:
+                    self.admission.withdraw(member["number"], member["accepted_head"])
                 self.store.update(
                     "inputs",
                     {"id": member["input_id"]},

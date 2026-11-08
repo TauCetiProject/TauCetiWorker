@@ -649,8 +649,10 @@ class EmptyContributions(QueueFixture):
 
     def test_external_landing_retries_after_a_transient_git_failure(self):
         head = self.repaired_empty()
+        self.approve(102, {"Outside.lean": "outside\n"})
         self.github.update_ref(PROJECT, "refs/heads/main", head["tip"])
-        with patch.object(self.controller, "_commit_empty", side_effect=chain.ChainError("transient git failure")):
+        self.repo.advance_main({"Outside.lean": "outside\n"}, message="Change 102 (#102)")
+        with patch.object(chain, "read_commit", side_effect=chain.ChainError("transient git failure")):
             with self.assertRaises(chain.ChainError):
                 self.tick()
         self.assertIsNotNone(self.head())
@@ -661,7 +663,18 @@ class EmptyContributions(QueueFixture):
         restarted.tick()
         self.assertIsNone(restarted.store.row("batches", {"state": "head"}))
         self.assertEqual(restarted.input_for(PROJECT, 101)["reason"], "empty-commit")
+        self.assertEqual(restarted.input_for(PROJECT, 102)["reason"], "landed-externally")
         self.assertEqual(self.github.closed[101], "Change 101")
+
+    def test_failed_reapproval_preserves_the_rejected_revision(self):
+        self.repaired_empty()
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        row = self.controller.input_for(PROJECT, 101)
+        result = self.controller.approve(PROJECT, 101, row["head_sha"], "reviewer")
+        self.assertEqual((result["accepted"], result["reason"]), (False, "closed"))
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "empty-commit")
 
     def test_external_canonical_advance_does_not_count_empty_placeholders_as_landed(self):
         head = self.repaired_empty()
@@ -844,6 +857,14 @@ class HeadOperations(QueueFixture):
             sorted(c.source_pr for c in self.first_parent_chain(admin, self.repo.main_sha())),
             [f"{PROJECT}#101", f"{PROJECT}#102"],
         )
+
+        old_input = self.controller.input_for(PROJECT, 101)
+        self.github.prs[101]["state"] = "open"
+        new_head = self.github.push_pr(101, {"Followup.lean": "followup\n"})
+        self.assertTrue(self.controller.approve(PROJECT, 101, new_head, "reviewer")["accepted"])
+        self.assertEqual(self.controller.store.row("inputs", {"id": old_input["id"]})["state"], "landed")
+        outcomes = feeds.ControllerFeedSource(self.controller).outcomes(PROJECT, "main")
+        self.assertEqual(next(o for o in outcomes if o.pr == 101 and o.batch_id == head["id"]).state, "ok")
 
     def test_s10_promotion_refused_after_an_advance_between_pass_and_push(self):
         self.approve(101, {"A.lean": "a\n"})

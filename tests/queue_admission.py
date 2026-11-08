@@ -232,6 +232,28 @@ class AdmissionTests(unittest.TestCase):
         self.intake.invalidate(1)
         self.assertEqual(self.intake.run_once()["approved"], 1, "fresh review can authorize another attempt")
 
+    def test_empty_landing_consumes_approval_before_the_close_or_next_evaluation(self):
+        head = self.github.create_pr(1, {})
+        self.review()
+        for context in ("build", "scope"):
+            self.github.statuses[(head, context)] = Status("success", "", "", self.clock(), None)
+        self.assertTrue(self.controller.approve(REPO, 1, head, "reviewer")["accepted"])
+        self.intake.run_once()
+        self.controller.tick()
+        self.github.start_runs()
+        self.github.complete_runs()
+        self.github.fail_next["close_pr"] = 1
+        self.controller.tick()
+        self.controller.tick()
+        row = self.controller.input_for(REPO, 1)
+        self.assertEqual(row["reason"], "empty-commit")
+        self.assertEqual(self.github.prs[1]["state"], "open")
+        self.assertEqual(self.intake.state.get(1)["cancelled_head_sha"], head)
+        self.intake.invalidate(1)
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(len(self.controller.inputs()), 1)
+        self.assertEqual(self.controller.input_for(REPO, 1)["reason"], "empty-commit")
+
     def test_cutover_uses_the_legacy_withdrawal_time_without_rejecting_a_new_comment(self):
         head = self.ready()
         self.controller.admission = None

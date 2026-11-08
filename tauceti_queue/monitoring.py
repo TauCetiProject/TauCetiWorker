@@ -547,6 +547,7 @@ def project(
         if (
             batch.get("state") == "landed"
             and item.get("state") == "cancelled"
+            and not item.get("landed_sha")
             and not row["withdrawn"]
             and not row["removed"]
         ):
