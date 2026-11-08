@@ -20,13 +20,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-DRIVER = ROOT / "scripts/LocalAxioms.lean"
+from tauceti_tools.templates import ASSETS
+
+DRIVER = ASSETS / "scripts/LocalAxioms.lean"
 LEAN = os.environ.get("LEAN") or shutil.which("lean")
 
 
 class NativeCache(unittest.TestCase):
     def test_cache_shared_across_isolated_homes_and_explicit_bubble_override(self):
-        wrapper = runpy.run_path(str(ROOT / "scripts/tauceti-local-axioms"))
+        wrapper = runpy.run_path(str(ASSETS / "scripts/local_axioms.py"))
         with tempfile.TemporaryDirectory() as name:
             login = Path(name)
             with (
@@ -44,7 +46,7 @@ class NativeCache(unittest.TestCase):
                 self.assertEqual(wrapper["cache_root"](), override)
 
     def test_concurrent_build_reuse_invalidation_and_interrupted_build(self):
-        wrapper = runpy.run_path(str(ROOT / "scripts/tauceti-local-axioms"))
+        wrapper = runpy.run_path(str(ASSETS / "scripts/local_axioms.py"))
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             prefix = root / "toolchain"
@@ -91,7 +93,7 @@ class NativeCache(unittest.TestCase):
         with tempfile.TemporaryDirectory() as name:
             listed = Path(name) / "empty.txt"
             listed.write_text("")
-            command = [sys.executable, str(ROOT / "scripts/tauceti-local-axioms"), "--modules", str(listed)]
+            command = [sys.executable, str(ASSETS / "scripts/local_axioms.py"), "--modules", str(listed)]
             result = subprocess.run(command, env=dict(os.environ, PATH="/nonexistent"), capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("checked 0 changed module(s)", result.stdout)
@@ -107,7 +109,7 @@ class LocalAxioms(unittest.TestCase):
     def setUpClass(cls):
         cls.tooling = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.tooling.cleanup)
-        wrapper = runpy.run_path(str(ROOT / "scripts/tauceti-local-axioms"))
+        wrapper = runpy.run_path(str(ASSETS / "scripts/local_axioms.py"))
         prefix = Path(subprocess.check_output([LEAN, "--print-prefix"], text=True).strip())
         cls.native = wrapper["checker"](DRIVER, prefix, Path(cls.tooling.name))
 

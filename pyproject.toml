@@ -8,8 +8,8 @@ version = "0.1.0"
 description = "Autonomous worker for the TauCetiProject/TauCeti Lean library"
 requires-python = ">=3.11"
 dependencies = [
-    "tauceti-review @ git+https://github.com/TauCetiProject/TauCetiReview@f2c57dda135775ec0117a6ae18ae9443f3e56601",
-    "tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@ea62fea3a5411a746a10f5d5f7f6466b98c368ba",
+    "tauceti-review @ git+https://github.com/TauCetiProject/TauCetiReview@1ff9effbf6568ef7380b077bc4f70c297d041a87",
+    "tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@3b5a8cf7e28f2d51fc6f5e5a13941840db612c0e",
     "rich>=13",
     "textual>=8,<9",
     "psutil>=7; sys_platform == 'darwin'",
@@ -39,7 +39,7 @@ packages = ["tauceti_worker", "tauceti_queue"]
 target-version = "py311"
 line-length = 120
 # `tauceti` is the program but has no .py extension, so ruff won't pick it up by default.
-extend-include = ["tauceti", "scripts/tauceti-local-axioms", "scripts/tauceti-local-lint", "scripts/tauceti-lean"]
+extend-include = ["tauceti", "scripts/tauceti-local-axioms", "scripts/tauceti-local-lint", "scripts/tauceti-local-checks", "scripts/tauceti-lean"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
