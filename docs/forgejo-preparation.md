@@ -341,21 +341,30 @@ repository ID and pull number; their chain attribution labels remain separate.
 The wire record and checkpoint omit the legacy `repository` field, so older
 runners cannot interpret the source name as a GitHub target. Missing, malformed
 or different persisted bindings are not claimed or silently reinterpreted after
-a policy change. Existing tasks need explicit replacement under the new policy.
+a policy change. Each tick supersedes stale open tasks, releases their claims and
+creates fresh tasks for still-current work under the new policy. The old task
+snapshot stays intact. Owners can release stale-policy work; late results are
+retained and recorded as rejected without adoption. This keeps policy upgrades
+from leaving an unclaimable task blocking the head batch.
 
 The native task client requires its expected binding from trusted runner
 configuration and an explicit native bearer. It refuses redirects and remote
 plain HTTP, bounds responses, rejects duplicate JSON fields, and checks the binding
 before claim adoption, renewal, submission or release. No binding is inferred from
-the claim response. Checkpoints and compact progress retain the qualified binding;
+the claim response. The native claim request must identify its expected contract;
+missing or mismatched contracts are refused before source API reads or lease
+allocation, with a second policy check under the controller lock.
+Checkpoints and compact progress retain the qualified binding;
 monitoring matches progress to the SQL task binding and reports task identity even
 without a worker observation. These identity helpers do not enable public native
 export: the existing GitHub allowlist and URL policy still refuse source-bound ledgers.
 Native metadata does not enable the existing runner:
 native execution, legacy admin-cache use, Git fetch/push, agent work and resume or
 release retries through an unqualified client remain refused until the native
-transport, source validation and runner adapters are implemented. Native checkpoint
-directory/cache namespaces also need integration before enabling execution.
+transport, source validation and runner adapters are implemented. Whole-request
+transport deadlines and native checkpoint directory/cache namespaces also need
+integration before enabling execution; the prototype client currently uses socket
+timeouts and a response byte bound.
 Credential audience/delegation policy and ingress rate/concurrency limits also
 require integration before activation: a native user ACL observation alone does
 not identify a bearer as a dedicated queue-control credential.

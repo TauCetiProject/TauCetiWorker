@@ -511,8 +511,9 @@ def run_group_job(job_path: Path) -> int:
 
     job = json.loads(job_path.read_text())
     cfg = config_from_json(job["cfg"], repair_task.RunnerConfig)
-    cfg.api_key = os.environ.pop(API_KEY_ENV, None) or None
     task = repair_task.Task.from_json(job["task"])
+    repair_task.require_task_execution(cfg=cfg, task=task)
+    cfg.api_key = os.environ.pop(API_KEY_ENV, None) or None
     cancel = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: cancel.set())

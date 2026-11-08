@@ -155,7 +155,7 @@ class EndpointMissing(Exception):
 
 
 CLAIM_CODES = ("unknown-task", "unknown-claim", "claim-expired", "claim-superseded", "not-authorized")
-TERMINAL_REJECTIONS = ("version-mismatch", "tip-unavailable", "not-authorized", "unknown-task")
+TERMINAL_REJECTIONS = ("version-mismatch", "tip-unavailable", "not-authorized", "unknown-task", "policy-changed")
 
 
 @dataclasses.dataclass
@@ -229,7 +229,7 @@ class Task:
             raise ValueError("task record lacks 'repository'")
         if data["kind"] not in TASK_KINDS:
             raise ValueError(f"unknown task kind {data['kind']!r}")
-        repository = binding.source.repository.name if binding is not None else str(data["repository"])
+        repository = "" if binding is not None else str(data["repository"])
         if binding is not None:
             validate_native_task(data)
         members = []
@@ -239,7 +239,7 @@ class Task:
                     raise TaskBindingMismatch("invalid qualified task member")
                 identity = binding.pull_key(raw.get("number"))
                 if raw.get("source_identity") != identity or raw.get("source_pr") not in {
-                    f"{repository}#{raw['number']}",
+                    f"{binding.source.repository.name}#{raw['number']}",
                     f"{binding.source.repository.key}#{raw['number']}",
                     identity,
                 }:
@@ -300,7 +300,13 @@ class Task:
             claim_token=str(data["claim_token"]),
             expires_at=expires_at,
             renew_after=float(
-                data.get("renew_after") or extra.get("renew_after") or max(5.0, (expires_at - time.time()) / 3)
+                data.get("renew_after")
+                or extra.get("renew_after")
+                or (
+                    min(300.0, max(5.0, (expires_at - time.time()) / 3))
+                    if binding is not None
+                    else max(5.0, (expires_at - time.time()) / 3)
+                )
             ),
             instruction=str(data.get("instruction") or ""),
             created_at=float(data["created_at"]) if data.get("created_at") is not None else None,
@@ -365,10 +371,7 @@ class TaskClient:
                 or url.password is not None
                 or url.query
                 or url.fragment
-                or (
-                    url.scheme != "https"
-                    and not (url.scheme == "http" and url.hostname in {"127.0.0.1", "::1", "localhost"})
-                )
+                or (url.scheme != "https" and not (url.scheme == "http" and url.hostname in {"127.0.0.1", "::1"}))
             ):
                 raise ValueError("native task service requires HTTPS or an explicit loopback fixture")
             if not isinstance(token, str) or not 0 < len(token) <= 4096 or not all(33 <= ord(c) <= 126 for c in token):
@@ -379,10 +382,12 @@ class TaskClient:
             self._opener = urllib.request.build_opener(*handlers)
 
     def _require_task(self, task):
-        if not isinstance(task, Task) or task.binding != self.binding:
+        if getattr(task, "binding", None) != self.binding:
             raise TaskBindingMismatch("task source/execution policy differs from the trusted client binding")
 
     def _post(self, path: str, body: dict) -> tuple[int, dict | None]:
+        if self.binding is not None:
+            body = {**body, "schema": TASK_SCHEMA, "task_binding": self.binding.record()}
         data = json.dumps(body).encode()
         request = urllib.request.Request(
             f"{self.service}{path}",
@@ -436,7 +441,14 @@ class TaskClient:
             raise ClaimRefused(f"claim refused: HTTP {status} {_error_text(payload)}".strip())
         if status != 200 or not isinstance(payload, dict):
             raise ServiceError(f"claim: unexpected HTTP {status} {_error_text(payload)}".strip())
-        task = Task.from_json(payload)
+        try:
+            task = Task.from_json(payload)
+        except TaskBindingMismatch:
+            raise
+        except (TypeError, ValueError, KeyError):
+            if self.binding is None:
+                raise
+            raise ServiceError("claim: invalid native task record") from None
         self._require_task(task)
         return task
 
@@ -1438,6 +1450,7 @@ def run_repair_agent(
     an argv the kernel rejects), and ``"artifacts_unavailable"`` when the worker's cache preparation
     refused to start inference. ``provider`` names the provider whose agent ran last.
     """
+    require_task_execution(cfg=cfg, task=task)
     from tauceti_worker.agents import (
         AgentLaunchUnavailable,
         BuildCacheUnavailable,
@@ -1626,6 +1639,7 @@ def run_parallel_groups(
     build (``stream``) the path first waits for it to finish and takes the groups from its complete
     error list, ``errors.jsonl``, merged with the task's diagnostics. Returns the record for the outcome
     and the findings the sequential path still has to repair (None when nothing changes for it)."""
+    require_task_execution(cfg=cfg, task=task)
     record: dict = {"source": "diagnostics"}
     if stream is not None:
         waited = time.monotonic()

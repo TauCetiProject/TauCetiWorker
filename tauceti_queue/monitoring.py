@@ -372,13 +372,16 @@ class TaskObservations:
                                 final = raw.get("outcome") or raw
                             record = task_progress.summarize(raw, final)
                         if str(record.get("task_id")) != str(task["id"]):
+                            self.cache[key] = (fingerprint, None, None)
                             continue
                         observation = task_progress.public(record)
                         if observation.get("task_binding") != expected_binding:
+                            self.cache[key] = (fingerprint, None, None)
                             continue
                         binding = record.get("claim_token")
                         self.cache[key] = (fingerprint, observation, binding if isinstance(binding, str) else None)
-                    candidates.append((*self.cache[key][1:], directory))
+                    if self.cache[key][1] is not None:
+                        candidates.append((*self.cache[key][1:], directory))
                 except (OSError, ValueError, TypeError, AttributeError):
                     continue
             if candidates:

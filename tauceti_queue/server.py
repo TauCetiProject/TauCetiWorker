@@ -56,6 +56,7 @@ from .source_authority import (
     principal_key,
 )
 from .stale_cache import MAX_AGE_SECONDS, StaleCache
+from .task_identity import TASK_SCHEMA, TaskBinding
 
 log = logging.getLogger("tauceti_queue.server")
 
@@ -473,6 +474,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._authenticated(), None  # Syntactic check only, before any body or source I/O.
             # A slow request body must not keep an earlier native ACL grant.
             body = self._read_json()
+            if body is not None and urllib.parse.urlsplit(self.path).path == "/tasks/claim":
+                try:
+                    binding = TaskBinding.parse(body.get("task_binding"))
+                    ledger = self.server.controller.candidate_ci.ledger
+                    if body.get("schema") != TASK_SCHEMA or binding != TaskBinding.from_policy(
+                        ledger.policy, queue_epoch=ledger.epoch
+                    ):
+                        raise ValueError("native task policy mismatch")
+                except (TypeError, ValueError):
+                    self._error(400, "a matching qualified native task contract is required")
+                    return None, None
+                self._expected_task_binding = binding
             return (self._authenticated(), body) if body is not None else (None, None)
         identity = self._authenticated()
         return (identity, self._read_json()) if identity is not None else (None, None)
@@ -717,9 +730,10 @@ class Handler(BaseHTTPRequestHandler):
         if identity is None or body is None:
             return
         login = identity[0]
-        self._call(
-            lambda: self.server.controller.claim_task(self._worker_identity(body), login, **self._source_task_kwargs())
-        )
+        kwargs = self._source_task_kwargs()
+        if self.server.source_authority is not None:
+            kwargs["expected_binding"] = self._expected_task_binding
+        self._call(lambda: self.server.controller.claim_task(self._worker_identity(body), login, **kwargs))
 
     def _task(self, task_id: str, action: str) -> None:
         """`renew`, `result` and `release` carry the claim token the claim handed out; the

@@ -92,6 +92,26 @@ def validate_native_task(row):
         or re.fullmatch(r"[0-9a-f]{32}", row["claim_token"]) is None
     ):
         raise TaskBindingMismatch("invalid qualified task references or lease")
+    batch_id = row.get("batch_id")
+    if (
+        type(batch_id) not in (int, str)
+        or re.fullmatch(r"[1-9][0-9]{0,18}", str(batch_id)) is None
+        or int(batch_id) >= 2**63
+        or type(row.get("batch_version")) is not int
+        or not 0 <= row["batch_version"] < 2**63
+    ):
+        raise TaskBindingMismatch("invalid qualified task batch identity")
+    branch = row["extra"].get("canonical_branch")
+    if (
+        not isinstance(branch, str)
+        or re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*(?:/[A-Za-z0-9_][A-Za-z0-9_-]*)*", branch) is None
+    ):
+        raise TaskBindingMismatch("invalid qualified task canonical branch")
+    for section in (row, row["extra"]):
+        if "renew_after" in section and (
+            type(section["renew_after"]) not in (int, float) or not 0 < section["renew_after"] <= 3600
+        ):
+            raise TaskBindingMismatch("invalid qualified task renewal interval")
     for key in ("base", "tip", "onto"):
         value = row.get(key)
         if (
@@ -100,6 +120,29 @@ def validate_native_task(row):
             or not int(value, 16)
         ):
             raise TaskBindingMismatch("invalid qualified task commit")
+
+    def oid(value):
+        return (
+            isinstance(value, str)
+            and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is not None
+            and bool(int(value, 16))
+        )
+
+    warm = row.get("warm_revs", [])
+    if not isinstance(warm, list) or any(not oid(value) for value in warm):
+        raise TaskBindingMismatch("invalid qualified task warm revision")
+    pre = row["extra"].get("pre_rebased")
+    if pre is not None and (
+        not isinstance(pre, dict)
+        or not oid(pre.get("source"))
+        or not oid(pre.get("batch_base"))
+        or (pre.get("head_base") is not None and not oid(pre["head_base"]))
+        or (
+            pre.get("head_batch_id") is not None
+            and (type(pre["head_batch_id"]) is not int or not 0 < pre["head_batch_id"] < 2**63)
+        )
+    ):
+        raise TaskBindingMismatch("invalid qualified pre-rebased task references")
     refs = row.get("retained_refs")
     if (
         not isinstance(refs, list)
@@ -135,3 +178,10 @@ def validate_native_task(row):
             or not int(head, 16)
         ):
             raise TaskBindingMismatch("invalid qualified member head")
+        retained = f"refs/tauceti-queue/inputs/{member['number']}/{head}"
+        if (
+            member.get("retained_ref") != retained
+            or retained not in refs
+            or (member.get("commit") is not None and not oid(member["commit"]))
+        ):
+            raise TaskBindingMismatch("invalid qualified member commit or retained ref")
