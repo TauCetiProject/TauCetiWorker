@@ -100,8 +100,8 @@ class FakeController(FakeSource):
     def release_task(self, task_id, claim_token, reason, error=""):
         self.calls.append(("release_task", task_id, claim_token, reason, error))
 
-    def retry_ci(self, repo, actor):
-        self.calls.append(("retry_ci", repo, actor))
+    def retry_ci(self, repo, actor, *, request_id=None):
+        self.calls.append(("retry_ci", repo, actor) if request_id is None else ("retry_ci", repo, actor, request_id))
         return {"retried": True}
 
     def rebuild_head(self, repo, actor):
@@ -492,6 +492,17 @@ class ServerTest(unittest.TestCase):
         status, body = self.request("POST", "/admin/retry-ci", {}, self.bearer("ghp_guest"))
         self.assertEqual(status, 503, "a login never checked before is neither granted nor refused")
         self.assertIn("could not confirm", body["error"])
+
+    def test_admin_retry_passes_exact_request_nonce_and_refuses_malformed_values(self):
+        request_id = "a" * 32
+        status, _ = self.request("POST", "/admin/retry-ci", {"request_id": request_id}, self.bearer("ghp_kim"))
+        self.assertEqual(status, 200)
+        self.assertEqual(self.controller.calls[-1], ("retry_ci", TAUCETI, "kim-em", request_id))
+        count = len(self.controller.calls)
+        for value in (42, "", "a" * 31, "A" * 32):
+            status, _ = self.request("POST", "/admin/retry-ci", {"request_id": value}, self.bearer("ghp_kim"))
+            self.assertEqual(status, 400)
+        self.assertEqual(len(self.controller.calls), count)
 
     def test_admin_settings_accepts_every_controller_setting_and_refuses_unknown_keys_first(self):
         from tauceti_queue.controller import DEFAULT_SETTINGS

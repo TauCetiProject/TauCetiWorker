@@ -158,6 +158,49 @@ class AppAuth(unittest.TestCase):
         self.assertEqual(source.token(), "ghs_two")
         self.assertEqual(source.refreshes, 3)
 
+    def test_execution_token_is_minted_for_an_immutable_repository_id_on_every_refresh(self):
+        pem, _ = key_pair()
+        transport = FakeTransport()
+        url = "https://api.github.com/app/installations/178451644/access_tokens"
+        value = "ghs_123_JWT_" + "a.b.c" * 100
+        transport.add(
+            "POST",
+            url,
+            201,
+            {
+                "token": value,
+                "expires_at": "2027-01-15T11:00:00Z",
+                "repositories": [{"id": 42, "full_name": "renamed/Execution"}],
+            },
+        )
+        source = app.InstallationTokenSource(
+            credentials(pem),
+            transport,
+            repository_id=42,
+            permissions={"actions": "write", "contents": "write"},
+        )
+        self.assertEqual(source.token(), value)
+        source.invalidate()
+        self.assertEqual(source.token(), value)
+        self.assertEqual(source.repository_id, 42)
+        for _, _, _, body in transport.calls:
+            self.assertEqual(
+                json.loads(body), {"repository_ids": [42], "permissions": {"actions": "write", "contents": "write"}}
+            )
+        transport.add(
+            "POST",
+            url,
+            201,
+            {"token": "wrong-repository", "expires_at": "2027-01-15T11:00:00Z", "repositories": [{"id": 99}]},
+        )
+        # Consume the original response, then check that a response selecting a
+        # replacement ID is never cached as a usable execution credential.
+        transport.responses[f"POST {url}"] = transport.responses[f"POST {url}"][-1:]
+        source.invalidate()
+        with self.assertRaisesRegex(app.CredentialsError, "another repository"):
+            source.token()
+        self.assertIsNone(source.expires_at())
+
 
 class StaticTokens:
     def __init__(self, value="ghs_static"):

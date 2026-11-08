@@ -49,6 +49,10 @@ TOKEN_REFRESH_MARGIN_SECONDS = 5 * 60
 class CredentialsError(RuntimeError):
     """The configuration directory is incomplete or malformed."""
 
+    def __init__(self, message, *, retryable=False):
+        super().__init__(message)
+        self.retryable = retryable
+
 
 def config_dir(explicit: pathlib.Path | str | None = None) -> pathlib.Path:
     """The credential directory: the explicit path, else `$TAUCETI_QUEUE_CONFIG`, else the default."""
@@ -166,14 +170,38 @@ class InstallationTokenSource:
         *,
         api: str = API,
         clock: Callable[[], float] = time.time,
+        repository_id: int | None = None,
+        permissions: dict[str, str] | None = None,
     ) -> None:
+        if repository_id is not None and (type(repository_id) is not int or repository_id < 1):
+            raise CredentialsError("installation token repository ID must be positive")
+        if permissions is not None and (
+            not isinstance(permissions, dict)
+            or not permissions
+            or any(
+                not isinstance(key, str) or not isinstance(value, str) or value not in {"read", "write"}
+                for key, value in permissions.items()
+            )
+        ):
+            raise CredentialsError("invalid installation token permissions")
         self.credentials = credentials
         self._transport = transport
         self._api = api
         self._clock = clock
+        self._repository_id = repository_id
+        self._permissions = None if permissions is None else dict(permissions)
         self._lock = threading.Lock()
         self._current: InstallationToken | None = None
         self.refreshes = 0
+
+    @property
+    def repository_id(self) -> int | None:
+        """The immutable repository resource selected when each token is minted."""
+        return self._repository_id
+
+    @property
+    def permissions(self) -> dict[str, str] | None:
+        return None if self._permissions is None else dict(self._permissions)
 
     def jwt(self) -> str:
         return app_jwt(self.credentials.app_id, self.credentials.private_key_pem, self._clock())
@@ -204,10 +232,35 @@ class InstallationTokenSource:
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": f"tauceti-queue/{self.credentials.slug}",
         }
-        status, _, body = self._transport("POST", url, headers, b"{}")
+        selection = {}
+        if self._repository_id is not None:
+            selection["repository_ids"] = [self._repository_id]
+        if self._permissions is not None:
+            selection["permissions"] = self._permissions
+        status, response_headers, body = self._transport(
+            "POST", url, headers, json.dumps(selection, separators=(",", ":")).encode()
+        )
         if status != 201:
-            raise CredentialsError(f"installation token request failed with HTTP {status}")
+            limited = status == 403 and (
+                response_headers.get("x-ratelimit-remaining") == "0" or "retry-after" in response_headers
+            )
+            raise CredentialsError(
+                f"installation token request failed with HTTP {status}",
+                retryable=limited or status == 429 or 500 <= status <= 599,
+            )
         data = json.loads(body)
+        if self._repository_id is not None:
+            token = data.get("token")
+            if not isinstance(token, str) or not token or not all(33 <= ord(char) <= 126 for char in token):
+                raise CredentialsError("scoped installation token response is invalid")
+            if "repositories" in data and (
+                not isinstance(data["repositories"], list)
+                or len(data["repositories"]) != 1
+                or not isinstance(data["repositories"][0], dict)
+                or type(data["repositories"][0].get("id")) is not int
+                or data["repositories"][0]["id"] != self._repository_id
+            ):
+                raise CredentialsError("installation token response selected another repository")
         self.refreshes += 1
         return InstallationToken(
             value=str(data["token"]),
