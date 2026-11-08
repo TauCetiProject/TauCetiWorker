@@ -104,9 +104,14 @@ class Integration(unittest.TestCase):
             self.assertFalse(admission.evaluate(snapshot)[0]["merge"])
             intent = publisher.prepare_publication(name, number, head, body, "review-native")
             comment_id = publisher.publish(intent)
+            # A write-only publisher reconciles its own accepted receipt without
+            # the repo-admin permission needed to inspect another user's ACL.
+            self.assertEqual(publisher.publish(intent), comment_id)
             snapshot = source.admission_snapshot(name, number)
             self.assertTrue(admission.evaluate(snapshot)[0]["merge"])
             self.assertEqual(snapshot.paths, ("Math/A.lean",))
+            with patch.object(source, "fetch_refs", side_effect=AssertionError("refetched immutable Git objects")):
+                self.assertTrue(admission.evaluate(source.admission_snapshot(name, number))[0]["merge"])
             # A copied native body cannot borrow the configured actor's identity.
             contributor.post_comment(repository, number, admission.bind_comment(body, actor))
             self.assertEqual(len(source.admission_snapshot(name, number).comments), 1)
@@ -195,6 +200,9 @@ class Integration(unittest.TestCase):
                 summary = poller.run_once()
                 self.assertEqual(summary["errors"], [])
                 self.assertTrue(store.rows("inputs"), summary)
+                poller.request_discovery()
+                repeated = poller.run_once()
+                self.assertEqual(repeated["evaluated"], 0, repeated)
                 controller.tick()
                 attempts = store.rows("ci_attempts")
                 self.assertEqual(len(attempts), 1, controller.status())
@@ -207,6 +215,17 @@ class Integration(unittest.TestCase):
                     source._git("show", "-s", "--format=%an <%ae>", frozen.request.head).stdout, accepted_author
                 )
                 execution.add(frozen, classification="passed")
+                reviewing = publisher.prepare_publication(
+                    name, number, head, body + "\nRefreshed verdict.", "review-native-current"
+                )
+                with patch.object(reviewer, "post_comment", side_effect=ForgeError("publication outage", status=503)):
+                    with self.assertRaises(ForgeError):
+                        publisher.publish(reviewing)
+                clock.advance(60)
+                controller.tick()
+                self.assertNotEqual(source.ref_sha(name, "heads/main"), frozen.request.head)
+                self.assertIsNone(store.get_setting(f"source-ci:promotion-hold:{attempts[0]['id']}"))
+                publisher.publish(reviewing)
                 clock.advance(60)
                 controller.tick()
                 self.assertEqual(source.ref_sha(name, "heads/main"), frozen.request.head)

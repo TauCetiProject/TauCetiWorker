@@ -9,6 +9,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
+import time
 from dataclasses import dataclass
 from urllib.parse import quote
 
@@ -26,8 +28,9 @@ from .task_identity import NATIVE_GIT_REFS
 
 BINDING = re.compile(r"<!--tauceti-source:v1 (.*?)-->", re.S)
 PUBLICATION_SCHEMA = "tauceti-source-publication/v1"
-INTENT_SCHEMA = "tauceti-source-publication-intent/v1"
+INTENT_SCHEMA = "tauceti-source-publication-intent/v2"
 PUB_DESCRIPTION = "tauceti-pub/v1:"
+PUB_V2 = "tauceti-pub/v2:"
 REVIEW_CONTEXT = "tauceti-review/"
 RECOVERY_CONTEXT = "tauceti-recovery/"
 
@@ -76,6 +79,8 @@ class NativePublishers:
 
 
 class NativeAdmissionPolicy(AdmissionPolicy):
+    human_owned_approvals = False
+
     def __init__(self, publishers, **kwargs):
         if not isinstance(publishers, NativePublishers):
             raise ValueError("native admission requires explicit publisher identities")
@@ -112,6 +117,11 @@ class NativeAdmissionPolicy(AdmissionPolicy):
         return self.append_provenance(body, block)
 
     def evaluate(self, snapshot):
+        if snapshot.statuses.get("_native_review") == "pending":
+            raise Incomplete("native review publication is still pending")
+        board = policy.latest_current_scoreboard(snapshot.comments, snapshot.pull.head_sha)
+        if board and board[1].get("mode") == "init":
+            raise Incomplete("native review has not completed this round")
         result, authorization, evidence, comment, meta = super().evaluate(snapshot)
         # Adapter comments carry only authenticated, source-bound publisher rows.
         heads = set()
@@ -155,6 +165,36 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             raise ValueError("native source and admission policy differ")
         self.admission_policy = admission_policy
         self.clone_dir = self.clone
+        self._publisher_history = {
+            name: set(getattr(admission_policy.publishers, name)) for name in ("reviews", "statuses", "recoveries")
+        }
+
+    def bind_publisher_history(self, store):
+        """Remember former issuers in the queue's existing settings across rotation.
+
+        Former issuers are barriers, never current authority. This prevents a
+        publisher configuration change from exposing an older green verdict.
+        """
+        key = "state:native-publishers:" + self.repository.key + ":" + str(self.repository_identity.native_id)
+        with store.transaction():
+            saved = store.get_setting(key, {})
+            if not isinstance(saved, dict) or set(saved) - set(self._publisher_history):
+                raise ValueError("invalid native publisher history")
+            for name, known in self._publisher_history.items():
+                ids = saved.get(name, [])
+                if not isinstance(ids, list) or any(type(i) is not int or i < 1 for i in ids):
+                    raise ValueError("invalid native publisher history")
+                known.update(PrincipalRef(self.repository.forge, str(i)) for i in ids)
+                if len(known) > 4096:
+                    raise ValueError("native publisher history exceeds its bound")
+            store.set_setting(
+                key, {name: sorted(int(p.native_id) for p in known) for name, known in self._publisher_history.items()}
+            )
+
+    def _known_publishers(self, name):
+        known = self._publisher_history[name]
+        known.update(getattr(self.admission_policy.publishers, name))
+        return known
 
     @staticmethod
     def _positive(value):
@@ -286,7 +326,10 @@ class ForgejoSourceAdapter(ForgejoGitSource):
 
     def _publication_latest(self, rows, context, allowed):
         candidates = []
+        completions = []
         seen = set()
+        role = "reviews" if context.startswith(REVIEW_CONTEXT) else "recoveries"
+        known = self._known_publishers(role)
         for row in rows:
             if not isinstance(row, dict):
                 raise Incomplete("native statuses are incomplete")
@@ -300,21 +343,70 @@ class ForgejoSourceAdapter(ForgejoGitSource):
                 actor = SourceActor.from_native(self.repository.forge, row.get("creator"))
             except Incomplete:
                 actor = None  # An unknown/deleted issuer is a barrier, never fallback authority.
-            if actor is None or actor.principal in allowed:
-                candidates.append((status_id, row, actor))
-        return max(candidates, key=lambda r: r[0]) if candidates else None
+            if actor is not None and actor.principal not in known:
+                continue
+            description = row.get("description") or ""
+            if description.startswith(PUB_V2):
+                fields = description[len(PUB_V2) :].split(":")
+                if len(fields) not in {3, 4} or re.fullmatch(r"[0-9a-f]{32}", fields[0]) is None:
+                    raise Incomplete("native publication receipt is malformed")
+                if fields[1] != "pending":
+                    if len(fields) != 3 or not fields[1].isdigit() or re.fullmatch(r"[0-9a-f]{64}", fields[2]) is None:
+                        raise Incomplete("native publication receipt is malformed")
+                    completions.append((status_id, row, actor))
+                    continue
+                if len(fields) != 4 or re.fullmatch(r"0|[1-9][0-9]*", fields[3]) is None:
+                    raise Incomplete("native publication predecessor is malformed")
+            candidates.append((status_id, row, actor))
+        if not candidates:
+            if completions:
+                raise Incomplete("native publication has no intent registration")
+            return None
+        latest = None
+        for candidate in sorted(candidates, key=lambda r: r[0]):
+            description = candidate[1].get("description") or ""
+            if description.startswith(PUB_V2):
+                expected = int(description.rsplit(":", 1)[1])
+                if expected != (latest[0] if latest else 0):
+                    continue  # A competing or stale intent did not acquire this predecessor.
+            latest = candidate
+        if latest is None:
+            raise Incomplete("native publication predecessor history is unavailable")
+        start_id, start, actor = latest
+        description = start.get("description") or ""
+        if description.startswith(PUB_V2):
+            nonce, _, body_hash, _ = description[len(PUB_V2) :].split(":")
+            if re.fullmatch(r"[0-9a-f]{64}", body_hash) is None:
+                raise Incomplete("native publication digest is malformed")
+            finished = [
+                (i, row, issuer)
+                for i, row, issuer in completions
+                if i > start_id
+                and issuer == actor
+                and re.fullmatch(
+                    re.escape(PUB_V2 + nonce + ":") + r"[1-9][0-9]*:" + body_hash, row.get("description") or ""
+                )
+                and (row.get("status") or row.get("state")) == "success"
+            ]
+            if finished:
+                # Ordering belongs to immutable pending registrations, not the
+                # arrival of completions. A late completion cannot revive old work.
+                return start_id, max(finished, key=lambda r: r[0])[1], actor
+        return latest
 
-    def _publication_comment(self, number, rows, context, allowed, comments):
+    def _publication_comment(self, number, rows, context, allowed, comments, *, own_actor=None):
         latest = self._publication_latest(rows, context, allowed)
         if latest is None:
             return None, "absent"
         _id, stamp, actor = latest
         if actor is None:
             raise Incomplete("latest native publication issuer is unavailable")
+        if actor.principal not in allowed:
+            return None, "revoked"
         # Select latest first: revocation or corrupt negative evidence must never
         # expose an older green publication from another issuer.
         try:
-            writable = self._permission(actor) in {"write", "admin", "owner"}
+            writable = actor == own_actor or self._permission(actor) in {"write", "admin", "owner"}
         except ForgeError as error:
             if error.status != 404:
                 raise
@@ -327,7 +419,15 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         description = stamp.get("description")
         if context.startswith(RECOVERY_CONTEXT) and description == PUB_DESCRIPTION + "clear":
             return None, "clear"
-        match = re.fullmatch(re.escape(PUB_DESCRIPTION) + r"([1-9][0-9]*):([0-9a-f]{64})", description or "")
+        match = re.fullmatch(
+            r"(?:"
+            + re.escape(PUB_DESCRIPTION)
+            + "|"
+            + re.escape(PUB_V2)
+            + r"[0-9a-f]{32}:)"
+            + r"([1-9][0-9]*):([0-9a-f]{64})",
+            description or "",
+        )
         if match is None:
             raise Incomplete("native publication receipt is unavailable")
         selected = [row for row in comments if isinstance(row, dict) and row.get("id") == int(match[1])]
@@ -361,7 +461,6 @@ class ForgejoSourceAdapter(ForgejoGitSource):
     def _statuses(self, head, rows=None):
         rows = self.client.statuses(self.repository, head) if rows is None else rows
         newest = {}
-        permissions = {}
         for row in rows:
             if not isinstance(row, dict):
                 raise Incomplete("native statuses are incomplete")
@@ -371,7 +470,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             ):
                 continue
             actor = SourceActor.from_native(self.repository.forge, row.get("creator"))
-            if actor.principal not in self.admission_policy.publishers.statuses:
+            if actor.principal not in self._known_publishers("statuses"):
                 continue
             context, state = row.get("context"), row.get("status") or row.get("state")
             if (
@@ -381,19 +480,32 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             ):
                 raise Incomplete("native status context or outcome is unavailable")
             status_id = self._positive(row.get("id"))
+            if status_id > newest.get(context, (0, "", None))[0]:
+                newest[context] = (status_id, state, actor)
+        permissions = {}
+        result = {}
+        for context, (_id, state, actor) in newest.items():
             if actor.principal not in permissions:
                 try:
-                    permissions[actor.principal] = self._permission(actor) in {"write", "admin", "owner"}
+                    permissions[actor.principal] = (
+                        actor.principal in self.admission_policy.publishers.statuses
+                        and self._permission(actor) in {"write", "admin", "owner"}
+                    )
                 except ForgeError as error:
                     if error.status != 404:
                         raise
                     permissions[actor.principal] = False
-            if permissions[actor.principal] and status_id > newest.get(context, (0, ""))[0]:
-                newest[context] = (status_id, state)
-        return {context: state for context, (_id, state) in newest.items()}
+            result[context] = state if permissions[actor.principal] else "error"
+        return result
 
     def _merge_base(self, repo, pull):
-        self.fetch_refs(repo, [pull.head_sha, pull.base_sha])
+        missing = [
+            sha
+            for sha in (pull.head_sha, pull.base_sha)
+            if self._git("cat-file", "-e", sha + "^{commit}", check=False).returncode
+        ]
+        if missing:
+            self.fetch_refs(repo, missing)
         bases = self._git("merge-base", "--all", pull.base_sha, pull.head_sha).stdout.decode("ascii").splitlines()
         if len(bases) != 1:
             raise Incomplete("native pull comparison has no unique merge base")
@@ -408,9 +520,9 @@ class ForgejoSourceAdapter(ForgejoGitSource):
     def admission_snapshot(self, repo, number, *, generation=0):
         pull = self.fetch_pr(repo, number)
         if pull.state != "open" or pull.draft:
-            return ports.AdmissionSnapshot(pull, "", (), (), {})
+            return ports.AdmissionSnapshot(pull, "", (), (), {}, discovery_version=self._discovery_version(pull))
+        base = self._merge_base(repo, pull)
         with self._lock:
-            base = self._merge_base(repo, pull)
             raw = self._git(
                 "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", base, pull.head_sha, "--"
             ).stdout
@@ -424,7 +536,20 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         if fresh != pull:
             raise Incomplete("native pull changed while reading admission evidence")
         version = base + ":" + digest({"comments": comments, "policy": self.admission_policy.revision})
-        return ports.AdmissionSnapshot(fresh, base, paths, comments, statuses, version)
+        return ports.AdmissionSnapshot(fresh, base, paths, comments, statuses, version, self._discovery_version(fresh))
+
+    def _discovery_version(self, pull):
+        # Webhooks invalidate status/publication changes immediately. A bounded
+        # backstop also rechecks permissions and missed events without refetching
+        # unchanged immutable Git objects on every discovery.
+        return digest(
+            {
+                "source": self.repository_identity.record(),
+                "policy": self.admission_policy.revision,
+                "pull": pull.__dict__,
+                "refresh": int(time.time() // 900),
+            }
+        )
 
     def list_open_pull_requests(self, repo, *, review_app_id=0, admission=False, on_page=None):
         if not admission:
@@ -441,16 +566,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             seen.add(number)
             try:
                 pull = self._pull(row)
-                details = {
-                    "incomplete": "native detail refresh",
-                    "head": pull.head_sha,
-                    "base": pull.base_sha,
-                    "state": pull.state,
-                    "draft": pull.draft,
-                    "labels": list(pull.labels),
-                    "updated_at": pull.updated_at,
-                    "comments_count": pull.comments_count,
-                }
+                details = {"discovery_version": self._discovery_version(pull)}
                 item = ports.OpenPullRequest(pull.number, pull.head_sha, pull.base_ref, pull.draft, (), details)
             except (ForgeError, ValueError, TypeError, KeyError):
                 item = ports.OpenPullRequest(
@@ -531,8 +647,14 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         allowed = getattr(self.admission_policy.publishers, "reviews" if kind == "review" else "recoveries")
         if actor.principal not in allowed:
             raise PermissionError("native actor is not a configured publisher")
+        context = (REVIEW_CONTEXT if kind == "review" else RECOVERY_CONTEXT) + str(number)
+        latest = self._publication_latest(self.client.statuses(self.repository, head), context, allowed)
+        nonce = secrets.token_hex(16)
+        # Each intent owns its comment. Concurrent publishers cannot modify the
+        # body named by another immutable native receipt.
+        unique_marker = marker + ":" + nonce
         full = self.admission_policy.bind_comment(
-            self.admission_policy.append_provenance(body, comment_marker(marker)), actor
+            self.admission_policy.append_provenance(body, comment_marker(unique_marker)), actor
         )
         return {
             "schema": INTENT_SCHEMA,
@@ -542,12 +664,26 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             "head": head,
             "body": full,
             "digest": hashlib.sha256(full.encode()).hexdigest(),
-            "marker": marker,
+            "marker": unique_marker,
             "kind": kind,
+            "nonce": nonce,
+            "predecessor": latest[0] if latest else 0,
         }
 
     def publish(self, intent):
-        required = {"schema", "source", "issuer", "number", "head", "body", "digest", "marker", "kind"}
+        required = {
+            "schema",
+            "source",
+            "issuer",
+            "number",
+            "head",
+            "body",
+            "digest",
+            "marker",
+            "kind",
+            "nonce",
+            "predecessor",
+        }
         if (
             not isinstance(intent, dict)
             or set(intent) != required
@@ -558,6 +694,12 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             or len(intent["body"].encode()) > 16 * 1024 * 1024
             or not isinstance(intent["marker"], str)
             or not intent["marker"]
+            or not isinstance(intent["nonce"], str)
+            or re.fullmatch(r"[0-9a-f]{32}", intent["nonce"]) is None
+            or not intent["marker"].endswith(":" + intent["nonce"])
+            or comment_marker(intent["marker"]) not in intent["body"]
+            or type(intent["predecessor"]) is not int
+            or intent["predecessor"] < 0
             or hashlib.sha256(intent["body"].encode()).hexdigest() != intent["digest"]
         ):
             raise ValueError("invalid frozen native publication")
@@ -577,7 +719,8 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         if pull.head_sha != intent["head"] or pull.state != "open":
             raise PublicationSuperseded("native publication head changed")
         context = (REVIEW_CONTEXT if intent["kind"] == "review" else RECOVERY_CONTEXT) + str(intent["number"])
-        pending = PUB_DESCRIPTION + "pending:" + intent["digest"]
+        prefix = PUB_V2 + intent["nonce"] + ":"
+        pending = prefix + "pending:" + intent["digest"] + ":" + str(intent["predecessor"])
         rows = self.client.statuses(self.repository, intent["head"])
         latest = self._publication_latest(rows, context, allowed)
         prior = [
@@ -589,22 +732,34 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         ]
         if latest is not None:
             _id, stamp, _actor = latest
-            if (stamp.get("status") or stamp.get("state")) == "success" and (stamp.get("description") or "").endswith(
-                ":" + intent["digest"]
+            if (
+                prior
+                and _id in {self._positive(r.get("id")) for r in prior}
+                and (stamp.get("status") or stamp.get("state")) == "success"
             ):
                 comment, state = self._publication_comment(
-                    intent["number"], rows, context, allowed, self.client.comments(self.repository, intent["number"])
+                    intent["number"],
+                    rows,
+                    context,
+                    allowed,
+                    self.client.comments(self.repository, intent["number"]),
+                    own_actor=actor,
                 )
                 if state == "success" and comment is not None:
                     return str(comment["id"])
-            if prior and _id > max(self._positive(r.get("id")) for r in prior) and stamp.get("description") != pending:
+            if prior and _id not in {self._positive(r.get("id")) for r in prior}:
                 raise PublicationSuperseded("newer native publication superseded this intent")
+        if not prior and (latest[0] if latest else 0) != intent["predecessor"]:
+            raise PublicationSuperseded("native publication changed since this intent was prepared")
         if latest is None or latest[1].get("description") != pending:
             self.client.request(
                 "POST",
                 f"repos/{self.repository.name}/statuses/{intent['head']}",
                 {"context": context, "state": "pending", "description": pending},
             )
+        latest = self._publication_latest(self.client.statuses(self.repository, intent["head"]), context, allowed)
+        if latest is None or latest[1].get("description") != pending:
+            raise PublicationSuperseded("another native intent acquired this publication predecessor")
         comment_id = self._upsert_comment(intent["number"], intent["body"], intent["marker"], actor)
         latest = self._publication_latest(self.client.statuses(self.repository, intent["head"]), context, allowed)
         if latest is None or latest[1].get("description") != pending:
@@ -615,7 +770,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             {
                 "context": context,
                 "state": "success",
-                "description": PUB_DESCRIPTION + comment_id + ":" + intent["digest"],
+                "description": prefix + comment_id + ":" + intent["digest"],
             },
         )
         return comment_id

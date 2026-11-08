@@ -95,7 +95,8 @@ def source_version(source: dict, revision: str, no_repair_labels=()) -> str:
             "statuses": {
                 key: (source.get("statuses", {}).get(key) or "").lower()
                 for key in sorted(
-                    set(CONTEXTS) | {k for k in source.get("statuses", {}) if k.startswith("self-tested/")}
+                    set(CONTEXTS)
+                    | {k for k in source.get("statuses", {}) if k.startswith(("self-tested/", "_native_"))}
                 )
             },
         }
@@ -107,7 +108,13 @@ def recovery_heads(comments):
 
 
 def relevant_comment(comment):
-    return policy.SCOREBOARD_MARKER in (comment.get("body") or "") or bool(recovery_heads([comment]))
+    body = comment.get("body") or ""
+    return (
+        policy.SCOREBOARD_MARKER in body
+        or bool(recovery_heads([comment]))
+        or body.startswith("Merge-queue recovery for head `")
+        and "<!--tauceti-source:v1 " in body
+    )
 
 
 class AdmissionPolicy:
@@ -200,6 +207,9 @@ class AdmissionPoller:
         self.policy = policy_config
         self.clock = clock
         self.state = AdmissionState(controller.store, repo, clock=clock)
+        bind_history = getattr(adapter, "bind_publisher_history", None)
+        if bind_history is not None:
+            bind_history(controller.store)
         client = getattr(adapter, "client", None)
         restore = getattr(client, "restore_deadlines", None)
         if restore is not None:
@@ -300,6 +310,7 @@ class AdmissionPoller:
                 kind == "status"
                 and detail.get("context") not in CONTEXTS
                 and not str(detail.get("context", "")).startswith("self-tested/")
+                and not str(detail.get("context", "")).startswith(("tauceti-review/", "tauceti-recovery/"))
             ):
                 return
             if kind == "check_run" and detail.get("name") == "merge eligibility":
@@ -344,7 +355,7 @@ class AdmissionPoller:
             version = (
                 ("incomplete:" + digest(pull.admission))
                 if "incomplete" in pull.admission
-                else self._version(pull.admission)
+                else pull.admission.get("discovery_version") or self._version(pull.admission)
             )
             self.state.observe(pull.number, pull.head_sha, version)
 
@@ -634,7 +645,7 @@ class AdmissionPoller:
                 "admission_work",
                 {"id": work["id"]},
                 head_sha=pull.head_sha,
-                observed_version=version,
+                observed_version=snapshot.discovery_version or version,
                 decision=dumps({**result, "evidence": evidence}),
             )
             self.state.complete(work, version, authorization, disposition)
@@ -660,6 +671,8 @@ class AdmissionPoller:
         scoreboard into authority. Reads of effective admin permission happen
         outside the controller lock and failures leave this evaluation pending.
         """
+        if not getattr(self.policy, "human_owned_approvals", True):
+            return False
         if scoreboard or not current or current["state"] not in ("waiting", "reserved", "inserted"):
             return False
         pull = snapshot.pull

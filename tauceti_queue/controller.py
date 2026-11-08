@@ -394,8 +394,10 @@ class Controller:
         self.github = self.source  # compatibility for source-authentication/service callers
         self.clone = clone
         self.repository = repository
+        source_identity = getattr(self.source, "repository_identity", None)
+        self.native_source = bool(source_identity and source_identity.repository.forge.kind == "forgejo")
         self.provenance_repository = (
-            candidate_ci.ledger.policy.source.repository.key if candidate_ci is not None else repository
+            source_identity.repository.key if self.native_source else repository
         )
         self.revision = revision
         self.clock = clock
@@ -2304,7 +2306,7 @@ class Controller:
             member["accepted_head"],
             title=input_row.get("title", ""),
             description=input_row.get("description", ""),
-            author="" if self.candidate_ci is not None else input_row.get("author", ""),
+            author="" if self.native_source else input_row.get("author", ""),
             coauthors=None if coauthors is None else tuple(coauthors),
         )
 
@@ -2596,7 +2598,7 @@ class Controller:
                         continue  # an empty placeholder lands no contribution
                     if source and source.startswith(f"{self.provenance_repository}#"):
                         landed_prs.add(int(source.rsplit("#", 1)[1]))
-                    elif not source and self.candidate_ci is None:
+                    elif not source and not self.native_source:
                         # Bors's squash commits carry no Source-PR trailer; the subject names the PR.
                         lines = (commit.message or "").splitlines()
                         match = _BORS_SUBJECT_RE.search(lines[0]) if lines else None
@@ -5850,7 +5852,7 @@ class Controller:
         # Git uses POSIX ERE, whose literal escaping differs from Python re.escape.
         repository = "".join("\\" + char if char in ".[](){}*+?^$|\\" else char for char in self.provenance_repository)
         pattern = rf"(\(#{number}\)$|^{chain.SOURCE_PR_TRAILER}: {repository}#{number}$)"
-        if self.candidate_ci is not None:
+        if self.native_source:
             pattern = rf"^{chain.SOURCE_PR_TRAILER}: {repository}#{number}$"
         result = chain._git(
             self.clone, "log", "-n", "5", "--format=%H", "-E", f"--grep={pattern}", self._canonical, "--"

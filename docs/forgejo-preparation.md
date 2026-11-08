@@ -629,10 +629,14 @@ Native scoreboard and recovery comments carry a versioned
 `tauceti-source:v1` binding naming the source origin/repository ID, authenticated
 issuer and producer's policy revision. Comment authorship alone grants no
 authority: Forgejo repository writers may moderate another user's comments.
-The publisher first records a pending intent through the native commit-status API,
-then publishes the frozen body, then records its comment ID and SHA-256 digest in
-an append-only status. Admission selects the latest receipt from a configured
-publisher and verifies its current permission, exact body and source binding.
+The publisher freezes a versioned intent with a unique ID and the observed
+predecessor registration. It registers that intent through the native commit-status
+API, publishes a comment owned by that intent, then records its comment ID and
+SHA-256 digest in an append-only status. Registrations acquire their expected
+predecessor in native status-ID order; competing registrations for an already
+acquired predecessor are superseded. Admission orders publications by those
+registrations, so a late completion cannot revive an older verdict. It verifies
+the issuer's current permission, exact body and source binding.
 Edits, deletions, missing receipts and interrupted publications never expose an
 older green review as fresh authority. Ordinary contributors' same-name statuses
 cannot impersonate the configured issuer.
@@ -644,6 +648,14 @@ revocation does not cause fallback to another publisher's older green verdict.
 The caller must freeze the versioned publication intent in its existing outbox
 before sending. Retries reconcile native statuses and comments; an older intent
 superseded by a newer publication stops rather than overwriting that publication.
+Each publication uses its own comment rather than editing another intent's
+scoreboard. In-progress review publications and initial scoreboards defer
+admission and promotion; they do not create permanent promotion holds.
+The queue remembers historical publisher IDs in its existing settings when
+admission starts. Removed issuers remain revocation barriers across restarts,
+including for CI statuses; removing an issuer cannot reveal an older green
+result. Preserve those settings when restoring the queue. Publisher bootstrap
+and credential rotation must use the same issuer history as the consumer.
 Forgejo Actions remain disabled on the source repository.
 
 Promotion rereads the accepted PR heads and current review evidence. The trusted
@@ -654,10 +666,16 @@ configuration cannot bypass that restriction. A repaired candidate does not need
 to make the original PR head's failed build green. Source read failures remain unavailable; they do not become
 empty discussions or positive approval. GitHub App checks and GitHub quota are
 unsupported source capabilities here; Forgejo requires primary-policy admission.
+Native human-owned infrastructure approvals remain disabled in admission until
+their command intake and matching promotion checks are integrated.
 
 Discovery reads listing metadata and leaves detailed evidence to each PR's
-admission work item. An unreadable or changing PR cannot abort discovery for its
-siblings. This is a functional baseline, not a capacity result; query volume,
+admission work item. Stable discovery metadata does not continuously re-dirty an
+evaluated PR. Native publication and CI status events invalidate their PRs;
+a fifteen-minute backstop also refreshes permissions and missed events.
+Immutable commits already present in the controller clone are reused.
+An unreadable or changing PR cannot abort discovery for its siblings.
+This is a functional baseline, not a capacity result; query volume,
 backstop refreshes and history retrieval still need measurement and bounded
 caching before the concurrency rehearsal is complete.
 

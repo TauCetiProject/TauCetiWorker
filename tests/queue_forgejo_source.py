@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from tauceti_queue import chain, ports, repair_task
 from tauceti_queue.forgejo_source import (
     BINDING,
     PUB_DESCRIPTION,
+    PUB_V2,
     RECOVERY_CONTEXT,
     REVIEW_CONTEXT,
     ForgejoSourceAdapter,
@@ -29,6 +31,7 @@ from tauceti_queue.forgejo_source import (
     NativePublishers,
     PublicationSuperseded,
 )
+from tauceti_queue.store import Store
 from tauceti_queue.task_identity import NATIVE_GIT_REFS
 from tauceti_worker.source_identity import SourceActor
 
@@ -262,6 +265,160 @@ class NativeSource(unittest.TestCase):
             self.source.publish(first)
         self.assertEqual(len(self.status_rows), 4)
 
+    def test_intent_that_never_started_cannot_overwrite_a_newer_verdict(self):
+        old = self.source.prepare_publication("team/Math", 1, "a" * 40, self.body, "same")
+        new = self.source.prepare_publication("team/Math", 1, "a" * 40, self.body + "\nNew", "same")
+        newest = self.source.publish(new)
+        with self.assertRaises(PublicationSuperseded):
+            self.source.publish(old)
+        self.assertEqual(str(self.read()[0][0]["id"]), newest)
+
+    def test_new_intents_with_identical_bodies_can_follow_a_recovery_clear(self):
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        first = self.source.prepare_publication("team/Math", 1, "a" * 40, "Hold", "same", kind="recovery")
+        self.source.publish(first)
+        self.source.clear_recovery("team/Math", 1, "a" * 40)
+        again = self.source.prepare_publication("team/Math", 1, "a" * 40, "Hold", "same", kind="recovery")
+        self.assertNotEqual(first["nonce"], again["nonce"])
+        self.source.publish(again)
+        self.assertEqual(self.read()[2], "success")
+
+    def test_concurrent_publisher_cannot_edit_the_newer_intents_comment(self):
+        first = self.source.prepare_publication("team/Math", 1, "a" * 40, self.body, "shared")
+        original = self.source._upsert_comment
+        nested = []
+
+        def interleave(number, full, marker, actor):
+            second = self.source.prepare_publication("team/Math", 1, "a" * 40, self.body + "\nNewest", "shared")
+            with patch.object(self.source, "_upsert_comment", side_effect=original):
+                nested.append(self.source.publish(second))
+            return original(number, full, marker, actor)
+
+        with patch.object(self.source, "_upsert_comment", side_effect=interleave):
+            with self.assertRaises(PublicationSuperseded):
+                self.source.publish(first)
+        self.assertEqual(str(self.read()[0][0]["id"]), nested[0])
+        self.assertIn("Newest", self.read()[0][0]["body"])
+        self.api.edit_comment.assert_not_called()
+
+    def test_late_success_after_newer_pending_cannot_revive_an_older_review(self):
+        first = self.source.prepare_publication("team/Math", 1, "a" * 40, self.body, "shared")
+        original = self.api.request.side_effect
+        nested = []
+
+        def interleave(method, path, data=None, **kwargs):
+            if (
+                method == "POST"
+                and data
+                and data.get("description", "").startswith(PUB_V2 + first["nonce"] + ":")
+                and data["state"] == "success"
+            ):
+                second = self.source.prepare_publication("team/Math", 1, "a" * 40, self.body + "\nNewest", "shared")
+                with patch.object(self.api.request, "side_effect", original):
+                    nested.append(self.source.publish(second))
+            return original(method, path, data, **kwargs)
+
+        self.api.request.side_effect = interleave
+        self.source.publish(first)
+        self.assertEqual(str(self.read()[0][0]["id"]), nested[0])
+
+    def test_competing_pending_registration_cannot_acquire_a_stale_predecessor(self):
+        first = self.source.prepare_publication("team/Math", 1, "a" * 40, self.body, "shared")
+        second = self.source.prepare_publication("team/Math", 1, "a" * 40, self.body + "\nNewest", "shared")
+        original = self.api.request.side_effect
+        nested = []
+
+        def interleave(method, path, data=None, **kwargs):
+            if method == "POST" and data and data.get("description", "").startswith(PUB_V2 + first["nonce"] + ":"):
+                with patch.object(self.api.request, "side_effect", original):
+                    nested.append(self.source.publish(second))
+            return original(method, path, data, **kwargs)
+
+        self.api.request.side_effect = interleave
+        with self.assertRaises(PublicationSuperseded):
+            self.source.publish(first)
+        self.assertEqual(str(self.read()[0][0]["id"]), nested[0])
+
+    def test_publisher_reconciliation_does_not_require_other_user_admin_lookup(self):
+        intent = self.source.prepare_publication("team/Math", 1, "a" * 40, self.body, "review")
+        expected = self.source.publish(intent)
+        with patch.object(self.source, "_permission", side_effect=ForgeError("forbidden", status=403)):
+            self.assertEqual(self.source.publish(intent), expected)
+
+    def test_removed_publisher_remains_a_barrier_across_queue_restarts(self):
+        green = self.comment(actor=self.queue)
+        red = self.comment(comment_id=2, body=self.body.replace("green", "blocking_request"))
+        self.rows = [green, red]
+        self.status_rows = [self.stamp(green, actor=self.queue), self.stamp(red, status_id=2)]
+        with closing(Store(str(self.clone / "history.sqlite"))) as store:
+            self.source.bind_publisher_history(store)
+        with closing(Store(str(self.clone / "history.sqlite"))) as store:
+            changed = replace(self.publishers, reviews=frozenset({self.queue.principal}))
+            self.source = ForgejoSourceAdapter(
+                self.identity,
+                self.api,
+                self.clone,
+                token="token",
+                admission_policy=NativeAdmissionPolicy(changed, rubrics=("proof",), prefix="Math/", allow_files=()),
+            )
+            self.source.bind_publisher_history(store)
+            self.assertEqual(self.read(), ((), "revoked", "absent"))
+
+    def test_native_publication_status_event_invalidates_an_unchanged_pr(self):
+        from tauceti_queue.admission import AdmissionPoller
+        from tauceti_queue.fakes import make_controller
+
+        with tempfile.TemporaryDirectory() as root:
+            controller, _github, _repo, clock = make_controller(root, repository=self.repository.name)
+            self.addCleanup(controller.store.close)
+            poller = AdmissionPoller(controller, self.source, self.repository.name, self.policy, clock=clock)
+            poller.state.observe(1, "a" * 40, "stable")
+            before = poller.state.get(1)
+            poller.state.complete(before, "stable", "", "waiting")
+            poller.handle_event("status", {"context": REVIEW_CONTEXT + "1", "sha": "a" * 40})
+            after = poller.state.get(1)
+            self.assertGreater(after["generation"], before["generation"])
+            self.assertNotEqual(after["generation"], after["evaluated_generation"])
+
+    def test_latest_ci_status_is_selected_before_current_permission_checks(self):
+        self.source.admission_policy.publishers = replace(
+            self.publishers, statuses=frozenset({self.actor.principal, self.queue.principal})
+        )
+        self.source._known_publishers("statuses")
+        self.status_rows = [
+            {"id": 1, "context": "build", "status": "success", "creator": {"id": 7, "login": "reviewer"}},
+            {"id": 2, "context": "build", "status": "failure", "creator": {"id": 8, "login": "queue"}},
+        ]
+        with patch.object(self.source, "_permission", side_effect=lambda a: "read" if a == self.queue else "write"):
+            self.assertEqual(self.source._statuses("a" * 40), {"build": "error"})
+        self.source.admission_policy.publishers = replace(self.publishers, statuses=frozenset({self.actor.principal}))
+        self.assertEqual(self.source._statuses("a" * 40), {"build": "error"})
+
+    def test_pending_review_and_init_are_retryable_during_promotion(self):
+        pull = ports.PullRequest(1, "a" * 40, "main", "Proof", "", "contributor", "open")
+        frozen = SimpleNamespace(
+            policy=SimpleNamespace(source=self.identity, base_branch="main"),
+            request=SimpleNamespace(
+                source=self.identity,
+                base="b" * 40,
+                head="c" * 40,
+                accepted_members=(SimpleNamespace(pr=1, head="a" * 40),),
+            ),
+        )
+        for comments, state in [
+            ((), "pending"),
+            ((self.comment(body=self.body.replace('"states":', '"mode":"init","states":')),), "success"),
+        ]:
+            snapshot = ports.AdmissionSnapshot(pull, "b" * 40, ("Math/A.lean",), comments, {"_native_review": state})
+            with (
+                patch.object(self.source, "admission_snapshot", return_value=snapshot),
+                patch.object(
+                    self.source, "_git", return_value=subprocess.CompletedProcess([], 0, b"Math/A.lean\0", b"")
+                ),
+            ):
+                with self.assertRaises(Incomplete):
+                    self.source.verify_candidate_approval(frozen)
+
     def test_policy_changes_reapply_consumer_rules_without_discarding_published_facts_or_holds(self):
         row = self.comment()
         hold = self.comment(
@@ -337,7 +494,11 @@ class NativeSource(unittest.TestCase):
         with patch.object(self.source, "admission_snapshot", side_effect=AssertionError("deep discovery")):
             found = self.source.list_open_pull_requests("team/Math", admission=True)
         self.assertEqual([p.number for p in found], [1, 2, 3])
-        self.assertTrue(all("incomplete" in p.admission for p in found))
+        self.assertIn("incomplete", found[1].admission)
+        self.assertEqual(
+            found[0].admission["discovery_version"], self.source._discovery_version(self.source._pull(row))
+        )
+        self.assertEqual(self.source.list_open_pull_requests("team/Math", admission=True), found)
 
     def test_native_source_never_fabricates_github_app_or_quota(self):
         with self.assertRaises(Unsupported):
