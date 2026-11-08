@@ -361,10 +361,24 @@ export: the existing GitHub allowlist and URL policy still refuse source-bound l
 Native metadata does not enable the existing runner:
 native execution, legacy admin-cache use, Git fetch/push, agent work and resume or
 release retries through an unqualified client remain refused until the native
-transport, source validation and runner adapters are implemented. Whole-request
-transport deadlines and native checkpoint directory/cache namespaces also need
-integration before enabling execution; the prototype client currently uses socket
-timeouts and a response byte bound.
+Git transport, source validation and runner adapters are implemented.
+Native requests run once in a disposable HTTP helper process. Their total deadline
+includes DNS resolution, TLS, request writes, response headers and success/error
+bodies. On timeout the child is killed and reaped; delivery remains uncertain and
+the transport does not resend the POST. Uncertain native delivery, malformed
+native claim responses and native 5xx outcomes stop the generic service retry
+wrapper. Responses from helpers that already exited cleanly are preserved if the
+parent was descheduled at the deadline. A helper still running is killed and its
+delivery remains uncertain. Bearers travel on stdin, never process arguments. The helper source
+is captured at module import, skips site initialization and has its own lifetime
+bound if the parent dies. Redirect, HTTPS and response-size limits apply inside it.
+OS process creation and reaping cannot themselves be interrupted by a Python
+timeout. Interpreter startup and memory costs still need representative load tests.
+Native claim reconciliation/idempotency and the outer runner's restart/poll behavior
+must be integrated before execution: a no-retry exception alone cannot recover an
+assignment whose response was lost.
+Native checkpoint directory/cache namespaces still need integration before
+enabling execution.
 Credential audience/delegation policy and ingress rate/concurrency limits also
 require integration before activation: a native user ACL observation alone does
 not identify a bearer as a dedicated queue-control credential.

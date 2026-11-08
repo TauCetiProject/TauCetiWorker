@@ -216,6 +216,15 @@ class PRInfo:
     # make; "" when unknown, which reads as "cannot tell" and falls back to the plain TTL.
     updated_at: str = ""
     bump_integration_failed: bool = False
+    self_tested: bool = False
+
+    @property
+    def review_ready(self) -> bool:
+        return self.build_success or self.self_tested
+
+    @property
+    def needs_ci_repair(self) -> bool:
+        return self.build_failed and not self.self_tested
 
     @property
     def automatic_bump(self) -> bool:
@@ -238,6 +247,14 @@ class PRInfo:
         # check-run collided with this status context; TauCeti#1156 renamed it to `sandboxed-build`, so
         # no check-run named `build` exists at all now.) A PR with no `build` status yet is pending —
         # neither success nor failed — and simply waits for the trusted build to post.
+        from tauceti_tools.self_tested import accepted, context
+
+        local = d.get("baseRefName", "main") == "main" and accepted(
+            d.get("labels"),
+            next((c.get("state") for c in rollup if c.get("context") == context(d["number"])), ""),
+            member=True,
+            branch=d.get("headRefName", ""),
+        )
         build_states = [c.get("state") for c in rollup if c.get("context") == "build"]
         # `gh` normalizes a StatusContext's createdAt to `startedAt`, so this is when the build status
         # was posted. With several `build` contexts the LATEST is when the head became fully green.
@@ -261,6 +278,7 @@ class PRInfo:
             labels=tuple((lb.get("name") or "") for lb in (d.get("labels") or [])),
             build_status_at=max([t for t in posted if t is not None], default=None),
             updated_at=str(d.get("updatedAt") or ""),
+            self_tested=local,
             bump_integration_failed=any(
                 c.get("context") == "bump-integration" and c.get("state") in BUILD_FAIL for c in rollup
             ),
@@ -873,7 +891,7 @@ def survey(
         return ready
 
     sv.n_open_nondraft = len(nondraft)
-    sv.n_reviewable = sum(1 for p in nondraft if p.build_success)
+    sv.n_reviewable = sum(1 for p in nondraft if p.review_ready)
     sv._mine_open_prs = mine
     sv.rescope_roadmap()
     # Bucket open non-draft PRs by the STATUS_LABELS pipeline (fixed order), pairing each label's
@@ -971,11 +989,13 @@ def survey(
     for p in nondraft if "review" in enabled else []:
         if {label.lower() for label in p.labels} & {"hold", "wip", "human", "on-hold"}:
             continue
-        if not p.build_success:
+        if not p.review_ready:
             continue
         if not deep:
             sv.reviewable.actionable.append(
-                Candidate(p.number, p.head_oid, "build-green, head not cleanly reviewed", ready_at=p.build_status_at)
+                Candidate(
+                    p.number, p.head_oid, "ready for review, head not cleanly reviewed", ready_at=p.build_status_at
+                )
             )
             continue
         if not history_ready(p):
@@ -986,7 +1006,7 @@ def survey(
                 c = Candidate(
                     p.number,
                     p.head_oid,
-                    "build-green; review history incomplete, investigate in review engine",
+                    "ready for review; review history incomplete, investigate in review engine",
                     attempts=counters.read(f"review-err-{p.number}"),
                     budget=MAX_REVIEW_ERRORS,
                     ready_at=p.build_status_at,
@@ -1000,7 +1020,7 @@ def survey(
             c = Candidate(
                 p.number,
                 p.head_oid,
-                "build-green, head not cleanly reviewed",
+                "ready for review, head not cleanly reviewed",
                 attempts=counters.read(f"review-err-{p.number}"),
                 budget=MAX_REVIEW_ERRORS,
                 ready_at=p.build_status_at,
@@ -1067,7 +1087,7 @@ def survey(
             if not history_ready(p):
                 # Preserve the existing fallback for build-green PRs with
                 # incomplete history; a label alone is not a current finding.
-                if p.build_success and "awaiting-author" in p.labels:
+                if p.review_ready and "awaiting-author" in p.labels:
                     c = Candidate(
                         p.number,
                         p.head_oid,
@@ -1095,7 +1115,7 @@ def survey(
             disp, why = fix_disposition(
                 meta,
                 p.head_oid,
-                p.build_success,
+                p.review_ready,
                 blocking,
                 per_head,
                 pending_contest=pending_contest,
@@ -1131,7 +1151,7 @@ def survey(
     #    the lint-repair stage's, so fix-ci defers those; it picks up only other red PRs (ours, or
     #    any other bot-authored one).
     for p in tended if "fix-ci" in enabled else []:
-        if not p.build_failed or p.head_ref.startswith((BUMP_HEAD_PREFIX, LINT_REPAIR_HEAD_PREFIX)):
+        if not p.needs_ci_repair or p.head_ref.startswith((BUMP_HEAD_PREFIX, LINT_REPAIR_HEAD_PREFIX)):
             continue
         c = Candidate(p.number, p.head_oid, "build failed at head")
         per_head = counters.read(f"ci-{p.number}-{p.head_oid[:12]}")
@@ -1150,7 +1170,7 @@ def survey(
     for p in tended if "bump" in enabled else []:
         integration = p.build_success and p.bump_integration_failed
         branch = p.head_ref.startswith(BUMP_HEAD_PREFIX) or (integration and p.head_ref == "hopscotch/lkg-bump")
-        if not (branch and (p.build_failed or integration)):
+        if not (branch and (p.needs_ci_repair or integration)):
             continue
         if {label.lower() for label in p.labels} & {
             "keep",
