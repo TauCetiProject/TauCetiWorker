@@ -548,3 +548,47 @@ must use representative PR histories and fleet concurrency before service retire
 
 Installed production environments, development forge, admission settings, mirror
 configuration and shared-state lifecycle are unchanged by this preparation.
+
+### Native queue Git transport
+
+`ForgejoGitSource` supplies the Git part of the queue's source adapter. It uses
+ordinary Forgejo repositories and HTTP Git, with an explicit source bearer scoped
+to the configured clone URL. It disables redirects, interactive credentials,
+client hooks and inherited Git credential/trace overrides. The controller clone
+is trusted service state; candidate checkouts and their configuration must not be
+used as the controller clone.
+
+Candidate and member refs are created atomically with explicit absent-ref leases.
+Existing identical refs reconcile without another push; a different existing tip
+is refused. Retention is restricted to `refs/tauceti-queue/` and
+`refs/heads/tauceti-ci/`. A frozen request's source identity, candidate tree,
+base ancestry and commit objects are checked before retention. Ref observations
+are batched, so retaining multiple members does not require a separate network
+round trip for each ref. Configure a `tauceti-ci/**` branch-protection rule that
+permits the dedicated controller to create refs and refuses contributor writes;
+GitHub builds receive a source read credential. The real-server fixture exercises
+this rule, including a contributor's attempted replacement of a retained ref.
+
+Promotion checks local commit ancestry and pushes with an explicit expected-old
+lease. A competing update is refused even when the candidate already contains the
+competing commit. Forgejo's receive hooks still enforce branch protection. A
+transport timeout leaves publication uncertain and requires observation before
+retry. Source API identity checks bracket remote operations; they do not make a
+repository rename/deletion concurrent with Git publication atomic. Such operator
+operations must not overlap publication.
+
+Run the real stock-server HTTPS test with:
+
+```sh
+FORGEJO_BINARY=/path/to/forgejo python tests/integration_forgejo_git.py
+```
+
+It uses disposable repositories, users, credentials and a local TLS certificate;
+`openssl` and Git must be on PATH. It exercises fetch, frozen request retention,
+idempotent reconciliation, competing promotion, a rejected non-fast-forward,
+server branch protection, and a lost accepted publication response. The portable
+validation tests run in `tests/queue_forgejo_git.py`.
+
+This transport does not itself establish review approval, CI success or webhook
+admission. The complete source adapter, trusted review publisher integration and
+queue bootstrap must connect those checks before native operation is enabled.
