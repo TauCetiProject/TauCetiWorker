@@ -5,6 +5,31 @@ Running record for the work plan in
 what is blocked on which operator item, and the latest experiment numbers. Updated by the
 orchestrating session as streams land.
 
+## Import-header failures reach repair (2026-11-08)
+
+Head 388's import-header preflight repeatedly failed because PR #30063 imported a missing project
+module. The controller ignored the checker's located messages and saw only the failed finalizer's
+infrastructure finding, exhausting retries while repair workers stayed idle.
+[Worker PR 624](https://github.com/TauCetiProject/TauCetiWorker/pull/624) recognizes these messages
+as source diagnostics on the importing module. All nine CI jobs passed and the PR was admin-merged.
+The focused backport `21455f800c43` was deployed on chungus2 at 08:00:25 UTC, retaining the earlier
+production base without the newer mainline CI-engine changes.
+
+The supported retry operation superseded four exhausted verdicts.
+[Recovery CI](https://github.com/TauCetiProject/TauCeti/actions/runs/42461076366) reproduced the
+missing import and correctly created repair task 56. The first worker attempt exposed a separate
+read-only dependency artifact-cache failure during verification. Both workers now use normal
+private dependency preparation (`TAUCETI_QUEUE_SEED_PACKAGES` empty). An independent stock-Lake
+sandbox probe passed against a private reflink copy, and worker 1 reclaimed task 56 and produced
+successful source compilations in its streaming build. Repair is active; this is not yet evidence
+of a green replacement batch or a new landing.
+
+SQLite checks passed, all 4,699 membership records present at the recovery snapshot and runtime
+settings were preserved, admissions continued, and all 56 webhook deliveries around the restart
+succeeded. Evidence, backups and original environments are retained privately under
+`~/TauCetiQueue-data/import-preflight-recovery-20261108/`. See
+[repair execution](operations.md#repair-execution-on-chungus2) for the current dependency setup.
+
 ## Controller moved to chungus2 (2026-11-08)
 
 The controller, SQLite store, tunnel, monitoring publisher, history timer and backup timer moved

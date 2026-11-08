@@ -215,7 +215,8 @@ Paths on chungus2, where they differ from the default layout:
 | `~/TauCetiQueue-data/clone` | controller content clone, including retained private source refs |
 | `~/TauCetiQueue-data/queue.sqlite3` (+ `-wal`, `-shm`) | authoritative queue database |
 | `~/TauCetiQueue-data/logs` | service-owned files; process logs use `journalctl --user -u tauceti-queue` |
-| `~/TauCetiQueue-data/repair-clone`, `repair`, `repair-2`, `mathlib-packages` | separate repair Git clone, worker task/cache roots and shared dependency seed |
+| `~/TauCetiQueue-data/repair-clone`, `repair`, `repair-2` | separate repair Git clone and worker task/cache roots; active tasks use private writable dependencies |
+| `~/TauCetiQueue-data/mathlib-packages` | retained original dependency seed; no longer configured for live repairs |
 | `~/TauCetiQueue-data/monitoring/` | publisher identity/epoch/delta state, private token, prepared observations and pinned exporter release |
 | `~/TauCetiQueue-data/reports/` | retained pilot inputs and Bors baseline used by the history timer |
 | `~/.local/state/tauceti-queue/backups/` | daily and pre-deployment SQLite backups; an immediate destination backup was verified |
@@ -418,11 +419,22 @@ Live state on chungus2 is under `~/TauCetiQueue-data/repair{,-2}`, with the comm
 directories were initially seeded with hardlinks from one fresh public-main fetch. Dependency
 sources and built outputs at `mathlib-packages` were hardlinked from a compatible local checkout;
 every package revision was checked against the current manifest, including Mathlib
-`1b1ccf4b088b32fa3f23f2de1127433254a81e1e`. Both environments set
-`TAUCETI_QUEUE_SEED_PACKAGES` to that dedicated directory. Revalidate or replace the seed when the
-manifest/toolchain changes. Builds still use stock Lean `v4.36.0-rc2`, the offline sandbox and the
-existing pressure gate. At activation approximately 46 GiB remained free; check disk before large
-repairs and retain the existing cache-pruning discipline.
+`1b1ccf4b088b32fa3f23f2de1127433254a81e1e`. That initial read-only seed configuration was retired on
+November 8: stock Lake attempts to update artifact permissions/hash metadata even while replaying
+existing dependency outputs, which fails inside the sandbox
+(`failed to cache artifact: read-only file system`). Both environments now leave
+`TAUCETI_QUEUE_SEED_PACKAGES` empty and use the normal private dependency preparation path.
+Do not restore the shared read-only symlink without validating a real `lake build`, including
+artifact-cache replay. A direct Lean compilation alone does not test this path.
+
+The failed task-56 worktree on worker 2 received an independent XFS reflink copy of its dependencies;
+a stock-Lake sandbox build of `Batteries.CodeAction.Deprecated` passed afterward. The task was
+reclaimed by worker 1 with normal private dependency preparation, and its streaming build produced
+successful TauCeti compilations without the read-only artifact error. The dependency seed and
+original environment files remain retained for diagnosis. Builds keep stock Lean `v4.36.0-rc2`,
+the offline sandbox, Lake artifact caching and the existing pressure gate. Check disk before large
+repairs and retain the existing cache-pruning discipline; private dependencies consume additional
+space.
 
 The temporary SSH observation mirror used between the November 7 repair move and the November 8
 controller move is now retired. The local monitoring publisher reads `repair` and `repair-2`
