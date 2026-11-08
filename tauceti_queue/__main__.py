@@ -84,7 +84,7 @@ def _optional(module: str) -> ModuleType | None:
 class Service:
     """The wired process: configuration, runtime facts, and whichever components are installed."""
 
-    def __init__(self, config: Config, runtime: rt.ServiceRuntime) -> None:
+    def __init__(self, config: Config, runtime: rt.ServiceRuntime, *, native=None) -> None:
         self.config = config
         self.runtime = runtime
         self.stop = rt.StopSignal()
@@ -96,6 +96,13 @@ class Service:
         self.poller: Any = None
         self.loop_module: ModuleType | None = None
         self.unavailable_reason: str | None = None
+        self.native = native
+        self.native_http = None
+        if native is not None:
+            from .native_bootstrap import NativeBootstrap
+
+            if not isinstance(native, NativeBootstrap):
+                raise ValueError("native service requires an explicit trusted bootstrap")
 
     # Stream E and F integration points. Each is a small function so reconciling an interface
     # change is one edit here.
@@ -110,6 +117,8 @@ class Service:
         self.store = opener(self.config.database)
 
     def open_github(self) -> None:
+        if self.native is not None:
+            return  # execution credentials were explicitly supplied by the trusted bootstrap
         app_module, adapter_module = _optional("github_app"), _optional("github_adapter")
         if app_module is None or adapter_module is None:
             self.unavailable_reason = (
@@ -125,6 +134,18 @@ class Service:
         self.github = adapter_module.GitHubAdapter(app, self.config.repository, clone_dir=self.config.content_clone)
 
     def build_controller(self) -> None:
+        if self.native is not None:
+            if self.store is None:
+                raise ValueError("native service requires its existing durable queue store")
+            wired = self.native.build(self.config, self.store, revision=self.runtime.revision.sha)
+            self.github, self.controller, self.poller, self.native_http = (
+                wired.source,
+                wired.controller,
+                wired.poller,
+                wired.http,
+            )
+            self.loop_module = _optional("loop")
+            return
         module = _optional("controller")
         if module is None or self.store is None or self.github is None:
             self.unavailable_reason = self.unavailable_reason or "tauceti_queue.controller is not installed"
@@ -198,7 +219,7 @@ class Service:
         if module is not None and self.controller is not None:
             self.server = module.create_server(
                 self.controller,
-                self.config,
+                self.native_http if self.native_http is not None else self.config,
                 status=self.status_document,
                 adapter=self.github,
                 app=self.app,
