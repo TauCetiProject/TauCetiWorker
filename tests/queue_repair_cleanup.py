@@ -2,6 +2,7 @@
 """Real worktrees are collected only after terminal queue evidence and exclusive ownership."""
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -228,6 +229,45 @@ class Cleanup(unittest.TestCase):
         with patch.object(repair_publish, "_run_spec", side_effect=publish):
             self.assertEqual(repair_publish.run_spec(spec), 0)
         self.assertEqual(self.collect()[0]["state"], "removed")
+
+    def test_installer_writes_private_configuration_and_installs_both_units(self):
+        home = self.root / "home"
+        bindir = self.root / "bin"
+        bindir.mkdir()
+        systemctl = bindir / "systemctl"
+        systemctl.write_text("#!/bin/sh\nexit 0\n")
+        systemctl.chmod(0o700)
+        env = dict(os.environ, HOME=str(home), PATH=str(bindir) + os.pathsep + os.environ["PATH"])
+        result = subprocess.run(
+            [
+                "bash",
+                str(REPO / "services/queue/install-repair-cleanup.sh"),
+                "--database",
+                str(self.database),
+                "--clone",
+                str(self.clone),
+                "--root",
+                str(self.worker),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = home / ".config/tauceti-queue/repair-cleanup.json"
+        self.assertEqual(
+            json.loads(config.read_text()),
+            {
+                "database": str(self.database.resolve()),
+                "clone": str(self.clone.resolve()),
+                "roots": [str(self.worker.resolve())],
+            },
+        )
+        self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+        for name in ("tauceti-queue-repair-cleanup.service", "tauceti-queue-repair-cleanup.timer"):
+            self.assertEqual(
+                (home / ".config/systemd/user" / name).read_bytes(), (REPO / "services/queue" / name).read_bytes()
+            )
 
     def test_failed_removal_is_reported_and_retried(self):
         self.tree(batch="landed")
