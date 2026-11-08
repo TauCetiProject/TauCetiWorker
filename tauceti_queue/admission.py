@@ -17,6 +17,8 @@ from contextlib import nullcontext
 from datetime import datetime
 
 from runner import admission_policy as policy
+from tauceti_tools.self_tested import accepted
+from tauceti_tools.self_tested import context as local_context
 
 from .admission_state import AdmissionState
 from .eligibility import KEEP
@@ -76,7 +78,11 @@ def source_version(source: dict, revision: str, no_repair_labels=()) -> str:
             "diff": source.get("diff_version") or source.get("merge_base"),
             "labels": sorted(
                 {s.lower() for s in source.get("labels", ())}
-                & (KEEP | {s.lower() for s in no_repair_labels} | {"needs-rebase"})
+                & (
+                    KEEP
+                    | {s.lower() for s in no_repair_labels}
+                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair"}
+                )
             ),
             "comments": [
                 {
@@ -86,7 +92,12 @@ def source_version(source: dict, revision: str, no_repair_labels=()) -> str:
                 for c in source.get("comments", ())
                 if relevant_comment(c)
             ],
-            "statuses": {key: (source.get("statuses", {}).get(key) or "").lower() for key in CONTEXTS},
+            "statuses": {
+                key: (source.get("statuses", {}).get(key) or "").lower()
+                for key in sorted(
+                    set(CONTEXTS) | {k for k in source.get("statuses", {}) if k.startswith("self-tested/")}
+                )
+            },
         }
     )
 
@@ -139,6 +150,9 @@ class AdmissionPolicy:
             table_rubrics=self.rubrics,
             scope=snapshot.statuses.get("scope", ""),
             merge_base_sha=snapshot.merge_base_sha,
+            self_tested=accepted(
+                snapshot.pull.labels, snapshot.statuses.get(local_context(snapshot.pull.number)), member=True
+            ),
         )
         result["recovery_heads"] = sorted(recovery_heads(snapshot.comments))
         if result["review_safe"] and snapshot.pull.head_sha in result["recovery_heads"]:
@@ -257,7 +271,11 @@ class AdmissionPoller:
             if payload.get("action") in ("labeled", "unlabeled"):
                 label_payload = payload.get("label")
                 label = label_payload.get("name") if isinstance(label_payload, dict) else None
-                relevant_labels = KEEP | self.controller._no_repair_labels() | {"needs-rebase"}
+                relevant_labels = (
+                    KEEP
+                    | self.controller._no_repair_labels()
+                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair"}
+                )
                 if isinstance(label, str) and label and label.lower() not in relevant_labels:
                     return  # membership and repair labels are queue output, not admission evidence
             elif payload.get("action") == "edited":
@@ -277,7 +295,11 @@ class AdmissionPoller:
             self.invalidate(int(number), head=(pull.get("head") or {}).get("sha", ""))
         elif kind == "status":
             detail = payload.get(kind) or payload
-            if kind == "status" and detail.get("context") not in CONTEXTS:
+            if (
+                kind == "status"
+                and detail.get("context") not in CONTEXTS
+                and not str(detail.get("context", "")).startswith("self-tested/")
+            ):
                 return
             if kind == "check_run" and detail.get("name") == "merge eligibility":
                 return

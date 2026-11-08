@@ -1160,7 +1160,7 @@ class GitHubAdapter:
         statuses = {
             s["context"]: str(s.get("state") or "").lower()
             for s in (commit.get("status") or {}).get("contexts", ())
-            if s.get("context") in ("build", "scope", "bump-guard")
+            if s.get("context") in ("build", "scope", "bump-guard", f"self-tested/{number}")
         }
         return fresh, statuses
 
@@ -1235,7 +1235,7 @@ class GitHubAdapter:
         statuses = {
             s["context"]: str(s.get("state") or "").lower()
             for s in (commit.get("status") or {}).get("contexts", ())
-            if s.get("context") in ("build", "scope", "bump-guard")
+            if s.get("context") in ("build", "scope", "bump-guard", f"self-tested/{number}")
         }
         source = {
             "head": head,

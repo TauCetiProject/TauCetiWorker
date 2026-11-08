@@ -29,9 +29,9 @@ Land Tools support before its TauCeti and Worker consumers. Use the existing tes
 
 ## Stage 2 — Let trusted authors skip expensive PR CI
 
-An author runs the Stage 1 commands and applies `self-tested`. The label asserts that the current PR head passed. Workers can apply it after their normal successful verification.
+An author runs the Stage 1 commands and applies `self-tested`. The label asserts that the current PR head passed. This rollout is manual opt-in only: do not add automatic worker labelling, contributor recommendations or announcements.
 
-Accept it for PRs whose **author belongs to a designated GitHub team**, initially **Kim, David, Chris and the ai-for-science account**. Resolve the logins and team slug during implementation. A team member labelling somebody else's PR does not make it eligible.
+Accept it for PRs whose **author belongs to a designated GitHub team**, the **TauCetiProject/self-tested** team, initially **kim-em, roed314, roed-math, CBirkbeck and tauceti-ai-for-science**. A nonmember author's PR remains ineligible even when a team member labels it.
 
 The route applies to ordinary mathematics changes entirely under `TauCeti/`, with unchanged pins and lakefile. Infrastructure changes and explicit full-lint/lint-repair requests retain their existing CI route.
 
