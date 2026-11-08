@@ -298,8 +298,9 @@ through `SourcePort`; dispatches, workflow observations, cancellations, verdicts
 and compiled declaration evidence use `ExecutionPort`. The existing combined
 GitHub adapter supplies both by default. Its `github` attribute remains an alias
 for source-authentication callers. This separation does not select another
-execution repository or enable Forgejo: qualified bindings and versioned producer
-request/result contracts remain required.
+execution repository or enable Forgejo. The internal `SourceCandidateCI` coordinator
+adds a separate qualified request/result path; the production service does not
+construct it or enable a native source backend.
 
 A CI attempt now persists a request identity before source or execution I/O.
 Preparation can resume the same attempt after a restart. Before the one dispatch
@@ -342,10 +343,109 @@ Before a future rollout, take a ledger backup and settle unresolved sends before
 rolling back to older queue code. Older code does not understand these dispatch
 states and can retransmit an unresolved send after its legacy no-run timeout.
 
-The new receipt ID is not yet a producer-verified execution proof. Binding it to
-qualified source/execution repositories, trusted workflow revisions, run IDs and
-attempts, plus automatic safe supersession, remains part of the request/result
-integration. No production deployment or admissions change is part of this work.
+The legacy dispatch ID and title lookup provide no producer-verified execution
+proof. They remain confined to the existing combined GitHub path.
+
+### Frozen source requests and execution ownership
+
+The internal source CI path freezes a complete `source-candidate/v2` request in SQLite
+in the same transaction that inserts its prepared attempt. Immutable Git reads run
+before that transaction, with the controller lock released; a failed preparation records
+a reason and leaves the remainder of the queue pass running. Missing accepted heads are
+fetched by their retained original identity before freezing; repeated preparation
+failures use capped backoff and a deduplicated journal reason. A source-bound ledger
+refuses a restart through the legacy coordinator. Each request keeps its source,
+execution and harness native repository identities, queue epoch and nonce, ordered
+accepted PR heads, candidate/base/tree, trusted caller and harness revisions, and
+approved policy and project configuration bytes. Restart recovery loads these bytes
+rather than recomputing a request from current configuration or membership. An approved
+pipeline upgrade can serve older pending requests with their archived policy. Repository
+role or branch changes cannot silently rebind the ledger, and a new binding refuses
+existing unqualified source work without deleting it.
+
+Requests with up to 128 members retain the candidate and original accepted heads. Larger
+requests use a canonical membership document in a metadata Git commit whose parents
+retain the distinct original heads, limiting publication to two refs. The ledger keeps
+the exact membership and commit bytes so real Git garbage collection cannot change the
+metadata object's identity during recovery. This restores metadata, not missing original
+source history; admission must retain those heads. The 8,192 member maximum is a
+transport bound, not a demonstrated fleet capacity.
+
+`GitHubSourceExecution` requires installation tokens minted with exactly the native
+execution repository ID and explicit `contents:write`/`actions:write` permissions. A
+name preflight alone cannot protect a write against a repository name being reused.
+Dispatch validates the current repository identity, default branch and frozen trusted
+caller revision before source retention and before its single POST. The final preflight
+returns a process-local prepared dispatch with a hidden credential; after the durable
+`sending` claim the adapter performs only its one POST, with no token refresh or
+metadata reads. A crash during preflight leaves the same prepared request resumable.
+Retryable proven non-sends resume the same prepared request with persisted capped
+backoff, preserving its nonce, snapshot and retained refs. Scope/identity errors and
+permanent token-mint rejections have a finite rejection budget; they do not create a
+fresh set of source refs on every poll. The execution repository can be separate from
+the GitHub main mirror, avoiding caller revision changes on every source landing. Token
+refresh retains the native ID scope; no source credential is sent to GitHub.
+
+A matching run title is only a discovery hint. The trusted artifact reader verifies
+request receipts or final results against authenticated GitHub metadata, repository IDs,
+workflow revisions and run attempts. SQLite selects one owner with a compare and set and
+records additional proven runs without replacing it. Stored ownership permits
+observation and cancellation after a receipt expires; it grants no verdict. A malformed
+final result cannot erase ownership independently proved by a valid receipt. Completed
+runs need a freshly verified result for their current attempt. Legacy source statuses
+cannot make a source candidate pass. Promotion rechecks current membership, current
+passing evidence and fresh source approval before its source compare and set; an already
+visible promotion is reconciled without another write.
+
+Absent, expired, malformed or unavailable evidence keeps the request pending at the
+normal polling interval. A single transient observation failure on an already owned run
+does not trigger the request-age alert. Liveness checks read current run metadata
+without downloading expired artifacts. Automatic retries skip repeated repository-wide
+discovery for already owned completed attempts; explicit operator retries additionally
+check for newly discovered duplicates. Discovery uses closed creation-time windows and
+splits ranges before the [filtered 1,000-run cap](https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-workflow). Limits on requests, records, pages and
+time precision yield an explicit unavailable result; exceeding them never proves a
+dispatch did not happen. An acknowledged or ambiguous send is never automatically
+repeated because no run is found. After its evidence deadline the status includes
+`reconciliation_required` and the exact request nonce. `retry_ci` refuses when ownership
+cannot be verified. For an owned completed run, an operator must name the exact current
+request nonce shown in status to retire missing evidence and authorize a fresh dispatch;
+all discovered verified duplicates must also have finished. Fresh promotion reads
+release the controller lock and recheck local bindings on return. Source CI observation
+and live-run discovery also release that lock, then discard observations whose
+request or head changed while the reads were in flight. A typed authoritative
+approval or membership refusal settles that promotion entry and holds the request for
+explicit reconciliation; a changed result returns it to observation. The pending
+outcome, hold, promotion generation and journal update share one transaction so a crash
+cannot strand the head behind a finished outbox key. The existing admin retry endpoint
+accepts the exact `request_id` nonce; native HTTP authentication still requires its
+separate qualified authority integration. After publication grace, a verified owned
+completed run with a failure, cancellation, timeout or startup failure enters the
+bounded infrastructure retry policy only after a complete authenticated artifact
+listing and fresh run metadata confirm the result is absent. Read failures and
+present-but-unreadable artifacts stay pending. Grace starts at the controller's
+first completed observation. A successful run without a usable result
+still requires reconciliation. Repeated preparation/freeze failures raise alerts, and an
+exact-nonce operator retry can retire a request that remains prepared. Re-observing a
+deferred passing result does not count the same CI run twice; transient per-attempt
+settings are removed after landing.
+
+Permanently missing ownership, automatic late and duplicate run cleanup, richer repair
+diagnostics, the native source port, qualified task/reporting metadata, native HTTP
+actor/approval authority, protected ref publication and Git transport identity binding
+remain activation gates.
+
+The existing public monitoring projection accepts GitHub owner/name allowlists. It
+explicitly refuses a source-bound ledger until a qualified public policy and projection
+are implemented, avoiding incorrect GitHub URLs and cross-host disclosure. Internal CI
+verdicts retain the existing structured monitoring representation. Execution-repository
+rules must also prevent the dispatch credential from editing the trusted caller branch.
+The current execution-scoped metadata reads require a public harness repository; private
+harness access needs a separate read credential.
+
+These paths are exercised with local Git, real SQLite restart/connection races and
+trusted-boundary fakes. They are not the real HTTPS source/hosted-CI rehearsal. No
+production deployment or admissions change is part of this work.
 
 ## Outstanding integration and completion criteria
 
@@ -354,9 +454,9 @@ and scheduling still need qualified forge adapters. Review and Progress need
 equivalent operations and trusted publication. Native review replies and resolution
 must be covered by server/API integration tests and upstream patches as required.
 
-The queue still needs separate source-forge and CI backends, versioned exact-candidate
-request/result contracts, retained refs, trusted result verification, and Forgejo
-webhook/reconciliation support. Workflow scripts must handle Forgejo provenance,
+The queue's internal source/execution ports and frozen request/result integration
+still need the native source backend, protected retained refs, native authority,
+Forgejo webhook reconciliation and explicit operator recovery. Workflow scripts must handle Forgejo provenance,
 labels and comments for both PR and post-merge execution. Fleet, reporting, archives,
 installers and pins require the same source/execution distinction.
 

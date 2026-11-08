@@ -23,6 +23,14 @@ class DispatchNotAccepted(RuntimeError):
         self.retryable = retryable
 
 
+class PromotionRefused(RuntimeError):
+    """Trusted source evidence permanently refuses this exact promotion.
+
+    Transport, decoding and unavailable authority are observation failures;
+    only an authoritative refusal should use this type.
+    """
+
+
 class GitHubUnavailable(RuntimeError):
     """GitHub could not answer (rate limit, 5xx, network error), as opposed to answering no.
 

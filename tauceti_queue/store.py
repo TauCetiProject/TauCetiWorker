@@ -229,6 +229,7 @@ CREATE TABLE IF NOT EXISTS ci_attempts (
     sent_at REAL,
     dispatch_retry_at REAL,
     dispatch_retryable INTEGER NOT NULL DEFAULT 1,
+    dispatch_failures INTEGER NOT NULL DEFAULT 0,
     dispatched_at REAL NOT NULL,
     run_id TEXT,
     run_attempt INTEGER,
@@ -258,6 +259,30 @@ CREATE TABLE IF NOT EXISTS ci_attempts (
     cancel_result TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ci_batch ON ci_attempts (batch_id, batch_version);
+CREATE TABLE IF NOT EXISTS ci_requests (
+    id INTEGER PRIMARY KEY,
+    attempt_id INTEGER NOT NULL DEFAULT 0,
+    request_id TEXT NOT NULL DEFAULT '',
+    request_digest TEXT NOT NULL DEFAULT '',
+    request_json TEXT NOT NULL DEFAULT '{}',
+    policy_json TEXT NOT NULL DEFAULT '{}',
+    configuration BLOB NOT NULL DEFAULT X'',
+    member_manifest BLOB,
+    manifest_commit BLOB,
+    created_at REAL NOT NULL DEFAULT 0,
+    owner_run_id TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ci_request_attempt ON ci_requests (attempt_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ci_request_nonce ON ci_requests (request_id);
+CREATE TABLE IF NOT EXISTS ci_request_runs (
+    id INTEGER PRIMARY KEY,
+    request_digest TEXT NOT NULL DEFAULT '',
+    execution_id INTEGER NOT NULL DEFAULT 0,
+    run_id TEXT NOT NULL DEFAULT '',
+    receipt_json TEXT NOT NULL DEFAULT '{}',
+    first_observed_at REAL NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ci_request_run_owner ON ci_request_runs (execution_id, run_id);
 CREATE TABLE IF NOT EXISTS outbox (
     id INTEGER PRIMARY KEY,
     kind TEXT NOT NULL,
