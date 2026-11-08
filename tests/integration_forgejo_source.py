@@ -213,17 +213,10 @@ class Integration(unittest.TestCase):
                     store, source, str(clone), name, revision="native-source-fixture", clock=clock, candidate_ci=ci
                 )
                 controller.set_setting("publication_enabled", True, "disposable fixture")
-                recovery_body = f"Merge-queue recovery for head `{head}`\n<!--tauceti-rebase:v1 {head}-->"
-                controller._enqueue(
-                    "comment",
-                    "native-recovery-retry",
-                    {
-                        "number": number,
-                        "body": recovery_body,
-                        "marker": "native-recovery-retry",
-                    },
+                recovery_id = controller.enqueue_source_recovery(
+                    name, number, head, "Retry after conflict", key="native-recovery-retry"
                 )
-                recovery_entry = store.row("outbox", {"key": "native-recovery-retry"})
+                recovery_entry = store.row("outbox", {"id": recovery_id})
                 original_publish = source.publish
 
                 def lose_accepted_publication(intent):
@@ -245,17 +238,11 @@ class Integration(unittest.TestCase):
                 self.assertEqual(settled["state"], "done")
                 self.assertEqual(json.loads(settled["payload"])["native_intent"], frozen_recovery)
                 self.assertEqual(len(api.comments(repository, number)), comments_after_accept)
-                clear = source.prepare_publication(
-                    name,
-                    number,
-                    head,
-                    "",
-                    "native-recovery-clear",
-                    sequence=recovery_entry["id"] + 1,
-                    kind="recovery",
-                    clear=True,
+                clear_id = controller.enqueue_source_recovery(
+                    name, number, head, "Recovered", key="native-recovery-clear", clear=True
                 )
-                source.publish(clear)
+                self.assertGreater(clear_id, recovery_id)
+                controller._drain_outbox(clock())
                 poller = AdmissionPoller(controller, source, name, admission, clock=clock)
                 summary = poller.run_once()
                 self.assertEqual(summary["errors"], [])

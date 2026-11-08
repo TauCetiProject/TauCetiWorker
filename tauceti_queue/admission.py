@@ -449,6 +449,13 @@ class AdmissionPoller:
             with deferred(urgent=revocation) if deferred is not None else nullcontext():
                 self._evaluate(work, summary)
         except Exception as error:
+            if (
+                getattr(error, "publication_kind", None) == "recovery"
+                and getattr(error, "number", None) == work["number"]
+            ):
+                reconcile = getattr(self.controller, "reconcile_source_recovery", None)
+                if reconcile is not None:
+                    reconcile(work["number"], getattr(error, "head", None), getattr(error, "nonce", None))
             self.state.defer(
                 work,
                 self._retry_at(error),

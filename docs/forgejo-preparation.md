@@ -641,26 +641,36 @@ publication is pending, revoked, malformed, edited or deleted. Recovery clears
 use the same frozen-intent ordering, so an old clear cannot erase a newer hold.
 
 All publishers of one PR and kind must share the durable sequence allocator in
-the existing owner store. The queue uses its existing outbox row IDs and saves the
-complete intent in that row before sending. Retries preserve the nonce, body and
+the existing owner store. The queue uses its existing outbox row IDs for both holds and clears, through
+`enqueue_source_recovery`, and saves the complete intent in that row before sending. Retries preserve the nonce, body and
 sequence, including after a lost accepted response. A superseded intent settles
 without resending. A confirmed comment that was moderated raises
 `PublicationDamaged`; publish a new intent from the saved result rather than
 repeating inference. Review's trusted publication phase must integrate the same
-contract with its durable ledger before activation.
+contract with its durable ledger before activation. Queue comments are operational
+prose: their embedded `tauceti` markers are escaped. Only an explicit trusted
+recovery payload can create a queue publication; quoted agent text never selects
+a review operation, even if publisher roles overlap. Commit-bound facts still
+publish when a PR closes or temporarily changes head, so reopening cannot revive
+a superseded green verdict.
 
 `NativePublishers.generation` is a fresh random 128-bit hexadecimal value from
 trusted private publisher configuration. Generate it after revoking old
 credentials, and distribute it privately with the new grants before publishing.
 Changing publisher grants or restoring an account requires a fresh generation;
 the queue refuses reused generations in its existing settings. Publications from
-prior generations grant no authority, including facts planted while an account
-was unconfigured. Prefix, allow-file and ordinary consumer-policy changes keep
+prior generations grant no positive authority, including facts planted while an
+account was unconfigured. Any retired recovery history remains a blocking state
+until a current-generation explicit clear or hold is published. A rotation never
+silently releases a hold. The controller re-arms only its latest desired holds;
+old clears require a fresh explicit reconciliation decision. Prefix, allow-file and ordinary consumer-policy changes keep
 the generation and reapply current rules to existing facts. Grant changes require
 republishing saved review results under the new generation, without new model
 work. Native PR CI statuses carry `tauceti-ci-status/v1:<generation>` descriptions;
-the latest status is selected before checking issuer authority. An untrusted
-writer can block these contexts, as it can with labels, but cannot grant approval.
+the latest CI status is selected before checking issuer authority. Review and
+recovery records exclude resolvable non-publishers before parsing or comparing
+sequences; they cannot poison a head with an oversized or malformed intent.
+Unresolved/deleted issuers remain barriers requiring policy reconciliation.
 Legacy publication protocols grant no authority.
 
 In-progress publications and initial scoreboards defer admission and promotion
@@ -669,7 +679,13 @@ are evaluated immediately. An abandoned publication becomes review-unsafe after
 the configured wait; an already inserted batch receives the existing explicit
 promotion hold, preserving its candidate and repair work for operator recovery.
 It is never silently rebuilt or merged. Publisher bootstrap, credential rotation
-and the tested operational recovery path remain activation requirements.
+and the tested operational recovery path remain activation requirements. After
+any queue-store restore, reconcile source facts and cost history, then install a
+fresh authority generation before resuming publication; outbox IDs and retired
+generation records may otherwise have rolled back. Never replay a stale backup
+clear or green result over newer source evidence. Confirmed owned recovery
+comments that are moderated are requeued only if they are still the latest
+desired fact; a newer queued clear is never overwritten.
 Forgejo Actions remain disabled on the source repository.
 
 Promotion rereads the accepted PR heads and current review evidence. The trusted
