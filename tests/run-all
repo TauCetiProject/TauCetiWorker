@@ -168,6 +168,7 @@ RUN_STDLIB=(
   queue_task_transport.py
   queue_control_policy_file.py
   queue_native_bootstrap.py
+  queue_forgejo_webhook.py
   queue_monitoring.py
   queue_task_progress.py
   queue_monitoring_protocol.py

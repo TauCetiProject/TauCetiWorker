@@ -78,6 +78,8 @@ DEFAULT_BRANCH = main
 DISABLE_REGISTRATION = true
 [actions]
 ENABLED = false
+[webhook]
+ALLOWED_HOST_LIST = loopback
 [log]
 MODE = file
 ROOT_PATH = {root}/log

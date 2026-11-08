@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Actual native Service startup over disposable Forgejo HTTPS and fresh ACLs."""
 
+import base64
 import json
 import os
 import secrets
 import subprocess
 import sys
+import threading
 import unittest
 import urllib.error
 import urllib.request
@@ -94,7 +96,7 @@ class Integration(unittest.TestCase):
                 api,
                 tokens["queue"],
                 execution_tokens,
-                secrets.token_bytes(32),
+                secrets.token_hex(32).encode("ascii"),
             )
             service = Service(
                 config, ServiceRuntime.start(config, Revision("a" * 40, False, "fixture")), native=bootstrap
@@ -114,6 +116,60 @@ class Integration(unittest.TestCase):
                 url = f"http://{host}:{port}"
                 with urllib.request.urlopen(url + "/healthz", timeout=5) as response:
                     self.assertEqual(response.status, 200)
+                # Create a real hook and PR in the owned Forgejo. Its background
+                # delivery must pass the actual HTTP signature/repository checks.
+                delivered = threading.Event()
+                outcomes = []
+                receiver = service.server.native_receiver
+                original_handle = receiver.handle
+
+                def observed_delivery(*args, **kwargs):
+                    result = original_handle(*args, **kwargs)
+                    outcomes.append(result)
+                    if result == "invalidated":
+                        delivered.set()
+                    return result
+
+                api.request(
+                    "POST",
+                    f"repos/{repository.name}/hooks",
+                    {
+                        "type": "forgejo",
+                        "config": {
+                            "url": url + "/webhook/forgejo",
+                            "content_type": "json",
+                            "secret": bootstrap.source_webhook_secret.decode("latin1"),
+                        },
+                        "events": ["pull_request"],
+                        "active": True,
+                    },
+                )
+                contributor = Forgejo(repository.forge, token=tokens["contributor"])
+                contributor.request(
+                    "POST",
+                    f"repos/{repository.name}/branches",
+                    {"new_branch_name": "webhook-proof", "old_branch_name": "main"},
+                )
+                contributor.request(
+                    "POST",
+                    f"repos/{repository.name}/contents/Math/Hook.lean",
+                    {
+                        "branch": "webhook-proof",
+                        "message": "Owned hook fixture",
+                        "content": base64.b64encode(b"example : True := trivial\n").decode(),
+                    },
+                )
+                with patch.object(receiver, "handle", side_effect=observed_delivery):
+                    pull = contributor.request(
+                        "POST",
+                        f"repos/{repository.name}/pulls",
+                        {"head": "webhook-proof", "base": "main", "title": "Owned webhook proof"},
+                    )
+                    self.assertTrue(delivered.wait(20), outcomes)
+                work = service.poller.state.get(pull["number"])
+                self.assertEqual(work["head_sha"], pull["head"]["sha"])
+                self.assertNotEqual(work["generation"], work["evaluated_generation"])
+                self.assertEqual(service.store.rows("inputs"), [])
                 binding = TaskBinding.from_policy(approved, queue_epoch=service.controller.candidate_ci.ledger.epoch)
                 body = json.dumps(
                     {"worker": "owned-bootstrap", "schema": TASK_SCHEMA, "task_binding": binding.record()}

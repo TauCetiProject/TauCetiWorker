@@ -135,5 +135,6 @@ class NativeBootstrap:
             host=config.listen_host,
             port=config.listen_port,
             review_app_id=None,
+            native_webhooks=True,
         )
         return NativeComponents(source, controller, poller, http)
