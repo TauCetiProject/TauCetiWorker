@@ -49,11 +49,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import feeds, webhook
 from .ports import GitHubUnavailable
+from .source_authority import (
+    NativeQueueAuthority,
+    SourceAccessDenied,
+    SourceAuthorityUnavailable,
+    principal_key,
+)
 from .stale_cache import MAX_AGE_SECONDS, StaleCache
 
 log = logging.getLogger("tauceti_queue.server")
 
 MAX_BODY = 25 * 1024 * 1024
+SOURCE_BODY_DEADLINE_SECONDS = 10.0
 REPOSITORY_ROUTE = re.compile(r"^/repositories/(\d+)/(active-batches|candidates)$")
 TASK_ROUTE = re.compile(r"^/tasks/([A-Za-z0-9_.:-]+)/(renew|result|release)$")
 # `ControllerError.code` (tauceti_queue/controller.py) to HTTP status.
@@ -169,6 +176,26 @@ class BearerAuth:
 HEALTHZ_LOCK_WAIT_SECONDS = 0.5
 
 
+class NativeBearerAuth:
+    """One fresh source observation per request, with no retained bearer state."""
+
+    def __init__(self, authority):
+        self.authority = authority
+
+    @staticmethod
+    def token(header):
+        if not isinstance(header, str) or not header.startswith("Bearer "):
+            return None
+        token = header[len("Bearer ") :].strip()
+        return token if 0 < len(token) <= 4096 and all(33 <= ord(c) <= 126 for c in token) else None
+
+    def resolve(self, header):
+        token = self.token(header)
+        if token is None:
+            return None
+        return self.authority.authenticate(token)
+
+
 def _accepts_wait(callable_: Callable[..., object]) -> bool:
     """Whether a status provider takes the `wait` keyword (`Controller.status`, `Service.status_document`)."""
     try:
@@ -184,33 +211,59 @@ class QueueHTTPServer(ThreadingHTTPServer):
     def __init__(
         self, address, handler, controller, config: ServerConfig, status: Callable[[], dict] | None = None
     ) -> None:
+        self.source_authority = getattr(controller, "source_authority", None)
+        candidate_ci = getattr(controller, "candidate_ci", None)
+        if candidate_ci is not None:
+            if (
+                not isinstance(self.source_authority, NativeQueueAuthority)
+                or self.source_authority.source != candidate_ci.ledger.policy.source
+                or set(config.repositories.values()) != {self.source_authority.source.repository.name}
+            ):
+                raise ValueError("source-bound HTTP requires matching fresh native authority and repository")
+        elif self.source_authority is not None:
+            raise ValueError("native HTTP authority requires a source-bound controller")
         super().__init__(address, handler)
         self.controller = controller
         self.config = config
         self.status_provider = status
         self.started_at = config.clock()
-        self.receiver = webhook.WebhookReceiver(
-            controller, config.adapter, repositories=config.repositories.values(), review_app_id=config.review_app_id
+        self.receiver = (
+            None
+            if self.source_authority is not None
+            else webhook.WebhookReceiver(
+                controller,
+                config.adapter,
+                repositories=config.repositories.values(),
+                review_app_id=config.review_app_id,
+            )
         )
         store = config.store if config.store is not None else getattr(controller, "store", None)
         self.identity_store = store
-        self.auth = BearerAuth(
-            config.adapter,
-            ttl=config.auth_cache_seconds,
-            clock=config.clock,
-            store=store,
-            max_age=config.identity_max_age_seconds,
+        self.auth = (
+            NativeBearerAuth(self.source_authority)
+            if self.source_authority is not None
+            else BearerAuth(
+                config.adapter,
+                ttl=config.auth_cache_seconds,
+                clock=config.clock,
+                store=store,
+                max_age=config.identity_max_age_seconds,
+            )
         )
-        self.admins = StaleCache(
-            config.adapter.repository_admin,
-            ttl=config.auth_cache_seconds,
-            clock=config.clock,
-            logger=log,
-            what="admin",
-            store=store,
-            namespace="server-admin",
-            max_age=config.identity_max_age_seconds,
-            decode=bool,
+        self.admins = (
+            None
+            if self.source_authority is not None
+            else StaleCache(
+                config.adapter.repository_admin,
+                ttl=config.auth_cache_seconds,
+                clock=config.clock,
+                logger=log,
+                what="admin",
+                store=store,
+                namespace="server-admin",
+                max_age=config.identity_max_age_seconds,
+                decode=bool,
+            )
         )
         self.revision = config.revision or running_revision()
         self.poller = None  # the approval poller, set by `create_server(..., poller=)`
@@ -219,6 +272,8 @@ class QueueHTTPServer(ThreadingHTTPServer):
     def identity_caches(self) -> list[StaleCache]:
         """The caches of GitHub's answers about callers: bearer identities, the server's admin
         answers and the controller's (`Controller.admins`) when it keeps one."""
+        if self.source_authority is not None:
+            return []
         caches = [self.auth.cache, self.admins]
         controller_admins = getattr(self.controller, "admins", None)
         if isinstance(controller_admins, StaleCache):
@@ -240,7 +295,7 @@ class QueueHTTPServer(ThreadingHTTPServer):
             self.revalidate_identities()
 
     def serve_forever(self, poll_interval: float = 0.5) -> None:
-        if self.config.identity_revalidate_seconds > 0:
+        if self.source_authority is None and self.config.identity_revalidate_seconds > 0:
             threading.Thread(target=self._revalidate_loop, name="identity-revalidate", daemon=True).start()
         super().serve_forever(poll_interval)
 
@@ -250,6 +305,14 @@ class QueueHTTPServer(ThreadingHTTPServer):
 
     def identity_status(self) -> dict:
         """`/status`'s `identities`: how many answers are cached and whether GitHub can be asked."""
+        if self.source_authority is not None:
+            return {
+                "mode": "fresh-source",
+                "source": self.source_authority.source.record(),
+                "cached": 0,
+                "admin_answers_cached": 0,
+                "persisted": False,
+            }
         auth = self.auth.cache.stats()
         caches = [cache.stats() for cache in self.identity_caches()]
         unavailable = [stats for stats in caches if stats["github_unavailable"]]
@@ -295,9 +358,35 @@ class Handler(BaseHTTPRequestHandler):
     def _read_body(self) -> bytes | None:
         length = int(self.headers.get("Content-Length") or 0)
         if length < 0 or length > MAX_BODY:
+            if self.server.source_authority is not None:
+                self.close_connection = True
             self._error(413, "body too large")
             return None
-        return self.rfile.read(length) if length else b""
+        if self.server.source_authority is None:
+            return self.rfile.read(length) if length else b""
+        deadline = time.monotonic() + SOURCE_BODY_DEADLINE_SECONDS
+        chunks, remaining = [], length
+        previous = self.connection.gettimeout()
+        try:
+            while remaining:
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    raise TimeoutError
+                self.connection.settimeout(budget)
+                chunk = self.rfile.read1(min(remaining, 64 * 1024))
+                if not chunk:
+                    self._error(400, "incomplete request body")
+                    return None
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+        except TimeoutError:
+            self.close_connection = True
+            self.connection.settimeout(previous)
+            self._error(408, "native request body deadline exceeded")
+            return None
+        finally:
+            self.connection.settimeout(previous)
 
     def _read_json(self) -> dict | None:
         body = self._read_body()
@@ -316,8 +405,26 @@ class Handler(BaseHTTPRequestHandler):
     def _call(self, action: Callable[[], object], *, headers: dict | None = None) -> None:
         """Run a controller action and map its outcome to a reply."""
         try:
-            result = action()
+            path = urllib.parse.urlsplit(self.path).path
+            task_route = path == "/tasks/claim" or TASK_ROUTE.fullmatch(path)
+            if self.server.source_authority is not None and self.command == "POST" and not task_route:
+                # Authority reads precede this lock. Refuse a request that spent
+                # too long waiting; never let cached or old evidence grant work.
+                with self.server.controller._lock.priority():
+                    access = self.server.source_authority.validate(getattr(self, "_source_access", None))
+                    self.server.source_authority.require_admin(access)
+                    result = action()
+            else:
+                result = action()
+        except SourceAuthorityUnavailable as error:
+            log.warning("native queue request refused: %s", type(error).__name__)
+            self._error(503, str(error))
+        except SourceAccessDenied as error:
+            log.warning("native queue request denied (status %s)", error.status)
+            self._error(error.status, str(error))
         except PermissionError as error:
+            if self.server.source_authority is not None:
+                log.warning("native queue request refused: %s", type(error).__name__)
             self._error(403, str(error) or "forbidden")
         except LookupError as error:
             if isinstance(error, IndexError | KeyError):  # a bug, not a missing resource: keep the traceback
@@ -339,10 +446,46 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, _jsonable(result), extra=headers)
 
     def _authenticated(self) -> tuple[str, int] | None:
-        identity = self.server.auth.resolve(self.headers.get("Authorization"))
+        self._source_access = None
+        try:
+            identity = self.server.auth.resolve(self.headers.get("Authorization"))
+        except SourceAuthorityUnavailable as error:
+            log.warning("native source authentication refused: %s", type(error).__name__)
+            self._error(503, str(error))
+            return None
+        except SourceAccessDenied as error:
+            log.warning("native source authentication denied (status %s)", error.status)
+            self._error(error.status, str(error))
+            return None
+        if self.server.source_authority is not None and identity is not None:
+            self._source_access = identity
+            actor = identity.access.actor
+            return principal_key(actor), int(actor.principal.native_id)
         if identity is None:
-            self._error(401, "a GitHub token in `Authorization: Bearer` is required")
+            source = "native source" if self.server.source_authority is not None else "GitHub"
+            self._error(401, f"a {source} token in `Authorization: Bearer` is required")
         return identity
+
+    def _authenticated_json(self):
+        if self.server.source_authority is not None:
+            if NativeBearerAuth.token(self.headers.get("Authorization")) is None:
+                self.close_connection = True
+                return self._authenticated(), None  # Syntactic check only, before any body or source I/O.
+            # A slow request body must not keep an earlier native ACL grant.
+            body = self._read_json()
+            return (self._authenticated(), body) if body is not None else (None, None)
+        identity = self._authenticated()
+        return (identity, self._read_json()) if identity is not None else (None, None)
+
+    def _source_task_kwargs(self, *, refresh=False):
+        if self.server.source_authority is None:
+            return {}
+        result = {"source_access": self._source_access}
+        if refresh:
+            authority = self.server.source_authority
+            token = self.headers["Authorization"][len("Bearer ") :].strip()
+            result["source_refresh"] = lambda: authority.authenticate(token)
+        return result
 
     # -- routes
 
@@ -378,6 +521,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib naming
         path = urllib.parse.urlsplit(self.path).path
+        if self.server.source_authority is not None:
+            refused = {
+                "/webhook/github": (404, "GitHub webhooks are not a native source authority"),
+                "/admin/import-bors": (400, "unqualified Bors imports are unavailable for a native source"),
+                "/admin/reconcile-approvals": (503, "qualified native approval reconciliation is not available"),
+                "/admin/revoke-identity": (400, "native caller authority is read fresh; revoke access at the source"),
+            }.get(path)
+            if refused is not None:
+                self.close_connection = True
+                self._error(*refused)
+                return
         if path == "/webhook/github":
             self._webhook()
             return
@@ -420,9 +574,9 @@ class Handler(BaseHTTPRequestHandler):
             "github": client.stats() if client is not None and hasattr(client, "stats") else {},
             "identities": self.server.identity_status(),
             "webhooks": {
-                "received": self.server.receiver.received,
-                "duplicates": self.server.receiver.duplicates,
-                "ignored": self.server.receiver.ignored,
+                "received": self.server.receiver.received if self.server.receiver else 0,
+                "duplicates": self.server.receiver.duplicates if self.server.receiver else 0,
+                "ignored": self.server.receiver.ignored if self.server.receiver else 0,
             },
         }
 
@@ -468,6 +622,19 @@ class Handler(BaseHTTPRequestHandler):
         cache's lifetime and served stale while GitHub cannot answer; a login never checked before
         is refused (503) during such an outage. Sends the error response itself when refusing.
         """
+        if self.server.source_authority is not None:
+            try:
+                access = self.server.source_authority.validate(getattr(self, "_source_access", None))
+                self.server.source_authority.require_admin(access)
+            except SourceAuthorityUnavailable as error:
+                log.warning("native source admin authority unavailable")
+                self._error(503, str(error))
+                return False
+            except SourceAccessDenied as error:
+                log.warning("native source admin authority denied")
+                self._error(403, str(error))
+                return False
+            return True
         repo = next(iter(self.server.config.repositories.values()), None)
         if not repo:
             self._error(403, f"{login} is not a repository admin")
@@ -482,6 +649,9 @@ class Handler(BaseHTTPRequestHandler):
         return admin
 
     def _feed_reply(self, which: str, repo: str, query: dict) -> None:
+        if self.server.source_authority is not None:
+            self._error(503, "qualified native source feeds are not available")
+            return
         source = feeds.feed_source(self.server.controller)
         # Only the native controller guarantees retained, frozen admissions.
         # The legacy JSON schema and imported FeedSource behavior stay intact.
@@ -507,6 +677,9 @@ class Handler(BaseHTTPRequestHandler):
         return feeds.candidates_feed(source, repo, base, batch_id, promoted=promoted)
 
     def _webhook(self) -> None:
+        if self.server.source_authority is not None:
+            self._error(404, "GitHub webhooks are not a native source authority")
+            return
         body = self._read_body()
         if body is None:
             return
@@ -540,24 +713,20 @@ class Handler(BaseHTTPRequestHandler):
         return str(body.get("worker") or self.headers.get("X-TauCeti-Worker") or "")
 
     def _task_claim(self) -> None:
-        identity = self._authenticated()
-        if identity is None:
-            return
-        body = self._read_json()
-        if body is None:
+        identity, body = self._authenticated_json()
+        if identity is None or body is None:
             return
         login = identity[0]
-        self._call(lambda: self.server.controller.claim_task(self._worker_identity(body), login))
+        self._call(
+            lambda: self.server.controller.claim_task(self._worker_identity(body), login, **self._source_task_kwargs())
+        )
 
     def _task(self, task_id: str, action: str) -> None:
         """`renew`, `result` and `release` carry the claim token the claim handed out; the
         controller's task API (`renew_task(task_id, claim_token)`, `submit_task(task_id, claim_token,
         tip_sha, worker_notes)`, `release_task(task_id, claim_token, reason, error)`) checks it."""
-        identity = self._authenticated()
-        if identity is None:
-            return
-        body = self._read_json()
-        if body is None:
+        identity, body = self._authenticated_json()
+        if identity is None or body is None:
             return
         token = str(body.get("claim_token") or "")
         if not token:
@@ -566,11 +735,17 @@ class Handler(BaseHTTPRequestHandler):
         tid = int(task_id) if task_id.isdigit() else task_id
         controller = self.server.controller
         if action == "renew":
-            self._call(lambda: _renewal(tid, controller.renew_task(tid, token)))
+            self._call(
+                lambda: _renewal(tid, controller.renew_task(tid, token, **self._source_task_kwargs(refresh=True)))
+            )
         elif action == "release":
             self._call(
                 lambda: controller.release_task(
-                    tid, token, str(body.get("reason") or "released"), str(body.get("error") or "")
+                    tid,
+                    token,
+                    str(body.get("reason") or "released"),
+                    str(body.get("error") or ""),
+                    **self._source_task_kwargs(),
                 )
             )
         else:
@@ -578,46 +753,55 @@ class Handler(BaseHTTPRequestHandler):
             if not re.fullmatch(r"[0-9a-f]{40}", tip):
                 self._error(400, "`tip_sha` must be a full commit SHA")
                 return
-            self._call(lambda: controller.submit_task(tid, token, tip, str(body.get("worker_notes") or "")))
+            self._call(
+                lambda: controller.submit_task(
+                    tid, token, tip, str(body.get("worker_notes") or ""), **self._source_task_kwargs(refresh=True)
+                )
+            )
 
     def _admin_rebuild_head(self) -> None:
-        identity = self._authenticated()
-        if identity is None:
-            return
-        body = self._read_json()
-        if body is None:
+        identity, body = self._authenticated_json()
+        if identity is None or body is None:
             return
         if not self._admin(identity[0]):
             return
         repo = str(body.get("repo") or next(iter(self.server.config.repositories.values()), ""))
-        self._call(lambda: self.server.controller.rebuild_head(repo, identity[0]))
+        if self.server.source_authority is not None and repo != self.server.source_authority.source.repository.name:
+            self._error(400, "`repo` must be the configured native source")
+            return
+        self._call(
+            lambda: self.server.controller.rebuild_head(repo, identity[0], **self._source_task_kwargs(refresh=True))
+        )
 
     def _admin_retry_ci(self) -> None:
-        identity = self._authenticated()
-        if identity is None:
-            return
-        body = self._read_json()
-        if body is None:
+        identity, body = self._authenticated_json()
+        if identity is None or body is None:
             return
         if not self._admin(identity[0]):
             return
         repo = str(body.get("repo") or next(iter(self.server.config.repositories.values()), ""))
+        if self.server.source_authority is not None and repo != self.server.source_authority.source.repository.name:
+            self._error(400, "`repo` must be the configured native source")
+            return
         request_id = body.get("request_id")
         if request_id is not None:
             if not isinstance(request_id, str) or not re.fullmatch(r"[0-9a-f]{32}", request_id):
                 self._error(400, "`request_id` must be the exact 32-character request nonce")
                 return
-            self._call(lambda: self.server.controller.retry_ci(repo, identity[0], request_id=request_id))
+            self._call(
+                lambda: self.server.controller.retry_ci(
+                    repo, identity[0], request_id=request_id, **self._source_task_kwargs(refresh=True)
+                )
+            )
         else:
-            self._call(lambda: self.server.controller.retry_ci(repo, identity[0]))
+            self._call(
+                lambda: self.server.controller.retry_ci(repo, identity[0], **self._source_task_kwargs(refresh=True))
+            )
 
     def _task_inference(self) -> None:
         """A worker reports whether an inference call succeeded (`report_inference`), for the hold."""
-        identity = self._authenticated()
-        if identity is None:
-            return
-        body = self._read_json()
-        if body is None:
+        identity, body = self._authenticated_json()
+        if identity is None or body is None:
             return
         ok = body.get("ok")
         if not isinstance(ok, bool):
@@ -630,11 +814,8 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _admin_settings(self) -> None:
-        identity = self._authenticated()
-        if identity is None:
-            return
-        body = self._read_json()
-        if body is None:
+        identity, body = self._authenticated_json()
+        if identity is None or body is None:
             return
         if not self._admin(identity[0]):
             return
@@ -658,11 +839,8 @@ class Handler(BaseHTTPRequestHandler):
         return controller.update_settings(login, body)
 
     def _admin_urgent(self) -> None:
-        identity = self._authenticated()
-        if identity is None:
-            return
-        body = self._read_json()
-        if body is None:
+        identity, body = self._authenticated_json()
+        if identity is None or body is None:
             return
         repo = str(body.get("repo") or next(iter(self.server.config.repositories.values()), ""))
         pr = body.get("pr")
@@ -675,11 +853,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _admin_import_bors(self) -> None:
         """Bors's state at the cutover: `{"observation": feed, "candidates": journal | [journals], "dry_run", "release_head"}`."""
-        identity = self._authenticated()
-        if identity is None:
+        identity, body = self._authenticated_json()
+        if identity is None or body is None:
             return
-        body = self._read_json()
-        if body is None:
+        if self.server.source_authority is not None:
+            self._error(400, "unqualified Bors imports are unavailable for a native source")
             return
         observation = body.get("observation")
         if not isinstance(observation, dict):
@@ -702,13 +880,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _admin_reconcile_approvals(self) -> None:
         """One approval reconciliation pass now (`tauceti-queue reconcile-approvals`)."""
-        identity = self._authenticated()
-        if identity is None:
-            return
-        body = self._read_json()
-        if body is None:
+        identity, body = self._authenticated_json()
+        if identity is None or body is None:
             return
         if not self._admin(identity[0]):
+            return
+        if self.server.source_authority is not None:
+            self._error(503, "qualified native approval reconciliation is not available")
             return
         poller = self.server.poller
         if poller is None:
@@ -724,11 +902,11 @@ class Handler(BaseHTTPRequestHandler):
     def _admin_revoke_identity(self) -> None:
         """Forget what the service cached about a login (its bearer tokens and admin answers), so
         the next request with any of its tokens asks GitHub again and an outage cannot serve them."""
-        identity = self._authenticated()
-        if identity is None:
+        identity, body = self._authenticated_json()
+        if identity is None or body is None:
             return
-        body = self._read_json()
-        if body is None:
+        if self.server.source_authority is not None:
+            self._error(400, "native caller authority is read fresh; revoke access at the source")
             return
         login = body.get("login")
         if not isinstance(login, str) or not login:

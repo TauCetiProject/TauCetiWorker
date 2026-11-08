@@ -166,6 +166,7 @@ CREATE TABLE IF NOT EXISTS claims (
     operation TEXT NOT NULL,
     worker TEXT NOT NULL,
     github_login TEXT NOT NULL DEFAULT '',
+    source_actor TEXT NOT NULL DEFAULT '{}',
     token TEXT NOT NULL,
     starting_tip TEXT NOT NULL,
     task_id INTEGER,

@@ -293,6 +293,55 @@ the isolated author/review/CI/merge rehearsal or a capacity proof.
 
 ## Queue source and execution boundary
 
+The optional source-bound queue has a separate native HTTP authority path. Each
+mutation reads its bearer actor and repository user ACL directly from the configured
+Forgejo origin and checks the configured native repository ID. It uses neither the
+GitHub identity/admin caches nor a previous successful native observation. A denied
+or unavailable read refuses the operation. Queue controls require current repository
+admin and Code write ACL, with archive and pull-mirror states refused. These user
+ACLs do not establish bearer write scopes or authorize source publication.
+
+Native HTTP handlers reject malformed bearer headers without reading the body or
+contacting Forgejo. They read the bounded body under a ten-second total deadline
+before observing authority. Process-local observations expire after 15 seconds,
+including the native reads; they are checked after acquiring the controller lock.
+Claims persist a separate qualified native
+actor record, leaving the legacy GitHub-login field empty. Renewal, release and
+submission require the same native actor ID and origin plus fresh authority; a
+login rename preserves ownership and a reused login does not. After fresh
+authentication, a renewal entering the controller before expiry retains its
+arrival time while waiting for the lock, refreshing expired authority outside the
+lock while its renewal registration stays active. Reacquisition uses priority and
+the remaining evidence lifetime, with at most three refresh/acquisition attempts; overlapping
+renewals keep independent registrations. Source authentication and ACL
+outages fail closed; an unauthenticated request cannot extend a lease.
+All claim-expiry decisions honour a timely renewal that is still in progress,
+including concurrent renew, submit and explicit release requests. Current owner
+and authority checks still apply. Exhausting refresh attempts can delay an error
+until a current lock holder finishes; it never permits stale evidence to grant work.
+Submission refreshes authority outside the lock after validation and before
+adopting a chain, then checks current claim, task-kind rules, head target and
+covered membership again. Unrelated metadata and valid append operations for
+pre-rebase and pre-rebased-prepare tasks do not discard work. Ordinary preparation
+still requires its exact batch version. Stale or late results are recorded as
+retained rejections; that audit bookkeeping uses the initially authenticated
+request and never grants adoption or source-write authority.
+Operator retry and rebuild refresh and recheck state after their slow reads too.
+Existing unqualified
+claim records cannot acquire a native owner implicitly.
+
+Source-bound HTTP startup refuses a missing or mismatched native authority. Native
+feeds, GitHub webhook intake, unqualified Bors imports and legacy approval polling
+remain unavailable on this path. Qualified task/reporting metadata, native source
+publication and approval, and production bootstrap are still activation gates.
+Credential audience/delegation policy and ingress rate/concurrency limits also
+require integration before activation: a native user ACL observation alone does
+not identify a bearer as a dedicated queue-control credential.
+The disposable native integration exercises the actor/ACL reader against Forgejo
+17; separate HTTP/controller regressions cover revocation, slow bodies, lock waits,
+name reuse and claim ownership. These checks do not constitute the full hosted HTTPS
+or fleet-capacity rehearsal.
+
 The controller routes repository reads, refs, publication and repository authority
 through `SourcePort`; dispatches, workflow observations, cancellations, verdicts
 and compiled declaration evidence use `ExecutionPort`. The existing combined

@@ -23,8 +23,10 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from tauceti_tools.ci_candidate import RepositoryIdentity
 from tauceti_tools.forge import Forge, ForgeError, Forgejo, RepositoryRef
 
+from tauceti_queue.source_authority import NativeQueueAuthority, SourceAccessDenied
 from tauceti_worker.forgejo_reads import BoundedReadCache
 from tauceti_worker.github import GitHub
 from tauceti_worker.review_state import ReviewState
@@ -249,11 +251,19 @@ ROOT_PATH = {root}/log
                         self.assertEqual(access.actor, actor)
                         self.assertTrue(access.user_code_can_push)
                         self.assertTrue(access.user_is_repo_admin)
+                        queue_authority = NativeQueueAuthority(RepositoryIdentity(repo, access.repository_id))
+                        queue_authority.require_admin(
+                            queue_authority.validate(queue_authority.authenticate(api._token))
+                        )
+                        reused_name = NativeQueueAuthority(RepositoryIdentity(repo, access.repository_id + 1))
+                        with self.assertRaises(SourceAccessDenied):
+                            reused_name.observe(api._token)
                         self.assertIsNone(other.repository_access())
                         self.assertIn(other.last_failure.status, {401, 403, 404})
                         read_access = reader.repository_access()
                         self.assertEqual(read_access.actor, actor)
                         self.assertTrue(read_access.user_code_can_push)
+                        queue_authority.require_admin(queue_authority.observe(readonly._token))
                         print("Read-only token reports native push ACL:", read_access.user_code_can_push, flush=True)
                         with self.assertRaises(ForgeError) as denied_write:
                             readonly.request(
@@ -268,8 +278,12 @@ ROOT_PATH = {root}/log
                         self.assertFalse(collaborator.request("GET", "user")["is_admin"])
                         self.assertIsNone(member.repository_access())
                         self.assertEqual(member.last_failure.status, 404)
+                        with self.assertRaises(SourceAccessDenied):
+                            queue_authority.observe(collaborator._token)
                         api.request("PUT", "repos/operator/source/collaborators/collaborator", {"permission": "read"})
                         member_read = member.repository_access()
+                        with self.assertRaises(SourceAccessDenied):
+                            queue_authority.require_admin(queue_authority.observe(collaborator._token))
                         self.assertEqual(member_read.actor, member_actor)
                         self.assertEqual(
                             (
@@ -281,6 +295,8 @@ ROOT_PATH = {root}/log
                         )
                         api.request("PUT", "repos/operator/source/collaborators/collaborator", {"permission": "write"})
                         member_write = member.repository_access()
+                        with self.assertRaises(SourceAccessDenied):
+                            queue_authority.require_admin(queue_authority.observe(collaborator._token))
                         self.assertEqual(member_write.actor, member_actor)
                         self.assertEqual(
                             (
@@ -294,6 +310,8 @@ ROOT_PATH = {root}/log
                         self.assertIsNone(member.repository_access())
                         self.assertEqual(member.last_failure.status, 404)
                         self.assertEqual(member.authenticated_actor(), member_actor)
+                        with self.assertRaises(SourceAccessDenied):
+                            queue_authority.observe(collaborator._token)
                         history = source.issue_comments(number)
                         self.assertEqual(len(history), 33)
                         self.assertEqual(len({row["id"] for row in history}), 33)
@@ -356,6 +374,8 @@ ROOT_PATH = {root}/log
                         self.assertTrue(archived.archived)
                         self.assertFalse(archived.mirror)
                         self.assertTrue(archived.user_code_can_push)
+                        with self.assertRaises(SourceAccessDenied):
+                            queue_authority.require_admin(queue_authority.observe(api._token))
                 finally:
                     process.terminate()
                     try:
