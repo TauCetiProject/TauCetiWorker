@@ -509,7 +509,7 @@ class SourceController(unittest.TestCase):
             {"retried": True, "forgotten": 1},
         )
 
-    def test_owned_cancelled_run_uses_bounded_infrastructure_recovery(self):
+    def _owned_missing_result_uses_bounded_recovery(self, conclusion):
         attempt = self.start()
         frozen = self.ledger.load(attempt["id"])
         self.execution.add(frozen)
@@ -519,7 +519,7 @@ class SourceController(unittest.TestCase):
             digest,
             replace(
                 observation,
-                run=replace(observation.run, status="completed", conclusion="cancelled"),
+                run=replace(observation.run, status="completed", conclusion=conclusion),
                 result_absent=True,
             ),
         )
@@ -533,6 +533,12 @@ class SourceController(unittest.TestCase):
         self.controller.tick()
         self.assertEqual(len(self.execution.dispatches), 2)
         self.assertEqual(self.store.rows("ci_attempts")[-1]["infrastructure_retry"], 1)
+
+    def test_owned_cancelled_run_uses_bounded_infrastructure_recovery(self):
+        self._owned_missing_result_uses_bounded_recovery("cancelled")
+
+    def test_owned_failed_run_with_confirmed_absence_uses_bounded_infrastructure_recovery(self):
+        self._owned_missing_result_uses_bounded_recovery("failure")
 
     def test_repeated_preparation_failure_alerts_and_exact_retry_can_retire_prepared_request(self):
         def unavailable(_frozen):
@@ -586,7 +592,10 @@ class SourceController(unittest.TestCase):
         self.execution.runs["101"] = (digest, replace(original, result=None, result_absent=False))
         self.clock.advance(60)
         self.controller.tick()
-        self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["run_completed_at"], self.clock())
+        self.assertEqual(
+            self.store.row("ci_attempts", {"id": attempt["id"]})["run_completed_at"], original.run.completed_at
+        )
+        self.assertEqual(self.store.get_setting(f"source-ci:completion-seen:{attempt['id']}")["at"], self.clock())
         self.clock.advance(LOG_GRACE_SECONDS + 1)
         self.controller.tick()
         self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "pending")
@@ -616,6 +625,52 @@ class SourceController(unittest.TestCase):
         self.assertNotEqual(self.repo.main_sha(), frozen.request.head)
         self.assertEqual(self.approvals, [])
         self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "superseded")
+
+    def test_live_readoption_does_not_undo_an_operator_retry_during_unlocked_discovery(self):
+        attempt = self.start()
+        frozen = self.ledger.load(attempt["id"])
+        self.execution.add(frozen)
+        self.ci.observe(attempt["id"])
+        live = self.ci.live_attempt
+
+        def retry_during_discovery(attempts, **kwargs):
+            self.assertIsNone(self.controller._lock._owner)
+            stale = live(attempts, **kwargs)
+            self.ci.live_attempt = live  # The operator performs a separate, fresh check.
+            digest, observation = self.execution.runs["101"]
+            self.execution.runs["101"] = (
+                digest,
+                replace(observation, run=replace(observation.run, status="completed")),
+            )
+            self.assertEqual(
+                self.controller.retry_ci(PROJECT, "reviewer", request_id=attempt["request_id"]),
+                {"retried": True, "forgotten": 1},
+            )
+            return stale
+
+        self.ci.live_attempt = retry_during_discovery
+        with self.controller._lock:
+            self.assertTrue(self.controller._readopt_live_run(self.controller._head(), self.clock()))
+        self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "superseded")
+        self.assertEqual(self.store.count("journal", {"kind": "run-readopted"}), 0)
+
+    def test_retry_reports_changed_head_during_unlocked_liveness_check(self):
+        attempt = self.start()
+        frozen = self.ledger.load(attempt["id"])
+        self.execution.add(frozen)
+        self.ci.observe(attempt["id"])
+        status = self.execution.status
+
+        def changed(*args, **kwargs):
+            run = status(*args, **kwargs)
+            self.store.update("batches", {"id": attempt["batch_id"]}, version=attempt["batch_version"] + 1)
+            return run
+
+        self.execution.status = changed
+        self.assertEqual(
+            self.controller.retry_ci(PROJECT, "reviewer", request_id=attempt["request_id"]),
+            {"retried": False, "reason": "head-changed"},
+        )
 
 
 if __name__ == "__main__":

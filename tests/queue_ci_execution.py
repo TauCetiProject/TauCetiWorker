@@ -351,6 +351,39 @@ class Execution(unittest.TestCase):
             with patch.object(self.reader, "get", return_value=value):
                 self.assertFalse(self.adapter._result_absent(self.reader, self.frozen, run))
 
+    def test_absence_is_refused_if_attempt_or_conclusion_changes_during_confirmation(self):
+        self.reader.add(status="completed")
+        original = self.reader.runs["101"]
+        run = self.adapter._run(original)
+        for change in ({"run_attempt": 2}, {"conclusion": "failure"}):
+
+            def get(path, change=change):
+                if "/artifacts?" in path:
+                    return {"total_count": 0, "artifacts": []}
+                return dict(original, **change)
+
+            with patch.object(self.reader, "get", side_effect=get):
+                self.assertFalse(self.adapter._result_absent(self.reader, self.frozen, run))
+
+    def test_download_outage_with_present_result_does_not_prove_absence(self):
+        self.reader.add(status="completed")
+        self.reader.runs["101"]["conclusion"] = "failure"
+        original = self.reader.get
+        expected = cc.artifact_name(self.frozen.request, 101, 1)
+
+        def get(path):
+            if "/artifacts?" in path:
+                return {"total_count": 1, "artifacts": [{"id": 201, "name": expected, "expired": False}]}
+            return original(path)
+
+        with (
+            patch.object(self.reader, "get", side_effect=get),
+            patch.object(self.reader, "result", side_effect=EvidenceUnavailable("signed download unavailable")),
+        ):
+            observation = self.adapter.observe(self.frozen, "101", owned=True)
+        self.assertIsNone(observation.result)
+        self.assertFalse(observation.result_absent)
+
 
 if __name__ == "__main__":
     unittest.main()
