@@ -68,15 +68,15 @@ class ForgejoWebhookReceiver:
             # the delivery only repeats an idempotent invalidation after restart.
             # No command parsing, review evidence, ACL grant or payload mutation.
             if event == "push":
+                if payload.get("ref") != "refs/heads/" + self.controller.canonical_branch:
+                    self.ignored += 1
+                    return "ignored"  # Native PR synchronize events own head moves; queue retention is output.
                 with self.controller.store.transaction():
                     saved = self.controller.store.get_setting("state:admission_discovery", {})
                     self.controller.store.set_setting(
                         "state:admission_discovery", {**saved, "retry_at": 0, "next_attempt_at": 0}
                     )
-                if payload.get("ref") == "refs/heads/" + self.controller.canonical_branch:
-                    poller.handle_event("push", payload)
-                else:
-                    poller.request_discovery()
+                poller.handle_event("push", payload)
             elif event.startswith("pull_request") or event == "issue_comment":
                 pull = payload.get("pull_request") or {}
                 issue = payload.get("issue") or {}
@@ -112,7 +112,9 @@ class ForgejoWebhookReceiver:
                     if not isinstance(comment, dict):
                         raise ValueError("native comment is malformed")
                     changes = payload.get("changes") or {}
-                    previous = ((changes.get("body") or {}).get("from") or "") if isinstance(changes, dict) else ""
+                    if not isinstance(changes, dict) or not isinstance(changes.get("body", {}), dict):
+                        raise ValueError("native comment changes are malformed")
+                    previous = (changes.get("body") or {}).get("from") or ""
                     if (
                         action != "deleted"
                         and not relevant_comment(comment)
@@ -122,8 +124,17 @@ class ForgejoWebhookReceiver:
                         return "ignored"
                     config = getattr(getattr(self.controller.source, "admission_policy", None), "publishers", None)
                     publishers = set() if config is None else config.reviews | config.recoveries
-                    urgent = any(str(sender_id) == p.native_id for p in publishers)
-                    poller.invalidate(number, head=head, urgent=urgent)
+                    author = comment.get("user") or {}
+                    if not isinstance(author, dict):
+                        raise ValueError("native comment author is malformed")
+                    author_id = author.get("id")
+                    published = type(author_id) is int and any(str(author_id) == p.native_id for p in publishers)
+                    if not published and type(author_id) is int and author_id > 0:
+                        self.ignored += 1
+                        return "ignored"
+                    # Moderation of a publisher's row is urgent irrespective of
+                    # who edited/deleted it. Unknown/deleted authors fail closed.
+                    poller.invalidate(number, head=head, urgent=True)
                 else:
                     if action == "edited" and payload.get("changes") and set(payload["changes"]) <= {"title"}:
                         self.ignored += 1

@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field, fields
 
 from tauceti_tools.ci_candidate import RepositoryIdentity
-from tauceti_tools.forge import ForgeError, Forgejo, Incomplete
+from tauceti_tools.forge import ForgeError, Forgejo, Incomplete, PrincipalRef
 
 from tauceti_queue.control_policy_file import MAX_POLICY_BYTES, ControlPolicyError, read_control_policy
 from tauceti_worker.source_identity import SourceActor, SourceRepositoryAccess
@@ -198,6 +198,7 @@ class NativeQueueAuthority:
         control_policy: QueueControlPolicy,
         client_factory=Forgejo,
         clock=time.monotonic,
+        forbidden_control_principals=frozenset(),
     ):
         if not isinstance(source, RepositoryIdentity) or source.repository.forge.kind != "forgejo":
             raise ValueError("native queue authority requires a qualified Forgejo repository ID")
@@ -205,6 +206,16 @@ class NativeQueueAuthority:
             raise ValueError("control credential policy must match the queue's qualified native source")
         self.source = source
         self._control_policy = control_policy
+        if (
+            type(forbidden_control_principals) is not frozenset
+            or len(forbidden_control_principals) > 1024
+            or any(
+                not isinstance(p, PrincipalRef) or p.forge != source.repository.forge
+                for p in forbidden_control_principals
+            )
+        ):
+            raise ValueError("native control role exclusions require bounded source-local principals")
+        self._forbidden_controls = forbidden_control_principals
         self._client_factory = client_factory
         self.clock = clock
 
@@ -255,6 +266,8 @@ class NativeQueueAuthority:
             raise SourceAuthorityUnavailable("native source authority could not be read") from None
         if access.repository_id != self.source.native_id:
             raise SourceAccessDenied("native source repository identity changed")
+        if access.actor.principal in self._forbidden_controls:
+            raise SourceAccessDenied("publication and review principals cannot act as queue workers or controls")
         return access
 
     def require_control_credential(self, token: str) -> None:

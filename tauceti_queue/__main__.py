@@ -99,6 +99,7 @@ class Service:
         self.native = native
         self.native_http = None
         self._native_store_lock = None
+        self._native_listener = None
         if native is not None:
             from .native_bootstrap import NativeBootstrap
 
@@ -162,13 +163,24 @@ class Service:
         if self.native is not None:
             if self.store is None:
                 raise ValueError("native service requires its existing durable queue store")
-            wired = self.native.build(self.config, self.store, revision=self.runtime.revision.sha)
+            import socket
+
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind((self.config.listen_host, self.config.listen_port))
+                wired = self.native.build(self.config, self.store, revision=self.runtime.revision.sha)
+            except BaseException:
+                listener.close()
+                raise
+            self._native_listener = listener
             self.github, self.controller, self.poller, self.native_http = (
                 wired.source,
                 wired.controller,
                 wired.poller,
                 wired.http,
             )
+            self.native_http.prebound_socket = listener
             self.loop_module = _optional("loop")
             return
         module = _optional("controller")
@@ -283,6 +295,9 @@ class Service:
                 close()
         if self.store is not None:
             self.store.close()
+        if self._native_listener is not None:
+            self._native_listener.close()
+            self._native_listener = None
         if self._native_store_lock is not None:
             os.close(self._native_store_lock)
             self._native_store_lock = None

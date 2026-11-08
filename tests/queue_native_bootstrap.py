@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The actual Service wires native source and separately scoped execution."""
 
+import socket
 import sys
 import tempfile
 import unittest
@@ -227,6 +228,26 @@ class Bootstrap(unittest.TestCase):
             self.service(bootstrap=replace(self.bootstrap, publishers=changed)).build_controller()
         with self.assertRaises(ValueError):
             self.service(bootstrap=replace(self.bootstrap, source_webhook_secret=b"\xff" * 32)).build_controller()
+
+    def test_another_token_for_a_publication_or_review_actor_cannot_be_a_control(self):
+        service = self.service()
+        service.build_controller()
+        authority = service.controller.source_authority
+        authority._client_factory = self.native.authority._client_factory
+        for actor in [{"id": 7, "login": "controller"}, {"id": 8, "login": "reviewer"}]:
+            self.native.actor = actor
+            with self.assertRaisesRegex(SourceAccessDenied, "cannot act"):
+                authority.authenticate("other-token")
+
+    def test_a_busy_listen_port_cannot_commit_source_binding_or_publisher_rotation(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen()
+            service = self.service(config=replace(self.config, listen_port=occupied.getsockname()[1]))
+            with self.assertRaises(OSError):
+                service.build_controller()
+            self.assertIsNone(service.store.get_setting("source-ci:binding"))
+            self.assertEqual(service.store.query("SELECT * FROM settings"), [])
 
 
 if __name__ == "__main__":

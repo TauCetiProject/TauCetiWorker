@@ -8,12 +8,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from queue_ci_requests import policy
+from tauceti_tools.forge import PrincipalRef
 
 from tauceti_queue.admission import AdmissionPolicy, AdmissionPoller
 from tauceti_queue.fakes import make_controller
@@ -35,6 +37,12 @@ class Webhooks(unittest.TestCase):
             clock=clock,
         )
         self.source = policy().source
+        self.adapter.admission_policy = SimpleNamespace(
+            publishers=SimpleNamespace(
+                reviews=frozenset({PrincipalRef(self.source.repository.forge, "8")}),
+                recoveries=frozenset({PrincipalRef(self.source.repository.forge, "7")}),
+            )
+        )
         self.secret = b"dedicated-source-hook-secret" * 2
         self.receiver = ForgejoWebhookReceiver(self.controller, self.source, self.secret)
         self.payload = {
@@ -103,15 +111,15 @@ class Webhooks(unittest.TestCase):
         self.assertEqual(self.send(payload, event="issue_comment"), "invalidated")
         self.assertEqual(self.controller.store.rows("inputs"), [])
 
-    def test_main_push_invalidates_epoch_and_contributor_push_requests_discovery(self):
+    def test_main_push_is_durable_and_non_main_retention_pushes_do_not_request_discovery(self):
         epoch = self.poller._source_epoch()
         self.send({**self.payload, "ref": "refs/heads/main"}, event="push")
         self.assertEqual(self.poller._source_epoch(), epoch + 1)
         self.poller._discovery_at = 10**12
         self.controller.store.set_setting("state:admission_discovery", {"retry_at": 10**12})
         self.send({**self.payload, "ref": "refs/heads/contributor"}, event="push", delivery="other")
-        self.assertEqual(self.poller._discovery_at, 0)
-        self.assertEqual(self.controller.store.get_setting("state:admission_discovery")["retry_at"], 0)
+        self.assertEqual(self.poller._discovery_at, 10**12)
+        self.assertEqual(self.controller.store.get_setting("state:admission_discovery")["retry_at"], 10**12)
 
     def test_routine_prose_and_title_only_changes_do_not_dirty_a_pr(self):
         payload = {
@@ -138,7 +146,7 @@ class Webhooks(unittest.TestCase):
         self.assertEqual(self.send(issue, event="issue_comment", delivery="not-a-pr"), "ignored")
         self.assertIsNone(self.poller.state.get(2))
 
-    def test_controller_output_is_ignored_and_nonpublisher_marker_comments_are_not_urgent(self):
+    def test_output_and_nonpublisher_markers_are_ignored_but_moderated_publisher_comments_are_urgent(self):
         from tauceti_worker.source_identity import SourceActor
 
         self.controller.source_actor = SourceActor.from_native(
@@ -153,8 +161,13 @@ class Webhooks(unittest.TestCase):
         }
         self.assertEqual(self.send(payload, event="issue_comment"), "ignored")
         payload["sender"] = {"id": 99}
-        self.assertEqual(self.send(payload, event="issue_comment", delivery="non-publisher"), "invalidated")
-        self.assertEqual(self.poller.state.get(1)["urgent"], 0)
+        payload["comment"]["user"] = {"id": 99}
+        self.assertEqual(self.send(payload, event="issue_comment", delivery="non-publisher"), "ignored")
+        self.assertIsNone(self.poller.state.get(1))
+        payload["comment"]["user"] = {"id": 8}
+        payload["action"] = "edited"
+        self.assertEqual(self.send(payload, event="issue_comment", delivery="moderation"), "invalidated")
+        self.assertEqual(self.poller.state.get(1)["urgent"], 1)
 
     def test_malformed_native_structures_are_refused_as_bad_payloads(self):
         for change in [{"pull_request": []}, {"pull_request": {"head": []}}, {"sender": []}]:

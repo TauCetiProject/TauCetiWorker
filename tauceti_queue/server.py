@@ -112,6 +112,7 @@ class ServerConfig:
     # `auth_cache_seconds`; 0 disables it.
     identity_revalidate_seconds: float = 300.0
     native_webhooks: bool = False
+    prebound_socket: object | None = dataclasses.field(default=None, repr=False)
 
 
 def running_revision(package_dir: pathlib.Path | None = None) -> str:
@@ -224,7 +225,14 @@ class QueueHTTPServer(ThreadingHTTPServer):
                 raise ValueError("source-bound HTTP requires matching fresh native authority and repository")
         elif self.source_authority is not None:
             raise ValueError("native HTTP authority requires a source-bound controller")
-        super().__init__(address, handler)
+        bound = config.prebound_socket
+        super().__init__(address, handler, bind_and_activate=bound is None)
+        if bound is not None:
+            self.socket.close()
+            self.socket = bound
+            self.server_address = bound.getsockname()
+            self.server_name, self.server_port = str(self.server_address[0]), self.server_address[1]
+            self.server_activate()
         self.controller = controller
         self.config = config
         self.status_provider = status

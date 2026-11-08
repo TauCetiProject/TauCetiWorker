@@ -92,7 +92,13 @@ class NativeBootstrap:
         # immutable workflow revision and token-provider resource restrictions.
         # No generic gh/PAT fallback can supply execution credentials.
         execution = GitHubSourceExecution(self.execution_tokens, clock=clock)
-        authority = NativeQueueAuthority(approved.source, control_policy=self.control_policy)
+        authority = NativeQueueAuthority(
+            approved.source,
+            control_policy=self.control_policy,
+            forbidden_control_principals=self.publishers.reviews
+            | self.publishers.statuses
+            | self.publishers.recoveries,
+        )
         try:
             access = QueueRepositoryAccess.from_effective(
                 approved.source.repository,
