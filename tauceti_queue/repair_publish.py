@@ -528,6 +528,15 @@ def start_background(
 
 
 def run_spec(spec_path: Path) -> int:
+    from tauceti_queue.repair_cleanup import worktree_lease
+
+    spec = json.loads(spec_path.read_text())
+    root = Path(spec["worktree"]).parent.parent
+    with worktree_lease(root, spec["task_id"]):
+        return _run_spec(spec_path)
+
+
+def _run_spec(spec_path: Path) -> int:
     """The background publisher: publish as the spec says, write the record, then remove the worktree."""
     spec = json.loads(spec_path.read_text())
     path = Path(spec["record"]["record"])
