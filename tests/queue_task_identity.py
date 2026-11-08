@@ -242,6 +242,8 @@ class Identity(unittest.TestCase):
         self.assertEqual(monitoring.task_binding_fields(row), {"task_binding": self.binding.record()})
         self.assertEqual(monitoring.task_binding_fields({}), {})
         self.assertEqual(monitoring.task_binding_fields({"task_binding": "broken"})["identity_coverage"], "invalid")
+        with self.assertRaisesRegex(ValueError, "qualified public monitoring policy"):
+            monitoring.project(self.fixture.store.path, public_repositories=[self.binding.source.repository.name])
 
     def test_native_renewal_requires_a_finite_numeric_expiry(self):
         task = repair_task.Task.from_json(self.raw())

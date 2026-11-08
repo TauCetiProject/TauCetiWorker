@@ -349,7 +349,9 @@ plain HTTP, bounds responses, rejects duplicate JSON fields, and checks the bind
 before claim adoption, renewal, submission or release. No binding is inferred from
 the claim response. Checkpoints and compact progress retain the qualified binding;
 monitoring matches progress to the SQL task binding and reports task identity even
-without a worker observation. Native metadata does not enable the existing runner:
+without a worker observation. These identity helpers do not enable public native
+export: the existing GitHub allowlist and URL policy still refuse source-bound ledgers.
+Native metadata does not enable the existing runner:
 native execution, legacy admin-cache use, Git fetch/push, agent work and resume or
 release retries through an unqualified client remain refused until the native
 transport, source validation and runner adapters are implemented. Native checkpoint

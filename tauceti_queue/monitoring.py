@@ -478,9 +478,11 @@ def project(
             "FROM ci_attempts ORDER BY id DESC LIMIT ?",
             (LIMIT + 1,),
         )
+        task_columns = {r["name"] for r in rows("PRAGMA table_info(tasks)")}
+        task_binding_column = "task_binding" if "task_binding" in task_columns else "'{}' AS task_binding"
         tasks = rows(
             "SELECT id,kind,batch_id,batch_version,state,created_at,resolved_at,resolution,"
-            "ci_attempt_id FROM tasks ORDER BY id DESC LIMIT ?",
+            "ci_attempt_id," + task_binding_column + " FROM tasks ORDER BY id DESC LIMIT ?",
             (LIMIT + 1,),
         )
         claims = rows(
