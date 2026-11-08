@@ -65,6 +65,36 @@ class AdmissionTests(unittest.TestCase):
         self.controller = reopen_controller(self.tmp.name, self.github, self.repo, self.clock)
         self.intake = AdmissionPoller(self.controller, self.github, REPO, self.config, clock=self.clock)
 
+    def test_self_tested_reviewed_head_enters_existing_staging_without_build_success(self):
+        head = self.ready()
+        del self.github.statuses[(head, "build")]
+        self.github.labels[1].add("self-tested")
+        self.github.statuses[(head, "self-tested/1")] = Status(
+            "success", "PR CI skipped: self-tested.", "", self.clock(), None
+        )
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.controller.tick()
+        self.assertEqual(self.controller.inputs()[0]["state"], "inserted")
+        self.assertTrue(self.controller.store.rows("members"))
+        self.assertNotIn((head, "build"), self.github.statuses)
+
+    def test_label_and_dedicated_status_changes_invalidate_admission(self):
+        head = self.ready()
+        del self.github.statuses[(head, "build")]
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.github.labels[1].add("self-tested")
+        self.github.statuses[(head, "self-tested/2")] = Status("success", "other PR", "", self.clock(), None)
+        self.event("pull_request", {"number": 1, "action": "labeled", "label": {"name": "self-tested"}})
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.github.statuses[(head, "self-tested/1")] = Status(
+            "success", "PR CI skipped: self-tested.", "", self.clock(), None
+        )
+        self.event("status", {"sha": head, "context": "self-tested/1"})
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        generation = self.intake.state.get(1)["generation"]
+        self.event("pull_request", {"number": 1, "action": "unlabeled", "label": {"name": "self-tested"}})
+        self.assertEqual(self.intake.state.get(1)["generation"], generation + 1)
+
     def test_primary_intake_uses_published_review_and_unchanged_inputs_cost_no_evaluation(self):
         self.ready()
         result = self.intake.run_once()
