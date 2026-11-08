@@ -899,6 +899,7 @@ class NativeHTTP(unittest.TestCase):
             "schema": TASK_SCHEMA,
             "task_binding": TaskBinding.from_policy(ledger.policy, queue_epoch=ledger.epoch).record(),
         }
+
     def test_readonly_admin_token_cannot_claim_or_change_settings(self):
         self.effective.update(code_write=False, repository_admin=False)
         self.assertEqual(self.request("/tasks/claim", {"worker": "worker"})[0], 403)

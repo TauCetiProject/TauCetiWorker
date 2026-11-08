@@ -150,6 +150,7 @@ class Identity(unittest.TestCase):
         self.fixture.restart()
         self.fixture.controller.source_authority = NativeQueueAuthority(
             self.native.identity,
+            control_policy=self.native.authority._control_policy,
             client_factory=self.native.authority._client_factory,
             clock=self.fixture.clock,
         )
