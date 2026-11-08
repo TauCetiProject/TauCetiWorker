@@ -342,6 +342,11 @@ class Task:
         return self.onto or self.base
 
 
+class _NoTaskRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class TaskClient:
     """The worker's side of the task protocol. Transport failures raise ``ServiceError``.
 

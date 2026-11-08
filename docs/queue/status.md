@@ -5,24 +5,71 @@ Running record for the work plan in
 what is blocked on which operator item, and the latest experiment numbers. Updated by the
 orchestrating session as streams land.
 
+## Import-header failures reach repair (2026-11-08)
+
+Head 388's import-header preflight repeatedly failed because PR #30063 imported a missing project
+module. The controller ignored the checker's located messages and saw only the failed finalizer's
+infrastructure finding, exhausting retries while repair workers stayed idle.
+[Worker PR 624](https://github.com/TauCetiProject/TauCetiWorker/pull/624) recognizes these messages
+as source diagnostics on the importing module. All nine CI jobs passed and the PR was admin-merged.
+The focused backport `21455f800c43` was deployed on chungus2 at 08:00:25 UTC, retaining the earlier
+production base without the newer mainline CI-engine changes.
+
+The supported retry operation superseded four exhausted verdicts.
+[Recovery CI](https://github.com/TauCetiProject/TauCeti/actions/runs/42461076366) reproduced the
+missing import and correctly created repair task 56. The first worker attempt exposed a separate
+read-only dependency artifact-cache failure during verification. Both workers now use normal
+private dependency preparation (`TAUCETI_QUEUE_SEED_PACKAGES` empty). An independent stock-Lake
+sandbox probe passed against a private reflink copy, and worker 1 reclaimed task 56 and produced
+successful source compilations in its streaming build. Repair is active; this is not yet evidence
+of a green replacement batch or a new landing.
+
+SQLite checks passed, all 4,699 membership records present at the recovery snapshot and runtime
+settings were preserved, admissions continued, and all 56 webhook deliveries around the restart
+succeeded. Evidence, backups and original environments are retained privately under
+`~/TauCetiQueue-data/import-preflight-recovery-20261108/`. See
+[repair execution](operations.md#repair-execution-on-chungus2) for the current dependency setup.
+
+## Controller moved to chungus2 (2026-11-08)
+
+The controller, SQLite store, tunnel, monitoring publisher, history timer and backup timer moved
+from chungus to chungus2, alongside the repair workers. The move retained revision `6348a0116c2c`,
+all 4,363 existing member records, runtime settings and active batch identities. SQLite integrity
+checks and retained Git objects passed verification. Both public hostnames report chungus2;
+public service resumed approximately 73 seconds after cutoff. Ordinary admissions stayed enabled.
+
+The old controller/tunnel and monitoring/backup units are masked, and their shell helpers refuse
+execution. Destination systemd user units are enabled and active, a fresh backup succeeded, and
+the publisher reads local repair processes directly. Its former SSH observation mirror is retired.
+Both repair workers retained their processes with no active claims or checkpoints interrupted.
+GitHub recorded 159 unsuccessful webhook deliveries during the outage; the App redelivery API
+recovered them, with successful deliveries checked against every original delivery GUID.
+
+Head 388 already had an import-header CI preflight failure before the move and remains held for
+that separate issue. Journal/admission activity and fresh monitoring demonstrate continued
+operation, not a new green build or landing. `Linger=no` remains unchanged, so guaranteed reboot
+startup is still postponed. See the [relocation runbook](operations.md#controller-relocation-on-november-8)
+for verification, retained rollback state and the current deployment procedure.
+
 ## Repair execution moved to chungus2 (2026-11-07)
 
 At the operator's request, both repair workers moved from chungus to chungus2 at 22:00 UTC,
 retaining revision `6348a0116c2c` and the existing provider/pacing/cache configuration. Both source
 workers were idle and had no unfinished checkpoints or active claims. The replacements serve as
 `repair@chungus2` and `repair-2@chungus2` under the same systemd user unit names. Old repair units
-on chungus are masked; their shell launchers refuse execution, and `deploy-queue.sh` there now
-updates only the controller. Old source history remains retained.
+on chungus were masked; their shell launchers refused execution, and `deploy-queue.sh` there
+then updated only the controller (it too is retired following the controller move). Old source history remains retained.
 
-The controller, SQLite store, tunnel, backups and public monitoring stayed on chungus. Controller
+At this earlier repair-only cutover, the controller, SQLite store, tunnel, backups and public
+monitoring stayed on chungus; they subsequently moved on November 8 as recorded above. Controller
 PID/revision, runtime settings, admission and Fleet policies were unchanged. A private observation
-mirror keeps chungus's existing monitoring and hourly report supplied with chungus2 worker/task
+mirror kept chungus's existing monitoring and hourly report supplied with chungus2 worker/task
 JSON and bounded build-log tails. Destination preflight, administrator authorization, TLS, stock
 Lean version, an offline sandbox compilation and public monitoring freshness were verified.
 The workers had completed idle claim polls without errors; no repair task was available to verify
 a new repair completion at cutover. See [the runbook](operations.md#repair-execution-on-chungus2)
 for cache seeding, deployment, monitoring and rollback. Neither host gained lingering or a reboot
-startup guarantee; the earlier controller-host/supervision postponement still applies.
+startup guarantee; reboot supervision remains postponed.
 
 ## Primary admission cutover (2026-11-06)
 
@@ -270,13 +317,13 @@ Totals for the day: four heads landed through the queue (head 1 at 00:33, head 2
 
 ## Operator items outstanding
 
-0. Repair worker host: chungus for now (96 CPUs, 400 GB free), with the Claude Code credentials and the API key the operator placed there; it moves with the service to the dedicated host.
-6. Create the R2 write token for the `tauceti-repair` bucket and place it on the repair host as `TAUCETI_REPAIR_CACHE_KEY_FILE`; until then repairs read the worker cache but publish nothing.
+0. Done: both repair workers moved to chungus2 on November 7; the controller followed on November 8.
+6. Done: private R2 upload credentials are configured on chungus2 as `TAUCETI_REPAIR_CACHE_KEY_FILE`.
 7. Agree to pausing the `tauceti-bors` Worker's cron (it still runs against the suspended installation).
 1. Done: the `tauceti-queue` App is created and installed on `TauCetiProject/TauCeti`.
 2. Create `TauCetiProject/TauCetiQueueScratch` (stream I) and add it to the `tauceti-queue` App installation; optionally grant the App `checks: write` so the rehearsal can approve through `merge eligibility` checks (`docs/queue/rehearsal.md`). The rehearsal pushes the content itself.
 3. Staging capacity: no action for now (operator decision, 2026-11-04). Revisit from the pilot's measurements.
-4. Service host: chungus since 2026-11-05 01:13 UTC, temporary (moved from tauchonki, whose staging builds and Claude sessions held its load between 150 and 490 and stretched one controller pass to ten minutes). No root and no lingering there. The queue and tunnel retain detached supervisors; both repair workers use separate systemd user services with OOM recovery since November 6 at 07:04. Automatic startup after reboot remains unavailable. The backup timer is active but also depends on the user manager ([operations.md](operations.md), "Current deployment" and "Hosts without lingering"). The dedicated host's availability and hostname remain outstanding.
+4. Service host: chungus2 since November 8, with controller/tunnel, monitoring and backups under systemd user units. `Linger=no`; guaranteed reboot startup remains postponed ([operations.md](operations.md#current-deployment)).
 5. Done: cutover approved ("go") and executed on 2026-11-04.
 
 ## Next steps
@@ -284,9 +331,7 @@ Totals for the day: four heads landed through the queue (head 1 at 00:33, head 2
 - Watch new approvals flow through the queue.
 - Investigate why the concurrency group did not cancel the superseded run 42055229481.
 - The Zulip reply to Christian still awaits the operator.
-- The fresh machine for the service (below).
 - Read the current service revision from `/status`; use the live deployment procedure in the runbook.
-- Move the service and the repair worker from chungus to the dedicated machine when it arrives, restoring the systemd units and the backup timer ([operations.md](operations.md), "Moving to the dedicated host").
 - Pause the `tauceti-bors` Worker's cron once the operator agrees; delete it with its container after a week of queue operation.
 - Give Bors's admission-time checks (declaration collisions, merge-selection overlaps) to the agent as diagnostics, as described in the plan; streaming repair, the other follow-up there, is done (https://github.com/TauCetiProject/TauCetiWorker/pull/531).
 - The `staging-candidate-*` branches the service pushes accumulate as Bors's did; add deletion after the attempt's verdict.

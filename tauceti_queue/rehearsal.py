@@ -992,7 +992,7 @@ class Rig:
     def pr_record(self, number: int) -> dict:
         raise NotImplementedError
 
-    def landing_comment(self, number: int) -> dict | None:
+    def landing_comment(self, number: int, *, rejected: bool = False) -> dict | None:
         raise NotImplementedError
 
     def runner_config(self, inference_attempts: int):
@@ -1351,9 +1351,9 @@ class LocalRig(Rig):
             pr = self.github.prs[number]
             return {"state": pr["state"], "title": pr["title"]}
 
-    def landing_comment(self, number: int) -> dict | None:
+    def landing_comment(self, number: int, *, rejected: bool = False) -> dict | None:
         for comment in self.github.comments_for(number):
-            if "landed:" in comment["marker"]:
+            if ("rejected:" if rejected else "landed:") in comment["marker"]:
                 return {"id": comment["id"], "body": comment["body"]}
         return None
 
@@ -1980,10 +1980,10 @@ class LiveRig(Rig):
         pr = self.adapter.fetch_pr(self.repository, number)
         return {"state": pr.state, "title": pr.title}
 
-    def landing_comment(self, number: int) -> dict | None:
+    def landing_comment(self, number: int, *, rejected: bool = False) -> dict | None:
         for comment in self.client.paginate(f"repos/{self.repository}/issues/{number}/comments"):
             body = str(comment.get("body") or "")
-            if "landed:" in body and "tauceti-queue" in body:
+            if ("rejected:" if rejected else "landed:") in body and "tauceti-queue" in body:
                 return {"id": comment.get("id"), "body": body, "html_url": comment.get("html_url")}
         return None
 
@@ -2343,14 +2343,23 @@ class Rehearsal:
                         found.append(event)
         return found
 
-    def pr_evidence(self, pr: PR, *, edited: bool | None = None, mentions: str | None = None) -> dict:
+    def pr_evidence(
+        self, pr: PR, *, edited: bool | None = None, mentions: str | None = None, rejected: bool = False
+    ) -> dict:
         record = self.rig.pr_record(pr.number)
-        comment = self.rig.landing_comment(pr.number)
+        comment = self.rig.landing_comment(pr.number, rejected=rejected)
         expect(comment is not None, f"#{pr.number} has no landing comment")
         body = comment["body"]
-        expect(
-            "Pull request successfully merged into" in body, f"#{pr.number}: the landing comment lacks Bors's notice"
-        )
+        if rejected:
+            expect("rejected during staging repair" in body, f"#{pr.number}: no rejection notice")
+            expect("successfully merged" not in body, f"#{pr.number}: rejected PR has a merge notice")
+            expect(record["state"] == "closed", f"#{pr.number}: rejected PR is not closed")
+            expect(not record["title"].startswith(MERGED_TITLE_PREFIX), f"#{pr.number}: rejected PR has a merged title")
+        else:
+            expect(
+                "Pull request successfully merged into" in body,
+                f"#{pr.number}: the landing comment lacks Bors's notice",
+            )
         if edited is True:
             expect(
                 "edited this contribution" in body,
@@ -2499,7 +2508,7 @@ class Rehearsal:
     def scenario_shrink(self) -> None:
         with self.report.scenario(
             "shrink",
-            "A contribution the agent cannot make pass is shrunk to an empty commit; the comment names what was dropped",
+            "A contribution reduced to an empty commit is rejected; the comment names what was dropped",
             [3, 14],
         ) as rec:
             hopeless = self.rig.create_pr("hopeless", self.content.module("Hopeless", "1 = 2", failing=True))
@@ -2523,11 +2532,14 @@ class Rehearsal:
             expect(empty and empty[0].get("empty"), f"the landed commit of #{hopeless.number} is not empty: {empty}")
             rec.evidence["empty_commit"] = empty[0]
             expect(self.rig.base_content(path) is None, f"{path} landed although it was dropped")
-            rec.evidence["pr_hopeless"] = self.pr_evidence(hopeless, edited=True, mentions="Dropped")
+            rec.evidence["pr_hopeless"] = self.pr_evidence(hopeless, rejected=True, mentions="Dropped")
             rec.evidence["pr_sound"] = self.pr_evidence(sound, edited=False)
             counters = self.status().get("counters") or {}
             expect(counters.get("shrink_to_empty", 0) >= 1, f"no shrink counted: {counters}")
-            rec.evidence["counters"] = {k: counters.get(k) for k in ("shrink_to_empty", "repair_rounds")}
+            expect(counters.get("prs_rejected", 0) >= 1, f"no rejection counted: {counters}")
+            rec.evidence["counters"] = {
+                k: counters.get(k) for k in ("shrink_to_empty", "repair_rounds", "prs_rejected")
+            }
 
     def scenario_conflict(self) -> None:
         with self.report.scenario(

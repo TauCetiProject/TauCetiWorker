@@ -566,6 +566,14 @@ def project(
             )
         elif commit.get("empty") is False:
             disposition = "agent_edited" if row["provenance"] == "edited" else "clean_replay"
+        if (
+            batch.get("state") == "landed"
+            and item.get("state") == "cancelled"
+            and not item.get("landed_sha")
+            and not row["withdrawn"]
+            and not row["removed"]
+        ):
+            disposition = "rejected_empty"
         member_records.append(
             {
                 "id": str(row["id"]),
@@ -580,7 +588,7 @@ def project(
                 "author": text(item.get("author")),
                 "approved_at": iso(item.get("approved_at")),
                 "inserted_at": iso(row["added_at"]),
-                "landed_at": iso(batch.get("landed_at")),
+                "landed_at": iso(item.get("landed_at")),
                 "provenance": row["provenance"],
                 "disposition": disposition,
                 "empty": commit.get("empty"),
