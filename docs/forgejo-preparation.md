@@ -313,7 +313,10 @@ Enrolled credentials still need fresh native
 scope/resource/ACL checks on every operation; enrollment does not cache a grant.
 For routine rotation, enroll old and new fingerprints together, restart with the
 shared authority, roll workers to the new credential, then revoke the old token
-at Forgejo and remove its fingerprint on the next restart. This overlap keeps
+at Forgejo only after no running worker process still holds the old bearer.
+Workers read their bearer once at process startup; confirm each process has
+restarted and resumed its claims with the replacement, or has finished its work.
+Remove the old fingerprint on the next restart. This overlap keeps
 normal admissions and running work enabled. The replacement bearer must identify
 the same native actor to resume that actor's claims; a bot-user change requires
 reconciling the previous actor's work. Removing enrollment immediately
