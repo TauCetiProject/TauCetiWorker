@@ -1879,6 +1879,7 @@ def _ensure_scripts_executable() -> None:
         "tauceti-verify",
         "tauceti-local-axioms",
         "tauceti-local-lint",
+        "tauceti-local-checks",
         "tauceti-lean",
         "lean",
     ):

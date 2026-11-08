@@ -4,7 +4,8 @@
 [--base SHA] [--json] [--no-reuse] [--lint-modules FILE]` runs synchronously in a TauCeti checkout. It exits zero
 only after every requested phase succeeds against unchanged inputs. Progress, original tool output
 and actual exits go to stderr; `--json` writes one `tauceti-verification/v1` object on stdout.
-V0 authoring/repair dispatch remains the default. `TAUCETI_VERIFY_HELPER=1` opts a selected
+The default authoring/repair prompts run the shared Tools local checks, also exposed by
+`lake test` and `lake lint` in current content checkouts. Receipt-helper dispatch remains opt-in. `TAUCETI_VERIFY_HELPER=1` opts a selected
 natural canary into helper prompts; the helper CLI and receipt support are available separately.
 Helper prompts invoke the installed absolute `scripts/tauceti-verify` wrapper with the worker's Python
 interpreter. The wrapper also honors `TAUCETI_VERIFY_PYTHON` and supports Bubble's staged layout.
@@ -15,7 +16,7 @@ The worker pins `TAUCETI_VERIFY_BASE` from the existing canonical-main checkout 
 `TAUCETI_VERIFY_POLICY` from surveyed labels/branch, `TAUCETI_VERIFY_STATE` to worker state, and
 `TAUCETI_ROUND_DEADLINE` to the round's deadline. Standalone invocations resolve canonical main
 from local Git refs only. No scope or verification step requests GitHub data or fetches refs.
-The Python scope contract in `verification_scope.py` is tested against #305's V0 recipe: merge-base
+The shared offline Python scope calculation is re-exported by `verification_scope.py`: merge-base
 diff, both rename ends, staged/dirty/deleted/untracked sources, ignored sources under TauCeti,
 full CI requirements for broad policy/pins/deletions/unrepresentable modules, and unknown scope on missing
 history. Missing canonical main fails closed with an incomplete receipt: there is no resolved base to
@@ -34,22 +35,22 @@ list and any extra diagnostic logs outside the checkout; untracked checkout file
 
 The shim wrapper runs with the verifier's Python interpreter and inherited environment, including
 Bubble's mounted Tools package and standalone checkers' sibling imports. Its installed TauCetiTools
-implementation and configuration are verification inputs. Local helpers use the Worker's Tools pin;
-CI may use the content repository's separate pin. A missing required Tools import yields
+implementation and configuration are verification inputs. Local helpers use the Worker's installed Tools pin; checkout launchers and CI use the aligned content pin.
+Historical checkouts may retain older pins. A missing required Tools import yields
 `incomplete_reason: tool-missing`, rather than a source failure. Other checker exits retain their
 existing failure meaning. Recovery probes this prerequisite before claiming work or warming caches,
 so an unavailable Python dependency does not launch source repair. A changed verification-tool
 identity permits a fresh mechanical check of prior source failures, including records blocked only
 on continuation admission; publication scope, source ownership and model authorization still apply.
 
-Local environment lint uses the Worker-owned `LocalLint.lean` checker, compiled once and
+Local environment lint uses Tools' shared `LocalLint.lean` checker, compiled once and
 shared across workers with the same toolchain and dependency content. It imports only the
 explicit module list and checks declarations owned by those modules, including documentation
 and `nolint` entries. Imported dependency declarations are excluded. Empty or theorem-only
 documentation scopes are valid. Older PR scripts cannot restore a whole-project documentation
 scan: local verification never invokes their `lint-env.sh`. CI retains its full-library coverage.
 
-Local axiom checks use the bundled `scripts/LocalAxioms.lean`, through the absolute
+Local axiom checks use Tools' shared `LocalAxioms.lean`, through the absolute
 `scripts/tauceti-local-axioms --modules FILE` wrapper. They read only the selected modules' own
 `.olean`, `.olean.server` and `.olean.private` data, without loading a Lean environment,
 following imports, reading Mathlib artifacts or running candidate initializers. They reject axiom
@@ -125,7 +126,9 @@ concurrently. Verification adds no host-wide slot limit, ticket scheduler, polli
 capacity-specific retry/accounting path. Existing worker/fleet admission and host CPU/memory
 limits continue to apply.
 Per-job leases prevent duplicate execution of the same candidate; they never serialize independent
-candidates. Source style still runs before the default build so inexpensive diagnostics arrive early.
+candidates. The existing source/import guards and new-file length check run before the default build.
+Source style and environment lint run after their required artifacts exist. These checks use
+the shared Tools implementation; no GitHub request is added to local scope or lint.
 
 `TAUCETI_VERIFY_CACHE_DIR` selects the shared immutable-installation identity cache. The default
 uses the host boot/machine identity and UID under `/tmp`. The directory must be owned by the user
