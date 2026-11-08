@@ -6,12 +6,14 @@ belongs to a temporary loopback-only instance; no installed worker is executed.
 """
 
 import base64
+import contextlib
 import getpass
 import importlib
 import json
 import os
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -36,18 +38,65 @@ class Integration(unittest.TestCase):
     def test_real_source_with_service_and_github_fallback_blocked(self):
         binary = os.environ.get("FORGEJO_BINARY")
         effective_access = os.environ.get("FORGEJO_EFFECTIVE_ACCESS") == "1"
+        https = os.environ.get("FORGEJO_HTTPS") == "1"
         if not binary:
             self.skipTest("set FORGEJO_BINARY to run a disposable loopback server")
-        with tempfile.TemporaryDirectory(prefix="worker-forgejo-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="worker-forgejo-") as temporary, contextlib.ExitStack() as environment:
             root = Path(temporary)
+            tls_settings = ""
+            if https:
+                certificate, key = root / "source.crt", root / "source.key"
+                result = subprocess.run(
+                    [
+                        "openssl",
+                        "req",
+                        "-x509",
+                        "-newkey",
+                        "rsa:2048",
+                        "-nodes",
+                        "-days",
+                        "1",
+                        "-keyout",
+                        str(key),
+                        "-out",
+                        str(certificate),
+                        "-subj",
+                        "/CN=source-fixture.invalid",
+                        "-config",
+                        "/dev/null",
+                        "-addext",
+                        "subjectAltName=IP:127.0.0.1",
+                        "-addext",
+                        "basicConstraints=critical,CA:TRUE",
+                        "-addext",
+                        "keyUsage=critical,keyCertSign,digitalSignature,keyEncipherment",
+                        "-addext",
+                        "extendedKeyUsage=serverAuth",
+                    ],
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, "local TLS certificate generation failed")
+                key.chmod(0o600)
+                environment.enter_context(
+                    patch.dict(
+                        os.environ,
+                        {
+                            "SSL_CERT_FILE": str(certificate),
+                            "GIT_SSL_CAINFO": str(certificate),
+                        },
+                    )
+                )
+                tls_settings = f"PROTOCOL = https\nCERT_FILE = {certificate}\nKEY_FILE = {key}\n"
             with socket.socket() as listener:
                 listener.bind(("127.0.0.1", 0))
                 port = listener.getsockname()[1]
-            origin = f"http://127.0.0.1:{port}"
+            origin = f"{'https' if https else 'http'}://127.0.0.1:{port}"
             config = root / "app.ini"
             config.write_text(f"""RUN_USER = {getpass.getuser()}
 WORK_PATH = {root}
 [server]
+{tls_settings}
 HTTP_ADDR = 127.0.0.1
 HTTP_PORT = {port}
 ROOT_URL = {origin}/
@@ -127,18 +176,43 @@ ROOT_PATH = {root}/log
             readonly = Forgejo(api.forge, token=token("repo-reader", "read:user,read:repository"), timeout=3)
             collaborator = Forgejo(api.forge, token=token("member", "all", "collaborator"), timeout=3)
             collaborator_control = token("queue-control", "write:repository", "collaborator")
+            probe = Forgejo(api.forge, timeout=3)
             with (root / "server.log").open("w") as log:
                 process = subprocess.Popen([*base, "web"], stdout=log, stderr=subprocess.STDOUT)
                 try:
-                    deadline = time.monotonic() + 30
-                    while True:
-                        try:
-                            api.request("GET", "version")
-                            break
-                        except ForgeError:
-                            if process.poll() is not None or time.monotonic() >= deadline:
-                                self.fail("local Forgejo did not start; private log retained only within fixture")
-                            time.sleep(0.05)
+
+                    def await_source():
+                        deadline = time.monotonic() + 30
+                        while True:
+                            try:
+                                probe.request("GET", "version")
+                                return
+                            except ForgeError:
+                                if process.poll() is not None or time.monotonic() >= deadline:
+                                    self.fail("local Forgejo did not start; private log retained only within fixture")
+                                time.sleep(0.05)
+
+                    await_source()
+                    if https:
+                        # Probe real TLS before sending any bearer: neither an
+                        # untrusted certificate nor a hostname mismatch is accepted.
+                        for context, hostname in (
+                            (ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT), "127.0.0.1"),
+                            (ssl.create_default_context(cafile=str(certificate)), "wrong-fixture.invalid"),
+                        ):
+                            with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+                                with self.assertRaises(ssl.SSLCertVerificationError):
+                                    with context.wrap_socket(connection, server_hostname=hostname):
+                                        pass
+                        # The actual client must reject an untrusted CA too.
+                        empty_ca = root / "empty-ca.pem"
+                        empty_ca.write_text("")
+                        with patch.dict(os.environ, {"SSL_CERT_FILE": str(empty_ca)}):
+                            with self.assertRaises(ForgeError):
+                                # A fresh opener obtains its own trust context;
+                                # existing clients may retain the trusted one.
+                                Forgejo(api.forge, timeout=3).request("GET", "version")
+                        probe.request("GET", "version")
                     api.request(
                         "POST",
                         "user/repos",
@@ -417,6 +491,22 @@ ROOT_PATH = {root}/log
                         if effective_access:
                             self.assertTrue(archive_control.archived)
                             self.assertFalse(archive_control.credential_code_can_push)
+                        if https:
+                            # Keep the source database, certificate and client
+                            # objects; replace only the owned server process.
+                            process.terminate()
+                            process.wait(timeout=10)
+                            process = subprocess.Popen([*base, "web"], stdout=log, stderr=subprocess.STDOUT)
+                            await_source()
+                            after_restart = source.repository_access()
+                            self.assertEqual(after_restart.repository_id, access.repository_id)
+                            self.assertEqual(after_restart.actor, actor)
+                            self.assertTrue(after_restart.archived)
+                            deny_queue_admin(api._token)
+                            self.assertIsNone(member.repository_access())
+                            self.assertEqual(member.last_failure.status, 404)
+                            with self.assertRaises(SourceAccessDenied):
+                                queue_authority.observe(collaborator_control)
                 finally:
                     process.terminate()
                     try:

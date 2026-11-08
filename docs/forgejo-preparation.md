@@ -404,6 +404,15 @@ regressions cover read-only scopes, revocation, slow bodies, lock waits, name re
 and claim ownership. These checks do not constitute the full hosted HTTPS
 or fleet-capacity rehearsal.
 
+The native read/authority fixture also supports `FORGEJO_HTTPS=1`. It generates a
+temporary loopback certificate, trusts that certificate only for the fixture's
+lifetime, and runs the actual Forgejo client over verified HTTPS. Untrusted-CA
+and hostname-mismatch probes must fail before the normal read/authority cycle
+runs. The profile restarts its server with the same database and certificate,
+then checks repository identity, archive state and revoked collaborator access
+again using the existing client objects. This profile requires `openssl`; it does not provide the remaining
+author/review/repair/hosted-CI/merge/mirror lifecycle or fleet-load evidence.
+
 The controller routes repository reads, refs, publication and repository authority
 through `SourcePort`; dispatches, workflow observations, cancellations, verdicts
 and compiled declaration evidence use `ExecutionPort`. The existing combined
