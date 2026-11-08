@@ -288,11 +288,11 @@ These items warrant targeted follow-up; this specification cleanup does not impl
 
 ### Postponed work
 
-**Operator decision, 2026-11-07:** postpone both inference-free splitting and guaranteed reboot startup/dedicated-host migration. Neither is an active implementation or deployment task.
+**Operator decision, 2026-11-07:** inference-free splitting and guaranteed reboot startup remain postponed. The subsequently authorized host relocation completed on November 8; it does not complete reboot supervision.
 
 Hold-and-retry remains the inference policy. Splitting, when resumed, must stay within this engine and specify partitioning, attribution, ordering and recovery without returning control to legacy Bors.
 
-The service and tunnel currently use detached supervisors on chungus; repair workers moved to separate systemd user services on chungus2 on November 7. That repair-only move was explicitly authorized and leaves controller hosting unchanged. Crash/OOM recovery while the user manager is running is implemented, but automatic startup after reboot or user-manager loss is not guaranteed on either host. The runbook records the deployment and lack of lingering. Preserve that known operational limitation until the postponed controller-host/supervision work is resumed; it is not evidence of completed reboot recovery.
+The controller, tunnel, repair workers, monitoring and backups now run through systemd user units on chungus2. Repair execution moved on November 7 and the controller moved on November 8, retaining the running revision and queue state. Crash/OOM recovery while the user manager is running is implemented, but automatic startup after reboot or user-manager loss is not guaranteed (`Linger=no`). The [runbook](../../queue/operations.md#current-deployment) records the deployment and its limitation. Guaranteed reboot recovery remains unscheduled.
 
 ## Later increments
 
