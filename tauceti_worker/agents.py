@@ -495,8 +495,7 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         return fill_prompt(
             HERE / "prompts" / "local-verification.md",
             SCOPE_POLICY=policy,
-            LOCAL_AXIOMS=f'"{python}" "{wrapper_bin(bubble)}/tauceti-local-axioms"',
-            LOCAL_LINT=f'"{python}" -I "{wrapper_bin(bubble)}/tauceti-local-lint"',
+            LOCAL_CHECKS=f'"{python}" "{wrapper_bin(bubble)}/tauceti-local-checks"',
         )
     python = "/usr/bin/python3" if bubble else sys.executable
     helper = f'"{python}" "{wrapper_bin(bubble)}/tauceti-verify"'
@@ -504,7 +503,7 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "### Local verification\n"
         f"Run `{helper}` synchronously after the last edit or integration. "
         f"The worker's local actual-source scope policy is `{policy}`. "
-        "The helper runs the full `lake build --iofail`, fast changed-file axiom checks, "
+        "The helper runs cheap source guards, the full `lake build --iofail`, fast changed-file axiom checks, "
         "module-system, lint and shim-expiry phases. It prints `scope:`, phase exits and a durable receipt path. "
         "For diagnosis, use `--stage build|axioms|module-system|lint|shim-expiry`; final verification uses all stages. "
         "Exact-input phase receipts avoid repeated successful work; use `--no-reuse` only to investigate evidence. "
@@ -2308,8 +2307,16 @@ def run_in_bubble(
     (rounddir / "tauceti-tools").write_text('#!/bin/sh\nexec python3 -m tauceti_tools "$@"\n')
     (rounddir / "tauceti-tools").chmod(0o755)
     # Cheap V0 diagnostics also need these; do not tie them to the helper canary opt-in.
-    for name in ("tauceti-local-axioms", "LocalAxioms.lean", "tauceti-local-lint", "LocalLint.lean"):
-        shutil.copy(HERE / "scripts" / name, rounddir / name)
+    from tauceti_tools.templates import ASSETS
+
+    for name, source in {
+        "tauceti-local-axioms": "local_axioms.py",
+        "tauceti-local-lint": "local_lint.py",
+        "LocalAxioms.lean": "LocalAxioms.lean",
+        "LocalLint.lean": "LocalLint.lean",
+    }.items():
+        shutil.copy(ASSETS / "scripts" / source, rounddir / name)
+    shutil.copy(HERE / "scripts/tauceti-local-checks", rounddir / "tauceti-local-checks")
     # Container-produced executables must never enter the host's checker cache.
     local_axioms_cache = cfg.state / "bubble-local-axioms"
     local_axioms_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -2428,7 +2435,7 @@ def run_in_bubble(
         tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/api-bin:/opt/round:$PATH TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"
         if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
             tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
-    tcenv += " TAUCETI_LOCAL_LINT_CACHE=/opt/local-lint-cache"
+    tcenv += " TAUCETI_LOCAL_LINT_CACHE=/opt/local-lint-cache TAUCETI_VERIFY_PYTHON=/usr/bin/python3"
     tcenv += " LAKE_OVERRIDE_LEAN=true LEAN=/opt/round/tauceti-lean"
     if inner_cmd is None:
         for key, value in _foreground_shell_env(
@@ -2456,7 +2463,6 @@ def run_in_bubble(
             "TAUCETI_VERIFY_POLICY": os.environ.get("TAUCETI_VERIFY_POLICY", "ordinary"),
             "TAUCETI_ROUND_DEADLINE": str(getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)),
             "TAUCETI_VERIFY_CHECKPOINT_MARGIN": os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600"),
-            "TAUCETI_VERIFY_PYTHON": "/usr/bin/python3",
             "TAUCETI_VERIFY_BUBBLE": "1",
         }.items():
             tcenv += f" {key}={shlex.quote(value)}"

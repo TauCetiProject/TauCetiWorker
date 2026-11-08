@@ -51,7 +51,14 @@ class Receipts(unittest.TestCase):
         git(self.root, "init", "-q")
         git(self.root, "config", "user.name", "Fixture")
         git(self.root, "config", "user.email", "fixture@example.org")
-        for name in ("TauCeti/A.lean", "TauCeti/B.lean", "lean-toolchain", "lake-manifest.json", "lakefile.toml"):
+        for name in (
+            "TauCeti.lean",
+            "TauCeti/A.lean",
+            "TauCeti/B.lean",
+            "lean-toolchain",
+            "lake-manifest.json",
+            "lakefile.toml",
+        ):
             write(self.root, name, "fixture\n")
         write(self.root, ".gitignore", ".lake/\nTauCeti/Ignored.lean\n")
         write(self.root, "scripts/lint-env.sh", 'echo "LINT-ENV: PASS"\n')
@@ -70,6 +77,10 @@ class Receipts(unittest.TestCase):
 import sys
 from pathlib import Path
 if sys.argv[1:] == ['--print-prefix']: print({str(self.prefix)!r})
+elif '--run' in sys.argv:
+    import json
+    text = sys.stdin.read()
+    if text: print(json.dumps(dict(checked=len(json.loads(text)),problems=[])))
 else: Path('Main.c').write_text('fixture compiler output')
 """,
         )
@@ -273,10 +284,10 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["commands"][-1]["exit"], 23)
         os.environ.pop("FIXTURE_MODE")
+        # Candidate-owned style scripts cannot replace the shared implementation.
         write(self.root, "scripts/lint-style.sh", "false | cat\n")
         result = self.verify(stage="lint")
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["commands"][-1]["exit"], 1)
+        self.assertEqual(result["status"], "success", result.get("error"))
 
     def test_local_axioms_never_initialize_lake_or_fall_back_to_full(self):
         write(self.root, "TauCeti/A.lean", "changed")
@@ -520,12 +531,32 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
     def test_missing_tools_is_incomplete_before_lake_and_recovers_without_latch(self):
         write(self.root, "scripts/check-expired-mathlib-shims.py", "from tauceti_tools import templates\n")
         with patch.object(verification_tools, "check", side_effect=verification_tools.Unavailable("missing Tools")):
-            for _ in range(2):
-                result = self.verify(stage="shim-expiry")
+            for stage in ("shim-expiry", "lint"):
+                result = self.verify(stage=stage)
                 self.assertEqual(result["status"], "incomplete")
                 self.assertEqual(result["incomplete_reason"], "tool-missing")
                 self.assertEqual(result["commands"], [])
         self.assertEqual(self.verify(stage="shim-expiry")["status"], "success")
+
+    def test_early_source_checker_unavailable_is_incomplete_before_build(self):
+        actual = Verification.command
+
+        def unavailable(verifier, phase, argv, **kwargs):
+            if phase == "lint" and "sources" in argv:
+                raise subprocess.CalledProcessError(75, argv)
+            return actual(verifier, phase, argv, **kwargs)
+
+        with patch.object(Verification, "command", unavailable):
+            result = self.verify(stage="all")
+        self.assertEqual(result["status"], "incomplete", result.get("error"))
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+        self.assertNotIn("build", result["phases"])
+
+    def test_module_system_does_not_require_changed_module_scope(self):
+        write(self.root, ".git/shallow", self.base + "\n")
+        result = self.verify(stage="module-system")
+        self.assertEqual(result["scope"]["mode"], "unknown")
+        self.assertEqual(result["status"], "success", result.get("error"))
 
     def test_probe_preserves_mounted_pythonpath_and_observes_package_repair(self):
         bare = self.home / "mounted-python"
@@ -647,9 +678,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         write(self.root, "scripts/lint-env.sh", 'cat "$LINT_ONLY_MODULES"\n')
         result = self.verify(stage="lint", lint_modules=modules)
         self.assertEqual(result["status"], "success", result.get("error"))
-        lint = next(
-            c for c in result["commands"] if any(str(arg).endswith("/scripts/tauceti-local-lint") for arg in c["argv"])
-        )
+        lint = next(c for c in result["commands"] if "environment" in c["argv"])
         self.assertIn("TauCeti.B", Path(lint["argv"][-1]).read_text())
         self.assertFalse(any("scripts/lint-env.sh" in c["argv"] for c in result["commands"]))
         modules.write_text("TauCeti.A\n")
