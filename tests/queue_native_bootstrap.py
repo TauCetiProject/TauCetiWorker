@@ -59,6 +59,7 @@ class Bootstrap(unittest.TestCase):
             self.policy.source.repository.forge, token="controller-source-token"
         )
         api.forge = self.policy.source.repository.forge
+        api._token = "controller-source-token"
         actor = PrincipalRef(api.forge, "7")
         publishers = NativePublishers(
             self.policy.source,

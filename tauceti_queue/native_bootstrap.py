@@ -75,7 +75,10 @@ class NativeBootstrap:
             or any(not 33 <= c <= 126 for c in self.source_webhook_secret)
         ):
             raise ValueError("native service credentials must bind the approved source and execution origins")
-        if self.control_policy.permits(self.source_git_token):
+        api_token = getattr(self.source_client, "_token", None)
+        if not isinstance(api_token, str) or not api_token:
+            raise ValueError("native service requires an explicit authenticated source client")
+        if self.control_policy.permits(self.source_git_token) or self.control_policy.permits(api_token):
             raise ValueError("queue controls must not enroll the controller publication credential")
         if isinstance(self.execution_tokens, WorkflowTokenSource):
             job = self.execution_tokens.job
