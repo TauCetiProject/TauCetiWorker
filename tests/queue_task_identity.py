@@ -216,6 +216,25 @@ class Identity(unittest.TestCase):
         self.assertIsNotNone(claim["released_at"])
         self.assertNotEqual(self.native.claim().task_id, raw["task_id"])
 
+    def test_stale_prepared_clean_release_does_not_prepare_the_batch_under_a_new_policy(self):
+        controller, store = self.fixture.controller, self.fixture.store
+        store.update("batches", {"id": self.native.batch["id"]}, state="open")
+        batch = store.row("batches", {"id": self.native.batch["id"]})
+        task_id = controller._create_task(batch, "prepare", batch["base"], [], self.fixture.clock())
+        controller.set_setting("repair_concurrency", 2, "fixture-operator")
+        task = self.native.claim()
+        self.assertEqual(task.task_id, task_id)
+        self.fixture.ledger.policy = replace(self.fixture.ledger.policy, harness_revision="e" * 40)
+        controller.release_task(
+            task_id, task.claim_token, "prepared_clean", source_access=self.native.authority.authenticate("token")
+        )
+        self.assertIsNone(store.row("batches", {"id": batch["id"]})["prepared_version"])
+        self.assertEqual(store.row("tasks", {"id": task_id})["resolution"], "policy-changed")
+        replacement = store.rows("tasks", {"batch_id": batch["id"], "kind": "prepare", "state": "open"})[0]
+        self.assertEqual(
+            TaskBinding.parse(loads(replacement["task_binding"])).policy_digest, self.fixture.ledger.policy.digest
+        )
+
     def test_policy_change_during_submit_refresh_keeps_the_result_but_refuses_adoption(self):
         raw = self.raw()
 
