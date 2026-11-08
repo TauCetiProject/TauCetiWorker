@@ -45,7 +45,7 @@ from .ports import (
     Task,
     TaskMember,
 )
-from .source_authority import NativeQueueAuthority, principal_key
+from .source_authority import NativeQueueAuthority, SourceAuthorityUnavailable, principal_key
 from .stale_cache import StaleCache
 from .store import Store, dumps, loads
 
@@ -304,10 +304,16 @@ class ControllerLock:
             return self._priority_waiting
 
     @contextlib.contextmanager
-    def unlocked(self) -> Iterator[None]:
+    def unlocked(self, *, priority: bool = False, reacquire=None) -> Iterator[None]:
         """Let go of every level this thread holds for the body, then take them back (as an ordinary
         acquirer, so the priority requests that queued meanwhile run first). A no-op for a thread that
-        does not hold the lock. The caller must not be inside a store transaction."""
+        does not hold the lock. The caller must not be inside a store transaction.
+
+        An optional reacquire callback runs without the lock and must acquire one
+        level itself; this supports timed priority acquisition with refreshed
+        external evidence. On callback failure we still restore the original
+        ownership/depth before propagating the error.
+        """
         with self._cond:
             if self._owner != threading.get_ident():
                 depth = 0
@@ -318,9 +324,17 @@ class ControllerLock:
             yield
         finally:
             if depth:
-                with self._cond:
-                    self._take(False, None)
-                    self._depth = depth
+                try:
+                    if reacquire is not None:
+                        reacquire()
+                        with self._cond:
+                            if self._owner != threading.get_ident():
+                                raise RuntimeError("reacquire callback did not take the controller lock")
+                finally:
+                    with self._cond:
+                        if self._owner != threading.get_ident():
+                            self._take(priority, None)
+                        self._depth = depth
 
     def offer(self) -> None:
         """Between two units of a long holder's work: let the waiting priority requests run."""
@@ -397,6 +411,7 @@ class Controller:
         # Renewals waiting for the lock: claim token -> when the request arrived. `_expire_claims`
         # spares a claim whose renewal arrived before it expired.
         self._renewing: dict[str, float] = {}
+        self._renewal_waiters: dict[str, dict[object, float]] = {}
         self._renewing_guard = threading.Lock()
         self._wake = threading.Event()
         self._reasons: list[str] = []
@@ -1225,27 +1240,43 @@ class Controller:
             self._source_request_access(evidence, claim=claim)
             return evidence
         actor = evidence.access.actor  # Validated at this operation's entry.
-        with self._lock.unlocked():
-            fresh = refresh()
-        access, _ = self._source_request_access(fresh, claim=claim)
-        if access.actor != actor:
-            raise PermissionError("native source caller changed while refreshing authority")
+        fresh = None
+
+        def acquire_fresh():
+            nonlocal fresh
+            for _ in range(3):
+                fresh = refresh()
+                try:
+                    access, _ = self._source_request_access(fresh, claim=claim)
+                except SourceAuthorityUnavailable:
+                    continue
+                if access.actor != actor:
+                    raise PermissionError("native source caller changed while refreshing authority")
+                remaining = max(0, 15 - (self.source_authority.clock() - fresh.checked_at))
+                if not self._lock.acquire(priority=True, timeout=remaining):
+                    continue
+                try:
+                    self._source_request_access(fresh, claim=claim)
+                except SourceAuthorityUnavailable:
+                    self._lock.release()
+                    continue
+                return
+            raise SourceAuthorityUnavailable("controller stayed busy beyond fresh native authority")
+
+        with self._lock.unlocked(priority=True, reacquire=acquire_fresh):
+            pass
         return fresh
 
-    def _refresh_submission_access(self, evidence, refresh, task, claim, batch):
-        # Task base/tip are checked separately. Snapshot batch membership in SQL
-        # so the post-refresh check does not repeat a potentially long Git walk.
-        members = self._members(batch["id"])
-        fresh = self._refresh_source_access(evidence, refresh, claim=claim)
-        current = self._claim_for(task["id"], claim["token"], self.clock())
-        if (
-            self.store.row("tasks", {"id": task["id"]}) != task
-            or self.store.row("batches", {"id": batch["id"]}) != batch
-            or self._members(batch["id"]) != members
-        ):
-            raise TaskError("version-mismatch", "task or batch changed while refreshing native authority")
-        self._source_request_access(fresh, claim=current)
-        return fresh
+    def _submission_task_current(self, task, batch):
+        if task["kind"] == TASK_PRE_REBASE:
+            return self._pre_rebase_task_current(task, batch)
+        if self._pre_rebased_prepare(task):
+            return self._pre_rebased_prepare_current(task, batch)
+        return (
+            task["state"] == TASK_OPEN
+            and batch["version"] == task["batch_version"]
+            and batch["state"] == (BATCH_OPEN if task["kind"] == TASK_PREPARE else BATCH_HEAD)
+        )
 
     def claim_task(self, worker_identity: str, github_login: str, *, source_access=None) -> Task | None:
         """Hand an open task to an authorized worker under a renewable claim, within `repair_concurrency`.
@@ -1380,7 +1411,7 @@ class Controller:
             if row["task_id"] is not None
         ]
 
-    def renew_task(self, task_id: int, claim_token: str, *, source_access=None) -> float:
+    def renew_task(self, task_id: int, claim_token: str, *, source_access=None, source_refresh=None) -> float:
         """Extend the claim by `claim_ttl_seconds` from now.
 
         The claim's expiry is judged at the request's arrival, not when it gets the lock: a renewal that
@@ -1388,21 +1419,36 @@ class Controller:
         (and `_expire_claims` spares the claim while such a renewal waits).
         """
         arrived = self.clock()
+        if self.candidate_ci is not None:
+            self._source_request_access(source_access)  # Refused callers cannot reserve a renewal wait.
+        waiter = object()
         with self._renewing_guard:
-            self._renewing[claim_token] = min(arrived, self._renewing.get(claim_token, arrived))
+            waiting = self._renewal_waiters.setdefault(claim_token, {})
+            waiting[waiter] = arrived
+            self._renewing[claim_token] = min(waiting.values())
         try:
             with self._lock.priority():
                 claim = self._claim_for(task_id, claim_token, arrived)
                 if self.candidate_ci is not None:
-                    self._source_request_access(source_access, claim=claim)
+                    try:
+                        self._source_request_access(source_access, claim=claim)
+                    except SourceAuthorityUnavailable:
+                        source_access = self._refresh_source_access(source_access, source_refresh, claim=claim)
+                        claim = self._claim_for(task_id, claim_token, arrived)
+                        self._source_request_access(source_access, claim=claim)
                 now = self.clock()
                 expires = now + int(self.setting("claim_ttl_seconds"))
                 self.store.update("claims", {"id": claim["id"]}, expires_at=expires, renewed_at=now)
                 return expires
         finally:
             with self._renewing_guard:
-                if self._renewing.get(claim_token) == arrived:
-                    del self._renewing[claim_token]
+                waiting = self._renewal_waiters[claim_token]
+                del waiting[waiter]
+                if waiting:
+                    self._renewing[claim_token] = min(waiting.values())
+                else:
+                    del self._renewal_waiters[claim_token]
+                    self._renewing.pop(claim_token, None)
 
     def release_task(self, task_id: int, claim_token: str, reason: str, error: str = "", *, source_access=None) -> None:
         """A worker gives a task back. Reason `inference_unavailable` counts toward the inference hold.
@@ -1496,7 +1542,7 @@ class Controller:
             assert batch is not None
             retained = self._retain_submission(task, claim, tip_sha)
             if self.candidate_ci is not None:
-                source_access = self._refresh_submission_access(source_access, source_refresh, task, claim, batch)
+                now = self.clock()
 
             def reject(reason: str, violations: list[chain.Violation] | None = None) -> Adoption:
                 self.store.insert(
@@ -1530,23 +1576,15 @@ class Controller:
                 return reject("claim-expired")
             if self.candidate_ci is None and not self._repository_admin(claim["github_login"]):
                 return reject("not-authorized")
-            if task["kind"] == TASK_PRE_REBASE:
-                if not self._pre_rebase_task_current(task, batch):
-                    return reject("version-mismatch")
-            elif self._pre_rebased_prepare(task):
-                if not self._pre_rebased_prepare_current(task, batch):
-                    return reject("version-mismatch")
-            elif (
-                task["state"] != TASK_OPEN
-                or batch["version"] != task["batch_version"]
-                or batch["state"] != (BATCH_OPEN if task["kind"] == TASK_PREPARE else BATCH_HEAD)
-            ):
+            if not self._submission_task_current(task, batch):
                 return reject("version-mismatch")
             if retained is None:
                 return reject("tip-unavailable")
             members = self._task_members(task)
             records = [self._chain_member(member) for member in members]
             report = chain.validate(self.clone, task["onto"], tip_sha, records)
+            if self.candidate_ci is not None:
+                now = self.clock()
             if not report.ok:
                 self._count("chain_validation_failures")
                 self.store.journal(
@@ -1558,6 +1596,8 @@ class Controller:
                 )
                 return reject("invalid-chain", report.violations)
             comparison = chain.compare(self.clone, task["base"], task["tip"], task["onto"], tip_sha)
+            if self.candidate_ci is not None:
+                now = self.clock()
             if not comparison.ok:
                 self._count("chain_validation_failures")
                 self.store.journal(
@@ -1597,7 +1637,49 @@ class Controller:
                 (d for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions"), {}
             )
             if self.candidate_ci is not None:
-                source_access = self._refresh_submission_access(source_access, source_refresh, task, claim, batch)
+                original_task = task
+                source_access = self._refresh_source_access(source_access, source_refresh, claim=claim)
+                now = self.clock()
+                current_task = self.store.row("tasks", {"id": task_id})
+                current_claim = self.store.row("claims", {"id": claim["id"]})
+                current_batch = self.store.row("batches", {"id": task["batch_id"]})
+                if current_task is None or current_batch is None:
+                    return reject("version-mismatch")
+                if (
+                    current_claim is None
+                    or current_claim["token"] != claim_token
+                    or current_claim["task_id"] != task_id
+                ):
+                    return reject("claim-superseded")
+                task, claim, batch = current_task, current_claim, current_batch
+                self._source_request_access(source_access, claim=claim)
+                if claim["released_at"] is not None:
+                    return reject("claim-expired" if claim["release_reason"] == "expired" else "claim-superseded")
+                if claim["expires_at"] <= now:
+                    self.store.update("claims", {"id": claim["id"]}, released_at=now, release_reason="expired")
+                    return reject("claim-expired")
+                identity_fields = (
+                    "batch_id",
+                    "batch_version",
+                    "kind",
+                    "base",
+                    "tip",
+                    "onto",
+                    "pre_rebase_source",
+                    "ci_attempt_id",
+                )
+                if any(task[key] != original_task[key] for key in identity_fields):
+                    return reject("version-mismatch")
+                if not self._submission_task_current(task, batch):
+                    return reject("version-mismatch")
+                covered = {member["id"] for member in members}
+                current_members = [member for member in self._members(batch["id"]) if member["id"] in covered]
+                if current_members != members:
+                    return reject("version-mismatch")
+                self._source_request_access(source_access, claim=claim)
+                knowledge = next(
+                    (d for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions"), {}
+                )
             if tip_sha == task["tip"] and knowledge.get("was_proactive"):
                 self._release_claim(claim, "source-failure-refresh", now)
                 return reject(
@@ -4150,6 +4232,7 @@ class Controller:
                 chain.delete_chain_ref(self.clone, chain_id)
             if self.source_authority is not None:
                 source_access = self._refresh_source_access(source_access, source_refresh)
+                now = self.clock()
                 if not self._source_head_current(head) or self._members(head["id"]) != members:
                     return {"rebuilt": False, "reason": "head-changed"}
                 if self._active_claims(head["id"]):
@@ -4260,6 +4343,7 @@ class Controller:
                     return {"retried": False, "reason": "github-unavailable", "detail": str(error)}
                 if self.source_authority is not None:
                     source_access = self._refresh_source_access(source_access, source_refresh)
+                    now = self.clock()
                     if not self._source_head_current(head) or self._tip_attempts(head) != attempts:
                         return {"retried": False, "reason": "head-changed"}
                 if run is not None:

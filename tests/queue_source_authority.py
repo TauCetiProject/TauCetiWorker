@@ -6,7 +6,9 @@ import http.client
 import json
 import sys
 import threading
+import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -360,15 +362,234 @@ class NativeClaims(unittest.TestCase):
                 self.controller._create_task(self.batch, "repair", self.batch["base"], [], self.fixture.clock())
             return self.authority.authenticate("token")
 
-        with self.assertRaisesRegex(Exception, "task or batch changed"):
-            self.controller.submit_task(
-                task.task_id,
-                task.claim_token,
-                self.batch["tip"],
-                source_access=self.authority.authenticate("token"),
-                source_refresh=replaced,
-            )
+        result = self.controller.submit_task(
+            task.task_id,
+            task.claim_token,
+            self.batch["tip"],
+            source_access=self.authority.authenticate("token"),
+            source_refresh=replaced,
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "version-mismatch")
+        self.assertEqual(self.store.rows("submissions")[0]["retained_ref"], result.retained_ref)
         self.assertEqual(self.store.row("batches", {"id": self.batch["id"]})["version"], self.batch["version"])
+
+    def test_late_native_result_is_retained_and_recorded_as_a_rejection(self):
+        task = self.claim()
+        self.fixture.clock.advance(901)
+        result = self.controller.submit_task(
+            task.task_id,
+            task.claim_token,
+            self.batch["tip"],
+            source_access=self.authority.authenticate("token"),
+            source_refresh=lambda: self.authority.authenticate("token"),
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "claim-expired")
+        submission = self.store.rows("submissions")[0]
+        self.assertEqual(submission["retained_ref"], result.retained_ref)
+        self.assertTrue(submission["retained_ref"])
+        self.assertEqual(submission["created_at"], self.fixture.clock())
+        self.assertEqual(self.store.row("tasks", {"id": task.task_id})["submissions"], 1)
+
+    def test_claim_released_during_refresh_still_records_the_late_result(self):
+        task = self.claim()
+
+        def released():
+            with self.controller._lock:
+                self.store.update(
+                    "claims", {"task_id": task.task_id}, released_at=self.fixture.clock(), release_reason="released"
+                )
+            return self.authority.authenticate("token")
+
+        result = self.controller.submit_task(
+            task.task_id,
+            task.claim_token,
+            self.batch["tip"],
+            source_access=self.authority.authenticate("token"),
+            source_refresh=released,
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "claim-superseded")
+        self.assertEqual(self.store.rows("submissions")[0]["retained_ref"], result.retained_ref)
+
+    def test_unrelated_batch_metadata_during_refresh_does_not_discard_a_repair(self):
+        task = self.claim()
+
+        def urgent():
+            with self.controller._lock:
+                self.store.update("batches", {"id": self.batch["id"]}, urgent=1)
+            self.fixture.clock.advance(5)
+            return self.authority.authenticate("token")
+
+        result = self.controller.submit_task(
+            task.task_id,
+            task.claim_token,
+            self.batch["tip"],
+            source_access=self.authority.authenticate("token"),
+            source_refresh=urgent,
+        )
+        self.assertTrue(result.accepted)
+        self.assertEqual(self.store.row("batches", {"id": self.batch["id"]})["urgent"], 1)
+        self.assertEqual(self.store.rows("submissions")[0]["created_at"], self.fixture.clock())
+
+    def background_pre_rebase(self):
+        self.store.update("tasks", {"id": self.task_id}, state="superseded")
+        self.controller.set_setting("repair_concurrency", 2, "fixture")
+        accepted = self.fixture.source.create_pr(18, {"B.lean": "b\n"})
+        self.assertTrue(self.controller.approve(self.repository.name, 18, accepted, "reviewer")["accepted"])
+        self.controller.tick()
+        batch = self.store.row("batches", {"state": "open"})
+        self.assertIsNotNone(batch)
+        task_id = self.controller._create_task(batch, "pre_rebase", self.batch["tip"], [], self.fixture.clock())
+        task = self.claim()
+        self.assertEqual((task.task_id, task.kind), (task_id, "pre_rebase"))
+        replay = chain.replay(
+            self.fixture.repo.clone, batch["base"], batch["tip"], self.batch["tip"], chain_id="native-authority-prebase"
+        )
+        self.assertEqual(replay.status, chain.CLEAN)
+        return task, batch, replay.tip
+
+    def test_pre_rebase_refuses_a_head_move_during_authority_refresh(self):
+        task, batch, tip = self.background_pre_rebase()
+
+        def moved():
+            with self.controller._lock:
+                self.store.update("batches", {"id": self.batch["id"]}, tip="d" * 40, version=self.batch["version"] + 1)
+            return self.authority.authenticate("token")
+
+        result = self.controller.submit_task(
+            task.task_id,
+            task.claim_token,
+            tip,
+            source_access=self.authority.authenticate("token"),
+            source_refresh=moved,
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "version-mismatch")
+        self.assertEqual(self.store.row("batches", {"id": batch["id"]})["pre_rebase_tip"], batch["pre_rebase_tip"])
+
+    def test_pre_rebase_keeps_valid_work_when_insertion_appends_during_refresh(self):
+        task, batch, tip = self.background_pre_rebase()
+
+        def appended():
+            with self.controller._lock:
+                accepted = self.fixture.source.create_pr(19, {"C.lean": "c\n"})
+                self.assertTrue(self.controller.approve(self.repository.name, 19, accepted, "reviewer")["accepted"])
+                self.controller.tick()
+            return self.authority.authenticate("token")
+
+        result = self.controller.submit_task(
+            task.task_id,
+            task.claim_token,
+            tip,
+            source_access=self.authority.authenticate("token"),
+            source_refresh=appended,
+        )
+        self.assertTrue(result.accepted, result)
+        current = self.store.row("batches", {"id": batch["id"]})
+        self.assertGreater(current["version"], batch["version"])
+        self.assertEqual({m["number"] for m in self.controller._members(batch["id"])}, {18, 19})
+
+    def test_authority_reacquisition_timeout_refreshes_while_another_thread_holds_the_lock(self):
+        self.authority.clock = time.monotonic
+        initial = self.authority.authenticate("token")
+        held, release = threading.Event(), threading.Event()
+        calls, errors = [], []
+
+        def holder():
+            try:
+                with self.controller._lock:
+                    held.set()
+                    if not release.wait(3):
+                        raise AssertionError("refresh did not retry timed lock acquisition")
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=holder, daemon=True)
+
+        def refresh():
+            fresh = self.authority.authenticate("token")
+            calls.append(fresh)
+            if len(calls) == 1:
+                thread.start()
+                self.assertTrue(held.wait(2))
+                return replace(fresh, checked_at=fresh.checked_at - 14.99)
+            release.set()
+            return fresh
+
+        try:
+            with self.controller._lock.priority():
+                fresh = self.controller._refresh_source_access(initial, refresh)
+                self.authority.validate(fresh)
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(errors, [])
+        self.assertFalse(thread.is_alive())
+
+    def test_overlapping_renewals_keep_the_second_registration_after_the_first_finishes(self):
+        task = self.claim()
+        self.fixture.clock.advance(899)
+        first_registered, both_registered = threading.Event(), threading.Event()
+        second_refreshing, release_second = threading.Event(), threading.Event()
+        results = {}
+        assignments = []
+
+        class Renewals(dict):
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                assignments.append(value)
+                (first_registered if len(assignments) == 1 else both_registered).set()
+
+        self.controller._renewing = Renewals()
+
+        def renew(name, evidence):
+            def refresh():
+                if name == "second":
+                    second_refreshing.set()
+                    if not release_second.wait(5):
+                        raise AssertionError("second renewal was not released")
+                return self.authority.authenticate("token")
+
+            try:
+                results[name] = self.controller.renew_task(
+                    task.task_id, task.claim_token, source_access=evidence, source_refresh=refresh
+                )
+            except Exception as error:
+                results[name] = error
+
+        first = threading.Thread(target=renew, args=("first", self.authority.authenticate("token")), daemon=True)
+        second = None
+        try:
+            with self.controller._lock:
+                first.start()
+                self.assertTrue(first_registered.wait(2))
+                self.fixture.clock.advance(0.5)
+                second = threading.Thread(
+                    target=renew, args=("second", self.authority.authenticate("token")), daemon=True
+                )
+                second.start()
+                self.assertTrue(both_registered.wait(2))
+                self.fixture.clock.advance(16)
+            self.assertTrue(second_refreshing.wait(2))
+            first.join(3)
+            self.assertFalse(first.is_alive())
+            self.assertIsInstance(results["first"], float)
+            with self.controller._lock:
+                self.fixture.clock.advance(901)
+                self.controller._expire_claims(self.fixture.clock())
+                self.assertIsNone(self.store.rows("claims", {"task_id": self.task_id})[0]["released_at"])
+                self.assertIn(task.claim_token, self.controller._renewing)
+        finally:
+            release_second.set()
+            first.join(5)
+            if second is not None:
+                second.join(5)
+        self.assertIsInstance(results["second"], float)
+        self.assertNotIn(task.claim_token, self.controller._renewing)
+        self.assertNotIn(task.claim_token, self.controller._renewal_waiters)
 
 
 class NativeHTTP(unittest.TestCase):
@@ -522,6 +743,12 @@ class NativeHTTP(unittest.TestCase):
         self.assertEqual(self.clients, [])
 
     def test_native_renewal_arriving_before_expiry_survives_the_controller_lock_wait(self):
+        self.check_renewal_wait(2)
+
+    def test_renewal_wait_beyond_evidence_lifetime_refreshes_without_losing_the_claim(self):
+        self.check_renewal_wait(16)
+
+    def check_renewal_wait(self, wait):
         status, task = self.request("/tasks/claim", {"worker": "worker"})
         self.assertEqual(status, 200)
         self.fixture.clock.advance(899)
@@ -545,7 +772,7 @@ class NativeHTTP(unittest.TestCase):
             with self.controller._lock:
                 thread.start()
                 self.assertTrue(queued.wait(2))
-                self.fixture.clock.advance(2)
+                self.fixture.clock.advance(wait)
                 self.controller._expire_claims(self.fixture.clock())
                 claim = self.store.rows("claims", {"task_id": self.task_id})[0]
                 self.assertIsNone(claim["released_at"])
@@ -553,6 +780,21 @@ class NativeHTTP(unittest.TestCase):
             thread.join(5)
         self.assertFalse(thread.is_alive())
         self.assertEqual(results[0][0], 200)
+        self.assertEqual(len(self.clients), 3 if wait > 15 else 2)
+
+    def test_incomplete_body_reaches_its_deadline_without_source_authority_io(self):
+        connection = http.client.HTTPConnection(*self.http.server_address, timeout=10)
+        try:
+            with patch.object(server, "SOURCE_BODY_DEADLINE_SECONDS", 0.02):
+                connection.request(
+                    "POST", "/tasks/claim", b"{", {"Content-Length": "100", "Authorization": "Bearer token"}
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 408)
+        finally:
+            connection.close()
+        self.assertEqual(self.clients, [])
 
 
 if __name__ == "__main__":

@@ -252,7 +252,9 @@ ROOT_PATH = {root}/log
                         self.assertTrue(access.user_code_can_push)
                         self.assertTrue(access.user_is_repo_admin)
                         queue_authority = NativeQueueAuthority(RepositoryIdentity(repo, access.repository_id))
-                        queue_authority.require_admin(queue_authority.observe(api._token))
+                        queue_authority.require_admin(
+                            queue_authority.validate(queue_authority.authenticate(api._token))
+                        )
                         reused_name = NativeQueueAuthority(RepositoryIdentity(repo, access.repository_id + 1))
                         with self.assertRaises(SourceAccessDenied):
                             reused_name.observe(api._token)

@@ -60,6 +60,7 @@ from .stale_cache import MAX_AGE_SECONDS, StaleCache
 log = logging.getLogger("tauceti_queue.server")
 
 MAX_BODY = 25 * 1024 * 1024
+SOURCE_BODY_DEADLINE_SECONDS = 10.0
 REPOSITORY_ROUTE = re.compile(r"^/repositories/(\d+)/(active-batches|candidates)$")
 TASK_ROUTE = re.compile(r"^/tasks/([A-Za-z0-9_.:-]+)/(renew|result|release)$")
 # `ControllerError.code` (tauceti_queue/controller.py) to HTTP status.
@@ -357,11 +358,13 @@ class Handler(BaseHTTPRequestHandler):
     def _read_body(self) -> bytes | None:
         length = int(self.headers.get("Content-Length") or 0)
         if length < 0 or length > MAX_BODY:
+            if self.server.source_authority is not None:
+                self.close_connection = True
             self._error(413, "body too large")
             return None
         if self.server.source_authority is None:
             return self.rfile.read(length) if length else b""
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + SOURCE_BODY_DEADLINE_SECONDS
         chunks, remaining = [], length
         previous = self.connection.gettimeout()
         try:
@@ -379,6 +382,7 @@ class Handler(BaseHTTPRequestHandler):
             return b"".join(chunks)
         except TimeoutError:
             self.close_connection = True
+            self.connection.settimeout(previous)
             self._error(408, "native request body deadline exceeded")
             return None
         finally:
@@ -465,6 +469,7 @@ class Handler(BaseHTTPRequestHandler):
     def _authenticated_json(self):
         if self.server.source_authority is not None:
             if NativeBearerAuth.token(self.headers.get("Authorization")) is None:
+                self.close_connection = True
                 return self._authenticated(), None  # Syntactic check only, before any body or source I/O.
             # A slow request body must not keep an earlier native ACL grant.
             body = self._read_json()
@@ -730,7 +735,9 @@ class Handler(BaseHTTPRequestHandler):
         tid = int(task_id) if task_id.isdigit() else task_id
         controller = self.server.controller
         if action == "renew":
-            self._call(lambda: _renewal(tid, controller.renew_task(tid, token, **self._source_task_kwargs())))
+            self._call(
+                lambda: _renewal(tid, controller.renew_task(tid, token, **self._source_task_kwargs(refresh=True)))
+            )
         elif action == "release":
             self._call(
                 lambda: controller.release_task(

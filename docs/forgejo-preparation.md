@@ -308,10 +308,20 @@ including the native reads; they are checked after acquiring the controller lock
 Claims persist a separate qualified native
 actor record, leaving the legacy GitHub-login field empty. Renewal, release and
 submission require the same native actor ID and origin plus fresh authority; a
-login rename preserves ownership and a reused login does not. Renewal retains its
-protection when delivered before expiry while waiting for the controller lock.
-Submission refreshes authority outside the lock after retention and before
-adopting a chain, then checks the current task, claim, batch and membership again.
+login rename preserves ownership and a reused login does not. After fresh
+authentication, a renewal entering the controller before expiry retains its
+arrival time while waiting for the lock, refreshing expired authority outside the
+lock while its renewal registration stays active. Reacquisition uses priority and
+the remaining evidence lifetime, with at most three fresh observations; overlapping
+renewals keep independent registrations. Source authentication and ACL
+outages fail closed; an unauthenticated request cannot extend a lease.
+Submission refreshes authority outside the lock after validation and before
+adopting a chain, then checks current claim, task-kind rules, head target and
+covered membership again. Unrelated metadata and valid append operations for
+pre-rebase and pre-rebased-prepare tasks do not discard work. Ordinary preparation
+still requires its exact batch version. Stale or late results are recorded as
+retained rejections; that audit bookkeeping uses the initially authenticated
+request and never grants adoption or source-write authority.
 Operator retry and rebuild refresh and recheck state after their slow reads too.
 Existing unqualified
 claim records cannot acquire a native owner implicitly.
