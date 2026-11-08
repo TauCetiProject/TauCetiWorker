@@ -666,7 +666,7 @@ class Verification:
             return [(args, env)]
         if phase not in {"module-system", "lint"}:
             raise ValueError(f"unknown verification phase {phase}")
-        if selected["mode"] == "unknown":
+        if phase == "lint" and selected["mode"] == "unknown":
             raise Incomplete(f"{phase}: changed modules unknown; CI owns the full checks")
         self.check_tools()
         shared = [sys.executable, str(HERE / "scripts/tauceti-local-checks")]
@@ -711,7 +711,7 @@ class Verification:
         )
         cache_token = _HASH_CACHE.set(cache)
         try:
-            if "shim-expiry" in self.requested:
+            if any(phase in self.requested for phase in ("shim-expiry", "axioms", "module-system", "lint")):
                 self.check_tools()
 
             def interrupted(signum, _):
@@ -807,19 +807,27 @@ class Verification:
 
                 preserve_candidate(self, disposable_only=True)
                 self.receipt["phases"]["lint"] = dict(status="incomplete", started_at=time.time(), ended_at=None)
-                self.command(
-                    "lint",
-                    [
-                        sys.executable,
-                        str(HERE / "scripts/tauceti-local-checks"),
-                        "sources",
-                        "--base",
-                        self.base,
-                        "--policy",
-                        self.policy,
-                    ],
-                    env=dict(os.environ),
-                )
+                try:
+                    self.command(
+                        "lint",
+                        [
+                            sys.executable,
+                            str(HERE / "scripts/tauceti-local-checks"),
+                            "sources",
+                            "--base",
+                            self.base,
+                            "--policy",
+                            self.policy,
+                        ],
+                        env=dict(os.environ),
+                    )
+                except subprocess.CalledProcessError as error:
+                    if error.returncode in {2, 75}:
+                        raise Incomplete(
+                            "local source checker unavailable; see the phase log",
+                            reason="tool-missing" if error.returncode == 75 else "invalid-input",
+                        ) from error
+                    raise
             for phase in self.requested:
                 self.watch()
                 reused = self.find_reuse(fingerprint, phase) if self.reuse else None

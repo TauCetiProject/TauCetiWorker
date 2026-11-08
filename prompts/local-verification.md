@@ -20,7 +20,7 @@ full transitive axiom and global declaration-ownership audits remain in CI.
 
 Keep commands in the foreground and wait for their actual exit. If Codex returns a session ID,
 wait on that session with write_stdin until it exits. If piping output, use `set -o pipefail`.
-After a failure, rerun the failing phase (`sources`, `build`, `axioms`, `module-system`, `style`,
+After a failure, rerun the failing phase (`sources`, `axioms`, `module-system`, `style`,
 `environment` or `shim-expiry`) as needed; `lake build --iofail` is the build command. Repeat
 successful checks only if their inputs changed. Preserve unfinished work at the round deadline.
 

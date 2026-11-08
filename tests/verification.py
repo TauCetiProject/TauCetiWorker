@@ -531,12 +531,32 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
     def test_missing_tools_is_incomplete_before_lake_and_recovers_without_latch(self):
         write(self.root, "scripts/check-expired-mathlib-shims.py", "from tauceti_tools import templates\n")
         with patch.object(verification_tools, "check", side_effect=verification_tools.Unavailable("missing Tools")):
-            for _ in range(2):
-                result = self.verify(stage="shim-expiry")
+            for stage in ("shim-expiry", "lint"):
+                result = self.verify(stage=stage)
                 self.assertEqual(result["status"], "incomplete")
                 self.assertEqual(result["incomplete_reason"], "tool-missing")
                 self.assertEqual(result["commands"], [])
         self.assertEqual(self.verify(stage="shim-expiry")["status"], "success")
+
+    def test_early_source_checker_unavailable_is_incomplete_before_build(self):
+        actual = Verification.command
+
+        def unavailable(verifier, phase, argv, **kwargs):
+            if phase == "lint" and "sources" in argv:
+                raise subprocess.CalledProcessError(75, argv)
+            return actual(verifier, phase, argv, **kwargs)
+
+        with patch.object(Verification, "command", unavailable):
+            result = self.verify(stage="all")
+        self.assertEqual(result["status"], "incomplete", result.get("error"))
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+        self.assertNotIn("build", result["phases"])
+
+    def test_module_system_does_not_require_changed_module_scope(self):
+        write(self.root, ".git/shallow", self.base + "\n")
+        result = self.verify(stage="module-system")
+        self.assertEqual(result["scope"]["mode"], "unknown")
+        self.assertEqual(result["status"], "success", result.get("error"))
 
     def test_probe_preserves_mounted_pythonpath_and_observes_package_repair(self):
         bare = self.home / "mounted-python"
