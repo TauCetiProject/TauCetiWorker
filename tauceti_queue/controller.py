@@ -381,6 +381,8 @@ class Controller:
         if candidate_ci is None and store.get_setting("source-ci:binding") is not None:
             raise ValueError("source-bound queue ledger requires its qualified CI coordinator")
         if candidate_ci is not None:
+            if candidate_ci.ledger.policy.source.repository.forge.kind != "forgejo":
+                raise ValueError("source CI currently requires the qualified Forgejo task protocol")
             if candidate_ci.ledger.store is not store or candidate_ci.ledger.clone != str(clone):
                 raise ValueError("source CI ledger does not belong to this controller")
             if getattr(github, "repository_identity", None) != candidate_ci.ledger.policy.source:
@@ -396,6 +398,12 @@ class Controller:
         self.repository = repository
         source_identity = getattr(self.source, "repository_identity", None)
         self.native_source = bool(source_identity and source_identity.repository.forge.kind == "forgejo")
+        if self.native_source and candidate_ci is None:
+            raise ValueError("Forgejo source requires qualified source CI; legacy GitHub execution is unavailable")
+        if self.native_source:
+            configure_publishers = getattr(self.source, "configure_publisher_policy", None)
+            if configure_publishers is not None:
+                configure_publishers(store)
         self.provenance_repository = source_identity.repository.key if self.native_source else repository
         self.revision = revision
         self.clock = clock
@@ -2958,7 +2966,7 @@ class Controller:
             row["head_sha"],
             title=row["title"],
             description=row["description"],
-            author="" if self.candidate_ci is not None else row["author"],
+            author="" if self.native_source else row["author"],
             coauthors=None if loads(row["coauthors"]) is None else tuple(loads(row["coauthors"])),
         )
         chain_id = f"probe-{batch['id']}-{secrets.token_hex(4)}"
@@ -6160,7 +6168,33 @@ class Controller:
         result = ""
         try:
             with self._lock.unlocked():
-                result = self._perform(current["kind"], loads(current["payload"], {}), now)
+                payload = loads(current["payload"], {})
+                prepare_comment = getattr(self.source, "prepare_outbox_comment", None)
+                if (
+                    self.native_source
+                    and current["kind"] == "comment"
+                    and "native_intent" not in payload
+                    and prepare_comment is not None
+                ):
+                    intent = prepare_comment(
+                        self.repository,
+                        payload["number"],
+                        payload["body"],
+                        payload["marker"],
+                        sequence=current["id"],
+                    )
+                    if intent is not None:
+                        # Freeze before the first status/comment POST. A restart
+                        # or uncertain response must retain both nonce and order.
+                        with self._lock, self.store.transaction():
+                            pending = self._pending_entry(current)
+                            if pending is None:
+                                return
+                            payload = loads(pending["payload"], {})
+                            if "native_intent" not in payload:
+                                payload["native_intent"] = intent
+                                self.store.update("outbox", {"id": current["id"]}, payload=dumps(payload))
+                result = self._perform(current["kind"], payload, now)
         except Exception as caught:  # noqa: BLE001 - every adapter failure is recorded and retried
             error = caught
         with self._lock:
@@ -6234,6 +6268,22 @@ class Controller:
             self.source.update_ref(repo, payload["ref"], payload["sha"])
             return "retained"
         if kind == "comment":
+            if "native_intent" in payload and self.native_source:
+                from .forgejo_source import PublicationDamaged, PublicationSuperseded
+
+                try:
+                    return "comment " + str(self.source.publish(payload["native_intent"]))
+                except PublicationSuperseded:
+                    return "superseded native publication"
+                except PublicationDamaged:
+                    with self._lock:
+                        self.store.journal(
+                            now,
+                            "native-publication-damaged",
+                            number=payload["number"],
+                            nonce=payload["native_intent"]["nonce"],
+                        )
+                    return "reconciliation-required: confirmed native publication was moderated"
             return "comment " + str(
                 self.source.post_comment(repo, payload["number"], payload["body"], payload["marker"])
             )

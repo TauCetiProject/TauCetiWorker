@@ -60,6 +60,7 @@ class Integration(unittest.TestCase):
                 frozenset({actor.principal}),
                 frozenset({queue_actor.principal}),
                 frozenset({queue_actor.principal}),
+                generation="1" * 32,
             )
             admission = NativeAdmissionPolicy(publishers, rubrics=("proof",), prefix="Math/", allow_files=())
             clone = root / "controller"
@@ -99,10 +100,14 @@ class Integration(unittest.TestCase):
             # an otherwise configured publisher and tied to the same Git SHA.
             reviewer.post_comment(repository, number, body)
             for context in ("build", "scope"):
-                api.request("POST", f"repos/{name}/statuses/{head}", {"context": context, "state": "success"})
+                api.request(
+                    "POST",
+                    f"repos/{name}/statuses/{head}",
+                    {"context": context, "state": "success", "description": source.ci_status_description},
+                )
             snapshot = source.admission_snapshot(name, number)
             self.assertFalse(admission.evaluate(snapshot)[0]["merge"])
-            intent = publisher.prepare_publication(name, number, head, body, "review-native")
+            intent = publisher.prepare_publication(name, number, head, body, "review-native", sequence=1)
             comment_id = publisher.publish(intent)
             # A write-only publisher reconciles its own accepted receipt without
             # the repo-admin permission needed to inspect another user's ACL.
@@ -123,28 +128,40 @@ class Integration(unittest.TestCase):
             with self.assertRaises(Incomplete):
                 source.admission_snapshot(name, number)
             repaired = publisher.prepare_publication(
-                name, number, head, body + "\nRestored intended publication.", "review-native-restored"
+                name, number, head, body + "\nRestored intended publication.", "review-native-restored", sequence=2
             )
             publisher.publish(repaired)
             self.assertTrue(admission.evaluate(source.admission_snapshot(name, number))[0]["merge"])
             red = body.replace('"green"', '"blocking_request"')
-            withdrawn = publisher.prepare_publication(name, number, head, red, "review-native-red")
+            withdrawn = publisher.prepare_publication(name, number, head, red, "review-native-red", sequence=3)
             red_id = publisher.publish(withdrawn)
             self.assertFalse(admission.evaluate(source.admission_snapshot(name, number))[0]["merge"])
             contributor.request("DELETE", f"repos/{name}/issues/comments/{red_id}")
             with self.assertRaises(Incomplete):
                 source.admission_snapshot(name, number)
             restored = publisher.prepare_publication(
-                name, number, head, body + "\nNew confirmed verdict.", "review-native-current"
+                name, number, head, body + "\nNew confirmed verdict.", "review-native-current", sequence=4
             )
             publisher.publish(restored)
             self.assertTrue(admission.evaluate(source.admission_snapshot(name, number))[0]["merge"])
             # Latest trusted status wins; an ordinary contributor's same-name
             # green status cannot hide a trusted failure.
-            api.request("POST", f"repos/{name}/statuses/{head}", {"context": "build", "state": "failure"})
-            contributor.request("POST", f"repos/{name}/statuses/{head}", {"context": "build", "state": "success"})
+            api.request(
+                "POST",
+                f"repos/{name}/statuses/{head}",
+                {"context": "build", "state": "failure", "description": source.ci_status_description},
+            )
+            contributor.request(
+                "POST",
+                f"repos/{name}/statuses/{head}",
+                {"context": "build", "state": "success", "description": source.ci_status_description},
+            )
             self.assertFalse(admission.evaluate(source.admission_snapshot(name, number))[0]["merge"])
-            api.request("POST", f"repos/{name}/statuses/{head}", {"context": "build", "state": "success"})
+            api.request(
+                "POST",
+                f"repos/{name}/statuses/{head}",
+                {"context": "build", "state": "success", "description": source.ci_status_description},
+            )
             # Revocation is a current native ACL read, never a cached login grant.
             admin.request("PUT", f"repos/{name}/collaborators/reviewer", {"permission": "read"})
             self.assertFalse(admission.evaluate(source.admission_snapshot(name, number))[0]["merge"])
@@ -196,6 +213,49 @@ class Integration(unittest.TestCase):
                     store, source, str(clone), name, revision="native-source-fixture", clock=clock, candidate_ci=ci
                 )
                 controller.set_setting("publication_enabled", True, "disposable fixture")
+                recovery_body = f"Merge-queue recovery for head `{head}`\n<!--tauceti-rebase:v1 {head}-->"
+                controller._enqueue(
+                    "comment",
+                    "native-recovery-retry",
+                    {
+                        "number": number,
+                        "body": recovery_body,
+                        "marker": "native-recovery-retry",
+                    },
+                )
+                recovery_entry = store.row("outbox", {"key": "native-recovery-retry"})
+                original_publish = source.publish
+
+                def lose_accepted_publication(intent):
+                    original_publish(intent)
+                    raise OSError("lost accepted recovery response")
+
+                with patch.object(source, "publish", side_effect=lose_accepted_publication):
+                    controller._drain_outbox(clock())
+                pending_recovery = store.row("outbox", {"id": recovery_entry["id"]})
+                self.assertEqual(pending_recovery["state"], "pending")
+                frozen_recovery = json.loads(pending_recovery["payload"])["native_intent"]
+                comments_after_accept = len(api.comments(repository, number))
+                clock.advance(60)
+                with patch.object(
+                    source, "prepare_outbox_comment", side_effect=AssertionError("intent was re-prepared")
+                ):
+                    controller._drain_outbox(clock())
+                settled = store.row("outbox", {"id": recovery_entry["id"]})
+                self.assertEqual(settled["state"], "done")
+                self.assertEqual(json.loads(settled["payload"])["native_intent"], frozen_recovery)
+                self.assertEqual(len(api.comments(repository, number)), comments_after_accept)
+                clear = source.prepare_publication(
+                    name,
+                    number,
+                    head,
+                    "",
+                    "native-recovery-clear",
+                    sequence=recovery_entry["id"] + 1,
+                    kind="recovery",
+                    clear=True,
+                )
+                source.publish(clear)
                 poller = AdmissionPoller(controller, source, name, admission, clock=clock)
                 summary = poller.run_once()
                 self.assertEqual(summary["errors"], [])
@@ -216,7 +276,7 @@ class Integration(unittest.TestCase):
                 )
                 execution.add(frozen, classification="passed")
                 reviewing = publisher.prepare_publication(
-                    name, number, head, body + "\nRefreshed verdict.", "review-native-current"
+                    name, number, head, body + "\nRefreshed verdict.", "review-native-current", sequence=5
                 )
                 with patch.object(reviewer, "post_comment", side_effect=ForgeError("publication outage", status=503)):
                     with self.assertRaises(ForgeError):

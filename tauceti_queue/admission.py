@@ -113,7 +113,7 @@ def relevant_comment(comment):
         policy.SCOREBOARD_MARKER in body
         or bool(recovery_heads([comment]))
         or body.startswith("Merge-queue recovery for head `")
-        and "<!--tauceti-source:v1 " in body
+        and "<!--tauceti-source:v2 " in body
     )
 
 
@@ -207,9 +207,6 @@ class AdmissionPoller:
         self.policy = policy_config
         self.clock = clock
         self.state = AdmissionState(controller.store, repo, clock=clock)
-        bind_history = getattr(adapter, "bind_publisher_history", None)
-        if bind_history is not None:
-            bind_history(controller.store)
         client = getattr(adapter, "client", None)
         restore = getattr(client, "restore_deadlines", None)
         if restore is not None:
@@ -368,6 +365,11 @@ class AdmissionPoller:
                 return self._run(reason)
 
     def _run(self, reason):
+        configure_polling = getattr(self.adapter, "configure_admission_polling", None)
+        if configure_polling is not None:
+            configure_polling(
+                clock=self.clock, refresh_seconds=self.controller.setting("approval_poll_interval_seconds")
+            )
         summary = {
             "at": self.clock(),
             "reason": reason,
