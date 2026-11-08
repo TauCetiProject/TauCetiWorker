@@ -6345,15 +6345,19 @@ class Controller:
 
     def _outbox_done(self, entry: dict[str, Any], history: list[Any], result: str, now: float) -> None:
         history.append({"at": now, "result": result})
-        self.store.update(
-            "outbox",
-            {"id": entry["id"]},
-            state="done",
-            attempts=entry["attempts"] + 1,
-            history=dumps(history[-20:]),
-            done_at=now,
-            result=result,
-        )
+        with self.store.transaction():
+            self.store.update(
+                "outbox",
+                {"id": entry["id"]},
+                state="done",
+                attempts=entry["attempts"] + 1,
+                history=dumps(history[-20:]),
+                done_at=now,
+                result=result,
+            )
+            publication = loads(entry["payload"], {}).get("publication")
+            if self.native_source and self.admission is not None and publication and result.startswith("comment "):
+                self.admission.invalidate(loads(entry["payload"], {})["number"], head="", urgent=True)
 
     def _outbox_failed(self, entry: dict[str, Any], history: list[Any], error: Exception, now: float) -> None:
         attempts = entry["attempts"] + 1

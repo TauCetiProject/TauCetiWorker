@@ -974,7 +974,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
 
     def _check_publication_current(self, intent, context):
         latest = self._publication_latest(self.client.statuses(self.repository, intent["head"]), context)
-        if latest is None or latest[1]["_stage"] == "unverified":
+        if latest is None or latest[1]["_stage"] in {"unverified", "retired"}:
             raise Incomplete("native publication registration needs observation or exact-intent reconciliation")
         stamp = latest[1]
         if stamp["_nonce"] != intent["nonce"]:

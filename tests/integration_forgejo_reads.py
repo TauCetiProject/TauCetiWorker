@@ -6,12 +6,14 @@ belongs to a temporary loopback-only instance; no installed worker is executed.
 """
 
 import base64
+import contextlib
 import getpass
 import importlib
 import json
 import os
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -26,7 +28,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_tools.ci_candidate import RepositoryIdentity
 from tauceti_tools.forge import Forge, ForgeError, Forgejo, RepositoryRef
 
-from tauceti_queue.source_authority import NativeQueueAuthority, SourceAccessDenied
+from tauceti_queue.source_authority import (
+    NativeQueueAuthority,
+    QueueControlPolicy,
+    SourceAccessDenied,
+    control_token_fingerprint,
+)
 from tauceti_worker.forgejo_reads import BoundedReadCache
 from tauceti_worker.github import GitHub
 from tauceti_worker.review_state import ReviewState
@@ -35,23 +42,72 @@ from tauceti_worker.review_state import ReviewState
 class Integration(unittest.TestCase):
     def test_real_source_with_service_and_github_fallback_blocked(self):
         binary = os.environ.get("FORGEJO_BINARY")
+        effective_access = os.environ.get("FORGEJO_EFFECTIVE_ACCESS") == "1"
+        https = os.environ.get("FORGEJO_HTTPS") == "1"
         if not binary:
             self.skipTest("set FORGEJO_BINARY to run a disposable loopback server")
-        with tempfile.TemporaryDirectory(prefix="worker-forgejo-") as temporary:
-            root = Path(temporary)
+        with tempfile.TemporaryDirectory(prefix="worker-forgejo-") as temporary, contextlib.ExitStack() as environment:
+            root = Path(temporary).resolve()
+            tls_settings = ""
+            if https:
+                certificate, key = root / "source.crt", root / "source.key"
+                result = subprocess.run(
+                    [
+                        "openssl",
+                        "req",
+                        "-x509",
+                        "-newkey",
+                        "rsa:2048",
+                        "-nodes",
+                        "-days",
+                        "1",
+                        "-keyout",
+                        str(key),
+                        "-out",
+                        str(certificate),
+                        "-subj",
+                        "/CN=source-fixture.invalid",
+                        "-config",
+                        "/dev/null",
+                        "-addext",
+                        "subjectAltName=IP:127.0.0.1",
+                        "-addext",
+                        "basicConstraints=critical,CA:TRUE",
+                        "-addext",
+                        "keyUsage=critical,keyCertSign,digitalSignature,keyEncipherment",
+                        "-addext",
+                        "extendedKeyUsage=serverAuth",
+                    ],
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, "local TLS certificate generation failed")
+                key.chmod(0o600)
+                environment.enter_context(
+                    patch.dict(
+                        os.environ,
+                        {
+                            "SSL_CERT_FILE": str(certificate),
+                            "GIT_SSL_CAINFO": str(certificate),
+                        },
+                    )
+                )
+                tls_settings = f"PROTOCOL = https\nCERT_FILE = {certificate}\nKEY_FILE = {key}\n"
             with socket.socket() as listener:
                 listener.bind(("127.0.0.1", 0))
                 port = listener.getsockname()[1]
-            origin = f"http://127.0.0.1:{port}"
+            origin = f"{'https' if https else 'http'}://127.0.0.1:{port}"
             config = root / "app.ini"
             config.write_text(f"""RUN_USER = {getpass.getuser()}
 WORK_PATH = {root}
 [server]
+{tls_settings}
 HTTP_ADDR = 127.0.0.1
 HTTP_PORT = {port}
 ROOT_URL = {origin}/
 DISABLE_SSH = true
 APP_DATA_PATH = {root}/data
+STATIC_ROOT_PATH = {os.environ.get("FORGEJO_STATIC_ROOT", "")}
 [database]
 DB_TYPE = sqlite3
 PATH = {root}/db.sqlite
@@ -124,18 +180,45 @@ ROOT_PATH = {root}/log
             restricted = Forgejo(api.forge, token=token("identity-only", "read:user"), timeout=3)
             readonly = Forgejo(api.forge, token=token("repo-reader", "read:user,read:repository"), timeout=3)
             collaborator = Forgejo(api.forge, token=token("member", "all", "collaborator"), timeout=3)
+            collaborator_control = token("queue-control", "write:repository", "collaborator")
+            third_party_control = token("third-party-ci", "write:repository")
+            probe = Forgejo(api.forge, timeout=3)
             with (root / "server.log").open("w") as log:
                 process = subprocess.Popen([*base, "web"], stdout=log, stderr=subprocess.STDOUT)
                 try:
-                    deadline = time.monotonic() + 30
-                    while True:
-                        try:
-                            api.request("GET", "version")
-                            break
-                        except ForgeError:
-                            if process.poll() is not None or time.monotonic() >= deadline:
-                                self.fail("local Forgejo did not start; private log retained only within fixture")
-                            time.sleep(0.05)
+
+                    def await_source():
+                        deadline = time.monotonic() + 30
+                        while True:
+                            try:
+                                probe.request("GET", "version")
+                                return
+                            except ForgeError:
+                                if process.poll() is not None or time.monotonic() >= deadline:
+                                    self.fail("local Forgejo did not start; private log retained only within fixture")
+                                time.sleep(0.05)
+
+                    await_source()
+                    if https:
+                        # Probe real TLS before sending any bearer: neither an
+                        # untrusted certificate nor a hostname mismatch is accepted.
+                        for context, hostname in (
+                            (ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT), "127.0.0.1"),
+                            (ssl.create_default_context(cafile=str(certificate)), "wrong-fixture.invalid"),
+                        ):
+                            with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+                                with self.assertRaises(ssl.SSLCertVerificationError):
+                                    with context.wrap_socket(connection, server_hostname=hostname):
+                                        pass
+                        # The actual client must reject an untrusted CA too.
+                        empty_ca = root / "empty-ca.pem"
+                        empty_ca.write_text("")
+                        with patch.dict(os.environ, {"SSL_CERT_FILE": str(empty_ca)}):
+                            with self.assertRaises(ForgeError):
+                                # A fresh opener obtains its own trust context;
+                                # existing clients may retain the trusted one.
+                                Forgejo(api.forge, timeout=3).request("GET", "version")
+                        probe.request("GET", "version")
                     api.request(
                         "POST",
                         "user/repos",
@@ -251,19 +334,75 @@ ROOT_PATH = {root}/log
                         self.assertEqual(access.actor, actor)
                         self.assertTrue(access.user_code_can_push)
                         self.assertTrue(access.user_is_repo_admin)
-                        queue_authority = NativeQueueAuthority(RepositoryIdentity(repo, access.repository_id))
-                        queue_authority.require_admin(
-                            queue_authority.validate(queue_authority.authenticate(api._token))
+                        queue_identity = RepositoryIdentity(repo, access.repository_id)
+                        # Dedicated enrollment is explicit; scope/ACL/revocation tests
+                        # enroll their narrow negative-test tokens as well.
+                        controls = (api._token, readonly._token, collaborator._token, collaborator_control)
+                        control_policy = QueueControlPolicy(
+                            queue_identity,
+                            frozenset(control_token_fingerprint(queue_identity, bearer) for bearer in controls),
                         )
-                        reused_name = NativeQueueAuthority(RepositoryIdentity(repo, access.repository_id + 1))
+                        policy_file = root / "queue-control-policy.json"
+                        policy_file.write_text(json.dumps(control_policy.record()))
+                        policy_file.chmod(0o600)
+                        queue_authority = NativeQueueAuthority.from_control_file(queue_identity, policy_file)
+
+                        def deny_queue_admin(bearer):
+                            if effective_access:
+                                # Observation must succeed on the private build;
+                                # an unsupported route or scope error is a failure.
+                                observation = queue_authority.observe(bearer)
+                                with self.assertRaises(SourceAccessDenied):
+                                    queue_authority.require_admin(observation)
+                                return observation
+                            with self.assertRaises(SourceAccessDenied):
+                                queue_authority.observe(bearer)
+
+                        if effective_access:
+                            queue_authority.require_admin(
+                                queue_authority.validate(queue_authority.authenticate(api._token))
+                            )
+                            # A real, independently valid Code-write/admin
+                            # token is not automatically a queue credential.
+                            third_party = Forgejo(api.forge, token=third_party_control, timeout=3)
+                            third_party_rights = third_party.request(
+                                "GET", f"repositories/{access.repository_id}/effective_access"
+                            )
+                            self.assertTrue(third_party_rights["code_write"])
+                            self.assertTrue(third_party_rights["repository_admin"])
+                            with self.assertRaisesRegex(SourceAccessDenied, "dedicated credential"):
+                                queue_authority.observe(third_party_control)
+                        else:
+                            # Stock Forgejo lacks effective scope evidence. User
+                            # ACLs remain available for surveys, never controls.
+                            with self.assertRaises(SourceAccessDenied):
+                                queue_authority.observe(api._token)
+                        missing_identity = RepositoryIdentity(repo, access.repository_id + 1)
+                        missing_id = NativeQueueAuthority(
+                            missing_identity,
+                            control_policy=QueueControlPolicy(
+                                missing_identity, frozenset({control_token_fingerprint(missing_identity, api._token)})
+                            ),
+                        )
                         with self.assertRaises(SourceAccessDenied):
-                            reused_name.observe(api._token)
+                            missing_id.observe(api._token)
                         self.assertIsNone(other.repository_access())
                         self.assertIn(other.last_failure.status, {401, 403, 404})
                         read_access = reader.repository_access()
                         self.assertEqual(read_access.actor, actor)
                         self.assertTrue(read_access.user_code_can_push)
-                        queue_authority.require_admin(queue_authority.observe(readonly._token))
+                        readonly_control = deny_queue_admin(readonly._token)
+                        if effective_access:
+                            self.assertTrue(readonly_control.user_code_can_push)
+                            self.assertTrue(readonly_control.user_is_repo_admin)
+                            self.assertEqual(
+                                (
+                                    readonly_control.credential_code_can_read,
+                                    readonly_control.credential_code_can_push,
+                                    readonly_control.credential_is_repo_admin,
+                                ),
+                                (True, False, False),
+                            )
                         print("Read-only token reports native push ACL:", read_access.user_code_can_push, flush=True)
                         with self.assertRaises(ForgeError) as denied_write:
                             readonly.request(
@@ -282,8 +421,7 @@ ROOT_PATH = {root}/log
                             queue_authority.observe(collaborator._token)
                         api.request("PUT", "repos/operator/source/collaborators/collaborator", {"permission": "read"})
                         member_read = member.repository_access()
-                        with self.assertRaises(SourceAccessDenied):
-                            queue_authority.require_admin(queue_authority.observe(collaborator._token))
+                        deny_queue_admin(collaborator_control)
                         self.assertEqual(member_read.actor, member_actor)
                         self.assertEqual(
                             (
@@ -295,8 +433,7 @@ ROOT_PATH = {root}/log
                         )
                         api.request("PUT", "repos/operator/source/collaborators/collaborator", {"permission": "write"})
                         member_write = member.repository_access()
-                        with self.assertRaises(SourceAccessDenied):
-                            queue_authority.require_admin(queue_authority.observe(collaborator._token))
+                        deny_queue_admin(collaborator_control)
                         self.assertEqual(member_write.actor, member_actor)
                         self.assertEqual(
                             (
@@ -306,6 +443,15 @@ ROOT_PATH = {root}/log
                             ),
                             (True, True, False),
                         )
+                        api.request("PUT", "repos/operator/source/collaborators/collaborator", {"permission": "admin"})
+                        if effective_access:
+                            # No site-admin privilege and no read:user scope:
+                            # current repository role plus narrow write scope.
+                            narrowed = queue_authority.observe(collaborator_control)
+                            self.assertEqual(narrowed.actor, member_actor)
+                            self.assertTrue(narrowed.credential_code_can_push)
+                            self.assertTrue(narrowed.credential_is_repo_admin)
+                            queue_authority.require_admin(narrowed)
                         api.request("DELETE", "repos/operator/source/collaborators/collaborator")
                         self.assertIsNone(member.repository_access())
                         self.assertEqual(member.last_failure.status, 404)
@@ -374,8 +520,26 @@ ROOT_PATH = {root}/log
                         self.assertTrue(archived.archived)
                         self.assertFalse(archived.mirror)
                         self.assertTrue(archived.user_code_can_push)
-                        with self.assertRaises(SourceAccessDenied):
-                            queue_authority.require_admin(queue_authority.observe(api._token))
+                        archive_control = deny_queue_admin(api._token)
+                        if effective_access:
+                            self.assertTrue(archive_control.archived)
+                            self.assertFalse(archive_control.credential_code_can_push)
+                        if https:
+                            # Keep the source database, certificate and client
+                            # objects; replace only the owned server process.
+                            process.terminate()
+                            process.wait(timeout=10)
+                            process = subprocess.Popen([*base, "web"], stdout=log, stderr=subprocess.STDOUT)
+                            await_source()
+                            after_restart = source.repository_access()
+                            self.assertEqual(after_restart.repository_id, access.repository_id)
+                            self.assertEqual(after_restart.actor, actor)
+                            self.assertTrue(after_restart.archived)
+                            deny_queue_admin(api._token)
+                            self.assertIsNone(member.repository_access())
+                            self.assertEqual(member.last_failure.status, 404)
+                            with self.assertRaises(SourceAccessDenied):
+                                queue_authority.observe(collaborator_control)
                 finally:
                     process.terminate()
                     try:

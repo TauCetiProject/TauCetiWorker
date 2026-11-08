@@ -293,13 +293,85 @@ the isolated author/review/CI/merge rehearsal or a capacity proof.
 
 ## Queue source and execution boundary
 
-The optional source-bound queue has a separate native HTTP authority path. Each
-mutation reads its bearer actor and repository user ACL directly from the configured
-Forgejo origin and checks the configured native repository ID. It uses neither the
+The optional source-bound queue has a separate native HTTP authority path. Its
+authority requires an explicit, immutable `QueueControlPolicy` from trusted
+operator configuration. Register only dedicated, independently generated
+high-entropy queue-control bearers using `control_token_fingerprint(source, token)`.
+Its private file uses `tauceti-queue.control-policy/v1` with exactly `schema`,
+`source` (the qualified origin/name/native-ID record) and a `fingerprints` array.
+`QueueControlPolicy.load(path, source=trusted_source)` validates the file against
+the independently configured source; file contents cannot select another source.
+`NativeQueueAuthority.from_control_file` constructs one startup snapshot for both
+the server and controller. Every ancestor is opened through a pinned directory
+descriptor without following symlinks, with trusted ownership and write modes.
+Root-owned sticky temporary ancestors are allowed, but the immediate parent must
+be private and owned by the service user. The policy must be one user-owned
+regular file of mode 0600 or 0400 with no extra hard links. Reads are bounded to
+128 KiB and detect most in-place changes; atomic replacement is required because
+coarse filesystem timestamps cannot prove that every same-size edit was absent.
+Duplicate fields, duplicate fingerprints,
+unknown fields and malformed source identities are refused. Errors omit private
+contents. Write replacements atomically, then restart as described below; the
+loader never reloads policy during a request or caches a successful source ACL.
+The example `services/queue/source-control-policy.json.example` is a placeholder,
+not an active enrollment. Native startup and the installer do not yet select this
+backend; wiring this loader does not enable native execution.
+All path components must be real directories: an operator using a symlinked home
+or configuration tree must choose its verified canonical path explicitly. File
+permissions protect against other Unix users, not the owner or root. The owner can
+chmod a 0400 policy back to writable. Queue policy, source publication credentials
+and service code must therefore be isolated from agent accounts before serving
+less-trusted workers; the current user-unit layout is not that privilege boundary.
+The policy holds a bounded nonempty set of SHA-256 fingerprints, domain-separated
+by the native source origin and repository ID. It never accepts enrollment from
+request JSON, task metadata or a Forgejo profile. Fingerprints are private
+configuration and are omitted from policy repr, tasks, public progress and journals.
+An unenrolled token is refused before the HTTP body is read or any source request,
+even when it otherwise has effective admin and Code write privileges. For incident
+revocation, revoke the bearer at Forgejo first: removing a fingerprint only removes queue enrollment,
+and does not revoke the credential's source permissions. Then remove the old
+fingerprint and restart the queue process with the new immutable policy and one
+authority shared by its HTTP server and controller. Do not swap only the
+controller's authority or mutate an existing instance. Omitted old tokens cannot
+authorize queue calls; process-local evidence from the previous instance is invalid.
+Enrolled credentials still need fresh native
+scope/resource/ACL checks on every operation; enrollment does not cache a grant.
+For routine rotation, enroll old and new fingerprints together, restart with the
+shared authority, roll workers to the new credential, then revoke the old token
+at Forgejo only after no running worker process still holds the old bearer.
+Workers read their bearer once at process startup; confirm each process has
+restarted and resumed its claims with the replacement, or has finished its work.
+Remove the old fingerprint on the next restart. This overlap keeps
+normal admissions and running work enabled. The replacement bearer must identify
+the same native actor to resume that actor's claims; a bot-user change requires
+reconciling the previous actor's work. Removing enrollment immediately
+returns 403 and stops affected claims; revocation of an enrolled bearer returns
+401, so existing renewal retries can continue only until lease expiry and cannot
+submit work. Reconcile affected work explicitly after incident revocation.
+
+Each mutation reads its bearer actor, repository user ACL and effective credential
+access directly from the configured Forgejo origin by native repository ID. The
+required `GET /api/v1/repositories/{id}/effective_access` response comes from a
+private native API addition. It includes current repository restrictions and
+read/write repository scopes. Unsupported endpoints, missing flags and inconsistent
+responses refuse controls without falling back to ordinary repository metadata.
+The client also checks the configured repository name, origin and native ID. It uses neither the
 GitHub identity/admin caches nor a previous successful native observation. A denied
 or unavailable read refuses the operation. Queue controls require current repository
-admin and Code write ACL, with archive and pull-mirror states refused. These user
-ACLs do not establish bearer write scopes or authorize source publication.
+admin and Code write ACL together with effective credential admin and Code write
+access, with archive and pull-mirror states refused. A read-only token cannot borrow
+its user's admin privileges. The native endpoint requires explicit scopes including
+`read:repository`. Its actor contains only the native ID and login, so repository-limited
+tokens can use it without `read:user`, which their creation rules forbid.
+Unscoped password, session and Actions authentication, implicit OAuth API scope
+fallback and impersonation cannot supply this evidence. Explicitly scoped OAuth
+and authorized-integration tokens can supply effective-access evidence, but they
+remain unenrolled for queue control unless the operator deliberately approves that
+exact bearer for this source. Integration scope or a third-party OAuth grant alone
+does not enroll it. The returned user ACL
+already includes credential repository-resource reduction; it excludes read/write
+scope, which the effective flags additionally enforce. Protected branch, approval and merge
+checks remain necessary when publishing to the source.
 
 Native HTTP handlers reject malformed bearer headers without reading the body or
 contacting Forgejo. They read the bounded body under a ten-second total deadline
@@ -379,13 +451,36 @@ must be integrated before execution: a no-retry exception alone cannot recover a
 assignment whose response was lost.
 Native checkpoint directory/cache namespaces still need integration before
 enabling execution.
-Credential audience/delegation policy and ingress rate/concurrency limits also
-require integration before activation: a native user ACL observation alone does
-not identify a bearer as a dedicated queue-control credential.
-The disposable native integration exercises the actor/ACL reader against Forgejo
-17; separate HTTP/controller regressions cover revocation, slow bodies, lock waits,
-name reuse and claim ownership. These checks do not constitute the full hosted HTTPS
+Ingress rate/concurrency limits still require integration before activation.
+Dedicated control credentials and their provisioning, revocation and rotation
+must also be integrated with the operator installer; native bootstrap stays disabled.
+The installer must generate repository-limited credentials for dedicated bot users
+with minimal scopes, not enroll a shared personal/CI bearer. Enrollment narrows
+what the queue accepts; it does not constrain use of that bearer directly against
+Forgejo. The present admin/Code-write requirement therefore still grants source
+power to the credential holder. Separating task credentials from source publication
+authority needs a queue-issued credential or a separately authorized native task
+role before exposing task controls to less-trusted workers.
+OAuth/integration refresh and its restart/enrollment lifecycle are not implemented
+by the installer and are not supported operationally for queue-control credentials.
+No client or integration ID is implicitly trusted across credential rotation.
+The native effective-access API addition remains private pending its upstream
+contribution handoff. The disposable native integration checks effective access
+with the private native build and verifies that stock Forgejo refuses controls.
+Set `FORGEJO_EFFECTIVE_ACCESS=1` with `FORGEJO_BINARY` to require that capability;
+`FORGEJO_STATIC_ROOT` selects matching unbundled assets. Separate HTTP/controller
+regressions cover read-only scopes, revocation, slow bodies, lock waits, name reuse
+and claim ownership. These checks do not constitute the full hosted HTTPS
 or fleet-capacity rehearsal.
+
+The native read/authority fixture also supports `FORGEJO_HTTPS=1`. It generates a
+temporary loopback certificate, trusts that certificate only for the fixture's
+lifetime, and runs the actual Forgejo client over verified HTTPS. Untrusted-CA
+and hostname-mismatch probes must fail before the normal read/authority cycle
+runs. The profile restarts its server with the same database and certificate,
+then checks repository identity, archive state and revoked collaborator access
+again using the existing client objects. This profile requires `openssl`; it does not provide the remaining
+author/review/repair/hosted-CI/merge/mirror lifecycle or fleet-load evidence.
 
 The controller routes repository reads, refs, publication and repository authority
 through `SourcePort`; dispatches, workflow observations, cancellations, verdicts
@@ -465,9 +560,49 @@ metadata object's identity during recovery. This restores metadata, not missing 
 source history; admission must retain those heads. The 8,192 member maximum is a
 transport bound, not a demonstrated fleet capacity.
 
-`GitHubSourceExecution` requires installation tokens minted with exactly the native
-execution repository ID and explicit `contents:write`/`actions:write` permissions. A
-name preflight alone cannot protect a write against a repository name being reused.
+`GitHubSourceExecution` requires an explicitly selected credential provider: App
+installation tokens minted with exactly the native execution repository ID, or a
+native GitHub workflow job token supplied by an approved, pinned workflow bootstrap.
+Both require explicit `contents:write`/`actions:write` permissions. A name preflight
+alone cannot protect a write against a repository name being reused.
+
+`WorkflowTokenSource` is available for a trusted GitHub Actions controller job. Its
+bootstrap must pass the literal `${{ github.token }}` context and approved repository
+ID, workflow path, caller revision, branch and unique nonmatrix job name. Never select its
+token or approved identity from event payloads, repository secrets, inherited `gh`
+credentials or untrusted worker configuration. GitHub's
+[native job-token contract](https://docs.github.com/en/actions/concepts/security/github_token)
+provides the immutable repository resource scope. A singleton response from
+`/installation/repositories` alone cannot prove mint-time scope: a broad App token
+could currently expose just one repository. The provider therefore cannot discover
+or adopt arbitrary credentials by inspecting that endpoint.
+
+Load the approved revision and controller workflow path from independently trusted
+queue configuration, not from `github.sha` or event data. The existing request ledger
+archives the separately approved execution caller revision. Dispatch preflight
+requires the controller to use that same execution repository tree and branch;
+observing or cancelling ledger-owned older requests still uses their archived caller
+identities. The
+controller workflow must not allow dispatch inputs to influence credential or
+identity handling. Supply the literal `${{ github.ref }}` context as the launch ref;
+it must equal the approved `refs/heads/<branch>`. The REST `head_branch` field alone
+cannot distinguish a tag whose name collides with that branch.
+
+On first credential use, the provider corroborates the singleton resource identity,
+live run/attempt, exact workflow revision/path/branch, same-repository head and unique
+running job through authenticated GitHub reads. Only trusted `push` or
+`workflow_dispatch` controller launches are supported. These identity checks run once
+per instance; recurring reads would waste the repository's shared
+[job-token API budget](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api).
+Permanent verification mismatches disable the instance without repeating API reads.
+The provider has a six-hour instance lifetime cap, no token refresh and permanent invalidation;
+GitHub independently expires the token when its job ends. Responses have a byte
+bound and socket timeout; this does not promise a whole-exchange deadline against
+trickling responses. No production entry point automatically selects this provider.
+The controller job must remain alive while it dispatches and collects its candidates,
+occupying a runner for that period. Long-running external queue services continue to
+use the repository-ID-scoped App token provider.
+
 Dispatch validates the current repository identity, default branch and frozen trusted
 caller revision before source retention and before its single POST. The final preflight
 returns a process-local prepared dispatch with a hidden credential; after the durable
@@ -761,11 +896,93 @@ protected candidate retention and source branch promotion with the shared-state
 and legacy GitHub source paths blocked. CI observations in this fixture are
 deterministic; it does not prove the separate real GitHub Actions rehearsal.
 
+### Explicit native service construction
+
+The existing queue `Service` accepts an explicit `NativeBootstrap` for trusted
+rehearsal/operator callers. It wires the immutable project snapshot and execution
+policy to `ForgejoSourceAdapter`, the scoped GitHub execution backend, the existing
+request ledger, native control authority, primary admission and the HTTP server.
+Source repository/branch, native publisher grants, control audience, execution
+repository ID and effective source credential permissions are checked before a
+controller starts. Startup never discovers a GitHub source App or substitutes an
+environment PAT. The default `Service` and CLI continue to select the GitHub path.
+
+This constructor accepts independently loaded private credentials and publisher
+configuration; it does not provision them or enable native execution. Native CLI
+configuration selection, credential provisioning/rotation, ingress concurrency
+bounds, less-trusted worker admission and Review's publication ledger
+remain activation gates. The actual hosted execution and full lifecycle/load
+rehearsals remain required.
+
+Run the constructor/HTTP checks with `python tests/queue_native_bootstrap.py`.
+`tests/integration_forgejo_bootstrap.py` starts the actual Service against the
+owned HTTPS fixture: the native API build permits an enrolled caller and then
+refuses it after ACL reduction; stock Forgejo refuses startup before the ledger
+binding is written. Both tests block shared-state and legacy GitHub source reads.
+The integration profile uses the same `FORGEJO_BINARY`, `FORGEJO_STATIC_ROOT` and
+`FORGEJO_EFFECTIVE_ACCESS` variables as the source authority fixture. No execution
+API request is needed to start the service; these tests do not prove hosted CI.
+
+
+The explicit native bootstrap enables `/webhook/forgejo` with a separate source
+secret. The receiver verifies Forgejo's raw SHA-256 signature and native delivery
+headers, repository ID, configured name and browser origin. Verified PR/comment
+and push notifications only dirty admission work or request discovery; payload
+bodies cannot grant approvals or run Bors commands. Invalidation is committed
+before acknowledgement. Duplicate deliveries are bounded in memory; after a
+restart redelivery repeats the idempotent invalidation. The primary poller owns
+source re-observation. The GitHub webhook endpoint remains refused on this path.
+
+`tests/queue_forgejo_webhook.py` covers signatures, origin/ID mismatches, retry
+after an interrupted durable write, duplicate/out-of-order notifications and
+restart redelivery. The HTTPS bootstrap fixture creates an actual hook in the
+disposable Forgejo and creates a PR as its contributor: Forgejo's background
+delivery reaches the actual Service HTTP endpoint and dirties work without
+creating an approval. Only that owned fixture permits loopback webhook targets.
+Stock Forgejo emits no commit-status events, so prompt status-only publication
+notifications still need a trusted caller/backstop path. Event intake alone does
+not enable native worker execution or establish load capacity.
+
+
+Native startup checks the separate Git credential through the same effective-access
+API and requires its repository ID, actor and write/admin scope to match the source
+API credential. Controller publication identities cannot be trusted reviewers, and
+controller publication tokens cannot also be enrolled queue-control tokens.
+The owned fixture uses a separate enrolled worker identity. This still requires the
+planned narrower worker role before admitting less-trusted production workers.
+Native GitHub job credentials are checked against the approved repository, revision
+and branch at startup as well as at dispatch. Source credential refusal is distinct
+from an unavailable authority endpoint.
+
+Before opening its store, a native `Service` takes an exclusive advisory process
+lock beside the existing database and retains it through shutdown. A second native
+service cannot commit bindings or publisher rotations while the first process is
+running, even if it chooses another port. The native listener is bound and listening
+before constructing the controller, so a busy port cannot commit a publisher
+rotation. A control token is rejected by actor identity if that account is any
+configured reviewer/status/recovery publisher, even when the token itself differs. Existing live-update tooling must stop
+and replace the service process without draining worker or CI admissions; this
+constructor does not deploy or replace a running service itself.
+
+Source webhook secrets must be printable ASCII of at least 32 bytes, generated
+from fresh random data and configured with the same text on Forgejo. This route
+rejects bodies larger than one MiB before reading or hashing them. Routine prose,
+controller-authored output comments/labels and title-only edits do not re-dirty
+admission. Native review votes and thread notifications, assignments, milestones
+and review requests do not affect the scoreboard-based policy and are ignored; marker
+comments from resolvable non-publisher authors are ignored. Moderation of a
+publisher's comment is urgent regardless of the sender. Only canonical main pushes
+request discovery; retention and submission pushes are output, and PR head changes
+arrive through synchronize events. Main discovery requests are persisted before
+acknowledgment. Confirmed controller recovery publications
+atomically invalidate their PR directly with delivery settlement, so ignoring their output webhook does not delay
+reconciliation. Polling remains the recovery backstop; automatic Forgejo webhook
+redelivery is not assumed.
 
 The recovery publisher identity is exclusive to one controller/outbox owner.
 Operator tools enqueue decisions through that owner rather than independently
 allocating sequences or using its token. Native service bootstrap enforces a
-single process on its existing database; credential rotation stops the old
+single native process on its existing database; credential rotation stops the old
 publisher before starting the new generation, while normal worker/CI admissions
 stay enabled. A publication arriving from an unknown owned nonce is an operator
 reconciliation alert, not silently adopted local history.

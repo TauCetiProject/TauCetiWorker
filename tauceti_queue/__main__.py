@@ -84,7 +84,7 @@ def _optional(module: str) -> ModuleType | None:
 class Service:
     """The wired process: configuration, runtime facts, and whichever components are installed."""
 
-    def __init__(self, config: Config, runtime: rt.ServiceRuntime) -> None:
+    def __init__(self, config: Config, runtime: rt.ServiceRuntime, *, native=None) -> None:
         self.config = config
         self.runtime = runtime
         self.stop = rt.StopSignal()
@@ -96,11 +96,44 @@ class Service:
         self.poller: Any = None
         self.loop_module: ModuleType | None = None
         self.unavailable_reason: str | None = None
+        self.native = native
+        self.native_http = None
+        self._native_store_lock = None
+        self._native_listener = None
+        if native is not None:
+            from .native_bootstrap import NativeBootstrap
+
+            if not isinstance(native, NativeBootstrap):
+                raise ValueError("native service requires an explicit trusted bootstrap")
 
     # Stream E and F integration points. Each is a small function so reconciling an interface
     # change is one edit here.
 
     def open_store(self) -> None:
+        if self.native is not None:
+            # Reserve the existing store before a constructor can commit any
+            # binding or publisher rotation. Two native services must not share
+            # a writable queue, even if they listen on different ports.
+            import fcntl
+            import stat
+
+            database = self.config.database.resolve()
+            database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(str(database) + ".native-service.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            try:
+                info = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o077
+                    or info.st_nlink != 1
+                ):
+                    raise ValueError("native service lock must be an owned private regular file")
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BaseException:
+                os.close(fd)
+                raise
+            self._native_store_lock = fd
         module = _optional("store")
         if module is None:
             self.unavailable_reason = "tauceti_queue.store is not installed"
@@ -110,6 +143,8 @@ class Service:
         self.store = opener(self.config.database)
 
     def open_github(self) -> None:
+        if self.native is not None:
+            return  # execution credentials were explicitly supplied by the trusted bootstrap
         app_module, adapter_module = _optional("github_app"), _optional("github_adapter")
         if app_module is None or adapter_module is None:
             self.unavailable_reason = (
@@ -125,6 +160,30 @@ class Service:
         self.github = adapter_module.GitHubAdapter(app, self.config.repository, clone_dir=self.config.content_clone)
 
     def build_controller(self) -> None:
+        if self.native is not None:
+            if self.store is None:
+                raise ValueError("native service requires its existing durable queue store")
+            import socket
+
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind((self.config.listen_host, self.config.listen_port))
+                listener.listen()
+                wired = self.native.build(self.config, self.store, revision=self.runtime.revision.sha)
+            except BaseException:
+                listener.close()
+                raise
+            self._native_listener = listener
+            self.github, self.controller, self.poller, self.native_http = (
+                wired.source,
+                wired.controller,
+                wired.poller,
+                wired.http,
+            )
+            self.native_http.prebound_socket = listener
+            self.loop_module = _optional("loop")
+            return
         module = _optional("controller")
         if module is None or self.store is None or self.github is None:
             self.unavailable_reason = self.unavailable_reason or "tauceti_queue.controller is not installed"
@@ -198,7 +257,7 @@ class Service:
         if module is not None and self.controller is not None:
             self.server = module.create_server(
                 self.controller,
-                self.config,
+                self.native_http if self.native_http is not None else self.config,
                 status=self.status_document,
                 adapter=self.github,
                 app=self.app,
@@ -237,6 +296,12 @@ class Service:
                 close()
         if self.store is not None:
             self.store.close()
+        if self._native_listener is not None:
+            self._native_listener.close()
+            self._native_listener = None
+        if self._native_store_lock is not None:
+            os.close(self._native_store_lock)
+            self._native_store_lock = None
 
 
 def _install_signal_handlers(stop: rt.StopSignal) -> None:
