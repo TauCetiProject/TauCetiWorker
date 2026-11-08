@@ -70,8 +70,11 @@ def exchange():
         timer = threading.Timer(remaining + 0.25, lambda: os._exit(124))
         timer.daemon = True
         timer.start()
-    url = urllib.parse.urlsplit(value["url"])
-    _ = url.port
+    try:
+        url = urllib.parse.urlsplit(value["url"])
+        _ = url.port
+    except ValueError:
+        return fail("url-refused")
     if (
         not url.hostname or url.username is not None or url.password is not None
         or url.query or url.fragment
@@ -153,6 +156,14 @@ def post(url: str, data: bytes, headers: dict[str, str], *, timeout: float) -> t
                     raise TaskTransportError("native task deadline elapsed before HTTP send")
                 sent = True
                 output, _ = process.communicate(request, timeout=remaining)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                output, _ = process.communicate()
+                # communicate can notice its timeout after the child already
+                # flushed a complete response and exited. Do not lose that
+                # assignment merely because the parent was descheduled.
+                if process.returncode != 0:
+                    raise
             except BaseException:
                 process.kill()
                 process.communicate()

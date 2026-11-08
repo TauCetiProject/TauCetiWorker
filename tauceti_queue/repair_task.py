@@ -363,6 +363,12 @@ class TaskClient:
         self.binding = binding
         if binding is not None:
             task_transport.check_timeout(timeout)
+            if (
+                not isinstance(worker, str)
+                or not 0 < len(worker) <= 256
+                or not all(33 <= ord(c) <= 126 for c in worker)
+            ):
+                raise ValueError("native task worker must be a bounded printable ASCII header value")
             url = urllib.parse.urlsplit(self.service)
             _ = url.port  # Validate malformed ports before constructing a credential-bearing request.
             if (

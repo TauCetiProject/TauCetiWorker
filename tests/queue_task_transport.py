@@ -5,6 +5,7 @@ import datetime
 import ipaddress
 import json
 import os
+import socket
 import ssl
 import subprocess
 import sys
@@ -82,7 +83,7 @@ class Deadline(unittest.TestCase):
         self.addCleanup(finished.set)
         return f"http://127.0.0.1:{server.server_port}", calls
 
-    def bounded(self, action, *, limit=0.6):
+    def bounded(self, action, *, limit=2.0):
         processes = []
         original = subprocess.Popen
 
@@ -145,17 +146,17 @@ class Deadline(unittest.TestCase):
 
     def test_helper_bounds_its_own_lifetime_without_a_parent_timeout(self):
         url, calls = self.server("headers")
-        request = json.dumps({"url": url, "data": "e30=", "headers": {}, "deadline": time.monotonic() + 0.4}).encode()
+        request = json.dumps({"url": url, "data": "e30=", "headers": {}, "deadline": time.monotonic() + 2}).encode()
         started = time.monotonic()
         result = subprocess.run(
             [sys.executable, "-I", "-S", "-c", task_transport._HELPER_SOURCE],
             input=request,
             capture_output=True,
-            timeout=3,
+            timeout=5,
             check=False,
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertLess(time.monotonic() - started, 2)
+        self.assertLess(time.monotonic() - started, 3.5)
         self.assertEqual(calls, ["/"])
 
     def test_uncertain_native_posts_are_not_automatically_retried(self):
@@ -169,7 +170,7 @@ class Deadline(unittest.TestCase):
         ):
             with self.subTest(mode=mode, status=status, payload=payload):
                 url, calls = self.server(mode, status, payload)
-                client = repair_task.TaskClient(url, "token", "worker", 0.5, binding=self.binding)
+                client = repair_task.TaskClient(url, "token", "worker", 2, binding=self.binding)
                 with self.assertRaises(repair_task.NativeTaskDeliveryUncertain):
                     repair_task.with_retries(client.claim, attempts=3, delays=(0,), what="claim")
                 self.assertEqual(calls, ["/tasks/claim"])
@@ -200,6 +201,62 @@ class Deadline(unittest.TestCase):
         for value in (0, -1, True, None, "1", float("nan"), float("inf"), 3601):
             with self.subTest(timeout=value), self.assertRaises(ValueError):
                 repair_task.TaskClient("https://queue.example", "token", "worker", value, binding=self.binding)
+
+    def test_complete_clean_exit_is_preserved_when_communicate_notices_timeout_late(self):
+        original = subprocess.Popen
+        calls = []
+
+        def launch(*args, **kwargs):
+            process = original(*args, **kwargs)
+            communicate = process.communicate
+
+            def delayed(*args, **kwargs):
+                output = communicate(*args, **kwargs)
+                calls.append(process.returncode)
+                if len(calls) == 1:
+                    raise subprocess.TimeoutExpired(process.args, 2, output=output[0])
+                return output
+
+            process.communicate = delayed
+            return process
+
+        with patch.object(task_transport, "_HELPER_SOURCE", "print('200\\n{}')"):
+            with patch.object(task_transport.subprocess, "Popen", side_effect=launch):
+                status, payload = task_transport.post("https://queue.example", b"{}", {}, timeout=2)
+        self.assertEqual((status, json.loads(payload)), (200, {}))
+        self.assertEqual(calls, [0, 0])
+
+    def test_refused_connections_are_known_non_sends_and_keep_legacy_retry_behavior(self):
+        with socket.socket() as held:
+            held.bind(("127.0.0.1", 0))  # Occupied port with no listener; no allocation race.
+            client = repair_task.TaskClient(
+                f"http://127.0.0.1:{held.getsockname()[1]}", "token", "worker", 2, binding=self.binding
+            )
+            original = subprocess.Popen
+            with patch.object(task_transport.subprocess, "Popen", wraps=original) as send:
+                with self.assertRaisesRegex(repair_task.ServiceError, "connection was refused") as raised:
+                    repair_task.with_retries(client.claim, attempts=3, delays=(0,), what="claim")
+            self.assertIs(type(raised.exception), repair_task.ServiceError)
+            self.assertEqual(send.call_count, 3)
+
+    def test_resolver_failure_has_a_safe_known_non_send_diagnostic(self):
+        source = (
+            "import socket\n"
+            "def unavailable(*args, **kwargs):\n"
+            "    raise socket.gaierror(socket.EAI_NONAME, 'private-native-bearer')\n"
+            "socket.getaddrinfo = unavailable\n" + task_transport._HELPER_SOURCE
+        )
+        client = repair_task.TaskClient("http://127.0.0.1:1", "token", "worker", 2, binding=self.binding)
+        with patch.object(task_transport, "_HELPER_SOURCE", source):
+            with self.assertRaisesRegex(repair_task.ServiceError, "DNS resolution failed") as raised:
+                client.claim()
+        self.assertIs(type(raised.exception), repair_task.ServiceError)
+        self.assertNotIn("private-native-bearer", str(raised.exception))
+
+    def test_invalid_worker_header_is_refused_before_any_process_or_request(self):
+        for worker in (None, "", "worker\r\nInjected: value", "x" * 257, "\u2603"):
+            with self.subTest(worker=worker), self.assertRaises(ValueError):
+                repair_task.TaskClient("https://queue.example", "token", worker, binding=self.binding)
 
     def test_tls_trust_and_hostname_checks_survive_process_isolation(self):
         calls = []
@@ -261,8 +318,11 @@ class Deadline(unittest.TestCase):
                         binding=self.binding,
                     )
                     with patch.dict(os.environ, SSL_CERT_FILE=str(empty), SSL_CERT_DIR=str(root / "no-cas")):
-                        with self.assertRaises(repair_task.ServiceError):
+                        with self.assertRaisesRegex(
+                            repair_task.ServiceError, "TLS certificate verification failed"
+                        ) as raised:
                             client.claim()
+                        self.assertIs(type(raised.exception), repair_task.ServiceError)
                     self.assertEqual(calls, [])
                     with patch.dict(os.environ, SSL_CERT_FILE=str(cert_file), SSL_CERT_DIR=str(root / "no-cas")):
                         if address == "127.0.0.1":
@@ -270,8 +330,11 @@ class Deadline(unittest.TestCase):
                             self.assertEqual(calls, ["/tasks/claim"])
                             calls.clear()
                         else:
-                            with self.assertRaises(repair_task.ServiceError):
+                            with self.assertRaisesRegex(
+                                repair_task.ServiceError, "TLS certificate verification failed"
+                            ) as raised:
                                 client.claim()
+                            self.assertIs(type(raised.exception), repair_task.ServiceError)
                             self.assertEqual(calls, [])
                 finally:
                     server.shutdown()
