@@ -38,7 +38,7 @@ from .verification_storage import Pressure, cache_generation
 
 SCHEMA = "tauceti-verification/v1"
 POLICY_VERSION = 6
-LOCAL_CHECKERS = ("tauceti-local-axioms", "LocalAxioms.lean", "tauceti-local-lint", "LocalLint.lean")
+LOCAL_CHECKERS = ("tauceti-local-axioms", "tauceti-local-lint", "tauceti-local-checks")
 HASH_CACHE_LIMIT = 200000
 _HASH_CACHE = contextvars.ContextVar("verification_hash_cache", default=None)
 LEAN_DIR = LEAN_ROOT.replace(".", "/")
@@ -624,31 +624,6 @@ class Verification:
                     env,
                 )
             ]
-        if phase == "module-system":
-            return [(["lake", "exe", "module-system"], env)]
-        if phase == "lint":
-            if selected["mode"] == "unknown":
-                raise Incomplete("lint: changed modules unknown; CI owns the full environment lint")
-            commands = [(["bash", "-o", "pipefail", "scripts/lint-style.sh"], env)]
-            lint_list = self.directory / "lint-modules.txt"
-            lint_modules = set(selected["modules"])
-            if self.lint_modules:
-                for module in Path(self.lint_modules).read_text().splitlines():
-                    module = module.strip()
-                    if not module:
-                        continue
-                    path = module.replace(".", "/") + ".lean"
-                    from .verification_scope import MODULE
-
-                    if not MODULE.fullmatch(path) or not (self.root / path).is_file():
-                        raise Incomplete(f"invalid explicit lint module: {module}")
-                    lint_modules.add(module)
-            lint_list.write_text("".join(f"{m}\n" for m in sorted(lint_modules)))
-            if lint_modules:
-                commands.append(
-                    ([sys.executable, "-I", str(HERE / "scripts/tauceti-local-lint"), "--modules", str(lint_list)], env)
-                )
-            return commands
         if phase == "shim-expiry":
             script = self.root / "scripts/check-expired-mathlib-shims.py"
             if not script.exists():
@@ -689,13 +664,38 @@ class Verification:
                 if not pins and self.policy != "bump":
                     args += ["--only-new"]
             return [(args, env)]
-        raise ValueError(f"unknown verification phase {phase}")
+        if phase not in {"module-system", "lint"}:
+            raise ValueError(f"unknown verification phase {phase}")
+        if selected["mode"] == "unknown":
+            raise Incomplete(f"{phase}: changed modules unknown; CI owns the full checks")
+        self.check_tools()
+        shared = [sys.executable, str(HERE / "scripts/tauceti-local-checks")]
+        common = ["--base", self.base, "--policy", self.policy, "--modules", str(modules)]
+        if phase == "lint":
+            lint_list = self.directory / "lint-modules.txt"
+            selected_modules = set(selected["modules"])
+            if self.lint_modules:
+                from .verification_scope import MODULE
+
+                for module in Path(self.lint_modules).read_text().splitlines():
+                    module = module.strip()
+                    if module and (
+                        not MODULE.fullmatch(module.replace(".", "/") + ".lean")
+                        or not (self.root / (module.replace(".", "/") + ".lean")).is_file()
+                    ):
+                        raise Incomplete(f"invalid explicit lint module: {module}")
+                    if module:
+                        selected_modules.add(module)
+            lint_list.write_text("".join(m + "\n" for m in sorted(selected_modules)))
+            common = ["--base", self.base, "--policy", self.policy, "--modules", str(lint_list)]
+            return [(shared + [part] + common, env) for part in ("sources", "style", "environment")]
+        return [(shared + [phase] + common, env)]
 
     def check_tools(self):
         from . import verification_tools
 
         try:
-            verification_tools.check(self.root)
+            verification_tools.check(self.root, required=True)
         except verification_tools.Unavailable as error:
             raise Incomplete(str(error), reason=error.reason) from error
 
@@ -796,17 +796,30 @@ class Verification:
             modules = self.directory / "modules.txt"
             modules.write_text("".join(f"{m}\n" for m in self.receipt["scope"]["modules"]))
             self.save()
-            early_style = (
+            early_sources = (
                 len(self.requested) > 1
                 and "lint" in self.requested
+                and self.receipt["scope"]["mode"] != "unknown"
                 and not (self.reuse and self.find_reuse(fingerprint, "lint"))
             )
-            if early_style:
+            if early_sources:
                 from .verification_jobs import preserve_candidate
 
                 preserve_candidate(self, disposable_only=True)
                 self.receipt["phases"]["lint"] = dict(status="incomplete", started_at=time.time(), ended_at=None)
-                self.command("lint", ["bash", "-o", "pipefail", "scripts/lint-style.sh"], env=dict(os.environ))
+                self.command(
+                    "lint",
+                    [
+                        sys.executable,
+                        str(HERE / "scripts/tauceti-local-checks"),
+                        "sources",
+                        "--base",
+                        self.base,
+                        "--policy",
+                        self.policy,
+                    ],
+                    env=dict(os.environ),
+                )
             for phase in self.requested:
                 self.watch()
                 reused = self.find_reuse(fingerprint, phase) if self.reuse else None
@@ -826,14 +839,14 @@ class Verification:
                 self.receipt["phases"][phase] = record
                 self.save()
                 for argv, env in self.phase_commands(phase, modules):
-                    if early_style and phase == "lint" and "scripts/lint-style.sh" in argv:
+                    if early_sources and phase == "lint" and "sources" in argv:
                         continue
                     try:
                         self.command(phase, argv, env=env)
                     except subprocess.CalledProcessError as error:
                         if phase == "shim-expiry":
                             self.check_tools()  # A removed runtime dependency is not a source defect.
-                        local_lint = any(str(arg).endswith("/scripts/tauceti-local-lint") for arg in error.cmd)
+                        local_lint = any(str(arg).endswith("/scripts/tauceti-local-checks") for arg in error.cmd)
                         if (phase == "axioms" or local_lint) and error.returncode in {2, 75}:
                             raise Incomplete(
                                 f"local {phase} checker unavailable; see the phase log",

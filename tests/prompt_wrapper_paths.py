@@ -57,9 +57,7 @@ CALL_SITES = {
     "rebase.md": FIXLIKE,
     "bump.md": dict(FIXLIKE, SCOPE_POLICY="bump"),
     "lint-repair.md": dict(FIXLIKE, SCOPE_POLICY="lint-repair"),
-    "local-verification.md": dict(
-        SCOPE_POLICY="ordinary", LOCAL_AXIOMS="/bin/tauceti-local-axioms", LOCAL_LINT="/bin/tauceti-local-lint"
-    ),
+    "local-verification.md": dict(SCOPE_POLICY="ordinary", LOCAL_CHECKS="/bin/tauceti-local-checks"),
     "roadmap.md": dict(
         ONLY="CFSGStatement",
         SKIP="none",
@@ -136,8 +134,8 @@ def main():
             )
             text = fill_prompt(PROMPTS / name, **substitutions)
             check(
-                f"{name}: V0 rollback restores scope recipe",
-                "<<'TAUCETI_SCOPE'" in text and "/tauceti-verify" not in text,
+                f"{name}: default prompts use shared local checks",
+                "/tauceti-local-checks" in text and "/tauceti-verify" not in text,
             )
 
     # 4) Shim expiry is an autonomous repair input, not a notification-only dead end. Both workers

@@ -51,7 +51,14 @@ class Receipts(unittest.TestCase):
         git(self.root, "init", "-q")
         git(self.root, "config", "user.name", "Fixture")
         git(self.root, "config", "user.email", "fixture@example.org")
-        for name in ("TauCeti/A.lean", "TauCeti/B.lean", "lean-toolchain", "lake-manifest.json", "lakefile.toml"):
+        for name in (
+            "TauCeti.lean",
+            "TauCeti/A.lean",
+            "TauCeti/B.lean",
+            "lean-toolchain",
+            "lake-manifest.json",
+            "lakefile.toml",
+        ):
             write(self.root, name, "fixture\n")
         write(self.root, ".gitignore", ".lake/\nTauCeti/Ignored.lean\n")
         write(self.root, "scripts/lint-env.sh", 'echo "LINT-ENV: PASS"\n')
@@ -70,6 +77,10 @@ class Receipts(unittest.TestCase):
 import sys
 from pathlib import Path
 if sys.argv[1:] == ['--print-prefix']: print({str(self.prefix)!r})
+elif '--run' in sys.argv:
+    import json
+    text = sys.stdin.read()
+    if text: print(json.dumps(dict(checked=len(json.loads(text)),problems=[])))
 else: Path('Main.c').write_text('fixture compiler output')
 """,
         )
@@ -273,10 +284,10 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["commands"][-1]["exit"], 23)
         os.environ.pop("FIXTURE_MODE")
+        # Candidate-owned style scripts cannot replace the shared implementation.
         write(self.root, "scripts/lint-style.sh", "false | cat\n")
         result = self.verify(stage="lint")
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["commands"][-1]["exit"], 1)
+        self.assertEqual(result["status"], "success", result.get("error"))
 
     def test_local_axioms_never_initialize_lake_or_fall_back_to_full(self):
         write(self.root, "TauCeti/A.lean", "changed")
@@ -647,9 +658,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         write(self.root, "scripts/lint-env.sh", 'cat "$LINT_ONLY_MODULES"\n')
         result = self.verify(stage="lint", lint_modules=modules)
         self.assertEqual(result["status"], "success", result.get("error"))
-        lint = next(
-            c for c in result["commands"] if any(str(arg).endswith("/scripts/tauceti-local-lint") for arg in c["argv"])
-        )
+        lint = next(c for c in result["commands"] if "environment" in c["argv"])
         self.assertIn("TauCeti.B", Path(lint["argv"][-1]).read_text())
         self.assertFalse(any("scripts/lint-env.sh" in c["argv"] for c in result["commands"]))
         modules.write_text("TauCeti.A\n")
