@@ -670,6 +670,23 @@ class NativeClaims(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "lock ownership"):
             self.controller._refresh_source_access(evidence, lambda: self.authority.authenticate("token"))
 
+    def test_failed_refresh_removes_protection_before_a_late_retry(self):
+        def revoked(_task):
+            self.repo["permissions"]["admin"] = False
+            return "revoked"
+
+        task, _late_result, original = self.run_late_request_during_refresh(revoked)
+        self.assertIsInstance(original, SourceAccessDenied)
+        self.assertNotIn(task.claim_token, self.controller._renewing)
+        self.assertNotIn(task.claim_token, self.controller._renewal_waiters)
+        self.repo["permissions"]["admin"] = True
+        with self.assertRaises(Exception) as caught:
+            self.controller.renew_task(
+                task.task_id, task.claim_token, source_access=self.authority.authenticate("token")
+            )
+        self.assertEqual(caught.exception.code, "claim-expired")
+        self.assertEqual(self.store.rows("claims", {"task_id": task.task_id})[0]["release_reason"], "expired")
+
 
 class NativeHTTP(unittest.TestCase):
     def setUp(self):
