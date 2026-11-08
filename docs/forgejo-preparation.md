@@ -760,3 +760,12 @@ statuses, unavailable authority, label/comment publication, primary admission,
 protected candidate retention and source branch promotion with the shared-state
 and legacy GitHub source paths blocked. CI observations in this fixture are
 deterministic; it does not prove the separate real GitHub Actions rehearsal.
+
+
+The recovery publisher identity is exclusive to one controller/outbox owner.
+Operator tools enqueue decisions through that owner rather than independently
+allocating sequences or using its token. Native service bootstrap enforces a
+single process on its existing database; credential rotation stops the old
+publisher before starting the new generation, while normal worker/CI admissions
+stay enabled. A publication arriving from an unknown owned nonce is an operator
+reconciliation alert, not silently adopted local history.
