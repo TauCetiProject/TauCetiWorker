@@ -74,6 +74,7 @@ from tauceti_queue import (
     repair_publish,
     repair_sandbox,
     repair_stream,
+    task_transport,
 )
 from tauceti_queue.repair import PromptContext, checkout_worktree, git, read_chain
 from tauceti_queue.task_identity import (
@@ -144,6 +145,10 @@ def log(message: str) -> None:
 
 class ServiceError(Exception):
     """The service could not be reached or answered 5xx; the call may be retried."""
+
+
+class NativeTaskDeliveryUncertain(ServiceError):
+    """A native POST may have committed; reconcile it instead of resending."""
 
 
 class ClaimRefused(Exception):
@@ -337,11 +342,6 @@ class Task:
         return self.onto or self.base
 
 
-class _NoTaskRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
 class TaskClient:
     """The worker's side of the task protocol. Transport failures raise ``ServiceError``.
 
@@ -361,8 +361,8 @@ class TaskClient:
         if binding is not None and not isinstance(binding, TaskBinding):
             raise ValueError("a trusted qualified task binding is required")
         self.binding = binding
-        self._opener = None
         if binding is not None:
+            task_transport.check_timeout(timeout)
             url = urllib.parse.urlsplit(self.service)
             _ = url.port  # Validate malformed ports before constructing a credential-bearing request.
             if (
@@ -376,10 +376,6 @@ class TaskClient:
                 raise ValueError("native task service requires HTTPS or an explicit loopback fixture")
             if not isinstance(token, str) or not 0 < len(token) <= 4096 or not all(33 <= ord(c) <= 126 for c in token):
                 raise ValueError("an explicit native queue bearer is required")
-            handlers = [_NoTaskRedirect()]
-            if url.hostname in {"127.0.0.1", "::1", "localhost"}:
-                handlers.insert(0, urllib.request.ProxyHandler({}))
-            self._opener = urllib.request.build_opener(*handlers)
 
     def _require_task(self, task):
         if getattr(task, "binding", None) != self.binding:
@@ -402,10 +398,17 @@ class TaskClient:
             },
         )
         try:
-            open_request = self._opener.open if self._opener is not None else urllib.request.urlopen
-            with open_request(request, timeout=self.timeout) as response:
-                status = response.status
-                payload = response.read(16 * 1024 * 1024 + 1) if self.binding is not None else response.read()
+            if self.binding is not None:
+                status, payload = task_transport.post(
+                    request.full_url, data, dict(request.header_items()), timeout=self.timeout
+                )
+            else:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    status = response.status
+                    payload = response.read()
+        except task_transport.TaskTransportError as error:
+            failure = NativeTaskDeliveryUncertain if error.delivery_uncertain else ServiceError
+            raise failure(f"{path}: {error}") from None
         except urllib.error.HTTPError as error:
             status = error.code
             with error:
@@ -424,12 +427,16 @@ class TaskClient:
                 else:
                     parsed = json.loads(payload)
             except ValueError as error:
+                if self.binding is not None:
+                    raise NativeTaskDeliveryUncertain(f"{path}: response is not JSON; delivery is uncertain") from None
                 if status >= 500:
                     raise ServiceError(f"{path}: HTTP {status}") from error
                 raise ServiceError(f"{path}: response is not JSON") from error
         if status >= 400 and _claim_code(parsed):
             raise ClaimRefused(f"{path}: HTTP {status} {_claim_code(parsed)}: {_error_text(parsed)}".strip())
         if status >= 500:
+            if self.binding is not None:
+                raise NativeTaskDeliveryUncertain(f"{path}: HTTP {status}; delivery is uncertain")
             raise ServiceError(f"{path}: HTTP {status} {_error_text(parsed)}".strip())
         return status, parsed
 
@@ -440,6 +447,10 @@ class TaskClient:
         if status in (401, 403):
             raise ClaimRefused(f"claim refused: HTTP {status} {_error_text(payload)}".strip())
         if status != 200 or not isinstance(payload, dict):
+            if self.binding is not None:
+                raise NativeTaskDeliveryUncertain(
+                    f"claim: unexpected HTTP {status} or native response; delivery is uncertain"
+                )
             raise ServiceError(f"claim: unexpected HTTP {status} {_error_text(payload)}".strip())
         try:
             task = Task.from_json(payload)
@@ -448,7 +459,7 @@ class TaskClient:
         except (TypeError, ValueError, KeyError):
             if self.binding is None:
                 raise
-            raise ServiceError("claim: invalid native task record") from None
+            raise NativeTaskDeliveryUncertain("claim: invalid native task record; delivery is uncertain") from None
         self._require_task(task)
         return task
 
@@ -547,6 +558,8 @@ def with_retries(call, *, attempts: int, delays: tuple[float, ...], what: str):
     for index in range(attempts):
         try:
             return call()
+        except NativeTaskDeliveryUncertain:
+            raise
         except ServiceError as error:
             last = error
             log(f"{what}: {error} (attempt {index + 1}/{attempts})")
