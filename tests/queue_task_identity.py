@@ -493,7 +493,12 @@ class ClientHTTP(unittest.TestCase):
         self.assertEqual(self.native.store.rows("claims", {"task_id": self.native.task_id}), [])
 
     def test_native_service_requires_secure_origin_and_explicit_bearer(self):
-        for url in ("http://outside.example", "https://user:pass@queue.example", "https://queue.example/#fragment"):
+        for url in (
+            "http://outside.example",
+            "https://user:pass@queue.example",
+            "https://queue.example/#fragment",
+            "https://queue.example:99999",
+        ):
             with self.assertRaises(ValueError):
                 repair_task.TaskClient(url, "token", "worker", binding=self.binding)
         for bearer in ("", "bad\nvalue", None):

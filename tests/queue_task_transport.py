@@ -178,6 +178,7 @@ class Deadline(unittest.TestCase):
     def test_helper_failures_and_malformed_framing_cannot_alias_a_valid_response(self):
         for source, diagnostic in (
             ("raise SystemExit(2)", "helper failed"),
+            ("import sys; print('200\\n{}'); sys.exit(1)", "helper failed"),
             ("print('malformed')", "invalid response"),
             ("print('999\\n{}')", "invalid response"),
         ):
@@ -187,9 +188,11 @@ class Deadline(unittest.TestCase):
                 self.assertTrue(raised.exception.delivery_uncertain)
 
     def test_helper_refuses_remote_http_without_sending_a_request(self):
-        with self.assertRaisesRegex(task_transport.TaskTransportError, "refused the service URL") as raised:
-            task_transport.post("http://outside.example", b"{}", {"Authorization": "private-native-bearer"}, timeout=2)
-        self.assertFalse(raised.exception.delivery_uncertain)
+        for url in ("http://outside.example", "https://queue.example:99999"):
+            with self.subTest(url=url):
+                with self.assertRaisesRegex(task_transport.TaskTransportError, "refused the service URL") as raised:
+                    task_transport.post(url, b"{}", {"Authorization": "private-native-bearer"}, timeout=2)
+                self.assertFalse(raised.exception.delivery_uncertain)
 
     def test_missing_python_interpreter_is_a_typed_transport_failure(self):
         for executable in (None, ""):
@@ -211,11 +214,14 @@ class Deadline(unittest.TestCase):
             communicate = process.communicate
 
             def delayed(*args, **kwargs):
-                output = communicate(*args, **kwargs)
+                if not calls:
+                    process.wait(timeout=kwargs["timeout"])
+                    calls.append(process.returncode)
+                    # The response is ready but still unread in its pipe. A
+                    # real zero-budget communicate exercises CPython's race.
+                    return communicate(*args, **{**kwargs, "timeout": 0})
                 calls.append(process.returncode)
-                if len(calls) == 1:
-                    raise subprocess.TimeoutExpired(process.args, 2, output=output[0])
-                return output
+                return communicate(*args, **kwargs)
 
             process.communicate = delayed
             return process

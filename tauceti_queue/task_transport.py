@@ -131,8 +131,8 @@ _ERROR_CATEGORIES = {
 def post(url: str, data: bytes, headers: dict[str, str], *, timeout: float) -> tuple[int, bytes]:
     """Send once, with secrets on stdin. Kill and reap before reporting timeout.
 
-    The total budget includes encoding and spawn. Known complete responses are
-    retained even if the parent was briefly descheduled at the deadline. OS
+    The total budget includes encoding and spawn. Responses from helpers that
+    already exited cleanly are retained if the parent was descheduled. OS
     process creation/reaping itself cannot be interrupted by a Python timeout.
     """
     check_timeout(timeout)

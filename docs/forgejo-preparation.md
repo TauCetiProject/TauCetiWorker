@@ -367,8 +367,9 @@ includes DNS resolution, TLS, request writes, response headers and success/error
 bodies. On timeout the child is killed and reaped; delivery remains uncertain and
 the transport does not resend the POST. Uncertain native delivery, malformed
 native claim responses and native 5xx outcomes stop the generic service retry
-wrapper. Completed responses are preserved even if the parent was descheduled at
-the deadline. Bearers travel on stdin, never process arguments. The helper source
+wrapper. Responses from helpers that already exited cleanly are preserved if the
+parent was descheduled at the deadline. A helper still running is killed and its
+delivery remains uncertain. Bearers travel on stdin, never process arguments. The helper source
 is captured at module import, skips site initialization and has its own lifetime
 bound if the parent dies. Redirect, HTTPS and response-size limits apply inside it.
 OS process creation and reaping cannot themselves be interrupted by a Python
