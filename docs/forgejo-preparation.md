@@ -957,7 +957,10 @@ from an unavailable authority endpoint.
 Before opening its store, a native `Service` takes an exclusive advisory process
 lock beside the existing database and retains it through shutdown. A second native
 service cannot commit bindings or publisher rotations while the first process is
-running, even if it chooses another port. Existing live-update tooling must stop
+running, even if it chooses another port. The native listener is also reserved
+before constructing the controller, so a busy port cannot commit a publisher
+rotation. A control token is rejected by actor identity if that account is any
+configured reviewer/status/recovery publisher, even when the token itself differs. Existing live-update tooling must stop
 and replace the service process without draining worker or CI admissions; this
 constructor does not deploy or replace a running service itself.
 
@@ -966,8 +969,19 @@ from fresh random data and configured with the same text on Forgejo. This route
 rejects bodies larger than one MiB before reading or hashing them. Routine prose,
 controller-authored output comments/labels and title-only edits do not re-dirty
 admission. Native review event names are normalized to invalidations; marker
-comments from non-publishers receive ordinary priority. Push discovery requests
-are persisted before acknowledgment. Confirmed controller recovery publications
-invalidate their PR directly, so ignoring their output webhook does not delay
+comments from resolvable non-publisher authors are ignored. Moderation of a
+publisher's comment is urgent regardless of the sender. Only canonical main pushes
+request discovery; retention and submission pushes are output, and PR head changes
+arrive through synchronize events. Main discovery requests are persisted before
+acknowledgment. Confirmed controller recovery publications
+atomically invalidate their PR directly with delivery settlement, so ignoring their output webhook does not delay
 reconciliation. Polling remains the recovery backstop; automatic Forgejo webhook
 redelivery is not assumed.
+
+The recovery publisher identity is exclusive to one controller/outbox owner.
+Operator tools enqueue decisions through that owner rather than independently
+allocating sequences or using its token. Native service bootstrap enforces a
+single process on its existing database; credential rotation stops the old
+publisher before starting the new generation, while normal worker/CI admissions
+stay enabled. A publication arriving from an unknown owned nonce is an operator
+reconciliation alert, not silently adopted local history.

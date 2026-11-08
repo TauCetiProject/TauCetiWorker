@@ -28,6 +28,7 @@ from tauceti_queue.forgejo_source import (
     ForgejoSourceAdapter,
     NativeAdmissionPolicy,
     NativePublishers,
+    NativePullRequest,
     PublicationDamaged,
     PublicationSuperseded,
 )
@@ -955,6 +956,32 @@ class NativeSource(unittest.TestCase):
             status["description"] = status["description"].replace(self.publishers.generation, "f" * 32)
         self.status_rows = [old]
         self.assertEqual(self.read()[2], "revoked")
+
+    def test_retired_writer_rows_after_a_current_explicit_clear_cannot_reimpose_a_hold(self):
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        clear = self.prepare("team/Math", 1, "a" * 40, "", "clear", kind="recovery", clear=True)
+        self.source.publish(clear)
+        outsider = SourceActor.from_native(self.repository.forge, {"id": 99, "login": "writer"})
+        old = self.stamp(self.comment(actor=outsider), actor=outsider, status_id=2, kind="recovery")
+        for index, row in enumerate(old):
+            row["id"] = 1000 + index
+            row["description"] = row["description"].replace(self.publishers.generation, "f" * 32)
+        self.status_rows.append(old)
+        self.assertEqual(self.read()[2], "clear")
+
+    def test_unrelated_discussion_does_not_starve_a_source_snapshot_but_changed_heads_still_do(self):
+        pull = NativePullRequest(1, "a" * 40, "main", "Proof", "", "writer", "open", base_sha="b" * 40)
+        discussion = replace(pull, title="A new title", comments_count=1, updated_at="2026-11-08T14:00:00Z")
+        with (
+            patch.object(self.source, "_merge_base", return_value="b" * 40),
+            patch.object(self.source, "_git", return_value=subprocess.CompletedProcess([], 0, b"Math/A.lean\0", b"")),
+        ):
+            self.source.fetch_pr.side_effect = [pull, discussion]
+            snapshot = self.source.admission_snapshot("team/Math", 1)
+            self.assertEqual(snapshot.pull, discussion)
+            self.source.fetch_pr.side_effect = [pull, replace(discussion, head_sha="c" * 40)]
+            with self.assertRaises(Incomplete):
+                self.source.admission_snapshot("team/Math", 1)
 
     def test_native_publication_status_event_invalidates_an_unchanged_pr(self):
         from tauceti_queue.admission import AdmissionPoller

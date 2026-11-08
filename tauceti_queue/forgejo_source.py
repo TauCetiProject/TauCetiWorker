@@ -531,7 +531,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         if latest is None:
             return None, "absent"
         _id, stamp, actor = latest
-        if stamp["_stage"] == "unverified":
+        if stamp["_stage"] in {"unverified", "retired"}:
             return None, "revoked"
         if actor is None or actor.principal not in allowed:
             return None, "revoked"
@@ -700,7 +700,11 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         latest = self._publication_latest(rows, REVIEW_CONTEXT + str(number))
         statuses["_native_review_started"] = (latest[1].get("_started_at") or "") if latest is not None else ""
         fresh = self.fetch_pr(repo, number)
-        if fresh != pull:
+        # Ordinary discussion/title timestamps cannot invalidate a complete
+        # source read. Relevant publications are bound by immutable receipts;
+        # source head/base/state/labels/body still fence this observation.
+        fields = ("head_sha", "base_ref", "state", "draft", "labels", "body", "base_sha", "merged")
+        if any(getattr(fresh, key, None) != getattr(pull, key, None) for key in fields):
             raise Incomplete("native pull changed while reading admission evidence")
         version = base + ":" + digest({"comments": comments, "policy": self.admission_policy.revision})
         return ports.AdmissionSnapshot(fresh, base, paths, comments, statuses, version, self._discovery_version(fresh))
