@@ -61,7 +61,7 @@ are unix seconds, run and comment ids strings, `repo` is `owner/name`, SHAs are 
 | `post_comment(repo, number, body, marker) -> str` | appends `<!-- tauceti-queue <marker> -->`; a comment already carrying the marker is edited (or left alone when identical), never duplicated |
 | `set_labels(repo, number, add, remove)` | `POST /issues/{n}/labels` and `DELETE /issues/{n}/labels/{name}` (404 tolerated) |
 | `ensure_label(repo, name, color, description)` | `POST /labels` (422 `already_exists` tolerated) |
-| `close_pr(repo, number, title)` | `PATCH /pulls/{n} {state: closed, title}`, bookkeeping fields only, as Bors's `close_merged_pr`; the controller passes the `[Merged by Bors] - ` title |
+| `close_pr(repo, number, title)` | `PATCH /pulls/{n} {state: closed, title}`, bookkeeping fields only; the controller prefixes merged PR titles with `[Merged by Bors] - ` and preserves the current title for rejected empty contributions |
 | `repository_admin(login, repo=None) -> bool` | `GET /collaborators/{login}/permission` is `admin` (the `security_audit.require_admin` predicate); `reviewer(login)` is Bors's reviewer check, push access (`admin`, `maintain`, `write`) |
 | `rate_limit() -> (int, float)` | from the last response headers, else `GET /rate_limit` |
 
@@ -192,7 +192,9 @@ fenced `diff` block. A diff longer than 400 lines shows the first 400 and a note
 line count and a link to the commit. Then the earlier edited revisions, the PRs the explanation
 mentions and the retained ref, as before. Each summary is journaled as `edit-summary` (number,
 commit, accepted head, `diff_lines`, `truncated`) and counted in `edit_summaries`. A clean member's
-comment is unchanged.
+comment is unchanged. A final empty contribution instead receives a rejection notice quoting the
+same accumulated explanations, has its staging label removed, and is closed without the merged
+title prefix. Existing externally merged placeholders and opt-out withdrawals retain their handling.
 
 **The `repaired-in-queue` label.** Beside `dont-repair-in-queue` (the author's opt-out) and
 `needs-rebase` (the author must act), the queue marks the PRs it changed: every landed member that

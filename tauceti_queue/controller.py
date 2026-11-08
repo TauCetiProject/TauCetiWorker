@@ -40,12 +40,15 @@ from .ports import (
     DispatchNotAccepted,
     ExecutionPort,
     GitHubUnavailable,
+    PromotionRefused,
     SourcePort,
     Task,
     TaskMember,
 )
+from .source_authority import NativeQueueAuthority, SourceAuthorityUnavailable, principal_key
 from .stale_cache import StaleCache
 from .store import Store, dumps, loads
+from .task_identity import TaskBinding
 
 STATUS_SCHEMA = "tauceti-queue.status/v1"
 BUILD_CONTEXT = "build"
@@ -301,11 +304,21 @@ class ControllerLock:
         with self._cond:
             return self._priority_waiting
 
+    def owned(self) -> bool:
+        with self._cond:
+            return self._owner == threading.get_ident()
+
     @contextlib.contextmanager
-    def unlocked(self) -> Iterator[None]:
-        """Let go of every level this thread holds for the body, then take them back (as an ordinary
-        acquirer, so the priority requests that queued meanwhile run first). A no-op for a thread that
-        does not hold the lock. The caller must not be inside a store transaction."""
+    def unlocked(self, *, priority: bool = False, reacquire=None) -> Iterator[None]:
+        """Let go of every level this thread holds for the body, then take them back (ordinary by
+        default, or at priority when requested). A no-op for a thread that
+        does not hold the lock. The caller must not be inside a store transaction.
+
+        An optional reacquire callback runs without the lock and must acquire one
+        level itself; this supports timed priority acquisition with refreshed
+        external evidence. On callback failure we still restore the original
+        ownership/depth before propagating the error.
+        """
         with self._cond:
             if self._owner != threading.get_ident():
                 depth = 0
@@ -316,9 +329,17 @@ class ControllerLock:
             yield
         finally:
             if depth:
-                with self._cond:
-                    self._take(False, None)
-                    self._depth = depth
+                try:
+                    if reacquire is not None:
+                        reacquire()
+                        with self._cond:
+                            if self._owner != threading.get_ident():
+                                raise RuntimeError("reacquire callback did not take the controller lock")
+                finally:
+                    with self._cond:
+                        if self._owner != threading.get_ident():
+                            self._take(priority, None)
+                        self._depth = depth
 
     def offer(self) -> None:
         """Between two units of a long holder's work: let the waiting priority requests run."""
@@ -337,6 +358,8 @@ class Controller:
         *,
         revision: str,
         execution: ExecutionPort | None = None,
+        candidate_ci=None,
+        source_authority=None,
         canonical_branch: str | None = None,
         clock: Callable[[], float] = time.time,
         rng: random.Random | None = None,
@@ -346,6 +369,27 @@ class Controller:
         self.admission = None  # primary policy intake, attached by the service in policy mode
         self.source = github
         self.execution = execution if execution is not None else github
+        self.candidate_ci = candidate_ci
+        self.source_authority = source_authority
+        if source_authority is not None and (
+            not isinstance(source_authority, NativeQueueAuthority)
+            or candidate_ci is None
+            or source_authority.source != candidate_ci.ledger.policy.source
+        ):
+            raise ValueError("native queue authority differs from its source CI binding")
+        if candidate_ci is None and store.get_setting("source-ci:binding") is not None:
+            raise ValueError("source-bound queue ledger requires its qualified CI coordinator")
+        if candidate_ci is not None:
+            if candidate_ci.ledger.store is not store or candidate_ci.ledger.clone != str(clone):
+                raise ValueError("source CI ledger does not belong to this controller")
+            if getattr(github, "repository_identity", None) != candidate_ci.ledger.policy.source:
+                raise ValueError("source CI source port identity differs from its policy")
+            if repository != candidate_ci.ledger.policy.source.repository.name:
+                raise ValueError("controller repository differs from its qualified source")
+            if not all(
+                callable(getattr(github, name, None)) for name in ("retain_candidate", "verify_candidate_approval")
+            ):
+                raise ValueError("source CI needs qualified retention and fresh approval operations")
         self.github = self.source  # compatibility for source-authentication/service callers
         self.clone = clone
         self.repository = repository
@@ -374,6 +418,7 @@ class Controller:
         # Renewals waiting for the lock: claim token -> when the request arrived. `_expire_claims`
         # spares a claim whose renewal arrived before it expired.
         self._renewing: dict[str, float] = {}
+        self._renewal_waiters: dict[str, dict[object, float]] = {}
         self._renewing_guard = threading.Lock()
         self._wake = threading.Event()
         self._reasons: list[str] = []
@@ -381,6 +426,11 @@ class Controller:
         # lock is held by a long tick.
         self._status_snapshot: tuple[float, dict[str, Any]] | None = None
         self.canonical_branch = canonical_branch or self._discover_canonical_branch()
+        if candidate_ci is not None and (
+            repository != candidate_ci.ledger.policy.source.repository.name
+            or self.canonical_branch != candidate_ci.ledger.policy.base_branch
+        ):
+            raise ValueError("controller source repository or branch differs from its CI policy")
         self._canonical: str | None = self.store.get_setting("state:canonical_sha")
         # Labels this process has made sure exist in the repository (`_ensure_labels`).
         self._labels_ensured: set[str] = set()
@@ -587,7 +637,7 @@ class Controller:
         Unknown/missing producer evidence is final for this revision; transport exceptions have
         three attempts with backoff. Persisted attempts bound retries across service restarts.
         """
-        if not hasattr(self.execution, "declaration_names"):
+        if self.candidate_ci is not None or not hasattr(self.execution, "declaration_names"):
             return False
         if not hasattr(self, "_declaration_fetches"):
             self._declaration_fetches: dict[str, concurrent.futures.Future] = {}
@@ -723,10 +773,6 @@ class Controller:
                     return {"accepted": True, "reason": "already-approved", "input": self._input_for(pr)}
                 if existing["state"] == INPUT_INSERTED:
                     return {"accepted": False, "reason": "member", "input": existing}
-                # A different head while waiting: the previous approval no longer describes the source.
-                self.store.update(
-                    "inputs", {"id": existing["id"]}, state=INPUT_CANCELLED, reason="superseded-by-new-approval"
-                )
             if pull is None or pull.head_sha != head_sha:
                 pull, reason = self.validate_pull(repo, pr, head_sha)
                 if reason is not None:
@@ -740,6 +786,11 @@ class Controller:
             no_repair = self._carries_no_repair(getattr(pull, "labels", None))
             ref = self.input_ref(pr, head_sha)
             with self.store.transaction():
+                if existing is not None and existing["state"] in (INPUT_WAITING, INPUT_RESERVED):
+                    # A validated new approval supersedes the old waiting revision, preserving terminal history.
+                    self.store.update(
+                        "inputs", {"id": existing["id"]}, state=INPUT_CANCELLED, reason="superseded-by-new-approval"
+                    )
                 self._retain(ref, head_sha)
                 input_id = self.store.insert(
                     "inputs",
@@ -816,7 +867,7 @@ class Controller:
         return bool({str(label).lower() for label in labels or ()} & self._no_repair_labels())
 
     def input_for(self, repo: str, pr: int) -> dict[str, Any] | None:
-        """The PR's current input row (the newest that is not cancelled, else the newest), or None."""
+        """The PR's newest live input row, or its newest terminal row when none is live, or None."""
         with self._lock:
             self._check_repo(repo)
             return self._input_for(pr)
@@ -994,10 +1045,10 @@ class Controller:
             return {"urgent": True, "state": current["state"]}
 
     def _input_for(self, pr: int) -> dict[str, Any] | None:
-        """The PR's current input: the newest row that is not cancelled, else the newest row."""
+        """The PR's newest live input, otherwise its newest terminal input."""
         rows = self.store.rows("inputs", {"repository": self.repository, "number": pr}, order="id DESC")
         for row in rows:
-            if row["state"] != INPUT_CANCELLED:
+            if row["state"] in (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED):
                 return row
         return rows[0] if rows else None
 
@@ -1166,13 +1217,84 @@ class Controller:
 
     def _repository_admin(self, login: str) -> bool | None:
         """`repository_admin(login)` through the cache; None when GitHub cannot answer and never has."""
+        if self.candidate_ci is not None:
+            return None  # Native authority never uses a cached GitHub login.
         try:
             return bool(self.admins.get(login, login))
         except GitHubUnavailable as error:
             self.log.warning("admin check for %s failed with nothing cached: %s", login, error)
             return None
 
-    def claim_task(self, worker_identity: str, github_login: str) -> Task | None:
+    def _source_request_access(self, evidence, *, claim=None):
+        """Validate a native request under the lock without performing I/O."""
+        if self.source_authority is None:
+            raise PermissionError("native source authority is required")
+        access = self.source_authority.validate(evidence)
+        self.source_authority.require_admin(access)
+        actor = {
+            "origin": access.actor.principal.forge.key,
+            "id": access.actor.principal.native_id,
+            "login": access.actor.login,
+        }
+        if claim is not None:
+            self._check_source_claim_owner(actor, claim)
+        return access, actor
+
+    @staticmethod
+    def _check_source_claim_owner(actor, claim):
+        owner = loads(claim.get("source_actor"), {})
+        if not isinstance(owner, dict) or (owner.get("origin"), owner.get("id")) != (actor["origin"], actor["id"]):
+            raise PermissionError("native source caller does not own this claim")
+
+    def _refresh_source_access(self, evidence, refresh, *, claim=None):
+        """Refresh outside the controller lock; callers must recheck their state."""
+        if not self._lock.owned():
+            raise RuntimeError("native authority refresh requires controller lock ownership")
+        if refresh is None:
+            self._source_request_access(evidence, claim=claim)
+            return evidence
+        actor = evidence.access.actor  # Validated at this operation's entry.
+        fresh = None
+
+        def acquire_fresh():
+            nonlocal fresh
+            for _ in range(3):
+                fresh = refresh()
+                try:
+                    access, _ = self._source_request_access(fresh, claim=claim)
+                except SourceAuthorityUnavailable:
+                    continue
+                if access.actor != actor:
+                    raise PermissionError("native source caller changed while refreshing authority")
+                remaining = max(0, 15 - (self.source_authority.clock() - fresh.checked_at))
+                if not self._lock.acquire(priority=True, timeout=remaining):
+                    continue
+                try:
+                    self._source_request_access(fresh, claim=claim)
+                except SourceAuthorityUnavailable:
+                    self._lock.release()
+                    continue
+                return
+            raise SourceAuthorityUnavailable("controller stayed busy beyond fresh native authority")
+
+        with self._lock.unlocked(priority=True, reacquire=acquire_fresh):
+            pass
+        return fresh
+
+    def _submission_task_current(self, task, batch):
+        if task["kind"] == TASK_PRE_REBASE:
+            return self._pre_rebase_task_current(task, batch)
+        if self._pre_rebased_prepare(task):
+            return self._pre_rebased_prepare_current(task, batch)
+        return (
+            task["state"] == TASK_OPEN
+            and batch["version"] == task["batch_version"]
+            and batch["state"] == (BATCH_OPEN if task["kind"] == TASK_PREPARE else BATCH_HEAD)
+        )
+
+    def claim_task(
+        self, worker_identity: str, github_login: str, *, source_access=None, expected_binding=None
+    ) -> Task | None:
         """Hand an open task to an authorized worker under a renewable claim, within `repair_concurrency`.
 
         `repair_concurrency` bounds the live task claims in total. Within it, tasks are offered in
@@ -1186,8 +1308,19 @@ class Controller:
         The admin check (a cached GitHub read) runs before the lock is taken, and the claim takes the
         lock's priority lane, so a claim answers while a tick is running.
         """
-        admin = self._repository_admin(github_login)
+        if expected_binding is not None and self.candidate_ci is None:
+            raise TaskError("not-authorized", "qualified task binding requires a native source controller")
+        admin = self._repository_admin(github_login) if self.candidate_ci is None else None
         with self._lock.priority():
+            actor = {}
+            if self.candidate_ci is not None:
+                if expected_binding is not None and expected_binding != TaskBinding.from_policy(
+                    self.candidate_ci.ledger.policy, queue_epoch=self.candidate_ci.ledger.epoch
+                ):
+                    raise TaskError("not-authorized", "requested native task policy changed")
+                _access, actor = self._source_request_access(source_access)
+                github_login = ""  # Native identities never populate the legacy login field.
+                admin = True
             now = self.clock()
             self._expire_claims(now)
             if not admin:
@@ -1220,6 +1353,7 @@ class Controller:
                     operation=f"task:{task['kind']}",
                     worker=worker_identity,
                     github_login=github_login,
+                    source_actor=dumps(actor),
                     token=token,
                     starting_tip=batch["tip"],
                     task_id=task["id"],
@@ -1271,6 +1405,10 @@ class Controller:
         `prepare` task of the pre-rebased chain likewise (`_pre_rebased_prepare_current`)."""
         found = []
         for task in self.store.rows("tasks", {"repository": self.repository, "state": TASK_OPEN}):
+            try:
+                self._task_binding(task)
+            except TaskError:
+                continue  # No implicit adoption of old/unqualified policy snapshots.
             batch = self.store.row("batches", {"id": task["batch_id"]})
             if batch is None:
                 continue
@@ -1299,7 +1437,7 @@ class Controller:
             if row["task_id"] is not None
         ]
 
-    def renew_task(self, task_id: int, claim_token: str) -> float:
+    def renew_task(self, task_id: int, claim_token: str, *, source_access=None, source_refresh=None) -> float:
         """Extend the claim by `claim_ttl_seconds` from now.
 
         The claim's expiry is judged at the request's arrival, not when it gets the lock: a renewal that
@@ -1307,21 +1445,40 @@ class Controller:
         (and `_expire_claims` spares the claim while such a renewal waits).
         """
         arrived = self.clock()
+        entry_actor = None
+        if self.candidate_ci is not None:
+            _, entry_actor = self._source_request_access(source_access)
+        waiter = object()
         with self._renewing_guard:
-            self._renewing[claim_token] = min(arrived, self._renewing.get(claim_token, arrived))
+            waiting = self._renewal_waiters.setdefault(claim_token, {})
+            waiting[waiter] = arrived
+            self._renewing[claim_token] = min(waiting.values())
         try:
             with self._lock.priority():
                 claim = self._claim_for(task_id, claim_token, arrived)
+                if self.candidate_ci is not None:
+                    self._check_source_claim_owner(entry_actor, claim)
+                    try:
+                        self._source_request_access(source_access, claim=claim)
+                    except SourceAuthorityUnavailable:
+                        source_access = self._refresh_source_access(source_access, source_refresh, claim=claim)
+                        claim = self._claim_for(task_id, claim_token, arrived)
+                        self._source_request_access(source_access, claim=claim)
                 now = self.clock()
                 expires = now + int(self.setting("claim_ttl_seconds"))
                 self.store.update("claims", {"id": claim["id"]}, expires_at=expires, renewed_at=now)
                 return expires
         finally:
             with self._renewing_guard:
-                if self._renewing.get(claim_token) == arrived:
-                    del self._renewing[claim_token]
+                waiting = self._renewal_waiters[claim_token]
+                del waiting[waiter]
+                if waiting:
+                    self._renewing[claim_token] = min(waiting.values())
+                else:
+                    del self._renewal_waiters[claim_token]
+                    self._renewing.pop(claim_token, None)
 
-    def release_task(self, task_id: int, claim_token: str, reason: str, error: str = "") -> None:
+    def release_task(self, task_id: int, claim_token: str, reason: str, error: str = "", *, source_access=None) -> None:
         """A worker gives a task back. Reason `inference_unavailable` counts toward the inference hold.
 
         A `prepare` task released as `prepared_clean` (its batch built without an error, so there was
@@ -1331,12 +1488,17 @@ class Controller:
         """
         with self._lock.priority():
             now = self.clock()
-            claim = self._claim_for(task_id, claim_token, now)
+            claim = self._claim_for(task_id, claim_token, now, allow_stale_policy=True)
+            if self.candidate_ci is not None:
+                self._source_request_access(source_access, claim=claim)
             task = self.store.row("tasks", {"id": task_id})
+            stale_policy = task is not None and not self._task_policy_current(task)
             with self.store.transaction():
                 self.store.update("claims", {"id": claim["id"]}, released_at=now, release_reason=reason)
                 self.store.journal(now, "released", claim["batch_id"], task_id=task_id, reason=reason, error=error)
-                if task is not None and task["kind"] == TASK_PREPARE and task["state"] == TASK_OPEN:
+                if stale_policy and task["state"] == TASK_OPEN:
+                    self._replace_stale_source_task(task, now)
+                elif task is not None and task["kind"] == TASK_PREPARE and task["state"] == TASK_OPEN:
                     self._settle_prepare_release(task, reason, now)
                     if reason == PREPARE_CLEAN_REASON:
                         settled = self.store.row("tasks", {"id": task_id}) or {}
@@ -1382,7 +1544,16 @@ class Controller:
             self._count("prepares_failed")
             self.store.journal(now, "prepare-failed", task["batch_id"], task_id=task["id"], reason=reason)
 
-    def submit_task(self, task_id: int, claim_token: str, tip_sha: str, worker_notes: str = "") -> Adoption:
+    def submit_task(
+        self,
+        task_id: int,
+        claim_token: str,
+        tip_sha: str,
+        worker_notes: str = "",
+        *,
+        source_access=None,
+        source_refresh=None,
+    ) -> Adoption:
         """Validate a proposed chain against the task and adopt it as the batch's next version.
 
         A late result (expired claim, superseded task or batch version) is rejected but its commits
@@ -1396,9 +1567,14 @@ class Controller:
             claim = self.store.row("claims", {"task_id": task_id, "token": claim_token})
             if claim is None:
                 raise TaskError("unknown-claim", "no claim with that token on this task")
+            if self.candidate_ci is not None:
+                self._source_request_access(source_access, claim=claim)
+            self._task_binding(task, allow_stale_policy=True)
             batch = self.store.row("batches", {"id": task["batch_id"]})
             assert batch is not None
             retained = self._retain_submission(task, claim, tip_sha)
+            if self.candidate_ci is not None:
+                now = self.clock()
 
             def reject(reason: str, violations: list[chain.Violation] | None = None) -> Adoption:
                 self.store.insert(
@@ -1425,30 +1601,25 @@ class Controller:
                     [v.to_dict() for v in violations or []],
                 )
 
+            if not self._task_policy_current(task):
+                self._replace_stale_source_task(task, now)
+                return reject("policy-changed")
             if claim["released_at"] is not None:
                 return reject("claim-expired" if claim["release_reason"] == "expired" else "claim-superseded")
-            if claim["expires_at"] <= now:
+            if claim["expires_at"] <= now and not self._renewal_protects(claim):
                 self.store.update("claims", {"id": claim["id"]}, released_at=now, release_reason="expired")
                 return reject("claim-expired")
-            if not self._repository_admin(claim["github_login"]):
+            if self.candidate_ci is None and not self._repository_admin(claim["github_login"]):
                 return reject("not-authorized")
-            if task["kind"] == TASK_PRE_REBASE:
-                if not self._pre_rebase_task_current(task, batch):
-                    return reject("version-mismatch")
-            elif self._pre_rebased_prepare(task):
-                if not self._pre_rebased_prepare_current(task, batch):
-                    return reject("version-mismatch")
-            elif (
-                task["state"] != TASK_OPEN
-                or batch["version"] != task["batch_version"]
-                or batch["state"] != (BATCH_OPEN if task["kind"] == TASK_PREPARE else BATCH_HEAD)
-            ):
+            if not self._submission_task_current(task, batch):
                 return reject("version-mismatch")
             if retained is None:
                 return reject("tip-unavailable")
             members = self._task_members(task)
             records = [self._chain_member(member) for member in members]
             report = chain.validate(self.clone, task["onto"], tip_sha, records)
+            if self.candidate_ci is not None:
+                now = self.clock()
             if not report.ok:
                 self._count("chain_validation_failures")
                 self.store.journal(
@@ -1460,6 +1631,8 @@ class Controller:
                 )
                 return reject("invalid-chain", report.violations)
             comparison = chain.compare(self.clone, task["base"], task["tip"], task["onto"], tip_sha)
+            if self.candidate_ci is not None:
+                now = self.clock()
             if not comparison.ok:
                 self._count("chain_validation_failures")
                 self.store.journal(
@@ -1498,6 +1671,54 @@ class Controller:
             knowledge = next(
                 (d for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions"), {}
             )
+            if self.candidate_ci is not None:
+                original_task = task
+                source_access = self._refresh_source_access(source_access, source_refresh, claim=claim)
+                now = self.clock()
+                current_task = self.store.row("tasks", {"id": task_id})
+                current_claim = self.store.row("claims", {"id": claim["id"]})
+                current_batch = self.store.row("batches", {"id": task["batch_id"]})
+                if current_task is None or current_batch is None:
+                    return reject("version-mismatch")
+                if (
+                    current_claim is None
+                    or current_claim["token"] != claim_token
+                    or current_claim["task_id"] != task_id
+                ):
+                    return reject("claim-superseded")
+                task, claim, batch = current_task, current_claim, current_batch
+                self._source_request_access(source_access, claim=claim)
+                if not self._task_policy_current(task):
+                    self._replace_stale_source_task(task, now)
+                    return reject("policy-changed")
+                if claim["released_at"] is not None:
+                    return reject("claim-expired" if claim["release_reason"] == "expired" else "claim-superseded")
+                if claim["expires_at"] <= now and not self._renewal_protects(claim):
+                    self.store.update("claims", {"id": claim["id"]}, released_at=now, release_reason="expired")
+                    return reject("claim-expired")
+                identity_fields = (
+                    "batch_id",
+                    "batch_version",
+                    "kind",
+                    "base",
+                    "tip",
+                    "onto",
+                    "pre_rebase_source",
+                    "ci_attempt_id",
+                    "task_binding",
+                )
+                if any(task[key] != original_task[key] for key in identity_fields):
+                    return reject("version-mismatch")
+                if not self._submission_task_current(task, batch):
+                    return reject("version-mismatch")
+                covered = {member["id"] for member in members}
+                current_members = [member for member in self._members(batch["id"]) if member["id"] in covered]
+                if current_members != members:
+                    return reject("version-mismatch")
+                self._source_request_access(source_access, claim=claim)
+                knowledge = next(
+                    (d for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions"), {}
+                )
             if tip_sha == task["tip"] and knowledge.get("was_proactive"):
                 self._release_claim(claim, "source-failure-refresh", now)
                 return reject(
@@ -1757,16 +1978,26 @@ class Controller:
         self._wake.set()
         return Adoption(True, "adopted", task["id"], batch["id"], batch["version"], tip_sha, ref, provenance=provenance)
 
-    def _claim_for(self, task_id: int, token: str, now: float) -> dict[str, Any]:
+    def _claim_for(self, task_id: int, token: str, now: float, *, allow_stale_policy=False) -> dict[str, Any]:
         claim = self.store.row("claims", {"task_id": task_id, "token": token})
         if claim is None:
             raise TaskError("unknown-claim", "no claim with that token on this task")
+        task = self.store.row("tasks", {"id": task_id})
+        if task is None:
+            raise TaskError("unknown-task")
+        self._task_binding(task, allow_stale_policy=allow_stale_policy)
         if claim["released_at"] is not None:
             raise TaskError("claim-expired" if claim["release_reason"] == "expired" else "claim-superseded")
-        if claim["expires_at"] <= now:
+        if claim["expires_at"] <= now and not self._renewal_protects(claim):
             self.store.update("claims", {"id": claim["id"]}, released_at=now, release_reason="expired")
             raise TaskError("claim-expired")
         return claim
+
+    def _renewal_protects(self, claim):
+        """An authenticated request delivered before expiry keeps this lease live."""
+        with self._renewing_guard:
+            arrived = self._renewing.get(claim["token"])
+        return arrived is not None and arrived < claim["expires_at"]
 
     def _open_task(self, head: dict[str, Any]) -> dict[str, Any] | None:
         return self.store.row(
@@ -1782,6 +2013,74 @@ class Controller:
             return members
         covered = {commit.source_pr for commit in chain.chain_commits(self.clone, task["base"], task["tip"])}
         return [member for member in members if member["source_pr"] in covered]
+
+    def _task_binding(self, task, *, allow_stale_policy=False):
+        try:
+            row = loads(task.get("task_binding"), {})
+        except (TypeError, ValueError):
+            raise TaskError("not-authorized", "qualified task binding is unreadable") from None
+        if self.candidate_ci is None:
+            if not isinstance(row, dict) or row != {}:
+                raise TaskError("not-authorized", "native task requires its qualified controller")
+            return None
+        try:
+            binding = TaskBinding.parse(row)
+        except (TypeError, ValueError):
+            raise TaskError("not-authorized", "qualified task binding is unavailable") from None
+        current = TaskBinding.from_policy(self.candidate_ci.ledger.policy, queue_epoch=self.candidate_ci.ledger.epoch)
+        same_scope = (binding.source, binding.execution, binding.queue_epoch) == (
+            current.source,
+            current.execution,
+            current.queue_epoch,
+        )
+        if binding != current and not (allow_stale_policy and same_scope):
+            raise TaskError("not-authorized", "qualified task policy changed")
+        return binding
+
+    def _task_policy_current(self, task):
+        try:
+            self._task_binding(task)
+            return True
+        except TaskError:
+            return False
+
+    def _replace_stale_source_task(self, task, now):
+        """Replace work under a changed policy; never reinterpret its claim."""
+        if task["state"] != TASK_OPEN:
+            return None
+        batch = self.store.row("batches", {"id": task["batch_id"]})
+        replace = batch is not None and self._submission_task_current(task, batch)
+        with self.store.transaction():
+            self.store.update(
+                "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="policy-changed"
+            )
+            self.store.update(
+                "claims", {"task_id": task["id"], "released_at": None}, released_at=now, release_reason="policy-changed"
+            )
+            replacement = None
+            if replace:
+                replacement = self._create_task(
+                    batch,
+                    task["kind"],
+                    task["onto"],
+                    loads(task["diagnostics"], []),
+                    now,
+                    ci_attempt_id=task["ci_attempt_id"],
+                    pre_rebased=(task["tip"], task["pre_rebase_source"]) if self._pre_rebased_prepare(task) else None,
+                )
+            self.store.journal(
+                now, "task-policy-changed", task["batch_id"], task_id=task["id"], replacement_task_id=replacement
+            )
+        self._wake.set()
+        return replacement
+
+    def _supersede_stale_source_tasks(self, now):
+        if self.candidate_ci is None:
+            return
+        for previous in self.store.rows("tasks", {"repository": self.repository, "state": TASK_OPEN}):
+            task = self.store.row("tasks", {"id": previous["id"]})
+            if task is not None and task["state"] == TASK_OPEN and not self._task_policy_current(task):
+                self._replace_stale_source_task(task, now)
 
     def _task_record(
         self, task: dict[str, Any], batch: dict[str, Any], claim_id: int, token: str, expires: float
@@ -1831,7 +2130,7 @@ class Controller:
         return Task(
             task_id=task["id"],
             kind=task["kind"],
-            repository=self.repository,
+            repository="" if self.candidate_ci is not None else self.repository,
             batch_id=batch["id"],
             batch_version=task["batch_version"],
             base=task["base"],
@@ -1847,6 +2146,7 @@ class Controller:
             created_at=task["created_at"],
             extra=extra,
             warm_revs=self._warm_revs(task, batch),
+            binding=self._task_binding(task),
         )
 
     def _create_task(
@@ -1898,6 +2198,13 @@ class Controller:
                 created_at=now,
                 ci_attempt_id=ci_attempt_id,
                 pre_rebase_source=pre_rebased[1] if pre_rebased else None,
+                task_binding=dumps(
+                    TaskBinding.from_policy(
+                        self.candidate_ci.ledger.policy, queue_epoch=self.candidate_ci.ledger.epoch
+                    ).record()
+                )
+                if self.candidate_ci is not None
+                else "{}",
             )
             self._count("tasks_prepare_pre_rebased" if pre_rebased else f"tasks_{kind}")
             self.store.journal(
@@ -2161,6 +2468,7 @@ class Controller:
         offer = self._lock.offer
         self._reasons = []
         now = self.clock()
+        self._supersede_stale_source_tasks(now)
         self._expire_claims(now)
         self._drain_outbox(now)
         offer()
@@ -2247,27 +2555,29 @@ class Controller:
 
     def _observe_canonical(self, canonical: str, now: float) -> None:
         previous = self._canonical
-        self._canonical = canonical
         self._set_state("canonical_stale", False)
-        if canonical == previous:
-            return
-        self._set_state("canonical_sha", canonical)
-        self.store.journal(now, "canonical-advance", previous=previous, current=canonical)
         head = self._head()
         if head is not None and chain.is_ancestor(self.clone, head["tip"], canonical):
             how = "promoted" if head["expected_parent"] else "external"
             self._landed(head, how, now)
+        self._canonical = canonical
+        if canonical == previous:
+            return
+        self._set_state("canonical_sha", canonical)
+        self.store.journal(now, "canonical-advance", previous=previous, current=canonical)
         if previous and chain.is_ancestor(self.clone, previous, canonical):
             landed_prs: set[int] = set()
             bors_landed: set[int] = set()
-            withdrawn = {
-                m["commit_sha"] for m in self.store.rows("members", {"withdrawn": 1, "removed": 0}) if m["commit_sha"]
-            }
             try:
+                trees = {previous: chain.tree_of(self.clone, previous)}
                 for commit in chain.chain_commits(self.clone, previous, canonical):
                     source = commit.source_pr
-                    if commit.sha in withdrawn:
-                        continue  # a withdrawn member's empty commit lands nothing
+                    empty = len(commit.parents) == 1 and commit.tree == (
+                        trees.get(commit.parents[0]) or chain.tree_of(self.clone, commit.parents[0])
+                    )
+                    trees[commit.sha] = commit.tree
+                    if empty:
+                        continue  # an empty placeholder lands no contribution
                     if source and source.startswith(f"{self.repository}#"):
                         landed_prs.add(int(source.rsplit("#", 1)[1]))
                     elif not source:
@@ -3940,6 +4250,11 @@ class Controller:
 
     def _advance_attempt(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> None:
         if attempt.get("dispatch_state") == "prepared":
+            if self.candidate_ci is not None and now < (attempt["dispatch_retry_at"] or 0):
+                self._reasons.append(
+                    f"head {head['id']}: prepared source CI retry at {attempt['dispatch_retry_at']:.0f}"
+                )
+                return
             self._send_prepared(head, attempt, now)
         else:
             self._observe_attempt(head, attempt, now)
@@ -4007,7 +4322,7 @@ class Controller:
         elif attempt["outcome"] == OUTCOME_PASS:
             self._promote(head, attempt, now)
 
-    def rebuild_head(self, repo: str, actor: str) -> dict[str, Any]:
+    def rebuild_head(self, repo: str, actor: str, *, source_access=None, source_refresh=None) -> dict[str, Any]:
         """Operator: rebuild the head's chain from its members' accepted heads and dispatch it again.
 
         For a head whose chain must be regenerated without a source change (a new commit message format,
@@ -4016,6 +4331,9 @@ class Controller:
         claimed or when a member carries agent edits, which a rebuild from accepted heads would discard.
         """
         with self._lock:
+            if self.source_authority is not None:
+                access, _ = self._source_request_access(source_access)
+                actor = principal_key(access.actor)
             self._check_repo(repo)
             head = self._head()
             if head is None:
@@ -4040,6 +4358,13 @@ class Controller:
                 return {"rebuilt": False, "reason": str(error)}
             finally:
                 chain.delete_chain_ref(self.clone, chain_id)
+            if self.source_authority is not None:
+                source_access = self._refresh_source_access(source_access, source_refresh)
+                now = self.clock()
+                if not self._source_head_current(head) or self._members(head["id"]) != members:
+                    return {"rebuilt": False, "reason": "head-changed"}
+                if self._active_claims(head["id"]):
+                    return {"rebuilt": False, "reason": "claimed"}
             if result.status != chain.CLEAN:
                 conflict = result.conflict
                 self.store.journal(
@@ -4084,19 +4409,49 @@ class Controller:
                 "landed_on_base": result.landed_on_base,
             }
 
-    def retry_ci(self, repo: str, actor: str) -> dict[str, Any]:
+    def retry_ci(
+        self, repo: str, actor: str, *, request_id: str | None = None, source_access=None, source_refresh=None
+    ) -> dict[str, Any]:
         """Operator: supersede infrastructure failures or an unresolved send before a new dispatch.
 
         Refused (`reason: live-run`) while GitHub reports a run for the head's tip queued or in
         progress, since the re-dispatch would cancel it; `github-unavailable` when that cannot be checked.
         """
         with self._lock:
+            if self.source_authority is not None:
+                access, _ = self._source_request_access(source_access)
+                actor = principal_key(access.actor)
             self._check_repo(repo)
             head = self._head()
             if head is None:
                 return {"retried": False, "reason": "no-head"}
             now = self.clock()
             attempts = self._tip_attempts(head)
+            current_attempt = self._current_attempt(head)
+            if self.candidate_ci is not None and (
+                current_attempt is None or request_id is None or request_id != current_attempt["request_id"]
+            ):
+                return {"retried": False, "reason": "request-identity-required"}
+            if self.candidate_ci is not None:
+                prepared = current_attempt["dispatch_state"] == "prepared"
+                if prepared and current_attempt["outcome"] == OUTCOME_PENDING:
+                    with self.store.transaction():
+                        changed = self.store.update(
+                            "ci_attempts",
+                            {"id": current_attempt["id"], "dispatch_state": "prepared", "outcome": OUTCOME_PENDING},
+                            outcome=OUTCOME_SUPERSEDED,
+                        )
+                        self.store.journal(
+                            now,
+                            "retry-ci",
+                            head["id"],
+                            actor=actor,
+                            forgotten=changed,
+                            request_id=request_id,
+                            prepared=True,
+                        )
+                    self._wake.set()
+                    return {"retried": bool(changed), "forgotten": changed}
             if attempts:
                 # A new dispatch would cancel a live run for the tip (pr-build.yml's concurrency group).
                 try:
@@ -4108,8 +4463,17 @@ class Controller:
                             self._observe_attempt(head, dict(attempt, needs_observation=1), now, strict=True)
                     attempts = self._tip_attempts(head)
                     run = self._live_run(head, attempts)
+                except ControllerError as error:
+                    if error.code == "head-changed":
+                        return {"retried": False, "reason": "head-changed"}
+                    raise
                 except Exception as error:  # noqa: BLE001
                     return {"retried": False, "reason": "github-unavailable", "detail": str(error)}
+                if self.source_authority is not None:
+                    source_access = self._refresh_source_access(source_access, source_refresh)
+                    now = self.clock()
+                    if not self._source_head_current(head) or self._tip_attempts(head) != attempts:
+                        return {"retried": False, "reason": "head-changed"}
                 if run is not None:
                     self.store.journal(now, "retry-ci-refused", head["id"], actor=actor, run_id=run.run_id)
                     return {
@@ -4128,7 +4492,17 @@ class Controller:
                         "sending",
                         "uncertain",
                     }
-                    if attempt["outcome"] == OUTCOME_INFRASTRUCTURE or unknown:
+                    # Native retries name one exact request, and the live-run
+                    # check above must prove its owned run has finished. A
+                    # completed run without usable evidence can then be retired
+                    # explicitly; no absence or title proves an unowned send lost.
+                    source_pending = (
+                        self.candidate_ci is not None
+                        and attempt["request_id"] == request_id
+                        and attempt["outcome"] == OUTCOME_PENDING
+                        and attempt["dispatch_state"] == "accepted"
+                    )
+                    if attempt["outcome"] == OUTCOME_INFRASTRUCTURE or unknown or source_pending:
                         changed = self.store.update(
                             "ci_attempts",
                             {
@@ -4145,7 +4519,7 @@ class Controller:
                 count = len(forgotten)
                 self.store.journal(now, "retry-ci", head["id"], actor=actor, forgotten=count, attempts=forgotten)
             self._wake.set()
-            return {"retried": True, "forgotten": count}
+            return {"retried": bool(count) if self.candidate_ci is not None else True, "forgotten": count}
 
     def _tip_attempts(self, head: dict[str, Any]) -> list[dict[str, Any]]:
         """The attempts at the head's current version for its current tip and base, oldest first."""
@@ -4155,9 +4529,29 @@ class Controller:
             if a["head_sha"] == head["tip"] and a["base_sha"] == head["base"]
         ]
 
+    def _source_head_current(self, head, attempt=None):
+        current = self._head()
+        if current is None or any(current[key] != head[key] for key in ("id", "version", "tip", "base")):
+            return False
+        if attempt is None:
+            return True
+        row = self.store.row("ci_attempts", {"id": attempt["id"]})
+        return (
+            row is not None
+            and row["request_id"] == attempt["request_id"]
+            and row["outcome"] == OUTCOME_PENDING
+            and row["cancelled_at"] is None
+        )
+
     def _live_run(self, head: dict[str, Any], attempts: list[dict[str, Any]]) -> CandidateRun | None:
         """The newest run GitHub reports for the head's tip since its first attempt, when it is still
         queued or in progress; `None` when there is none. Raises when GitHub cannot be asked."""
+        if self.candidate_ci is not None:
+            with self._lock.unlocked():
+                live = self.candidate_ci.live_attempt(attempts, discover_completed=True)
+            if not self._source_head_current(head):
+                raise ControllerError("head-changed", "source head changed during live CI discovery")
+            return None if live is None else live[1]
         run = self.execution.find_candidate_run(
             self.repository,
             batch_id=str(head["id"]),
@@ -4184,28 +4578,51 @@ class Controller:
         if not attempts:
             return False
         try:
-            run = self._live_run(head, attempts)
+            qualified = None
+            if self.candidate_ci is not None:
+                with self._lock.unlocked():
+                    qualified = self.candidate_ci.live_attempt(attempts)
+                if not self._source_head_current(head):
+                    return True
+            run = (
+                (None if qualified is None else qualified[1])
+                if self.candidate_ci is not None
+                else self._live_run(head, attempts)
+            )
         except Exception as error:  # noqa: BLE001
             self._reasons.append(f"head {head['id']}: cannot check for a live CI run before re-dispatch: {error}")
             return True
         if run is None:
             return False
-        attempt = next(
-            (a for a in reversed(attempts) if a["dispatch_state"] in {"legacy", "accepted", "sending", "uncertain"}),
-            None,
+        attempt = (
+            qualified[0]
+            if qualified is not None
+            else next(
+                (
+                    a
+                    for a in reversed(attempts)
+                    if a["dispatch_state"] in {"legacy", "accepted", "sending", "uncertain"}
+                ),
+                None,
+            )
         )
         if attempt is None:
             self._reasons.append(f"head {head['id']}: live run {run.run_id} has no previously sent attempt; waiting")
             return True
+        if self.candidate_ci is not None and self.candidate_ci.ledger.owner_run(attempt["id"]) != run.run_id:
+            self._reasons.append(f"head {head['id']}: verified duplicate run {run.run_id} is still live; waiting")
+            return True
+        where = {"id": attempt["id"]}
+        if self.candidate_ci is not None:
+            where.update(
+                {key: attempt[key] for key in ("outcome", "dispatch_state", "cancelled_at", "run_id", "request_id")}
+            )
         with self.store.transaction():
-            # A late live run belongs to a previously sent attempt, including its
-            # existing candidate ref. Newer rejected receipts must not hide it.
-            for rejected in attempts:
-                if rejected["id"] > attempt["id"] and rejected["dispatch_state"] == "rejected":
-                    self.store.update("ci_attempts", {"id": rejected["id"]}, outcome=OUTCOME_SUPERSEDED)
-            self.store.update(
+            # The selected attempt may have changed while discovery released
+            # the controller lock. Never undo an explicit retry/cancellation.
+            changed = self.store.update(
                 "ci_attempts",
-                {"id": attempt["id"]},
+                where,
                 outcome=OUTCOME_PENDING,
                 outcome_detail="",
                 run_id=run.run_id,
@@ -4213,6 +4630,16 @@ class Controller:
                 last_progress_at=now,
                 needs_observation=1,
             )
+            if changed != 1:
+                return True
+            # A late live run belongs to a previously sent attempt, including its
+            # existing candidate ref. Newer rejected receipts must not hide it.
+            for rejected in attempts:
+                if rejected["id"] > attempt["id"] and rejected["dispatch_state"] == "rejected":
+                    match = {"id": rejected["id"]}
+                    if self.candidate_ci is not None:
+                        match.update(dispatch_state="rejected", outcome=rejected["outcome"])
+                    self.store.update("ci_attempts", match, outcome=OUTCOME_SUPERSEDED)
             self._count("ci_readoptions")
             self.store.journal(
                 now,
@@ -4238,6 +4665,8 @@ class Controller:
 
     def _read_run(self, run_id: str, *, with_jobs: bool) -> CandidateRun | None:
         """`read_run` on the port; a port without it reads nothing directly (raises, so nothing is lost)."""
+        if self.candidate_ci is not None:
+            return self.candidate_ci.read_run(run_id)
         reader = getattr(self.execution, "read_run", None)
         if reader is None:
             raise ControllerError("no-read-run", "the GitHub port cannot read a run directly")
@@ -4262,7 +4691,11 @@ class Controller:
         anything back. The attempt is recorded as cancelled either way, so observation and the
         re-adoption of live runs leave its run alone.
         """
-        cancel = getattr(self.execution, "cancel_run", None)
+        cancel = (
+            self.candidate_ci.cancel_run
+            if self.candidate_ci is not None
+            else getattr(self.execution, "cancel_run", None)
+        )
         if cancel is None:
             return
         adopted = self.store.row("ci_attempts", {"id": by}) if by is not None else None
@@ -4285,13 +4718,17 @@ class Controller:
                 )
                 if attempt["dispatch_state"] in {"sending", "uncertain", "accepted"}:
                     try:
-                        run = self.execution.find_candidate_run(
-                            self.repository,
-                            batch_id=str(batch_id),
-                            head_sha=attempt["head_sha"],
-                            base_sha=attempt["base_sha"],
-                            since=attempt["sent_at"] or attempt["dispatched_at"],
-                        )
+                        if self.candidate_ci is not None:
+                            with self._lock.unlocked():
+                                run = self.candidate_ci.observe(attempt["id"]).run
+                        else:
+                            run = self.execution.find_candidate_run(
+                                self.repository,
+                                batch_id=str(batch_id),
+                                head_sha=attempt["head_sha"],
+                                base_sha=attempt["base_sha"],
+                                since=attempt["sent_at"] or attempt["dispatched_at"],
+                            )
                         if run is not None:
                             self.store.update(
                                 "ci_attempts", {"id": attempt["id"]}, run_id=run.run_id, run_status=run.status
@@ -4305,7 +4742,11 @@ class Controller:
                 continue
             run_id = str(attempt["run_id"])
             try:
-                result = cancel(self.repository, run_id)
+                if self.candidate_ci is not None:
+                    with self._lock.unlocked():
+                        result = cancel(run_id)
+                else:
+                    result = cancel(self.repository, run_id)
                 error = None
             except Exception as caught:  # noqa: BLE001 - a failed cancel is retried once, never blocks
                 result, error = "failed", caught
@@ -4346,6 +4787,12 @@ class Controller:
                 f"publication disabled: would dispatch CI for head {head['id']} v{head['version']} ({head['tip'][:12]} on {head['base'][:12]})"
             )
             return
+        freeze_key = f"source-ci:freeze-error:{head['id']}"
+        failed = self.store.get_setting(freeze_key) if self.candidate_ci is not None else None
+        binding = [head["version"], head["tip"], head["base"]]
+        if failed and failed["binding"] == binding and now < failed["retry_at"]:
+            self._reasons.append(f"head {head['id']}: source CI preparation retry at {failed['retry_at']:.0f}")
+            return
         if self._readopt_live_run(head, now):
             return
         # A head from before `batch_tips` existed has its current tip recorded here, so that the
@@ -4354,20 +4801,51 @@ class Controller:
         repair_outputs_revs = self._repair_outputs_revs(head)
         # Persist intent before source or execution I/O. This row's id names
         # the candidate branch and must survive an accepted response being lost.
-        attempt_id = self.store.insert(
-            "ci_attempts",
-            batch_id=head["id"],
-            batch_version=head["version"],
-            head_sha=head["tip"],
-            base_sha=head["base"],
-            base_ref=self.canonical_branch,
-            dispatched_at=now,
-            infrastructure_retry=retry,
-            last_progress_at=now,
-            repair_outputs_revs=dumps(repair_outputs_revs),
-            request_id=secrets.token_hex(16),
-            dispatch_state="prepared",
-        )
+        request_id = secrets.token_hex(16)
+        members = self._members(head["id"])
+        try:
+            prepared = None
+            if self.candidate_ci is not None:
+                with self._lock.unlocked():
+                    prepared = self.candidate_ci.prepare(head, members, request_id, fetch_missing=self._fetch_head)
+                current = self.store.row("batches", {"id": head["id"]})
+                if current is None or any(current[key] != head[key] for key in ("state", "version", "tip", "base")):
+                    return
+                if not self.setting("publication_enabled"):
+                    return
+            with self.store.transaction():
+                attempt_id = self.store.insert(
+                    "ci_attempts",
+                    batch_id=head["id"],
+                    batch_version=head["version"],
+                    head_sha=head["tip"],
+                    base_sha=head["base"],
+                    base_ref=self.canonical_branch,
+                    dispatched_at=now,
+                    infrastructure_retry=retry,
+                    last_progress_at=now,
+                    repair_outputs_revs=dumps(repair_outputs_revs),
+                    request_id=request_id,
+                    dispatch_state="prepared",
+                )
+                if self.candidate_ci is not None:
+                    self.candidate_ci.freeze(attempt_id, members, prepared=prepared)
+        except Exception as error:  # noqa: BLE001 - head failure must not stop unrelated queue work
+            if self.candidate_ci is None:
+                raise
+            detail = f"{type(error).__name__}: {str(error)[:200]}"
+            self._reasons.append(f"head {head['id']}: cannot freeze source CI request ({detail})")
+            same = failed and failed["binding"] == binding and failed["detail"] == detail
+            count = failed["count"] + 1 if failed and failed["binding"] == binding else 1
+            retry_at = now + int(self.setting("infrastructure_retry_backoff_seconds")) * 2 ** min(3, count - 1)
+            self.store.set_setting(freeze_key, dict(binding=binding, detail=detail, count=count, retry_at=retry_at))
+            if not same:
+                self.store.journal(
+                    now, "source-ci-freeze-failed", head["id"], error=type(error).__name__, detail=detail
+                )
+            return
+        if self.candidate_ci is not None and failed:
+            self.store.set_setting(freeze_key, None)
         self._send_prepared(head, self.store.row("ci_attempts", {"id": attempt_id}), now)
 
     def _send_prepared(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> None:
@@ -4395,13 +4873,29 @@ class Controller:
             # out by SHA, so the retained ref is pushed before the dispatch rather than by the outbox later.
             # The staging candidate branch is the same commit under the name pr-build.yml's train identity
             # check fetches and compares with the dispatched head.
-            retained_ref = self.batch_ref(head["id"], head["version"])
-            retained = self.store.row("outbox", {"key": f"retain:{retained_ref}:{head['tip']}"})
-            if retained is None or retained["state"] != "done":
-                self.source.update_ref(self.repository, retained_ref, head["tip"])
-                if retained is not None:
-                    self._outbox_done(retained, loads(retained["history"], []), "retained-by-dispatch", now)
-            self.source.update_ref(self.repository, f"refs/heads/{branch}", head["tip"])
+            if self.candidate_ci is not None:
+                with self._lock.unlocked():
+                    dispatch_prepared = self.candidate_ci.prepare_source(attempt_id, self.source)
+                current_head = self.store.row("batches", {"id": head["id"]})
+                if current_head is None or any(
+                    current_head[key] != head[key] for key in ("state", "version", "tip", "base")
+                ):
+                    self.store.update(
+                        "ci_attempts",
+                        {"id": attempt_id, "dispatch_state": "prepared", "outcome": OUTCOME_PENDING},
+                        outcome=OUTCOME_SUPERSEDED,
+                    )
+                    return
+                if not self.setting("publication_enabled"):
+                    return
+            else:
+                retained_ref = self.batch_ref(head["id"], head["version"])
+                retained = self.store.row("outbox", {"key": f"retain:{retained_ref}:{head['tip']}"})
+                if retained is None or retained["state"] != "done":
+                    self.source.update_ref(self.repository, retained_ref, head["tip"])
+                    if retained is not None:
+                        self._outbox_done(retained, loads(retained["history"], []), "retained-by-dispatch", now)
+                self.source.update_ref(self.repository, f"refs/heads/{branch}", head["tip"])
             now = self.clock()
             claimed = self.store.update(
                 "ci_attempts",
@@ -4414,15 +4908,19 @@ class Controller:
             if claimed != 1:
                 return  # Another recovery process already owns or settled this send.
             sending = True
-            dispatch_id = self.execution.dispatch_candidate(
-                self.repository,
-                head_sha=head["tip"],
-                base_sha=head["base"],
-                base_ref=self.canonical_branch,
-                batch_id=str(head["id"]),
-                members=members,
-                repair_outputs_revs=repair_outputs_revs,
-            )
+            if self.candidate_ci is not None:
+                with self._lock.unlocked():
+                    dispatch_id = self.candidate_ci.dispatch(attempt_id, prepared=dispatch_prepared)
+            else:
+                dispatch_id = self.execution.dispatch_candidate(
+                    self.repository,
+                    head_sha=head["tip"],
+                    base_sha=head["base"],
+                    base_ref=self.canonical_branch,
+                    batch_id=str(head["id"]),
+                    members=members,
+                    repair_outputs_revs=repair_outputs_revs,
+                )
         except Exception as error:  # noqa: BLE001
             uncertain = sending and not isinstance(error, DispatchNotAccepted)
             with self.store.transaction():
@@ -4431,6 +4929,17 @@ class Controller:
                 if current is None or current["dispatch_state"] != state:
                     return
                 pending = current["outcome"] == OUTCOME_PENDING
+                retryable = (
+                    getattr(error, "retryable", not isinstance(error, (ValueError, TypeError, KeyError)))
+                    if self.candidate_ci is not None
+                    else getattr(error, "retryable", True)
+                )
+                resume_prepared = self.candidate_ci is not None and not uncertain and pending and retryable
+                retry_at = getattr(error, "retry_at", None)
+                failures = current["dispatch_failures"] + 1
+                if resume_prepared:
+                    backoff = int(self.setting("infrastructure_retry_backoff_seconds")) * 2 ** min(3, failures - 1)
+                    retry_at = max(retry_at or 0, self.clock() + backoff)
                 changed = self.store.update(
                     "ci_attempts",
                     {
@@ -4438,16 +4947,17 @@ class Controller:
                         "dispatch_state": state,
                         "outcome": current["outcome"],
                     },
-                    dispatch_state="uncertain" if uncertain else "rejected",
+                    dispatch_state="prepared" if resume_prepared else "uncertain" if uncertain else "rejected",
                     dispatch_error=type(error).__name__,
-                    outcome=(OUTCOME_PENDING if uncertain else OUTCOME_INFRASTRUCTURE)
+                    outcome=(OUTCOME_PENDING if uncertain or resume_prepared else OUTCOME_INFRASTRUCTURE)
                     if pending
                     else current["outcome"],
                     outcome_detail=("dispatch outcome unknown" if uncertain else "dispatch not accepted")
                     if pending
                     else current["outcome_detail"],
-                    dispatch_retry_at=getattr(error, "retry_at", None),
-                    dispatch_retryable=int(getattr(error, "retryable", True)),
+                    dispatch_retry_at=retry_at,
+                    dispatch_retryable=int(retryable),
+                    dispatch_failures=failures,
                     last_observed_at=self.clock(),
                 )
                 if not changed:
@@ -4571,6 +5081,9 @@ class Controller:
             or now - attempt["last_observed_at"] >= interval
         )
         if not due:
+            return
+        if self.candidate_ci is not None:
+            self._observe_source_attempt(head, attempt, now, strict=strict)
             return
         try:
             run = self.execution.find_candidate_run(
@@ -4818,6 +5331,178 @@ class Controller:
                 )
         self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
 
+    def _observe_source_attempt(self, head, attempt, now, *, strict=False):
+        """Only the artifact verifier may decide a source candidate's outcome.
+
+        Absence, expiry and unavailable APIs preserve the single-send intent.
+        They never become an infrastructure verdict that authorizes a new send.
+        """
+        values = {"last_observed_at": now, "needs_observation": 0}
+        hold = self.store.get_setting(f"source-ci:promotion-hold:{attempt['id']}")
+        if hold is not None:
+            self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
+            self._reasons.append(
+                f"head {head['id']}: source promotion requires operator reconciliation ({hold['kind']})"
+            )
+            return
+        try:
+            with self._lock.unlocked():
+                observation = self.candidate_ci.observe(attempt["id"])
+        except Exception as error:  # noqa: BLE001 - keep pending, including malformed evidence
+            if not self._source_head_current(head, attempt):
+                if strict:
+                    raise ControllerError("head-changed", "source request changed during CI observation") from None
+                return
+            key = f"source-ci:evidence-error:{attempt['id']}"
+            failed = self.store.get_setting(key)
+            if failed is None:
+                failed = {"since": now}
+                self.store.set_setting(key, failed)
+            request_row = self.store.row("ci_requests", {"attempt_id": attempt["id"]})
+            owned = request_row is not None and request_row["owner_run_id"] is not None
+            since = failed["since"] if owned else (attempt["sent_at"] or attempt["dispatched_at"])
+            overdue = now - since >= int(self.setting("dispatch_timeout_seconds"))
+            detail = (
+                "reconciliation-required: source CI ownership or evidence unavailable; no automatic resend"
+                if overdue
+                else "waiting for verified source CI ownership and evidence"
+            )
+            values["outcome_detail"] = detail
+            self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
+            self._reasons.append(
+                f"head {head['id']}: {detail} ({type(error).__name__}, request {attempt['request_id']})"
+            )
+            if strict:
+                raise
+            return
+        if not self._source_head_current(head, attempt):
+            if strict:
+                raise ControllerError("head-changed", "source request changed during CI observation")
+            return
+        with self.store.transaction():
+            self.store.execute("DELETE FROM settings WHERE key=?", (f"source-ci:evidence-error:{attempt['id']}",))
+        run = observation.run
+        self._settle_accepted(head, attempt, now, run_id=run.run_id)
+        if (
+            not self._source_head_current(head, attempt)
+            or self.store.get_setting(f"source-ci:promotion-hold:{attempt['id']}") is not None
+        ):
+            return
+        now = self.clock()
+        values["last_observed_at"] = now
+        values.update(
+            run_id=run.run_id,
+            run_attempt=run.attempt,
+            run_status=run.status,
+            run_conclusion=run.conclusion,
+            run_created_at=run.created_at,
+            run_started_at=run.started_at,
+            run_updated_at=run.updated_at,
+            run_completed_at=(
+                attempt["run_completed_at"]
+                if attempt["run_id"] == run.run_id and attempt["run_attempt"] == run.attempt
+                else None
+            )
+            or (run.completed_at or now if run.status == "completed" else None),
+            html_url=run.html_url,
+            outcome_detail="waiting for verified source CI result",
+        )
+        if run.updated_at != attempt["run_updated_at"]:
+            values["last_progress_at"] = now
+        if run.status == "completed":
+            completion_key = f"source-ci:completion-seen:{attempt['id']}"
+            completed = self.store.get_setting(completion_key)
+            if completed is None or (completed["run_id"], completed["attempt"]) != (run.run_id, run.attempt):
+                completed = {"run_id": run.run_id, "attempt": run.attempt, "at": now}
+                self.store.set_setting(completion_key, completed)
+            result = observation.result
+            if result is None:
+                if now - completed["at"] >= LOG_GRACE_SECONDS:
+                    if observation.result_absent and run.conclusion in {
+                        "cancelled",
+                        "timed_out",
+                        "startup_failure",
+                        "failure",
+                    }:
+                        values.update(
+                            outcome=OUTCOME_INFRASTRUCTURE,
+                            outcome_detail=f"owned-run-{run.conclusion}: no verified result after publication grace",
+                        )
+                        self.store.journal(
+                            now,
+                            "source-ci-infrastructure",
+                            head["id"],
+                            attempt_id=attempt["id"],
+                            run_id=run.run_id,
+                            run_attempt=run.attempt,
+                        )
+                    else:
+                        values["outcome_detail"] = (
+                            "reconciliation-required: completed source CI has no verified current result; no automatic resend"
+                        )
+            else:
+                # GitHubEvidence binds this to the immutable request, repository,
+                # current run attempt and trusted isolated publisher.
+                outcomes = {
+                    "passed": OUTCOME_PASS,
+                    "source_failure": OUTCOME_SOURCE_FAILURE,
+                    "policy_failure": OUTCOME_SOURCE_FAILURE,
+                    "infrastructure": OUTCOME_INFRASTRUCTURE,
+                }
+                outcome = outcomes[result["classification"]]
+                values.update(
+                    outcome=outcome,
+                    outcome_detail="verified source CI: " + result["classification"],
+                    verdicts=dumps(
+                        {
+                            ("bump-guard" if name == "bump_guard" else name): {
+                                "state": verdict,
+                                "bound": True,
+                                "description": "verified source CI",
+                                "target_url": run.html_url,
+                            }
+                            for name, verdict in result["verdicts"].items()
+                        }
+                    ),
+                )
+                if outcome == OUTCOME_SOURCE_FAILURE:
+                    values["diagnostics"] = dumps(
+                        [
+                            {
+                                "kind": "status",
+                                "module": "",
+                                "message": values["outcome_detail"],
+                                "target_url": run.html_url,
+                            }
+                        ]
+                    )
+                with self.store.transaction():
+                    verdict_key = f"source-ci:observed-verdict:{attempt['id']}"
+                    verdict_identity = [run.run_id, run.attempt, outcome]
+                    # Accounting only: every outcome above still requires fresh
+                    # evidence. Re-observing a deferred promotion isn't a new CI.
+                    if self.store.get_setting(verdict_key) != verdict_identity:
+                        self.store.set_setting(verdict_key, verdict_identity)
+                        if outcome == OUTCOME_SOURCE_FAILURE:
+                            self._count("ci_source_failures")
+                        elif outcome == OUTCOME_PASS:
+                            self._count("ci_passes")
+                        self.store.journal(
+                            now,
+                            "source-ci-result",
+                            head["id"],
+                            attempt_id=attempt["id"],
+                            run_id=run.run_id,
+                            run_attempt=run.attempt,
+                            outcome=outcome,
+                            request_digest=result["request_digest"],
+                        )
+        if (
+            self._source_head_current(head, attempt)
+            and self.store.get_setting(f"source-ci:promotion-hold:{attempt['id']}") is None
+        ):
+            self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
+
     # --- promotion and landing ---------------------------------------------------------------------
 
     def _promote(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> None:
@@ -4827,6 +5512,9 @@ class Controller:
             )
             return
         key = f"promote:{head['id']}:{head['version']}:{head['tip']}"
+        if self.candidate_ci is not None:
+            generation = self.store.get_setting(f"source-ci:promotion-generation:{attempt['id']}", 0)
+            key += f":source:{attempt['id']}:{generation}"
         if self.store.row("outbox", {"key": key}) is None:
             with self.store.transaction():
                 self.store.update("batches", {"id": head["id"]}, expected_parent=head["base"])
@@ -4853,9 +5541,32 @@ class Controller:
         # landed, commented on or closed (`_anticipate` told its author why).
         everyone = self._members(batch["id"])
         withdrawn = [m["number"] for m in everyone if m["withdrawn"]]
-        members = [m for m in everyone if not m["withdrawn"]]
+        rejected = []
+        members = []
+        for member in everyone:
+            if member["withdrawn"]:
+                continue
+            commit = chain.read_commit(self.clone, member["commit_sha"])
+            empty = len(commit.parents) == 1 and commit.tree == chain.tree_of(self.clone, commit.parents[0])
+            if empty and not chain.carries_landed_note(commit.message):
+                rejected.append(member)
+            else:
+                members.append(member)
         with self.store.transaction():
             self.store.update("batches", {"id": batch["id"]}, state=BATCH_LANDED, landed_at=now, landed_how=how)
+            if self.candidate_ci is not None:
+                self.store.execute("DELETE FROM settings WHERE key=?", (f"source-ci:freeze-error:{batch['id']}",))
+                for recorded_attempt in self.store.rows("ci_attempts", {"batch_id": batch["id"]}):
+                    for category in (
+                        "evidence-error",
+                        "promotion-hold",
+                        "promotion-generation",
+                        "observed-verdict",
+                        "completion-seen",
+                    ):
+                        self.store.execute(
+                            "DELETE FROM settings WHERE key=?", (f"source-ci:{category}:{recorded_attempt['id']}",)
+                        )
             self._clear_admission_state(batch["id"])
             for member in members:
                 self.store.update(
@@ -4864,6 +5575,17 @@ class Controller:
                     state=INPUT_LANDED,
                     landed_at=now,
                     landed_sha=member["commit_sha"],
+                )
+            for member in rejected:
+                if self.admission is not None:
+                    self.admission.withdraw(member["number"], member["accepted_head"])
+                self.store.update(
+                    "inputs",
+                    {"id": member["input_id"]},
+                    state=INPUT_CANCELLED,
+                    reason="empty-commit",
+                    landed_at=None,
+                    landed_sha=None,
                 )
             for stale in self.store.rows("tasks", {"batch_id": batch["id"], "state": TASK_OPEN}):
                 self.store.update(
@@ -4874,6 +5596,8 @@ class Controller:
             self._count("heads_landed")
             self._count("prs_landed", len(members))
             self._count("prs_edited_landed", sum(1 for m in members if m["provenance"] == "edited"))
+            if rejected:
+                self._count("prs_rejected", len(rejected))
             if batch["first_dispatch_at"]:
                 cycles = self._state("head_cycle_seconds", [])
                 cycles.append(round(now - batch["first_dispatch_at"], 1))
@@ -4886,13 +5610,49 @@ class Controller:
                 tip=batch["tip"],
                 members=[m["number"] for m in members],
                 **({"withdrawn": withdrawn} if withdrawn else {}),
+                **({"rejected": [m["number"] for m in rejected]} if rejected else {}),
             )
             if self.setting("publication_enabled"):
                 for member in members:
                     self._enqueue_landing_effects(batch, member)
+                for member in rejected:
+                    self._enqueue_rejection_effects(batch, member)
             self._interacting_landed({m["number"] for m in members}, now)
         self._cancel_superseded_runs(batch["id"], now, reason="batch landed")
         self._wake.set()
+
+    def _enqueue_rejection_effects(self, batch: dict[str, Any], member: dict[str, Any]) -> None:
+        number = member["number"]
+        action = "during staging repair of" if member["provenance"] != "clean" else "from staging"
+        lines = [
+            f"Pull request rejected {action} batch {batch['id']}: no contribution remained.",
+            "",
+            f"The final staging commit is empty. This PR was not merged into `{self.canonical_branch}`.",
+            "",
+            f"Rejected revision: `{member['accepted_head']}`.",
+        ]
+        if member["explanation"].strip():
+            lines += ["", "The repair agent's explanation:", ""]
+            lines += [f"> {line}" if line else ">" for line in member["explanation"].splitlines()]
+        lines += ["", f"The staging history is retained under `{self.batch_ref(batch['id'], batch['version'])}`."]
+        marker = f"<!-- {COMMENT_MARKER} rejected:{self.repository}#{number}:{batch['id']}:{member['commit_sha']} -->"
+        self._enqueue(
+            "comment",
+            f"rejected-comment:{batch['id']}:{number}",
+            {"number": number, "body": "\n".join(lines) + "\n\n" + marker, "marker": marker},
+        )
+        label = self.setting("membership_label")
+        if label:
+            self._enqueue(
+                "labels",
+                f"rejected-labels:{batch['id']}:{number}",
+                {"number": number, "add": [], "remove": [label], "input_id": member["input_id"]},
+            )
+        self._enqueue(
+            "close_pr",
+            f"rejected-close:{batch['id']}:{number}",
+            {"number": number, "rejected": True, "head_sha": member["accepted_head"], "input_id": member["input_id"]},
+        )
 
     def _enqueue_landing_effects(self, batch: dict[str, Any], member: dict[str, Any]) -> None:
         number = member["number"]
@@ -5469,6 +6229,11 @@ class Controller:
                 work = self.store.row("admission_work", {"repository": repo, "number": payload["number"]})
                 if work["generation"] != payload["admission_generation"]:
                     return "stale-admission"
+            elif "input_id" in payload:
+                with self._lock:
+                    current = self._input_for(payload["number"])
+                    if current and current["id"] != payload["input_id"] and current["state"] == INPUT_INSERTED:
+                        return "new-member"
             self._ensure_labels(repo, payload.get("ensure", []))
             self.source.set_labels(repo, payload["number"], payload.get("add", []), payload.get("remove", []))
             return "labels"
@@ -5476,7 +6241,20 @@ class Controller:
             pull = self.source.fetch_pr(repo, payload["number"])
             if pull.state == "closed":
                 return "already-closed"
-            title = pull.title if pull.title.startswith(MERGED_TITLE_PREFIX) else MERGED_TITLE_PREFIX + pull.title
+            if payload.get("rejected"):
+                if pull.head_sha != payload["head_sha"]:
+                    return "stale-head"
+                with self._lock:
+                    current = self._input_for(payload["number"])
+                    if (
+                        current
+                        and current["id"] != payload["input_id"]
+                        and current["state"] in (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED)
+                    ):
+                        return "new-approval"
+                title = pull.title
+            else:
+                title = pull.title if pull.title.startswith(MERGED_TITLE_PREFIX) else MERGED_TITLE_PREFIX + pull.title
             self.source.close_pr(repo, payload["number"], title)
             return "closed"
         if kind == "promote":
@@ -5484,6 +6262,8 @@ class Controller:
         if kind == "cancel_run":
             # The one retry of a cancel that failed inline: a second failure is recorded, not retried.
             try:
+                if self.candidate_ci is not None:
+                    return self.candidate_ci.cancel_run(payload["run_id"])
                 return self.execution.cancel_run(repo, payload["run_id"])
             except Exception as error:  # noqa: BLE001
                 self.log.warning("retry of cancelling CI run %s failed, giving up: %s", payload["run_id"], error)
@@ -5505,6 +6285,73 @@ class Controller:
             self._set_state("canonical_sha", canonical)
             self._landed(batch, "promoted", now)
             return "already-visible"
+        if self.candidate_ci is not None:
+            attempt = self.store.row("ci_attempts", {"id": payload["attempt_id"]})
+            if (
+                attempt is None
+                or attempt["batch_id"] != batch["id"]
+                or attempt["batch_version"] != batch["version"]
+                or attempt["head_sha"] != batch["tip"]
+                or attempt["base_sha"] != payload["expected_parent"]
+                or attempt["cancelled_at"] is not None
+                or attempt["outcome"] != OUTCOME_PASS
+            ):
+                generation_key = f"source-ci:promotion-generation:{payload['attempt_id']}"
+                self.store.set_setting(generation_key, self.store.get_setting(generation_key, 0) + 1)
+                return "stale-source-attempt"
+            members = self._members(batch["id"])
+            try:
+                with self._lock.unlocked():
+                    self.candidate_ci.verify_promotion(attempt["id"], members, self.source)
+            except Exception as error:  # noqa: BLE001 - settle this outbox entry; re-observe or reconcile
+                permanent = isinstance(error, PromotionRefused)
+                detail = (
+                    "reconciliation-required: source promotion refused; repair authority or membership and retry the exact request"
+                    if permanent
+                    else "source promotion deferred; waiting for current verified evidence"
+                )
+                with self.store.transaction():
+                    changed = self.store.update(
+                        "ci_attempts",
+                        {"id": attempt["id"], "outcome": OUTCOME_PASS},
+                        outcome=OUTCOME_PENDING,
+                        outcome_detail=detail,
+                        needs_observation=0,
+                        last_observed_at=now,
+                    )
+                    if not changed:
+                        return "stale-source-attempt"
+                    if permanent:
+                        self.store.set_setting(
+                            f"source-ci:promotion-hold:{attempt['id']}", {"kind": type(error).__name__}
+                        )
+                    generation_key = f"source-ci:promotion-generation:{attempt['id']}"
+                    self.store.set_setting(generation_key, self.store.get_setting(generation_key, 0) + 1)
+                    self.store.journal(
+                        now,
+                        "source-promotion-deferred",
+                        batch["id"],
+                        attempt_id=attempt["id"],
+                        permanent=permanent,
+                        error=type(error).__name__,
+                    )
+                return "source-reconciliation-required" if permanent else "source-evidence-deferred"
+            current = self.store.row("batches", {"id": batch["id"]})
+            current_attempt = self.store.row("ci_attempts", {"id": attempt["id"]})
+            if (
+                current != batch
+                or current_attempt is None
+                or any(
+                    current_attempt[key] != attempt[key]
+                    for key in ("outcome", "run_id", "run_attempt", "cancelled_at", "request_id")
+                )
+                or self._members(batch["id"]) != members
+                or self._active_claims(batch["id"])
+                or not self.setting("publication_enabled")
+            ):
+                generation_key = f"source-ci:promotion-generation:{attempt['id']}"
+                self.store.set_setting(generation_key, self.store.get_setting(generation_key, 0) + 1)
+                return "stale-source-work"
         result = self.source.fast_forward(
             self.repository, self.canonical_branch, payload["expected_parent"], payload["tip"]
         )
@@ -5855,6 +6702,12 @@ class Controller:
         else:
             stage = attempt["outcome"]
         info["stage"] = stage
+        if self.candidate_ci is not None:
+            failure = self.store.get_setting(f"source-ci:freeze-error:{head['id']}")
+            if failure and failure["binding"] == [head["version"], head["tip"], head["base"]] and failure["count"] >= 3:
+                alerts.append(
+                    f"head {head['id']}: source CI request freeze failed {failure['count']} times: {failure['detail']}"
+                )
         if attempt is not None:
             ci = {
                 "attempt_id": attempt["id"],
@@ -5866,6 +6719,7 @@ class Controller:
                 "sent_at": attempt["sent_at"],
                 "dispatch_retry_at": attempt["dispatch_retry_at"],
                 "dispatch_retryable": bool(attempt["dispatch_retryable"]),
+                "dispatch_failures": attempt["dispatch_failures"],
                 "run_id": attempt["run_id"],
                 "run_attempt": attempt["run_attempt"],
                 "status": attempt["run_status"],
@@ -5888,13 +6742,27 @@ class Controller:
                 "repair_outputs_revs": loads(attempt.get("repair_outputs_revs"), []),
             }
             info["ci"] = ci
+            if self.candidate_ci is not None:
+                if attempt["dispatch_state"] == "prepared" and attempt["dispatch_failures"] >= 3:
+                    alerts.append(
+                        f"head {head['id']}: source CI preparation failed or send was refused {attempt['dispatch_failures']} times; "
+                        f"repair configuration or retry request {attempt['request_id']}"
+                    )
+                ci["reconciliation_required"] = attempt["outcome_detail"].startswith("reconciliation-required:")
+                if ci["reconciliation_required"]:
+                    alerts.append(f"head {head['id']}: {attempt['outcome_detail']} (request {attempt['request_id']})")
             if attempt["dispatch_state"] == "rejected" and not attempt["dispatch_retryable"]:
                 alerts.append(
                     f"head {head['id']} dispatch rejected; check CI permissions and configuration, then use retry_ci after repair if retries are exhausted"
                 )
             if attempt["outcome"] == OUTCOME_PENDING and attempt["dispatch_state"] in {"sending", "uncertain"}:
                 alerts.append(
-                    f"head {head['id']} dispatch outcome unknown (request {attempt['request_id']}); reconciling, use retry_ci only to authorize another send"
+                    f"head {head['id']} dispatch outcome unknown (request {attempt['request_id']}); "
+                    + (
+                        "source CI requires verified ownership before retry_ci can proceed"
+                        if self.candidate_ci is not None
+                        else "reconciling, use retry_ci only to authorize another send"
+                    )
                 )
             elif (
                 task is None

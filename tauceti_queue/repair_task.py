@@ -62,6 +62,7 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -75,6 +76,13 @@ from tauceti_queue import (
     repair_stream,
 )
 from tauceti_queue.repair import PromptContext, checkout_worktree, git, read_chain
+from tauceti_queue.task_identity import (
+    TASK_SCHEMA,
+    NativeTaskExecutionUnavailable,
+    TaskBinding,
+    TaskBindingMismatch,
+    validate_native_task,
+)
 
 SCHEMA = "tauceti-queue.repair-task/v1"
 RESULT_REF_PREFIX = "refs/tauceti-queue/task"
@@ -147,7 +155,7 @@ class EndpointMissing(Exception):
 
 
 CLAIM_CODES = ("unknown-task", "unknown-claim", "claim-expired", "claim-superseded", "not-authorized")
-TERMINAL_REJECTIONS = ("version-mismatch", "tip-unavailable", "not-authorized", "unknown-task")
+TERMINAL_REJECTIONS = ("version-mismatch", "tip-unavailable", "not-authorized", "unknown-task", "policy-changed")
 
 
 @dataclasses.dataclass
@@ -167,6 +175,7 @@ class TaskMember:
     no_repair: bool = False  # the PR opted out of repair: never edited, only emptied with an attribution
     withdrawn: bool = False  # already withdrawn that way: it stays an empty commit
     declaration_names: dict = dataclasses.field(default_factory=dict)
+    source_identity: str = ""
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -202,17 +211,39 @@ class Task:
     created_at: float | None = None
     extra: dict = dataclasses.field(default_factory=dict)
     warm_revs: list[str] = dataclasses.field(default_factory=list)  # repair outputs to restore, in order
+    binding: TaskBinding | None = None
 
     @classmethod
     def from_json(cls, data: dict) -> Task:
-        for key in ("task_id", "kind", "repository", "base", "tip", "members", "claim_token", "expires_at"):
+        if not isinstance(data, dict):
+            raise ValueError("task record must be an object")
+        binding = None
+        if "binding" in data or "schema" in data:
+            if data.get("schema") != TASK_SCHEMA or "repository" in data:
+                raise TaskBindingMismatch("unknown or downgraded task identity schema")
+            binding = TaskBinding.parse(data.get("binding"))
+        for key in ("task_id", "kind", "base", "tip", "members", "claim_token", "expires_at"):
             if key not in data:
                 raise ValueError(f"task record lacks {key!r}")
+        if binding is None and "repository" not in data:
+            raise ValueError("task record lacks 'repository'")
         if data["kind"] not in TASK_KINDS:
             raise ValueError(f"unknown task kind {data['kind']!r}")
-        repository = str(data["repository"])
+        repository = "" if binding is not None else str(data["repository"])
+        if binding is not None:
+            validate_native_task(data)
         members = []
         for raw in data["members"]:
+            if binding is not None:
+                if not isinstance(raw, dict):
+                    raise TaskBindingMismatch("invalid qualified task member")
+                identity = binding.pull_key(raw.get("number"))
+                if raw.get("source_identity") != identity or raw.get("source_pr") not in {
+                    f"{binding.source.repository.name}#{raw['number']}",
+                    f"{binding.source.repository.key}#{raw['number']}",
+                    identity,
+                }:
+                    raise TaskBindingMismatch("task member belongs to another qualified source")
             number = raw.get("number", raw.get("pr"))
             source_pr = raw.get("source_pr") or f"{repository}#{number}"
             members.append(
@@ -232,6 +263,7 @@ class Task:
                     declaration_names=raw.get("declaration_names")
                     if isinstance(raw.get("declaration_names"), dict)
                     else {},
+                    source_identity=raw.get("source_identity", "") if binding is not None else "",
                 )
             )
         extra = dict(data.get("extra") or {})
@@ -268,17 +300,31 @@ class Task:
             claim_token=str(data["claim_token"]),
             expires_at=expires_at,
             renew_after=float(
-                data.get("renew_after") or extra.get("renew_after") or max(5.0, (expires_at - time.time()) / 3)
+                data.get("renew_after")
+                or extra.get("renew_after")
+                or (
+                    min(300.0, max(5.0, (expires_at - time.time()) / 3))
+                    if binding is not None
+                    else max(5.0, (expires_at - time.time()) / 3)
+                )
             ),
             instruction=str(data.get("instruction") or ""),
             created_at=float(data["created_at"]) if data.get("created_at") is not None else None,
             extra=extra,
             warm_revs=[str(r) for r in (data.get("warm_revs") or extra.get("warm_revs") or []) if r],
+            binding=binding,
         )
 
     def to_json(self) -> dict:
         record = dataclasses.asdict(self)
         record["members"] = [m.to_json() for m in self.members]
+        record.pop("binding")
+        if self.binding is not None:
+            record.pop("repository")
+            record.update(schema=TASK_SCHEMA, binding=self.binding.record())
+        else:
+            for member in record["members"]:
+                member.pop("source_identity")
         return record
 
     @property
@@ -291,6 +337,11 @@ class Task:
         return self.onto or self.base
 
 
+class _NoTaskRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class TaskClient:
     """The worker's side of the task protocol. Transport failures raise ``ServiceError``.
 
@@ -300,13 +351,43 @@ class TaskClient:
     ``not-authorized``; both are ``ClaimRefused``. 5xx without such a code is ``ServiceError``.
     """
 
-    def __init__(self, service: str, token: str, worker: str, timeout: float = 30.0):
+    def __init__(
+        self, service: str, token: str, worker: str, timeout: float = 30.0, *, binding: TaskBinding | None = None
+    ):
         self.service = service.rstrip("/")
         self.token = token
         self.worker = worker
         self.timeout = timeout
+        if binding is not None and not isinstance(binding, TaskBinding):
+            raise ValueError("a trusted qualified task binding is required")
+        self.binding = binding
+        self._opener = None
+        if binding is not None:
+            url = urllib.parse.urlsplit(self.service)
+            _ = url.port  # Validate malformed ports before constructing a credential-bearing request.
+            if (
+                not url.hostname
+                or url.username is not None
+                or url.password is not None
+                or url.query
+                or url.fragment
+                or (url.scheme != "https" and not (url.scheme == "http" and url.hostname in {"127.0.0.1", "::1"}))
+            ):
+                raise ValueError("native task service requires HTTPS or an explicit loopback fixture")
+            if not isinstance(token, str) or not 0 < len(token) <= 4096 or not all(33 <= ord(c) <= 126 for c in token):
+                raise ValueError("an explicit native queue bearer is required")
+            handlers = [_NoTaskRedirect()]
+            if url.hostname in {"127.0.0.1", "::1", "localhost"}:
+                handlers.insert(0, urllib.request.ProxyHandler({}))
+            self._opener = urllib.request.build_opener(*handlers)
+
+    def _require_task(self, task):
+        if getattr(task, "binding", None) != self.binding:
+            raise TaskBindingMismatch("task source/execution policy differs from the trusted client binding")
 
     def _post(self, path: str, body: dict) -> tuple[int, dict | None]:
+        if self.binding is not None:
+            body = {**body, "schema": TASK_SCHEMA, "task_binding": self.binding.record()}
         data = json.dumps(body).encode()
         request = urllib.request.Request(
             f"{self.service}{path}",
@@ -321,19 +402,27 @@ class TaskClient:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            open_request = self._opener.open if self._opener is not None else urllib.request.urlopen
+            with open_request(request, timeout=self.timeout) as response:
                 status = response.status
-                payload = response.read()
+                payload = response.read(16 * 1024 * 1024 + 1) if self.binding is not None else response.read()
         except urllib.error.HTTPError as error:
             status = error.code
             with error:
-                payload = error.read()
+                payload = error.read(16 * 1024 * 1024 + 1) if self.binding is not None else error.read()
         except (urllib.error.URLError, OSError) as error:
             raise ServiceError(f"{path}: {error}") from error
         parsed = None
+        if self.binding is not None and len(payload) > 16 * 1024 * 1024:
+            raise ServiceError("native task response exceeds its byte bound")
         if payload:
             try:
-                parsed = json.loads(payload)
+                if self.binding is not None:
+                    from tauceti_tools.ci_candidate import read_json
+
+                    parsed = read_json(payload, max_bytes=16 * 1024 * 1024)
+                else:
+                    parsed = json.loads(payload)
             except ValueError as error:
                 if status >= 500:
                     raise ServiceError(f"{path}: HTTP {status}") from error
@@ -346,15 +435,25 @@ class TaskClient:
 
     def claim(self) -> Task | None:
         status, payload = self._post("/tasks/claim", {"worker": self.worker})
-        if status == 204 or (status == 200 and not payload):
+        if status == 204 or (self.binding is None and status == 200 and not payload):
             return None
         if status in (401, 403):
             raise ClaimRefused(f"claim refused: HTTP {status} {_error_text(payload)}".strip())
         if status != 200 or not isinstance(payload, dict):
             raise ServiceError(f"claim: unexpected HTTP {status} {_error_text(payload)}".strip())
-        return Task.from_json(payload)
+        try:
+            task = Task.from_json(payload)
+        except TaskBindingMismatch:
+            raise
+        except (TypeError, ValueError, KeyError):
+            if self.binding is None:
+                raise
+            raise ServiceError("claim: invalid native task record") from None
+        self._require_task(task)
+        return task
 
     def renew(self, task: Task) -> float:
+        self._require_task(task)
         status, payload = self._post(
             f"/tasks/{task.task_id}/renew", {"worker": self.worker, "claim_token": task.claim_token}
         )
@@ -369,12 +468,15 @@ class TaskClient:
             raise ServiceError(f"renew: unexpected HTTP {status}")
         # The controller returns the new expiry as a number; a dict form ``{expires_at}`` is accepted too.
         value = payload.get("expires_at") if isinstance(payload, dict) else payload
+        if self.binding is not None and (type(value) not in (int, float) or not 0 < value < 2**53):
+            raise ServiceError("renew: invalid native claim expiry")
         if not isinstance(value, (int, float)):
             raise ServiceError("renew: no expires_at in the response")
         return float(value)
 
     def submit(self, task: Task, tip: str, pushed_ref: str, notes: dict | None) -> dict:
         """``submit_task(task_id, claim_token, tip_sha, worker_notes)``; returns the Adoption record."""
+        self._require_task(task)
         status, payload = self._post(
             f"/tasks/{task.task_id}/result",
             {
@@ -395,6 +497,7 @@ class TaskClient:
 
     def release(self, task: Task, reason: str, error: str = "") -> dict:
         """``release_task(task_id, claim_token, reason, error)``."""
+        self._require_task(task)
         status, payload = self._post(
             f"/tasks/{task.task_id}/release",
             {"worker": self.worker, "claim_token": task.claim_token, "reason": reason, "error": error or ""},
@@ -710,6 +813,12 @@ class RunnerConfig:
     artifacts_backoff: tuple[float, float] = (60.0, 600.0)
     # The workers' own cache namespace: read before the public cache, written after a green repair.
     publish: repair_publish.Settings = dataclasses.field(default_factory=repair_publish.Settings.from_env)
+    # Supplied by trusted runner configuration, never inferred from a claim.
+    binding: TaskBinding | None = None
+
+    def __post_init__(self):
+        if self.binding is not None and not isinstance(self.binding, TaskBinding):
+            raise ValueError("runner task binding must come from trusted configuration")
 
     @property
     def tasks_dir(self) -> Path:
@@ -891,6 +1000,13 @@ def _fetch_retained_once(
     return {"refs": [private for _, private, _ in specs], "base": task.base, "tip": task.tip}
 
 
+def require_task_execution(*, cfg=None, task=None):
+    if cfg is not None and task is not None and cfg.binding != task.binding:
+        raise TaskBindingMismatch("task differs from the runner's trusted source/execution policy")
+    if (cfg is not None and cfg.binding is not None) or (task is not None and task.binding is not None):
+        raise NativeTaskExecutionUnavailable("native task source transport and runner adapters are not available")
+
+
 def fetch_retained(
     clone: Path,
     task: Task,
@@ -907,6 +1023,7 @@ def fetch_retained(
     ``retry_seconds``, each attempt fetching only the refs the earlier ones did not get; afterwards
     ``SourcesUnavailable`` carries the last error.
     """
+    require_task_execution(task=task)
     deadline = time.monotonic() + max(0.0, retry_seconds)
     attempt = 0
     done: set[str] = set()
@@ -1333,6 +1450,7 @@ def run_repair_agent(
     an argv the kernel rejects), and ``"artifacts_unavailable"`` when the worker's cache preparation
     refused to start inference. ``provider`` names the provider whose agent ran last.
     """
+    require_task_execution(cfg=cfg, task=task)
     from tauceti_worker.agents import (
         AgentLaunchUnavailable,
         BuildCacheUnavailable,
@@ -1521,6 +1639,7 @@ def run_parallel_groups(
     build (``stream``) the path first waits for it to finish and takes the groups from its complete
     error list, ``errors.jsonl``, merged with the task's diagnostics. Returns the record for the outcome
     and the findings the sequential path still has to repair (None when nothing changes for it)."""
+    require_task_execution(cfg=cfg, task=task)
     record: dict = {"source": "diagnostics"}
     if stream is not None:
         waited = time.monotonic()
@@ -1601,6 +1720,7 @@ def push_result(cfg: RunnerConfig, task: Task, worktree: Path, tip: str, logdir:
     there (ref CAS); the first push is create-only and, when the ref already exists (a previous
     incarnation of this runner under the same claim), is retried once against the observed oid.
     """
+    require_task_execution(cfg=cfg, task=task)
     remote = cfg.push_remote or f"https://github.com/{task.repository}"
     env = {k: v for k, v in os.environ.items() if not k.startswith(("TAUCETI_PUSH_", "TAUCETI_CLAIM_", "GIT_CONFIG_"))}
     env.update(
@@ -1690,6 +1810,7 @@ def run_task(
     the next start renews the claim and continues the same session. A stop after validation lets the
     push and submission finish; they are quick and end the task.
     """
+    require_task_execution(cfg=cfg, task=task)
     state_dir = cfg.tasks_dir / task.task_id
     logdir = state_dir / "logs"
     state = resume_state or TaskState(state_dir, task)
@@ -2259,6 +2380,8 @@ def read_admin_check(cfg: RunnerConfig) -> dict:
     ``verified_at``), or ``{}`` when there is none."""
     from tauceti_worker.runtime_status import read_json
 
+    if cfg.binding is not None:
+        return {}
     record = read_json(admin_check_path(cfg))
     if record.get("repository") != cfg.repository or not isinstance(record.get("verified_at"), (int, float)):
         return {}
@@ -2293,6 +2416,7 @@ class AdminCheck:
         from tauceti_worker.config import Die, NoProgress
         from tauceti_worker.runtime_status import atomic_json
 
+        require_task_execution(cfg=self.cfg)
         now = time.time()
         if self.fresh(now) or now < self.retry_at:
             return
@@ -2334,6 +2458,10 @@ def admin_login() -> str | None:
 
 
 def make_client(cfg: RunnerConfig) -> TaskClient:
+    if cfg.binding is not None:
+        if not cfg.token:
+            raise TaskBindingMismatch("an explicit native queue bearer is required; GitHub fallback is unavailable")
+        return TaskClient(cfg.service, cfg.token, cfg.worker, binding=cfg.binding)
     return TaskClient(cfg.service, cfg.token or worker_token(), cfg.worker)
 
 
@@ -2341,6 +2469,7 @@ def claim_and_run(
     cfg: RunnerConfig, client: TaskClient, admin: AdminCheck | None = None, *, stop: Stop | None = None
 ) -> dict | None:
     """Verify the account, claim one task and run it. None when nothing was claimable."""
+    require_task_execution(cfg=cfg)
     (admin or AdminCheck(cfg)).ensure()
     task = with_retries(client.claim, attempts=cfg.service_attempts, delays=cfg.service_delays, what="claim")
     if task is None and release_stale_claims(cfg, client):
@@ -2370,6 +2499,10 @@ def resume_pending(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None =
             break
         try:
             task = Task.from_json(record["task"])
+            require_task_execution(cfg=cfg, task=task)
+        except NativeTaskExecutionUnavailable as error:
+            log(f"{directory.name}: native checkpoint cannot run ({error})")
+            continue
         except (ValueError, KeyError) as error:
             log(f"{directory.name}: unreadable checkpoint ({error})")
             continue
@@ -2425,6 +2558,9 @@ def release_stale_claims(cfg: RunnerConfig, client: TaskClient) -> int:
     for directory, record in in_flight_checkpoints(cfg):
         try:
             task = Task.from_json(record["task"])
+            require_task_execution(cfg=cfg, task=task)
+        except NativeTaskExecutionUnavailable:
+            continue
         except (ValueError, KeyError):
             continue
         state = TaskState(directory, task)
@@ -2554,6 +2690,10 @@ def retry_releases(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None =
             continue
         try:
             task = Task.from_json(record["task"])
+            require_task_execution(cfg=cfg, task=task)
+        except NativeTaskExecutionUnavailable as error:
+            log(f"{directory.name}: native release checkpoint needs its native runner ({error})")
+            continue
         except (ValueError, KeyError) as error:
             log(f"{directory.name}: unreadable checkpoint ({error})")
             continue
@@ -2594,6 +2734,7 @@ def serve(
     """
     from tauceti_worker.config import Die, NoProgress
 
+    require_task_execution(cfg=cfg)
     admin = admin or AdminCheck(cfg)
     summary: dict = {
         "schema": HEARTBEAT_SCHEMA,
@@ -2696,6 +2837,14 @@ def serve(
 def preflight(cfg: RunnerConfig, *, min_free_gib: float = 20.0) -> list[dict]:
     """What the host must have before serving, each ``{check, ok, detail}``; secrets are named, never
     printed. Fails fast where the loop would otherwise retry forever."""
+    if cfg.binding is not None:
+        return [
+            {
+                "check": "native task adapters",
+                "ok": False,
+                "detail": "native task transport/runner adapters are unavailable",
+            }
+        ]
     checks: list[dict] = []
 
     def check(name: str, ok: bool, detail: str) -> None:

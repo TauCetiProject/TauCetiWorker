@@ -30,6 +30,7 @@ from pathlib import Path
 
 from . import task_progress
 from .monitoring_protocol import PublicationRejected, PublisherIdentity, ResyncRequired, SnapshotPublisher, encode
+from .task_identity import TaskBinding
 
 SCHEMA = "tauceti.operations.queue/v1"
 LIMIT = 20_000
@@ -310,6 +311,15 @@ class BuildObservations:
             return None
 
 
+def task_binding_fields(task):
+    """Project SQL identity metadata independently of optional worker progress."""
+    try:
+        row = json.loads(task.get("task_binding", "{}"))
+        return {} if row == {} else {"task_binding": TaskBinding.parse(row).record()}
+    except (ValueError, TypeError):
+        return {"task_binding": None, "identity_coverage": "invalid"}
+
+
 class TaskObservations:
     """Bounded cached projection of trusted worker checkpoints/outcomes."""
 
@@ -321,6 +331,11 @@ class TaskObservations:
         result = {}
         observed_at = time.time() if observed_at is None else observed_at
         for task in sorted(tasks, key=lambda t: (t["state"] != "open", -t["id"]))[:100]:
+            try:
+                raw_binding = json.loads(task.get("task_binding", "{}"))
+                expected_binding = None if raw_binding == {} else TaskBinding.parse(raw_binding).record()
+            except (ValueError, TypeError):
+                continue
             candidates = []
             for root in roots:
                 directory = Path(root) / "tasks" / str(task["id"])
@@ -341,7 +356,7 @@ class TaskObservations:
                             outcome.stat().st_mtime_ns if outcome.exists() else None,
                         )
                     )
-                    key = str(directory)
+                    key = (str(directory), json.dumps(expected_binding, sort_keys=True))
                     if self.cache.get(key, (None,))[0] != fingerprint:
                         if progress_stat is not None:
                             record = json_read(progress)
@@ -357,11 +372,16 @@ class TaskObservations:
                                 final = raw.get("outcome") or raw
                             record = task_progress.summarize(raw, final)
                         if str(record.get("task_id")) != str(task["id"]):
+                            self.cache[key] = (fingerprint, None, None)
                             continue
                         observation = task_progress.public(record)
+                        if observation.get("task_binding") != expected_binding:
+                            self.cache[key] = (fingerprint, None, None)
+                            continue
                         binding = record.get("claim_token")
                         self.cache[key] = (fingerprint, observation, binding if isinstance(binding, str) else None)
-                    candidates.append((*self.cache[key][1:], directory))
+                    if self.cache[key][1] is not None:
+                        candidates.append((*self.cache[key][1:], directory))
                 except (OSError, ValueError, TypeError, AttributeError):
                     continue
             if candidates:
@@ -416,6 +436,12 @@ def project(
         def rows(sql, params=()):
             return [dict(r) for r in conn.execute(sql, params)]
 
+        if rows("SELECT key FROM settings WHERE key='source-ci:binding'"):
+            # This projection's public allowlist and URLs identify GitHub names,
+            # not qualified source repositories. Refuse rather than publishing
+            # native records under an unrelated github.com owner/name.
+            raise ValueError("source-bound queue requires a qualified public monitoring policy")
+
         batches = rows(
             "SELECT id,repository,version,base,tip,state,created_at,sealed_at,landed_at,"
             "first_dispatch_at,pre_rebase_state,pre_rebase_tip,pre_rebase_onto,pre_rebase_prepared "
@@ -455,9 +481,11 @@ def project(
             "FROM ci_attempts ORDER BY id DESC LIMIT ?",
             (LIMIT + 1,),
         )
+        task_columns = {r["name"] for r in rows("PRAGMA table_info(tasks)")}
+        task_binding_column = "task_binding" if "task_binding" in task_columns else "'{}' AS task_binding"
         tasks = rows(
             "SELECT id,kind,batch_id,batch_version,state,created_at,resolved_at,resolution,"
-            "ci_attempt_id FROM tasks ORDER BY id DESC LIMIT ?",
+            "ci_attempt_id," + task_binding_column + " FROM tasks ORDER BY id DESC LIMIT ?",
             (LIMIT + 1,),
         )
         claims = rows(
@@ -538,6 +566,14 @@ def project(
             )
         elif commit.get("empty") is False:
             disposition = "agent_edited" if row["provenance"] == "edited" else "clean_replay"
+        if (
+            batch.get("state") == "landed"
+            and item.get("state") == "cancelled"
+            and not item.get("landed_sha")
+            and not row["withdrawn"]
+            and not row["removed"]
+        ):
+            disposition = "rejected_empty"
         member_records.append(
             {
                 "id": str(row["id"]),
@@ -552,7 +588,7 @@ def project(
                 "author": text(item.get("author")),
                 "approved_at": iso(item.get("approved_at")),
                 "inserted_at": iso(row["added_at"]),
-                "landed_at": iso(batch.get("landed_at")),
+                "landed_at": iso(item.get("landed_at")),
                 "provenance": row["provenance"],
                 "disposition": disposition,
                 "empty": commit.get("empty"),
@@ -734,6 +770,7 @@ def project(
                 "created_at": iso(r["created_at"]),
                 "resolved_at": iso(r["resolved_at"]),
                 "progress": task_progress.get(r["id"], {"coverage": "unavailable", "observed_at": None}),
+                **task_binding_fields(r),
             }
             for r in tasks
             if r["batch_id"] in batch_map

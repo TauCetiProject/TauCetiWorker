@@ -742,6 +742,10 @@ class ControllerFeedSource:
                 attempts = self._attempts(batch["id"])
                 state = "running" if attempts and attempts[-1].get("outcome") == "pending" else "waiting"
             source = inputs.get(member["input_id"]) or {}
+            if batch["state"] == "landed" and (
+                member["withdrawn"] or (source.get("state") == "cancelled" and not source.get("landed_sha"))
+            ):
+                state = "canceled"
             if source.get("state") == "landed" and batch["state"] != "landed":
                 continue
             out.append(OutcomeView(int(member["number"]), str(member["accepted_head"]), int(batch["id"]), state))

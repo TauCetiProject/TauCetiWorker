@@ -65,6 +65,36 @@ class AdmissionTests(unittest.TestCase):
         self.controller = reopen_controller(self.tmp.name, self.github, self.repo, self.clock)
         self.intake = AdmissionPoller(self.controller, self.github, REPO, self.config, clock=self.clock)
 
+    def test_self_tested_reviewed_head_enters_existing_staging_without_build_success(self):
+        head = self.ready()
+        del self.github.statuses[(head, "build")]
+        self.github.labels[1].add("self-tested")
+        self.github.statuses[(head, "self-tested/1")] = Status(
+            "success", "PR CI skipped: self-tested.", "", self.clock(), None
+        )
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.controller.tick()
+        self.assertEqual(self.controller.inputs()[0]["state"], "inserted")
+        self.assertTrue(self.controller.store.rows("members"))
+        self.assertNotIn((head, "build"), self.github.statuses)
+
+    def test_label_and_dedicated_status_changes_invalidate_admission(self):
+        head = self.ready()
+        del self.github.statuses[(head, "build")]
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.github.labels[1].add("self-tested")
+        self.github.statuses[(head, "self-tested/2")] = Status("success", "other PR", "", self.clock(), None)
+        self.event("pull_request", {"number": 1, "action": "labeled", "label": {"name": "self-tested"}})
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.github.statuses[(head, "self-tested/1")] = Status(
+            "success", "PR CI skipped: self-tested.", "", self.clock(), None
+        )
+        self.event("status", {"sha": head, "context": "self-tested/1"})
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        generation = self.intake.state.get(1)["generation"]
+        self.event("pull_request", {"number": 1, "action": "unlabeled", "label": {"name": "self-tested"}})
+        self.assertEqual(self.intake.state.get(1)["generation"], generation + 1)
+
     def test_primary_intake_uses_published_review_and_unchanged_inputs_cost_no_evaluation(self):
         self.ready()
         result = self.intake.run_once()
@@ -207,6 +237,52 @@ class AdmissionTests(unittest.TestCase):
         self.review(round=2)
         self.intake.invalidate(1)
         self.assertEqual(self.intake.run_once()["approved"], 1)
+
+    def test_rejection_is_consumed_while_close_is_pending_and_after_restart(self):
+        self.ready()
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.controller.tick()
+        row = self.controller.input_for(REPO, 1)
+        self.clock.advance(1)
+        rejected_at = self.clock()
+        with self.controller.store.transaction():
+            self.controller.store.update("inputs", {"id": row["id"]}, state="cancelled", reason="empty-commit")
+            self.controller.store.journal(self.clock(), "landed", row["batch_id"], members=[], rejected=[1])
+        self.clock.advance(10)
+        self.intake.invalidate(1)
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(self.intake.state.get(1)["cancelled_at"], rejected_at)
+        self.restart()
+        self.intake.invalidate(1)
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(len(self.controller.inputs()), 1)
+        self.assertEqual(self.github.prs[1]["state"], "open")
+        self.clock.advance(1)
+        self.review(round=2, comment=11)
+        self.intake.invalidate(1)
+        self.assertEqual(self.intake.run_once()["approved"], 1, "fresh review can authorize another attempt")
+
+    def test_empty_landing_consumes_approval_before_the_close_or_next_evaluation(self):
+        head = self.github.create_pr(1, {})
+        self.review()
+        for context in ("build", "scope"):
+            self.github.statuses[(head, context)] = Status("success", "", "", self.clock(), None)
+        self.assertTrue(self.controller.approve(REPO, 1, head, "reviewer")["accepted"])
+        self.intake.run_once()
+        self.controller.tick()
+        self.github.start_runs()
+        self.github.complete_runs()
+        self.github.fail_next["close_pr"] = 1
+        self.controller.tick()
+        self.controller.tick()
+        row = self.controller.input_for(REPO, 1)
+        self.assertEqual(row["reason"], "empty-commit")
+        self.assertEqual(self.github.prs[1]["state"], "open")
+        self.assertEqual(self.intake.state.get(1)["cancelled_head_sha"], head)
+        self.intake.invalidate(1)
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(len(self.controller.inputs()), 1)
+        self.assertEqual(self.controller.input_for(REPO, 1)["reason"], "empty-commit")
 
     def test_cutover_uses_the_legacy_withdrawal_time_without_rejecting_a_new_comment(self):
         head = self.ready()

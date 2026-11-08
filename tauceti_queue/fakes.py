@@ -702,7 +702,7 @@ class FakeGitHub:
             "statuses": {
                 context: status.state
                 for (head, context), status in self.statuses.items()
-                if head == pull.head_sha and context in ("build", "scope", "bump-guard")
+                if head == pull.head_sha and context in ("build", "scope", "bump-guard", f"self-tested/{number}")
             },
         }
 

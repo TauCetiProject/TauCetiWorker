@@ -1,7 +1,8 @@
 """Small, optional observations made from an already-loaded private task checkpoint.
 
 The lease binding stays private. Only ``public()`` crosses the monitoring boundary.
-Task/member context, prompts, diagnostics and logs are never traversed or copied.
+Only qualified task bindings and accounting cross that boundary. Member context,
+prompts, diagnostics and logs are never traversed or copied.
 """
 
 from __future__ import annotations
@@ -10,6 +11,8 @@ import math
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+
+from .task_identity import TASK_SCHEMA, TaskBinding
 
 SCHEMA = "tauceti.queue.task-progress/v1"
 FILENAME = "progress.json"
@@ -89,7 +92,7 @@ def summarize(raw, final=None):
                     if isinstance(child, dict | list) and child:
                         pending.append(iter((child,)))
                         break
-    return {
+    record = {
         "schema": SCHEMA,
         "task_id": task.get("task_id"),
         "claim_token": task.get("claim_token"),
@@ -102,6 +105,11 @@ def summarize(raw, final=None):
         "usage": usage,
         "cost": cost,
     }
+    if "schema" in task or "binding" in task:
+        if task.get("schema") != TASK_SCHEMA or "repository" in task:
+            raise ValueError("unknown task identity in progress checkpoint")
+        record["task_binding"] = TaskBinding.parse(task.get("binding")).record()
+    return record
 
 
 def public(record):
@@ -116,7 +124,7 @@ def public(record):
         }
         for key in TOKEN_KEYS
     }
-    return {
+    observation = {
         "coverage": "observed",
         "state": text(record.get("state")),
         "observed_at": datetime.fromtimestamp(observed, UTC).isoformat().replace("+00:00", "Z")
@@ -135,6 +143,9 @@ def public(record):
             "coverage": "recorded_subtotal_only",
         },
     }
+    if "task_binding" in record:
+        observation["task_binding"] = TaskBinding.parse(record["task_binding"]).record()
+    return observation
 
 
 def write(directory: Path, raw, final=None):

@@ -1061,7 +1061,7 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) ->
         disp, why = fix_disposition(
             meta,
             c.head,
-            p.build_success,
+            p.review_ready,
             blocking,
             attempts,
             pending_contest=pending_contest,
