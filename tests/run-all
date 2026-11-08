@@ -162,6 +162,7 @@ RUN_STDLIB=(
   queue_source_ci.py
   queue_source_authority.py
   queue_task_identity.py
+  queue_task_transport.py
   queue_monitoring.py
   queue_task_progress.py
   queue_monitoring_protocol.py
