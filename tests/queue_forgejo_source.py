@@ -490,7 +490,8 @@ class NativeSource(unittest.TestCase):
             return original(method, path, data, **kwargs)
 
         self.api.request.side_effect = interleave
-        self.source.publish(first)
+        with self.assertRaises(PublicationSuperseded):
+            self.source.publish(first)
         self.assertEqual(str(self.read()[0][0]["id"]), nested[0])
 
     def test_competing_pending_registration_cannot_acquire_a_stale_predecessor(self):
@@ -914,6 +915,46 @@ class NativeSource(unittest.TestCase):
         with closing(Store(str(self.clone / "fresh-policy.sqlite"))) as store:
             fresh.configure_publisher_policy(store)
             self.assertEqual(fresh._comments(1, "a" * 40), ((), "absent", "absent"))
+
+    def test_barriers_during_registration_or_completion_leave_the_exact_clear_retryable(self):
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        original = self.api.request.side_effect
+        for stage in ["pending", "success"]:
+            with self.subTest(stage=stage):
+                clear = self.prepare("team/Math", 1, "a" * 40, "", "clear", kind="recovery", clear=True)
+                injected = []
+
+                def insert_barrier(*args, stage=stage, injected=injected, **kwargs):
+                    value = original(*args, **kwargs)
+                    if args[0] == "POST" and "/statuses/" in args[1] and args[2]["state"] == stage and not injected:
+                        injected.append(True)
+                        self.status_rows.append(
+                            {
+                                "id": 100 + len(self.status_rows),
+                                "context": RECOVERY_CONTEXT + "1",
+                                "status": "pending",
+                                "creator": None,
+                                "description": PUB_DESCRIPTION + self.publishers.generation + ":junk",
+                            }
+                        )
+                    return value
+
+                self.api.request.side_effect = insert_barrier
+                with self.assertRaises(Incomplete):
+                    self.source.publish(clear)
+                self.assertEqual(self.read()[2], "revoked")
+                self.api.request.side_effect = original
+                self.assertEqual(self.source.publish(clear), "clear")
+                self.assertEqual(self.read()[2], "clear")
+
+    def test_restored_history_with_an_entirely_lost_recovery_account_still_denies(self):
+        missing_actor = SourceActor.from_native(self.repository.forge, {"id": 99, "login": "retired-bot"})
+        record = self.comment(actor=missing_actor)
+        old = self.stamp(record, actor=missing_actor, kind="recovery")
+        for status in old:
+            status["description"] = status["description"].replace(self.publishers.generation, "f" * 32)
+        self.status_rows = [old]
+        self.assertEqual(self.read()[2], "revoked")
 
     def test_native_publication_status_event_invalidates_an_unchanged_pr(self):
         from tauceti_queue.admission import AdmissionPoller

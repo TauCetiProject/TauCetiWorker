@@ -815,9 +815,10 @@ Unresolved/deleted or synthetic issuers deny older facts without contributing
 an intent sequence. They retain the greatest trusted sequence observed before
 the barrier. Only that exact intent or a newer sequence can register after the
 barrier to reconcile it; a forged maximum sequence never permanently poisons publication.
-Retired recovery evidence blocks when its resolvable issuer is a current or
-recorded recovery publisher, even if that generation is missing from a restored
-backup. Reads and publication require the durable publisher-policy binding; a
+Retired recovery history conservatively blocks even if a restored backup lost
+both its generation and its publisher account. Historical records only deny;
+a current explicit clear or hold reconciles them. An untrusted writer may impose
+this deny state, but cannot override an existing current-generation decision. Reads and publication require the durable publisher-policy binding; a
 fresh adapter cannot silently start with incomplete historical grants. Authority
 holds withdraw waiting/reserved inputs before they consume candidate CI; inserted
 work retains the existing explicit promotion refusal and recovery procedure.
