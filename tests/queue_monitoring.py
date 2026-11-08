@@ -54,6 +54,19 @@ class Monitoring(unittest.TestCase):
         self.assertEqual(attempt["dispatch_state"], "accepted")
         self.assertRegex(attempt["request_id"], r"^[0-9a-f]{32}$")
 
+    def test_export_distinguishes_a_sealed_successor_from_unsealed_batches(self):
+        self.controller.set_setting("sealed_successor_min_members", 1, "test")
+        head = self.github.create_pr(201, {"TauCeti/P201.lean": "def p201 := 1\n"})
+        self.controller.approve(PROJECT, 201, head, "reviewer")
+        self.controller.tick()
+        successor = self.controller.status()["sealed_successor"]
+        value = self.export(status=self.controller.status())
+        record = next(b for b in value["batches"] if b["id"] == str(successor["id"]))
+        self.assertTrue(record["sealed"])
+        self.assertEqual(record["state"], "open")
+        self.assertIsNotNone(record["sealed_at"])
+        self.assertEqual(value["settings"]["sealed_successor_min_members"], 1)
+
     def test_export_reads_an_unmigrated_dispatch_ledger_without_writing_it(self):
         missing = (
             "sent_at",

@@ -443,7 +443,7 @@ def project(
             raise ValueError("source-bound queue requires a qualified public monitoring policy")
 
         batches = rows(
-            "SELECT id,repository,version,base,tip,state,created_at,sealed_at,landed_at,"
+            "SELECT id,repository,version,base,tip,state,sealed,created_at,sealed_at,landed_at,"
             "first_dispatch_at,pre_rebase_state,pre_rebase_tip,pre_rebase_onto,pre_rebase_prepared "
             "FROM batches ORDER BY CASE state WHEN 'head' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,id DESC LIMIT ?",
             (LIMIT + 1,),
@@ -661,6 +661,7 @@ def project(
                 "base": row["base"],
                 "tip": row["tip"],
                 "state": row["state"],
+                "sealed": bool(row["sealed"]),
                 "size": counts.get(str(row["id"]), 0),
                 **{k: iso(row[k]) for k in ("created_at", "sealed_at", "landed_at", "first_dispatch_at")},
                 "pre_rebase_state": row["pre_rebase_state"],
@@ -734,6 +735,7 @@ def project(
                 "repair_concurrency",
                 "stall_interval_seconds",
                 "open_batch_limit",
+                "sealed_successor_min_members",
                 "prepare_min_members",
                 "prepare_quiet_seconds",
                 "prepare_open_batches",

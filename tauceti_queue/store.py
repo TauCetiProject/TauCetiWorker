@@ -13,7 +13,8 @@ Tables:
   landed/cancelled state, priority, urgency, the retained ref of the accepted head, the `no_repair`
   opt-out and, for a `problem-anticipated` withdrawal, what it waits for (`anticipated`).
 - `batches`: identity, version, base, tip, sealed flag, state (`open`, `head`, `landed`, `removed`),
-  the expected parent recorded for promotion and, for an open batch, the version a `prepare` task
+  `state=open, sealed=1` denotes the fixed-membership successor, separate from the sole head;
+  the expected parent recorded for promotion and, for a non-head batch, the version a `prepare` task
   last built (and repaired) on its own base and its pre-rebase onto the head's tip
   (`pre_rebase_state`, `_tip`, `_onto`, `_source`, `_edits`, `_at`, and `_prepared`, the pre-rebased
   tip a `prepare` task last built and repaired on the head's tip).
