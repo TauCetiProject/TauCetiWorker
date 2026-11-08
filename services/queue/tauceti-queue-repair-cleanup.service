@@ -1,0 +1,12 @@
+[Unit]
+Description=Remove terminal Tau Ceti queue repair worktrees
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/TauCetiQueue
+Environment=UV_NO_SYNC=1
+ExecStart=%h/TauCetiQueue/.venv/bin/python -m tauceti_queue.repair_cleanup --config %h/.config/tauceti-queue/repair-cleanup.json --apply
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=15min
+UMask=0077

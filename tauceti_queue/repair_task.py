@@ -1826,6 +1826,21 @@ def run_task(
     resume_state: TaskState | None = None,
     stop: Stop | None = None,
 ) -> dict:
+    from tauceti_queue.repair_cleanup import worktree_lease
+
+    require_task_execution(cfg=cfg, task=task)
+    with worktree_lease(cfg.root, task.task_id):
+        return _run_task(cfg, task, client, resume_state=resume_state, stop=stop)
+
+
+def _run_task(
+    cfg: RunnerConfig,
+    task: Task,
+    client: TaskClient,
+    *,
+    resume_state: TaskState | None = None,
+    stop: Stop | None = None,
+) -> dict:
     """Run one claimed task to its outcome. The claim is renewed throughout and the result discarded
     if it is lost. Returns the outcome record (also written to the task's state directory).
 
