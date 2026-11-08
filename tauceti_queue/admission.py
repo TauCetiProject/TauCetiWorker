@@ -201,8 +201,9 @@ class AdmissionPoller:
         self.clock = clock
         self.state = AdmissionState(controller.store, repo, clock=clock)
         client = getattr(adapter, "client", None)
-        if client is not None:
-            client.restore_deadlines(controller.store.get_setting(self.state.resource_key, {}))
+        restore = getattr(client, "restore_deadlines", None)
+        if restore is not None:
+            restore(controller.store.get_setting(self.state.resource_key, {}))
         self._lock = threading.Lock()
         self._discovery_lock = threading.Lock()
         self._discovery_serial = 0
@@ -350,7 +351,8 @@ class AdmissionPoller:
     def run_once(self, *, reason="interval"):
         with self._lock:
             client = getattr(self.adapter, "client", None)
-            context = client.deferred_requests() if client is not None else nullcontext()
+            deferred = getattr(client, "deferred_requests", None)
+            context = deferred() if deferred is not None else nullcontext()
             with context:
                 return self._run(reason)
 
@@ -430,7 +432,8 @@ class AdmissionPoller:
                     "inputs", {"repository": self.repo, "number": work["number"], "state": ["waiting", "reserved"]}
                 )
             )
-            with client.deferred_requests(urgent=revocation) if client is not None else nullcontext():
+            deferred = getattr(client, "deferred_requests", None)
+            with deferred(urgent=revocation) if deferred is not None else nullcontext():
                 self._evaluate(work, summary)
         except Exception as error:
             self.state.defer(

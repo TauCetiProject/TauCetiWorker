@@ -24,6 +24,7 @@ from tauceti_tools.forge import AmbiguousWrite, ForgeError, Incomplete
 
 from .ci_requests import FrozenRequest
 from .ports import FastForwardResult
+from .task_identity import native_retained_ref
 
 SHA = re.compile(r"[0-9a-f]{40}")
 
@@ -176,7 +177,7 @@ class ForgejoGitSource:
         # The queue keeps its existing local refs. On Forgejo, expose retention
         # as ordinary protected branches; custom refs have no protection rules.
         if ref.startswith("refs/tauceti-queue/"):
-            return "refs/heads/tauceti-ci/queue/" + ref.removeprefix("refs/tauceti-queue/")
+            return native_retained_ref(ref)
         return ref
 
     def ref_sha(self, repo, ref):

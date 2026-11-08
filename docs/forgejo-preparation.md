@@ -611,8 +611,81 @@ server branch protection, and a lost accepted publication response. The portable
 validation tests run in `tests/queue_forgejo_git.py`.
 
 This transport does not itself establish review approval, CI success or webhook
-admission. The complete source adapter, trusted review publisher integration and
-queue bootstrap must connect those checks before native operation is enabled.
-Native worker task metadata and submission transport must also use the protected
-remote names: the existing worker's literal custom-ref fetch and submission paths
-remain disabled for native execution until that integration is complete.
+admission. The source adapter below connects native review checks; service
+bootstrap and trusted publisher integration are still required before activation.
+
+
+### Native source adapter and admission
+
+`ForgejoSourceAdapter` connects PR metadata, immutable Git comparisons, comments,
+labels, publication and fresh repository permissions to the existing controller.
+`NativeAdmissionPolicy` uses the installed Review admission policy. Explicit
+`NativePublishers` lists identify review, status and recovery publishers by
+server-local principal ID, bound to the native source repository. The source API
+credential needs repository-admin permission to query other users' current
+permissions; Git publication still uses its separately supplied source bearer.
+
+Native scoreboard and recovery comments carry a versioned
+`tauceti-source:v1` binding naming the source origin/repository ID, authenticated
+issuer and producer's policy revision. Comment authorship alone grants no
+authority: Forgejo repository writers may moderate another user's comments.
+The publisher first records a pending intent through the native commit-status API,
+then publishes the frozen body, then records its comment ID and SHA-256 digest in
+an append-only status. Admission selects the latest receipt from a configured
+publisher and verifies its current permission, exact body and source binding.
+Edits, deletions, missing receipts and interrupted publications never expose an
+older green review as fresh authority. Ordinary contributors' same-name statuses
+cannot impersonate the configured issuer.
+
+The consumer applies its current policy to the published facts. Queue-side prefix,
+allow-file or policy-code changes do not themselves discard a published review or
+recovery hold. A hold needs an explicit clear from a configured recovery publisher;
+revocation does not cause fallback to another publisher's older green verdict.
+The caller must freeze the versioned publication intent in its existing outbox
+before sending. Retries reconcile native statuses and comments; an older intent
+superseded by a newer publication stops rather than overwriting that publication.
+Forgejo Actions remain disabled on the source repository.
+
+Promotion rereads the accepted PR heads and current review evidence. The trusted
+CI coordinator separately verifies the exact frozen candidate's build, scope and
+bump results. The source adapter additionally checks the actual candidate's changed
+paths against the current admission prefix and allow-files, so a broader CI scope
+configuration cannot bypass that restriction. A repaired candidate does not need
+to make the original PR head's failed build green. Source read failures remain unavailable; they do not become
+empty discussions or positive approval. GitHub App checks and GitHub quota are
+unsupported source capabilities here; Forgejo requires primary-policy admission.
+
+Discovery reads listing metadata and leaves detailed evidence to each PR's
+admission work item. An unreadable or changing PR cannot abort discovery for its
+siblings. This is a functional baseline, not a capacity result; query volume,
+backstop refreshes and history retrieval still need measurement and bounded
+caching before the concurrency rehearsal is complete.
+
+Native queue commits now carry host-qualified `Source-PR` trailers and preserve
+the accepted Git commit's author rather than inventing a GitHub noreply address.
+Historical GitHub attribution remains readable; native landing checks do not
+reuse GitHub PR-number aliases as native authority.
+
+A task produced by the native adapter advertises its protected input refs under
+`refs/heads/tauceti-ci/queue/`. Untrusted worker proposals use a separate
+`refs/heads/tauceti-submissions/<queue-epoch>/<task>/<claim>` namespace. The
+controller fetches and locally retains the exact submitted commit before
+validation/adoption, including rejected submissions; its durable outbox publishes
+the protected retention ref. Proposal
+refs confer no merge authority. Task metadata validates the ref transport version,
+queue epoch and claim identity; native execution remains disabled until source
+credentials, runner isolation, checkpoint/cache namespaces and claim recovery are
+integrated. Trusted Review publication must emit the new source binding, and the
+service bootstrap must wire the source and execution adapters independently.
+
+Run the isolated real-source controller test with:
+
+```sh
+FORGEJO_BINARY=/path/to/forgejo python tests/integration_forgejo_source.py
+```
+
+It exercises real HTTPS source reads, native publisher revocation, spoofed
+statuses, unavailable authority, label/comment publication, primary admission,
+protected candidate retention and source branch promotion with the shared-state
+and legacy GitHub source paths blocked. CI observations in this fixture are
+deterministic; it does not prove the separate real GitHub Actions rehearsal.

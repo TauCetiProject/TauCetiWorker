@@ -95,6 +95,7 @@ class Identity(unittest.TestCase):
                 changed_binding = TaskBinding.parse(altered["binding"])
                 for member in altered["members"]:
                     member["source_identity"] = changed_binding.pull_key(member["number"])
+                    member["source_pr"] = f"{changed_binding.source.repository.key}#{member['number']}"
                 task = repair_task.Task.from_json(altered)
                 with patch.object(client, "_post", side_effect=AssertionError("cross-binding request")):
                     for action in (

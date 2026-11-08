@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import dataclasses
 import logging
 import random
 import re
@@ -48,7 +49,7 @@ from .ports import (
 from .source_authority import NativeQueueAuthority, SourceAuthorityUnavailable, principal_key
 from .stale_cache import StaleCache
 from .store import Store, dumps, loads
-from .task_identity import TaskBinding
+from .task_identity import NATIVE_GIT_REFS, TaskBinding, native_retained_ref, native_submission_ref
 
 STATUS_SCHEMA = "tauceti-queue.status/v1"
 BUILD_CONTEXT = "build"
@@ -393,6 +394,9 @@ class Controller:
         self.github = self.source  # compatibility for source-authentication/service callers
         self.clone = clone
         self.repository = repository
+        self.provenance_repository = (
+            candidate_ci.ledger.policy.source.repository.key if candidate_ci is not None else repository
+        )
         self.revision = revision
         self.clock = clock
         self.rng = rng or random.Random()
@@ -1775,11 +1779,17 @@ class Controller:
             and not chain.landed_commit(landed, m.source_pr)
         ]
 
+    def _worker_submission_ref(self, task_id, claim_id):
+        if self.candidate_ci is not None and getattr(self.source, "task_git_transport", None) == NATIVE_GIT_REFS:
+            return native_submission_ref(self.candidate_ci.ledger.epoch, task_id, claim_id)
+        return self.submission_ref(task_id, claim_id)
+
     def _retain_submission(self, task: dict[str, Any], claim: dict[str, Any], tip_sha: str) -> str | None:
         ref = self.submission_ref(task["id"], claim["id"])
+        remote = self._worker_submission_ref(task["id"], claim["id"])
         if not chain.object_exists(self.clone, tip_sha):
             try:
-                self.source.fetch_refs(self.repository, [f"+{ref}:{ref}"])
+                self.source.fetch_refs(self.repository, [f"+{remote}:{ref}"])
             except Exception as error:  # noqa: BLE001
                 self.log.warning("fetch of %s failed: %s", ref, error)
             if not chain.object_exists(self.clone, tip_sha):
@@ -2127,6 +2137,12 @@ class Controller:
             ahead = self._head()
             if ahead is not None and ahead["tip"] == task["onto"]:
                 refs.insert(1, self.batch_ref(ahead["id"], ahead["version"]))  # where `onto` is fetched from
+        if self.candidate_ci is not None and getattr(self.source, "task_git_transport", None) == NATIVE_GIT_REFS:
+            refs = [native_retained_ref(ref) for ref in refs]
+            members = [
+                dataclasses.replace(member, retained_ref=native_retained_ref(member.retained_ref)) for member in members
+            ]
+            extra["git_transport"] = NATIVE_GIT_REFS
         return Task(
             task_id=task["id"],
             kind=task["kind"],
@@ -2139,7 +2155,7 @@ class Controller:
             members=members,
             diagnostics=loads(task["diagnostics"], []),
             retained_refs=refs,
-            submission_ref=self.submission_ref(task["id"], claim_id),
+            submission_ref=self._worker_submission_ref(task["id"], claim_id),
             claim_token=token,
             expires_at=expires,
             instruction=AGENT_INSTRUCTION,
@@ -2283,12 +2299,12 @@ class Controller:
         input_row = self.store.row("inputs", {"id": member["input_id"]}) or {}
         coauthors = loads(input_row.get("coauthors"))
         return chain.Member(
-            self.repository,
+            self.provenance_repository,
             member["number"],
             member["accepted_head"],
             title=input_row.get("title", ""),
             description=input_row.get("description", ""),
-            author=input_row.get("author", ""),
+            author="" if self.candidate_ci is not None else input_row.get("author", ""),
             coauthors=None if coauthors is None else tuple(coauthors),
         )
 
@@ -2578,9 +2594,9 @@ class Controller:
                     trees[commit.sha] = commit.tree
                     if empty:
                         continue  # an empty placeholder lands no contribution
-                    if source and source.startswith(f"{self.repository}#"):
+                    if source and source.startswith(f"{self.provenance_repository}#"):
                         landed_prs.add(int(source.rsplit("#", 1)[1]))
-                    elif not source:
+                    elif not source and self.candidate_ci is None:
                         # Bors's squash commits carry no Source-PR trailer; the subject names the PR.
                         lines = (commit.message or "").splitlines()
                         match = _BORS_SUBJECT_RE.search(lines[0]) if lines else None
@@ -2937,12 +2953,12 @@ class Controller:
             )
             claim = self._take_claim(batch, "insert", now)
         member = chain.Member(
-            self.repository,
+            self.provenance_repository,
             row["number"],
             row["head_sha"],
             title=row["title"],
             description=row["description"],
-            author=row["author"],
+            author="" if self.candidate_ci is not None else row["author"],
             coauthors=None if loads(row["coauthors"]) is None else tuple(loads(row["coauthors"])),
         )
         chain_id = f"probe-{batch['id']}-{secrets.token_hex(4)}"
@@ -5831,8 +5847,11 @@ class Controller:
         """Whether a non-empty commit on the canonical branch names PR `number` (` (#N)` subject or `Source-PR`)."""
         if self._canonical is None:
             return False
-        repository = self.repository.replace(".", "\\.")
+        # Git uses POSIX ERE, whose literal escaping differs from Python re.escape.
+        repository = "".join("\\" + char if char in ".[](){}*+?^$|\\" else char for char in self.provenance_repository)
         pattern = rf"(\(#{number}\)$|^{chain.SOURCE_PR_TRAILER}: {repository}#{number}$)"
+        if self.candidate_ci is not None:
+            pattern = rf"^{chain.SOURCE_PR_TRAILER}: {repository}#{number}$"
         result = chain._git(
             self.clone, "log", "-n", "5", "--format=%H", "-E", f"--grep={pattern}", self._canonical, "--"
         )
