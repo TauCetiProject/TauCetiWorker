@@ -29,10 +29,7 @@ For each finding, judge whether it is actually correct:
 
 ## Verify before pushing (all MUST pass)
 __LOCAL_VERIFICATION__
-While fixing, use `lake build` (incremental) to check each edit. When every fix is in, run the final
-verification once: `lake exe cache get` (if you have not run it this session), `lake build --iofail`, then
-the scope recipe and the scoped audit above. Iterate until green. Never push red. If you changed no
-source (every finding contested), there is nothing new to verify: do not rebuild or re-audit.
+While fixing, use incremental builds or the failing shared phase. Run the shared final verification above once after the last edit; never push red. If no source changed, do not repeat successful checks.
 
 **Do this synchronously, in this one turn.** You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 

@@ -4,7 +4,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 - See which checks failed and read their logs:
   - `gh pr checks __PR__ --repo TauCetiProject/TauCeti`
   - `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed` (use the run id from the failing check)
-- The single `build` check runs these stages in order: the expired-shim check, `lake build --iofail`,
+- The `build` check includes source guards, `lake build --iofail`, shim checks,
   the audit driver (global duplicate declarations, then axioms), the module-system audit, the
   environment lint (`lint-env`) and the source style lint (`lint-style`). Find the stage that failed
   in the log, then use the corresponding local check when it covers that failure. Local axiom checks
