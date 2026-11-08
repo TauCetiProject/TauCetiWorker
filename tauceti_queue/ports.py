@@ -198,7 +198,7 @@ class SourcePort(Protocol):
         ...
 
     def close_pr(self, repo: str, number: int, title: str) -> None:
-        """`PATCH pulls/<number> {state: closed, title}`: how Bors closes a squash-landed member (not GitHub's merged state)."""
+        """`PATCH pulls/<number> {state: closed, title}` for a landed or rejected member (not GitHub's merged state)."""
         ...
 
     def repository_admin(self, login: str) -> bool:

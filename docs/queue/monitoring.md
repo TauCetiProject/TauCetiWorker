@@ -105,6 +105,9 @@ accepted adoptions journal explicit `member-reduced-to-empty` facts; retained
 scripted already-landed notes remain separate. Historical ambiguous empties stay
 `empty_unknown`.
 
+Members rejected at batch landing are shown as `rejected_empty`, with no `landed_at` timestamp.
+The input's landing timestamp, rather than the batch's, is used for each member.
+
 The module's local JSON output is prepared public data; keep its parent directory
 private until it has been inspected against the configured scope. Public browsers
 read R2 only, never this file or the queue's database. Queue publication has a
