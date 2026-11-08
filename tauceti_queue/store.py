@@ -194,7 +194,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     ci_attempt_id INTEGER,
     claims INTEGER NOT NULL DEFAULT 0,
     submissions INTEGER NOT NULL DEFAULT 0,
-    pre_rebase_source TEXT
+    pre_rebase_source TEXT,
+    task_binding TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS tasks_state ON tasks (state, batch_id);
 CREATE TABLE IF NOT EXISTS submissions (

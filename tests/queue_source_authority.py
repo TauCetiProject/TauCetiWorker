@@ -27,6 +27,7 @@ from tauceti_queue.source_authority import (
     principal_key,
 )
 from tauceti_queue.store import loads
+from tauceti_queue.task_identity import TASK_SCHEMA, TaskBinding
 
 
 class SourceAuthority(unittest.TestCase):
@@ -712,6 +713,8 @@ class NativeHTTP(unittest.TestCase):
         connection = http.client.HTTPConnection(*self.http.server_address, timeout=10)
         try:
             headers = {"Authorization": "Bearer " + token} if token is not None else {}
+            if path == "/tasks/claim":
+                body = self.claim_body(body)
             connection.request("POST", path, json.dumps(body).encode(), headers)
             response = connection.getresponse()
             raw = response.read()
@@ -747,6 +750,14 @@ class NativeHTTP(unittest.TestCase):
                 self.error = ForgeError("private response", status=upstream)
                 self.assertEqual(self.request("/tasks/claim", {"worker": "worker"})[0], expected)
 
+    def claim_body(self, body):
+        ledger = self.controller.candidate_ci.ledger
+        return {
+            **body,
+            "schema": TASK_SCHEMA,
+            "task_binding": TaskBinding.from_policy(ledger.policy, queue_epoch=ledger.epoch).record(),
+        }
+
     def test_slow_body_is_read_before_native_authority_is_observed(self):
         entered = threading.Event()
         read_body = server.Handler._read_body
@@ -756,7 +767,7 @@ class NativeHTTP(unittest.TestCase):
             return read_body(handler)
 
         connection = http.client.HTTPConnection(*self.http.server_address, timeout=10)
-        body = json.dumps({"worker": "worker"}).encode()
+        body = json.dumps(self.claim_body({"worker": "worker"})).encode()
         try:
             with patch.object(server.Handler, "_read_body", reading):
                 connection.putrequest("POST", "/tasks/claim")

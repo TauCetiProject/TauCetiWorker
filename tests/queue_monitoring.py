@@ -71,6 +71,12 @@ class Monitoring(unittest.TestCase):
         present = {r["name"] for r in self.controller.store.query("PRAGMA table_info(ci_attempts)")}
         self.assertFalse(set(missing) & present)
 
+    def test_legacy_task_table_is_read_without_adding_a_binding_column(self):
+        self.controller.store.execute("ALTER TABLE tasks DROP COLUMN task_binding")
+        self.export()
+        present = {r["name"] for r in self.controller.store.query("PRAGMA table_info(tasks)")}
+        self.assertNotIn("task_binding", present)
+
     def test_dispatch_policy_is_allowlisted_cached_and_bound_to_the_canonical_commit(self):
         revision = self.repo.commit_branch(
             {

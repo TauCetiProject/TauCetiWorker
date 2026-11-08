@@ -48,6 +48,7 @@ from .ports import (
 from .source_authority import NativeQueueAuthority, SourceAuthorityUnavailable, principal_key
 from .stale_cache import StaleCache
 from .store import Store, dumps, loads
+from .task_identity import TaskBinding
 
 STATUS_SCHEMA = "tauceti-queue.status/v1"
 BUILD_CONTEXT = "build"
@@ -383,6 +384,8 @@ class Controller:
                 raise ValueError("source CI ledger does not belong to this controller")
             if getattr(github, "repository_identity", None) != candidate_ci.ledger.policy.source:
                 raise ValueError("source CI source port identity differs from its policy")
+            if repository != candidate_ci.ledger.policy.source.repository.name:
+                raise ValueError("controller repository differs from its qualified source")
             if not all(
                 callable(getattr(github, name, None)) for name in ("retain_candidate", "verify_candidate_approval")
             ):
@@ -1289,7 +1292,9 @@ class Controller:
             and batch["state"] == (BATCH_OPEN if task["kind"] == TASK_PREPARE else BATCH_HEAD)
         )
 
-    def claim_task(self, worker_identity: str, github_login: str, *, source_access=None) -> Task | None:
+    def claim_task(
+        self, worker_identity: str, github_login: str, *, source_access=None, expected_binding=None
+    ) -> Task | None:
         """Hand an open task to an authorized worker under a renewable claim, within `repair_concurrency`.
 
         `repair_concurrency` bounds the live task claims in total. Within it, tasks are offered in
@@ -1303,10 +1308,16 @@ class Controller:
         The admin check (a cached GitHub read) runs before the lock is taken, and the claim takes the
         lock's priority lane, so a claim answers while a tick is running.
         """
+        if expected_binding is not None and self.candidate_ci is None:
+            raise TaskError("not-authorized", "qualified task binding requires a native source controller")
         admin = self._repository_admin(github_login) if self.candidate_ci is None else None
         with self._lock.priority():
             actor = {}
             if self.candidate_ci is not None:
+                if expected_binding is not None and expected_binding != TaskBinding.from_policy(
+                    self.candidate_ci.ledger.policy, queue_epoch=self.candidate_ci.ledger.epoch
+                ):
+                    raise TaskError("not-authorized", "requested native task policy changed")
                 _access, actor = self._source_request_access(source_access)
                 github_login = ""  # Native identities never populate the legacy login field.
                 admin = True
@@ -1394,6 +1405,10 @@ class Controller:
         `prepare` task of the pre-rebased chain likewise (`_pre_rebased_prepare_current`)."""
         found = []
         for task in self.store.rows("tasks", {"repository": self.repository, "state": TASK_OPEN}):
+            try:
+                self._task_binding(task)
+            except TaskError:
+                continue  # No implicit adoption of old/unqualified policy snapshots.
             batch = self.store.row("batches", {"id": task["batch_id"]})
             if batch is None:
                 continue
@@ -1473,14 +1488,17 @@ class Controller:
         """
         with self._lock.priority():
             now = self.clock()
-            claim = self._claim_for(task_id, claim_token, now)
+            claim = self._claim_for(task_id, claim_token, now, allow_stale_policy=True)
             if self.candidate_ci is not None:
                 self._source_request_access(source_access, claim=claim)
             task = self.store.row("tasks", {"id": task_id})
+            stale_policy = task is not None and not self._task_policy_current(task)
             with self.store.transaction():
                 self.store.update("claims", {"id": claim["id"]}, released_at=now, release_reason=reason)
                 self.store.journal(now, "released", claim["batch_id"], task_id=task_id, reason=reason, error=error)
-                if task is not None and task["kind"] == TASK_PREPARE and task["state"] == TASK_OPEN:
+                if stale_policy and task["state"] == TASK_OPEN:
+                    self._replace_stale_source_task(task, now)
+                elif task is not None and task["kind"] == TASK_PREPARE and task["state"] == TASK_OPEN:
                     self._settle_prepare_release(task, reason, now)
                     if reason == PREPARE_CLEAN_REASON:
                         settled = self.store.row("tasks", {"id": task_id}) or {}
@@ -1551,6 +1569,7 @@ class Controller:
                 raise TaskError("unknown-claim", "no claim with that token on this task")
             if self.candidate_ci is not None:
                 self._source_request_access(source_access, claim=claim)
+            self._task_binding(task, allow_stale_policy=True)
             batch = self.store.row("batches", {"id": task["batch_id"]})
             assert batch is not None
             retained = self._retain_submission(task, claim, tip_sha)
@@ -1582,6 +1601,9 @@ class Controller:
                     [v.to_dict() for v in violations or []],
                 )
 
+            if not self._task_policy_current(task):
+                self._replace_stale_source_task(task, now)
+                return reject("policy-changed")
             if claim["released_at"] is not None:
                 return reject("claim-expired" if claim["release_reason"] == "expired" else "claim-superseded")
             if claim["expires_at"] <= now and not self._renewal_protects(claim):
@@ -1666,6 +1688,9 @@ class Controller:
                     return reject("claim-superseded")
                 task, claim, batch = current_task, current_claim, current_batch
                 self._source_request_access(source_access, claim=claim)
+                if not self._task_policy_current(task):
+                    self._replace_stale_source_task(task, now)
+                    return reject("policy-changed")
                 if claim["released_at"] is not None:
                     return reject("claim-expired" if claim["release_reason"] == "expired" else "claim-superseded")
                 if claim["expires_at"] <= now and not self._renewal_protects(claim):
@@ -1680,6 +1705,7 @@ class Controller:
                     "onto",
                     "pre_rebase_source",
                     "ci_attempt_id",
+                    "task_binding",
                 )
                 if any(task[key] != original_task[key] for key in identity_fields):
                     return reject("version-mismatch")
@@ -1952,10 +1978,14 @@ class Controller:
         self._wake.set()
         return Adoption(True, "adopted", task["id"], batch["id"], batch["version"], tip_sha, ref, provenance=provenance)
 
-    def _claim_for(self, task_id: int, token: str, now: float) -> dict[str, Any]:
+    def _claim_for(self, task_id: int, token: str, now: float, *, allow_stale_policy=False) -> dict[str, Any]:
         claim = self.store.row("claims", {"task_id": task_id, "token": token})
         if claim is None:
             raise TaskError("unknown-claim", "no claim with that token on this task")
+        task = self.store.row("tasks", {"id": task_id})
+        if task is None:
+            raise TaskError("unknown-task")
+        self._task_binding(task, allow_stale_policy=allow_stale_policy)
         if claim["released_at"] is not None:
             raise TaskError("claim-expired" if claim["release_reason"] == "expired" else "claim-superseded")
         if claim["expires_at"] <= now and not self._renewal_protects(claim):
@@ -1983,6 +2013,74 @@ class Controller:
             return members
         covered = {commit.source_pr for commit in chain.chain_commits(self.clone, task["base"], task["tip"])}
         return [member for member in members if member["source_pr"] in covered]
+
+    def _task_binding(self, task, *, allow_stale_policy=False):
+        try:
+            row = loads(task.get("task_binding"), {})
+        except (TypeError, ValueError):
+            raise TaskError("not-authorized", "qualified task binding is unreadable") from None
+        if self.candidate_ci is None:
+            if not isinstance(row, dict) or row != {}:
+                raise TaskError("not-authorized", "native task requires its qualified controller")
+            return None
+        try:
+            binding = TaskBinding.parse(row)
+        except (TypeError, ValueError):
+            raise TaskError("not-authorized", "qualified task binding is unavailable") from None
+        current = TaskBinding.from_policy(self.candidate_ci.ledger.policy, queue_epoch=self.candidate_ci.ledger.epoch)
+        same_scope = (binding.source, binding.execution, binding.queue_epoch) == (
+            current.source,
+            current.execution,
+            current.queue_epoch,
+        )
+        if binding != current and not (allow_stale_policy and same_scope):
+            raise TaskError("not-authorized", "qualified task policy changed")
+        return binding
+
+    def _task_policy_current(self, task):
+        try:
+            self._task_binding(task)
+            return True
+        except TaskError:
+            return False
+
+    def _replace_stale_source_task(self, task, now):
+        """Replace work under a changed policy; never reinterpret its claim."""
+        if task["state"] != TASK_OPEN:
+            return None
+        batch = self.store.row("batches", {"id": task["batch_id"]})
+        replace = batch is not None and self._submission_task_current(task, batch)
+        with self.store.transaction():
+            self.store.update(
+                "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="policy-changed"
+            )
+            self.store.update(
+                "claims", {"task_id": task["id"], "released_at": None}, released_at=now, release_reason="policy-changed"
+            )
+            replacement = None
+            if replace:
+                replacement = self._create_task(
+                    batch,
+                    task["kind"],
+                    task["onto"],
+                    loads(task["diagnostics"], []),
+                    now,
+                    ci_attempt_id=task["ci_attempt_id"],
+                    pre_rebased=(task["tip"], task["pre_rebase_source"]) if self._pre_rebased_prepare(task) else None,
+                )
+            self.store.journal(
+                now, "task-policy-changed", task["batch_id"], task_id=task["id"], replacement_task_id=replacement
+            )
+        self._wake.set()
+        return replacement
+
+    def _supersede_stale_source_tasks(self, now):
+        if self.candidate_ci is None:
+            return
+        for previous in self.store.rows("tasks", {"repository": self.repository, "state": TASK_OPEN}):
+            task = self.store.row("tasks", {"id": previous["id"]})
+            if task is not None and task["state"] == TASK_OPEN and not self._task_policy_current(task):
+                self._replace_stale_source_task(task, now)
 
     def _task_record(
         self, task: dict[str, Any], batch: dict[str, Any], claim_id: int, token: str, expires: float
@@ -2032,7 +2130,7 @@ class Controller:
         return Task(
             task_id=task["id"],
             kind=task["kind"],
-            repository=self.repository,
+            repository="" if self.candidate_ci is not None else self.repository,
             batch_id=batch["id"],
             batch_version=task["batch_version"],
             base=task["base"],
@@ -2048,6 +2146,7 @@ class Controller:
             created_at=task["created_at"],
             extra=extra,
             warm_revs=self._warm_revs(task, batch),
+            binding=self._task_binding(task),
         )
 
     def _create_task(
@@ -2099,6 +2198,13 @@ class Controller:
                 created_at=now,
                 ci_attempt_id=ci_attempt_id,
                 pre_rebase_source=pre_rebased[1] if pre_rebased else None,
+                task_binding=dumps(
+                    TaskBinding.from_policy(
+                        self.candidate_ci.ledger.policy, queue_epoch=self.candidate_ci.ledger.epoch
+                    ).record()
+                )
+                if self.candidate_ci is not None
+                else "{}",
             )
             self._count("tasks_prepare_pre_rebased" if pre_rebased else f"tasks_{kind}")
             self.store.journal(
@@ -2362,6 +2468,7 @@ class Controller:
         offer = self._lock.offer
         self._reasons = []
         now = self.clock()
+        self._supersede_stale_source_tasks(now)
         self._expire_claims(now)
         self._drain_outbox(now)
         offer()
