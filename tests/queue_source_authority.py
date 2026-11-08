@@ -591,6 +591,87 @@ class NativeClaims(unittest.TestCase):
         self.assertNotIn(task.claim_token, self.controller._renewing)
         self.assertNotIn(task.claim_token, self.controller._renewal_waiters)
 
+    def run_late_request_during_refresh(self, action):
+        task = self.claim()
+        self.fixture.clock.advance(899)
+        registered, result = threading.Event(), []
+
+        class Renewals(dict):
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                registered.set()
+
+        self.controller._renewing = Renewals()
+        late_result = []
+
+        def refresh():
+            late_result.append(action(task))
+            return self.authority.authenticate("token")
+
+        evidence = self.authority.authenticate("token")
+
+        def renew():
+            try:
+                result.append(
+                    self.controller.renew_task(
+                        task.task_id, task.claim_token, source_access=evidence, source_refresh=refresh
+                    )
+                )
+            except Exception as error:
+                result.append(error)
+
+        thread = threading.Thread(target=renew, daemon=True)
+        try:
+            with self.controller._lock:
+                thread.start()
+                self.assertTrue(registered.wait(2))
+                self.fixture.clock.advance(16)
+        finally:
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        return task, late_result[0], result[0]
+
+    def test_late_second_renewal_cannot_expire_a_timely_renewal(self):
+        def late(task):
+            return self.controller.renew_task(
+                task.task_id, task.claim_token, source_access=self.authority.authenticate("token")
+            )
+
+        task, late_result, original = self.run_late_request_during_refresh(late)
+        self.assertIsInstance(late_result, float)
+        self.assertIsInstance(original, float)
+        self.assertIsNone(self.store.rows("claims", {"task_id": task.task_id})[0]["released_at"])
+
+    def test_submit_during_timely_renewal_refresh_can_use_the_still_live_lease(self):
+        def late(task):
+            return self.controller.submit_task(
+                task.task_id,
+                task.claim_token,
+                self.batch["tip"],
+                source_access=self.authority.authenticate("token"),
+                source_refresh=lambda: self.authority.authenticate("token"),
+            )
+
+        task, late_result, original = self.run_late_request_during_refresh(late)
+        self.assertTrue(late_result.accepted)
+        self.assertEqual(getattr(original, "code", None), "claim-superseded")
+        self.assertNotEqual(self.store.rows("claims", {"task_id": task.task_id})[0]["release_reason"], "expired")
+
+    def test_explicit_release_during_refresh_is_honoured_as_a_release(self):
+        def late(task):
+            return self.controller.release_task(
+                task.task_id, task.claim_token, "released", source_access=self.authority.authenticate("token")
+            )
+
+        task, _late_result, original = self.run_late_request_during_refresh(late)
+        self.assertEqual(getattr(original, "code", None), "claim-superseded")
+        self.assertEqual(self.store.rows("claims", {"task_id": task.task_id})[0]["release_reason"], "released")
+
+    def test_refresh_outside_a_controller_lock_is_an_explicit_error(self):
+        evidence = self.authority.authenticate("token")
+        with self.assertRaisesRegex(RuntimeError, "lock ownership"):
+            self.controller._refresh_source_access(evidence, lambda: self.authority.authenticate("token"))
+
 
 class NativeHTTP(unittest.TestCase):
     def setUp(self):

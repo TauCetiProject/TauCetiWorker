@@ -315,6 +315,10 @@ lock while its renewal registration stays active. Reacquisition uses priority an
 the remaining evidence lifetime, with at most three fresh observations; overlapping
 renewals keep independent registrations. Source authentication and ACL
 outages fail closed; an unauthenticated request cannot extend a lease.
+All claim-expiry decisions honour a timely renewal that is still in progress,
+including concurrent renew, submit and explicit release requests. Current owner
+and authority checks still apply. Exhausting refresh attempts can delay an error
+until a current lock holder finishes; it never permits stale evidence to grant work.
 Submission refreshes authority outside the lock after validation and before
 adopting a chain, then checks current claim, task-kind rules, head target and
 covered membership again. Unrelated metadata and valid append operations for

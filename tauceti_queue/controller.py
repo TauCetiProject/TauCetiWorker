@@ -303,10 +303,14 @@ class ControllerLock:
         with self._cond:
             return self._priority_waiting
 
+    def owned(self) -> bool:
+        with self._cond:
+            return self._owner == threading.get_ident()
+
     @contextlib.contextmanager
     def unlocked(self, *, priority: bool = False, reacquire=None) -> Iterator[None]:
-        """Let go of every level this thread holds for the body, then take them back (as an ordinary
-        acquirer, so the priority requests that queued meanwhile run first). A no-op for a thread that
+        """Let go of every level this thread holds for the body, then take them back (ordinary by
+        default, or at priority when requested). A no-op for a thread that
         does not hold the lock. The caller must not be inside a store transaction.
 
         An optional reacquire callback runs without the lock and must acquire one
@@ -1229,13 +1233,19 @@ class Controller:
             "login": access.actor.login,
         }
         if claim is not None:
-            owner = loads(claim.get("source_actor"), {})
-            if not owner or (owner.get("origin"), owner.get("id")) != (actor["origin"], actor["id"]):
-                raise PermissionError("native source caller does not own this claim")
+            self._check_source_claim_owner(actor, claim)
         return access, actor
+
+    @staticmethod
+    def _check_source_claim_owner(actor, claim):
+        owner = loads(claim.get("source_actor"), {})
+        if not isinstance(owner, dict) or (owner.get("origin"), owner.get("id")) != (actor["origin"], actor["id"]):
+            raise PermissionError("native source caller does not own this claim")
 
     def _refresh_source_access(self, evidence, refresh, *, claim=None):
         """Refresh outside the controller lock; callers must recheck their state."""
+        if not self._lock.owned():
+            raise RuntimeError("native authority refresh requires controller lock ownership")
         if refresh is None:
             self._source_request_access(evidence, claim=claim)
             return evidence
@@ -1419,8 +1429,9 @@ class Controller:
         (and `_expire_claims` spares the claim while such a renewal waits).
         """
         arrived = self.clock()
+        entry_actor = None
         if self.candidate_ci is not None:
-            self._source_request_access(source_access)  # Refused callers cannot reserve a renewal wait.
+            _, entry_actor = self._source_request_access(source_access)
         waiter = object()
         with self._renewing_guard:
             waiting = self._renewal_waiters.setdefault(claim_token, {})
@@ -1430,6 +1441,7 @@ class Controller:
             with self._lock.priority():
                 claim = self._claim_for(task_id, claim_token, arrived)
                 if self.candidate_ci is not None:
+                    self._check_source_claim_owner(entry_actor, claim)
                     try:
                         self._source_request_access(source_access, claim=claim)
                     except SourceAuthorityUnavailable:
@@ -1571,7 +1583,7 @@ class Controller:
 
             if claim["released_at"] is not None:
                 return reject("claim-expired" if claim["release_reason"] == "expired" else "claim-superseded")
-            if claim["expires_at"] <= now:
+            if claim["expires_at"] <= now and not self._renewal_protects(claim):
                 self.store.update("claims", {"id": claim["id"]}, released_at=now, release_reason="expired")
                 return reject("claim-expired")
             if self.candidate_ci is None and not self._repository_admin(claim["github_login"]):
@@ -1655,7 +1667,7 @@ class Controller:
                 self._source_request_access(source_access, claim=claim)
                 if claim["released_at"] is not None:
                     return reject("claim-expired" if claim["release_reason"] == "expired" else "claim-superseded")
-                if claim["expires_at"] <= now:
+                if claim["expires_at"] <= now and not self._renewal_protects(claim):
                     self.store.update("claims", {"id": claim["id"]}, released_at=now, release_reason="expired")
                     return reject("claim-expired")
                 identity_fields = (
@@ -1945,10 +1957,16 @@ class Controller:
             raise TaskError("unknown-claim", "no claim with that token on this task")
         if claim["released_at"] is not None:
             raise TaskError("claim-expired" if claim["release_reason"] == "expired" else "claim-superseded")
-        if claim["expires_at"] <= now:
+        if claim["expires_at"] <= now and not self._renewal_protects(claim):
             self.store.update("claims", {"id": claim["id"]}, released_at=now, release_reason="expired")
             raise TaskError("claim-expired")
         return claim
+
+    def _renewal_protects(self, claim):
+        """An authenticated request delivered before expiry keeps this lease live."""
+        with self._renewing_guard:
+            arrived = self._renewing.get(claim["token"])
+        return arrived is not None and arrived < claim["expires_at"]
 
     def _open_task(self, head: dict[str, Any]) -> dict[str, Any] | None:
         return self.store.row(
