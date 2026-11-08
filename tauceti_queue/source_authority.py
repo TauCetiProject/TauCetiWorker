@@ -1,16 +1,16 @@
 """Fresh native caller/ACL observations for the source-bound queue HTTP path.
 
 No bearer, actor or permission cache is used. Each request supplies its own token
-to a new origin-bound client. These observations authorize queue controls under
-their policy; source publication still needs its own native scope, branch and
-approval checks.
+to a new origin-bound client. Native effective-access evidence must include the
+credential's repository restrictions and scopes as well as the current user ACL.
+Source publication still needs its own native branch and approval checks.
 """
 
 from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 from tauceti_tools.ci_candidate import RepositoryIdentity
 from tauceti_tools.forge import ForgeError, Forgejo, Incomplete
@@ -30,6 +30,51 @@ class SourceAuthorityUnavailable(RuntimeError):
     """Current native identity/ACL evidence could not be obtained."""
 
 
+@dataclass(frozen=True)
+class QueueRepositoryAccess(SourceRepositoryAccess):
+    """User ACL and effective scoped credential rights from one native request."""
+
+    credential_code_can_read: bool
+    credential_code_can_push: bool
+    credential_is_repo_admin: bool
+
+    def __post_init__(self):
+        super().__post_init__()
+        if any(
+            type(value) is not bool
+            for value in (self.credential_code_can_read, self.credential_code_can_push, self.credential_is_repo_admin)
+        ):
+            raise ValueError("credential access flags must be explicit booleans")
+        if (
+            (self.credential_code_can_read and not self.user_code_can_read)
+            or (
+                self.credential_code_can_push
+                and (not self.credential_code_can_read or not self.user_code_can_push or self.archived or self.mirror)
+            )
+            or (self.credential_is_repo_admin and not self.user_is_repo_admin)
+        ):
+            raise ValueError("credential access is inconsistent with its reduced user ACL")
+
+    @classmethod
+    def from_effective(cls, repository, row):
+        if not isinstance(row, dict):
+            raise Incomplete("native effective repository access is unavailable")
+        actor = SourceActor.from_native(repository.forge, row.get("user"))
+        acl = SourceRepositoryAccess.from_native(repository, actor, row.get("repository"))
+        keys = ("code_read", "code_write", "repository_admin")
+        if any(type(row.get(key)) is not bool for key in keys):
+            raise Incomplete("native effective repository access flags are unavailable")
+        try:
+            return cls(
+                **{entry.name: getattr(acl, entry.name) for entry in fields(SourceRepositoryAccess)},
+                credential_code_can_read=row["code_read"],
+                credential_code_can_push=row["code_write"],
+                credential_is_repo_admin=row["repository_admin"],
+            )
+        except ValueError:
+            raise Incomplete("native effective repository access is inconsistent with its user ACL") from None
+
+
 def principal_key(actor: SourceActor) -> str:
     """An immutable qualified identity for journals, never a display login."""
     if not isinstance(actor, SourceActor):
@@ -41,7 +86,7 @@ def principal_key(actor: SourceActor) -> str:
 class RequestAccess:
     """Process-local evidence; never persist or accept it from HTTP JSON."""
 
-    access: SourceRepositoryAccess
+    access: QueueRepositoryAccess
     checked_at: float
     issuer: object = field(repr=False, compare=False)
 
@@ -59,7 +104,7 @@ class NativeQueueAuthority:
         access = self.observe(token)
         return RequestAccess(access, checked_at, self)
 
-    def validate(self, evidence: RequestAccess) -> SourceRepositoryAccess:
+    def validate(self, evidence: RequestAccess) -> QueueRepositoryAccess:
         """Bound freshness across a wait for the controller lock, with no I/O."""
         if (
             not isinstance(evidence, RequestAccess)
@@ -70,29 +115,27 @@ class NativeQueueAuthority:
             raise SourceAuthorityUnavailable("native source authority needs a fresh request observation")
         access = evidence.access
         if (
-            not isinstance(access, SourceRepositoryAccess)
+            not isinstance(access, QueueRepositoryAccess)
             or access.repository != self.source.repository
             or access.repository_id != self.source.native_id
         ):
             raise SourceAccessDenied("native source authority belongs to another repository")
         return access
 
-    def observe(self, token: str) -> SourceRepositoryAccess:
-        """Read this token's actor and user ACL fresh, without retaining the token.
+    def observe(self, token: str) -> QueueRepositoryAccess:
+        """Read this token's actor and effective rights without retaining the token.
 
         Call after reading/validating the HTTP body, immediately before the queue
         operation. A prior observation never substitutes for a failed new read.
-        The user ACL does not establish the token's write scopes.
+        A server without the effective-access endpoint cannot authorize controls.
         """
         if not isinstance(token, str) or not 0 < len(token) <= 4096 or not all(33 <= ord(c) <= 126 for c in token):
             raise SourceAccessDenied("a native source bearer token is required", status=401)
         try:
             api = self._client_factory(self.source.repository.forge, token=token, timeout=10, max_bytes=1024 * 1024)
-            actor = SourceActor.from_native(self.source.repository.forge, api.request("GET", "user"))
-            access = SourceRepositoryAccess.from_native(
+            access = QueueRepositoryAccess.from_effective(
                 self.source.repository,
-                actor,
-                api.request("GET", "repos/" + self.source.repository.name),
+                api.request("GET", f"repositories/{self.source.native_id}/effective_access"),
             )
         except Incomplete:
             raise SourceAuthorityUnavailable("native source identity or repository ACL is incomplete") from None
@@ -106,15 +149,20 @@ class NativeQueueAuthority:
             raise SourceAccessDenied("native source repository identity changed")
         return access
 
-    def require_admin(self, access: SourceRepositoryAccess) -> None:
+    def require_admin(self, access: QueueRepositoryAccess) -> None:
         """Validate a fresh observation against this queue's writable source."""
         if (
-            not isinstance(access, SourceRepositoryAccess)
+            not isinstance(access, QueueRepositoryAccess)
             or access.repository != self.source.repository
             or access.repository_id != self.source.native_id
             or not access.user_is_repo_admin
             or not access.user_code_can_push
+            or not access.credential_code_can_read
+            or not access.credential_code_can_push
+            or not access.credential_is_repo_admin
             or access.archived
             or access.mirror
         ):
-            raise SourceAccessDenied("current source repository admin and Code write access are required")
+            raise SourceAccessDenied(
+                "current source repository admin and scoped credential Code write access are required"
+            )

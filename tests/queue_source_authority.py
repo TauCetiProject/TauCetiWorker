@@ -44,6 +44,7 @@ class SourceAuthority(unittest.TestCase):
             "mirror": False,
         }
         self.error = None
+        self.effective = {}
         self.calls = []
         self.clients = []
         outer = self
@@ -58,7 +59,19 @@ class SourceAuthority(unittest.TestCase):
                 outer.calls.append((method, path, self.token))
                 if outer.error:
                     raise outer.error
-                return copy.deepcopy(outer.actor if path == "user" else outer.repo)
+                outer.assertEqual((method, path), ("GET", f"repositories/{outer.identity.native_id}/effective_access"))
+                return copy.deepcopy(
+                    {
+                        "user": outer.actor,
+                        "repository": outer.repo,
+                        "code_read": outer.repo["permissions"]["pull"],
+                        "code_write": outer.repo["permissions"]["push"]
+                        and not outer.repo["archived"]
+                        and not outer.repo["mirror"],
+                        "repository_admin": outer.repo["permissions"]["admin"],
+                        **outer.effective,
+                    }
+                )
 
         self.authority = NativeQueueAuthority(self.identity, client_factory=Client)
 
@@ -68,7 +81,36 @@ class SourceAuthority(unittest.TestCase):
         with self.assertRaises(SourceAccessDenied):
             self.authority.observe("token")
         self.assertEqual(len(self.clients), 2)
-        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_readonly_credential_cannot_borrow_its_users_admin_acl(self):
+        self.authority.require_admin(self.authority.observe("token"))
+        self.effective.update(code_write=False, repository_admin=False)
+        access = self.authority.observe("read-only-token")
+        self.assertTrue(access.user_code_can_push)
+        self.assertTrue(access.user_is_repo_admin)
+        with self.assertRaises(SourceAccessDenied):
+            self.authority.require_admin(access)
+
+    def test_unsupported_effective_endpoint_does_not_fall_back_to_user_acl(self):
+        self.error = ForgeError("not supported", status=404)
+        with self.assertRaises(SourceAccessDenied):
+            self.authority.observe("token")
+        self.assertEqual(self.calls, [("GET", "repositories/41/effective_access", "token")])
+
+    def test_missing_or_inconsistent_effective_flags_are_not_authority(self):
+        for effective in (
+            {"code_read": None},
+            {"code_write": "true"},
+            {"repository_admin": 1},
+            {"code_read": False, "code_write": True},
+            {"repository": None},
+            {"user": None},
+        ):
+            with self.subTest(effective=effective):
+                self.effective = effective
+                with self.assertRaises(SourceAuthorityUnavailable):
+                    self.authority.observe("token")
 
     def test_changed_acl_and_archival_are_seen_after_prior_success(self):
         self.authority.require_admin(self.authority.observe("token"))
@@ -206,6 +248,16 @@ class NativeClaims(unittest.TestCase):
                 self.controller.claim_task("worker", "operator")
         cache.assert_not_called()
         self.assertEqual(self.store.rows("claims", {"task_id": self.task_id}), [])
+
+    def test_credential_scope_reduction_prevents_renewal_despite_unchanged_admin_acl(self):
+        task = self.claim()
+        before = self.store.rows("claims", {"task_id": self.task_id})[0]
+        self.effective.update(code_write=False, repository_admin=False)
+        with self.assertRaises(SourceAccessDenied):
+            self.controller.renew_task(
+                task.task_id, task.claim_token, source_access=self.authority.authenticate("now-read-only-token")
+            )
+        self.assertEqual(self.store.rows("claims", {"task_id": self.task_id})[0], before)
 
     def test_rename_keeps_claim_and_reused_login_cannot_renew_release_or_submit(self):
         task = self.claim()
@@ -757,6 +809,12 @@ class NativeHTTP(unittest.TestCase):
             "schema": TASK_SCHEMA,
             "task_binding": TaskBinding.from_policy(ledger.policy, queue_epoch=ledger.epoch).record(),
         }
+    def test_readonly_admin_token_cannot_claim_or_change_settings(self):
+        self.effective.update(code_write=False, repository_admin=False)
+        self.assertEqual(self.request("/tasks/claim", {"worker": "worker"})[0], 403)
+        self.assertEqual(self.request("/admin/settings", {"repair_concurrency": 2})[0], 403)
+        self.assertEqual(self.store.rows("claims", {"task_id": self.task_id}), [])
+        self.assertEqual(self.controller.setting("repair_concurrency"), 1)
 
     def test_slow_body_is_read_before_native_authority_is_observed(self):
         entered = threading.Event()

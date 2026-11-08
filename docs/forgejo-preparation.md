@@ -294,12 +294,25 @@ the isolated author/review/CI/merge rehearsal or a capacity proof.
 ## Queue source and execution boundary
 
 The optional source-bound queue has a separate native HTTP authority path. Each
-mutation reads its bearer actor and repository user ACL directly from the configured
-Forgejo origin and checks the configured native repository ID. It uses neither the
+mutation reads its bearer actor, repository user ACL and effective credential
+access directly from the configured Forgejo origin by native repository ID. The
+required `GET /api/v1/repositories/{id}/effective_access` response comes from a
+private native API addition. It includes current repository restrictions and
+read/write repository scopes. Unsupported endpoints, missing flags and inconsistent
+responses refuse controls without falling back to ordinary repository metadata.
+The client also checks the configured repository name, origin and native ID. It uses neither the
 GitHub identity/admin caches nor a previous successful native observation. A denied
 or unavailable read refuses the operation. Queue controls require current repository
-admin and Code write ACL, with archive and pull-mirror states refused. These user
-ACLs do not establish bearer write scopes or authorize source publication.
+admin and Code write ACL together with effective credential admin and Code write
+access, with archive and pull-mirror states refused. A read-only token cannot borrow
+its user's admin privileges. The native endpoint requires explicit scopes including
+`read:repository`. Its actor contains only the native ID and login, so repository-limited
+tokens can use it without `read:user`, which their creation rules forbid.
+Unscoped password, session and Actions authentication, implicit OAuth API scope
+fallback and impersonation cannot supply this evidence. The returned user ACL
+already includes credential repository-resource reduction; it excludes read/write
+scope, which the effective flags additionally enforce. Protected branch, approval and merge
+checks remain necessary when publishing to the source.
 
 Native HTTP handlers reject malformed bearer headers without reading the body or
 contacting Forgejo. They read the bounded body under a ten-second total deadline
@@ -382,9 +395,13 @@ enabling execution.
 Credential audience/delegation policy and ingress rate/concurrency limits also
 require integration before activation: a native user ACL observation alone does
 not identify a bearer as a dedicated queue-control credential.
-The disposable native integration exercises the actor/ACL reader against Forgejo
-17; separate HTTP/controller regressions cover revocation, slow bodies, lock waits,
-name reuse and claim ownership. These checks do not constitute the full hosted HTTPS
+The native effective-access API addition remains private pending its upstream
+contribution handoff. The disposable native integration checks effective access
+with the private native build and verifies that stock Forgejo refuses controls.
+Set `FORGEJO_EFFECTIVE_ACCESS=1` with `FORGEJO_BINARY` to require that capability;
+`FORGEJO_STATIC_ROOT` selects matching unbundled assets. Separate HTTP/controller
+regressions cover read-only scopes, revocation, slow bodies, lock waits, name reuse
+and claim ownership. These checks do not constitute the full hosted HTTPS
 or fleet-capacity rehearsal.
 
 The controller routes repository reads, refs, publication and repository authority
