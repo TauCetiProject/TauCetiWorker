@@ -25,6 +25,32 @@ def kinds(findings):
 
 
 class ParseLog(unittest.TestCase):
+    def test_import_header_findings_are_located_source_errors(self):
+        missing = (
+            "TauCeti/Probability/MarkovChain/ClosedClass.lean: missing project import "
+            "TauCeti.Probability.Kernel.ClosedClass: expected TauCeti/Probability/Kernel/ClosedClass.lean "
+            "in the exact candidate source tree (add the source or fix the import)"
+        )
+        messages = [
+            "Lean import header does not parse at 2:1: unexpected token",
+            "Lake import header does not parse: unexpected token",
+            "does not opt into the module system (no leading module header)",
+            "`meta import Mathlib.X` is not allowed: TauCeti/ holds no metaprogramming",
+            "direct metaprogramming import Lean is not allowed: import mathematical modules",
+            "ambiguous project imports: Lean and Lake disagree",
+        ]
+        findings = d.parse_log(
+            ["2026-11-08T06:09:55.0786175Z " + missing, missing]
+            + ["TauCeti.lean: " + message for message in messages]
+            + ["check-imports: Lean header driver exited 1: missing executable"]
+        )
+        self.assertEqual(len(findings), 7)
+        self.assertEqual(findings[0]["module"], "TauCeti.Probability.MarkovChain.ClosedClass")
+        self.assertEqual(findings[0]["message"], missing)
+        self.assertTrue(all(f["kind"] == "compiler" and f["reason"] == "import_header" for f in findings))
+        self.assertTrue(all(f["module"] == "TauCeti" for f in findings[1:]))
+        self.assertEqual(d.parse_log(["../TauCeti/A.lean: missing project import TauCeti.B"]), [])
+
     def test_compiler_errors(self):
         lines = [
             "2026-11-04T04:20:00.1234567Z \x1b[31merror: TauCeti/Algebra/Group/Basic.lean:12:3: error: unknown identifier\x1b[0m",
