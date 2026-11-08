@@ -69,6 +69,12 @@ class Integration(unittest.TestCase):
             publisher = ForgejoSourceAdapter(
                 identity, reviewer, clone, token=tokens["reviewer"], admission_policy=admission
             )
+            publisher_policy_store = Store(str(root / "publisher-policy.sqlite"))
+            try:
+                source.configure_publisher_policy(publisher_policy_store)
+                publisher.configure_publisher_policy(publisher_policy_store)
+            finally:
+                publisher_policy_store.close()
             name = repository.name
             base = source.ref_sha(name, "heads/main")
             contributor.request(

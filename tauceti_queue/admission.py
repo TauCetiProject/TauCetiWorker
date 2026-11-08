@@ -616,7 +616,7 @@ class AdmissionPoller:
                     self.clock(),
                 )
                 disposition = "closed" if pull.state != "open" else "draft"
-            elif not result["review_safe"]:
+            elif not result["review_safe"] or result.get("recovery_authority_hold"):
                 withdrawn = self.controller._withdraw(self.repo, pull.number, "review-unsafe", "tauceti-queue policy")
                 summary["revoked"] += int(withdrawn["withdrawn"])
                 disposition = "review-unsafe"

@@ -6178,6 +6178,8 @@ class Controller:
         with self._lock, self.store.transaction():
             latest = None
             for entry in self.store.rows("outbox", {"kind": "comment"}, order="id"):
+                if entry.get("result") == "reconciliation-required: clear predates authority rotation":
+                    continue
                 payload = loads(entry["payload"], {})
                 publication = payload.get("publication") or {}
                 if (
@@ -6396,7 +6398,7 @@ class Controller:
                 try:
                     return "comment " + str(self.source.publish(payload["native_intent"]))
                 except PublicationSuperseded as error:
-                    known = any(
+                    known = bool(error.nonce) and any(
                         (loads(e["payload"], {}).get("native_intent") or {}).get("nonce") == error.nonce
                         for e in self.store.rows("outbox", {"kind": "comment"})
                     )
@@ -6408,6 +6410,11 @@ class Controller:
                                 number=payload["number"],
                                 remote_sequence=error.sequence,
                                 remote_nonce=error.nonce,
+                            )
+                            self.log.warning(
+                                "native publication for #%s requires restore reconciliation (remote sequence %s)",
+                                payload["number"],
+                                error.sequence,
                             )
                         return "reconciliation-required: remote publication is absent from the local outbox; reconcile restore"
                     return "superseded native publication"
