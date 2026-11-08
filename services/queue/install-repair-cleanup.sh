@@ -15,7 +15,7 @@ if not args.database.is_file() or not (args.clone / '.git').is_dir():
     parser.error('database and repair clone must already exist on this host')
 config = Path.home() / '.config/tauceti-queue/repair-cleanup.json'
 config.parent.mkdir(parents=True, exist_ok=True)
-with config.open('w', opener=lambda path, flags: os.open(path, flags, 0o600)) as output:
+with open(config, 'w', opener=lambda path, flags: os.open(path, flags, 0o600)) as output:
     json.dump({'database': str(args.database.resolve()), 'clone': str(args.clone.resolve()),
                'roots': [str(root.resolve()) for root in args.root]}, output, indent=2)
     output.write('\n')
