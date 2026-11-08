@@ -92,7 +92,7 @@ ROOT_PATH = {root}/log
 
         admin("migrate")
         tokens = {}
-        for username in ("operator", "contributor"):
+        for username in ("operator", "contributor", "queue"):
             args = [
                 "admin",
                 "user",
@@ -150,5 +150,6 @@ ROOT_PATH = {root}/log
             "POST", "user/repos", {"name": "source", "private": True, "auto_init": True, "default_branch": "main"}
         )
         api.request("PUT", "repos/operator/source/collaborators/contributor", {"permission": "write"})
+        api.request("PUT", "repos/operator/source/collaborators/queue", {"permission": "write"})
         repository = RepositoryRef(api.forge, "operator/source")
         yield root, api, repository, row, tokens

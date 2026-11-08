@@ -560,21 +560,26 @@ used as the controller clone.
 
 Candidate and member refs are created atomically with explicit absent-ref leases.
 Existing identical refs reconcile without another push; a different existing tip
-is refused. Retention is restricted to `refs/tauceti-queue/` and
-`refs/heads/tauceti-ci/`. A frozen request's source identity, candidate tree,
-base ancestry and commit objects are checked before retention. Ref observations
-are batched, so retaining multiple members does not require a separate network
-round trip for each ref. Configure a `tauceti-ci/**` branch-protection rule that
-permits the dedicated controller to create refs and refuses contributor writes;
+is refused. Retention accepts the queue's existing local `refs/tauceti-queue/`
+names and CI's `refs/heads/tauceti-ci/` names. The former map to remote branches under
+`refs/heads/tauceti-ci/queue/`; fetch maps back into the original local names.
+This lets Forgejo's ordinary branch rules protect every remote retained ref.
+A frozen request's source identity, candidate tree, base ancestry and commit
+objects are checked before retention. Ref observations use the narrowest shared
+Forgejo API prefix, without downloading the repository's entire Git ref list.
+Configure a `tauceti-ci/**` branch-protection rule that permits the dedicated controller to create refs and refuses contributor writes;
 GitHub builds receive a source read credential. The real-server fixture exercises
 this rule, including a contributor's attempted replacement of a retained ref.
 
 Promotion checks local commit ancestry and pushes with an explicit expected-old
 lease. A competing update is refused even when the candidate already contains the
 competing commit. Forgejo's receive hooks still enforce branch protection. A
-transport timeout leaves publication uncertain and requires observation before
-retry. Source API identity checks bracket remote operations; they do not make a
-repository rename/deletion concurrent with Git publication atomic. Such operator
+transport timeout terminates the complete Git process group and leaves publication
+uncertain. An exact visible tip reconciles a lost acknowledgement without another
+push. A definitive server acknowledgement records success even if another writer
+then advances the branch; an unacknowledged outcome stays uncertain so the
+controller's existing landed-commit reconciliation runs before retry. Source API
+identity checks bracket remote operations; they do not make a repository rename/deletion concurrent with Git publication atomic. Such operator
 operations must not overlap publication.
 
 Run the real stock-server HTTPS test with:

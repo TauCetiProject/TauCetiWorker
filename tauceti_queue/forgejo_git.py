@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import base64
 import os
+import posixpath
 import re
 import shutil
+import signal
 import subprocess
 import threading
 from pathlib import Path
+from urllib.parse import quote
 
 from tauceti_tools.ci_candidate import RepositoryIdentity
 from tauceti_tools.forge import AmbiguousWrite, ForgeError, Incomplete
@@ -89,17 +92,37 @@ class ForgejoGitSource:
         return env
 
     def _git(self, *args, write=False, check=True):
+        process = None
+
+        def stop():
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
+
         try:
-            result = subprocess.run(
-                [*self.command, *args], env=self._environment(), capture_output=True, timeout=self.timeout
+            process = subprocess.Popen(
+                [*self.command, *args],
+                env=self._environment(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
             )
+            stdout, stderr = process.communicate(timeout=self.timeout)
+            result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
         except (OSError, subprocess.TimeoutExpired):
+            stop()
             error = AmbiguousWrite if write else ForgeError
             raise error(
                 "source Git transport failed; reconcile before retrying publication"
                 if write
                 else "source Git operation failed"
             ) from None
+        except BaseException:
+            stop()
+            raise
         if check and result.returncode:
             error = AmbiguousWrite if write else ForgeError
             raise error(
@@ -117,7 +140,8 @@ class ForgejoGitSource:
             not isinstance(row, dict)
             or type(row.get("id")) is not int
             or row["id"] != self.repository_identity.native_id
-            or row.get("full_name") != self.repository.name
+            or not isinstance(row.get("full_name"), str)
+            or row["full_name"].casefold() != self.repository.name.casefold()
         ):
             raise Incomplete("native Git repository identity changed")
 
@@ -141,23 +165,45 @@ class ForgejoGitSource:
         if self._git("cat-file", "-t", value).stdout != b"commit\n":
             raise ValueError("source Git object is not a commit")
 
+    @staticmethod
+    def _remote_ref(ref):
+        # The queue keeps its existing local refs. On Forgejo, expose retention
+        # as ordinary protected branches; custom refs have no protection rules.
+        if ref.startswith("refs/tauceti-queue/"):
+            return "refs/heads/tauceti-ci/queue/" + ref.removeprefix("refs/tauceti-queue/")
+        return ref
+
     def ref_sha(self, repo, ref):
-        return self._remote_refs(repo, [ref])[self._ref(ref if ref.startswith("refs/") else "refs/" + ref)]
+        ref = self._ref(ref if ref.startswith("refs/") else "refs/" + ref)
+        return self._remote_refs(repo, [ref])[ref]
 
     def _remote_refs(self, repo, refs):
         refs = tuple(self._ref(ref if ref.startswith("refs/") else "refs/" + ref) for ref in refs)
-        if not refs or len(refs) > 4096 or len(set(refs)) != len(refs):
+        remote = {self._remote_ref(ref): ref for ref in refs}
+        if not refs or len(refs) > 4096 or len(remote) != len(refs):
             raise ValueError("source ref lookup needs bounded distinct refs")
+        prefix = posixpath.commonpath(tuple(remote)).removeprefix("refs/")
         with self._lock:
             self._bound(repo)
-            output = self._git("ls-remote", "--refs", self.repository.clone_url, *refs).stdout.splitlines()
+            try:
+                rows = self.client.request("GET", f"repos/{self.repository.name}/git/refs/" + quote(prefix, safe="/"))
+            except ForgeError as error:
+                if error.status != 404:
+                    raise
+                rows = []
             self._bound(repo)
+            if not isinstance(rows, list):
+                raise Incomplete("source ref listing is unavailable")
             found = dict.fromkeys(refs)
-            for line in output:
-                fields = line.decode("ascii").split("\t")
-                if len(fields) != 2 or fields[1] not in found or found[fields[1]] is not None:
-                    raise Incomplete("source Git returned ambiguous or unrequested refs")
-                found[fields[1]] = self._sha(fields[0])
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get("ref"), str):
+                    raise Incomplete("source ref listing is malformed")
+                if row["ref"] not in remote:
+                    continue  # Prefix matches never identify an exact requested ref.
+                logical = remote[row["ref"]]
+                if found[logical] is not None or not isinstance(row.get("object"), dict):
+                    raise Incomplete("source ref listing is ambiguous")
+                found[logical] = self._sha(row["object"].get("sha"))
             return found
 
     def fetch_refs(self, repo, refspecs):
@@ -175,9 +221,18 @@ class ForgejoGitSource:
                     raise ValueError("source fetch requires explicit refs or commit IDs")
                 for ref in parts:
                     self._ref(ref)
+        remote_specs = []
+        for spec in refspecs:
+            if SHA.fullmatch(spec):
+                remote_specs.append(spec)
+            else:
+                source, destination = spec.removeprefix("+").split(":")
+                remote_specs.append(
+                    ("+" if spec.startswith("+") else "") + self._remote_ref(source) + ":" + destination
+                )
         with self._lock:
             self._bound(repo)
-            self._git("fetch", "--no-tags", "--no-recurse-submodules", self.repository.clone_url, *refspecs)
+            self._git("fetch", "--no-tags", "--no-recurse-submodules", self.repository.clone_url, *remote_specs)
             self._bound(repo)
 
     def update_ref(self, repo, ref, sha):
@@ -194,11 +249,10 @@ class ForgejoGitSource:
             if not ref.startswith(("refs/tauceti-queue/", "refs/heads/tauceti-ci/")):
                 raise ValueError("source retention cannot update ordinary branches")
             self._commit(sha)
-            normalized.append((ref, sha))
+            normalized.append((self._remote_ref(ref), sha))
         if len({ref for ref, _ in normalized}) != len(normalized):
             raise ValueError("duplicate retained ref")
         with self._lock:
-            self._bound(repo)
             pending = []
             observed = self._remote_refs(repo, [ref for ref, _ in normalized])
             for ref, sha in normalized:
@@ -207,18 +261,32 @@ class ForgejoGitSource:
                     raise ForgeError("retained source ref already names another commit")
                 if current is None:
                     pending.append((ref, sha))
-            if pending:
-                self._git(
-                    "push",
-                    "--atomic",
-                    "--porcelain",
-                    *(f"--force-with-lease={ref}:" for ref, _ in pending),
-                    self.repository.clone_url,
-                    *(f"{sha}:{ref}" for ref, sha in pending),
-                    write=True,
-                )
-            if self._remote_refs(repo, [ref for ref, _ in normalized]) != dict(normalized):
-                raise AmbiguousWrite("retained source refs did not reconcile to their expected commits")
+            try:
+                if pending:
+                    self._git(
+                        "push",
+                        "--atomic",
+                        "--porcelain",
+                        *(f"--force-with-lease={ref}:" for ref, _ in pending),
+                        self.repository.clone_url,
+                        *(f"{sha}:{ref}" for ref, sha in pending),
+                        write=True,
+                    )
+            except AmbiguousWrite:
+                # A lost acknowledgement or another controller creating identical
+                # refs is settled only by observing the exact complete target set.
+                try:
+                    if self._remote_refs(repo, [ref for ref, _ in normalized]) == dict(normalized):
+                        return
+                except (ForgeError, ValueError):
+                    pass
+                raise
+            try:
+                if self._remote_refs(repo, [ref for ref, _ in normalized]) == dict(normalized):
+                    return
+            except (ForgeError, ValueError):
+                pass
+            raise AmbiguousWrite("retained source refs could not be reconciled to their expected commits")
 
     def retain_candidate(self, frozen):
         if (
@@ -253,6 +321,8 @@ class ForgejoGitSource:
             if ancestry.returncode:
                 raise ForgeError("source ancestry could not be verified")
             current = self.ref_sha(repo, ref)
+            if current == tip:
+                return FastForwardResult(True, expected_parent)
             if current != expected_parent:
                 return FastForwardResult(False, current, "parent changed before the push")
             result = self._git(
@@ -264,7 +334,22 @@ class ForgejoGitSource:
                 write=True,
                 check=False,
             )
-            actual = self.ref_sha(repo, ref)
-            if result.returncode == 0 and actual == tip:
+            explicit_refusal = False
+            for line in result.stdout.splitlines():
+                fields = line.split(b"\t")
+                if len(fields) != 3 or fields[1].split(b":", 1)[-1] != ref.encode("utf-8"):
+                    continue
+                if fields[0] in (b"*", b" ", b"=") and result.returncode == 0:
+                    # The server acknowledged the exact leased update. Another
+                    # writer may advance the branch before a later observation.
+                    return FastForwardResult(True, expected_parent)
+                explicit_refusal |= fields[0] == b"!"
+            try:
+                actual = self.ref_sha(repo, ref)
+            except (ForgeError, ValueError):
+                raise AmbiguousWrite("source promotion outcome could not be observed") from None
+            if actual == tip:
                 return FastForwardResult(True, expected_parent)
-            return FastForwardResult(False, actual, "source lease or branch protection refused publication")
+            if explicit_refusal:
+                return FastForwardResult(False, actual, "source lease or branch protection refused publication")
+            raise AmbiguousWrite("source promotion has no definitive acknowledgement; reconcile before retry")
