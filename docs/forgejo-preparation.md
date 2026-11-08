@@ -579,8 +579,9 @@ names and CI's `refs/heads/tauceti-ci/` names. The former map to remote branches
 `refs/heads/tauceti-ci/queue/`; fetch maps back into the original local names.
 This lets Forgejo's ordinary branch rules protect every remote retained ref.
 A frozen request's source identity, candidate tree, base ancestry and commit
-objects are checked before retention. Ref observations use the narrowest shared
-Forgejo API prefix, without downloading the repository's entire Git ref list.
+objects are checked before retention. CI refs for one immutable request share a
+bounded API lookup. Other queue refs use exact-name lookups, so a batch spanning
+many inputs never scans the growing retained namespace.
 Configure a `tauceti-ci/**` branch-protection rule that permits the dedicated controller to create refs and refuses contributor writes;
 GitHub builds receive a source read credential. The real-server fixture exercises
 this rule, including a contributor's attempted replacement of a retained ref.
@@ -589,7 +590,8 @@ Promotion checks local commit ancestry and pushes with an explicit expected-old
 lease. A competing update is refused even when the candidate already contains the
 competing commit. Forgejo's receive hooks still enforce branch protection. A
 transport timeout terminates the complete Git process group and leaves publication
-uncertain. An exact visible tip reconciles a lost acknowledgement without another
+uncertain. SIGTERM allows Git to clean lock files, with SIGKILL after a two-second
+grace period if needed. An exact visible tip reconciles a lost acknowledgement without another
 push. A definitive server acknowledgement records success even if another writer
 then advances the branch; an unacknowledged outcome stays uncertain so the
 controller's existing landed-commit reconciliation runs before retry. Source API
@@ -611,3 +613,6 @@ validation tests run in `tests/queue_forgejo_git.py`.
 This transport does not itself establish review approval, CI success or webhook
 admission. The complete source adapter, trusted review publisher integration and
 queue bootstrap must connect those checks before native operation is enabled.
+Native worker task metadata and submission transport must also use the protected
+remote names: the existing worker's literal custom-ref fetch and submission paths
+remain disabled for native execution until that integration is complete.

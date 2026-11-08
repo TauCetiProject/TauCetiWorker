@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import base64
 import os
-import posixpath
 import re
 import shutil
 import signal
@@ -97,10 +96,17 @@ class ForgejoGitSource:
         def stop():
             if process is not None:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    os.killpg(process.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-                process.communicate()
+                try:
+                    process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.communicate()
 
         try:
             process = subprocess.Popen(
@@ -182,28 +188,45 @@ class ForgejoGitSource:
         remote = {self._remote_ref(ref): ref for ref in refs}
         if not refs or len(refs) > 4096 or len(remote) != len(refs):
             raise ValueError("source ref lookup needs bounded distinct refs")
-        prefix = posixpath.commonpath(tuple(remote)).removeprefix("refs/")
+        groups = {}
+        for ref in remote:
+            # Only a single immutable CI request has a bounded shared namespace.
+            # Queue outbox batches can span years of input/batch refs; read those
+            # by their exact names instead of listing a growing queue prefix.
+            prefix = ref
+            if re.fullmatch(
+                r"refs/heads/tauceti-ci/[0-9a-f]{32}/[0-9a-f]{32}/(?:candidate|members|member-[1-9][0-9]*)", ref
+            ):
+                prefix = ref.rsplit("/", 1)[0]
+            groups.setdefault(prefix, []).append(ref)
         with self._lock:
             self._bound(repo)
-            try:
-                rows = self.client.request("GET", f"repos/{self.repository.name}/git/refs/" + quote(prefix, safe="/"))
-            except ForgeError as error:
-                if error.status != 404:
-                    raise
-                rows = []
-            self._bound(repo)
-            if not isinstance(rows, list):
-                raise Incomplete("source ref listing is unavailable")
             found = dict.fromkeys(refs)
-            for row in rows:
-                if not isinstance(row, dict) or not isinstance(row.get("ref"), str):
-                    raise Incomplete("source ref listing is malformed")
-                if row["ref"] not in remote:
-                    continue  # Prefix matches never identify an exact requested ref.
-                logical = remote[row["ref"]]
-                if found[logical] is not None or not isinstance(row.get("object"), dict):
-                    raise Incomplete("source ref listing is ambiguous")
-                found[logical] = self._sha(row["object"].get("sha"))
+            for prefix, targets in groups.items():
+                try:
+                    rows = self.client.request(
+                        "GET", f"repos/{self.repository.name}/git/refs/" + quote(prefix.removeprefix("refs/"), safe="/")
+                    )
+                except ForgeError as error:
+                    if error.status != 404:
+                        raise
+                    rows = []
+                if isinstance(rows, dict):
+                    if rows.get("ref") not in targets:
+                        raise Incomplete("source ref response identifies a different ref")
+                    rows = [rows]
+                if not isinstance(rows, list):
+                    raise Incomplete("source ref listing is unavailable")
+                for row in rows:
+                    if not isinstance(row, dict) or not isinstance(row.get("ref"), str):
+                        raise Incomplete("source ref listing is malformed")
+                    if row["ref"] not in targets:
+                        continue
+                    logical = remote[row["ref"]]
+                    if found[logical] is not None or not isinstance(row.get("object"), dict):
+                        raise Incomplete("source ref listing is ambiguous")
+                    found[logical] = self._sha(row["object"].get("sha"))
+            self._bound(repo)
             return found
 
     def fetch_refs(self, repo, refspecs):
@@ -343,7 +366,7 @@ class ForgejoGitSource:
                     # The server acknowledged the exact leased update. Another
                     # writer may advance the branch before a later observation.
                     return FastForwardResult(True, expected_parent)
-                explicit_refusal |= fields[0] == b"!"
+                explicit_refusal |= fields[0] == b"!" and fields[2].startswith((b"[rejected]", b"[remote rejected]"))
             try:
                 actual = self.ref_sha(repo, ref)
             except (ForgeError, ValueError):

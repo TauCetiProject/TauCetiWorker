@@ -161,9 +161,86 @@ class SourceGit(unittest.TestCase):
             self.promotion("c" * 40, b"!\t" + b"b" * 40 + b":refs/heads/main\t[rejected] (stale info)\n", 1).ok
         )
 
+    def test_remote_failure_porcelain_is_uncertain_when_the_branch_advanced(self):
+        with self.assertRaises(AmbiguousWrite):
+            self.promotion(
+                "c" * 40,
+                b"!\t" + b"b" * 40 + b":refs/heads/main\t[remote failure] (remote failed to report status)\n",
+                1,
+            )
+
+    def test_mixed_queue_batches_never_list_the_whole_retention_namespace(self):
+        self.source._remote_refs("team/Math", ["refs/tauceti-queue/input/1", "refs/tauceti-queue/input/2"])
+        self.assertEqual(
+            [call.args[1] for call in self.api.request.call_args_list],
+            [
+                "repos/team/Math/git/refs/heads/tauceti-ci/queue/input/1",
+                "repos/team/Math/git/refs/heads/tauceti-ci/queue/input/2",
+            ],
+        )
+        self.api.request.reset_mock()
+        prefix = "refs/heads/tauceti-ci/" + "a" * 32 + "/" + "b" * 32
+        self.source._remote_refs("team/Math", [prefix + "/candidate", prefix + "/member-1"])
+        self.api.request.assert_called_once_with("GET", "repos/team/Math/git/refs/" + prefix.removeprefix("refs/"))
+
+    def test_single_object_ref_response_is_exact_and_validated(self):
+        self.api.request.return_value = {"ref": "refs/heads/main", "object": {"sha": "a" * 40}}
+        self.assertEqual(self.source.ref_sha("team/Math", "heads/main"), "a" * 40)
+        self.api.request.return_value = {"ref": "refs/heads/other", "object": {"sha": "a" * 40}}
+        with self.assertRaises(Incomplete):
+            self.source.ref_sha("team/Math", "heads/main")
+
     def test_an_already_visible_tip_is_reconciled_without_another_push(self):
         self.assertTrue(self.promotion(None, b"", 1, initial="b" * 40).ok)
         self.assertFalse(any(call.args[0] == "push" for call in self.source._git.call_args_list))
+
+    def test_timeout_allows_real_git_to_clean_a_prepared_ref_transaction(self):
+        tree = (
+            subprocess.run(["git", "-C", str(self.clone), "mktree"], input=b"", check=True, capture_output=True)
+            .stdout.decode()
+            .strip()
+        )
+        commit = (
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(self.clone),
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit-tree",
+                    tree,
+                    "-m",
+                    "prepared",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            .stdout.decode()
+            .strip()
+        )
+        ready = self.clone / "prepared"
+        transaction = f"start\nupdate refs/heads/held {commit}\nprepare\n".encode()
+        lock = self.clone / ".git/refs/heads/held.lock"
+        program = (
+            "import subprocess,time,pathlib; "
+            f"p=subprocess.Popen(['git','-C',{str(self.clone)!r},'update-ref','--stdin'],stdin=subprocess.PIPE,stdout=subprocess.PIPE); "
+            f"p.stdin.write({transaction!r}); p.stdin.flush(); "
+            "assert p.stdout.readline()==b'start: ok\\n';assert p.stdout.readline()==b'prepare: ok\\n'; "
+            f"assert pathlib.Path({str(lock)!r}).exists(); "
+            f"pathlib.Path({str(ready)!r}).touch();time.sleep(60)"
+        )
+        self.source.command = [sys.executable, "-c", program]
+        self.source.timeout = 2
+        with self.assertRaises(AmbiguousWrite):
+            self.source._git("push", write=True)
+        self.assertTrue(ready.exists(), "real Git prepared the ref transaction before timeout")
+        self.assertFalse((self.clone / ".git/refs/heads/held.lock").exists())
+        subprocess.run(
+            ["git", "-C", str(self.clone), "update-ref", "refs/heads/held", commit], check=True, capture_output=True
+        )
 
     @unittest.skipUnless(Path("/proc").exists(), "Linux process-group observation")
     def test_real_timeout_terminates_git_helpers_in_the_same_process_group(self):
