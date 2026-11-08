@@ -84,6 +84,7 @@ class AdmissionSnapshot:
     comments: tuple[dict[str, Any], ...]
     statuses: dict[str, str]
     diff_version: str = ""
+    discovery_version: str = ""
 
     def source(self) -> dict[str, Any]:
         return {

@@ -10,6 +10,23 @@ from tauceti_tools.forge import GITHUB
 
 TASK_SCHEMA = "tauceti-queue.source-task/v2"
 BINDING_SCHEMA = "tauceti-queue.task-binding/v1"
+NATIVE_GIT_REFS = "tauceti-queue.forgejo-git/v1"
+
+
+def native_retained_ref(ref):
+    if not isinstance(ref, str) or not ref.startswith("refs/tauceti-queue/"):
+        raise ValueError("expected a controller-local queue ref")
+    return "refs/heads/tauceti-ci/queue/" + ref.removeprefix("refs/tauceti-queue/")
+
+
+def native_submission_ref(epoch, task_id, claim_id):
+    if (
+        not isinstance(epoch, str)
+        or re.fullmatch(r"[0-9a-f]{32}", epoch) is None
+        or any(type(i) is not int or not 0 < i < 2**63 for i in (task_id, claim_id))
+    ):
+        raise ValueError("invalid native submission identity")
+    return f"refs/heads/tauceti-submissions/{epoch}/{task_id}/{claim_id}"
 
 
 @dataclass(frozen=True)
@@ -143,18 +160,25 @@ def validate_native_task(row):
         )
     ):
         raise TaskBindingMismatch("invalid qualified pre-rebased task references")
+    transport = row["extra"].get("git_transport")
+    if transport not in (None, NATIVE_GIT_REFS):
+        raise TaskBindingMismatch("unknown native Git transport")
+    prefix = "refs/heads/tauceti-ci/queue/" if transport == NATIVE_GIT_REFS else "refs/tauceti-queue/"
     refs = row.get("retained_refs")
     if (
         not isinstance(refs, list)
         or not refs
         or any(
             not isinstance(ref, str)
-            or re.fullmatch(r"refs/tauceti-queue/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*", ref) is None
+            or re.fullmatch(re.escape(prefix) + r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*", ref) is None
             for ref in refs
         )
     ):
         raise TaskBindingMismatch("invalid qualified task retained refs")
     expected = f"refs/tauceti-queue/submissions/{row['task_id']}/{row['extra'].get('claim_id')}"
+    if transport == NATIVE_GIT_REFS:
+        binding = TaskBinding.parse(row.get("binding"))
+        expected = native_submission_ref(binding.queue_epoch, int(row["task_id"]), row["extra"].get("claim_id"))
     if (
         type(row["extra"].get("claim_id")) is not int
         or row["extra"]["claim_id"] < 1
@@ -178,7 +202,7 @@ def validate_native_task(row):
             or not int(head, 16)
         ):
             raise TaskBindingMismatch("invalid qualified member head")
-        retained = f"refs/tauceti-queue/inputs/{member['number']}/{head}"
+        retained = f"{prefix}inputs/{member['number']}/{head}"
         if (
             member.get("retained_ref") != retained
             or retained not in refs

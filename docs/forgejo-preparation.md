@@ -562,3 +562,210 @@ must use representative PR histories and fleet concurrency before service retire
 
 Installed production environments, development forge, admission settings, mirror
 configuration and shared-state lifecycle are unchanged by this preparation.
+
+### Native queue Git transport
+
+`ForgejoGitSource` supplies the Git part of the queue's source adapter. It uses
+ordinary Forgejo repositories and HTTP Git, with an explicit source bearer scoped
+to the configured clone URL. It disables redirects, interactive credentials,
+client hooks and inherited Git credential/trace overrides. The controller clone
+is trusted service state; candidate checkouts and their configuration must not be
+used as the controller clone.
+
+Candidate and member refs are created atomically with explicit absent-ref leases.
+Existing identical refs reconcile without another push; a different existing tip
+is refused. Retention accepts the queue's existing local `refs/tauceti-queue/`
+names and CI's `refs/heads/tauceti-ci/` names. The former map to remote branches under
+`refs/heads/tauceti-ci/queue/`; fetch maps back into the original local names.
+This lets Forgejo's ordinary branch rules protect every remote retained ref.
+A frozen request's source identity, candidate tree, base ancestry and commit
+objects are checked before retention. CI refs for one immutable request share a
+bounded API lookup. Other queue refs use exact-name lookups, so a batch spanning
+many inputs never scans the growing retained namespace.
+Configure a `tauceti-ci/**` branch-protection rule that permits the dedicated controller to create refs and refuses contributor writes;
+GitHub builds receive a source read credential. The real-server fixture exercises
+this rule, including a contributor's attempted replacement of a retained ref.
+
+Promotion checks local commit ancestry and pushes with an explicit expected-old
+lease. A competing update is refused even when the candidate already contains the
+competing commit. Forgejo's receive hooks still enforce branch protection. A
+transport timeout terminates the complete Git process group and leaves publication
+uncertain. SIGTERM allows Git to clean lock files, with SIGKILL after a two-second
+grace period if needed. An exact visible tip reconciles a lost acknowledgement without another
+push. A definitive server acknowledgement records success even if another writer
+then advances the branch; an unacknowledged outcome stays uncertain so the
+controller's existing landed-commit reconciliation runs before retry. Source API
+identity checks bracket remote operations; they do not make a repository rename/deletion concurrent with Git publication atomic. Such operator
+operations must not overlap publication.
+
+Run the real stock-server HTTPS test with:
+
+```sh
+FORGEJO_BINARY=/path/to/forgejo python tests/integration_forgejo_git.py
+```
+
+It uses disposable repositories, users, credentials and a local TLS certificate;
+`openssl` and Git must be on PATH. It exercises fetch, frozen request retention,
+idempotent reconciliation, competing promotion, a rejected non-fast-forward,
+server branch protection, and a lost accepted publication response. The portable
+validation tests run in `tests/queue_forgejo_git.py`.
+
+This transport does not itself establish review approval, CI success or webhook
+admission. The source adapter below connects native review checks; service
+bootstrap and trusted publisher integration are still required before activation.
+
+
+### Native source adapter and admission
+
+`ForgejoSourceAdapter` connects PR metadata, immutable Git comparisons, comments,
+labels, publication and fresh repository permissions to the existing controller.
+`NativeAdmissionPolicy` uses the installed Review admission policy. Explicit
+`NativePublishers` lists identify review, status and recovery publishers by
+server-local principal ID, bound to the native source repository. The source API
+credential needs repository-admin permission to query other users' current
+permissions; Git publication still uses its separately supplied source bearer.
+
+Native scoreboard and recovery comments carry a `tauceti-source:v2` binding
+naming the source origin/repository ID, authenticated issuer, publisher-policy
+generation and producer's policy revision. Comment authorship alone grants no
+authority: Forgejo repository writers may moderate another user's comments.
+A `tauceti-source-publication-intent/v3` record freezes a unique nonce, the exact
+body and a durable, increasing outbox sequence before any remote write. The
+sequence orders intent creation, including intents prepared during an outage;
+registration or completion delivery order never determines review precedence.
+Each intent owns a separate comment. Native append-only commit statuses register
+the intent first, then bind its comment ID and SHA-256 digest. Admission selects
+the greatest sequence and verifies current issuer permission, exact body and
+source binding. It never falls back to an older green verdict when the newest
+publication is pending, revoked, malformed, edited or deleted. Recovery clears
+use the same frozen-intent ordering, so an old clear cannot erase a newer hold.
+
+All publishers of one PR and kind must share the durable sequence allocator in
+the existing owner store. The queue uses its existing outbox row IDs for both holds and clears, through
+`enqueue_source_recovery`, and saves the complete intent in that row before
+sending. Reusing an intent key with a different decision is refused. Retries
+preserve the nonce, body and
+sequence, including after a lost accepted response. A superseded intent settles
+without resending; an unknown remote owned nonce reports restore reconciliation
+in the journal instead of silently dropping a newer desired local fact. A confirmed comment that was moderated raises
+`PublicationDamaged`; publish a new intent from the saved result rather than
+repeating inference. Review's trusted publication phase must integrate the same
+contract with its durable ledger before activation. Queue comments are operational
+prose: their embedded `tauceti` markers are escaped. Only an explicit trusted
+recovery payload can create a queue publication; quoted agent text never selects
+a review operation, even if publisher roles overlap. Commit-bound facts still
+publish when a PR closes or temporarily changes head, so reopening cannot revive
+a superseded green verdict.
+
+`NativePublishers.generation` is a fresh random 128-bit hexadecimal value from
+trusted private publisher configuration. Generate it after revoking old
+credentials, and distribute it privately with the new grants before publishing.
+Changing publisher grants or restoring an account requires a fresh generation;
+the queue refuses reused generations in its existing settings. Publications from
+prior generations grant no positive authority, including facts planted while an
+account was unconfigured. Any retired recovery history remains a blocking state
+until a current-generation explicit clear or hold is published. A rotation never
+silently releases a hold. The controller does not replay completed historical publications. Pending holds
+can rebind to the new generation; all pending old-authority clears settle as
+reconciliation-required, including clears not yet prepared. A release always
+needs a fresh explicit decision. Authority holds report a reconciliation reason,
+not a rebase request. Prefix, allow-file and ordinary consumer-policy changes keep
+the generation and reapply current rules to existing facts. Grant changes require
+republishing saved review results under the new generation, without new model
+work. Native PR CI statuses carry `tauceti-ci-status/v1:<generation>` descriptions;
+the latest CI status is selected before checking issuer authority. Review and
+recovery records exclude resolvable non-publishers before parsing or comparing
+sequences; they cannot poison a head with an oversized or malformed intent.
+Unresolved/deleted or synthetic issuers deny older facts without contributing
+an intent sequence. They retain the greatest trusted sequence observed before
+the barrier. Only that exact intent or a newer sequence can register after the
+barrier to reconcile it; a forged maximum sequence never permanently poisons publication.
+Retired recovery history conservatively blocks even if a restored backup lost
+both its generation and its publisher account. Historical records only deny;
+a current explicit clear or hold reconciles them. An untrusted writer may impose
+this deny state, but cannot override an existing current-generation decision. Reads and publication require the durable publisher-policy binding; a
+fresh adapter cannot silently start with incomplete historical grants. Authority
+holds withdraw waiting/reserved inputs before they consume candidate CI; inserted
+work retains the existing explicit promotion refusal and recovery procedure.
+Legacy publication protocols grant no authority.
+
+In-progress publications and initial scoreboards defer admission and promotion
+for a bounded wait (six hours by default). Closed, draft, retargeted and held PRs
+are evaluated immediately. An abandoned publication becomes review-unsafe after
+the configured wait; a confirmed review that was moderated is immediately unsafe
+rather than a transient read failure. At promotion either unsafe state refuses
+the exact candidate; an already inserted batch receives the existing explicit
+promotion hold, preserving its candidate and repair work for operator recovery.
+It is never silently rebuilt or merged. `publication_enabled=false` also blocks
+already frozen intents. OS permission/transport errors remain retryable; only a
+typed missing publisher grant settles for operator reconciliation. Publisher bootstrap, credential rotation
+and the tested operational recovery path remain activation requirements. After
+any queue-store restore, reconcile source facts and cost history, then install a
+fresh authority generation before resuming publication; outbox IDs and retired
+generation records may otherwise have rolled back. Never replay a stale backup
+clear or green result over newer source evidence. Confirmed owned recovery
+comments that are moderated are requeued only if they are still the latest
+desired fact; a newer queued clear is never overwritten.
+Forgejo Actions remain disabled on the source repository.
+
+Promotion rereads the accepted PR heads and current review evidence. The trusted
+CI coordinator separately verifies the exact frozen candidate's build, scope and
+bump results. The source adapter additionally checks the actual candidate's changed
+paths against the current admission prefix and allow-files, so a broader CI scope
+configuration cannot bypass that restriction. A repaired candidate does not need
+to make the original PR head's failed build green. Source read failures remain unavailable; they do not become
+empty discussions or positive approval. GitHub App checks and GitHub quota are
+unsupported source capabilities here; Forgejo requires primary-policy admission.
+Native human-owned infrastructure approvals remain disabled in admission until
+their command intake and matching promotion checks are integrated.
+
+Discovery reads listing metadata and leaves detailed evidence to each PR's
+admission work item. Stable discovery metadata does not continuously re-dirty an
+evaluated PR. Refresh versions use the poller's clock and configured interval,
+with per-PR offsets. Stock Forgejo 17 does not emit commit-status webhooks; native
+webhook ingress and immediate trusted publication notifications still need service
+bootstrap integration. Direct polling remains the backstop for source statuses
+and permissions, and promotion always rereads current approval evidence.
+Immutable commits already present in the controller clone are reused.
+An unreadable or changing PR cannot abort discovery for its siblings.
+This is a functional baseline, not a capacity result; query volume,
+backstop refreshes and history retrieval still need measurement and bounded
+caching before the concurrency rehearsal is complete.
+
+Native queue commits now carry host-qualified `Source-PR` trailers and preserve
+the accepted Git commit's author rather than inventing a GitHub noreply address.
+Historical GitHub attribution remains readable; native landing checks do not
+reuse GitHub PR-number aliases as native authority.
+
+A task produced by the native adapter advertises its protected input refs under
+`refs/heads/tauceti-ci/queue/`. Untrusted worker proposals use a separate
+`refs/heads/tauceti-submissions/<queue-epoch>/<task>/<claim>` namespace. The
+controller fetches and locally retains the exact submitted commit before
+validation/adoption, including rejected submissions; its durable outbox publishes
+the protected retention ref. Proposal
+refs confer no merge authority. Task metadata validates the ref transport version,
+queue epoch and claim identity; native execution remains disabled until source
+credentials, runner isolation, checkpoint/cache namespaces and claim recovery are
+integrated. Trusted Review publication must emit the new source binding, and the
+service bootstrap must wire the source and execution adapters independently.
+
+Run the isolated real-source controller test with:
+
+```sh
+FORGEJO_BINARY=/path/to/forgejo python tests/integration_forgejo_source.py
+```
+
+It exercises real HTTPS source reads, native publisher revocation, spoofed
+statuses, unavailable authority, label/comment publication, primary admission,
+protected candidate retention and source branch promotion with the shared-state
+and legacy GitHub source paths blocked. CI observations in this fixture are
+deterministic; it does not prove the separate real GitHub Actions rehearsal.
+
+
+The recovery publisher identity is exclusive to one controller/outbox owner.
+Operator tools enqueue decisions through that owner rather than independently
+allocating sequences or using its token. Native service bootstrap enforces a
+single process on its existing database; credential rotation stops the old
+publisher before starting the new generation, while normal worker/CI admissions
+stay enabled. A publication arriving from an unknown owned nonce is an operator
+reconciliation alert, not silently adopted local history.
