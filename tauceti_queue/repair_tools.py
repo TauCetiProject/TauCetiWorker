@@ -5,6 +5,8 @@ lock through ``build_lock`` and the agent's ``.tauceti-repair/build`` (written b
 ``write_build_script`` from the very same ``take_lock``) holds it the same way. The lock is the
 directory ``.tauceti-repair/build.lock``, taken atomically by ``mkdir`` with the holder's pid in
 ``pid`` inside; a waiter polls every 2 s, says so every 30 s, and clears a lock whose holder has died.
+Stale recovery rechecks the PID under a sibling ``.reclaim`` flock so two stale
+observers cannot remove a newly acquired live lock. That guard file stays in place.
 
 The script takes module names (``TauCeti.Foo.Bar``) or paths (``TauCeti/Foo/Bar.lean``), with
 ``--dependents`` every module importing them transitively (from the library's ``import`` lines, one
@@ -18,6 +20,7 @@ exiting 1 on a finding. Lake runs in the offline
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import inspect
 import json
 import os
@@ -29,6 +32,27 @@ from pathlib import Path
 TOOLS_DIR = ".tauceti-repair"
 BUILD_FILE = "build"
 LOCK_DIR = "build.lock"
+
+
+def reclaim_dead_lock(lock: Path, observed_pid: int) -> None:
+    """Recheck the holder while serializing stale-directory replacement.
+
+    This sibling file must remain in place: unlinking it could give concurrent
+    reclaimers different flock inodes. Lock acquisition still uses atomic mkdir.
+    """
+    with (lock.parent / (lock.name + ".reclaim")).open("a+b") as guard:
+        fcntl.flock(guard, fcntl.LOCK_EX)
+        try:
+            current_pid = int((lock / "pid").read_text())
+            if current_pid != observed_pid:
+                return
+            os.kill(current_pid, 0)
+        except (FileNotFoundError, ValueError):
+            return  # Gone, or a replacement has not finished publishing its PID.
+        except ProcessLookupError:
+            with contextlib.suppress(OSError):
+                os.rename(lock, stale := f"{lock}.stale-{os.getpid()}")
+                shutil.rmtree(stale, ignore_errors=True)
 
 
 def take_lock(lock: Path, log=print) -> None:
@@ -46,9 +70,7 @@ def take_lock(lock: Path, log=print) -> None:
         except (FileNotFoundError, ValueError):
             pid = 0  # still being taken
         except ProcessLookupError:
-            with contextlib.suppress(OSError):  # one waiter wins the rename; the others find the lock gone
-                os.rename(lock, stale := f"{lock}.stale-{os.getpid()}")
-                shutil.rmtree(stale, ignore_errors=True)
+            reclaim_dead_lock(lock, pid)
             continue
         if waited % 30 == 0:
             log(f"waiting for {lock.parent.name}/{lock.name} (held by pid {pid or '?'})", flush=True)
@@ -91,7 +113,7 @@ and hold the lock directory .tauceti-repair/build.lock (mkdir, pid inside); exit
 for an audit or lint finding. Lake runs offline in the bwrap sandbox of CI's required build
 (tauceti_queue.repair_sandbox).
 """
-import contextlib, json, os, re, shutil, subprocess, sys, time
+import contextlib, fcntl, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -122,7 +144,7 @@ finally:
 
 
 def build_script(lock: Path | None = None) -> str:
-    """The agent's build script: ``take_lock`` and ``imports`` verbatim, the lock (the worktree's own
+    """The agent's build script: the lock helpers and ``imports`` verbatim, the lock (the worktree's own
     ``.tauceti-repair/build.lock``, or ``lock`` when several worktrees of one repair share one) and the
     main, which runs Lake through ``repair_sandbox.sandboxed_lake`` imported from this checkout of the
     package."""
@@ -134,7 +156,7 @@ def build_script(lock: Path | None = None) -> str:
     return (
         BUILD_HEADER
         + sandbox
-        + "\n\n".join(inspect.getsource(f) for f in (take_lock, imports))
+        + "\n\n".join(inspect.getsource(f) for f in (reclaim_dead_lock, take_lock, imports))
         + "\n"
         + where
         + BUILD_MAIN
