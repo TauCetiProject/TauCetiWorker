@@ -875,3 +875,30 @@ statuses, unavailable authority, label/comment publication, primary admission,
 protected candidate retention and source branch promotion with the shared-state
 and legacy GitHub source paths blocked. CI observations in this fixture are
 deterministic; it does not prove the separate real GitHub Actions rehearsal.
+
+### Explicit native service construction
+
+The existing queue `Service` accepts an explicit `NativeBootstrap` for trusted
+rehearsal/operator callers. It wires the immutable project snapshot and execution
+policy to `ForgejoSourceAdapter`, the scoped GitHub execution backend, the existing
+request ledger, native control authority, primary admission and the HTTP server.
+Source repository/branch, native publisher grants, control audience, execution
+repository ID and effective source credential permissions are checked before a
+controller starts. Startup never discovers a GitHub source App or substitutes an
+environment PAT. The default `Service` and CLI continue to select the GitHub path.
+
+This constructor accepts independently loaded private credentials and publisher
+configuration; it does not provision them or enable native execution. Native CLI
+configuration selection, credential provisioning/rotation, webhook ingress,
+concurrency bounds, less-trusted worker admission and Review's publication ledger
+remain activation gates. The actual hosted execution and full lifecycle/load
+rehearsals remain required.
+
+Run the constructor/HTTP checks with `python tests/queue_native_bootstrap.py`.
+`tests/integration_forgejo_bootstrap.py` starts the actual Service against the
+owned HTTPS fixture: the native API build permits an enrolled caller and then
+refuses it after ACL reduction; stock Forgejo refuses startup before the ledger
+binding is written. Both tests block shared-state and legacy GitHub source reads.
+The integration profile uses the same `FORGEJO_BINARY`, `FORGEJO_STATIC_ROOT` and
+`FORGEJO_EFFECTIVE_ACCESS` variables as the source authority fixture. No execution
+API request is needed to start the service; these tests do not prove hosted CI.
