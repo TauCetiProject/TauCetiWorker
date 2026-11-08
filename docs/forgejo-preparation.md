@@ -812,10 +812,15 @@ the latest CI status is selected before checking issuer authority. Review and
 recovery records exclude resolvable non-publishers before parsing or comparing
 sequences; they cannot poison a head with an oversized or malformed intent.
 Unresolved/deleted or synthetic issuers deny older facts without contributing
-an intent sequence. A trusted registration after that native row can reconcile
-the barrier; a forged maximum sequence never permanently poisons publication.
-Retired recovery evidence only blocks when its resolvable issuer belongs to the
-recorded publisher configuration for that generation.
+an intent sequence. They retain the greatest trusted sequence observed before
+the barrier. Only that exact intent or a newer sequence can register after the
+barrier to reconcile it; a forged maximum sequence never permanently poisons publication.
+Retired recovery evidence blocks when its resolvable issuer is a current or
+recorded recovery publisher, even if that generation is missing from a restored
+backup. Reads and publication require the durable publisher-policy binding; a
+fresh adapter cannot silently start with incomplete historical grants. Authority
+holds withdraw waiting/reserved inputs before they consume candidate CI; inserted
+work retains the existing explicit promotion refusal and recovery procedure.
 Legacy publication protocols grant no authority.
 
 In-progress publications and initial scoreboards defer admission and promotion

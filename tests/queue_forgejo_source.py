@@ -109,6 +109,8 @@ class NativeSource(unittest.TestCase):
         self.source = ForgejoSourceAdapter(
             self.identity, self.api, self.clone, token="token", admission_policy=self.policy, clock=lambda: 1000
         )
+        with closing(Store(str(self.clone / "publisher-policy.sqlite"))) as store:
+            self.source.configure_publisher_policy(store)
         self.source.fetch_pr = Mock(return_value=SimpleNamespace(head_sha="a" * 40, state="open"))
         self.body = (
             "<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 "
@@ -822,6 +824,96 @@ class NativeSource(unittest.TestCase):
         settled = controller.store.row("outbox", {"id": row_id})
         self.assertIn("reconcile restore", settled["result"])
         self.assertTrue(controller.store.rows("journal", {"kind": "native-publication-history-mismatch"}))
+
+    def test_unverified_barrier_preserves_newer_trusted_hold_over_an_old_clear(self):
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        old_clear = self.prepare("team/Math", 1, "a" * 40, "", "clear", kind="recovery", clear=True, sequence=5)
+        hold = self.prepare("team/Math", 1, "a" * 40, "Newer hold", "hold", kind="recovery", sequence=9)
+        self.source.publish(hold)
+        self.status_rows.append(
+            {
+                "id": 1000,
+                "context": RECOVERY_CONTEXT + "1",
+                "status": "pending",
+                "creator": None,
+                "description": PUB_DESCRIPTION + self.publishers.generation + ":junk",
+            }
+        )
+        with self.assertRaises(PublicationSuperseded) as refused:
+            self.source.publish(old_clear)
+        self.assertEqual(refused.exception.sequence, 9)
+        self.assertEqual(self.read()[2], "revoked")
+        original = self.api.request.side_effect
+
+        def native_ids(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if args[0] == "POST" and "/statuses/" in args[1]:
+                self.status_rows[-1]["id"] = 2000 + len(self.status_rows)
+            return result
+
+        self.api.request.side_effect = native_ids
+        self.source.publish(hold)  # Exact highest intent may reconcile its own registration after the barrier.
+        self.assertEqual(self.read()[2], "success")
+        with self.assertRaises(PublicationSuperseded):
+            self.source.publish(old_clear)
+
+    def test_unverified_barrier_never_revives_old_green_over_a_newer_red(self):
+        old = self.prepare("team/Math", 1, "a" * 40, self.body, "green", sequence=5)
+        red = self.prepare("team/Math", 1, "a" * 40, self.body.replace("green", "blocking_request"), "red", sequence=6)
+        self.source.publish(red)
+        self.status_rows.append(
+            {
+                "id": 1000,
+                "context": REVIEW_CONTEXT + "1",
+                "status": "pending",
+                "creator": None,
+                "description": PUB_DESCRIPTION + self.publishers.generation + ":junk",
+            }
+        )
+        with self.assertRaises(PublicationSuperseded) as refused:
+            self.source.publish(old)
+        self.assertEqual(refused.exception.sequence, 6)
+        self.assertEqual(self.read()[1], "revoked")
+
+    def test_restored_publisher_history_cannot_release_a_remote_hold_in_a_missing_generation(self):
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        path = self.clone / "restore-policy.sqlite"
+        with closing(Store(str(path))) as store:
+            self.source.configure_publisher_policy(store)
+            saved = copy.deepcopy(store.query("SELECT * FROM settings"))
+            self.source.admission_policy = NativeAdmissionPolicy(
+                replace(self.publishers, generation="2" * 32), rubrics=("proof",), prefix="Math/", allow_files=()
+            )
+            self.source.configure_publisher_policy(store)
+            self.source.publish(
+                self.prepare("team/Math", 1, "a" * 40, "Remote newer hold", "hold", kind="recovery", sequence=9)
+            )
+            store.execute("DELETE FROM settings")
+            for row in saved:
+                store.set_setting(row["key"], json.loads(row["value"]))
+            fresh = ForgejoSourceAdapter(
+                self.identity,
+                self.api,
+                self.clone,
+                token="token",
+                admission_policy=NativeAdmissionPolicy(
+                    replace(self.publishers, generation="3" * 32), rubrics=("proof",), prefix="Math/", allow_files=()
+                ),
+            )
+            with self.assertRaises(Incomplete):
+                fresh._comments(1, "a" * 40)
+            fresh.configure_publisher_policy(store)
+            self.assertEqual(fresh._comments(1, "a" * 40)[2], "revoked")
+
+    def test_fresh_publisher_process_requires_its_durable_binding_before_read_or_write(self):
+        fresh = ForgejoSourceAdapter(self.identity, self.api, self.clone, token="token", admission_policy=self.policy)
+        with self.assertRaises(Incomplete):
+            fresh.prepare_publication("team/Math", 1, "a" * 40, self.body, "review", sequence=1)
+        with self.assertRaises(Incomplete):
+            fresh._statuses("a" * 40)
+        with closing(Store(str(self.clone / "fresh-policy.sqlite"))) as store:
+            fresh.configure_publisher_policy(store)
+            self.assertEqual(fresh._comments(1, "a" * 40), ((), "absent", "absent"))
 
     def test_native_publication_status_event_invalidates_an_unchanged_pr(self):
         from tauceti_queue.admission import AdmissionPoller
