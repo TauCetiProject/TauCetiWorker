@@ -297,6 +297,31 @@ The optional source-bound queue has a separate native HTTP authority path. Its
 authority requires an explicit, immutable `QueueControlPolicy` from trusted
 operator configuration. Register only dedicated, independently generated
 high-entropy queue-control bearers using `control_token_fingerprint(source, token)`.
+Its private file uses `tauceti-queue.control-policy/v1` with exactly `schema`,
+`source` (the qualified origin/name/native-ID record) and a `fingerprints` array.
+`QueueControlPolicy.load(path, source=trusted_source)` validates the file against
+the independently configured source; file contents cannot select another source.
+`NativeQueueAuthority.from_control_file` constructs one startup snapshot for both
+the server and controller. Every ancestor is opened through a pinned directory
+descriptor without following symlinks, with trusted ownership and write modes.
+Root-owned sticky temporary ancestors are allowed, but the immediate parent must
+be private and owned by the service user. The policy must be one user-owned
+regular file of mode 0600 or 0400 with no extra hard links. Reads are bounded to
+128 KiB and detect most in-place changes; atomic replacement is required because
+coarse filesystem timestamps cannot prove that every same-size edit was absent.
+Duplicate fields, duplicate fingerprints,
+unknown fields and malformed source identities are refused. Errors omit private
+contents. Write replacements atomically, then restart as described below; the
+loader never reloads policy during a request or caches a successful source ACL.
+The example `services/queue/source-control-policy.json.example` is a placeholder,
+not an active enrollment. Native startup and the installer do not yet select this
+backend; wiring this loader does not enable native execution.
+All path components must be real directories: an operator using a symlinked home
+or configuration tree must choose its verified canonical path explicitly. File
+permissions protect against other Unix users, not the owner or root. The owner can
+chmod a 0400 policy back to writable. Queue policy, source publication credentials
+and service code must therefore be isolated from agent accounts before serving
+less-trusted workers; the current user-unit layout is not that privilege boundary.
 The policy holds a bounded nonempty set of SHA-256 fingerprints, domain-separated
 by the native source origin and repository ID. It never accepts enrollment from
 request JSON, task metadata or a Forgejo profile. Fingerprints are private

@@ -1,0 +1,9 @@
+{
+  "schema": "tauceti-queue.control-policy/v1",
+  "source": {
+    "forge": {"kind": "forgejo", "url": "https://forgejo.example.invalid"},
+    "name": "team/source",
+    "id": 41
+  },
+  "fingerprints": ["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"]
+}

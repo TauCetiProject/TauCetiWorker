@@ -47,7 +47,7 @@ class Integration(unittest.TestCase):
         if not binary:
             self.skipTest("set FORGEJO_BINARY to run a disposable loopback server")
         with tempfile.TemporaryDirectory(prefix="worker-forgejo-") as temporary, contextlib.ExitStack() as environment:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             tls_settings = ""
             if https:
                 certificate, key = root / "source.crt", root / "source.key"
@@ -342,7 +342,10 @@ ROOT_PATH = {root}/log
                             queue_identity,
                             frozenset(control_token_fingerprint(queue_identity, bearer) for bearer in controls),
                         )
-                        queue_authority = NativeQueueAuthority(queue_identity, control_policy=control_policy)
+                        policy_file = root / "queue-control-policy.json"
+                        policy_file.write_text(json.dumps(control_policy.record()))
+                        policy_file.chmod(0o600)
+                        queue_authority = NativeQueueAuthority.from_control_file(queue_identity, policy_file)
 
                         def deny_queue_admin(bearer):
                             if effective_access:

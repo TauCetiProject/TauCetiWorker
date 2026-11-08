@@ -18,7 +18,10 @@ from dataclasses import dataclass, field, fields
 from tauceti_tools.ci_candidate import RepositoryIdentity
 from tauceti_tools.forge import ForgeError, Forgejo, Incomplete
 
+from tauceti_queue.control_policy_file import MAX_POLICY_BYTES, ControlPolicyError, read_control_policy
 from tauceti_worker.source_identity import SourceActor, SourceRepositoryAccess
+
+CONTROL_POLICY_SCHEMA = "tauceti-queue.control-policy/v1"
 
 
 class SourceAccessDenied(PermissionError):
@@ -78,6 +81,47 @@ class QueueControlPolicy:
         # Examine every configured fingerprint, without leaking which entry
         # matched through short-circuit comparisons.
         return bool(sum(hmac.compare_digest(candidate, approved) for approved in self.fingerprints))
+
+    def record(self) -> dict:
+        """Private operator configuration; never attach this to status or tasks."""
+        return {
+            "schema": CONTROL_POLICY_SCHEMA,
+            "source": self.source.record(),
+            "fingerprints": sorted(self.fingerprints),
+        }
+
+    @classmethod
+    def load(cls, path, *, source: RepositoryIdentity):
+        """Read an explicit trusted file for this independently configured source."""
+        from tauceti_tools.ci_candidate import read_json
+
+        if not isinstance(source, RepositoryIdentity) or source.repository.forge.kind != "forgejo":
+            raise ControlPolicyError("queue control policy needs an independently configured native source")
+        payload = read_control_policy(path)
+        loaded = None
+        try:
+            row = read_json(payload, max_bytes=MAX_POLICY_BYTES)
+            if (
+                not isinstance(row, dict)
+                or set(row) != {"schema", "source", "fingerprints"}
+                or row["schema"] != CONTROL_POLICY_SCHEMA
+                or RepositoryIdentity.parse(row["source"]) != source
+                or type(row["fingerprints"]) is not list
+                or not 0 < len(row["fingerprints"]) <= 1024
+                or len(set(row["fingerprints"])) != len(row["fingerprints"])
+            ):
+                raise ValueError
+            loaded = cls(source, frozenset(row["fingerprints"]))
+        except (ValueError, TypeError, KeyError):
+            pass
+        finally:
+            # Do not retain JSONDecodeError.doc/UnicodeDecodeError.object in a
+            # public exception chain, or private bytes in this traceback frame.
+            del payload
+            row = None
+        if loaded is None:
+            raise ControlPolicyError("queue control policy schema, source or fingerprints are invalid")
+        return loaded
 
 
 @dataclass(frozen=True)
@@ -142,6 +186,11 @@ class RequestAccess:
 
 
 class NativeQueueAuthority:
+    @classmethod
+    def from_control_file(cls, source: RepositoryIdentity, path, **kwargs):
+        """Construct one authority shared by the server and controller at startup."""
+        return cls(source, control_policy=QueueControlPolicy.load(path, source=source), **kwargs)
+
     def __init__(
         self,
         source: RepositoryIdentity,
