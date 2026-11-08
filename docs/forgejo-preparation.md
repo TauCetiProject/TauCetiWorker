@@ -642,9 +642,12 @@ use the same frozen-intent ordering, so an old clear cannot erase a newer hold.
 
 All publishers of one PR and kind must share the durable sequence allocator in
 the existing owner store. The queue uses its existing outbox row IDs for both holds and clears, through
-`enqueue_source_recovery`, and saves the complete intent in that row before sending. Retries preserve the nonce, body and
+`enqueue_source_recovery`, and saves the complete intent in that row before
+sending. Reusing an intent key with a different decision is refused. Retries
+preserve the nonce, body and
 sequence, including after a lost accepted response. A superseded intent settles
-without resending. A confirmed comment that was moderated raises
+without resending; an unknown remote owned nonce reports restore reconciliation
+in the journal instead of silently dropping a newer desired local fact. A confirmed comment that was moderated raises
 `PublicationDamaged`; publish a new intent from the saved result rather than
 repeating inference. Review's trusted publication phase must integrate the same
 contract with its durable ledger before activation. Queue comments are operational
@@ -662,23 +665,34 @@ the queue refuses reused generations in its existing settings. Publications from
 prior generations grant no positive authority, including facts planted while an
 account was unconfigured. Any retired recovery history remains a blocking state
 until a current-generation explicit clear or hold is published. A rotation never
-silently releases a hold. The controller re-arms only its latest desired holds;
-old clears require a fresh explicit reconciliation decision. Prefix, allow-file and ordinary consumer-policy changes keep
+silently releases a hold. The controller does not replay completed historical publications. Pending holds
+can rebind to the new generation; all pending old-authority clears settle as
+reconciliation-required, including clears not yet prepared. A release always
+needs a fresh explicit decision. Authority holds report a reconciliation reason,
+not a rebase request. Prefix, allow-file and ordinary consumer-policy changes keep
 the generation and reapply current rules to existing facts. Grant changes require
 republishing saved review results under the new generation, without new model
 work. Native PR CI statuses carry `tauceti-ci-status/v1:<generation>` descriptions;
 the latest CI status is selected before checking issuer authority. Review and
 recovery records exclude resolvable non-publishers before parsing or comparing
 sequences; they cannot poison a head with an oversized or malformed intent.
-Unresolved/deleted issuers remain barriers requiring policy reconciliation.
+Unresolved/deleted or synthetic issuers deny older facts without contributing
+an intent sequence. A trusted registration after that native row can reconcile
+the barrier; a forged maximum sequence never permanently poisons publication.
+Retired recovery evidence only blocks when its resolvable issuer belongs to the
+recorded publisher configuration for that generation.
 Legacy publication protocols grant no authority.
 
 In-progress publications and initial scoreboards defer admission and promotion
 for a bounded wait (six hours by default). Closed, draft, retargeted and held PRs
 are evaluated immediately. An abandoned publication becomes review-unsafe after
-the configured wait; an already inserted batch receives the existing explicit
+the configured wait; a confirmed review that was moderated is immediately unsafe
+rather than a transient read failure. At promotion either unsafe state refuses
+the exact candidate; an already inserted batch receives the existing explicit
 promotion hold, preserving its candidate and repair work for operator recovery.
-It is never silently rebuilt or merged. Publisher bootstrap, credential rotation
+It is never silently rebuilt or merged. `publication_enabled=false` also blocks
+already frozen intents. OS permission/transport errors remain retryable; only a
+typed missing publisher grant settles for operator reconciliation. Publisher bootstrap, credential rotation
 and the tested operational recovery path remain activation requirements. After
 any queue-store restore, reconcile source facts and cost history, then install a
 fresh authority generation before resuming publication; outbox IDs and retired

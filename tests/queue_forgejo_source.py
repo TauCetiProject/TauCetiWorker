@@ -637,7 +637,8 @@ class NativeSource(unittest.TestCase):
         self.api.current_user.return_value = {"id": 8, "login": "queue"}
         controller, clock = self.controller()
         hold_id = controller.enqueue_source_recovery("team/Math", 1, "a" * 40, "Hold", key="first")
-        controller._drain_outbox(clock())
+        with patch.object(self.api, "post_comment", side_effect=OSError("outage")):
+            controller._drain_outbox(clock())
         self.source.admission_policy = NativeAdmissionPolicy(
             replace(self.publishers, generation="2" * 32), rubrics=("proof",), prefix="Math/", allow_files=()
         )
@@ -652,6 +653,7 @@ class NativeSource(unittest.TestCase):
             clock=clock,
         )
         self.assertEqual(controller.store.row("outbox", {"id": hold_id})["state"], "pending")
+        clock.advance(60)
         restarted._drain_outbox(clock())
         updated = json.loads(controller.store.row("outbox", {"id": hold_id})["payload"])["native_intent"]
         self.assertEqual(updated["generation"], "2" * 32)
@@ -697,6 +699,129 @@ class NativeSource(unittest.TestCase):
         settled = controller.store.row("outbox", {"id": entry})
         self.assertEqual(settled["state"], "done")
         self.assertIn("reconciliation-required", settled["result"])
+
+    def test_pending_prepared_and_unprepared_clears_never_survive_authority_rotation(self):
+        from tauceti_queue.controller import Controller
+
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        controller, clock = self.controller()
+        prepared = controller.enqueue_source_recovery("team/Math", 1, "a" * 40, "Clear", key="prepared", clear=True)
+        with patch.object(self.source, "publish", side_effect=OSError("outage")):
+            controller._drain_outbox(clock())
+        unprepared = controller.enqueue_source_recovery("team/Math", 2, "a" * 40, "Clear", key="unprepared", clear=True)
+        self.source.admission_policy = NativeAdmissionPolicy(
+            replace(self.publishers, generation="2" * 32), rubrics=("proof",), prefix="Math/", allow_files=()
+        )
+        restarted = Controller(
+            controller.store,
+            self.source,
+            str(self.clone),
+            self.repository.name,
+            revision="restore",
+            candidate_ci=controller.candidate_ci,
+            canonical_branch="main",
+            clock=clock,
+        )
+        clock.advance(60)
+        restarted._drain_outbox(clock())
+        for row_id in (prepared, unprepared):
+            row = controller.store.row("outbox", {"id": row_id})
+            self.assertEqual(row["state"], "done")
+            self.assertIn("clear predates authority rotation", row["result"])
+        self.assertEqual(self.status_rows, [])
+
+    def test_unresolved_or_synthetic_issuer_cannot_poison_sequence_permanently(self):
+        self.source.publish(self.prepare("team/Math", 1, "a" * 40, self.body, "original"))
+        for i, creator in enumerate([None, {"id": -2, "login": "forgejo-actions"}, {"id": -1, "login": "ghost"}]):
+            self.status_rows.append(
+                {
+                    "id": 1000 + i,
+                    "context": REVIEW_CONTEXT + "1",
+                    "status": "pending",
+                    "creator": creator,
+                    "description": PUB_DESCRIPTION
+                    + self.publishers.generation
+                    + ":"
+                    + str(2**63 - 1)
+                    + ":"
+                    + "f" * 32
+                    + ":pending:"
+                    + "f" * 64,
+                }
+            )
+        self.assertEqual(self.read()[1], "revoked")
+        # Simulate native increasing server IDs after the injected rows.
+        original = self.api.request.side_effect
+
+        def native_ids(*args, **kwargs):
+            value = original(*args, **kwargs)
+            if args[0] == "POST" and "/statuses/" in args[1]:
+                self.status_rows[-1]["id"] = 2000 + len(self.status_rows)
+            return value
+
+        self.api.request.side_effect = native_ids
+        self.source.publish(self.prepare("team/Math", 1, "a" * 40, self.body, "reconciled"))
+        self.assertEqual(self.read()[1], "success")
+
+    def test_frozen_intents_respect_publication_disabled_and_os_permission_errors_still_retry(self):
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        controller, clock = self.controller()
+        row_id = controller.enqueue_source_recovery("team/Math", 1, "a" * 40, "Hold", key="hold")
+        with patch.object(self.source, "publish", side_effect=PermissionError("socket OS EACCES")):
+            controller._drain_outbox(clock())
+        row = controller.store.row("outbox", {"id": row_id})
+        self.assertEqual(row["state"], "pending")
+        self.assertIn("native_intent", json.loads(row["payload"]))
+        controller.set_setting("publication_enabled", False, "operator")
+        clock.advance(60)
+        with patch.object(self.source, "publish", side_effect=AssertionError("disabled frozen intent was sent")):
+            controller._drain_outbox(clock())
+        self.assertEqual(controller.store.row("outbox", {"id": row_id})["state"], "pending")
+
+    def test_recovery_keys_cannot_silently_change_semantics(self):
+        controller, _clock = self.controller()
+        first = controller.enqueue_source_recovery("team/Math", 1, "a" * 40, "Hold", key="stable")
+        self.assertEqual(controller.enqueue_source_recovery("team/Math", 1, "a" * 40, "Hold", key="stable"), first)
+        with self.assertRaisesRegex(ValueError, "reused"):
+            controller.enqueue_source_recovery("team/Math", 1, "a" * 40, "Clear", key="stable", clear=True)
+
+    def test_damaged_review_is_unsafe_and_refuses_promotion_instead_of_deferring_forever(self):
+        first = self.prepare("team/Math", 1, "a" * 40, self.body, "review")
+        self.source.publish(first)
+        self.rows[0]["body"] = "Moderated after confirmation"
+        pull = ports.PullRequest(1, "a" * 40, "main", "Proof", "", "writer", "open")
+        self.source.fetch_pr.return_value = pull
+        frozen = SimpleNamespace(
+            policy=SimpleNamespace(source=self.identity, base_branch="main"),
+            request=SimpleNamespace(
+                source=self.identity,
+                base="b" * 40,
+                head="c" * 40,
+                accepted_members=(SimpleNamespace(pr=1, head="a" * 40),),
+            ),
+        )
+        with (
+            patch.object(self.source, "_merge_base", return_value="b" * 40),
+            patch.object(self.source, "_git", return_value=subprocess.CompletedProcess([], 0, b"Math/A.lean\0", b"")),
+        ):
+            snapshot = self.source.admission_snapshot("team/Math", 1)
+            self.assertEqual(snapshot.statuses["_native_review"], "damaged")
+            self.assertFalse(self.source.admission_policy.evaluate(snapshot)[0]["review_safe"])
+            with self.assertRaises(ports.PromotionRefused):
+                self.source.verify_candidate_approval(frozen)
+
+    def test_unknown_remote_owned_recovery_reports_restore_reconciliation(self):
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        controller, clock = self.controller()
+        row_id = controller.enqueue_source_recovery("team/Math", 1, "a" * 40, "Hold", key="local")
+        remote = self.prepare(
+            "team/Math", 1, "a" * 40, "Remote later hold", "unknown-to-backup", kind="recovery", sequence=99
+        )
+        self.source.publish(remote)
+        controller._drain_outbox(clock())
+        settled = controller.store.row("outbox", {"id": row_id})
+        self.assertIn("reconcile restore", settled["result"])
+        self.assertTrue(controller.store.rows("journal", {"kind": "native-publication-history-mismatch"}))
 
     def test_native_publication_status_event_invalidates_an_unchanged_pr(self):
         from tauceti_queue.admission import AdmissionPoller

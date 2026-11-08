@@ -37,6 +37,14 @@ RECOVERY_CONTEXT = "tauceti-recovery/"
 class PublicationSuperseded(RuntimeError):
     """A newer native publication superseded this frozen intent; do not resend it."""
 
+    def __init__(self, message, *, sequence=None, nonce=None, actor=None):
+        super().__init__(message)
+        self.sequence, self.nonce, self.actor = sequence, nonce, actor
+
+
+class PublisherNotGranted(PermissionError):
+    """Trusted publisher configuration refuses this operation; operator reconciliation is required."""
+
 
 class PublicationDamaged(Incomplete):
     """Confirmed publication was moderated; prepare a new intent, never rerun inference."""
@@ -161,8 +169,16 @@ class NativeAdmissionPolicy(AdmissionPolicy):
         if snapshot.statuses.get("_native_recovery", "absent") not in {"absent", "clear", "success"}:
             heads.add(snapshot.pull.head_sha)
         result["recovery_heads"] = sorted(heads)
+        result["recovery_authority_hold"] = snapshot.statuses.get("_native_recovery") == "revoked"
         if snapshot.pull.head_sha in heads:
-            result.update(merge=False, reason="waiting on a trusted native recovery request for this head")
+            result.update(
+                merge=False,
+                reason=(
+                    "native recovery authority needs reconciliation"
+                    if result["recovery_authority_hold"]
+                    else "waiting on a trusted native recovery request for this head"
+                ),
+            )
         if (
             pending
             and snapshot.pull.head_sha not in heads
@@ -207,6 +223,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         self.admission_policy = admission_policy
         self.clone_dir = self.clone
         self.clock, self.refresh_seconds = clock, 900
+        self._recovery_grants = {admission_policy.publishers.generation: set(admission_policy.publishers.recoveries)}
 
     def configure_admission_polling(self, *, clock, refresh_seconds):
         self.clock, self.refresh_seconds = clock, max(1, int(refresh_seconds))
@@ -218,13 +235,15 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         with store.transaction():
             saved = store.get_setting(key)
             if saved is None:
-                saved = {"current": current, "retired_generations": []}
+                saved = {"current": current, "retired_generations": [], "recovery_grants": {}}
             if (
                 not isinstance(saved, dict)
-                or set(saved) != {"current", "retired_generations"}
+                or set(saved) != {"current", "retired_generations", "recovery_grants"}
                 or not isinstance(saved["current"], dict)
                 or not isinstance(saved["retired_generations"], list)
                 or len(saved["retired_generations"]) > 4096
+                or not isinstance(saved["recovery_grants"], dict)
+                or len(saved["recovery_grants"]) > 4097
             ):
                 raise ValueError("invalid native publisher configuration history")
             previous, retired = saved["current"], saved["retired_generations"]
@@ -234,7 +253,22 @@ class ForgejoSourceAdapter(ForgejoGitSource):
                 retired = [*retired, previous["generation"]]
                 if len(retired) > 4096:
                     raise ValueError("native publisher configuration history exceeds its bound")
-            store.set_setting(key, {"current": current, "retired_generations": retired})
+            grants = saved["recovery_grants"]
+            for record in (previous, current):
+                grants[record["generation"]] = record["recoveries"]
+            for generation, ids in grants.items():
+                if (
+                    not isinstance(generation, str)
+                    or re.fullmatch(r"[0-9a-f]{32}", generation) is None
+                    or not isinstance(ids, list)
+                    or len(ids) > 256
+                    or any(type(i) is not int or i < 1 for i in ids)
+                ):
+                    raise ValueError("invalid native recovery publisher history")
+            self._recovery_grants = {
+                g: {PrincipalRef(self.repository.forge, str(i)) for i in ids} for g, ids in grants.items()
+            }
+            store.set_setting(key, {"current": current, "retired_generations": retired, "recovery_grants": grants})
             return previous != current
 
     @staticmethod
@@ -376,6 +410,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         """
         entries = []
         retired_recovery = False
+        unknown_barrier = 0
         seen = set()
         generation = self.admission_policy.publishers.generation
         for row in rows:
@@ -388,16 +423,26 @@ class ForgejoSourceAdapter(ForgejoGitSource):
                 raise Incomplete("native publication statuses are ambiguous")
             seen.add(status_id)
             description = row.get("description") or ""
-            if (
-                context.startswith(RECOVERY_CONTEXT)
-                and description.startswith(PUB_DESCRIPTION)
-                and not description.startswith(PUB_DESCRIPTION + generation + ":")
-            ):
-                retired_recovery = True
             try:
                 actor = SourceActor.from_native(self.repository.forge, row.get("creator"))
             except Incomplete:
                 actor = None
+            if actor is None:
+                # Missing/deleted issuers deny older facts, without letting an
+                # unverified sequence poison the namespace forever. A fresh
+                # trusted registration after this row can reconcile the barrier.
+                if description.startswith("tauceti-pub/"):
+                    unknown_barrier = max(unknown_barrier, status_id)
+                continue
+            record_generation = description.split(":", 2)[1:2]
+            if (
+                context.startswith(RECOVERY_CONTEXT)
+                and description.startswith("tauceti-pub/")
+                and record_generation
+                and record_generation[0] != generation
+                and actor.principal in self._recovery_grants.get(record_generation[0], set())
+            ):
+                retired_recovery = True
             allowed = (
                 self.admission_policy.publishers.recoveries
                 if context.startswith(RECOVERY_CONTEXT)
@@ -420,6 +465,10 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             ):
                 raise Incomplete("native publication receipt is malformed")
             entries.append((int(parts[1]), parts[2], parts[3], parts[4], actor, row))
+        if unknown_barrier:
+            entries = [r for r in entries if r[5]["id"] > unknown_barrier]
+            if not any(r[2] in {"pending", "clear-pending"} for r in entries):
+                return unknown_barrier, {"_stage": "unverified", "_sequence": 0, "_nonce": "", "_digest": ""}, None
         if not entries:
             if retired_recovery:
                 return 0, {"_stage": "retired", "_sequence": 0, "_nonce": "", "_digest": ""}, None
@@ -508,9 +557,13 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         if not isinstance(comments, list):
             raise Incomplete("native discussion is unavailable")
         publishers = self.admission_policy.publishers
-        review, review_state = self._publication_comment(
-            number, rows, REVIEW_CONTEXT + str(number), publishers.reviews, comments
-        )
+        review_error = None
+        try:
+            review, review_state = self._publication_comment(
+                number, rows, REVIEW_CONTEXT + str(number), publishers.reviews, comments
+            )
+        except PublicationDamaged as error:
+            review_error = error
         try:
             recovery, recovery_state = self._publication_comment(
                 number, rows, RECOVERY_CONTEXT + str(number), publishers.recoveries, comments
@@ -518,6 +571,8 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         except PublicationDamaged as error:
             error.head = head
             raise
+        if review_error is not None:
+            raise review_error
         return tuple(row for row in (review, recovery) if row is not None), review_state, recovery_state
 
     def _statuses(self, head, rows=None):
@@ -595,7 +650,21 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             ).stdout
             paths = tuple(p.decode("utf-8") for p in raw.split(b"\0") if p)
         rows = self.client.statuses(self.repository, pull.head_sha)
-        comments, review_state, recovery_state = self._comments(number, pull.head_sha, rows)
+        try:
+            comments, review_state, recovery_state = self._comments(number, pull.head_sha, rows)
+        except PublicationDamaged as error:
+            if error.publication_kind != "review":
+                raise
+            # Known moderation is a negative verdict, not an API outage. It
+            # withdraws waiting inputs and refuses an inserted exact candidate.
+            recovery, recovery_state = self._publication_comment(
+                number,
+                rows,
+                RECOVERY_CONTEXT + str(number),
+                self.admission_policy.publishers.recoveries,
+                self.client.comments(self.repository, number),
+            )
+            comments, review_state = (() if recovery is None else (recovery,)), "damaged"
         statuses = self._statuses(pull.head_sha, rows)
         statuses["_native_review"] = review_state
         statuses["_native_recovery"] = recovery_state
@@ -727,7 +796,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         actor = SourceActor.from_native(self.repository.forge, self.client.current_user())
         allowed = getattr(self.admission_policy.publishers, "reviews" if kind == "review" else "recoveries")
         if actor.principal not in allowed:
-            raise PermissionError("native actor is not a configured publisher")
+            raise PublisherNotGranted("native actor is not a configured publisher")
         nonce = secrets.token_hex(16)
         unique_marker = marker + ":" + nonce
         full = (
@@ -811,7 +880,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             or not intent["clear"]
             and not self._binding_matches(intent["body"], actor)
         ):
-            raise PermissionError("frozen native publication belongs to another issuer or source")
+            raise PublisherNotGranted("frozen native publication belongs to another issuer or source")
         # Facts belong to the accepted commit, including while a PR is closed or
         # temporarily points elsewhere. Dropping a red intent would revive old
         # green evidence if that PR later returned to the same head.
@@ -823,7 +892,12 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         if latest is not None:
             _id, stamp, issuer = latest
             if stamp["_sequence"] > intent["sequence"]:
-                raise PublicationSuperseded("newer native publication superseded this intent")
+                raise PublicationSuperseded(
+                    "newer native publication superseded this intent",
+                    sequence=stamp["_sequence"],
+                    nonce=stamp["_nonce"],
+                    actor=issuer,
+                )
             if stamp["_sequence"] == intent["sequence"]:
                 if issuer != actor or stamp["_nonce"] != intent["nonce"] or stamp["_digest"] != intent["digest"]:
                     raise Incomplete("native publication sequence was reused for another intent")

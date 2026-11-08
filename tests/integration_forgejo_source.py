@@ -23,7 +23,7 @@ from forgejo_git_source import source_fixture
 from queue_ci_requests import CONFIG, policy
 from queue_source_ci import VerifiedExecution
 from tauceti_tools.ci_candidate import RepositoryIdentity
-from tauceti_tools.forge import ForgeError, Forgejo, Incomplete
+from tauceti_tools.forge import ForgeError, Forgejo
 
 from tauceti_queue.admission import AdmissionPoller
 from tauceti_queue.ci_requests import RequestLedger
@@ -125,8 +125,7 @@ class Integration(unittest.TestCase):
             contributor.edit_comment(
                 repository, int(comment_id), intent["body"].replace('"green"', '"blocking_request"')
             )
-            with self.assertRaises(Incomplete):
-                source.admission_snapshot(name, number)
+            self.assertFalse(admission.evaluate(source.admission_snapshot(name, number))[0]["review_safe"])
             repaired = publisher.prepare_publication(
                 name, number, head, body + "\nRestored intended publication.", "review-native-restored", sequence=2
             )
@@ -137,8 +136,7 @@ class Integration(unittest.TestCase):
             red_id = publisher.publish(withdrawn)
             self.assertFalse(admission.evaluate(source.admission_snapshot(name, number))[0]["merge"])
             contributor.request("DELETE", f"repos/{name}/issues/comments/{red_id}")
-            with self.assertRaises(Incomplete):
-                source.admission_snapshot(name, number)
+            self.assertFalse(admission.evaluate(source.admission_snapshot(name, number))[0]["review_safe"])
             restored = publisher.prepare_publication(
                 name, number, head, body + "\nNew confirmed verdict.", "review-native-current", sequence=4
             )

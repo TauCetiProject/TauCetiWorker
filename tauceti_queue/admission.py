@@ -585,6 +585,7 @@ class AdmissionPoller:
                 and result["review_safe"]
                 and not labels & KEEP
                 and requested
+                and not result.get("recovery_authority_hold")
             ):
                 held, labelled = pull.head_sha in requested, "needs-rebase" in labels
                 if held != labelled:
