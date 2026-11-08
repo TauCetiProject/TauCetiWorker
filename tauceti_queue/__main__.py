@@ -169,6 +169,7 @@ class Service:
             try:
                 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 listener.bind((self.config.listen_host, self.config.listen_port))
+                listener.listen()
                 wired = self.native.build(self.config, self.store, revision=self.runtime.revision.sha)
             except BaseException:
                 listener.close()

@@ -249,6 +249,26 @@ class Bootstrap(unittest.TestCase):
             self.assertIsNone(service.store.get_setting("source-ci:binding"))
             self.assertEqual(service.store.query("SELECT * FROM settings"), [])
 
+    def test_the_listener_is_exclusive_while_bootstrap_commits_its_bindings(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as available:
+            available.bind(("127.0.0.1", 0))
+            port = available.getsockname()[1]
+        service = self.service(config=replace(self.config, listen_port=port))
+        original = NativeBootstrap.build
+
+        def competing_bind(bootstrap, *args, **kwargs):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as competitor:
+                competitor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                with self.assertRaises(OSError):
+                    competitor.bind(("127.0.0.1", port))
+            return original(bootstrap, *args, **kwargs)
+
+        with patch.object(NativeBootstrap, "build", autospec=True, side_effect=competing_bind):
+            service.build_controller()
+        service.start_server()
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=5) as response:
+            self.assertEqual(response.status, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

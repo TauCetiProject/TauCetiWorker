@@ -134,9 +134,29 @@ class Webhooks(unittest.TestCase):
         self.assertEqual(self.send(edited, delivery="title"), "ignored")
         self.assertIsNone(self.poller.state.get(1))
 
-    def test_native_review_event_names_are_only_invalidations_and_non_pull_comments_are_ignored(self):
+    def test_native_review_events_and_social_metadata_cannot_cancel_an_evaluation(self):
+        head = self.adapter.create_pr(1, {"Math/A.lean": "example : True := trivial\n"})
+        self.payload["pull_request"]["head"]["sha"] = head
+        self.send()
+        work = self.poller.state.get(1)
         for name in ["pull_request_approved", "pull_request_rejected", "pull_request_comment"]:
-            self.assertEqual(self.send(event=name, delivery=name.replace("_", "-")), "invalidated")
+            self.assertEqual(self.send(event=name, delivery=name.replace("_", "-")), "ignored")
+        for action in [
+            "assigned",
+            "unassigned",
+            "review_requested",
+            "review_request_removed",
+            "milestoned",
+            "demilestoned",
+        ]:
+            self.assertEqual(
+                self.send({**self.payload, "action": action}, delivery=action.replace("_", "-")), "ignored"
+            )
+        self.assertEqual(self.poller.state.get(1), work)
+        self.poller.run_once()
+        self.assertTrue(self.poller.is_current(1, self.poller.state.get(1)["head_sha"]))
+
+    def test_non_pull_comments_are_ignored(self):
         issue = {
             "repository": self.payload["repository"],
             "is_pull": False,

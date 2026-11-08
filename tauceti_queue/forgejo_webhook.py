@@ -102,6 +102,24 @@ class ForgejoWebhookReceiver:
                 own_output = controller_actor is not None and str(sender_id) == controller_actor.principal.native_id
                 comment_event = event in {"issue_comment", "pull_request_comment"} and "comment" in payload
                 action = payload.get("action")
+                # Native review votes/threads are not the authenticated scoreboard
+                # evidence consumed by this policy. Social metadata cannot change
+                # admission either, and must not cancel an in-flight evaluation.
+                if (
+                    event in {"pull_request_approved", "pull_request_rejected", "pull_request_reviewed"}
+                    or (event == "pull_request_comment" and not comment_event)
+                    or action
+                    in {
+                        "assigned",
+                        "unassigned",
+                        "review_requested",
+                        "review_request_removed",
+                        "milestoned",
+                        "demilestoned",
+                    }
+                ):
+                    self.ignored += 1
+                    return "ignored"
                 if own_output and (
                     comment_event or action in {"label_updated", "label_cleared", "labeled", "unlabeled"}
                 ):

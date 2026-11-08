@@ -957,6 +957,69 @@ class NativeSource(unittest.TestCase):
         self.status_rows = [old]
         self.assertEqual(self.read()[2], "revoked")
 
+    def test_a_stale_read_of_retired_history_retries_the_frozen_recovery_intent(self):
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        old = self.stamp(self.comment(), kind="recovery")
+        for status in old:
+            status["description"] = status["description"].replace(self.publishers.generation, "f" * 32)
+        self.status_rows = [old]
+        controller, clock = self.controller()
+        entry = controller.enqueue_source_recovery("team/Math", 1, "a" * 40, "Clear", key="clear", clear=True)
+        original = self.api.request.side_effect
+
+        def lagged_registration(*args, **kwargs):
+            value = original(*args, **kwargs)
+            if args[0] == "POST" and "/statuses/" in args[1] and args[2]["state"] == "pending":
+                self.api.statuses = Mock(side_effect=[old, self.statuses()])
+            return value
+
+        self.api.request.side_effect = lagged_registration
+        controller._drain_outbox(clock())
+        pending = controller.store.row("outbox", {"id": entry})
+        self.assertEqual(pending["state"], "pending")
+        frozen = json.loads(pending["payload"])["native_intent"]
+        self.api.request.side_effect = original
+        self.api.statuses = lambda *_: self.statuses()
+        clock.advance(60)
+        controller._drain_outbox(clock())
+        done = controller.store.row("outbox", {"id": entry})
+        self.assertEqual(done["state"], "done")
+        self.assertEqual(json.loads(done["payload"])["native_intent"], frozen)
+        self.assertEqual(self.read()[2], "clear")
+
+    def test_recovery_settlement_and_invalidation_commit_together_without_replacing_the_known_head(self):
+        from tauceti_queue.admission import AdmissionPoller
+
+        controller, clock = self.controller()
+        poller = AdmissionPoller(controller, self.source, "team/Math", self.policy, clock=clock)
+        for number, clear in [(1, False), (2, True)]:
+            with self.subTest(clear=clear):
+                poller.invalidate(number, head="b" * 40)
+                before = poller.state.get(number)
+                entry_id = controller.enqueue_source_recovery(
+                    "team/Math", number, "a" * 40, "Decision", key=str(number), clear=clear
+                )
+                entry = controller.store.row("outbox", {"id": entry_id})
+                result = "comment clear" if clear else "comment 123"
+                original = poller.invalidate
+
+                def interrupted(*args, entry_id=entry_id, original=original, **kwargs):
+                    self.assertEqual(controller.store.row("outbox", {"id": entry_id})["state"], "done")
+                    original(*args, **kwargs)
+                    raise OSError("interrupted before settlement commit")
+
+                with patch.object(poller, "invalidate", side_effect=interrupted):
+                    with self.assertRaises(OSError):
+                        controller._outbox_done(entry, [], result, clock())
+                self.assertEqual(controller.store.row("outbox", {"id": entry_id})["state"], "pending")
+                self.assertEqual(poller.state.get(number), before)
+                controller._outbox_done(entry, [], result, clock())
+                after = poller.state.get(number)
+                self.assertEqual(after["head_sha"], "b" * 40)
+                self.assertEqual(after["generation"], before["generation"] + 1)
+                self.assertEqual(after["urgent"], 1)
+                self.assertEqual(controller.store.row("outbox", {"id": entry_id})["state"], "done")
+
     def test_retired_writer_rows_after_a_current_explicit_clear_cannot_reimpose_a_hold(self):
         self.api.current_user.return_value = {"id": 8, "login": "queue"}
         clear = self.prepare("team/Math", 1, "a" * 40, "", "clear", kind="recovery", clear=True)
