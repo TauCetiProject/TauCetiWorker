@@ -404,6 +404,48 @@ succeeds before then continues the claim.
   one task ([repair-task.md](repair-task.md), "Parallel agents within one task").
 - The content clone named by `TAUCETI_QUEUE_CLONE` (the installer creates it).
 
+### Terminal repair worktree cleanup
+
+On the colocated controller/repair host, install the lifecycle collector after deploying the
+worker/publisher ownership leases:
+
+```sh
+cd ~/TauCetiQueue
+services/queue/install-repair-cleanup.sh \
+  --database ~/TauCetiQueue-data/queue.sqlite3 \
+  --clone ~/TauCetiQueue-data/repair-clone \
+  --root ~/TauCetiQueue-data/repair \
+  --root ~/TauCetiQueue-data/repair-2
+```
+
+`tauceti-queue-repair-cleanup.timer` runs independently of the workers, on startup and every minute
+after the preceding collection ends. It reads the local authoritative SQLite database without
+writing it. Landed/removed batches and submitted/superseded tasks are eligible, including worktrees
+left by failed attempts and `task-<id>-group-*` parallel worktrees. The collector removes their Git
+worktree registrations and build/dependency directories; task JSON, logs, retained refs and artifact
+caches remain. `--keep-worktree` does not exempt terminal work from this collector.
+
+Each worker attempt and background publisher holds a shared per-task filesystem lease. Collection
+requires the exclusive lease and rechecks lifecycle, checkpoint identity and live claims before
+removing anything. It defers active owners and live claims, allows a bounded two-minute publisher
+startup handoff, and retries deferred trees on subsequent runs. A killed owner releases its kernel
+lock automatically; stale publisher records cannot retain trees indefinitely. Lease files live
+outside the trees and are never unlinked. Unknown/mismatched task identity, unreadable state and
+symlinked roots are not deletion authority. Do not point a collector at a different queue's database.
+
+```sh
+# Preview eligible/busy trees (no worktrees removed):
+.venv/bin/python -m tauceti_queue.repair_cleanup \
+  --config ~/.config/tauceti-queue/repair-cleanup.json
+systemctl --user status tauceti-queue-repair-cleanup.timer
+journalctl --user -u tauceti-queue-repair-cleanup -n 20
+```
+
+Errors fail the oneshot and remain visible in its journal; the timer retries on the next pass.
+This requires the database and worker roots on the same host. Remote-worker lifecycle collection
+needs an authoritative remote protocol rather than inferring terminality from missing status rows.
+The collector does not bound the separate artifact cache or implement a disk-space admission gate.
+
 ### Repair execution on chungus2
 
 The November 7 move changed only repair execution. The two idle source workers were stopped and

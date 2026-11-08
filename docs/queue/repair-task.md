@@ -383,6 +383,8 @@ has a time budget holds because the service re-exposes the task.
 6. **Submit and publish.** Push, `result`, record the response (checkpoints `pushed`, `submitted`,
    then `adopted` or `not_adopted`), then publish the build outputs (below). The worktree is removed
    afterwards (by the background publisher when one runs) unless `--keep-worktree`;
+   the [lifecycle collector](operations.md#terminal-repair-worktree-cleanup) overrides that retention
+   once the task or batch is terminal, including trees left by errors or process kills;
    the artifact pool is kept, since the next task on the same base reuses it (prune it with the
    experiment CLI's `prune`). Every attempt's tip stays under
    `refs/tauceti-queue/task/<id>/attempt-<n>` in the clone, and `tasks/<id>/outcome.json` holds the
