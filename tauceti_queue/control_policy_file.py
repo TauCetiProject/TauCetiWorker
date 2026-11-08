@@ -39,8 +39,8 @@ def _parent(path: Path, uid: int):
         for part in path.parts[1:-1]:
             _directory(os.fstat(directory), uid=uid)
             child = os.open(part, flags, dir_fd=directory)
-            os.close(directory)
-            directory = child
+            old, directory = directory, child
+            os.close(old)
         _directory(os.fstat(directory), uid=uid, private=True)
         yield directory, path.name
     finally:
@@ -76,8 +76,8 @@ def read_control_policy(path: Path) -> bytes:
 
     The caller supplies a trusted configuration path, never an HTTP/task field.
     Detect most in-place edits; timestamp checks alone cannot detect every
-    same-size rewrite on a coarse filesystem. Atomically replace policy files
-    atomically and restart with one newly constructed server/controller authority.
+    same-size rewrite on a coarse filesystem. Replace policy files atomically
+    and restart with one newly constructed server/controller authority.
     Errors contain no private file bytes or fingerprints.
     """
     if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
@@ -100,8 +100,6 @@ def read_control_policy(path: Path) -> bytes:
                     raise ControlPolicyError("queue control policy changed while it was read")
             finally:
                 os.close(descriptor)
-        if len(payload) > MAX_POLICY_BYTES:
-            raise ControlPolicyError("queue control policy exceeds its byte bound")
         return payload
     except ControlPolicyError:
         payload = None
