@@ -425,6 +425,47 @@ class WorkerLiveness(unittest.TestCase):
 
 
 class BuildObservations(unittest.TestCase):
+    def test_live_preparation_is_visible_before_the_finished_log_is_copied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = Path(tmp) / "tasks/79"
+            task.mkdir(parents=True)
+            live = Path(tmp) / "worktrees/task-79/.tauceti-repair/build.log"
+            live.parent.mkdir(parents=True)
+            live.write_text("[36/100] Built private.module\n")
+            observer = monitoring.BuildObservations()
+            first = observer.observe(task, "artifacts_ready", "token", 100, 0)
+            self.assertEqual((first["stage"], first["completed_tasks"], first["total_tasks"]), ("preparation", 36, 100))
+            self.assertIsNone(first["last_progress_at"])
+            live.write_text("[60/120] Built another.private.module\n")
+            second = observer.observe(task, "artifacts_ready", "token", 110, 0)
+            self.assertEqual(second["last_progress_at"], monitoring.iso(110))
+            self.assertNotIn("private", json.dumps(second))
+            live.write_text("[118/120] Built private\nBuild completed successfully (120 jobs).\n")
+            final = observer.observe(task, "artifacts_ready", "token", 120, 0)
+            self.assertEqual((final["completed_tasks"], final["total_tasks"]), (120, 120))
+            self.assertEqual(final["last_progress_at"], monitoring.iso(120))
+
+    def test_live_preparation_never_follows_candidate_symlinks_or_reuses_an_old_attempt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = Path(tmp) / "tasks/79"
+            task.mkdir(parents=True)
+            tree = Path(tmp) / "worktrees/task-79"
+            tree.mkdir(parents=True)
+            private = Path(tmp) / "private"
+            private.mkdir()
+            log = private / "build.log"
+            log.write_text("[50/100] Private data\n")
+            (tree / ".tauceti-repair").symlink_to(private, target_is_directory=True)
+            observer = monitoring.BuildObservations()
+            self.assertIsNone(observer.observe(task, "artifacts_ready", "token", 100, 0))
+            (tree / ".tauceti-repair").unlink()
+            (tree / ".tauceti-repair").mkdir()
+            (tree / ".tauceti-repair/build.log").symlink_to(log)
+            self.assertIsNone(observer.observe(task, "artifacts_ready", "token", 100, 0))
+            (tree / ".tauceti-repair/build.log").unlink()
+            (tree / ".tauceti-repair/build.log").write_text("[20/100] Old attempt\n")
+            self.assertIsNone(observer.observe(task, "artifacts_ready", "token", 100, 10**12))
+
     def test_build_counters_follow_the_current_claim_not_the_newest_worker_file(self):
         with tempfile.TemporaryDirectory() as directory:
             roots = [Path(directory) / str(i) for i in range(2)]

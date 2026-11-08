@@ -269,13 +269,23 @@ class BuildObservations:
     def observe(self, directory, phase, token, captured, phase_at):
         stage, name = {
             "sources_ready": ("preparation", "prepare-build.log"),
+            "artifacts_ready": ("preparation", "prepare-build.log"),
             "verifying": ("verification", "verify-build.log"),
             "agent_running": ("streaming", "stream-build.log"),
         }.get(phase, (None, None))
         if name is None:
             return None
+        path = directory / "logs" / name
+        if stage == "preparation" and directory.name.isdigit():
+            # Scripted preparation streams here while the checkpoint is artifacts_ready.
+            # The logs/ copy is only written after the build ends. Derive the path from the
+            # trusted task directory rather than reading a path out of candidate contents.
+            worktree = directory.parent.parent / "worktrees" / f"task-{directory.name}"
+            live = worktree / ".tauceti-repair" / "build.log"
+            if not worktree.is_symlink() and not live.parent.is_symlink() and live.exists():
+                path = live
         try:
-            descriptor = os.open(directory / "logs" / name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+            descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
             with os.fdopen(descriptor, "rb") as stream:
                 info = os.fstat(stream.fileno())
                 if not stat.S_ISREG(info.st_mode) or (phase_at is not None and info.st_mtime < phase_at):
@@ -285,8 +295,9 @@ class BuildObservations:
                 tail = stream.read(BUILD_TAIL_BYTES)
                 if offset:
                     tail = tail.partition(b"\n")[2]  # Never parse a truncated line as a counter.
-            matches = re.findall(rb"\[(\d{1,9})/(\d{1,9})\]", tail)
-            valid = [(int(a), int(b)) for a, b in matches if 0 <= int(a) <= int(b) and int(b) > 0]
+            matches = re.findall(rb"\[(\d{1,9})/(\d{1,9})\]|Build completed successfully \((\d{1,9}) jobs\)", tail)
+            counters = [(int(done), int(done)) if done else (int(a), int(b)) for a, b, done in matches]
+            valid = [(a, b) for a, b in counters if 0 <= a <= b and b > 0]
             if not valid:
                 return None
             completed, total = valid[-1]

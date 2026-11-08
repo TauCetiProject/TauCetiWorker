@@ -65,7 +65,10 @@ build log; no log text, module names or paths leave the machine. The first sampl
 has unknown progress-change time. Unchanged counts, including a heartbeat or
 other new log output, do not advance that time. Log replacement, truncation,
 counter regression, a new phase or claim resets the comparison. The phase's own
-checkpoint time stays unchanged. A silent log alone is not a stalled build.
+checkpoint time stays unchanged. A silent log alone is not a stalled build. Scripted preparation is sampled from the live
+worktree build log while the checkpoint is `artifacts_ready`; the completed copy under
+the task logs is not required. The final Lake job summary supplies the last numeric
+count, without treating a successful local build as a staging verdict.
 
 Worker liveness is distinct from task progress. Busy workers may not rewrite
 worker.json until a long task finishes. On Linux the sidecar can instead verify
