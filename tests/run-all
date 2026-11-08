@@ -62,6 +62,7 @@ RUN_STDLIB=(
   usage_supervisor.py
   queue_repair_experiment.py
   queue_repair_task.py
+  queue_repair_locks.py
   queue_claude_stdin.py
   expanded_cache.py
   cache_storage.py
