@@ -903,8 +903,8 @@ environment PAT. The default `Service` and CLI continue to select the GitHub pat
 
 This constructor accepts independently loaded private credentials and publisher
 configuration; it does not provision them or enable native execution. Native CLI
-configuration selection, credential provisioning/rotation, webhook ingress,
-concurrency bounds, less-trusted worker admission and Review's publication ledger
+configuration selection, credential provisioning/rotation, ingress concurrency
+bounds, less-trusted worker admission and Review's publication ledger
 remain activation gates. The actual hosted execution and full lifecycle/load
 rehearsals remain required.
 
@@ -916,3 +916,23 @@ binding is written. Both tests block shared-state and legacy GitHub source reads
 The integration profile uses the same `FORGEJO_BINARY`, `FORGEJO_STATIC_ROOT` and
 `FORGEJO_EFFECTIVE_ACCESS` variables as the source authority fixture. No execution
 API request is needed to start the service; these tests do not prove hosted CI.
+
+
+The explicit native bootstrap enables `/webhook/forgejo` with a separate source
+secret. The receiver verifies Forgejo's raw SHA-256 signature and native delivery
+headers, repository ID, configured name and browser origin. Verified PR/comment
+and push notifications only dirty admission work or request discovery; payload
+bodies cannot grant approvals or run Bors commands. Invalidation is committed
+before acknowledgement. Duplicate deliveries are bounded in memory; after a
+restart redelivery repeats the idempotent invalidation. The primary poller owns
+source re-observation. The GitHub webhook endpoint remains refused on this path.
+
+`tests/queue_forgejo_webhook.py` covers signatures, origin/ID mismatches, retry
+after an interrupted durable write, duplicate/out-of-order notifications and
+restart redelivery. The HTTPS bootstrap fixture creates an actual hook in the
+disposable Forgejo and creates a PR as its contributor: Forgejo's background
+delivery reaches the actual Service HTTP endpoint and dirties work without
+creating an approval. Only that owned fixture permits loopback webhook targets.
+Stock Forgejo emits no commit-status events, so prompt status-only publication
+notifications still need a trusted caller/backstop path. Event intake alone does
+not enable native worker execution or establish load capacity.
