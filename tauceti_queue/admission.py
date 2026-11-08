@@ -25,7 +25,15 @@ from .store import dumps, loads
 
 log = logging.getLogger(__name__)
 EXPLICIT_WITHDRAWALS = frozenset(
-    {"unapproved", "cancelled", "conflicts-with-main", "missing-source", "landed-externally", "problem-anticipated"}
+    {
+        "unapproved",
+        "cancelled",
+        "conflicts-with-main",
+        "missing-source",
+        "landed-externally",
+        "problem-anticipated",
+        "empty-commit",
+    }
 )
 CONTEXTS = ("build", "scope", "bump-guard")
 HUMAN_INFRASTRUCTURE_APPROVAL_VERSION = 1
@@ -438,6 +446,11 @@ class AdmissionPoller:
             )
         elif reason == "problem-anticipated":
             boundary = loads(current["anticipated"], {}).get("withdrawn_at")
+        elif reason == "empty-commit":
+            rows = self.controller.store.rows(
+                "journal", {"kind": "landed", "batch_id": current["batch_id"]}, order="id DESC", limit=1
+            )
+            boundary = rows[0]["at"] if rows else None
         # Missing history is held conservatively. Never infer approval from a comment edit.
         return boundary or self.clock(), evidence.get("authorization", "")
 

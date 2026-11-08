@@ -354,7 +354,10 @@ lists these PRs under `rejected`; `prs_rejected` counts them, merged counters ex
 their per-PR feed outcome is `canceled`. The rejection comment quotes the explanations already
 accumulated from the commit message and names the retained staging ref. The existing outbox
 removes the membership label and closes the PR with its current title, without the merged prefix;
-both operations check the accepted head so delayed effects do not change a newer revision.
+closure checks the accepted head and skips a fresh approval, and label removal skips a PR that
+has joined a new batch.
+The existing admission withdrawal rules consume the old approval, so pending closure or reopening
+does not automatically requeue the rejected revision; a fresh review or approval can authorize another attempt.
 No new agent protocol or repair metadata is required. Intermediate and speculative empty commits
 have no rejection effect: the final authoritative commit decides. Empty placeholders remain in
 the chain, preserving its one-commit-per-member invariant, and canonical advances ignore them as

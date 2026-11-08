@@ -2449,21 +2449,27 @@ class Controller:
         previous = self._canonical
         self._canonical = canonical
         self._set_state("canonical_stale", False)
-        if canonical == previous:
-            return
-        self._set_state("canonical_sha", canonical)
-        self.store.journal(now, "canonical-advance", previous=previous, current=canonical)
+        if canonical != previous:
+            self._set_state("canonical_sha", canonical)
+            self.store.journal(now, "canonical-advance", previous=previous, current=canonical)
         head = self._head()
         if head is not None and chain.is_ancestor(self.clone, head["tip"], canonical):
             how = "promoted" if head["expected_parent"] else "external"
             self._landed(head, how, now)
+        if canonical == previous:
+            return
         if previous and chain.is_ancestor(self.clone, previous, canonical):
             landed_prs: set[int] = set()
             bors_landed: set[int] = set()
             try:
+                trees = {previous: chain.tree_of(self.clone, previous)}
                 for commit in chain.chain_commits(self.clone, previous, canonical):
                     source = commit.source_pr
-                    if self._commit_empty(commit.sha):
+                    empty = len(commit.parents) == 1 and commit.tree == (
+                        trees.get(commit.parents[0]) or chain.tree_of(self.clone, commit.parents[0])
+                    )
+                    trees[commit.sha] = commit.tree
+                    if empty:
                         continue  # an empty placeholder lands no contribution
                     if source and source.startswith(f"{self.repository}#"):
                         landed_prs.add(int(source.rsplit("#", 1)[1]))
@@ -5506,10 +5512,13 @@ class Controller:
 
     def _enqueue_rejection_effects(self, batch: dict[str, Any], member: dict[str, Any]) -> None:
         number = member["number"]
+        action = "during staging repair of" if member["provenance"] != "clean" else "from staging"
         lines = [
-            f"Pull request rejected during staging repair of batch {batch['id']}: no contribution remained.",
+            f"Pull request rejected {action} batch {batch['id']}: no contribution remained.",
             "",
             f"The final staging commit is empty. This PR was not merged into `{self.canonical_branch}`.",
+            "",
+            f"Rejected revision: `{member['accepted_head']}`.",
         ]
         if member["explanation"].strip():
             lines += ["", "The repair agent's explanation:", ""]
@@ -5526,12 +5535,12 @@ class Controller:
             self._enqueue(
                 "labels",
                 f"rejected-labels:{batch['id']}:{number}",
-                {"number": number, "add": [], "remove": [label], "head_sha": member["accepted_head"]},
+                {"number": number, "add": [], "remove": [label], "input_id": member["input_id"]},
             )
         self._enqueue(
             "close_pr",
             f"rejected-close:{batch['id']}:{number}",
-            {"number": number, "rejected": True, "head_sha": member["accepted_head"]},
+            {"number": number, "rejected": True, "head_sha": member["accepted_head"], "input_id": member["input_id"]},
         )
 
     def _enqueue_landing_effects(self, batch: dict[str, Any], member: dict[str, Any]) -> None:
@@ -6109,10 +6118,11 @@ class Controller:
                 work = self.store.row("admission_work", {"repository": repo, "number": payload["number"]})
                 if work["generation"] != payload["admission_generation"]:
                     return "stale-admission"
-            elif "head_sha" in payload:
-                pull = self.source.fetch_pr(repo, payload["number"])
-                if pull.head_sha != payload["head_sha"]:
-                    return "stale-head"
+            elif "input_id" in payload:
+                with self._lock:
+                    current = self._input_for(payload["number"])
+                    if current and current["id"] != payload["input_id"] and current["state"] == INPUT_INSERTED:
+                        return "new-member"
             self._ensure_labels(repo, payload.get("ensure", []))
             self.source.set_labels(repo, payload["number"], payload.get("add", []), payload.get("remove", []))
             return "labels"
@@ -6123,6 +6133,14 @@ class Controller:
             if payload.get("rejected"):
                 if pull.head_sha != payload["head_sha"]:
                     return "stale-head"
+                with self._lock:
+                    current = self._input_for(payload["number"])
+                    if (
+                        current
+                        and current["id"] != payload["input_id"]
+                        and current["state"] in (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED)
+                    ):
+                        return "new-approval"
                 title = pull.title
             else:
                 title = pull.title if pull.title.startswith(MERGED_TITLE_PREFIX) else MERGED_TITLE_PREFIX + pull.title

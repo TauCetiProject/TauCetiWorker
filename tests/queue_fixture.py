@@ -594,7 +594,7 @@ class EmptyContributions(QueueFixture):
         self.assertEqual(restarted.status()["counters"]["prs_landed"], 0)
         self.assertEqual(len(restarted.store.journal_entries("landed")), 1)
 
-    def test_delayed_rejection_does_not_close_or_unlabel_a_new_revision(self):
+    def test_delayed_rejection_preserves_a_new_members_membership_label(self):
         head = self.repaired_empty()
         self.tick()
         self.run_ci()
@@ -603,16 +603,65 @@ class EmptyContributions(QueueFixture):
         self.assertNotIn(101, self.github.closed)
         new_head = self.github.push_pr(101, {"F101.lean": "fixed\n"})
         self.assertTrue(self.controller.approve(PROJECT, 101, new_head, "reviewer")["accepted"])
+        self.tick()
         self.clock.advance(self.controller.setting("outbox_retry_seconds"))
         self.tick()
         self.assertEqual(self.github.prs[101]["state"], "open")
         self.assertIn("bors-staging", self.github.labels[101])
-        for kind in ("close", "labels"):
+        for kind, result in (("close", "stale-head"), ("labels", "new-member")):
             entry = self.controller.store.row("outbox", {"key": f"rejected-{kind}:{head['id']}:101"})
-            self.assertEqual(entry["result"], "stale-head")
+            self.assertEqual(entry["result"], result)
         outcomes = feeds.ControllerFeedSource(self.controller).outcomes(PROJECT, "main")
         old = next(o for o in outcomes if o.batch_id == head["id"])
         self.assertEqual(old.state, "canceled")
+
+    def test_delayed_rejection_removes_staging_label_after_an_unapproved_push(self):
+        head = self.repaired_empty()
+        self.tick()
+        self.run_ci()
+        self.github.fail_next.update(close_pr=1, set_labels=1)
+        self.tick(2)
+        self.github.push_pr(101, {"F101.lean": "fixed\n"})
+        self.clock.advance(self.controller.setting("outbox_retry_seconds"))
+        self.tick()
+        self.assertEqual(self.github.prs[101]["state"], "open")
+        self.assertNotIn("bors-staging", self.github.labels[101])
+        self.assertEqual(
+            self.controller.store.row("outbox", {"key": f"rejected-labels:{head['id']}:101"})["result"], "labels"
+        )
+
+    def test_delayed_close_does_not_override_fresh_approval_of_the_same_revision(self):
+        head = self.repaired_empty()
+        self.tick()
+        self.run_ci()
+        self.github.fail_next["close_pr"] = 1
+        self.tick(2)
+        accepted_head = self.controller.input_for(PROJECT, 101)["head_sha"]
+        self.assertTrue(self.controller.approve(PROJECT, 101, accepted_head, "reviewer")["accepted"])
+        self.tick()
+        self.clock.advance(self.controller.setting("outbox_retry_seconds"))
+        self.tick()
+        self.assertEqual(self.github.prs[101]["state"], "open")
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
+        self.assertEqual(
+            self.controller.store.row("outbox", {"key": f"rejected-close:{head['id']}:101"})["result"], "new-approval"
+        )
+
+    def test_external_landing_retries_after_a_transient_git_failure(self):
+        head = self.repaired_empty()
+        self.github.update_ref(PROJECT, "refs/heads/main", head["tip"])
+        with patch.object(self.controller, "_commit_empty", side_effect=chain.ChainError("transient git failure")):
+            with self.assertRaises(chain.ChainError):
+                self.tick()
+        self.assertIsNotNone(self.head())
+        restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(restarted.store.close)
+        restarted.recover()
+        restarted.tick()
+        restarted.tick()
+        self.assertIsNone(restarted.store.row("batches", {"state": "head"}))
+        self.assertEqual(restarted.input_for(PROJECT, 101)["reason"], "empty-commit")
+        self.assertEqual(self.github.closed[101], "Change 101")
 
     def test_external_canonical_advance_does_not_count_empty_placeholders_as_landed(self):
         head = self.repaired_empty()
@@ -787,6 +836,10 @@ class HeadOperations(QueueFixture):
             self.controller.store.rows("outbox", {"kind": "labels", "key": f"repaired-label:{head['id']}:101"})
         )
         self.assertEqual(self.repo.file_at("main", "B.lean"), "b\n")
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "landed")
+        self.assertEqual(self.github.closed[101], MERGED_TITLE_PREFIX + "Change 101")
+        self.assertIn("successfully merged", self.github.comments_for(101)[0]["body"])
+        self.assertEqual(self.controller.status()["counters"].get("prs_rejected", 0), 0)
         self.assertEqual(
             sorted(c.source_pr for c in self.first_parent_chain(admin, self.repo.main_sha())),
             [f"{PROJECT}#101", f"{PROJECT}#102"],
@@ -1851,6 +1904,30 @@ class RepairOrReject(QueueFixture):
         self.tick(2)
         self.assertEqual(self.repo.file_at("main", "Other.lean"), "theorem foo' : True := trivial\n")
         self.assertIn(102, self.github.closed)
+
+    def test_a_rejected_interacting_pr_readmits_the_opt_out_withdrawal(self):
+        self.withdrawn_head()
+        self.github.ci_policy = verdicts("fail")
+        self.tick()
+        self.run_ci()
+        self.tick()
+        agent = self.agent(
+            name="second-repair",
+            script=lambda task: {
+                f"{PROJECT}#101": Resolution(empty=True, explanation="Dropped A: no contribution remained.")
+            },
+        )
+        self.github.ci_policy = verdicts()
+        self.assertTrue(agent.run(self.controller).accepted)
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "empty-commit")
+        row = self.controller.input_for(PROJECT, 102)
+        self.assertEqual(json.loads(row["anticipated"])["stage"], "readmitted")
+        self.assertNotIn("needs-rebase", self.github.labels[102])
+        self.assertNotIn(102, self.github.closed)
+        self.assertEqual(self.controller.store.journal_entries("needs-rebase"), [])
 
     def test_the_interacting_pr_leaving_the_queue_readmits_the_withdrawn_pr_at_its_original_age(self):
         approved_at = None

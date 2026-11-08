@@ -208,6 +208,30 @@ class AdmissionTests(unittest.TestCase):
         self.intake.invalidate(1)
         self.assertEqual(self.intake.run_once()["approved"], 1)
 
+    def test_rejection_is_consumed_while_close_is_pending_and_after_restart(self):
+        self.ready()
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.controller.tick()
+        row = self.controller.input_for(REPO, 1)
+        self.clock.advance(1)
+        rejected_at = self.clock()
+        with self.controller.store.transaction():
+            self.controller.store.update("inputs", {"id": row["id"]}, state="cancelled", reason="empty-commit")
+            self.controller.store.journal(self.clock(), "landed", row["batch_id"], members=[], rejected=[1])
+        self.clock.advance(10)
+        self.intake.invalidate(1)
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(self.intake.state.get(1)["cancelled_at"], rejected_at)
+        self.restart()
+        self.intake.invalidate(1)
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(len(self.controller.inputs()), 1)
+        self.assertEqual(self.github.prs[1]["state"], "open")
+        self.clock.advance(1)
+        self.review(round=2, comment=11)
+        self.intake.invalidate(1)
+        self.assertEqual(self.intake.run_once()["approved"], 1, "fresh review can authorize another attempt")
+
     def test_cutover_uses_the_legacy_withdrawal_time_without_rejecting_a_new_comment(self):
         head = self.ready()
         self.controller.admission = None
