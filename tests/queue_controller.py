@@ -18,7 +18,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from tauceti_queue import chain, feeds  # noqa: E402
+from tauceti_queue import chain, diagnostics, feeds  # noqa: E402
 from tauceti_queue.controller import (  # noqa: E402
     DEFAULT_SETTINGS,
     LOG_GRACE_SECONDS,
@@ -293,6 +293,27 @@ class Verdicts(ControllerCase):
         self.controller.tick()
         self.assertEqual(self.attempt(head)["outcome"], "infrastructure")
         self.assertEqual(self.controller.store.count("tasks", {}), 0)
+
+    def test_import_header_failure_with_failed_finalizer_creates_repair(self):
+        findings = diagnostics.parse_log(
+            [
+                "TauCeti/Probability/MarkovChain/ClosedClass.lean: missing project import TauCeti.Probability.Kernel.ClosedClass"
+            ]
+        )
+        findings += diagnostics.infrastructure_findings(
+            {"conclusion": "failure"}, [{"name": "finalize-merge-group-build", "conclusion": "failure"}]
+        )
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "source-failure")
+        task = self.controller.store.row("tasks", {"batch_id": head["id"], "state": "open"})
+        self.assertEqual(task["kind"], "repair")
+        self.assertEqual(json.loads(task["diagnostics"]), findings[:1])
+        self.assertEqual(len(self.github.dispatches), 1, "source errors must not consume infrastructure retries")
 
     def test_an_unrelated_cancelled_job_does_not_skip_publication_grace(self):
         self.github.ci_policy = lambda *_: (
