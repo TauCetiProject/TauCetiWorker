@@ -165,6 +165,14 @@ class Cleanup(unittest.TestCase):
             cleanup.collect(self.root / "missing.sqlite3", self.clone, [self.worker], apply=True)
         self.assertFalse((self.root / "missing.sqlite3").exists())
 
+    def test_malformed_checkpoint_is_reported_without_blocking_other_terminal_trees(self):
+        first = self.tree(batch="landed")
+        self.tree(2, batch="landed")
+        (self.worker / "tasks/1/task.json").write_text('{"task": []}')
+        rows = self.collect()
+        self.assertEqual([x["state"] for x in rows], ["error", "removed"])
+        self.assertTrue(first.exists())
+
     def test_native_task_binding_must_match_database_in_full(self):
         path = self.tree(batch="landed", binding={"queue_epoch": "a"})
         self.store.execute("UPDATE tasks SET task_binding=?", ('{"queue_epoch":"b"}',))
