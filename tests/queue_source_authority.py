@@ -22,8 +22,10 @@ from tauceti_queue import chain, server
 from tauceti_queue.controller import Controller
 from tauceti_queue.source_authority import (
     NativeQueueAuthority,
+    QueueControlPolicy,
     SourceAccessDenied,
     SourceAuthorityUnavailable,
+    control_token_fingerprint,
     principal_key,
 )
 from tauceti_queue.store import loads
@@ -31,6 +33,23 @@ from tauceti_queue.task_identity import TASK_SCHEMA, TaskBinding
 
 
 class SourceAuthority(unittest.TestCase):
+    @staticmethod
+    def control_policy(identity):
+        return QueueControlPolicy(
+            identity,
+            frozenset(
+                control_token_fingerprint(identity, token)
+                for token in (
+                    "token",
+                    "read-only-token",
+                    "replacement-token",
+                    "private-token",
+                    "other-token",
+                    "now-read-only-token",
+                )
+            ),
+        )
+
     def setUp(self):
         self.repository = RepositoryRef(Forge("forgejo", "https://source.example"), "team/source")
         self.identity = RepositoryIdentity(self.repository, 41)
@@ -73,7 +92,9 @@ class SourceAuthority(unittest.TestCase):
                     }
                 )
 
-        self.authority = NativeQueueAuthority(self.identity, client_factory=Client)
+        self.authority = NativeQueueAuthority(
+            self.identity, control_policy=self.control_policy(self.identity), client_factory=Client
+        )
 
     def test_repeated_bearer_observation_cannot_reuse_a_revoked_identity(self):
         self.authority.require_admin(self.authority.observe("token"))
@@ -82,6 +103,55 @@ class SourceAuthority(unittest.TestCase):
             self.authority.observe("token")
         self.assertEqual(len(self.clients), 2)
         self.assertEqual(len(self.calls), 2)
+
+    def test_unenrolled_admin_bearer_is_refused_without_any_native_request(self):
+        with self.assertRaisesRegex(SourceAccessDenied, "dedicated credential") as raised:
+            self.authority.observe("third-party-full-admin-token")
+        self.assertNotIn("third-party-full-admin-token", str(raised.exception))
+        self.assertEqual(self.clients, [])
+        self.assertEqual(self.calls, [])
+
+    def test_queue_credential_fingerprint_cannot_be_reused_for_another_origin_or_id(self):
+        approved = control_token_fingerprint(self.identity, "token")
+        for identity in (
+            RepositoryIdentity(self.repository, 42),
+            RepositoryIdentity(RepositoryRef(Forge("forgejo", "https://other.example"), "team/source"), 41),
+        ):
+            with self.subTest(source=identity):
+                copied_policy = QueueControlPolicy(identity, frozenset({approved}))
+                self.assertFalse(copied_policy.permits("token"))
+                with self.assertRaises(ValueError):
+                    NativeQueueAuthority(self.identity, control_policy=copied_policy)
+
+    def test_native_authority_requires_a_valid_explicit_control_policy(self):
+        for fingerprints in (frozenset(), {"f" * 64}, frozenset({"F" * 64}), frozenset({"0" * 64}), frozenset({"x"})):
+            with self.subTest(fingerprints=fingerprints), self.assertRaises(ValueError):
+                QueueControlPolicy(self.identity, fingerprints)
+        with self.assertRaises(TypeError):
+            NativeQueueAuthority(self.identity)
+        with self.assertRaises(ValueError):
+            NativeQueueAuthority(self.identity, control_policy=None)
+        policy = self.authority._control_policy
+        self.assertNotIn("token", repr(policy))
+        self.assertNotIn(next(iter(policy.fingerprints)), repr(policy))
+
+    def test_rotation_invalidates_old_tokens_and_old_request_evidence(self):
+        old = self.authority.authenticate("token")
+        fresh = NativeQueueAuthority(
+            self.identity,
+            control_policy=QueueControlPolicy(
+                self.identity, frozenset({control_token_fingerprint(self.identity, "rotated-token")})
+            ),
+            client_factory=self.authority._client_factory,
+        )
+        with self.assertRaises(SourceAuthorityUnavailable):
+            fresh.validate(old)
+        before = len(self.calls)
+        with self.assertRaises(SourceAccessDenied):
+            fresh.observe("token")
+        self.assertEqual(len(self.calls), before)
+        fresh.require_admin(fresh.validate(fresh.authenticate("rotated-token")))
+        self.assertEqual(self.calls[-1][2], "rotated-token")
 
     def test_readonly_credential_cannot_borrow_its_users_admin_acl(self):
         self.authority.require_admin(self.authority.observe("token"))
@@ -197,6 +267,8 @@ class SourceAuthority(unittest.TestCase):
 
 
 class NativeClaims(unittest.TestCase):
+    control_policy = staticmethod(SourceAuthority.control_policy)
+
     # Keep the provider-only tests above in their own case; this case exercises
     # the actual controller against a real temporary Git repository and ledger.
     def setUp(self):
@@ -209,7 +281,10 @@ class NativeClaims(unittest.TestCase):
         self.repository = self.identity.repository
         self.repo.update(id=self.identity.native_id, full_name=self.repository.name, html_url=self.repository.url)
         self.authority = NativeQueueAuthority(
-            self.identity, client_factory=self.authority._client_factory, clock=fixture.clock
+            self.identity,
+            control_policy=self.control_policy(self.identity),
+            client_factory=self.authority._client_factory,
+            clock=fixture.clock,
         )
         fixture.controller = Controller(
             fixture.store,
@@ -348,7 +423,10 @@ class NativeClaims(unittest.TestCase):
         self.store = self.fixture.store
         self.controller = self.fixture.controller
         self.authority = NativeQueueAuthority(
-            self.identity, client_factory=self.authority._client_factory, clock=self.fixture.clock
+            self.identity,
+            control_policy=self.control_policy(self.identity),
+            client_factory=self.authority._client_factory,
+            clock=self.fixture.clock,
         )
         self.controller.source_authority = self.authority
         with self.assertRaises(SourceAuthorityUnavailable):
@@ -742,6 +820,8 @@ class NativeClaims(unittest.TestCase):
 
 
 class NativeHTTP(unittest.TestCase):
+    control_policy = staticmethod(SourceAuthority.control_policy)
+
     def setUp(self):
         NativeClaims.setUp(self)
         self.config = server.ServerConfig(
@@ -794,6 +874,16 @@ class NativeHTTP(unittest.TestCase):
         status, body = self.request("/admin/settings", {"repair_concurrency": 2})
         self.assertEqual(status, 503)
         self.assertNotIn("private response", json.dumps(body))
+        self.assertEqual(self.controller.setting("repair_concurrency"), 1)
+
+    def test_unenrolled_privileged_bearer_cannot_claim_or_change_settings(self):
+        for path, body in (("/tasks/claim", {"worker": "worker"}), ("/admin/settings", {"repair_concurrency": 2})):
+            with patch.object(server.Handler, "_read_body", side_effect=AssertionError("unenrolled body read")):
+                status, response = self.request(path, body, token="third-party-full-admin-token")
+            self.assertEqual(status, 403)
+            self.assertNotIn("third-party-full-admin-token", json.dumps(response))
+        self.assertEqual(self.clients, [])
+        self.assertEqual(self.store.rows("claims", {"task_id": self.task_id}), [])
         self.assertEqual(self.controller.setting("repair_concurrency"), 1)
 
     def test_revoked_bearer_is_unauthorized_and_scope_denial_is_forbidden(self):

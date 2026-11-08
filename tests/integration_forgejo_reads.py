@@ -28,7 +28,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_tools.ci_candidate import RepositoryIdentity
 from tauceti_tools.forge import Forge, ForgeError, Forgejo, RepositoryRef
 
-from tauceti_queue.source_authority import NativeQueueAuthority, SourceAccessDenied
+from tauceti_queue.source_authority import (
+    NativeQueueAuthority,
+    QueueControlPolicy,
+    SourceAccessDenied,
+    control_token_fingerprint,
+)
 from tauceti_worker.forgejo_reads import BoundedReadCache
 from tauceti_worker.github import GitHub
 from tauceti_worker.review_state import ReviewState
@@ -176,6 +181,7 @@ ROOT_PATH = {root}/log
             readonly = Forgejo(api.forge, token=token("repo-reader", "read:user,read:repository"), timeout=3)
             collaborator = Forgejo(api.forge, token=token("member", "all", "collaborator"), timeout=3)
             collaborator_control = token("queue-control", "write:repository", "collaborator")
+            third_party_control = token("third-party-ci", "write:repository")
             probe = Forgejo(api.forge, timeout=3)
             with (root / "server.log").open("w") as log:
                 process = subprocess.Popen([*base, "web"], stdout=log, stderr=subprocess.STDOUT)
@@ -328,7 +334,15 @@ ROOT_PATH = {root}/log
                         self.assertEqual(access.actor, actor)
                         self.assertTrue(access.user_code_can_push)
                         self.assertTrue(access.user_is_repo_admin)
-                        queue_authority = NativeQueueAuthority(RepositoryIdentity(repo, access.repository_id))
+                        queue_identity = RepositoryIdentity(repo, access.repository_id)
+                        # Dedicated enrollment is explicit; scope/ACL/revocation tests
+                        # enroll their narrow negative-test tokens as well.
+                        controls = (api._token, readonly._token, collaborator._token, collaborator_control)
+                        control_policy = QueueControlPolicy(
+                            queue_identity,
+                            frozenset(control_token_fingerprint(queue_identity, bearer) for bearer in controls),
+                        )
+                        queue_authority = NativeQueueAuthority(queue_identity, control_policy=control_policy)
 
                         def deny_queue_admin(bearer):
                             if effective_access:
@@ -345,12 +359,28 @@ ROOT_PATH = {root}/log
                             queue_authority.require_admin(
                                 queue_authority.validate(queue_authority.authenticate(api._token))
                             )
+                            # A real, independently valid Code-write/admin
+                            # token is not automatically a queue credential.
+                            third_party = Forgejo(api.forge, token=third_party_control, timeout=3)
+                            third_party_rights = third_party.request(
+                                "GET", f"repositories/{access.repository_id}/effective_access"
+                            )
+                            self.assertTrue(third_party_rights["code_write"])
+                            self.assertTrue(third_party_rights["repository_admin"])
+                            with self.assertRaisesRegex(SourceAccessDenied, "dedicated credential"):
+                                queue_authority.observe(third_party_control)
                         else:
                             # Stock Forgejo lacks effective scope evidence. User
                             # ACLs remain available for surveys, never controls.
                             with self.assertRaises(SourceAccessDenied):
                                 queue_authority.observe(api._token)
-                        missing_id = NativeQueueAuthority(RepositoryIdentity(repo, access.repository_id + 1))
+                        missing_identity = RepositoryIdentity(repo, access.repository_id + 1)
+                        missing_id = NativeQueueAuthority(
+                            missing_identity,
+                            control_policy=QueueControlPolicy(
+                                missing_identity, frozenset({control_token_fingerprint(missing_identity, api._token)})
+                            ),
+                        )
                         with self.assertRaises(SourceAccessDenied):
                             missing_id.observe(api._token)
                         self.assertIsNone(other.repository_access())

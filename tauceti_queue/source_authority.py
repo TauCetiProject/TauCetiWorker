@@ -8,7 +8,10 @@ Source publication still needs its own native branch and approval checks.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import math
+import re
 import time
 from dataclasses import dataclass, field, fields
 
@@ -28,6 +31,53 @@ class SourceAccessDenied(PermissionError):
 
 class SourceAuthorityUnavailable(RuntimeError):
     """Current native identity/ACL evidence could not be obtained."""
+
+
+def control_token_fingerprint(source: RepositoryIdentity, token: str) -> str:
+    """Hash one deliberately provisioned control bearer for one native source.
+
+    This is trusted operator configuration, never a value accepted from an HTTP
+    request or a Forgejo profile. Keep it out of task records and public output.
+    Register only independently generated high-entropy control credentials.
+    """
+    if not isinstance(source, RepositoryIdentity) or source.repository.forge.kind != "forgejo":
+        raise ValueError("control credentials require a qualified native source")
+    if not isinstance(token, str) or not 0 < len(token) <= 4096 or not all(33 <= ord(c) <= 126 for c in token):
+        raise ValueError("a native control bearer is required")
+    audience = f"tauceti-queue.control-token/v1\0{source.repository.forge.key}\0{source.native_id}\0"
+    return hashlib.sha256(audience.encode() + token.encode("ascii")).hexdigest()
+
+
+@dataclass(frozen=True)
+class QueueControlPolicy:
+    """An explicit audience for dedicated queue-control credentials.
+
+    A repository-wide write grant alone does not enroll a third-party token.
+    Rotation provisions a new immutable policy and a new authority instance;
+    evidence issued by the old instance cannot survive that replacement.
+    """
+
+    source: RepositoryIdentity
+    fingerprints: frozenset[str] = field(repr=False)
+
+    def __post_init__(self):
+        if not isinstance(self.source, RepositoryIdentity) or self.source.repository.forge.kind != "forgejo":
+            raise ValueError("control policy requires a qualified native source")
+        if (
+            type(self.fingerprints) is not frozenset
+            or not 0 < len(self.fingerprints) <= 1024
+            or any(
+                not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None or value == "0" * 64
+                for value in self.fingerprints
+            )
+        ):
+            raise ValueError("control policy requires a bounded nonempty set of SHA-256 fingerprints")
+
+    def permits(self, token: str) -> bool:
+        candidate = control_token_fingerprint(self.source, token)
+        # Examine every configured fingerprint, without leaking which entry
+        # matched through short-circuit comparisons.
+        return bool(sum(hmac.compare_digest(candidate, approved) for approved in self.fingerprints))
 
 
 @dataclass(frozen=True)
@@ -92,10 +142,20 @@ class RequestAccess:
 
 
 class NativeQueueAuthority:
-    def __init__(self, source: RepositoryIdentity, *, client_factory=Forgejo, clock=time.monotonic):
+    def __init__(
+        self,
+        source: RepositoryIdentity,
+        *,
+        control_policy: QueueControlPolicy,
+        client_factory=Forgejo,
+        clock=time.monotonic,
+    ):
         if not isinstance(source, RepositoryIdentity) or source.repository.forge.kind != "forgejo":
             raise ValueError("native queue authority requires a qualified Forgejo repository ID")
+        if not isinstance(control_policy, QueueControlPolicy) or control_policy.source != source:
+            raise ValueError("control credential policy must match the queue's qualified native source")
         self.source = source
+        self._control_policy = control_policy
         self._client_factory = client_factory
         self.clock = clock
 
@@ -129,8 +189,7 @@ class NativeQueueAuthority:
         operation. A prior observation never substitutes for a failed new read.
         A server without the effective-access endpoint cannot authorize controls.
         """
-        if not isinstance(token, str) or not 0 < len(token) <= 4096 or not all(33 <= ord(c) <= 126 for c in token):
-            raise SourceAccessDenied("a native source bearer token is required", status=401)
+        self.require_control_credential(token)
         try:
             api = self._client_factory(self.source.repository.forge, token=token, timeout=10, max_bytes=1024 * 1024)
             access = QueueRepositoryAccess.from_effective(
@@ -148,6 +207,13 @@ class NativeQueueAuthority:
         if access.repository_id != self.source.native_id:
             raise SourceAccessDenied("native source repository identity changed")
         return access
+
+    def require_control_credential(self, token: str) -> None:
+        """Cheap local enrollment only; this never supplies actor or ACL evidence."""
+        if not isinstance(token, str) or not 0 < len(token) <= 4096 or not all(33 <= ord(c) <= 126 for c in token):
+            raise SourceAccessDenied("a native source bearer token is required", status=401)
+        if not self._control_policy.permits(token):
+            raise SourceAccessDenied("a dedicated credential approved for this queue source is required")
 
     def require_admin(self, access: QueueRepositoryAccess) -> None:
         """Validate a fresh observation against this queue's writable source."""

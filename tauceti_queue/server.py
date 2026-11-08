@@ -469,9 +469,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authenticated_json(self):
         if self.server.source_authority is not None:
-            if NativeBearerAuth.token(self.headers.get("Authorization")) is None:
+            token = NativeBearerAuth.token(self.headers.get("Authorization"))
+            if token is None:
                 self.close_connection = True
                 return self._authenticated(), None  # Syntactic check only, before any body or source I/O.
+            try:
+                self.server.source_authority.require_control_credential(token)
+            except SourceAccessDenied as error:
+                self.close_connection = True
+                self._error(error.status, str(error))
+                return None, None
             # A slow request body must not keep an earlier native ACL grant.
             body = self._read_json()
             if body is not None and urllib.parse.urlsplit(self.path).path == "/tasks/claim":

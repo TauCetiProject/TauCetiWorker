@@ -293,8 +293,26 @@ the isolated author/review/CI/merge rehearsal or a capacity proof.
 
 ## Queue source and execution boundary
 
-The optional source-bound queue has a separate native HTTP authority path. Each
-mutation reads its bearer actor, repository user ACL and effective credential
+The optional source-bound queue has a separate native HTTP authority path. Its
+authority requires an explicit, immutable `QueueControlPolicy` from trusted
+operator configuration. Register only dedicated, independently generated
+high-entropy queue-control bearers using `control_token_fingerprint(source, token)`.
+The policy holds a bounded nonempty set of SHA-256 fingerprints, domain-separated
+by the native source origin and repository ID. It never accepts enrollment from
+request JSON, task metadata or a Forgejo profile. Fingerprints are private
+configuration and are omitted from policy repr, tasks, public progress and journals.
+An unenrolled token is refused before the HTTP body is read or any source request,
+even when it otherwise has effective admin and Code write privileges. Revocation
+must happen at Forgejo first: removing a fingerprint only removes queue enrollment,
+and does not revoke the credential's source permissions. Then remove the old
+fingerprint and restart the queue process with the new immutable policy and one
+authority shared by its HTTP server and controller. Do not swap only the
+controller's authority or mutate an existing instance. Omitted old tokens cannot
+authorize queue calls; process-local evidence from the previous instance is invalid.
+Enrolled credentials still need fresh native
+scope/resource/ACL checks on every operation; enrollment does not cache a grant.
+
+Each mutation reads its bearer actor, repository user ACL and effective credential
 access directly from the configured Forgejo origin by native repository ID. The
 required `GET /api/v1/repositories/{id}/effective_access` response comes from a
 private native API addition. It includes current repository restrictions and
@@ -309,7 +327,11 @@ its user's admin privileges. The native endpoint requires explicit scopes includ
 `read:repository`. Its actor contains only the native ID and login, so repository-limited
 tokens can use it without `read:user`, which their creation rules forbid.
 Unscoped password, session and Actions authentication, implicit OAuth API scope
-fallback and impersonation cannot supply this evidence. The returned user ACL
+fallback and impersonation cannot supply this evidence. Explicitly scoped OAuth
+and authorized-integration tokens can supply effective-access evidence, but they
+remain unenrolled for queue control unless the operator deliberately approves that
+exact bearer for this source. Integration scope or a third-party OAuth grant alone
+does not enroll it. The returned user ACL
 already includes credential repository-resource reduction; it excludes read/write
 scope, which the effective flags additionally enforce. Protected branch, approval and merge
 checks remain necessary when publishing to the source.
@@ -392,9 +414,19 @@ must be integrated before execution: a no-retry exception alone cannot recover a
 assignment whose response was lost.
 Native checkpoint directory/cache namespaces still need integration before
 enabling execution.
-Credential audience/delegation policy and ingress rate/concurrency limits also
-require integration before activation: a native user ACL observation alone does
-not identify a bearer as a dedicated queue-control credential.
+Ingress rate/concurrency limits still require integration before activation.
+Dedicated control credentials and their provisioning, revocation and rotation
+must also be integrated with the operator installer; native bootstrap stays disabled.
+The installer must generate repository-limited credentials for dedicated bot users
+with minimal scopes, not enroll a shared personal/CI bearer. Enrollment narrows
+what the queue accepts; it does not constrain use of that bearer directly against
+Forgejo. The present admin/Code-write requirement therefore still grants source
+power to the credential holder. Separating task credentials from source publication
+authority needs a queue-issued credential or a separately authorized native task
+role before exposing task controls to less-trusted workers.
+OAuth/integration refresh and its restart/enrollment lifecycle are not implemented
+by the installer and are not supported operationally for queue-control credentials.
+No client or integration ID is implicitly trusted across credential rotation.
 The native effective-access API addition remains private pending its upstream
 contribution handoff. The disposable native integration checks effective access
 with the private native build and verifies that stock Forgejo refuses controls.
