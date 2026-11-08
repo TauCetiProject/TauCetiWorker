@@ -396,9 +396,7 @@ class Controller:
         self.repository = repository
         source_identity = getattr(self.source, "repository_identity", None)
         self.native_source = bool(source_identity and source_identity.repository.forge.kind == "forgejo")
-        self.provenance_repository = (
-            source_identity.repository.key if self.native_source else repository
-        )
+        self.provenance_repository = source_identity.repository.key if self.native_source else repository
         self.revision = revision
         self.clock = clock
         self.rng = rng or random.Random()
