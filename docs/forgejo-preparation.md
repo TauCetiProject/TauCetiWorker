@@ -560,9 +560,49 @@ metadata object's identity during recovery. This restores metadata, not missing 
 source history; admission must retain those heads. The 8,192 member maximum is a
 transport bound, not a demonstrated fleet capacity.
 
-`GitHubSourceExecution` requires installation tokens minted with exactly the native
-execution repository ID and explicit `contents:write`/`actions:write` permissions. A
-name preflight alone cannot protect a write against a repository name being reused.
+`GitHubSourceExecution` requires an explicitly selected credential provider: App
+installation tokens minted with exactly the native execution repository ID, or a
+native GitHub workflow job token supplied by an approved, pinned workflow bootstrap.
+Both require explicit `contents:write`/`actions:write` permissions. A name preflight
+alone cannot protect a write against a repository name being reused.
+
+`WorkflowTokenSource` is available for a trusted GitHub Actions controller job. Its
+bootstrap must pass the literal `${{ github.token }}` context and approved repository
+ID, workflow path, caller revision, branch and unique nonmatrix job name. Never select its
+token or approved identity from event payloads, repository secrets, inherited `gh`
+credentials or untrusted worker configuration. GitHub's
+[native job-token contract](https://docs.github.com/en/actions/concepts/security/github_token)
+provides the immutable repository resource scope. A singleton response from
+`/installation/repositories` alone cannot prove mint-time scope: a broad App token
+could currently expose just one repository. The provider therefore cannot discover
+or adopt arbitrary credentials by inspecting that endpoint.
+
+Load the approved revision and controller workflow path from independently trusted
+queue configuration, not from `github.sha` or event data. The existing request ledger
+archives the separately approved execution caller revision. Dispatch preflight
+requires the controller to use that same execution repository tree and branch;
+observing or cancelling ledger-owned older requests still uses their archived caller
+identities. The
+controller workflow must not allow dispatch inputs to influence credential or
+identity handling. Supply the literal `${{ github.ref }}` context as the launch ref;
+it must equal the approved `refs/heads/<branch>`. The REST `head_branch` field alone
+cannot distinguish a tag whose name collides with that branch.
+
+On first credential use, the provider corroborates the singleton resource identity,
+live run/attempt, exact workflow revision/path/branch, same-repository head and unique
+running job through authenticated GitHub reads. Only trusted `push` or
+`workflow_dispatch` controller launches are supported. These identity checks run once
+per instance; recurring reads would waste the repository's shared
+[job-token API budget](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api).
+Permanent verification mismatches disable the instance without repeating API reads.
+The provider has a six-hour instance lifetime cap, no token refresh and permanent invalidation;
+GitHub independently expires the token when its job ends. Responses have a byte
+bound and socket timeout; this does not promise a whole-exchange deadline against
+trickling responses. No production entry point automatically selects this provider.
+The controller job must remain alive while it dispatches and collects its candidates,
+occupying a runner for that period. Long-running external queue services continue to
+use the repository-ID-scoped App token provider.
+
 Dispatch validates the current repository identity, default branch and frozen trusted
 caller revision before source retention and before its single POST. The final preflight
 returns a process-local prepared dispatch with a hidden credential; after the durable
