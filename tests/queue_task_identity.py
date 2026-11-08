@@ -486,6 +486,7 @@ class ClientHTTP(unittest.TestCase):
 
         class Sink(BaseHTTPRequestHandler):
             def do_GET(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 sink_calls.append(dict(self.headers))
                 self.send_response(200)
                 self.end_headers()
@@ -501,6 +502,7 @@ class ClientHTTP(unittest.TestCase):
             status = 307
 
             def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 self.send_response(self.status)
                 self.send_header("Location", f"http://127.0.0.1:{sink.server_port}/stolen")
                 self.end_headers()
@@ -531,6 +533,7 @@ class ClientHTTP(unittest.TestCase):
             status = 200
 
             def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 self.send_response(self.status)
                 self.send_header("Content-Length", str(len(self.payload)))
                 self.end_headers()
