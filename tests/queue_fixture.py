@@ -18,6 +18,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from tauceti_queue import admission_planning, chain, feeds, monitoring  # noqa: E402
+from tauceti_queue.approval_poll import ApprovalPoller  # noqa: E402
 from tauceti_queue.controller import LOG_GRACE_SECONDS, MERGED_TITLE_PREFIX, ControllerError, TaskError  # noqa: E402
 from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller  # noqa: E402
 from tauceti_queue.loop import ReconciliationLoop  # noqa: E402
@@ -865,6 +866,12 @@ class HeadOperations(QueueFixture):
         self.assertEqual(self.controller.store.row("inputs", {"id": old_input["id"]})["state"], "landed")
         outcomes = feeds.ControllerFeedSource(self.controller).outcomes(PROJECT, "main")
         self.assertEqual(next(o for o in outcomes if o.pr == 101 and o.batch_id == head["id"]).state, "ok")
+        self.controller.unapprove(PROJECT, 101, "reviewer")
+        self.github.publish_check(101)
+        poller = ApprovalPoller(self.controller, self.github, PROJECT, clock=self.clock)
+        self.assertEqual(poller.run_once()["approved"], 0, "an old landed row must not hide a newer withdrawal")
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "unapproved")
+        self.assertEqual(self.controller._interacting_state(101), "gone")
 
     def test_s10_promotion_refused_after_an_advance_between_pass_and_push(self):
         self.approve(101, {"A.lean": "a\n"})

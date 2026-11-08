@@ -864,7 +864,7 @@ class Controller:
         return bool({str(label).lower() for label in labels or ()} & self._no_repair_labels())
 
     def input_for(self, repo: str, pr: int) -> dict[str, Any] | None:
-        """The PR's current input row (the newest that is not cancelled, else the newest), or None."""
+        """The PR's newest live input row, or its newest terminal row when none is live, or None."""
         with self._lock:
             self._check_repo(repo)
             return self._input_for(pr)
@@ -1042,10 +1042,10 @@ class Controller:
             return {"urgent": True, "state": current["state"]}
 
     def _input_for(self, pr: int) -> dict[str, Any] | None:
-        """The PR's current input: the newest row that is not cancelled, else the newest row."""
+        """The PR's newest live input, otherwise its newest terminal input."""
         rows = self.store.rows("inputs", {"repository": self.repository, "number": pr}, order="id DESC")
         for row in rows:
-            if row["state"] != INPUT_CANCELLED:
+            if row["state"] in (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED):
                 return row
         return rows[0] if rows else None
 
