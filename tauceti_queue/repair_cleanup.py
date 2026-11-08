@@ -91,6 +91,8 @@ def _collect_one(store, clone, root, tree, task_id, result, *, apply):
         (task_id,),
     ).fetchone()
     checkpoint = _record(root / "tasks" / str(task_id) / "task.json").get("task", {})
+    if not isinstance(checkpoint, dict):
+        raise ValueError("checkpoint task must be an object")
     # A local checkpoint must belong to this controller database, not a similarly numbered task
     # from a different queue. Unknown/malformed identity never authorizes deletion.
     if (
