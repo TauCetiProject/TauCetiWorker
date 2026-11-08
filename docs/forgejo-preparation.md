@@ -424,7 +424,8 @@ completed run with a failure, cancellation, timeout or startup failure enters th
 bounded infrastructure retry policy only after a complete authenticated artifact
 listing and fresh run metadata confirm the result is absent. Read failures and
 present-but-unreadable artifacts stay pending. Grace starts at the controller's
-first completed observation. A successful run without a usable result
+first completed observation, tracked separately from GitHub's completion time so
+status and feed timestamps retain their original meaning. A successful run without a usable result
 still requires reconciliation. Repeated preparation/freeze failures raise alerts, and an
 exact-nonce operator retry can retire a request that remains prepared. Re-observing a
 deferred passing result does not count the same CI run twice; transient per-attempt

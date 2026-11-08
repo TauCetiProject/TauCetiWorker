@@ -241,12 +241,21 @@ class GitHubSourceExecution:
         if not owned and ownership is None:
             raise EvidenceUnavailable("execution run has no verified request ownership yet")
         absent = False
-        if run.status == "completed" and result is None and (owned or ownership is not None):
+        if (
+            owned
+            and run.status == "completed"
+            and result is None
+            and run.conclusion in {"cancelled", "timed_out", "startup_failure", "failure"}
+        ):
             absent = self._result_absent(reader, frozen, run)
         return CandidateObservation(run, ownership, result, absent)
 
     def _result_absent(self, reader, frozen, run):
-        """A failed artifact download is not evidence of an absent verdict."""
+        """A failed artifact download is not evidence of an absent verdict.
+
+        Deleted/purged artifacts can establish current absence, not that a
+        result was never published. This permits only a bounded retry, no pass.
+        """
         expected = cc.artifact_name(frozen.request, int(run.run_id), run.attempt)
         seen, total = set(), None
         try:

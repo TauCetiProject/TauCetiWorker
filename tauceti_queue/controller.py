@@ -4157,6 +4157,10 @@ class Controller:
                             self._observe_attempt(head, dict(attempt, needs_observation=1), now, strict=True)
                     attempts = self._tip_attempts(head)
                     run = self._live_run(head, attempts)
+                except ControllerError as error:
+                    if error.code == "head-changed":
+                        return {"retried": False, "reason": "head-changed"}
+                    raise
                 except Exception as error:  # noqa: BLE001
                     return {"retried": False, "reason": "github-unavailable", "detail": str(error)}
                 if run is not None:
@@ -4297,15 +4301,17 @@ class Controller:
         if self.candidate_ci is not None and self.candidate_ci.ledger.owner_run(attempt["id"]) != run.run_id:
             self._reasons.append(f"head {head['id']}: verified duplicate run {run.run_id} is still live; waiting")
             return True
+        where = {"id": attempt["id"]}
+        if self.candidate_ci is not None:
+            where.update(
+                {key: attempt[key] for key in ("outcome", "dispatch_state", "cancelled_at", "run_id", "request_id")}
+            )
         with self.store.transaction():
-            # A late live run belongs to a previously sent attempt, including its
-            # existing candidate ref. Newer rejected receipts must not hide it.
-            for rejected in attempts:
-                if rejected["id"] > attempt["id"] and rejected["dispatch_state"] == "rejected":
-                    self.store.update("ci_attempts", {"id": rejected["id"]}, outcome=OUTCOME_SUPERSEDED)
-            self.store.update(
+            # The selected attempt may have changed while discovery released
+            # the controller lock. Never undo an explicit retry/cancellation.
+            changed = self.store.update(
                 "ci_attempts",
-                {"id": attempt["id"]},
+                where,
                 outcome=OUTCOME_PENDING,
                 outcome_detail="",
                 run_id=run.run_id,
@@ -4313,6 +4319,16 @@ class Controller:
                 last_progress_at=now,
                 needs_observation=1,
             )
+            if changed != 1:
+                return True
+            # A late live run belongs to a previously sent attempt, including its
+            # existing candidate ref. Newer rejected receipts must not hide it.
+            for rejected in attempts:
+                if rejected["id"] > attempt["id"] and rejected["dispatch_state"] == "rejected":
+                    match = {"id": rejected["id"]}
+                    if self.candidate_ci is not None:
+                        match.update(dispatch_state="rejected", outcome=rejected["outcome"])
+                    self.store.update("ci_attempts", match, outcome=OUTCOME_SUPERSEDED)
             self._count("ci_readoptions")
             self.store.journal(
                 now,
@@ -5056,6 +5072,13 @@ class Controller:
             self.store.execute("DELETE FROM settings WHERE key=?", (f"source-ci:evidence-error:{attempt['id']}",))
         run = observation.run
         self._settle_accepted(head, attempt, now, run_id=run.run_id)
+        if (
+            not self._source_head_current(head, attempt)
+            or self.store.get_setting(f"source-ci:promotion-hold:{attempt['id']}") is not None
+        ):
+            return
+        now = self.clock()
+        values["last_observed_at"] = now
         values.update(
             run_id=run.run_id,
             run_attempt=run.attempt,
@@ -5069,16 +5092,21 @@ class Controller:
                 if attempt["run_id"] == run.run_id and attempt["run_attempt"] == run.attempt
                 else None
             )
-            or (now if run.status == "completed" else None),
+            or (run.completed_at or now if run.status == "completed" else None),
             html_url=run.html_url,
             outcome_detail="waiting for verified source CI result",
         )
         if run.updated_at != attempt["run_updated_at"]:
             values["last_progress_at"] = now
         if run.status == "completed":
+            completion_key = f"source-ci:completion-seen:{attempt['id']}"
+            completed = self.store.get_setting(completion_key)
+            if completed is None or (completed["run_id"], completed["attempt"]) != (run.run_id, run.attempt):
+                completed = {"run_id": run.run_id, "attempt": run.attempt, "at": now}
+                self.store.set_setting(completion_key, completed)
             result = observation.result
             if result is None:
-                if now - values["run_completed_at"] >= LOG_GRACE_SECONDS:
+                if now - completed["at"] >= LOG_GRACE_SECONDS:
                     if observation.result_absent and run.conclusion in {
                         "cancelled",
                         "timed_out",
@@ -5158,7 +5186,11 @@ class Controller:
                             outcome=outcome,
                             request_digest=result["request_digest"],
                         )
-        self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
+        if (
+            self._source_head_current(head, attempt)
+            and self.store.get_setting(f"source-ci:promotion-hold:{attempt['id']}") is None
+        ):
+            self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
 
     # --- promotion and landing ---------------------------------------------------------------------
 
@@ -5204,7 +5236,13 @@ class Controller:
             if self.candidate_ci is not None:
                 self.store.execute("DELETE FROM settings WHERE key=?", (f"source-ci:freeze-error:{batch['id']}",))
                 for recorded_attempt in self.store.rows("ci_attempts", {"batch_id": batch["id"]}):
-                    for category in ("evidence-error", "promotion-hold", "promotion-generation", "observed-verdict"):
+                    for category in (
+                        "evidence-error",
+                        "promotion-hold",
+                        "promotion-generation",
+                        "observed-verdict",
+                        "completion-seen",
+                    ):
                         self.store.execute(
                             "DELETE FROM settings WHERE key=?", (f"source-ci:{category}:{recorded_attempt['id']}",)
                         )
