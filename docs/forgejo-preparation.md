@@ -625,37 +625,51 @@ server-local principal ID, bound to the native source repository. The source API
 credential needs repository-admin permission to query other users' current
 permissions; Git publication still uses its separately supplied source bearer.
 
-Native scoreboard and recovery comments carry a versioned
-`tauceti-source:v1` binding naming the source origin/repository ID, authenticated
-issuer and producer's policy revision. Comment authorship alone grants no
+Native scoreboard and recovery comments carry a `tauceti-source:v2` binding
+naming the source origin/repository ID, authenticated issuer, publisher-policy
+generation and producer's policy revision. Comment authorship alone grants no
 authority: Forgejo repository writers may moderate another user's comments.
-The publisher freezes a versioned intent with a unique ID and the observed
-predecessor registration. It registers that intent through the native commit-status
-API, publishes a comment owned by that intent, then records its comment ID and
-SHA-256 digest in an append-only status. Registrations acquire their expected
-predecessor in native status-ID order; competing registrations for an already
-acquired predecessor are superseded. Admission orders publications by those
-registrations, so a late completion cannot revive an older verdict. It verifies
-the issuer's current permission, exact body and source binding.
-Edits, deletions, missing receipts and interrupted publications never expose an
-older green review as fresh authority. Ordinary contributors' same-name statuses
-cannot impersonate the configured issuer.
+A `tauceti-source-publication-intent/v3` record freezes a unique nonce, the exact
+body and a durable, increasing outbox sequence before any remote write. The
+sequence orders intent creation, including intents prepared during an outage;
+registration or completion delivery order never determines review precedence.
+Each intent owns a separate comment. Native append-only commit statuses register
+the intent first, then bind its comment ID and SHA-256 digest. Admission selects
+the greatest sequence and verifies current issuer permission, exact body and
+source binding. It never falls back to an older green verdict when the newest
+publication is pending, revoked, malformed, edited or deleted. Recovery clears
+use the same frozen-intent ordering, so an old clear cannot erase a newer hold.
 
-The consumer applies its current policy to the published facts. Queue-side prefix,
-allow-file or policy-code changes do not themselves discard a published review or
-recovery hold. A hold needs an explicit clear from a configured recovery publisher;
-revocation does not cause fallback to another publisher's older green verdict.
-The caller must freeze the versioned publication intent in its existing outbox
-before sending. Retries reconcile native statuses and comments; an older intent
-superseded by a newer publication stops rather than overwriting that publication.
-Each publication uses its own comment rather than editing another intent's
-scoreboard. In-progress review publications and initial scoreboards defer
-admission and promotion; they do not create permanent promotion holds.
-The queue remembers historical publisher IDs in its existing settings when
-admission starts. Removed issuers remain revocation barriers across restarts,
-including for CI statuses; removing an issuer cannot reveal an older green
-result. Preserve those settings when restoring the queue. Publisher bootstrap
-and credential rotation must use the same issuer history as the consumer.
+All publishers of one PR and kind must share the durable sequence allocator in
+the existing owner store. The queue uses its existing outbox row IDs and saves the
+complete intent in that row before sending. Retries preserve the nonce, body and
+sequence, including after a lost accepted response. A superseded intent settles
+without resending. A confirmed comment that was moderated raises
+`PublicationDamaged`; publish a new intent from the saved result rather than
+repeating inference. Review's trusted publication phase must integrate the same
+contract with its durable ledger before activation.
+
+`NativePublishers.generation` is a fresh random 128-bit hexadecimal value from
+trusted private publisher configuration. Generate it after revoking old
+credentials, and distribute it privately with the new grants before publishing.
+Changing publisher grants or restoring an account requires a fresh generation;
+the queue refuses reused generations in its existing settings. Publications from
+prior generations grant no authority, including facts planted while an account
+was unconfigured. Prefix, allow-file and ordinary consumer-policy changes keep
+the generation and reapply current rules to existing facts. Grant changes require
+republishing saved review results under the new generation, without new model
+work. Native PR CI statuses carry `tauceti-ci-status/v1:<generation>` descriptions;
+the latest status is selected before checking issuer authority. An untrusted
+writer can block these contexts, as it can with labels, but cannot grant approval.
+Legacy publication protocols grant no authority.
+
+In-progress publications and initial scoreboards defer admission and promotion
+for a bounded wait (six hours by default). Closed, draft, retargeted and held PRs
+are evaluated immediately. An abandoned publication becomes review-unsafe after
+the configured wait; an already inserted batch receives the existing explicit
+promotion hold, preserving its candidate and repair work for operator recovery.
+It is never silently rebuilt or merged. Publisher bootstrap, credential rotation
+and the tested operational recovery path remain activation requirements.
 Forgejo Actions remain disabled on the source repository.
 
 Promotion rereads the accepted PR heads and current review evidence. The trusted
@@ -671,8 +685,11 @@ their command intake and matching promotion checks are integrated.
 
 Discovery reads listing metadata and leaves detailed evidence to each PR's
 admission work item. Stable discovery metadata does not continuously re-dirty an
-evaluated PR. Native publication and CI status events invalidate their PRs;
-a fifteen-minute backstop also refreshes permissions and missed events.
+evaluated PR. Refresh versions use the poller's clock and configured interval,
+with per-PR offsets. Stock Forgejo 17 does not emit commit-status webhooks; native
+webhook ingress and immediate trusted publication notifications still need service
+bootstrap integration. Direct polling remains the backstop for source statuses
+and permissions, and promotion always rereads current approval evidence.
 Immutable commits already present in the controller clone are reused.
 An unreadable or changing PR cannot abort discovery for its siblings.
 This is a functional baseline, not a capacity result; query volume,
