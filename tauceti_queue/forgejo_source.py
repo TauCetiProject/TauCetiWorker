@@ -41,6 +41,11 @@ class PublicationSuperseded(RuntimeError):
 class PublicationDamaged(Incomplete):
     """Confirmed publication was moderated; prepare a new intent, never rerun inference."""
 
+    def __init__(self, message, *, number=None, nonce=None, publication_kind=None):
+        super().__init__(message)
+        self.number, self.nonce, self.publication_kind = number, nonce, publication_kind
+        self.head = None
+
 
 def principal(actor):
     return f"{actor.principal.forge.key}/users/{actor.principal.native_id}"
@@ -230,6 +235,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
                 if len(retired) > 4096:
                     raise ValueError("native publisher configuration history exceeds its bound")
             store.set_setting(key, {"current": current, "retired_generations": retired})
+            return previous != current
 
     @staticmethod
     def _positive(value):
@@ -369,6 +375,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         Selection never depends on a process-local history of trusted user IDs.
         """
         entries = []
+        retired_recovery = False
         seen = set()
         generation = self.admission_policy.publishers.generation
         for row in rows:
@@ -381,6 +388,23 @@ class ForgejoSourceAdapter(ForgejoGitSource):
                 raise Incomplete("native publication statuses are ambiguous")
             seen.add(status_id)
             description = row.get("description") or ""
+            if (
+                context.startswith(RECOVERY_CONTEXT)
+                and description.startswith(PUB_DESCRIPTION)
+                and not description.startswith(PUB_DESCRIPTION + generation + ":")
+            ):
+                retired_recovery = True
+            try:
+                actor = SourceActor.from_native(self.repository.forge, row.get("creator"))
+            except Incomplete:
+                actor = None
+            allowed = (
+                self.admission_policy.publishers.recoveries
+                if context.startswith(RECOVERY_CONTEXT)
+                else self.admission_policy.publishers.reviews
+            )
+            if actor is not None and actor.principal not in allowed:
+                continue
             if not description.startswith(PUB_DESCRIPTION + str(generation) + ":"):
                 if description.startswith("tauceti-pub/") and description.split(":", 2)[1:2] == [generation]:
                     raise Incomplete("unsupported native publication protocol for the current authority generation")
@@ -395,12 +419,10 @@ class ForgejoSourceAdapter(ForgejoGitSource):
                 or re.fullmatch(r"[0-9a-f]{64}", parts[4]) is None
             ):
                 raise Incomplete("native publication receipt is malformed")
-            try:
-                actor = SourceActor.from_native(self.repository.forge, row.get("creator"))
-            except Incomplete:
-                actor = None
             entries.append((int(parts[1]), parts[2], parts[3], parts[4], actor, row))
         if not entries:
+            if retired_recovery:
+                return 0, {"_stage": "retired", "_sequence": 0, "_nonce": "", "_digest": ""}, None
             return None
         sequence = max(r[0] for r in entries)
         selected = [r for r in entries if r[0] == sequence]
@@ -458,7 +480,12 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             return None, "clear"
         selected = [row for row in comments if isinstance(row, dict) and row.get("id") == int(stage)]
         if len(selected) != 1:
-            raise PublicationDamaged("native publication comment was removed or is unavailable")
+            raise PublicationDamaged(
+                "native publication comment was removed or is unavailable",
+                number=number,
+                nonce=stamp["_nonce"],
+                publication_kind="recovery" if context.startswith(RECOVERY_CONTEXT) else "review",
+            )
         row = selected[0]
         body = row.get("body")
         if (
@@ -467,7 +494,12 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             or hashlib.sha256(body.encode()).hexdigest() != stamp["_digest"]
             or not self._binding_matches(body, actor)
         ):
-            raise PublicationDamaged("native publication content no longer matches its issuer's receipt")
+            raise PublicationDamaged(
+                "native publication content no longer matches its issuer's receipt",
+                number=number,
+                nonce=stamp["_nonce"],
+                publication_kind="recovery" if context.startswith(RECOVERY_CONTEXT) else "review",
+            )
         return row, "success"
 
     def _comments(self, number, head, rows=None):
@@ -479,9 +511,13 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         review, review_state = self._publication_comment(
             number, rows, REVIEW_CONTEXT + str(number), publishers.reviews, comments
         )
-        recovery, recovery_state = self._publication_comment(
-            number, rows, RECOVERY_CONTEXT + str(number), publishers.recoveries, comments
-        )
+        try:
+            recovery, recovery_state = self._publication_comment(
+                number, rows, RECOVERY_CONTEXT + str(number), publishers.recoveries, comments
+            )
+        except PublicationDamaged as error:
+            error.head = head
+            raise
         return tuple(row for row in (review, recovery) if row is not None), review_state, recovery_state
 
     def _statuses(self, head, rows=None):
@@ -776,9 +812,9 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             and not self._binding_matches(intent["body"], actor)
         ):
             raise PermissionError("frozen native publication belongs to another issuer or source")
-        pull = self.fetch_pr(self.repository.name, intent["number"])
-        if pull.head_sha != intent["head"] or pull.state != "open":
-            raise PublicationSuperseded("native publication head changed")
+        # Facts belong to the accepted commit, including while a PR is closed or
+        # temporarily points elsewhere. Dropping a red intent would revive old
+        # green evidence if that PR later returned to the same head.
         context = (REVIEW_CONTEXT if intent["kind"] == "review" else RECOVERY_CONTEXT) + str(intent["number"])
         prefix = self._intent_prefix(intent)
         pending = prefix + ("clear-pending:" if intent["clear"] else "pending:") + intent["digest"]
@@ -830,24 +866,31 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         )
         return comment_id
 
-    def prepare_outbox_comment(self, repo, number, body, marker, *, sequence):
-        if policy.SCOREBOARD_MARKER in body:
-            meta = policy.parse_meta(body)
-            if not meta or not isinstance(meta.get("head_sha"), str):
-                raise ValueError("native scoreboard has no accepted head")
-            return self.prepare_publication(repo, number, meta["head_sha"], body, marker, sequence=sequence)
-        heads = set(policy.REBASE_MARKER_RE.findall(body)) | set(policy.STALLED_MARKER_RE.findall(body))
-        if body.startswith("Merge-queue recovery for head `") and heads:
-            if len(heads) != 1:
-                raise ValueError("native recovery publication has ambiguous heads")
-            return self.prepare_publication(repo, number, heads.pop(), body, marker, sequence=sequence, kind="recovery")
-        return None
+    def prepare_outbox_comment(self, repo, number, body, marker, *, sequence, publication=None):
+        if publication is None:
+            return None
+        if (
+            not isinstance(publication, dict)
+            or set(publication) != {"kind", "head", "clear"}
+            or publication["kind"] != "recovery"
+            or type(publication["clear"]) is not bool
+        ):
+            raise ValueError("queue publications require an explicit trusted recovery operation")
+        return self.prepare_publication(
+            repo,
+            number,
+            publication["head"],
+            body,
+            marker,
+            sequence=sequence,
+            kind="recovery",
+            clear=publication["clear"],
+        )
 
     def post_comment(self, repo, number, body, marker):
-        if policy.SCOREBOARD_MARKER in body or body.startswith("Merge-queue recovery for head `"):
-            raise Unsupported("freeze a native publication intent in the existing outbox before publishing")
         self._bound(repo)
         actor = SourceActor.from_native(self.repository.forge, self.client.current_user())
+        body = body.replace("<!--tauceti-", "&lt;!--tauceti-")
         full = self.admission_policy.bind_comment(
             self.admission_policy.append_provenance(body, comment_marker(marker)), actor
         )

@@ -403,7 +403,29 @@ class Controller:
         if self.native_source:
             configure_publishers = getattr(self.source, "configure_publisher_policy", None)
             if configure_publishers is not None:
-                configure_publishers(store)
+                with store.transaction():
+                    if configure_publishers(store):
+                        # Rebind only the latest desired recovery fact for each
+                        # accepted head. Preserve row IDs as its durable order.
+                        latest = {}
+                        for entry in store.rows("outbox", {"kind": "comment"}, order="id"):
+                            body = loads(entry["payload"], {})
+                            publication = body.get("publication") or {}
+                            if publication.get("kind") == "recovery":
+                                latest[(body["number"], publication["head"])] = (entry, body)
+                        for entry, body in latest.values():
+                            if body["publication"].get("clear"):
+                                continue  # Positive releases need a fresh explicit decision after rotation/restore.
+                            body.pop("native_intent", None)
+                            store.update(
+                                "outbox",
+                                {"id": entry["id"]},
+                                payload=dumps(body),
+                                state="pending",
+                                next_attempt_at=clock(),
+                                done_at=None,
+                                result="",
+                            )
         self.provenance_repository = source_identity.repository.key if self.native_source else repository
         self.revision = revision
         self.clock = clock
@@ -6110,6 +6132,65 @@ class Controller:
 
     # --- outbox ------------------------------------------------------------------------------------
 
+    def enqueue_source_recovery(self, repo, number, head, explanation, *, key, clear=False):
+        """Trusted controller operation; holds and clears share the existing outbox allocator."""
+        if (
+            not self.native_source
+            or type(number) is not int
+            or number < 1
+            or not isinstance(head, str)
+            or re.fullmatch(r"[0-9a-f]{40}", head) is None
+            or type(clear) is not bool
+            or not isinstance(explanation, str)
+            or not isinstance(key, str)
+            or not key
+        ):
+            raise ValueError("native recovery requires a qualified accepted head and durable intent key")
+        with self._lock, self.store.transaction():
+            self._check_repo(repo)
+            body = (
+                f"Merge-queue recovery for head `{head}`\n\n"
+                + explanation.replace("<!--tauceti-", "&lt;!--tauceti-")
+                + f"\n\n<!--tauceti-rebase:v1 {head}-->"
+            )
+            outbox_key = "native-recovery:" + key
+            self._enqueue(
+                "comment",
+                outbox_key,
+                {
+                    "number": number,
+                    "body": body,
+                    "marker": outbox_key,
+                    "publication": {"kind": "recovery", "head": head, "clear": clear},
+                },
+            )
+            return self.store.row("outbox", {"key": outbox_key})["id"]
+
+    def reconcile_source_recovery(self, number, head, nonce):
+        """Republish only the latest desired owned fact, never an older hold over a newer clear."""
+        if not self.native_source or not head or not nonce:
+            return False
+        with self._lock, self.store.transaction():
+            latest = None
+            for entry in self.store.rows("outbox", {"kind": "comment"}, order="id"):
+                payload = loads(entry["payload"], {})
+                publication = payload.get("publication") or {}
+                if (
+                    payload.get("number") == number
+                    and publication.get("kind") == "recovery"
+                    and publication.get("head") == head
+                ):
+                    latest = payload
+            if latest is None or (latest.get("native_intent") or {}).get("nonce") != nonce:
+                return False
+            key = "native-republish:" + nonce
+            if self.store.row("outbox", {"key": key}) is not None:
+                return False
+            latest.pop("native_intent", None)
+            self._enqueue("comment", key, latest)
+            self.store.journal(self.clock(), "native-publication-requeued", number=number, nonce=nonce)
+            return True
+
     def _enqueue(self, kind: str, key: str, payload: dict[str, Any]) -> None:
         now = self.clock()
         if self.store.row("outbox", {"key": key}) is not None:
@@ -6170,18 +6251,27 @@ class Controller:
             with self._lock.unlocked():
                 payload = loads(current["payload"], {})
                 prepare_comment = getattr(self.source, "prepare_outbox_comment", None)
+                frozen = payload.get("native_intent")
+                wrong_generation = bool(
+                    frozen
+                    and self.native_source
+                    and frozen.get("generation") != self.source.admission_policy.publishers.generation
+                )
                 if (
                     self.native_source
                     and current["kind"] == "comment"
-                    and "native_intent" not in payload
+                    and ("native_intent" not in payload or wrong_generation)
                     and prepare_comment is not None
                 ):
+                    if payload.get("publication") and not self.setting("publication_enabled"):
+                        return
                     intent = prepare_comment(
                         self.repository,
                         payload["number"],
                         payload["body"],
                         payload["marker"],
                         sequence=current["id"],
+                        publication=payload.get("publication"),
                     )
                     if intent is not None:
                         # Freeze before the first status/comment POST. A restart
@@ -6191,7 +6281,7 @@ class Controller:
                             if pending is None:
                                 return
                             payload = loads(pending["payload"], {})
-                            if "native_intent" not in payload:
+                            if "native_intent" not in payload or wrong_generation:
                                 payload["native_intent"] = intent
                                 self.store.update("outbox", {"id": current["id"]}, payload=dumps(payload))
                 result = self._perform(current["kind"], payload, now)
@@ -6202,6 +6292,14 @@ class Controller:
             if current is None:
                 return
             if error is not None:
+                if self.native_source and current["kind"] == "comment" and isinstance(error, PermissionError):
+                    self._outbox_done(
+                        current,
+                        loads(current["history"], []),
+                        "reconciliation-required: source publication grant is unavailable",
+                        now,
+                    )
+                    return
                 self._outbox_failed(current, loads(current["history"], []), error, now)
             else:
                 self._outbox_done(current, loads(current["history"], []), result, now)
@@ -6271,19 +6369,21 @@ class Controller:
             if "native_intent" in payload and self.native_source:
                 from .forgejo_source import PublicationDamaged, PublicationSuperseded
 
+                if (
+                    payload.get("publication", {}).get("kind") != "recovery"
+                    or payload["native_intent"].get("kind") != "recovery"
+                ):
+                    return "reconciliation-required: unsupported queued native publication"
+
                 try:
                     return "comment " + str(self.source.publish(payload["native_intent"]))
                 except PublicationSuperseded:
                     return "superseded native publication"
                 except PublicationDamaged:
-                    with self._lock:
-                        self.store.journal(
-                            now,
-                            "native-publication-damaged",
-                            number=payload["number"],
-                            nonce=payload["native_intent"]["nonce"],
-                        )
-                    return "reconciliation-required: confirmed native publication was moderated"
+                    repaired = self.reconcile_source_recovery(
+                        payload["number"], payload["publication"]["head"], payload["native_intent"]["nonce"]
+                    )
+                    return "native publication requeued" if repaired else "superseded damaged native publication"
             return "comment " + str(
                 self.source.post_comment(repo, payload["number"], payload["body"], payload["marker"])
             )

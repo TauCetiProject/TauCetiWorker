@@ -150,6 +150,34 @@ class NativeSource(unittest.TestCase):
     def read(self):
         return self.source._comments(1, "a" * 40, self.statuses())
 
+    def controller(self):
+        from queue_ci_requests import CONFIG
+        from queue_ci_requests import policy as execution_policy
+        from queue_source_ci import VerifiedExecution
+
+        from tauceti_queue.ci_requests import RequestLedger
+        from tauceti_queue.controller import Controller
+        from tauceti_queue.fakes import FakeClock
+        from tauceti_queue.source_ci import SourceCandidateCI
+
+        store = Store(str(self.clone / "controller.sqlite"))
+        self.addCleanup(store.close)
+        clock = FakeClock()
+        ledger = RequestLedger(store, self.clone, execution_policy(), CONFIG, workflow_revision="b" * 40)
+        ci = SourceCandidateCI(ledger, VerifiedExecution(), clock=clock)
+        controller = Controller(
+            store,
+            self.source,
+            str(self.clone),
+            self.repository.name,
+            revision="native-outbox",
+            candidate_ci=ci,
+            canonical_branch="main",
+            clock=clock,
+        )
+        controller.set_setting("publication_enabled", True, "owned fixture")
+        return controller, clock
+
     def test_native_policy_requires_qualified_source_local_publishers(self):
         with self.assertRaises(ValueError):
             NativePublishers(self.identity, frozenset(), self.publishers.statuses, generation="1" * 32)
@@ -207,7 +235,7 @@ class NativeSource(unittest.TestCase):
         forged = self.comment(actor=outsider, comment_id=2)
         self.rows.append(forged)
         self.status_rows.append(self.stamp(forged, actor=outsider, status_id=2))
-        self.assertEqual(self.read()[1], "revoked")
+        self.assertEqual(self.read()[0], (row,))
 
     def test_deleting_an_untrusted_actor_cannot_reveal_an_older_green(self):
         row = self.comment()
@@ -215,10 +243,31 @@ class NativeSource(unittest.TestCase):
         outsider = SourceActor.from_native(self.repository.forge, {"id": 99, "login": "writer"})
         newer = self.stamp(self.comment(actor=outsider, comment_id=2), actor=outsider, status_id=2)
         self.status_rows = [self.stamp(row), newer]
-        self.assertEqual(self.read()[1], "revoked")
+        self.assertEqual(self.read()[0], (row,))
         for stamp in newer:
             stamp["creator"] = None
         self.assertEqual(self.read()[1], "revoked")
+
+    def test_nonpublisher_cannot_poison_a_head_with_an_unrecoverable_sequence_or_malformed_record(self):
+        red = self.comment(body=self.body.replace("green", "blocking_request"))
+        self.rows = [red]
+        self.status_rows = [self.stamp(red)]
+        descriptions = [
+            PUB_DESCRIPTION + self.publishers.generation + f":{2**63 - 1}:" + "f" * 32 + ":pending:" + "f" * 64,
+            PUB_DESCRIPTION + self.publishers.generation + ":malformed",
+            "tauceti-pub/v99:" + self.publishers.generation + ":future",
+        ]
+        for i, description in enumerate(descriptions):
+            self.status_rows.append(
+                {
+                    "id": 100 + i,
+                    "context": REVIEW_CONTEXT + "1",
+                    "status": "success",
+                    "creator": {"id": 99, "login": "writer"},
+                    "description": description,
+                }
+            )
+        self.assertEqual(self.read()[0], (red,))
 
     def test_imported_unbound_and_spoofed_comment_authors_cannot_authorize(self):
         row = self.comment()
@@ -345,10 +394,10 @@ class NativeSource(unittest.TestCase):
     def test_offline_intents_delivered_in_order_keep_the_newer_red_verdict(self):
         first = self.prepare("team/Math", 1, "a" * 40, self.body, "review")
         second = self.prepare("team/Math", 1, "a" * 40, self.body.replace("green", "blocking_request"), "review")
-        self.source.fetch_pr.side_effect = ForgeError("outage before registration", status=503)
+        self.api.repository.side_effect = ForgeError("outage before registration", status=503)
         with self.assertRaises(ForgeError):
             self.source.publish(first)
-        self.source.fetch_pr.side_effect = None
+        self.api.repository.side_effect = None
         self.source.publish(first)
         expected = self.source.publish(second)
         self.assertEqual(str(self.read()[0][0]["id"]), expected)
@@ -465,7 +514,7 @@ class NativeSource(unittest.TestCase):
         with patch.object(self.source, "_permission", side_effect=ForgeError("forbidden", status=403)):
             self.assertEqual(self.source.publish(intent), expected)
 
-    def test_removed_publisher_remains_a_barrier_across_queue_restarts(self):
+    def test_review_rotation_requires_fresh_publication_after_queue_restart(self):
         green = self.comment(actor=self.queue)
         red = self.comment(comment_id=2, body=self.body.replace("green", "blocking_request"))
         self.rows = [green, red]
@@ -502,7 +551,7 @@ class NativeSource(unittest.TestCase):
             planted = self.comment()
             self.rows.append(planted)
             self.status_rows.append(self.stamp(planted, status_id=2))
-            self.assertEqual(self.read()[1], "revoked")
+            self.assertEqual(self.read()[1], "absent")
             restored = replace(self.publishers, generation="3" * 32)
             self.source.admission_policy.publishers = restored
             self.source.configure_publisher_policy(store)
@@ -513,6 +562,141 @@ class NativeSource(unittest.TestCase):
             self.source.admission_policy.publishers = self.publishers
             with self.assertRaises(ValueError):
                 self.source.configure_publisher_policy(store)
+
+    def test_generation_rotation_preserves_a_hold_until_a_new_explicit_clear(self):
+        self.source.publish(self.prepare("team/Math", 1, "a" * 40, self.body, "review", sequence=1))
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        hold = "Merge-queue recovery for head `" + "a" * 40 + "`\n<!--tauceti-rebase:v1 " + "a" * 40 + "-->"
+        self.source.publish(self.prepare("team/Math", 1, "a" * 40, hold, "hold", kind="recovery", sequence=1))
+        changed = replace(self.publishers, generation="2" * 32)
+        self.source.admission_policy = NativeAdmissionPolicy(
+            changed, rubrics=("proof",), prefix="Math/", allow_files=()
+        )
+        self.api.current_user.return_value = {"id": 7, "login": "reviewer"}
+        self.source.publish(self.prepare("team/Math", 1, "a" * 40, self.body, "new-review", sequence=1))
+
+        def decision():
+            comments, review, recovery = self.read()
+            snapshot = ports.AdmissionSnapshot(
+                ports.PullRequest(1, "a" * 40, "main", "Proof", "", "writer", "open"),
+                "b" * 40,
+                ("Math/A.lean",),
+                comments,
+                {"build": "success", "scope": "success", "_native_review": review, "_native_recovery": recovery},
+            )
+            return self.source.admission_policy.evaluate(snapshot)[0]
+
+        self.assertEqual(self.read()[2], "revoked")
+        self.assertFalse(decision()["merge"])
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        clear = self.prepare("team/Math", 1, "a" * 40, "", "new-clear", kind="recovery", clear=True, sequence=1)
+        self.source.publish(clear)
+        self.assertTrue(decision()["merge"])
+
+    def test_quoted_scoreboards_are_operational_prose_even_if_queue_is_also_a_reviewer(self):
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        self.source.admission_policy.publishers = replace(self.publishers, reviews=frozenset({self.queue.principal}))
+        for body in ["Agent quoted <!--tauceti-scoreboard-->", "Agent quoted:\n> " + self.body]:
+            self.assertIsNone(self.source.prepare_outbox_comment("team/Math", 1, body, "quoted", sequence=1))
+            self.source.post_comment("team/Math", 1, body, "quoted")
+        self.assertEqual(self.status_rows, [])
+        self.assertNotIn("<!--tauceti-scoreboard-->", self.rows[0]["body"])
+        with self.assertRaises(ValueError):
+            self.source.prepare_outbox_comment(
+                "team/Math",
+                1,
+                self.body,
+                "bad-kind",
+                sequence=1,
+                publication={"kind": "review", "head": "a" * 40, "clear": False},
+            )
+
+    def test_closed_or_temporarily_retargeted_heads_do_not_discard_a_new_verdict(self):
+        first = self.prepare("team/Math", 1, "a" * 40, self.body, "review")
+        red = self.prepare("team/Math", 1, "a" * 40, self.body.replace("green", "blocking_request"), "review")
+        self.source.publish(first)
+        self.source.fetch_pr.side_effect = AssertionError("current PR state cannot discard accepted-head facts")
+        self.source.publish(red)
+        self.assertIn("blocking_request", self.read()[0][0]["body"])
+
+    def test_recovery_hold_clear_and_next_hold_use_one_durable_allocator(self):
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        controller, clock = self.controller()
+        ids = [controller.enqueue_source_recovery("team/Math", 1, "a" * 40, "Hold", key="first")]
+        ids.append(controller.enqueue_source_recovery("team/Math", 1, "a" * 40, "Clear", key="clear", clear=True))
+        ids.append(controller.enqueue_source_recovery("team/Math", 1, "a" * 40, "Hold again", key="last"))
+        self.assertEqual(ids, sorted(set(ids)))
+        controller._drain_outbox(clock())
+        self.assertEqual(self.read()[2], "success")
+        self.assertIn("Hold again", self.read()[0][-1]["body"])
+        self.assertEqual(controller.store.rows("outbox", {"state": "pending"}), [])
+
+    def test_rotation_rebinds_frozen_hold_intents_and_never_replays_old_clears(self):
+        from tauceti_queue.controller import Controller
+
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        controller, clock = self.controller()
+        hold_id = controller.enqueue_source_recovery("team/Math", 1, "a" * 40, "Hold", key="first")
+        controller._drain_outbox(clock())
+        self.source.admission_policy = NativeAdmissionPolicy(
+            replace(self.publishers, generation="2" * 32), rubrics=("proof",), prefix="Math/", allow_files=()
+        )
+        restarted = Controller(
+            controller.store,
+            self.source,
+            str(self.clone),
+            self.repository.name,
+            revision="rotated",
+            candidate_ci=controller.candidate_ci,
+            canonical_branch="main",
+            clock=clock,
+        )
+        self.assertEqual(controller.store.row("outbox", {"id": hold_id})["state"], "pending")
+        restarted._drain_outbox(clock())
+        updated = json.loads(controller.store.row("outbox", {"id": hold_id})["payload"])["native_intent"]
+        self.assertEqual(updated["generation"], "2" * 32)
+        self.assertEqual(self.read()[2], "success")
+        clear_id = restarted.enqueue_source_recovery("team/Math", 1, "a" * 40, "Clear", key="clear", clear=True)
+        restarted._drain_outbox(clock())
+        self.source.admission_policy.publishers = replace(self.publishers, generation="3" * 32)
+        Controller(
+            controller.store,
+            self.source,
+            str(self.clone),
+            self.repository.name,
+            revision="rotated-again",
+            candidate_ci=controller.candidate_ci,
+            canonical_branch="main",
+            clock=clock,
+        )
+        self.assertEqual(controller.store.row("outbox", {"id": clear_id})["state"], "done")
+        self.assertEqual(self.read()[2], "revoked")
+
+    def test_moderated_owned_hold_requeues_once_without_overriding_a_newer_desired_clear(self):
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        controller, clock = self.controller()
+        entry = controller.enqueue_source_recovery("team/Math", 1, "a" * 40, "Hold", key="hold")
+        controller._drain_outbox(clock())
+        intent = json.loads(controller.store.row("outbox", {"id": entry})["payload"])["native_intent"]
+        self.rows[0]["body"] = "Moderated"
+        self.assertTrue(controller.reconcile_source_recovery(1, "a" * 40, intent["nonce"]))
+        self.assertFalse(controller.reconcile_source_recovery(1, "a" * 40, intent["nonce"]))
+        controller._drain_outbox(clock())
+        repaired = controller.store.rows("outbox", order="id")[-1]
+        repaired_intent = json.loads(repaired["payload"])["native_intent"]
+        self.assertEqual(self.read()[2], "success")
+        controller.enqueue_source_recovery("team/Math", 1, "a" * 40, "Clear", key="clear", clear=True)
+        self.assertFalse(controller.reconcile_source_recovery(1, "a" * 40, repaired_intent["nonce"]))
+
+    def test_missing_recovery_grant_settles_as_reconciliation_without_permanent_retry(self):
+        self.api.current_user.return_value = {"id": 8, "login": "queue"}
+        controller, clock = self.controller()
+        entry = controller.enqueue_source_recovery("team/Math", 1, "a" * 40, "Hold", key="hold")
+        self.source.admission_policy.publishers = replace(self.publishers, recoveries=frozenset())
+        controller._drain_outbox(clock())
+        settled = controller.store.row("outbox", {"id": entry})
+        self.assertEqual(settled["state"], "done")
+        self.assertIn("reconciliation-required", settled["result"])
 
     def test_native_publication_status_event_invalidates_an_unchanged_pr(self):
         from tauceti_queue.admission import AdmissionPoller
