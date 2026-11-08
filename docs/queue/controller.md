@@ -57,7 +57,7 @@ dispatch pushes the head's batch ref itself only when the outbox has not already
 Inputs: `waiting` -> `reserved` (during a probe) -> `inserted` (a member) -> `landed`; or
 `cancelled` with a reason (`unapproved`, `cancelled`, `closed`, `head-changed`, `draft`,
 `merged-externally`, `landed-externally`, `conflicts-with-main`, `superseded-by-new-approval`,
-`problem-anticipated`).
+`problem-anticipated`, `empty-commit`).
 A member is never withdrawn by its author or reviewers: `unapprove`, `cancel`, a closing or
 relabelling event on a member PR are journaled (`member-event-ignored`, `withdrawal-refused`) and
 change nothing, except that a `labeled`/`unlabeled` event for one of the `no_repair_labels` updates
@@ -347,6 +347,22 @@ Landing side effects replicate bors-ng's squash landing exactly (`lib/worker/bat
 (`membership_label`, default `bors-staging`) is added at insertion. The `Source-PR` trailer in the
 landed commit is the landing evidence; GitHub does not show the PR as merged.
 
+At landing, a final commit whose tree equals its parent's is rejected instead of merged, unless
+it is the existing placeholder for a PR merged externally or an opt-out withdrawal. Its input is
+`cancelled` with reason `empty-commit`, with no landing time or SHA. The `landed` journal entry
+lists these PRs under `rejected`; `prs_rejected` counts them, merged counters exclude them, and
+their per-PR feed outcome is `canceled`. The rejection comment quotes the explanations already
+accumulated from the commit message and names the retained staging ref. The existing outbox
+removes the membership label and closes the PR with its current title, without the merged prefix;
+closure checks the accepted head and skips a fresh approval, and label removal skips a PR that
+has joined a new batch.
+The existing admission withdrawal rules consume the old approval, so pending closure or reopening
+does not automatically requeue the rejected revision; a fresh review or approval can authorize another attempt.
+No new agent protocol or repair metadata is required. Intermediate and speculative empty commits
+have no rejection effect: the final authoritative commit decides. Empty placeholders remain in
+the chain, preserving its one-commit-per-member invariant, and canonical advances ignore them as
+evidence of a PR landing.
+
 Provenance and comments: at adoption, `chain.compare` pairs the prior chain with the replacement by
 `Source-PR`. A member reported `edited` becomes provenance `edited` with the adopting task, the
 appended explanation accumulated onto earlier ones and the commit SHA added to `edited_shas`; a
@@ -584,7 +600,7 @@ Tests are `tests/queue_fixture.py` (F), `tests/queue_controller.py` (C) and `tes
 | 11 authorized claim, second claimant and late result cannot compete | F `test_s6_s11_...`, `test_s11_renewal_keeps_a_claim_alive_and_release_frees_the_task`; C one-owner claim, expiry and release regressions (warm artifacts are stream G's) |
 | 12 restart recovers outbox, claims and CI state before repeating work | F `test_s12_restart_recovers_pending_outbox_expired_claim_and_repeats_no_work`, `test_s12_loop_runs_passes_on_wake_and_on_the_polling_interval` |
 | 13 inference hold | F `test_s13_inference_hold_stops_sealing_keeps_the_head_and_resumes_on_success`, `test_s13_hold_without_a_head_prevents_sealing_until_a_provider_call_succeeds`; C `Holds` |
-| 14 shrink to green | F `test_s14_shrink_to_green_lands_with_an_empty_commit_and_names_what_was_dropped` |
+| 14 shrink to green | F `test_s14_shrink_to_green_rejects_the_empty_contribution_and_names_what_was_dropped` |
 | 15 live activation | not expressible locally; the rehearsal (`docs/queue/rehearsal.md`) covers the scratch-repository half of the transition |
 | 16 post-admission problem reports do not withdraw | F `test_s16_s21_problem_reports_closures_and_relabelling_do_not_withdraw_a_member` |
 | 17 two source failures, no singletons, at most three full runs | F `test_s17_two_source_failures_land_with_three_full_runs_and_no_singletons` (counts only; the 120-minute bound is a pilot measurement) |

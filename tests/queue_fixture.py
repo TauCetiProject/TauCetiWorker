@@ -17,7 +17,8 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from tauceti_queue import admission_planning, chain, feeds  # noqa: E402
+from tauceti_queue import admission_planning, chain, feeds, monitoring  # noqa: E402
+from tauceti_queue.approval_poll import ApprovalPoller  # noqa: E402
 from tauceti_queue.controller import LOG_GRACE_SECONDS, MERGED_TITLE_PREFIX, ControllerError, TaskError  # noqa: E402
 from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller  # noqa: E402
 from tauceti_queue.loop import ReconciliationLoop  # noqa: E402
@@ -203,6 +204,11 @@ class CleanFlow(QueueFixture):
         self.tick(2)
         landed = self.first_parent_chain(head["base"], self.repo.main_sha())
         self.assertEqual([c.source_pr for c in landed], [c.source_pr for c in commits])
+        self.assertEqual(self.controller.input_for(PROJECT, 102)["reason"], "empty-commit")
+        self.assertEqual(self.github.closed[102], "Change 102")
+        [comment] = self.github.comments_for(102)
+        self.assertIn("The final staging commit is empty", comment["body"])
+        self.assertNotIn("The repair agent's explanation", comment["body"], "do not invent a reason for a clean empty")
 
     def test_s3_validation_accepts_membership_equivalent_replacement_in_another_order(self):
         self.github.ci_policy = verdicts("fail")
@@ -381,7 +387,7 @@ class Repair(QueueFixture):
         self.assertNotIn("edited this contribution", self.github.comments_for(103)[0]["body"])
         self.assertIn("edited this contribution", self.github.comments_for(102)[0]["body"])
 
-    def test_s14_shrink_to_green_lands_with_an_empty_commit_and_names_what_was_dropped(self):
+    def test_s14_shrink_to_green_rejects_the_empty_contribution_and_names_what_was_dropped(self):
         self.github.ci_policy = fail_members(102)
         self.approve(101, {"A.lean": "a\n"})
         self.approve(102, {"Hopeless.lean": "nope\n"})
@@ -410,7 +416,30 @@ class Repair(QueueFixture):
         self.assertIsNone(self.repo.file_at("main", "Hopeless.lean"))
         self.assertIn("Dropped Hopeless.lean", self.github.comments_for(102)[0]["body"])
         self.assertEqual(self.controller.status()["counters"]["shrink_to_empty"], 1)
-        self.assertEqual(self.controller.inputs()[1]["state"], "landed")
+        rejected = self.controller.inputs()[1]
+        self.assertEqual((rejected["state"], rejected["reason"]), ("cancelled", "empty-commit"))
+        self.assertIsNone(rejected["landed_at"])
+        self.assertIsNone(rejected["landed_sha"])
+        self.assertEqual(self.controller.status()["counters"]["prs_landed"], 1)
+        self.assertEqual(self.controller.status()["counters"]["prs_edited_landed"], 0)
+        self.assertEqual(self.controller.status()["counters"]["prs_rejected"], 1)
+        self.assertEqual(self.github.closed[102], "Change 102")
+        self.assertEqual(self.github.closed[101], MERGED_TITLE_PREFIX + "Change 101")
+        [comment] = self.github.comments_for(102)
+        self.assertIn("rejected during staging repair", comment["body"])
+        self.assertNotIn("successfully merged", comment["body"])
+        self.assertNotIn("bors-staging", self.github.labels[102])
+        self.assertNotIn("repaired-in-queue", self.github.labels[102])
+        outcomes = feeds.ControllerFeedSource(self.controller).outcomes(PROJECT, "main")
+        self.assertEqual({o.pr: o.state for o in outcomes}, {101: "ok", 102: "canceled"})
+        landed = self.controller.store.journal_entries("landed")[0]["detail"]
+        self.assertEqual((landed["members"], landed["rejected"]), ([101], [102]))
+        exported = monitoring.project(
+            self.controller.store.path, clock=self.clock, facts=monitoring.CommitFacts(self.repo.clone)
+        )
+        item = next(m for m in exported["members"] if m["pr"] == "102")
+        self.assertEqual(item["disposition"], "rejected_empty")
+        self.assertIsNone(item["landed_at"])
 
     def test_s17_two_source_failures_land_with_three_full_runs_and_no_singletons(self):
         self.github.ci_policy = fail_members(103, 105)
@@ -465,6 +494,198 @@ class Repair(QueueFixture):
         tip = silent.produce(task)
         adoption = self.controller.submit_task(task.task_id, task.claim_token, tip)
         self.assertTrue(adoption.accepted, adoption)
+
+
+class EmptyContributions(QueueFixture):
+    def repaired_empty(self, count=1):
+        self.github.ci_policy = verdicts("fail")
+        for number in range(101, 101 + count):
+            self.approve(number, {f"F{number}.lean": "broken\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        agent = self.agent(
+            script=lambda task: {
+                m.source_pr: Resolution(empty=True, explanation=f"Dropped F{m.number}.lean: could not repair it.")
+                for m in task.members
+            }
+        )
+        self.assertTrue(agent.run(self.controller).accepted)
+        self.assertEqual({i["state"] for i in self.controller.inputs()}, {"inserted"})
+        self.assertEqual(self.github.comments, [], "no rejection until the final batch lands")
+        return self.head()
+
+    def test_an_all_empty_batch_finishes_without_claiming_any_pr_merged(self):
+        head = self.repaired_empty(count=2)
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.head())
+        self.assertEqual(self.repo.main_sha(), head["tip"])
+        self.assertEqual({i["state"] for i in self.controller.inputs()}, {"cancelled"})
+        self.assertEqual(self.controller.status()["counters"]["prs_landed"], 0)
+        self.assertEqual(self.controller.status()["counters"]["prs_rejected"], 2)
+        self.assertEqual(self.github.closed, {101: "Change 101", 102: "Change 102"})
+        for number in (101, 102):
+            [comment] = self.github.comments_for(number)
+            self.assertIn(f"Dropped F{number}.lean", comment["body"])
+            self.assertNotIn("successfully merged", comment["body"])
+            self.assertNotIn("bors-staging", self.github.labels[number])
+        outcomes = feeds.ControllerFeedSource(self.controller).outcomes(PROJECT, "main")
+        self.assertEqual({o.state for o in outcomes}, {"canceled"})
+
+    def test_a_later_repair_restoring_content_is_merged(self):
+        self.repaired_empty()
+        self.github.ci_policy = verdicts("fail")
+        self.tick()
+        self.run_ci()
+        self.tick()
+        agent = self.agent(
+            name="restorer",
+            script=lambda task: {
+                f"{PROJECT}#101": Resolution({"F101.lean": "fixed\n"}, explanation="Restored a working contribution.")
+            },
+        )
+        self.github.ci_policy = verdicts()
+        self.assertTrue(agent.run(self.controller).accepted)
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.controller.inputs()[0]["state"], "landed")
+        self.assertEqual(self.repo.file_at("main", "F101.lean"), "fixed\n")
+        self.assertEqual(self.github.closed[101], MERGED_TITLE_PREFIX + "Change 101")
+        [comment] = self.github.comments_for(101)
+        self.assertIn("successfully merged", comment["body"])
+        self.assertIn("Restored a working contribution.", comment["body"])
+        self.assertEqual(self.controller.status()["counters"].get("prs_rejected", 0), 0)
+
+    def test_rejection_effects_survive_lost_responses_and_restart_without_duplicates(self):
+        self.repaired_empty()
+        self.tick()
+        self.run_ci()
+        post = self.github.post_comment
+        close = self.github.close_pr
+
+        def post_then_fail(*args):
+            post(*args)
+            raise RuntimeError("lost comment response")
+
+        def close_then_fail(*args):
+            close(*args)
+            raise RuntimeError("lost close response")
+
+        self.github.fail_next["set_labels"] = 1
+        with (
+            patch.object(self.github, "post_comment", side_effect=post_then_fail),
+            patch.object(self.github, "close_pr", side_effect=close_then_fail),
+        ):
+            self.tick(2)
+        self.assertEqual(self.controller.store.count("outbox", {"state": "pending"}), 3)
+        restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(restarted.store.close)
+        restarted.recover()
+        self.clock.advance(restarted.setting("outbox_retry_max_seconds"))
+        restarted.tick()
+        restarted.tick()
+        self.assertEqual(restarted.store.count("outbox", {"state": "pending"}), 0)
+        self.assertEqual(len(self.github.comments_for(101)), 1)
+        self.assertEqual(self.github.closed[101], "Change 101")
+        self.assertNotIn("bors-staging", self.github.labels[101])
+        self.assertEqual(restarted.status()["counters"]["prs_rejected"], 1)
+        self.assertEqual(restarted.status()["counters"]["prs_landed"], 0)
+        self.assertEqual(len(restarted.store.journal_entries("landed")), 1)
+
+    def test_delayed_rejection_preserves_a_new_members_membership_label(self):
+        head = self.repaired_empty()
+        self.tick()
+        self.run_ci()
+        self.github.fail_next.update(close_pr=1, set_labels=1)
+        self.tick(2)
+        self.assertNotIn(101, self.github.closed)
+        new_head = self.github.push_pr(101, {"F101.lean": "fixed\n"})
+        self.assertTrue(self.controller.approve(PROJECT, 101, new_head, "reviewer")["accepted"])
+        self.tick()
+        self.clock.advance(self.controller.setting("outbox_retry_seconds"))
+        self.tick()
+        self.assertEqual(self.github.prs[101]["state"], "open")
+        self.assertIn("bors-staging", self.github.labels[101])
+        for kind, result in (("close", "stale-head"), ("labels", "new-member")):
+            entry = self.controller.store.row("outbox", {"key": f"rejected-{kind}:{head['id']}:101"})
+            self.assertEqual(entry["result"], result)
+        outcomes = feeds.ControllerFeedSource(self.controller).outcomes(PROJECT, "main")
+        old = next(o for o in outcomes if o.batch_id == head["id"])
+        self.assertEqual(old.state, "canceled")
+
+    def test_delayed_rejection_removes_staging_label_after_an_unapproved_push(self):
+        head = self.repaired_empty()
+        self.tick()
+        self.run_ci()
+        self.github.fail_next.update(close_pr=1, set_labels=1)
+        self.tick(2)
+        self.github.push_pr(101, {"F101.lean": "fixed\n"})
+        self.clock.advance(self.controller.setting("outbox_retry_seconds"))
+        self.tick()
+        self.assertEqual(self.github.prs[101]["state"], "open")
+        self.assertNotIn("bors-staging", self.github.labels[101])
+        self.assertEqual(
+            self.controller.store.row("outbox", {"key": f"rejected-labels:{head['id']}:101"})["result"], "labels"
+        )
+
+    def test_delayed_close_does_not_override_fresh_approval_of_the_same_revision(self):
+        head = self.repaired_empty()
+        self.tick()
+        self.run_ci()
+        self.github.fail_next["close_pr"] = 1
+        self.tick(2)
+        accepted_head = self.controller.input_for(PROJECT, 101)["head_sha"]
+        self.assertTrue(self.controller.approve(PROJECT, 101, accepted_head, "reviewer")["accepted"])
+        self.tick()
+        self.clock.advance(self.controller.setting("outbox_retry_seconds"))
+        self.tick()
+        self.assertEqual(self.github.prs[101]["state"], "open")
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
+        self.assertEqual(
+            self.controller.store.row("outbox", {"key": f"rejected-close:{head['id']}:101"})["result"], "new-approval"
+        )
+
+    def test_external_landing_retries_after_a_transient_git_failure(self):
+        head = self.repaired_empty()
+        self.approve(102, {"Outside.lean": "outside\n"})
+        self.github.update_ref(PROJECT, "refs/heads/main", head["tip"])
+        self.repo.advance_main({"Outside.lean": "outside\n"}, message="Change 102 (#102)")
+        with patch.object(chain, "read_commit", side_effect=chain.ChainError("transient git failure")):
+            with self.assertRaises(chain.ChainError):
+                self.tick()
+        self.assertIsNotNone(self.head())
+        restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(restarted.store.close)
+        restarted.recover()
+        restarted.tick()
+        restarted.tick()
+        self.assertIsNone(restarted.store.row("batches", {"state": "head"}))
+        self.assertEqual(restarted.input_for(PROJECT, 101)["reason"], "empty-commit")
+        self.assertEqual(restarted.input_for(PROJECT, 102)["reason"], "landed-externally")
+        self.assertEqual(self.github.closed[101], "Change 101")
+
+    def test_failed_reapproval_preserves_the_rejected_revision(self):
+        self.repaired_empty()
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        row = self.controller.input_for(PROJECT, 101)
+        result = self.controller.approve(PROJECT, 101, row["head_sha"], "reviewer")
+        self.assertEqual((result["accepted"], result["reason"]), (False, "closed"))
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "empty-commit")
+
+    def test_external_canonical_advance_does_not_count_empty_placeholders_as_landed(self):
+        head = self.repaired_empty()
+        self.github.update_ref(PROJECT, "refs/heads/main", head["tip"])
+        with patch.object(self.controller, "_interacting_landed") as observe:
+            self.tick(2)
+        self.assertTrue(observe.call_args_list)
+        self.assertTrue(all(101 not in call.args[0] for call in observe.call_args_list))
+        self.assertEqual(self.controller.inputs()[0]["reason"], "empty-commit")
+        self.assertEqual(self.github.closed[101], "Change 101")
 
 
 class Claims(QueueFixture):
@@ -629,10 +850,28 @@ class HeadOperations(QueueFixture):
             self.controller.store.rows("outbox", {"kind": "labels", "key": f"repaired-label:{head['id']}:101"})
         )
         self.assertEqual(self.repo.file_at("main", "B.lean"), "b\n")
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "landed")
+        self.assertEqual(self.github.closed[101], MERGED_TITLE_PREFIX + "Change 101")
+        self.assertIn("successfully merged", self.github.comments_for(101)[0]["body"])
+        self.assertEqual(self.controller.status()["counters"].get("prs_rejected", 0), 0)
         self.assertEqual(
             sorted(c.source_pr for c in self.first_parent_chain(admin, self.repo.main_sha())),
             [f"{PROJECT}#101", f"{PROJECT}#102"],
         )
+
+        old_input = self.controller.input_for(PROJECT, 101)
+        self.github.prs[101]["state"] = "open"
+        new_head = self.github.push_pr(101, {"Followup.lean": "followup\n"})
+        self.assertTrue(self.controller.approve(PROJECT, 101, new_head, "reviewer")["accepted"])
+        self.assertEqual(self.controller.store.row("inputs", {"id": old_input["id"]})["state"], "landed")
+        outcomes = feeds.ControllerFeedSource(self.controller).outcomes(PROJECT, "main")
+        self.assertEqual(next(o for o in outcomes if o.pr == 101 and o.batch_id == head["id"]).state, "ok")
+        self.controller.unapprove(PROJECT, 101, "reviewer")
+        self.github.publish_check(101)
+        poller = ApprovalPoller(self.controller, self.github, PROJECT, clock=self.clock)
+        self.assertEqual(poller.run_once()["approved"], 0, "an old landed row must not hide a newer withdrawal")
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "unapproved")
+        self.assertEqual(self.controller._interacting_state(101), "gone")
 
     def test_s10_promotion_refused_after_an_advance_between_pass_and_push(self):
         self.approve(101, {"A.lean": "a\n"})
@@ -1667,6 +1906,9 @@ class RepairOrReject(QueueFixture):
         self.assertIsNone(self.controller.store.row("outbox", {"key": f"landed-close:{head['id']}:102"}))
         self.assertEqual(self.controller.store.journal_entries("landed")[0]["detail"]["withdrawn"], [102])
         self.assertEqual({i["number"]: i["state"] for i in self.controller.inputs()}[102], "cancelled")
+        outcomes = feeds.ControllerFeedSource(self.controller).outcomes(PROJECT, "main")
+        self.assertEqual({o.pr: o.state for o in outcomes}, {101: "ok", 102: "canceled"})
+        self.assertEqual(self.controller.status()["counters"].get("prs_rejected", 0), 0)
 
     def test_the_interacting_pr_landing_converts_the_withdrawal_to_needs_rebase(self):
         head = self.withdrawn_head()
@@ -1690,6 +1932,30 @@ class RepairOrReject(QueueFixture):
         self.tick(2)
         self.assertEqual(self.repo.file_at("main", "Other.lean"), "theorem foo' : True := trivial\n")
         self.assertIn(102, self.github.closed)
+
+    def test_a_rejected_interacting_pr_readmits_the_opt_out_withdrawal(self):
+        self.withdrawn_head()
+        self.github.ci_policy = verdicts("fail")
+        self.tick()
+        self.run_ci()
+        self.tick()
+        agent = self.agent(
+            name="second-repair",
+            script=lambda task: {
+                f"{PROJECT}#101": Resolution(empty=True, explanation="Dropped A: no contribution remained.")
+            },
+        )
+        self.github.ci_policy = verdicts()
+        self.assertTrue(agent.run(self.controller).accepted)
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "empty-commit")
+        row = self.controller.input_for(PROJECT, 102)
+        self.assertEqual(json.loads(row["anticipated"])["stage"], "readmitted")
+        self.assertNotIn("needs-rebase", self.github.labels[102])
+        self.assertNotIn(102, self.github.closed)
+        self.assertEqual(self.controller.store.journal_entries("needs-rebase"), [])
 
     def test_the_interacting_pr_leaving_the_queue_readmits_the_withdrawn_pr_at_its_original_age(self):
         approved_at = None
@@ -2127,6 +2393,8 @@ class PreRebase(QueueFixture):
             "the batch stays open on its own base with its own chain",
         )
         self.assertEqual((adopted["pre_rebase_state"], adopted["pre_rebase_tip"]), ("adopted", adoption.tip))
+        self.assertEqual(self.controller.input_for(PROJECT, 103)["state"], "inserted")
+        self.assertEqual(self.github.comments_for(103), [], "speculative repair does not reject a PR")
         # Insertion goes on; the next pass replays the new member onto the adopted chain.
         self.approve(104, {"D.lean": "d\n"})
         self.tick()
@@ -2152,6 +2420,11 @@ class PreRebase(QueueFixture):
         self.assertEqual(self.repo.file_at("main", "TauCeti/Use.lean"), "theorem uses : True := foo_baz\n")
         self.assertIn("edited this contribution", self.github.comments_for(102)[0]["body"])
         self.assertNotIn("edited this contribution", self.github.comments_for(104)[0]["body"])
+        self.assertEqual(self.controller.input_for(PROJECT, 103)["reason"], "empty-commit")
+        [comment] = self.github.comments_for(103)
+        self.assertIn("rejected during staging repair", comment["body"])
+        self.assertIn("#101 adds both_add.", comment["body"])
+        self.assertEqual(self.github.closed[103], "Change 103")
 
     def test_a_head_tip_change_supersedes_the_open_pre_rebase_task_and_redoes_it(self):
         self.github.ci_policy = verdicts("fail")

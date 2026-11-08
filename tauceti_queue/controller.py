@@ -770,10 +770,6 @@ class Controller:
                     return {"accepted": True, "reason": "already-approved", "input": self._input_for(pr)}
                 if existing["state"] == INPUT_INSERTED:
                     return {"accepted": False, "reason": "member", "input": existing}
-                # A different head while waiting: the previous approval no longer describes the source.
-                self.store.update(
-                    "inputs", {"id": existing["id"]}, state=INPUT_CANCELLED, reason="superseded-by-new-approval"
-                )
             if pull is None or pull.head_sha != head_sha:
                 pull, reason = self.validate_pull(repo, pr, head_sha)
                 if reason is not None:
@@ -787,6 +783,11 @@ class Controller:
             no_repair = self._carries_no_repair(getattr(pull, "labels", None))
             ref = self.input_ref(pr, head_sha)
             with self.store.transaction():
+                if existing is not None and existing["state"] in (INPUT_WAITING, INPUT_RESERVED):
+                    # A validated new approval supersedes the old waiting revision, preserving terminal history.
+                    self.store.update(
+                        "inputs", {"id": existing["id"]}, state=INPUT_CANCELLED, reason="superseded-by-new-approval"
+                    )
                 self._retain(ref, head_sha)
                 input_id = self.store.insert(
                     "inputs",
@@ -863,7 +864,7 @@ class Controller:
         return bool({str(label).lower() for label in labels or ()} & self._no_repair_labels())
 
     def input_for(self, repo: str, pr: int) -> dict[str, Any] | None:
-        """The PR's current input row (the newest that is not cancelled, else the newest), or None."""
+        """The PR's newest live input row, or its newest terminal row when none is live, or None."""
         with self._lock:
             self._check_repo(repo)
             return self._input_for(pr)
@@ -1041,10 +1042,10 @@ class Controller:
             return {"urgent": True, "state": current["state"]}
 
     def _input_for(self, pr: int) -> dict[str, Any] | None:
-        """The PR's current input: the newest row that is not cancelled, else the newest row."""
+        """The PR's newest live input, otherwise its newest terminal input."""
         rows = self.store.rows("inputs", {"repository": self.repository, "number": pr}, order="id DESC")
         for row in rows:
-            if row["state"] != INPUT_CANCELLED:
+            if row["state"] in (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED):
                 return row
         return rows[0] if rows else None
 
@@ -2447,27 +2448,29 @@ class Controller:
 
     def _observe_canonical(self, canonical: str, now: float) -> None:
         previous = self._canonical
-        self._canonical = canonical
         self._set_state("canonical_stale", False)
-        if canonical == previous:
-            return
-        self._set_state("canonical_sha", canonical)
-        self.store.journal(now, "canonical-advance", previous=previous, current=canonical)
         head = self._head()
         if head is not None and chain.is_ancestor(self.clone, head["tip"], canonical):
             how = "promoted" if head["expected_parent"] else "external"
             self._landed(head, how, now)
+        self._canonical = canonical
+        if canonical == previous:
+            return
+        self._set_state("canonical_sha", canonical)
+        self.store.journal(now, "canonical-advance", previous=previous, current=canonical)
         if previous and chain.is_ancestor(self.clone, previous, canonical):
             landed_prs: set[int] = set()
             bors_landed: set[int] = set()
-            withdrawn = {
-                m["commit_sha"] for m in self.store.rows("members", {"withdrawn": 1, "removed": 0}) if m["commit_sha"]
-            }
             try:
+                trees = {previous: chain.tree_of(self.clone, previous)}
                 for commit in chain.chain_commits(self.clone, previous, canonical):
                     source = commit.source_pr
-                    if commit.sha in withdrawn:
-                        continue  # a withdrawn member's empty commit lands nothing
+                    empty = len(commit.parents) == 1 and commit.tree == (
+                        trees.get(commit.parents[0]) or chain.tree_of(self.clone, commit.parents[0])
+                    )
+                    trees[commit.sha] = commit.tree
+                    if empty:
+                        continue  # an empty placeholder lands no contribution
                     if source and source.startswith(f"{self.repository}#"):
                         landed_prs.add(int(source.rsplit("#", 1)[1]))
                     elif not source:
@@ -5431,7 +5434,17 @@ class Controller:
         # landed, commented on or closed (`_anticipate` told its author why).
         everyone = self._members(batch["id"])
         withdrawn = [m["number"] for m in everyone if m["withdrawn"]]
-        members = [m for m in everyone if not m["withdrawn"]]
+        rejected = []
+        members = []
+        for member in everyone:
+            if member["withdrawn"]:
+                continue
+            commit = chain.read_commit(self.clone, member["commit_sha"])
+            empty = len(commit.parents) == 1 and commit.tree == chain.tree_of(self.clone, commit.parents[0])
+            if empty and not chain.carries_landed_note(commit.message):
+                rejected.append(member)
+            else:
+                members.append(member)
         with self.store.transaction():
             self.store.update("batches", {"id": batch["id"]}, state=BATCH_LANDED, landed_at=now, landed_how=how)
             if self.candidate_ci is not None:
@@ -5456,6 +5469,17 @@ class Controller:
                     landed_at=now,
                     landed_sha=member["commit_sha"],
                 )
+            for member in rejected:
+                if self.admission is not None:
+                    self.admission.withdraw(member["number"], member["accepted_head"])
+                self.store.update(
+                    "inputs",
+                    {"id": member["input_id"]},
+                    state=INPUT_CANCELLED,
+                    reason="empty-commit",
+                    landed_at=None,
+                    landed_sha=None,
+                )
             for stale in self.store.rows("tasks", {"batch_id": batch["id"], "state": TASK_OPEN}):
                 self.store.update(
                     "tasks", {"id": stale["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="landed"
@@ -5465,6 +5489,8 @@ class Controller:
             self._count("heads_landed")
             self._count("prs_landed", len(members))
             self._count("prs_edited_landed", sum(1 for m in members if m["provenance"] == "edited"))
+            if rejected:
+                self._count("prs_rejected", len(rejected))
             if batch["first_dispatch_at"]:
                 cycles = self._state("head_cycle_seconds", [])
                 cycles.append(round(now - batch["first_dispatch_at"], 1))
@@ -5477,13 +5503,49 @@ class Controller:
                 tip=batch["tip"],
                 members=[m["number"] for m in members],
                 **({"withdrawn": withdrawn} if withdrawn else {}),
+                **({"rejected": [m["number"] for m in rejected]} if rejected else {}),
             )
             if self.setting("publication_enabled"):
                 for member in members:
                     self._enqueue_landing_effects(batch, member)
+                for member in rejected:
+                    self._enqueue_rejection_effects(batch, member)
             self._interacting_landed({m["number"] for m in members}, now)
         self._cancel_superseded_runs(batch["id"], now, reason="batch landed")
         self._wake.set()
+
+    def _enqueue_rejection_effects(self, batch: dict[str, Any], member: dict[str, Any]) -> None:
+        number = member["number"]
+        action = "during staging repair of" if member["provenance"] != "clean" else "from staging"
+        lines = [
+            f"Pull request rejected {action} batch {batch['id']}: no contribution remained.",
+            "",
+            f"The final staging commit is empty. This PR was not merged into `{self.canonical_branch}`.",
+            "",
+            f"Rejected revision: `{member['accepted_head']}`.",
+        ]
+        if member["explanation"].strip():
+            lines += ["", "The repair agent's explanation:", ""]
+            lines += [f"> {line}" if line else ">" for line in member["explanation"].splitlines()]
+        lines += ["", f"The staging history is retained under `{self.batch_ref(batch['id'], batch['version'])}`."]
+        marker = f"<!-- {COMMENT_MARKER} rejected:{self.repository}#{number}:{batch['id']}:{member['commit_sha']} -->"
+        self._enqueue(
+            "comment",
+            f"rejected-comment:{batch['id']}:{number}",
+            {"number": number, "body": "\n".join(lines) + "\n\n" + marker, "marker": marker},
+        )
+        label = self.setting("membership_label")
+        if label:
+            self._enqueue(
+                "labels",
+                f"rejected-labels:{batch['id']}:{number}",
+                {"number": number, "add": [], "remove": [label], "input_id": member["input_id"]},
+            )
+        self._enqueue(
+            "close_pr",
+            f"rejected-close:{batch['id']}:{number}",
+            {"number": number, "rejected": True, "head_sha": member["accepted_head"], "input_id": member["input_id"]},
+        )
 
     def _enqueue_landing_effects(self, batch: dict[str, Any], member: dict[str, Any]) -> None:
         number = member["number"]
@@ -6060,6 +6122,11 @@ class Controller:
                 work = self.store.row("admission_work", {"repository": repo, "number": payload["number"]})
                 if work["generation"] != payload["admission_generation"]:
                     return "stale-admission"
+            elif "input_id" in payload:
+                with self._lock:
+                    current = self._input_for(payload["number"])
+                    if current and current["id"] != payload["input_id"] and current["state"] == INPUT_INSERTED:
+                        return "new-member"
             self._ensure_labels(repo, payload.get("ensure", []))
             self.source.set_labels(repo, payload["number"], payload.get("add", []), payload.get("remove", []))
             return "labels"
@@ -6067,7 +6134,20 @@ class Controller:
             pull = self.source.fetch_pr(repo, payload["number"])
             if pull.state == "closed":
                 return "already-closed"
-            title = pull.title if pull.title.startswith(MERGED_TITLE_PREFIX) else MERGED_TITLE_PREFIX + pull.title
+            if payload.get("rejected"):
+                if pull.head_sha != payload["head_sha"]:
+                    return "stale-head"
+                with self._lock:
+                    current = self._input_for(payload["number"])
+                    if (
+                        current
+                        and current["id"] != payload["input_id"]
+                        and current["state"] in (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED)
+                    ):
+                        return "new-approval"
+                title = pull.title
+            else:
+                title = pull.title if pull.title.startswith(MERGED_TITLE_PREFIX) else MERGED_TITLE_PREFIX + pull.title
             self.source.close_pr(repo, payload["number"], title)
             return "closed"
         if kind == "promote":

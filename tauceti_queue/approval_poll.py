@@ -13,7 +13,8 @@ PR moved to another head, was closed or became a draft is told the way the webho
 (`controller.handle_event` with the equivalent `pull_request` action); a member PR is journaled and
 left alone, as the webhook path does. A decision the controller already consumed is not applied
 again: an input cancelled at the same head (withdrawn by `bors r-`, conflicting with the canonical
-branch, landed by other means, withdrawn as `problem-anticipated`) stays cancelled until a newer check (a higher id) decides again, as
+branch, landed by other means, withdrawn as `problem-anticipated`, or rejected as an empty contribution)
+stays cancelled until a newer check (a higher id) decides again, as
 it would under the webhook path, which only acts on new deliveries.
 
 Budget: one listing (GraphQL, ~12 calls for 1,200 open PRs) plus, per difference found, the calls
@@ -268,6 +269,7 @@ def _consumed(row: dict[str, Any], decision: eligibility.Decision) -> bool:
         "conflicts-with-main",
         "landed-externally",
         "problem-anticipated",
+        "empty-commit",
     )
 
 

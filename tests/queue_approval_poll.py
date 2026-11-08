@@ -149,6 +149,15 @@ class Revocation(PollCase):
         self.assertEqual(self.poller.run_once()["approved"], 1)
         self.assertEqual([r["head_sha"] for r in self.controller.inputs("waiting")], [new])
 
+    def test_a_rejected_manual_approval_is_not_readmitted_by_the_old_eligibility_check(self):
+        head = self.github.create_pr(1, {"P1.lean": "x\n"})
+        self.controller.approve(PROJECT, 1, head, "reviewer")
+        row = self.controller.input_for(PROJECT, 1)
+        self.controller.store.update("inputs", {"id": row["id"]}, state="cancelled", reason="empty-commit")
+        self.github.publish_check(1)
+        self.assertEqual(self.poller.run_once()["approved"], 0)
+        self.assertEqual(len(self.controller.inputs()), 1)
+
     def test_closed_and_draft_prs_withdraw_their_inputs(self):
         self.approved(1)
         self.approved(2)
