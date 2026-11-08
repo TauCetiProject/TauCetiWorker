@@ -714,6 +714,7 @@ class OlderStore(ControllerCase):
             "sent_at",
             "dispatch_retry_at",
             "dispatch_retryable",
+            "dispatch_failures",
             *CANCEL_COLUMNS,
         ):
             columns.remove(column)
@@ -739,6 +740,7 @@ class OlderStore(ControllerCase):
             "sent_at",
             "dispatch_retry_at",
             "dispatch_retryable",
+            "dispatch_failures",
             *CANCEL_COLUMNS,
         ):
             self.assertIn(column, present)

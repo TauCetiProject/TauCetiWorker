@@ -416,6 +416,12 @@ def project(
         def rows(sql, params=()):
             return [dict(r) for r in conn.execute(sql, params)]
 
+        if rows("SELECT key FROM settings WHERE key='source-ci:binding'"):
+            # This projection's public allowlist and URLs identify GitHub names,
+            # not qualified source repositories. Refuse rather than publishing
+            # native records under an unrelated github.com owner/name.
+            raise ValueError("source-bound queue requires a qualified public monitoring policy")
+
         batches = rows(
             "SELECT id,repository,version,base,tip,state,created_at,sealed_at,landed_at,"
             "first_dispatch_at,pre_rebase_state,pre_rebase_tip,pre_rebase_onto,pre_rebase_prepared "

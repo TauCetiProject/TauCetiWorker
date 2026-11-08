@@ -602,7 +602,14 @@ class Handler(BaseHTTPRequestHandler):
         if not self._admin(identity[0]):
             return
         repo = str(body.get("repo") or next(iter(self.server.config.repositories.values()), ""))
-        self._call(lambda: self.server.controller.retry_ci(repo, identity[0]))
+        request_id = body.get("request_id")
+        if request_id is not None:
+            if not isinstance(request_id, str) or not re.fullmatch(r"[0-9a-f]{32}", request_id):
+                self._error(400, "`request_id` must be the exact 32-character request nonce")
+                return
+            self._call(lambda: self.server.controller.retry_ci(repo, identity[0], request_id=request_id))
+        else:
+            self._call(lambda: self.server.controller.retry_ci(repo, identity[0]))
 
     def _task_inference(self) -> None:
         """A worker reports whether an inference call succeeded (`report_inference`), for the hold."""
