@@ -4,6 +4,7 @@
 import sys
 import tempfile
 import unittest
+import urllib.error
 import urllib.request
 from dataclasses import replace
 from pathlib import Path
@@ -83,6 +84,7 @@ class Bootstrap(unittest.TestCase):
             "source-git-token",
             self.tokens,
             b"x" * 32,
+            source_git_client_factory=self.native.authority._client_factory,
         )
         self.services = []
         self.addCleanup(self.close_services)
@@ -96,6 +98,8 @@ class Bootstrap(unittest.TestCase):
 
     def service(self, bootstrap=None, config=None):
         config = config or self.config
+        if self.services:
+            config = replace(config, database=config.database.with_name("queue-" + str(len(self.services)) + ".sqlite"))
         service = Service(
             config,
             ServiceRuntime.start(config, Revision("a" * 40, False, "fixture")),
@@ -121,9 +125,18 @@ class Bootstrap(unittest.TestCase):
             self.assertEqual(response.status, 200)
         with urllib.request.urlopen(f"http://{host}:{port}/status", timeout=5) as response:
             self.assertEqual(response.status, 200)
+        for headers, expected in [({}, 401), ({"Content-Length": str(1024 * 1024 + 1)}, 413)]:
+            request = urllib.request.Request(f"http://{host}:{port}/webhook/forgejo", data=b"{}", headers=headers)
+            with self.assertRaises(urllib.error.HTTPError) as refused:
+                urllib.request.urlopen(request, timeout=5)
+            self.assertEqual(refused.exception.code, expected)
+            refused.exception.close()
         self.assertEqual(
             self.native.calls,
-            [("GET", f"repositories/{self.policy.source.native_id}/effective_access", "controller-source-token")],
+            [
+                ("GET", f"repositories/{self.policy.source.native_id}/effective_access", "controller-source-token"),
+                ("GET", f"repositories/{self.policy.source.native_id}/effective_access", "source-git-token"),
+            ],
         )
 
     def test_source_branch_and_execution_repository_mismatches_fail_before_source_reads(self):
@@ -169,6 +182,50 @@ class Bootstrap(unittest.TestCase):
             self.service(bootstrap=replace(self.bootstrap, control_policy=None)).build_controller()
         with self.assertRaises(ValueError):
             Service(self.config, ServiceRuntime.start(self.config), native=object())
+
+    def test_a_second_native_service_cannot_write_the_same_store_before_the_first_stops(self):
+        service = self.service()
+        other = Service(self.config, ServiceRuntime.start(self.config), native=self.bootstrap)
+        self.services.append(other)
+        with self.assertRaises(BlockingIOError):
+            other.open_store()
+        self.assertIsNone(other.store)
+        service.shutdown()
+        service.store = None
+        other.open_store()
+        self.assertIsNotNone(other.store)
+
+    def test_git_credential_is_observed_separately_and_must_match_the_api_actor(self):
+        from tauceti_queue.source_authority import QueueControlPolicy, control_token_fingerprint
+
+        enrolled = QueueControlPolicy(
+            self.policy.source, frozenset({control_token_fingerprint(self.policy.source, "source-git-token")})
+        )
+        with self.assertRaisesRegex(ValueError, "publication credential"):
+            self.service(bootstrap=replace(self.bootstrap, control_policy=enrolled)).build_controller()
+
+        def alternate(forge, **kwargs):
+            client = self.native.authority._client_factory(forge, **kwargs)
+            original = client.request
+
+            def request(*args):
+                row = original(*args)
+                row["user"] = {"id": 99, "login": "other-writer"}
+                return row
+
+            client.request = request
+            return client
+
+        with self.assertRaisesRegex(SourceAccessDenied, "another actor"):
+            self.service(bootstrap=replace(self.bootstrap, source_git_client_factory=alternate)).build_controller()
+
+    def test_controller_review_role_and_non_ascii_webhook_secrets_are_refused(self):
+        actor = next(iter(self.bootstrap.publishers.statuses))
+        changed = replace(self.bootstrap.publishers, reviews=frozenset({actor}))
+        with self.assertRaisesRegex(SourceAccessDenied, "separate"):
+            self.service(bootstrap=replace(self.bootstrap, publishers=changed)).build_controller()
+        with self.assertRaises(ValueError):
+            self.service(bootstrap=replace(self.bootstrap, source_webhook_secret=b"\xff" * 32)).build_controller()
 
 
 if __name__ == "__main__":

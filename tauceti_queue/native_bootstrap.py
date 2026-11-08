@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 
 from tauceti_tools import ci_candidate as cc
-from tauceti_tools.forge import ForgeError, Incomplete
+from tauceti_tools.forge import ForgeError, Forgejo, Incomplete
 
 from .admission import AdmissionPoller
 from .admission import policy as review_policy
@@ -28,6 +28,7 @@ from .source_authority import (
     SourceAuthorityUnavailable,
 )
 from .source_ci import SourceCandidateCI
+from .workflow_token import WorkflowTokenSource
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class NativeBootstrap:
     source_git_token: str = field(repr=False)
     execution_tokens: object = field(repr=False)
     source_webhook_secret: bytes = field(repr=False)
+    source_git_client_factory: object = field(default=Forgejo, repr=False, kw_only=True)
 
     def build(self, config, store, *, revision, clock=time.time):
         """Validate every binding before constructing the live controller."""
@@ -70,8 +72,19 @@ class NativeBootstrap:
             or getattr(self.execution_tokens, "repository_id", None) != approved.execution.native_id
             or not isinstance(self.source_webhook_secret, bytes)
             or len(self.source_webhook_secret) < 32
+            or any(not 33 <= c <= 126 for c in self.source_webhook_secret)
         ):
             raise ValueError("native service credentials must bind the approved source and execution origins")
+        if self.control_policy.permits(self.source_git_token):
+            raise ValueError("queue controls must not enroll the controller publication credential")
+        if isinstance(self.execution_tokens, WorkflowTokenSource):
+            job = self.execution_tokens.job
+            if (
+                job.repository != approved.execution
+                or job.revision != self.workflow_revision
+                or job.branch != approved.execution_branch
+            ):
+                raise ValueError("native workflow credential launch differs from the approved execution policy")
         # Constructors validate exact configuration bytes, repository IDs,
         # immutable workflow revision and token-provider resource restrictions.
         # No generic gh/PAT fallback can supply execution credentials.
@@ -82,18 +95,39 @@ class NativeBootstrap:
                 approved.source.repository,
                 self.source_client.request("GET", f"repositories/{approved.source.native_id}/effective_access"),
             )
-        except (ForgeError, Incomplete):
+            git_client = self.source_git_client_factory(
+                approved.source.repository.forge, token=self.source_git_token, timeout=10, max_bytes=1024 * 1024
+            )
+            git_access = QueueRepositoryAccess.from_effective(
+                approved.source.repository,
+                git_client.request("GET", f"repositories/{approved.source.native_id}/effective_access"),
+            )
+        except ForgeError as error:
+            if error.status in {401, 403, 404}:
+                raise SourceAccessDenied("native source credential was refused") from None
+            raise SourceAuthorityUnavailable(
+                "native service requires current effective source credential access"
+            ) from None
+        except Incomplete:
             raise SourceAuthorityUnavailable(
                 "native service requires current effective source credential access"
             ) from None
         authority.require_admin(access)
+        authority.require_admin(git_access)
         if access.repository_id != approved.source.native_id:
             raise SourceAccessDenied("native service source repository identity changed")
+        if (
+            git_access.repository_id != approved.source.native_id
+            or git_access.actor.principal != access.actor.principal
+        ):
+            raise SourceAccessDenied("native Git publication credential belongs to another actor or repository")
         if (
             access.actor.principal not in self.publishers.statuses
             or access.actor.principal not in self.publishers.recoveries
         ):
             raise SourceAccessDenied("controller source actor is not an approved status and recovery publisher")
+        if access.actor.principal in self.publishers.reviews:
+            raise SourceAccessDenied("controller publication actor must be separate from trusted review publishers")
         ledger = RequestLedger(
             store, config.content_clone, approved, self.configuration, workflow_revision=self.workflow_revision
         )
@@ -127,6 +161,7 @@ class NativeBootstrap:
             canonical_branch=approved.base_branch,
             clock=clock,
         )
+        controller.source_actor = access.actor
         poller = AdmissionPoller(controller, source, config.repository, admission, clock=clock)
         http = ServerConfig(
             webhook_secret=self.source_webhook_secret,

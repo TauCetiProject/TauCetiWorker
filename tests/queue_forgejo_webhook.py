@@ -25,6 +25,7 @@ class Webhooks(unittest.TestCase):
         root = tempfile.TemporaryDirectory()
         self.addCleanup(root.cleanup)
         self.controller, adapter, _repo, clock = make_controller(root.name, repository="team/Math")
+        self.adapter = adapter
         self.addCleanup(self.controller.store.close)
         self.poller = AdmissionPoller(
             self.controller,
@@ -53,13 +54,17 @@ class Webhooks(unittest.TestCase):
         return self.receiver.handle(body, event=event, delivery=delivery, signature=signature)
 
     def test_signed_delivery_records_pending_work_without_granting_approval(self):
+        head = self.adapter.create_pr(1, {"Math/A.lean": "example : True := trivial\n"})
+        self.payload["pull_request"]["head"]["sha"] = head
         self.assertEqual(self.send(), "invalidated")
         work = self.poller.state.get(1)
-        self.assertEqual(work["head_sha"], "a" * 40)
+        self.assertEqual(work["head_sha"], head)
         self.assertNotEqual(work["generation"], work["evaluated_generation"])
         self.assertEqual(self.controller.store.rows("inputs"), [])
         self.assertEqual(self.send(), "duplicate")
         self.assertEqual(self.poller.state.get(1)["generation"], work["generation"])
+        self.poller.run_once()  # The actual primary policy still refuses a PR with no completed review.
+        self.assertEqual(self.controller.store.rows("inputs"), [])
 
     def test_bad_signature_or_another_repository_or_server_cannot_invalidate(self):
         with self.assertRaises(PermissionError):
@@ -102,8 +107,61 @@ class Webhooks(unittest.TestCase):
         epoch = self.poller._source_epoch()
         self.send({**self.payload, "ref": "refs/heads/main"}, event="push")
         self.assertEqual(self.poller._source_epoch(), epoch + 1)
+        self.poller._discovery_at = 10**12
+        self.controller.store.set_setting("state:admission_discovery", {"retry_at": 10**12})
         self.send({**self.payload, "ref": "refs/heads/contributor"}, event="push", delivery="other")
         self.assertEqual(self.poller._discovery_at, 0)
+        self.assertEqual(self.controller.store.get_setting("state:admission_discovery")["retry_at"], 0)
+
+    def test_routine_prose_and_title_only_changes_do_not_dirty_a_pr(self):
+        payload = {
+            "repository": self.payload["repository"],
+            "is_pull": True,
+            "issue": {"number": 1},
+            "comment": {"body": "Routine conversation"},
+            "action": "created",
+        }
+        self.assertEqual(self.send(payload, event="issue_comment"), "ignored")
+        edited = {**self.payload, "action": "edited", "changes": {"title": {"from": "old"}}}
+        self.assertEqual(self.send(edited, delivery="title"), "ignored")
+        self.assertIsNone(self.poller.state.get(1))
+
+    def test_native_review_event_names_are_only_invalidations_and_non_pull_comments_are_ignored(self):
+        for name in ["pull_request_approved", "pull_request_rejected", "pull_request_comment"]:
+            self.assertEqual(self.send(event=name, delivery=name.replace("_", "-")), "invalidated")
+        issue = {
+            "repository": self.payload["repository"],
+            "is_pull": False,
+            "issue": {"number": 2},
+            "comment": {"body": "<!--tauceti-scoreboard-->"},
+        }
+        self.assertEqual(self.send(issue, event="issue_comment", delivery="not-a-pr"), "ignored")
+        self.assertIsNone(self.poller.state.get(2))
+
+    def test_controller_output_is_ignored_and_nonpublisher_marker_comments_are_not_urgent(self):
+        from tauceti_worker.source_identity import SourceActor
+
+        self.controller.source_actor = SourceActor.from_native(
+            self.source.repository.forge, {"id": 7, "login": "queue"}
+        )
+        payload = {
+            "repository": self.payload["repository"],
+            "is_pull": True,
+            "issue": {"number": 1},
+            "sender": {"id": 7},
+            "comment": {"body": "<!--tauceti-scoreboard-->"},
+        }
+        self.assertEqual(self.send(payload, event="issue_comment"), "ignored")
+        payload["sender"] = {"id": 99}
+        self.assertEqual(self.send(payload, event="issue_comment", delivery="non-publisher"), "invalidated")
+        self.assertEqual(self.poller.state.get(1)["urgent"], 0)
+
+    def test_malformed_native_structures_are_refused_as_bad_payloads(self):
+        for change in [{"pull_request": []}, {"pull_request": {"head": []}}, {"sender": []}]:
+            # Non-empty wrong-shaped values cannot be treated as absent records.
+            change = {k: ([1] if v == [] else {"head": [1]}) for k, v in change.items()}
+            with self.assertRaises(ValueError):
+                self.send({**self.payload, **change})
 
     def test_delivery_identity_reuse_with_different_body_is_refused(self):
         self.send()

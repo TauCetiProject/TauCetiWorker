@@ -45,6 +45,7 @@ class Integration(unittest.TestCase):
             ),
         ):
             admin.request("PUT", f"repos/{repository.name}/collaborators/queue", {"permission": "admin"})
+            admin.request("PUT", f"repos/{repository.name}/collaborators/worker", {"permission": "admin"})
             api = Forgejo(repository.forge, token=tokens["queue"])
             reviewer = Forgejo(repository.forge, token=tokens["reviewer"])
             queue_actor = SourceActor.from_native(repository.forge, api.current_user())
@@ -86,7 +87,7 @@ class Integration(unittest.TestCase):
                 repository_id=approved.execution.native_id,
                 permissions={"contents": "write", "actions": "write"},
             )
-            controls = QueueControlPolicy(identity, frozenset({control_token_fingerprint(identity, tokens["queue"])}))
+            controls = QueueControlPolicy(identity, frozenset({control_token_fingerprint(identity, tokens["worker"])}))
             bootstrap = NativeBootstrap(
                 configuration,
                 approved,
@@ -138,7 +139,7 @@ class Integration(unittest.TestCase):
                         "config": {
                             "url": url + "/webhook/forgejo",
                             "content_type": "json",
-                            "secret": bootstrap.source_webhook_secret.decode("latin1"),
+                            "secret": bootstrap.source_webhook_secret.decode("ascii"),
                         },
                         "events": ["pull_request"],
                         "active": True,
@@ -179,14 +180,14 @@ class Integration(unittest.TestCase):
                     request = urllib.request.Request(
                         url + "/tasks/claim",
                         data=body,
-                        headers={"Authorization": "Bearer " + tokens["queue"], "Content-Type": "application/json"},
+                        headers={"Authorization": "Bearer " + tokens["worker"], "Content-Type": "application/json"},
                     )
                     return urllib.request.urlopen(request, timeout=10)
 
                 with claim() as response:
                     self.assertIn(response.status, {200, 204})
                 self.assertEqual(service.store.rows("claims"), [])
-                admin.request("PUT", f"repos/{repository.name}/collaborators/queue", {"permission": "write"})
+                admin.request("PUT", f"repos/{repository.name}/collaborators/worker", {"permission": "write"})
                 with self.assertRaises(urllib.error.HTTPError) as denied:
                     claim()
                 self.assertEqual(denied.exception.code, 403)

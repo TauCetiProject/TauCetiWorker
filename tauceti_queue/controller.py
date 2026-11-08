@@ -6352,6 +6352,9 @@ class Controller:
             done_at=now,
             result=result,
         )
+        publication = loads(entry["payload"], {}).get("publication")
+        if self.native_source and self.admission is not None and publication and result.startswith("comment "):
+            self.admission.invalidate(loads(entry["payload"], {})["number"], head=publication["head"], urgent=True)
 
     def _outbox_failed(self, entry: dict[str, Any], history: list[Any], error: Exception, now: float) -> None:
         attempts = entry["attempts"] + 1

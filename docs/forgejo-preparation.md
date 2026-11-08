@@ -936,3 +936,32 @@ creating an approval. Only that owned fixture permits loopback webhook targets.
 Stock Forgejo emits no commit-status events, so prompt status-only publication
 notifications still need a trusted caller/backstop path. Event intake alone does
 not enable native worker execution or establish load capacity.
+
+
+Native startup checks the separate Git credential through the same effective-access
+API and requires its repository ID, actor and write/admin scope to match the source
+API credential. Controller publication identities cannot be trusted reviewers, and
+controller publication tokens cannot also be enrolled queue-control tokens.
+The owned fixture uses a separate enrolled worker identity. This still requires the
+planned narrower worker role before admitting less-trusted production workers.
+Native GitHub job credentials are checked against the approved repository, revision
+and branch at startup as well as at dispatch. Source credential refusal is distinct
+from an unavailable authority endpoint.
+
+Before opening its store, a native `Service` takes an exclusive advisory process
+lock beside the existing database and retains it through shutdown. A second native
+service cannot commit bindings or publisher rotations while the first process is
+running, even if it chooses another port. Existing live-update tooling must stop
+and replace the service process without draining worker or CI admissions; this
+constructor does not deploy or replace a running service itself.
+
+Source webhook secrets must be printable ASCII of at least 32 bytes, generated
+from fresh random data and configured with the same text on Forgejo. This route
+rejects bodies larger than one MiB before reading or hashing them. Routine prose,
+controller-authored output comments/labels and title-only edits do not re-dirty
+admission. Native review event names are normalized to invalidations; marker
+comments from non-publishers receive ordinary priority. Push discovery requests
+are persisted before acknowledgment. Confirmed controller recovery publications
+invalidate their PR directly, so ignoring their output webhook does not delay
+reconciliation. Polling remains the recovery backstop; automatic Forgejo webhook
+redelivery is not assumed.

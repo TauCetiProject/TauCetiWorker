@@ -10,6 +10,8 @@ import threading
 
 from tauceti_tools.ci_candidate import RepositoryIdentity, read_json
 
+from .admission import relevant_comment
+
 
 class ForgejoWebhookReceiver:
     def __init__(self, controller, source, secret, *, dedupe_window=4096):
@@ -66,6 +68,11 @@ class ForgejoWebhookReceiver:
             # the delivery only repeats an idempotent invalidation after restart.
             # No command parsing, review evidence, ACL grant or payload mutation.
             if event == "push":
+                with self.controller.store.transaction():
+                    saved = self.controller.store.get_setting("state:admission_discovery", {})
+                    self.controller.store.set_setting(
+                        "state:admission_discovery", {**saved, "retry_at": 0, "next_attempt_at": 0}
+                    )
                 if payload.get("ref") == "refs/heads/" + self.controller.canonical_branch:
                     poller.handle_event("push", payload)
                 else:
@@ -73,16 +80,60 @@ class ForgejoWebhookReceiver:
             elif event.startswith("pull_request") or event == "issue_comment":
                 pull = payload.get("pull_request") or {}
                 issue = payload.get("issue") or {}
+                if not isinstance(pull, dict) or not isinstance(issue, dict):
+                    raise ValueError("native pull notification is malformed")
                 number = payload.get("number") or pull.get("number") or issue.get("number")
                 if event == "issue_comment" and payload.get("is_pull") is not True and not pull:
                     self.ignored += 1
                     return "ignored"
                 if type(number) is not int or not 0 < number < 2**63:
                     raise ValueError("native pull event has no positive pull number")
-                head = (pull.get("head") or {}).get("sha", "")
+                endpoint = pull.get("head") or {}
+                if not isinstance(endpoint, dict):
+                    raise ValueError("native pull head is malformed")
+                head = endpoint.get("sha", "")
                 if head and (not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None):
                     raise ValueError("native pull event head is malformed")
-                poller.invalidate(number, head=head)
+                sender = payload.get("sender") or {}
+                if not isinstance(sender, dict):
+                    raise ValueError("native notification sender is malformed")
+                sender_id = sender.get("id")
+                controller_actor = getattr(self.controller, "source_actor", None)
+                own_output = controller_actor is not None and str(sender_id) == controller_actor.principal.native_id
+                comment_event = event in {"issue_comment", "pull_request_comment"} and "comment" in payload
+                action = payload.get("action")
+                if own_output and (
+                    comment_event or action in {"label_updated", "label_cleared", "labeled", "unlabeled"}
+                ):
+                    self.ignored += 1
+                    return "ignored"
+                if comment_event:
+                    comment = payload.get("comment") or {}
+                    if not isinstance(comment, dict):
+                        raise ValueError("native comment is malformed")
+                    changes = payload.get("changes") or {}
+                    previous = ((changes.get("body") or {}).get("from") or "") if isinstance(changes, dict) else ""
+                    if (
+                        action != "deleted"
+                        and not relevant_comment(comment)
+                        and not relevant_comment({"body": previous})
+                    ):
+                        self.ignored += 1
+                        return "ignored"
+                    config = getattr(getattr(self.controller.source, "admission_policy", None), "publishers", None)
+                    publishers = set() if config is None else config.reviews | config.recoveries
+                    urgent = any(str(sender_id) == p.native_id for p in publishers)
+                    poller.invalidate(number, head=head, urgent=urgent)
+                else:
+                    if action == "edited" and payload.get("changes") and set(payload["changes"]) <= {"title"}:
+                        self.ignored += 1
+                        return "ignored"
+                    normalized = dict(payload)
+                    if action == "label_updated":
+                        normalized["action"] = "labeled"
+                    elif action == "label_cleared":
+                        normalized["action"] = "unlabeled"
+                    poller.handle_event("pull_request", normalized)
             elif event == "ping":
                 return "pong"
             else:

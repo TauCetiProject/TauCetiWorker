@@ -98,6 +98,7 @@ class Service:
         self.unavailable_reason: str | None = None
         self.native = native
         self.native_http = None
+        self._native_store_lock = None
         if native is not None:
             from .native_bootstrap import NativeBootstrap
 
@@ -108,6 +109,30 @@ class Service:
     # change is one edit here.
 
     def open_store(self) -> None:
+        if self.native is not None:
+            # Reserve the existing store before a constructor can commit any
+            # binding or publisher rotation. Two native services must not share
+            # a writable queue, even if they listen on different ports.
+            import fcntl
+            import stat
+
+            database = self.config.database.resolve()
+            database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(str(database) + ".native-service.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            try:
+                info = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o077
+                    or info.st_nlink != 1
+                ):
+                    raise ValueError("native service lock must be an owned private regular file")
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BaseException:
+                os.close(fd)
+                raise
+            self._native_store_lock = fd
         module = _optional("store")
         if module is None:
             self.unavailable_reason = "tauceti_queue.store is not installed"
@@ -258,6 +283,9 @@ class Service:
                 close()
         if self.store is not None:
             self.store.close()
+        if self._native_store_lock is not None:
+            os.close(self._native_store_lock)
+            self._native_store_lock = None
 
 
 def _install_signal_handlers(stop: rt.StopSignal) -> None:

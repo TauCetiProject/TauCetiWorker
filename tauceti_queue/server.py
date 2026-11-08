@@ -746,6 +746,16 @@ class Handler(BaseHTTPRequestHandler):
         if receiver is None:
             self._error(404, "native source notifications are unavailable")
             return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._error(400, "invalid native notification length")
+            self.close_connection = True
+            return
+        if not 0 <= length <= 1024 * 1024:
+            self._error(413, "native notification exceeds one MiB")
+            self.close_connection = True
+            return
         body = self._read_body()
         if body is None:
             return
