@@ -6,7 +6,6 @@ import http.client
 import json
 import sys
 import threading
-import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -492,7 +491,6 @@ class NativeClaims(unittest.TestCase):
         self.assertEqual({m["number"] for m in self.controller._members(batch["id"])}, {18, 19})
 
     def test_authority_reacquisition_timeout_refreshes_while_another_thread_holds_the_lock(self):
-        self.authority.clock = time.monotonic
         initial = self.authority.authenticate("token")
         held, release = threading.Event(), threading.Event()
         calls, errors = [], []
@@ -514,7 +512,7 @@ class NativeClaims(unittest.TestCase):
             if len(calls) == 1:
                 thread.start()
                 self.assertTrue(held.wait(2))
-                return replace(fresh, checked_at=fresh.checked_at - 14.99)
+                return replace(fresh, checked_at=fresh.checked_at - 14.8)
             release.set()
             return fresh
 

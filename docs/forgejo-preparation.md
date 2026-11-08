@@ -312,7 +312,7 @@ login rename preserves ownership and a reused login does not. After fresh
 authentication, a renewal entering the controller before expiry retains its
 arrival time while waiting for the lock, refreshing expired authority outside the
 lock while its renewal registration stays active. Reacquisition uses priority and
-the remaining evidence lifetime, with at most three fresh observations; overlapping
+the remaining evidence lifetime, with at most three refresh/acquisition attempts; overlapping
 renewals keep independent registrations. Source authentication and ACL
 outages fail closed; an unauthenticated request cannot extend a lease.
 All claim-expiry decisions honour a timely renewal that is still in progress,
