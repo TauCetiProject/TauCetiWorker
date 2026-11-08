@@ -13,6 +13,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from .task_identity import TASK_SCHEMA, TaskBinding
+
 
 class DispatchNotAccepted(RuntimeError):
     """Execution backend proves this dispatch was not accepted; retry may be scheduled."""
@@ -351,9 +353,10 @@ class Task:
     # order: for `pre_rebase` the head's tips then its base, for `prepare` the batch's previous tips
     # then its base, for the head's `repair` and `rebase_conflict` its tips then its base and main.
     warm_revs: list[str] = field(default_factory=list)
+    binding: TaskBinding | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        record = {
             "task_id": self.task_id,
             "kind": self.kind,
             "repository": self.repository,
@@ -362,7 +365,7 @@ class Task:
             "base": self.base,
             "tip": self.tip,
             "onto": self.onto,
-            "members": [vars(member) for member in self.members],
+            "members": [dict(vars(member)) for member in self.members],
             "diagnostics": self.diagnostics,
             "retained_refs": self.retained_refs,
             "submission_ref": self.submission_ref,
@@ -373,6 +376,15 @@ class Task:
             "extra": self.extra,
             "warm_revs": list(self.warm_revs),
         }
+        if self.binding is not None:
+            # Old runners require repository and must refuse this schema rather
+            # than silently fetching/pushing owner/name on GitHub.
+            record.pop("repository")
+            record["schema"] = TASK_SCHEMA
+            record["binding"] = self.binding.record()
+            for member in record["members"]:
+                member["source_identity"] = self.binding.pull_key(member["number"])
+        return record
 
 
 @dataclass

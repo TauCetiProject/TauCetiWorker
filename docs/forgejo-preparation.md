@@ -332,8 +332,28 @@ claim records cannot acquire a native owner implicitly.
 
 Source-bound HTTP startup refuses a missing or mismatched native authority. Native
 feeds, GitHub webhook intake, unqualified Bors imports and legacy approval polling
-remain unavailable on this path. Qualified task/reporting metadata, native source
-publication and approval, and production bootstrap are still activation gates.
+remain unavailable on this path. Native task execution, remaining reporting
+consumers, source publication and approval, and production bootstrap are still activation gates.
+Native task claims use `tauceti-queue.source-task/v2`. Their persisted binding
+contains qualified source and execution repository IDs, the CI policy digest and
+the queue's durable epoch. Member identities include the source origin, native
+repository ID and pull number; their chain attribution labels remain separate.
+The wire record and checkpoint omit the legacy `repository` field, so older
+runners cannot interpret the source name as a GitHub target. Missing, malformed
+or different persisted bindings are not claimed or silently reinterpreted after
+a policy change. Existing tasks need explicit replacement under the new policy.
+
+The native task client requires its expected binding from trusted runner
+configuration and an explicit native bearer. It refuses redirects and remote
+plain HTTP, bounds responses, rejects duplicate JSON fields, and checks the binding
+before claim adoption, renewal, submission or release. No binding is inferred from
+the claim response. Checkpoints and compact progress retain the qualified binding;
+monitoring matches progress to the SQL task binding and reports task identity even
+without a worker observation. Native metadata does not enable the existing runner:
+native execution, legacy admin-cache use, Git fetch/push, agent work and resume or
+release retries through an unqualified client remain refused until the native
+transport, source validation and runner adapters are implemented. Native checkpoint
+directory/cache namespaces also need integration before enabling execution.
 Credential audience/delegation policy and ingress rate/concurrency limits also
 require integration before activation: a native user ACL observation alone does
 not identify a bearer as a dedicated queue-control credential.

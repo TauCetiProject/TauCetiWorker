@@ -1,0 +1,137 @@
+"""Qualified task identities; message metadata never supplies runner authority."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+from tauceti_tools import ci_candidate as cc
+from tauceti_tools.forge import GITHUB
+
+TASK_SCHEMA = "tauceti-queue.source-task/v2"
+BINDING_SCHEMA = "tauceti-queue.task-binding/v1"
+
+
+@dataclass(frozen=True)
+class TaskBinding:
+    source: cc.RepositoryIdentity
+    execution: cc.RepositoryIdentity
+    policy_digest: str
+    queue_epoch: str
+
+    def __post_init__(self):
+        if (
+            not isinstance(self.source, cc.RepositoryIdentity)
+            or self.source.repository.forge.kind != "forgejo"
+            or not isinstance(self.execution, cc.RepositoryIdentity)
+            or self.execution.repository.forge != GITHUB
+            or not isinstance(self.policy_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", self.policy_digest) is None
+            or not int(self.policy_digest, 16)
+            or not isinstance(self.queue_epoch, str)
+            or re.fullmatch(r"[0-9a-f]{32}", self.queue_epoch) is None
+        ):
+            raise ValueError("invalid qualified task binding")
+
+    @classmethod
+    def from_policy(cls, policy: cc.ExecutionPolicy, *, queue_epoch: str):
+        if not isinstance(policy, cc.ExecutionPolicy):
+            raise ValueError("a trusted source execution policy is required")
+        return cls(policy.source, policy.execution, policy.digest, queue_epoch)
+
+    @classmethod
+    def parse(cls, row):
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"schema", "source", "execution", "policy_digest", "queue_epoch"}
+            or row["schema"] != BINDING_SCHEMA
+        ):
+            raise ValueError("invalid qualified task binding fields")
+        return cls(
+            cc.RepositoryIdentity.parse(row["source"]),
+            cc.RepositoryIdentity.parse(row["execution"]),
+            row["policy_digest"],
+            row["queue_epoch"],
+        )
+
+    def record(self):
+        return {
+            "schema": BINDING_SCHEMA,
+            "source": self.source.record(),
+            "execution": self.execution.record(),
+            "policy_digest": self.policy_digest,
+            "queue_epoch": self.queue_epoch,
+        }
+
+    def pull_key(self, number: int) -> str:
+        if type(number) is not int or not 0 < number < 2**63:
+            raise ValueError("a native source pull number is required")
+        return f"{self.source.repository.forge.key}/repositories/{self.source.native_id}/pulls/{number}"
+
+
+class TaskBindingMismatch(ValueError):
+    """A task is not bound to this runner's trusted source/execution policy."""
+
+
+class NativeTaskExecutionUnavailable(RuntimeError):
+    """The native transport/runner adapters are required before task execution."""
+
+
+def validate_native_task(row):
+    """Validate task references without Git, credentials or source I/O."""
+    if (
+        type(row.get("task_id")) not in (int, str)
+        or re.fullmatch(r"[1-9][0-9]{0,18}", str(row["task_id"])) is None
+        or int(row["task_id"]) >= 2**63
+        or not isinstance(row.get("members"), list)
+        or len(row["members"]) > cc.MAX_RETAINED_MEMBERS
+        or not isinstance(row.get("extra"), dict)
+        or type(row.get("expires_at")) not in (int, float)
+        or not 0 < row["expires_at"] < 2**53
+        or not isinstance(row.get("claim_token"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", row["claim_token"]) is None
+    ):
+        raise TaskBindingMismatch("invalid qualified task references or lease")
+    for key in ("base", "tip", "onto"):
+        value = row.get(key)
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is None
+            or not int(value, 16)
+        ):
+            raise TaskBindingMismatch("invalid qualified task commit")
+    refs = row.get("retained_refs")
+    if (
+        not isinstance(refs, list)
+        or not refs
+        or any(
+            not isinstance(ref, str)
+            or re.fullmatch(r"refs/tauceti-queue/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*", ref) is None
+            for ref in refs
+        )
+    ):
+        raise TaskBindingMismatch("invalid qualified task retained refs")
+    expected = f"refs/tauceti-queue/submissions/{row['task_id']}/{row['extra'].get('claim_id')}"
+    if (
+        type(row["extra"].get("claim_id")) is not int
+        or row["extra"]["claim_id"] < 1
+        or row.get("submission_ref") != expected
+    ):
+        raise TaskBindingMismatch("invalid qualified task submission ref")
+    seen = set()
+    for member in row["members"]:
+        if (
+            not isinstance(member, dict)
+            or type(member.get("number")) is not int
+            or member["number"] < 1
+            or member["number"] in seen
+        ):
+            raise TaskBindingMismatch("invalid or repeated qualified task member")
+        seen.add(member["number"])
+        head = member.get("accepted_head")
+        if (
+            not isinstance(head, str)
+            or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head) is None
+            or not int(head, 16)
+        ):
+            raise TaskBindingMismatch("invalid qualified member head")

@@ -48,6 +48,7 @@ from .ports import (
 from .source_authority import NativeQueueAuthority, SourceAuthorityUnavailable, principal_key
 from .stale_cache import StaleCache
 from .store import Store, dumps, loads
+from .task_identity import TaskBinding
 
 STATUS_SCHEMA = "tauceti-queue.status/v1"
 BUILD_CONTEXT = "build"
@@ -383,6 +384,8 @@ class Controller:
                 raise ValueError("source CI ledger does not belong to this controller")
             if getattr(github, "repository_identity", None) != candidate_ci.ledger.policy.source:
                 raise ValueError("source CI source port identity differs from its policy")
+            if repository != candidate_ci.ledger.policy.source.repository.name:
+                raise ValueError("controller repository differs from its qualified source")
             if not all(
                 callable(getattr(github, name, None)) for name in ("retain_candidate", "verify_candidate_approval")
             ):
@@ -1234,6 +1237,10 @@ class Controller:
         }
         if claim is not None:
             self._check_source_claim_owner(actor, claim)
+            task = self.store.row("tasks", {"id": claim["task_id"]})
+            if task is None:
+                raise TaskError("unknown-task")
+            self._task_binding(task)
         return access, actor
 
     @staticmethod
@@ -1393,6 +1400,10 @@ class Controller:
         `prepare` task of the pre-rebased chain likewise (`_pre_rebased_prepare_current`)."""
         found = []
         for task in self.store.rows("tasks", {"repository": self.repository, "state": TASK_OPEN}):
+            try:
+                self._task_binding(task)
+            except TaskError:
+                continue  # No implicit adoption of old/unqualified policy snapshots.
             batch = self.store.row("batches", {"id": task["batch_id"]})
             if batch is None:
                 continue
@@ -1983,6 +1994,25 @@ class Controller:
         covered = {commit.source_pr for commit in chain.chain_commits(self.clone, task["base"], task["tip"])}
         return [member for member in members if member["source_pr"] in covered]
 
+    def _task_binding(self, task):
+        try:
+            row = loads(task.get("task_binding"), {})
+        except (TypeError, ValueError):
+            raise TaskError("not-authorized", "qualified task binding is unreadable") from None
+        if self.candidate_ci is None:
+            if row:
+                raise TaskError("not-authorized", "native task requires its qualified controller")
+            return None
+        try:
+            binding = TaskBinding.parse(row)
+        except (TypeError, ValueError):
+            raise TaskError("not-authorized", "qualified task binding is unavailable") from None
+        if binding != TaskBinding.from_policy(
+            self.candidate_ci.ledger.policy, queue_epoch=self.candidate_ci.ledger.epoch
+        ):
+            raise TaskError("not-authorized", "qualified task policy changed")
+        return binding
+
     def _task_record(
         self, task: dict[str, Any], batch: dict[str, Any], claim_id: int, token: str, expires: float
     ) -> Task:
@@ -2047,6 +2077,7 @@ class Controller:
             created_at=task["created_at"],
             extra=extra,
             warm_revs=self._warm_revs(task, batch),
+            binding=self._task_binding(task),
         )
 
     def _create_task(
@@ -2098,6 +2129,13 @@ class Controller:
                 created_at=now,
                 ci_attempt_id=ci_attempt_id,
                 pre_rebase_source=pre_rebased[1] if pre_rebased else None,
+                task_binding=dumps(
+                    TaskBinding.from_policy(
+                        self.candidate_ci.ledger.policy, queue_epoch=self.candidate_ci.ledger.epoch
+                    ).record()
+                )
+                if self.candidate_ci is not None
+                else "{}",
             )
             self._count("tasks_prepare_pre_rebased" if pre_rebased else f"tasks_{kind}")
             self.store.journal(
