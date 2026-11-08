@@ -1,8 +1,8 @@
 """The AI merge queue controller: records, claims, insertion, sealing, head reconciliation, tasks, status.
 
-This is increment 1 of `docs/redesign/specs/ai-merge-queue.md`: one open batch receiving scripted
-insertions and at most one sealed head that is rebased, built, repaired in place by agents claiming
-tasks, and fast-forwarded onto the canonical branch. The controller is one object shared by the
+The queue has unsealed batches receiving scripted insertions, at most one sealed successor being
+prepared, and one head that is rebased, built, repaired in place by agents claiming tasks, and
+fast-forwarded onto the canonical branch. The controller is one object shared by the
 reconciliation loop (`tauceti_queue.loop`) and the HTTP server; every public method takes the
 controller lock (`ControllerLock`: the worker endpoints take it ahead of the tick, which lets
 go of it around its GitHub I/O), and every record mutation is a `Store` transaction.
@@ -72,6 +72,9 @@ COMMENT_MARKER = "tauceti-queue"
 DEFAULT_SETTINGS: dict[str, Any] = {
     "insertion_age_window": 16,
     "open_batch_limit": 2,
+    # Freeze the oldest unsealed batch behind the head at this size, keeping one sealed successor.
+    # Zero disables successor sealing. Head creation never waits for this threshold.
+    "sealed_successor_min_members": 100,
     "repair_concurrency": 1,
     "stall_interval_seconds": 900,
     "publication_enabled": False,
@@ -1462,7 +1465,14 @@ class Controller:
             if batch["state"] != wanted:
                 continue
             found.append((task, batch))
-        found.sort(key=lambda pair: (TASK_PRIORITY.get(pair[0]["kind"], 0), pair[0]["created_at"], pair[0]["id"]))
+        found.sort(
+            key=lambda pair: (
+                TASK_PRIORITY.get(pair[0]["kind"], 0),
+                not pair[1]["sealed"],
+                pair[0]["created_at"],
+                pair[0]["id"],
+            )
+        )
         return found
 
     def _active_task_claims(self) -> list[dict[str, Any]]:
@@ -2314,8 +2324,12 @@ class Controller:
     # --- records -----------------------------------------------------------------------------------
 
     def _open_batches(self) -> list[dict[str, Any]]:
-        """Open batches oldest first: insertion tries them in this order and sealing takes the first."""
+        """Non-head batches oldest first, including the sealed successor (`state=open, sealed=1`)."""
         return self.store.rows("batches", {"repository": self.repository, "state": BATCH_OPEN}, order="id")
+
+    def _unsealed_batches(self) -> list[dict[str, Any]]:
+        """Batches still accepting insertions; only these count against `open_batch_limit`."""
+        return [batch for batch in self._open_batches() if not batch["sealed"]]
 
     def _open_batch(self) -> dict[str, Any] | None:
         batches = self._open_batches()
@@ -2937,7 +2951,7 @@ class Controller:
             self._reasons.append("canonical branch not yet observed")
             return None
         batches = []
-        for batch in self._open_batches():
+        for batch in self._unsealed_batches():
             if not self._members(batch["id"]) and batch["base"] != canonical:
                 self._remove_batch(batch, "stale-empty", now)
             else:
@@ -2950,7 +2964,7 @@ class Controller:
         """Remove empty open batches: a later one as soon as the pass leaves it empty (it is created on
         demand for an input that conflicts with the batches before it), the first only when nothing waits
         and its base is stale."""
-        for position, batch in enumerate(self._open_batches()):
+        for position, batch in enumerate(self._unsealed_batches()):
             if self._members(batch["id"]):
                 continue
             if position > 0:
@@ -3035,7 +3049,13 @@ class Controller:
         row = fresh
         current = self.store.row("batches", {"id": batch["id"]})
         prepared = any(c["operation"] == f"task:{TASK_PREPARE}" for c in self._active_claims(batch["id"]))
-        if current is None or current["version"] != batch["version"] or current["state"] != BATCH_OPEN or prepared:
+        if (
+            current is None
+            or current["version"] != batch["version"]
+            or current["state"] != BATCH_OPEN
+            or current["sealed"]
+            or prepared
+        ):
             # The batch moved while the probe ran without the lock (an adoption, a removal), or a
             # `prepare` task claimed it: the input waits for the next pass.
             with self.store.transaction():
@@ -3337,6 +3357,7 @@ class Controller:
 
     def _seal(self, now: float) -> None:
         if self._head() is not None:
+            self._seal_successor(now)
             return
         batch = self._open_batch()
         if batch is None or not self._members(batch["id"]):
@@ -3363,7 +3384,13 @@ class Controller:
                 self.store.update(
                     "tasks", {"id": stale["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="sealed"
                 )
-            self.store.update("batches", {"id": batch["id"]}, sealed=1, state=BATCH_HEAD, sealed_at=now)
+            self.store.update(
+                "batches",
+                {"id": batch["id"]},
+                sealed=1,
+                state=BATCH_HEAD,
+                sealed_at=batch["sealed_at"] if batch["sealed_at"] is not None else now,
+            )
             self._count("heads_sealed")
             self.store.journal(
                 now,
@@ -3373,8 +3400,31 @@ class Controller:
                 size=len(self._members(batch["id"])),
                 urgent=batch["urgent"],
             )
-            if self._canonical is not None and not self._open_batches():
+            if self._canonical is not None and not self._unsealed_batches():
                 self._create_open_batch(self._canonical, now)
+        self._seal_successor(now)
+
+    def _seal_successor(self, now: float) -> None:
+        """Freeze the oldest unsealed batch at the threshold, without making it the head.
+
+        The existing sealed flag fixes membership independently of `state`: a successor remains
+        `open` for the background task protocol until promotion to `head`. An active background
+        owner keeps its task and can adopt normally; insertions may never enter the sealed batch.
+        """
+        minimum = int(self.setting("sealed_successor_min_members"))
+        if minimum == 0 or self._state("inference_hold") or self._external_head_blocks_sealing():
+            return
+        batches = self._open_batches()
+        if not batches or any(batch["sealed"] for batch in batches):
+            return
+        batch = batches[0]
+        size = len(self._members(batch["id"]))
+        if size < minimum or any(c["operation"] not in BACKGROUND_OPERATIONS for c in self._active_claims(batch["id"])):
+            return
+        with self.store.transaction():
+            self.store.update("batches", {"id": batch["id"]}, sealed=1, sealed_at=now)
+            self._count("successors_sealed")
+            self.store.journal(now, "successor-sealed", batch["id"], version=batch["version"], size=size)
 
     # --- head reconciliation -----------------------------------------------------------------------
 
@@ -3575,7 +3625,7 @@ class Controller:
             return f"prepare task {prepare['id']} is {held}"
         if not self.setting("prepare_open_batches"):
             return None
-        if len(self._members(batch["id"])) < max(1, int(self.setting("prepare_min_members"))):
+        if not batch["sealed"] and len(self._members(batch["id"])) < max(1, int(self.setting("prepare_min_members"))):
             return None
         if batch["prepared_version"] == batch["version"]:
             return None
@@ -3652,7 +3702,7 @@ class Controller:
                 if admission_planning.fingerprint([{"base": task["base"]}, *collisions]) == digest:
                     attempted = True
                     break
-        if not predicted or attempted:
+        if not batch["sealed"] and (not predicted or attempted):
             if len(members) < max(1, int(self.setting("prepare_min_members"))):
                 return False
             if now - max(m["added_at"] for m in members) < int(self.setting("prepare_quiet_seconds")):
@@ -4014,7 +4064,7 @@ class Controller:
         preparation of the same chain that was adopted, released clean or failed is not repeated."""
         if not self.setting("prepare_pre_rebased") or not self.setting("prepare_open_batches"):
             return "prepare_pre_rebased is off"
-        if len(self._members(batch["id"])) < max(1, int(self.setting("prepare_min_members"))):
+        if not batch["sealed"] and len(self._members(batch["id"])) < max(1, int(self.setting("prepare_min_members"))):
             return "below prepare_min_members"
         if batch["pre_rebase_state"] not in PRE_REBASE_USABLE or not batch["pre_rebase_tip"]:
             return "no usable pre-rebase"
@@ -6677,6 +6727,9 @@ class Controller:
                 if open_batch is None
                 else self._batch_status(open_batch, now) | {"pre_rebase": self._pre_rebase_status(open_batch)},
                 "open_batches": [self._open_batch_summary(batch, now) for batch in open_batches],
+                "sealed_successor": next(
+                    (self._open_batch_summary(batch, now) for batch in open_batches if batch["sealed"]), None
+                ),
                 "head": head_status,
                 "external_head": self._external_head_status(),
                 "approvals": {
@@ -6750,6 +6803,8 @@ class Controller:
         return {
             "id": batch["id"],
             "version": batch["version"],
+            "sealed": bool(batch["sealed"]),
+            "sealed_at": batch["sealed_at"],
             "base": batch["base"],
             "tip": batch["tip"],
             "size": len(members),
@@ -6849,6 +6904,8 @@ class Controller:
         return {
             "id": batch["id"],
             "version": batch["version"],
+            "sealed": bool(batch["sealed"]),
+            "sealed_at": batch["sealed_at"],
             "base": batch["base"],
             "tip": batch["tip"],
             "size": len(members),

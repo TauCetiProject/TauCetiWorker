@@ -2546,6 +2546,7 @@ class StatusShape(ControllerCase):
                 "waiting",
                 "open_batch",
                 "open_batches",
+                "sealed_successor",
                 "head",
                 "external_head",
                 "approvals",
