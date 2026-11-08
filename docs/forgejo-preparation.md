@@ -302,8 +302,8 @@ by the native source origin and repository ID. It never accepts enrollment from
 request JSON, task metadata or a Forgejo profile. Fingerprints are private
 configuration and are omitted from policy repr, tasks, public progress and journals.
 An unenrolled token is refused before the HTTP body is read or any source request,
-even when it otherwise has effective admin and Code write privileges. Revocation
-must happen at Forgejo first: removing a fingerprint only removes queue enrollment,
+even when it otherwise has effective admin and Code write privileges. For incident
+revocation, revoke the bearer at Forgejo first: removing a fingerprint only removes queue enrollment,
 and does not revoke the credential's source permissions. Then remove the old
 fingerprint and restart the queue process with the new immutable policy and one
 authority shared by its HTTP server and controller. Do not swap only the
@@ -311,6 +311,15 @@ controller's authority or mutate an existing instance. Omitted old tokens cannot
 authorize queue calls; process-local evidence from the previous instance is invalid.
 Enrolled credentials still need fresh native
 scope/resource/ACL checks on every operation; enrollment does not cache a grant.
+For routine rotation, enroll old and new fingerprints together, restart with the
+shared authority, roll workers to the new credential, then revoke the old token
+at Forgejo and remove its fingerprint on the next restart. This overlap keeps
+normal admissions and running work enabled. The replacement bearer must identify
+the same native actor to resume that actor's claims; a bot-user change requires
+reconciling the previous actor's work. Removing enrollment immediately
+returns 403 and stops affected claims; revocation of an enrolled bearer returns
+401, so existing renewal retries can continue only until lease expiry and cannot
+submit work. Reconcile affected work explicitly after incident revocation.
 
 Each mutation reads its bearer actor, repository user ACL and effective credential
 access directly from the configured Forgejo origin by native repository ID. The
