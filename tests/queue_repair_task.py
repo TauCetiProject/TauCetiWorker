@@ -4756,7 +4756,8 @@ class BuildScript(unittest.TestCase):
             (self.root / name).parent.mkdir(parents=True, exist_ok=True)
             (self.root / name).write_text(text)
         self.script = repair_tools.write_build_script(self.root / ".tauceti-repair")
-        self.assertLess(len(self.script.read_text().splitlines()), 85)
+        # The standalone helper now includes the stale-holder recheck/guard.
+        self.assertLess(len(self.script.read_text().splitlines()), 110)
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.log = self.root / "lake.log"
