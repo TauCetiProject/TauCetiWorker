@@ -444,9 +444,11 @@ class ForgejoSourceAdapter(ForgejoGitSource):
                 and description.startswith("tauceti-pub/")
                 and record_generation
                 and record_generation[0] != generation
-                and actor.principal
-                in set().union(self.admission_policy.publishers.recoveries, *self._recovery_grants.values())
             ):
+                # A restored backup may have lost both a generation and its
+                # publisher account. Unattributable retired facts can only deny,
+                # until a fresh explicit current-authority decision reconciles
+                # them. No old record can override current-generation evidence.
                 retired_recovery = True
             allowed = (
                 self.admission_policy.publishers.recoveries
@@ -951,35 +953,30 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             )
         # Each intent owns its comment; late writes cannot corrupt newer bodies.
         # Even a success POST racing a new registration remains an older sequence.
-        latest = self._publication_latest(self.client.statuses(self.repository, intent["head"]), context)
-        if latest is None or latest[1]["_nonce"] != intent["nonce"]:
-            stamp = latest[1] if latest else {}
-            raise PublicationSuperseded(
-                "native publication intent changed",
-                sequence=stamp.get("_sequence"),
-                nonce=stamp.get("_nonce"),
-                actor=latest[2] if latest else None,
-            )
+        self._check_publication_current(intent, context)
         comment_id = (
             "clear"
             if intent["clear"]
             else self._upsert_comment(intent["number"], intent["body"], intent["marker"], actor)
         )
-        latest = self._publication_latest(self.client.statuses(self.repository, intent["head"]), context)
-        if latest is None or latest[1]["_nonce"] != intent["nonce"]:
-            stamp = latest[1] if latest else {}
-            raise PublicationSuperseded(
-                "native publication intent changed",
-                sequence=stamp.get("_sequence"),
-                nonce=stamp.get("_nonce"),
-                actor=latest[2] if latest else None,
-            )
+        self._check_publication_current(intent, context)
         self.client.request(
             "POST",
             f"repos/{self.repository.name}/statuses/{intent['head']}",
             {"context": context, "state": "success", "description": prefix + comment_id + ":" + intent["digest"]},
         )
+        self._check_publication_current(intent, context)
         return comment_id
+
+    def _check_publication_current(self, intent, context):
+        latest = self._publication_latest(self.client.statuses(self.repository, intent["head"]), context)
+        if latest is None or latest[1]["_stage"] == "unverified":
+            raise Incomplete("native publication registration needs observation or exact-intent reconciliation")
+        stamp = latest[1]
+        if stamp["_nonce"] != intent["nonce"]:
+            raise PublicationSuperseded(
+                "native publication intent changed", sequence=stamp["_sequence"], nonce=stamp["_nonce"], actor=latest[2]
+            )
 
     def prepare_outbox_comment(self, repo, number, body, marker, *, sequence, publication=None):
         if publication is None:
