@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import json
 import os
 import re
 import shutil
@@ -34,6 +35,29 @@ def copy_file(source, target):
         return shutil.copy2(source, target)
 
 
+def backing_source(source, build, lower):
+    """Merged enumeration owns whiteouts; open real backing files for reflink."""
+    source = Path(source)
+    if not source.is_relative_to(build):
+        return source
+    relative = source.relative_to(build)
+    private = build.parent / "tauceti-overlay-upper" / relative
+    return private if private.is_file() else lower / relative
+
+
+def snapshot_command():
+    """Private subprocess entry; preserve retryable storage failures across IPC."""
+    payload = json.load(sys.stdin)
+    for name in ("root", "target", "immutable_packages"):
+        if payload.get(name) is not None:
+            payload[name] = Path(payload[name])
+    try:
+        snapshot(**payload)
+    except Pressure as error:
+        print(json.dumps(dict(pressure=error.reason, error=str(error))))
+        raise SystemExit(75) from error
+
+
 def snapshot(root, target, names, *, immutable_packages=None, include_builds=True):
     """A failed copy is disposable until the caller durably publishes isolated ownership."""
     from .shared_mathlib import remove_tree
@@ -47,6 +71,71 @@ def snapshot(root, target, names, *, immutable_packages=None, include_builds=Tru
     marker = state / "verification-copy-incomplete" / f"{target.name}.json"
     atomic(marker, dict(version=1, source=str(root), source_digest=digest(names)))
     try:
+        # After the agent namespace exits, this host path is only the sparse
+        # upper (possibly with whiteouts), not a usable Mathlib build. Materialize
+        # its merged cache while holding the existing lower's ordinary reader lease.
+        from . import shared_mathlib
+        from .verification import Incomplete
+
+        upper = root / ".lake/packages/mathlib/.lake/build"
+        shared = read_json(upper.parent / "tauceti-shared-mathlib.json")
+        if include_builds and shared and not upper.is_mount():
+            if not shared_mathlib._build_parent_owned(upper):
+                # A stale overlay under caller-owned dependency links must not
+                # be detached or repeatedly rehydrated. Preserve independent
+                # exact sources; normal verification warms the private cache.
+                from .config import log
+
+                log("verification: stale shared Mathlib build under linked packages; preserving private sources")
+                return _snapshot(root, target, names, immutable_packages=None, include_builds=False)
+            key = shared.get("key", "")
+            if not re.fullmatch("[0-9a-f]{64}", key):
+                raise Incomplete("invalid shared Mathlib snapshot identity", reason="preservation")
+            pool = Path(shared.get("pool") or shared_mathlib.root())
+            with shared_mathlib.key_lock(pool, key, exclusive=False) as lease:
+                lower = pool / "entries" / key / "build"
+                if lower.is_dir() and shared.get("boot_id") == shared_mathlib.boot_id():
+                    work = upper.with_name("tauceti-overlay-work")
+                    work.mkdir(exist_ok=True)
+                    payload = dict(
+                        root=str(root),
+                        target=str(target),
+                        names=names,
+                        immutable_packages=str(immutable_packages) if immutable_packages else None,
+                        include_builds=include_builds,
+                    )
+                    env = dict(os.environ)
+                    package = str(Path(__file__).resolve().parent.parent)
+                    env["PYTHONPATH"] = package + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+                    result = subprocess.run(
+                        shared_mathlib.overlay_command(lower, upper, work, upper, pool, lease_fd=lease.fileno())
+                        + [sys.executable, "-m", "tauceti_worker.verification_jobs"],
+                        input=json.dumps(payload),
+                        env=env,
+                        text=True,
+                        capture_output=True,
+                        pass_fds=(lease.fileno(),),
+                    )
+                    if result.returncode == 75:
+                        failure = json.loads(result.stdout)
+                        raise Pressure(failure["error"], reason=failure["pressure"])
+                    if result.returncode:
+                        raise Incomplete(
+                            "merged Mathlib snapshot failed: " + result.stderr[-1000:], reason="preservation"
+                        )
+                    return
+            # A collected lower or pre-reboot disposable upper is a cache
+            # miss. Rehydrate normally, with the normal service config.
+            from .agents import host_build_cache_context
+
+            try:
+                shared_mathlib.detach_upper(upper, upper.parent / "tauceti-shared-mathlib.json")
+                with host_build_cache_context(root, dict(os.environ), state / "verification-cache-prepare"):
+                    return snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=True)
+            except Pressure:
+                raise
+            except Exception as error:
+                raise Pressure(f"Mathlib cache preparation pending: {error}", reason="cache") from error
         return _snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=include_builds)
     except BaseException:
         # Nothing in this directory has become an authoritative workspace. Owner death leaves
@@ -67,23 +156,24 @@ def commit_copy(state, identifier):
 def _snapshot(root, target, names, *, immutable_packages=None, include_builds=True):
     """Copy exact sources/index and warm build caches without editing the agent's index."""
     from .verification import Incomplete
-    from .verification_storage import CopyBudget, CopyLimit, reserve, settle
+    from .verification_storage import CopyBudget, reserve, settle
 
     try:
-        reduced_for_capacity = False
-        try:
-            amount = reserve(target.parent.parent, target.name)
-        except Pressure as error:
-            if not include_builds or error.reason != "capacity":
-                raise
-            include_builds = False
-            reduced_for_capacity = True
-            amount = reserve(target.parent.parent, target.name, source_only=True)
+        amount = reserve(target.parent.parent, target.name)
         budget = CopyBudget(amount, target)
+
+        build = root / ".lake/packages/mathlib/.lake/build"
+        shared = read_json(build.parent / "tauceti-shared-mathlib.json")
+        lower = None
+        if shared and build.is_mount():
+            from .shared_mathlib import root as shared_root
+
+            lower = Path(shared.get("pool") or shared_root()) / "entries" / shared["key"] / "build"
 
         def copy(source, dest):
             budget.charge(Path(source))
-            return copy_file(source, dest)
+            actual = backing_source(source, build, lower) if lower is not None else source
+            return copy_file(actual, dest)
 
         index = git(root, "rev-parse", "--git-path", "index").decode().strip()
         index = Path(index) if Path(index).is_absolute() else root / index
@@ -135,7 +225,18 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
                 return [
                     name
                     for name in entries
-                    if name in {"__pycache__", "tauceti-scope"}
+                    if name
+                    in {
+                        "__pycache__",
+                        "tauceti-scope",
+                        "tauceti-overlay-work",
+                        "tauceti-overlay-upper",
+                        "tauceti-shared-mathlib.json",
+                        "build-before-sharing",
+                        "build-shared-delta",
+                    }
+                    or name == "build-shared-deltas"
+                    and Path(directory).name == ".lake"
                     or not include_builds
                     and name in {"build", "build-before-sharing"}
                     and Path(directory).name == ".lake"
@@ -146,20 +247,18 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
                 ]
 
             shutil.copytree(lake, target / ".lake", symlinks=False, copy_function=copy, ignore=ignore)
+            if not include_builds:
+                # Read-only installations can supply source inputs. Their new
+                # private directories must allow new cache files and Git lockfile
+                # operations; existing file bytes and modes remain unchanged.
+                for directory, _, _ in os.walk(target / ".lake", followlinks=False):
+                    path = Path(directory)
+                    path.chmod(path.stat().st_mode | 0o700)
         if immutable_packages is not None:
             (target / ".lake").mkdir(exist_ok=True)
             (target / ".lake/packages").symlink_to(immutable_packages, target_is_directory=True)
-        settle(target.parent.parent, target.name, budget.bytes + 65536, compact=not include_builds)
-    except CopyLimit as error:
-        if not include_builds:
-            if reduced_for_capacity:
-                raise Pressure("source preservation needs more temporarily available candidate capacity") from error
-            raise
-        if target.exists():
-            from .shared_mathlib import remove_tree
-
-            remove_tree(target)  # incomplete snapshot; original source is still intact
-        _snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=False)
+        with contextlib.suppress(OSError, Pressure):
+            settle(target.parent.parent, target.name, budget.bytes + 65536, compact=not include_builds)
     except (OSError, subprocess.CalledProcessError) as error:
         raise Incomplete(f"candidate preservation incomplete: {error}", reason="preservation") from error
 
@@ -262,11 +361,15 @@ def preserve_candidate(verification, *, disposable_only=False):
 
 
 def tool_readiness(job):
+    from . import verification_tools
     from .verification import LOCAL_CHECKERS, digest, stamps
 
     paths = [path for name in ("lake", "lean", "bash", "python3", "git", "tar") if (path := shutil.which(name))]
     paths += [str(p) for p in Path(__file__).parent.glob("*.py")]
     paths += [str(HERE / "scripts" / name) for name in ("tauceti-verify", *LOCAL_CHECKERS)]
+    paths += [sys.executable, *verification_tools.files()]
+    if config := verification_tools.configuration():
+        paths.append(config)
     paths.append(str(Path(os.environ.get("ELAN_HOME", str(Path.home() / ".elan"))) / "toolchains"))
     if registration := os.environ.get("TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS"):
         paths.append(registration)
@@ -303,26 +406,26 @@ def finish_job(verification):
     path = verification.state / "verification-pending" / f"{job['id']}.json"
     waiting_tools = verification.receipt.get("incomplete_reason") in {"tool-missing", "toolchain"}
     storage_wait = verification.receipt.get("incomplete_reason") == "disk-pressure"
-    storage_limit = verification.receipt.get("incomplete_reason") == "storage-limit"
     resumable = (
-        verification.receipt.get("incomplete_reason") in {"deadline", "signal", "disk-pressure", "storage-limit"}
+        verification.receipt.get("incomplete_reason")
+        in {"deadline", "signal", "disk-pressure", "storage-limit", "verification-busy"}
         or waiting_tools
     )
-    if resumable and not job.get("isolated") and not storage_wait and not storage_limit:
+    if resumable and not job.get("isolated") and not storage_wait:
         try:
             preserve_candidate(verification)
         except (Incomplete, OSError, ValueError, Pressure) as error:
             # Preservation errors retain source/checkpoint artifacts and never become tool failures.
             if isinstance(error, Pressure):
-                storage_limit = error.reason == "limit"
-                storage_wait = not storage_limit
+                storage_wait = True
                 verification.receipt.update(
-                    error=str(error), incomplete_reason="storage-limit" if storage_limit else "disk-pressure"
+                    error=str(error),
+                    incomplete_reason="verification-busy" if error.reason == "busy" else "disk-pressure",
                 )
             else:
                 verification.receipt.update(error=str(error), incomplete_reason="preservation")
                 resumable = False
-    if (storage_wait or storage_limit) and not job.get("isolated"):
+    if storage_wait and not job.get("isolated"):
         # A live or container-only checkout is not an independent continuation workspace.
         # Permit a fresh exact-source invocation after reclamation rather than deduplicating
         # it against a pending job the supervisor cannot safely execute.
@@ -338,26 +441,22 @@ def finish_job(verification):
                 next_action=(
                     "reclaim verification storage and retry verify in this workspace"
                     if storage_wait
-                    else "adjust verification storage limits or inputs, then invoke verify again"
-                    if storage_limit
                     else "repair verification inputs and invoke verify again"
                 ),
             )
     else:
         job.update(
-            status="blocked-storage-limit" if storage_limit else "blocked-tools" if waiting_tools else "pending",
-            next_at=time.time() + (60 if waiting_tools or storage_wait or storage_limit else 5),
+            status="blocked-tools" if waiting_tools else "pending",
+            next_at=time.time() + (60 if waiting_tools or storage_wait else 5),
         )
-        if waiting_tools or storage_limit:
+        if waiting_tools:
             job["tool_readiness"] = tool_readiness(job)
         atomic(path, job)
         verification.receipt.update(
             result_type="pending",
             continuation_job=str(path),
             next_action=(
-                "supervisor: resume after verification storage limits or verifier inputs change"
-                if storage_limit
-                else "supervisor: reclaim idle build caches, then resume verification without a model"
+                "supervisor: reclaim idle build caches, then resume verification without a model"
                 if storage_wait
                 else "supervisor: resume when local toolchain availability changes"
                 if waiting_tools
@@ -417,7 +516,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
 
     if getattr(cfg, "state", None) is None:
         return False
-    from .verification_storage import Limit, Pressure, housekeep, reserve, validate_settings
+    from .verification_storage import Pressure, housekeep, reserve, validate_settings
 
     housekeep((cfg.state, cfg.state / "verification-state"))
     try:
@@ -467,9 +566,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
             continue
         if job.get("next_at", 0) > time.time():
             continue
-        if job.get("status") in {"blocked-tools", "blocked-storage-limit"} and job.get(
-            "tool_readiness"
-        ) == tool_readiness(job):
+        if job.get("status") == "blocked-tools" and job.get("tool_readiness") == tool_readiness(job):
             continue
         # Bubble writes paths in its mounted namespace. Rebase only that known state
         # prefix; ordinary host paths are already absolute.
@@ -616,22 +713,12 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                                 path.unlink(missing_ok=True)
                             else:
                                 atomic(path, current)
-                    except Limit as error:
+                    except Pressure as error:
                         job.update(
                             error=str(error),
-                            status="blocked-storage-limit",
-                            next_at=time.time() + 60,
-                            tool_readiness=tool_readiness(job),
+                            status="pending",
+                            next_at=time.time() + (5 if error.reason == "busy" else 60),
                         )
-                        if job.get("isolated"):
-                            atomic(path, job)
-                        else:
-                            job["status"] = "incomplete"
-                            atomic(state / "verification-jobs" / path.name, job)
-                            path.unlink(missing_ok=True)
-                        return False
-                    except Pressure as error:
-                        job.update(error=str(error), status="pending", next_at=time.time() + 60)
                         atomic(path, job)
                         report_runtime("verification-pending", detail=str(error), verification_job=job["id"])
                         return False
@@ -642,3 +729,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                         report_runtime("verification-incomplete", detail=str(error), verification_job=job["id"])
                     return True
     return False
+
+
+if __name__ == "__main__":
+    snapshot_command()

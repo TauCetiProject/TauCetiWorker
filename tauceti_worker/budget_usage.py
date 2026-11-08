@@ -17,7 +17,15 @@ def evidence(directory, session, sessions, *, checkpoints=None):
     # A resumed CLI can replay old responses. Charge each provider response once,
     # to the first admitted invocation which recorded it.
     seen = set()
-    previous = sessions.values() if session.get("resume") else ()
+    previous = (
+        (
+            sessions.related([session["resume"]], include=session["id"])
+            if hasattr(sessions, "related")
+            else sessions.values()
+        )
+        if session.get("resume")
+        else ()
+    )
     for prior in previous:
         if prior["id"] == session["id"]:
             break
@@ -58,7 +66,7 @@ def linked_transcript(directory, session, sessions=None):
     from pathlib import Path
 
     from .claude_api import safe_message
-    from .paths import HERE
+    from .paths import HERE, legacy_data_root
     from .usage_accounting import MAX_CHECKPOINT, UsageJournal
 
     try:
@@ -69,7 +77,7 @@ def linked_transcript(directory, session, sessions=None):
         worker = session["worker"]
         if not worker or Path(worker).name != worker:
             return None
-        roots = [HERE / "state" / worker / "home/.claude/projects"]
+        roots = [legacy_data_root(HERE) / "state" / worker / "home/.claude/projects"]
         if worker == "default":
             roots.append(Path.home() / ".claude/projects")
         if override := os.environ.get("TAUCETI_USAGE_TRANSCRIPT_ROOTS"):
@@ -92,7 +100,7 @@ def linked_transcript(directory, session, sessions=None):
             sources=[],
         )
         journal.current, journal.waiting, journal.dirty = {}, {"unknown"}, set()
-        journal.flush = lambda: None
+        journal.flush = lambda **_: None
         for provider in providers:
             until = time.time()
             if session.get("finished") is not None:
@@ -102,7 +110,7 @@ def linked_transcript(directory, session, sessions=None):
             resume_before = None
             # Identity is receipt-linked. A later recorded resume bounds which
             # invocation owns responses without guessing a provider from time overlap.
-            for later in (sessions or {}).values():
+            for later in sessions.related([provider]) if hasattr(sessions, "related") else (sessions or {}).values():
                 if later.get("resume") == provider and later["started"] > session["started"]:
                     resume_before = min(resume_before, later["started"]) if resume_before else later["started"]
             matches = {

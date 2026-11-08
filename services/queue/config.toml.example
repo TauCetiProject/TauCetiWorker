@@ -1,0 +1,41 @@
+# Tau Ceti AI merge queue service configuration: ~/.config/tauceti-queue/config.toml
+# (tauceti_queue/config.py documents every key; `tauceti-queue check-config` prints the
+# effective values with their sources). Environment variables TAUCETI_QUEUE_<KEY> override.
+
+repository = "TauCetiProject/TauCeti"
+# Leave empty to discover the default branch from the repository at start.
+canonical_branch = ""
+# The host this service runs on, as reported in status; empty means this machine's host name.
+host = ""
+# The cutover flag. false is shadow mode: the service observes, builds batches and reports what
+# it would do without publishing. Set to true only in the cutover step of the runbook.
+publication_enabled = false
+
+content_clone = "~/.local/share/tauceti-queue/content"
+database = "~/.local/state/tauceti-queue/queue.sqlite3"
+credentials_dir = "~/.config/tauceti-queue"
+log_dir = "~/.local/state/tauceti-queue/logs"
+
+# Local listen address; the Cloudflare tunnel forwards queue.taucetiproject.org here.
+listen_host = "127.0.0.1"
+listen_port = 8780
+public_url = "https://queue.taucetiproject.org"
+reconcile_interval_seconds = 30
+# Primary deterministic intake. Policy source and project defaults are trusted service
+# configuration, never loaded from a PR. An upgrade must make the owner switch deliberately.
+admission_source = "policy"
+admission_lean_root = "TauCeti"
+admission_rubrics = "correctness,reuse,scope,attribution,api-design,generality,placement,naming,documentation,proof-quality"
+# admission_extra_files = ""   # additional explicitly allowed repository paths, comma separated
+
+# Initial runtime controls: `serve` seeds the store with these (and `publication_enabled` above)
+# only for keys the store has no value for, or whose stored value is an earlier seed from this file.
+# A value set with `tauceti-queue settings set <key> <value>` is never replaced by this file, so once
+# the store exists change them that way; `tauceti-queue check-config` shows which value is in effect.
+[settings]
+insertion_age_window = 16
+repair_concurrency = 1
+stall_interval_seconds = 900
+# Existing source discovery at startup and to recover missed deliveries; events wake pending
+# policy work immediately. This is not a work allowance or a maximum retry count.
+approval_poll_interval_seconds = 900

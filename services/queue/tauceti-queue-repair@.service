@@ -1,0 +1,31 @@
+# Additional repair workers use the same recovery policy as the singleton service.
+# Each instance requires its own repair-environment-%i, worker identity and task root.
+[Unit]
+Description=Tau Ceti AI merge queue repair worker %i
+Documentation=https://github.com/TauCetiProject/TauCetiWorker/blob/main/docs/queue/operations.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/TauCetiQueue
+EnvironmentFile=%h/.config/tauceti-queue/repair-environment-%i
+Environment=PATH=%h/.local/bin:%h/.elan/bin:%h/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=UV_NO_SYNC=1
+ExecStart=%h/TauCetiQueue/.venv/bin/python -m tauceti_queue.repair_task
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=300
+Restart=always
+RestartSec=30
+OOMPolicy=kill
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tauceti-queue-repair-%i
+LimitNOFILE=65536
+UMask=0077
+
+[Install]
+WantedBy=default.target

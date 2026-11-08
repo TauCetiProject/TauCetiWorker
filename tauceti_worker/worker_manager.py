@@ -29,7 +29,8 @@ import uuid
 from pathlib import Path
 from typing import NoReturn
 
-from .config import positive_integer
+from . import worker_scopes
+from .config import positive_integer, security_audit_problem, validate_extra_roadmap_prompt
 from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS
 from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
@@ -58,6 +59,7 @@ _WORKER_KEYS = {
     "roadmap_skip",
     "roadmap_extra_identities",
     "respect_claims",
+    "extra_roadmap_prompt",
     "source",
     "author_model",
     "author_effort",
@@ -189,6 +191,18 @@ def _strings(value, where: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _extra_roadmap_prompt(value, where: str) -> str | None:
+    """Operator guidance for roadmap rounds, checked at the configuration boundary like `pace`: a blank
+    or oversized value is a bad line in workers.toml, not a worker that dies on launch."""
+    text = _string(value, where, optional=True)
+    if text is None:
+        return None
+    try:
+        return validate_extra_roadmap_prompt(text)
+    except ValueError as e:
+        raise WorkersError(f"{where}: {e}") from None
+
+
 def _pace(value, where: str) -> str | None:
     """A pacing curve, checked here at the CONFIGURATION boundary. Without this a typo passes `workers
     apply --check`, and the manager discovers it only by launching a worker that rejects its own --pace
@@ -270,6 +284,7 @@ class WorkerSpec:
     roadmap_skip: tuple[str, ...] = ()
     roadmap_extra_identities: tuple[str, ...] = ()
     respect_claims: bool = True
+    extra_roadmap_prompt: str | None = None
     source: str | None = None
     author_model: str | None = None
     author_effort: str | None = None
@@ -338,6 +353,9 @@ class WorkerSpec:
                 raw.get("roadmap_extra_identities", []), f"workers[{index}].roadmap_extra_identities"
             ),
             respect_claims=_boolean(raw.get("respect_claims", True), f"workers[{index}].respect_claims"),
+            extra_roadmap_prompt=_extra_roadmap_prompt(
+                raw.get("extra_roadmap_prompt"), f"workers[{index}].extra_roadmap_prompt"
+            ),
             source=_string(raw.get("source"), f"workers[{index}].source", optional=True),
             author_model=_string(raw.get("author_model"), f"workers[{index}].author_model", optional=True),
             author_effort=_string(raw.get("author_effort"), f"workers[{index}].author_effort", optional=True),
@@ -363,6 +381,15 @@ class WorkerSpec:
                 raise WorkersError("Claude API workers require agent=claude and no subscription quota overrides")
         elif spec.budget or spec.anthropic_api_key_file:
             raise WorkersError("budget and anthropic_api_key_file require claude_billing=api")
+        # The same static checks `tauceti work` applies, so `apply --check` rejects what a worker would.
+        problem = security_audit_problem(
+            spec.only,
+            agent=spec.agent,
+            author_override=bool(spec.author_model or spec.author_effort),
+            api=spec.claude_billing == "api",
+        )
+        if problem:
+            raise WorkersError(f"workers[{index}]: {problem}")
         return spec
 
     def as_dict(self) -> dict:
@@ -398,6 +425,7 @@ class WorkerSpec:
             "conf",
             "github_state_url",
             "github_state_token_file",
+            "extra_roadmap_prompt",
             "source",
             "author_model",
             "author_effort",
@@ -462,6 +490,9 @@ class WorkerSpec:
         ):
             if field is not None:
                 argv += [flag, field]
+        if self.extra_roadmap_prompt is not None:
+            # One argument: free text may begin with `-`, which argparse would otherwise read as a flag.
+            argv.append(f"--extra-roadmap-prompt={self.extra_roadmap_prompt}")
         if self.stream:
             argv.append("--stream")
         if self.isolate_home:
@@ -711,7 +742,26 @@ def _serve_one(server: socket.socket, handler) -> None:
             pass
 
 
+def raise_oom_score(env=None, path=Path("/proc/self/oom_score_adj")) -> None:
+    """Apply TAUCETI_WORKER_OOM_SCORE_ADJ before the wrapper starts any child.
+
+    A supervisor can then keep a low score itself while its expendable workers
+    remain preferred kernel OOM victims. Only raises: an unprivileged process
+    cannot lower its score, and a supervisor's own higher score is kept.
+    """
+    raw = (os.environ if env is None else env).get("TAUCETI_WORKER_OOM_SCORE_ADJ")
+    if not raw:
+        return
+    try:
+        wanted = int(raw)
+        if -1000 <= wanted <= 1000 and wanted > int(path.read_text()):
+            path.write_text(f"{wanted}\n")
+    except (OSError, ValueError):
+        pass
+
+
 def cmd_managed_runner(args) -> int:
+    raise_oom_score()
     spec = _decode_spec(args.spec)
     state_dir = Path(args.state_dir)
     runtime_dir = Path(args.runtime_dir)
@@ -724,6 +774,7 @@ def cmd_managed_runner(args) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 73
+        isolation = worker_scopes.enter(spec.id, runtime_dir)
         server = _bind_socket(sock_path)
         stopping = False
         child: subprocess.Popen | None = None
@@ -798,6 +849,7 @@ def cmd_managed_runner(args) -> int:
                 restart_count=restart_count,
                 exit_code=None,
                 stopped_at=None,
+                **isolation,
             )
             test_command = os.environ.get("TAUCETI_MANAGER_TEST_COMMAND")
             child_argv = shlex.split(test_command) if test_command else spec.work_argv()
@@ -949,6 +1001,14 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             workers_die("another worker manager is already running")
+        from .activity import root as activity_root
+        from .retention import install_timer
+
+        if read_json(activity_root() / "cleanup-service.json").get("installed"):
+            try:
+                install_timer()
+            except Exception as error:
+                print(f"warning: cleanup unit refresh deferred: {error}", file=sys.stderr)
         server_path = manager_socket(runtime_dir)
         server = _bind_socket(server_path)
         exiting = False
@@ -959,13 +1019,28 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
         child_generations: dict[str, str] = {}
         exit_outcomes: dict[str, tuple[str, int]] = {}
         launch_failures: dict[str, tuple[str, int, float]] = {}
+        stopping_workers: dict[str, float] = {}
+        observed_workers: dict[str, dict] = {}
+        scopes = worker_scopes.Scopes(runtime_dir)
         last_good: list[WorkerSpec] | None = None
         last_error: str | None = None
 
         def stop(signum=None, frame=None) -> None:
             nonlocal exiting, stop_workers
             exiting = True
-            stop_workers = True
+            # Fleet's manager service is replaceable independently of its scopes.
+            # Explicit shutdown RPC still selects whether workers should stop.
+            stop_workers = stop_workers or not worker_scopes.enabled()
+
+        def unreported_exit(wid: str, fingerprint: str) -> None:
+            previous = launch_failures.get(wid)
+            failures = previous[1] + 1 if previous and previous[0] == fingerprint else 1
+            delay = min(5 * (2 ** min(failures - 1, 6)), 300)
+            launch_failures[wid] = (fingerprint, failures, time.time() + delay)
+            print(
+                f"tauceti workers: wrapper {wid} exited before publishing terminal state; failure backoff {delay}s",
+                file=sys.stderr,
+            )
 
         old_term = signal.signal(signal.SIGTERM, stop)
         old_int = signal.signal(signal.SIGINT, stop)
@@ -980,6 +1055,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                 if not isinstance(wid, str):
                     return {"ok": False, "error": "restart requires id"}
                 restart_ids.add(wid)
+                launch_failures.pop(wid, None)
                 return {"ok": True}
             if action == "enable":
                 wid = req.get("id")
@@ -1036,24 +1112,32 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                         if not terminal and process.returncode != 0:
                             spec = wanted.get(wid)
                             fingerprint = spec.fingerprint() if spec else "removed"
-                            previous = launch_failures.get(wid)
-                            failures = previous[1] + 1 if previous and previous[0] == fingerprint else 1
-                            delay = min(5 * (2 ** min(failures - 1, 6)), 300)
-                            launch_failures[wid] = (fingerprint, failures, time.time() + delay)
-                            print(
-                                f"tauceti workers: wrapper {wid} exited before publishing terminal state; "
-                                f"retrying in {delay}s",
-                                file=sys.stderr,
-                            )
+                            unreported_exit(wid, fingerprint)
                 known_ids = set(wanted)
                 try:
                     known_ids.update(path.stem for path in state_dir.glob("*.json"))
                 except OSError:
                     pass
+                scopes.cleanup_unknown(known_ids)
                 for wid in sorted(known_ids):
+                    # Reconciliation can outlast the control client's deadline on
+                    # busy hosts. Serve commands between workers, not only once
+                    # after scanning the whole fleet.
+                    ready, _, _ = select.select([server], [], [], 0)
+                    if ready:
+                        _serve_one(server, handle)
+                    if exiting:
+                        break
                     spec = wanted.get(wid)
                     live = runner_status(wid, state_dir, runtime_dir)
                     is_live = bool(live.get("alive"))
+                    observed = observed_workers.pop(wid, None)
+                    if is_live:
+                        observed_workers[wid] = {**(observed or {}), **live}
+                    if not is_live:
+                        stopping_workers.pop(wid, None)
+                        if wid not in children:
+                            scopes.cleanup(wid)
                     should_run = bool(spec and spec.enabled)
                     if is_live or not should_run:
                         enable_ids.discard(wid)
@@ -1071,7 +1155,11 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                         launch_failures.pop(wid, None)
                     if is_live and (not should_run or changed or wid in restart_ids):
                         _stop_runner(wid, runtime_dir)
+                        began = stopping_workers.setdefault(wid, time.monotonic())
+                        if time.monotonic() - began >= 25:
+                            scopes.cleanup(wid, force=True)
                         continue
+                    stopping_workers.pop(wid, None)
                     if is_live or not should_run or wid in children:
                         if not is_live and spec is None and live.get("managed"):
                             for stale in (
@@ -1084,13 +1172,28 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                                     pass
                         continue
                     prior = read_json(status_path(wid, state_dir))
+                    if observed and (
+                        prior.get("wrapper_pid") != observed.get("wrapper_pid") or prior.get("stopped_at") is None
+                    ):
+                        prior = observed
                     forced = wid in restart_ids or wid in enable_ids
+                    # Adopted wrappers are not Popen children. A missing terminal
+                    # receipt must still honor their restart policy and backoff.
+                    if (
+                        wid not in exit_outcomes
+                        and prior.get("wrapper_pid")
+                        and prior.get("spec_hash") == spec.fingerprint()
+                        and prior.get("stopped_at") is None
+                    ):
+                        exit_outcomes[wid] = (spec.fingerprint(), 1)
+                        unreported_exit(wid, spec.fingerprint())
                     outcome = exit_outcomes.get(wid)
                     if not forced and outcome and outcome[0] == spec.fingerprint():
                         if spec.restart == "never" or spec.restart == "on-failure" and outcome[1] == 0:
                             continue  # Parent-observed exits remain authoritative if reporting fails.
                     if (
                         not forced
+                        and not (outcome and outcome[0] == spec.fingerprint())
                         and spec.restart == "never"
                         and prior.get("spec_hash") == spec.fingerprint()
                         and prior.get("stopped_at")
@@ -1103,6 +1206,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     # could never be reconfigured without an explicit restart.
                     if (
                         not forced
+                        and not (outcome and outcome[0] == spec.fingerprint())
                         and spec.restart == "on-failure"
                         and prior.get("spec_hash") == spec.fingerprint()
                         and prior.get("exit_code") == 0
@@ -1114,9 +1218,16 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     manager_retry_at = (
                         manager_failure[2] if manager_failure and manager_failure[0] == spec.fingerprint() else 0
                     )
-                    if not forced and max(float(prior.get("stopped_at") or 0) + delay, manager_retry_at) > time.time():
+                    if manager_retry_at > time.time() or (
+                        not forced and float(prior.get("stopped_at") or 0) + delay > time.time()
+                    ):
                         continue
-                    children[wid] = _launch_runner(spec, state_dir, runtime_dir)
+                    try:
+                        children[wid] = _launch_runner(spec, state_dir, runtime_dir)
+                    except OSError as exc:
+                        print(f"tauceti workers: cannot launch {wid}: {exc}", file=sys.stderr)
+                        unreported_exit(wid, spec.fingerprint())
+                        continue
                     child_generations[wid] = spec.fingerprint()
                     exit_outcomes.pop(wid, None)
                     restart_ids.discard(wid)
@@ -1133,6 +1244,8 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     runner_status(wid, state_dir, runtime_dir).get("alive") for wid in live_ids
                 ):
                     time.sleep(0.1)
+                for wid in live_ids:
+                    scopes.cleanup(wid, force=True)
             return 0
         finally:
             activity_stopping.set()
@@ -1368,6 +1481,11 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
         if spec.get("respect_claims", True) is False:
             roadmap_values.append("claims: ignored")
         lines.extend(_status_field("roadmap", roadmap_values, width))
+    if spec.get("extra_roadmap_prompt"):
+        guidance = " ".join(str(spec["extra_roadmap_prompt"]).split())
+        if "roadmap" not in phases:
+            guidance += " (unused: the roadmap phase is not enabled)"
+        lines.extend(_status_field("guidance", [guidance], width))
 
     if spec.get("source"):
         lines.extend(_status_field("source", [str(spec["source"])], width))
@@ -1527,6 +1645,7 @@ def add_dashboard_worker(
     roadmap_only: str | None,
     roadmap_skip: str | None,
     github_account: str | None = None,
+    extra_roadmap_prompt: str | None = None,
 ) -> WorkerSpec:
     with _config_lock(config):
         try:
@@ -1543,6 +1662,7 @@ def add_dashboard_worker(
             sandbox="bubble" if bubble else "host",
             roadmap_only=roadmap_only,
             roadmap_skip=tuple(part.strip() for part in (roadmap_skip or "").split(",") if part.strip()),
+            extra_roadmap_prompt=extra_roadmap_prompt,
         )
         _write_worker_specs(config, [*specs, spec])
     ensure_manager(config)
@@ -1818,7 +1938,10 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        argv = shlex.split(line)
+        try:
+            argv = shlex.split(line)
+        except ValueError as exc:
+            raise WorkersError(f"{path}:{number}: {exc} (a value spanning several lines cannot be imported)") from None
         if len(argv) < 3 or Path(argv[0]).name != "tauceti" or argv[1] != "work" or "--loop" not in argv:
             raise WorkersError(f"{path}:{number}: expected a `tauceti work --loop` command")
         values: dict = {"only": []}
@@ -1840,10 +1963,13 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
             if token == "--ignore-claims":
                 values["respect_claims"] = False
                 continue
-            try:
-                value = next(flags)
-            except StopIteration:
-                raise WorkersError(f"{path}:{number}: {token} needs a value") from None
+            if token.startswith("--") and "=" in token:
+                token, value = token.split("=", 1)
+            else:
+                try:
+                    value = next(flags)
+                except StopIteration:
+                    raise WorkersError(f"{path}:{number}: {token} needs a value") from None
             key = {
                 "--worker-id": "id",
                 "--agent": "agent",
@@ -1855,6 +1981,7 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
                 "--roadmap-only": "roadmap_only",
                 "--roadmap-skip": "roadmap_skip",
                 "--roadmap-extra-identities": "roadmap_extra_identities",
+                "--extra-roadmap-prompt": "extra_roadmap_prompt",
                 "--source": "source",
                 "--author-model": "author_model",
                 "--author-effort": "author_effort",
@@ -1937,6 +2064,7 @@ def add_workers_parser(subparsers) -> None:
     )
     add.add_argument("--roadmap-only", help="pin roadmap rounds to one area")
     add.add_argument("--roadmap-skip", default="", help="comma-separated roadmap areas to exclude")
+    add.add_argument("--extra-roadmap-prompt", help="extra guidance for roadmap rounds, appended to the agent's prompt")
     add.add_argument("--source", help="source repository; requires roadmap in --only and one pinned roadmap area")
     add.add_argument("--author-model", help="exact authoring model; needs an explicit --agent")
     add.add_argument("--author-effort", help="reasoning effort for an explicit codex/claude/kiro agent")
@@ -2034,6 +2162,7 @@ def cmd_workers(args) -> int:
                     "github_state_url",
                     "github_state_token_file",
                     "roadmap_only",
+                    "extra_roadmap_prompt",
                     "source",
                     "author_model",
                     "author_effort",

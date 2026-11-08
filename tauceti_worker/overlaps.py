@@ -121,6 +121,16 @@ def pinned_sources(repo: Path, pin: str) -> Path:
 
 def issues(gh: GitHub, *, fresh=False) -> list[dict]:
     def fetch():
+        if not fresh:
+            from .github_state import read
+
+            available, rows = read(TAUCETI, "open_issues")
+            if available:
+                return [
+                    {**row, "state": row.get("state", "").lower(), "created_at": row.get("createdAt", "")}
+                    for row in rows
+                    if LABEL in {label["name"] for label in row.get("labels", [])}
+                ]
         # REST pagination has no fixed 200-issue ceiling. Decode all pages before caching.
         result = gh._gh(
             ["api", "--paginate", "--slurp", f"repos/{TAUCETI}/issues?labels={LABEL}&state=all&per_page=100"]
@@ -140,6 +150,12 @@ def overlap_prs(gh, *, fresh=False):
     """Only body/ownership are needed here; do not spend GraphQL on CI/review state."""
 
     def fetch():
+        if not fresh:
+            from .github_state import read
+
+            available, rows = read(TAUCETI, "open_prs")
+            if available:
+                return rows
         result = gh._gh(["api", "--paginate", "--slurp", f"repos/{TAUCETI}/pulls?state=open&per_page=100"])
         if result.returncode:
             raise Die("overlap: open PR inventory failed: " + result.stderr.strip()[-300:])
@@ -483,6 +499,7 @@ def do_scan(w, sv, c, opts, bubble):
                 logdir=work,
                 label="conversation",
                 provider=profile.provider,
+                quota_cfg=w.cfg,
                 cancel_event=lease.lost,
             )
             if rc:
@@ -561,6 +578,7 @@ def do_fix(w, sv, c, opts, bubble):
                     _effective_authoring_profile(opts),
                     w.cfg.logdir,
                     cancel_event=getattr(lease, "lost", None),
+                    quota_cfg=w.cfg,
                 )
         if rc:
             return rc

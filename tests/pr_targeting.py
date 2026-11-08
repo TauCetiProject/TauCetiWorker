@@ -224,10 +224,6 @@ sv = survey_with(suppressed={"fix": [1]})
 check("out of attempts", reason(sv, Opts(prs=[1]), 1), "fix suppressed: fix at head (3/3 attempts spent)")
 
 sv = survey_with()
-sv.review_inflight.append((1, "codex"))
-check("a peer holds the head", reason(sv, Opts(prs=[1]), 1), "review: a peer reviewer (codex) holds this head")
-
-sv = survey_with()
 sv.review_stuck.append(1)
 check("escalated for infrastructure repair", "needs infrastructure repair" in reason(sv, Opts(prs=[1]), 1), True)
 
@@ -238,9 +234,13 @@ check("nothing to fix yet", reason(sv, Opts(prs=[1]), 1), "fix: reviews at head 
 # Several reasons can be true at once, and reporting only the first would send the operator after the
 # wrong one.
 sv = survey_with(suppressed={"fix": [1]})
-sv.review_inflight.append((1, "codex"))
+sv.fix_waiting.append((1, "awaiting first review"))
 got = reason(sv, Opts(prs=[1]), 1)
-check("every reason is reported, not just the first", ("attempts spent" in got, "peer reviewer" in got), (True, True))
+check(
+    "every reason is reported, not just the first",
+    ("attempts spent" in got, "awaiting first review" in got),
+    (True, True),
+)
 
 
 def pr_info(number, *, draft=False, green_since=None):
@@ -423,17 +423,6 @@ check("...and that throttle is reported too", said("--review-min-age"), True)
 
 
 # --- the survey's own stops hold: a named PR is not reviewed just because it was named ---------------
-def inflight_survey():
-    sv = survey_with()
-    sv.open_prs.append(pr_info(412))
-    sv.review_inflight.append((412, "codex"))
-    return sv
-
-
-units, why = round_over(inflight_survey, opts_for(prs=[412]))
-check("a PR a peer is reviewing is not reviewed", units, [])
-check("...and the peer is the reported reason", said("holds this head"), True)
-
 units, why = round_over(lambda: survey_with(suppressed={"fix": [412]}), opts_for(prs=[412]))
 check("a PR whose fix budget is spent is not fixed", units, [])
 check("...and the spent budget is the reported reason", said("attempts spent"), True)

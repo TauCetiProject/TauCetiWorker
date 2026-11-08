@@ -3,6 +3,7 @@
 
 import contextlib
 import errno
+import fcntl
 import json
 import os
 import shutil
@@ -12,14 +13,17 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from work_recovery import allow_cleanup, fixture, git, reconstruct, snapshot_tree
 
 from tauceti_worker import recovery_index as index
 from tauceti_worker import recovery_maintenance as maintenance
+from tauceti_worker import usage_lifecycle
 from tauceti_worker import work_recovery as wr
 
 
@@ -31,7 +35,7 @@ class RecoveryMaintenance(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.env = patch.dict(
             os.environ,
             {
@@ -75,6 +79,165 @@ class RecoveryMaintenance(unittest.TestCase):
                 summary = wr.summary(self.cfg.state.parent)
                 self.assertEqual(summary["records"], 0)
                 self.assertEqual(summary["reasons"], [])
+
+    def expire_record(self, record):
+        manifest = json.loads((record / "manifest.json").read_text())
+        manifest["created_at"] = time.time() - maintenance.RECOVERY_RECORD_TTL - 1
+        maintenance.atomic_json(record / "manifest.json", manifest)
+
+    def test_record_lifetime_expires_unclassified_retry_and_stale_handoff_without_model_work(self):
+        for journal in (
+            {},
+            dict(state="eligible", reason=dict(code="invocation-failed"), retry_at=time.time() + 999999),
+            dict(state="resuming", handoff=dict(state="offered"), reason=dict(code="source-handoff-source-pending")),
+        ):
+            with self.subTest(journal=journal):
+                self.dirty()
+                record = wr.guard(self.cfg, self.co).record
+                self.expire_record(record)
+                maintenance.atomic_json(record / "recovery.json", journal | dict(updated_at=time.time()))
+                outbox = self.cfg.state / "github-outbox/keep.json"
+                maintenance.atomic_json(outbox, dict(pending=True))
+                with patch.object(wr, "inspect", side_effect=AssertionError("retirement needs no source work")):
+                    self.tick()
+                self.assertFalse(record.exists())
+                self.assertEqual(json.loads(outbox.read_text()), dict(pending=True))
+
+    def test_exhausted_recovery_retires_but_uncertain_publication_survives(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        exhausted = dict(state="eligible", attempts=3, reason=dict(code="invocation-failed"))
+        maintenance.atomic_json(record / "recovery.json", exhausted)
+        self.assertEqual(maintenance.abandonment_reason(record, exhausted), "recovery-exhausted")
+        for publication in [
+            dict(publication=dict(oid="unconfirmed", push_started=True)),
+            dict(normal_publication=dict(oid="unconfirmed", expected="old", ref="main")),
+        ]:
+            journal = exhausted | publication
+            maintenance.atomic_json(record / "recovery.json", journal)
+            self.expire_record(record)
+            self.assertEqual(maintenance.abandonment_reason(record, journal), "recovery-lifetime-exhausted")
+            checkout = record / "checkout"
+            checkout.mkdir(exist_ok=True)
+            (checkout / "derived").write_text("disposable")
+            self.assertTrue(maintenance.discard_record(self.cfg.state, record))
+            self.assertTrue(record.exists())
+            self.assertFalse(checkout.exists())
+            self.assertEqual(maintenance._metadata(record / "recovery.json")["state"], "obsolete")
+            self.assertFalse(maintenance.disposal_pending(record, journal))
+            self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+        maintenance.atomic_json(record / "recovery.json", exhausted)
+        self.assertTrue(maintenance.discard_record(self.cfg.state, record))
+        self.assertFalse(record.exists())
+
+    def test_legacy_blocked_publication_reconciles_before_lifetime_expiry(self):
+        for code in ("content-allowance", "recovery-exhausted"):
+            self.dirty()
+            record = wr.guard(self.cfg, self.co).record
+            journal = dict(
+                state="blocked", reason=dict(code=code), publication=dict(oid="unconfirmed", push_started=True)
+            )
+            maintenance.atomic_json(record / "recovery.json", journal)
+            checkout = record / "checkout"
+            checkout.mkdir(exist_ok=True)
+            with patch.object(wr, "live_users", side_effect=AssertionError("not ready for disposal")):
+                self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+            self.tick()
+            self.assertTrue(checkout.exists())
+            self.assertEqual(maintenance._metadata(record / "recovery.json")["state"], "eligible")
+            self.expire_record(record)
+            self.assertTrue(maintenance.discard_record(self.cfg.state, record))
+            with patch.object(wr, "live_users", side_effect=AssertionError("evidence needs no process scan")):
+                self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+
+    def test_native_cleanup_restart_progresses_past_slow_fresh_records(self):
+        base = self.cfg.state.parent
+        for name in ("a", "b", "c"):
+            record = base / name / "recovery/fresh"
+            record.mkdir(parents=True)
+            maintenance.atomic_json(record / "manifest.json", dict(created_at=time.time()))
+        expired = base / "z" / "recovery/expired"
+        expired.mkdir(parents=True)
+        maintenance.atomic_json(expired / "manifest.json", dict(created_at=time.time() - 90000))
+        original = maintenance._metadata
+
+        def slow_front(path, *args, **kwargs):
+            if path.parent.name == "fresh":
+                time.sleep(0.03)
+            return original(path, *args, **kwargs)
+
+        with patch.object(maintenance, "_metadata", side_effect=slow_front):
+            for _ in range(12):
+                maintenance._SWEEPS.clear()  # Fresh hourly collector, not a persistent process.
+                maintenance.prepare(base, seconds=0.02, entries=10000)
+                if not expired.exists():
+                    break
+        self.assertFalse(expired.exists(), "saved metadata progress must reach the old record")
+        self.assertTrue((base / "a/recovery/fresh").is_dir())
+
+    def test_exhausted_content_allowance_retires_a_fresh_record(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        maintenance.atomic_json(record / "recovery.json", dict(state="eligible", reason=dict(code="content-allowance")))
+        self.tick()
+        self.assertFalse(record.exists())
+
+    def test_deadline_uses_manifest_creation_not_recent_retry_or_future_timestamp(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        self.expire_record(record)
+        for _ in range(3):
+            maintenance.atomic_json(record / "recovery.json", dict(state="resuming", updated_at=time.time()))
+            self.assertEqual(maintenance.abandonment_reason(record, {}), "recovery-lifetime-exhausted")
+        manifest = json.loads((record / "manifest.json").read_text())
+        manifest["created_at"] = time.time() + 999999
+        maintenance.atomic_json(record / "manifest.json", manifest)
+        old = time.time() - maintenance.RECOVERY_RECORD_TTL - 1
+        os.utime(record / "manifest.json", (old, old))
+        self.assertEqual(maintenance.abandonment_reason(record, {}), "recovery-lifetime-exhausted")
+
+    def test_expiry_defers_for_actual_lock_live_user_and_mount_then_retires(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        self.expire_record(record)
+        with (record / "recovery.lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+        with patch.object(wr, "live_users", return_value=["active verifier"]):
+            self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+        with patch.object(maintenance.retention, "mount_points", return_value=[record]):
+            self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+        self.assertTrue(record.exists())
+        self.assertTrue(maintenance.discard_record(self.cfg.state, record))
+
+    def test_expired_handoff_protects_its_live_round_but_not_an_unrelated_new_round(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        self.expire_record(record)
+        maintenance.atomic_json(
+            record / "recovery.json",
+            dict(state="resuming", handoff=dict(state="offered", source_round="receiver", checkout=str(self.co))),
+        )
+        owner = self.cfg.state / "checkout-owners/TauCeti.json"
+        maintenance.atomic_json(owner, dict(round_id="receiver", process=wr.process_owner()))
+        with patch.object(wr, "live_users", return_value=[]):
+            self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+        maintenance.atomic_json(owner, dict(round_id="new-round", process=wr.process_owner()))
+
+        def users(path):
+            return ["unrelated work"] if path == self.co else []
+
+        with patch.object(wr, "live_users", side_effect=users):
+            self.assertTrue(maintenance.discard_record(self.cfg.state, record))
+
+    def test_bundle_without_command_timeout_still_obeys_housekeeping_budget(self):
+        with self.assertRaises(wr.BudgetExhausted):
+            wr._bounded_git(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                os.environ.copy(),
+                wr.Work(seconds=0.05),
+                timeout=None,
+            )
 
     def test_infrastructure_retry_keeps_warm_artifacts(self):
         self.dirty()
@@ -123,6 +286,28 @@ class RecoveryMaintenance(unittest.TestCase):
         self.assertTrue(garbage.exists())
         self.assertEqual(wr.summary(self.cfg.state.parent)["recovery_obsolete"], 0)
 
+    def test_collector_drains_only_retired_trash_and_resumes_its_cursor(self):
+        garbage = self.cfg.state / "recovery-cleanup/discarded/large"
+        garbage.mkdir(parents=True)
+        (garbage / "payload").write_bytes(b"x" * 32768)
+        source = self.cfg.state / "recovery/unfinished/source"
+        source.parent.mkdir(parents=True)
+        source.write_text("unpublished")
+        (garbage / "source-link").symlink_to(source.parent, target_is_directory=True)
+        maintenance.atomic_json(garbage.with_name(garbage.name + ".json"), dict(stack=None))
+        with patch.object(wr, "inspect", side_effect=AssertionError("trash needs no source archival")):
+            for step in range(10):
+                maintenance.collect_discarded(self.cfg.state.parent, removal_bytes=8192)
+                if not garbage.exists():
+                    break
+                if step == 0:
+                    # A copied/restored trash directory has new inode metadata.
+                    maintenance.atomic_json(
+                        garbage.with_name(garbage.name + ".json"), dict(tree_identity=[0, 0], stack=[""])
+                    )
+        self.assertFalse(garbage.exists())
+        self.assertEqual(source.read_text(), "unpublished")
+
     def restored(self, record, expected):
         dest = self.root / f"restore-{len(list(self.root.glob('restore-*')))}"
         clone = reconstruct(self.origin, record, self.root, dest.name)
@@ -132,6 +317,504 @@ class RecoveryMaintenance(unittest.TestCase):
         tree = Path(wr.retain(self.cfg, self.co, "fixture").details["retained"])
         allow_cleanup(self.cfg, self.co)
         return tree
+
+    def test_slow_safety_finishes_and_reclaims_cache_before_yielding(self):
+        self.dirty()
+        cache = self.co / ".lake" / "generated"
+        cache.parent.mkdir()
+        cache.write_bytes(b"artifact" * 100)
+        tree = self.retained()
+
+        def slow_users(*args, **kwargs):
+            time.sleep(0.3)  # Longer than the actual production scheduling slice.
+            return []
+
+        with patch.object(wr, "live_users", slow_users), patch.object(wr, "process_references", return_value=[]):
+            report = wr.housekeep(self.cfg.state.parent)
+        self.assertGreater(report["removed_bytes"], 0)
+        self.assertFalse((tree / ".lake").exists())
+        self.assertGreater(report["safety_seconds"], 0.25)
+
+    def test_shared_discovery_respects_busy_users_and_changed_generation(self):
+        state = self.cfg.state
+        trees = []
+        for name in ("first", "busy", "last"):
+            record = state / "recovery" / name
+            checkout = record / "checkout"
+            checkout.mkdir(parents=True)
+            wr.atomic_json(record / "cache-use.json", dict(generation="old"))
+            wr.atomic_json(
+                state / "recovery-cleanup/cache-roots" / f"{maintenance._name(record)}.json",
+                dict(generation=dict(cache_use="old"), owner=dict(process={})),
+            )
+            trees.append(checkout)
+        checks = maintenance.Checks(state.parent)
+        references = [("123", None, "123 (verifier)", [str(trees[1])])]
+        with (
+            patch.object(wr, "owner_stopped", return_value=True),
+            patch.object(wr, "process_references", return_value=references) as discovery,
+        ):
+            self.assertEqual(checks.users(trees[0], None, locked=True), ([], True))
+            self.assertTrue(checks.users(trees[1], None, locked=True)[0])
+            self.assertEqual(checks.users(trees[2], None, locked=True), ([], True))
+            alias = self.root / "state-alias"
+            alias.symlink_to(state.parent, target_is_directory=True)
+            self.assertEqual(
+                checks.users(alias / state.name / "recovery/first/checkout", None, locked=True), ([], True)
+            )
+            self.assertEqual(discovery.call_count, 1)
+        wr.atomic_json(trees[2].parent / "cache-use.json", dict(generation="new invocation"))
+        with patch.object(wr, "live_users", return_value=["new verifier"]) as fresh:
+            users, shared = checks.users(trees[2], None, locked=True)
+        self.assertEqual(users, ["new verifier"])
+        self.assertFalse(shared)
+        fresh.assert_called_once()
+        # A run active while discovery happened can spawn a survivor afterward.
+        with (
+            patch.object(wr, "owner_stopped", return_value=False),
+            patch.object(wr, "process_references", return_value=[]),
+            patch.object(wr, "live_users", return_value=["late child"]),
+        ):
+            users, shared = maintenance.Checks(state.parent).users(trees[0], None, locked=True)
+        self.assertEqual(users, ["late child"])
+        self.assertFalse(shared)
+
+    def test_unavailable_mount_snapshot_withholds_each_candidate_without_aborting(self):
+        trees = [self.cfg.state / "recovery" / name / "checkout" for name in ("first", "last")]
+        for tree in trees:
+            tree.mkdir(parents=True)
+            wr.atomic_json(tree.parent / "cache-use.json", dict(generation="stopped-use"))
+            wr.atomic_json(
+                self.cfg.state / "recovery-cleanup/cache-roots" / f"{maintenance._name(tree.parent)}.json",
+                dict(generation=dict(cache_use="stopped-use"), owner=dict(process={})),
+            )
+        checks = maintenance.Checks(self.cfg.state.parent)
+        real_read = Path.read_text
+
+        def unavailable(path, *args, **kwargs):
+            if str(path) == "/proc/self/mountinfo":
+                raise FileNotFoundError("fixture host without procfs")
+            return real_read(path, *args, **kwargs)
+
+        token = maintenance._CHECKS.set(checks)
+        try:
+            with (
+                patch.object(Path, "read_text", unavailable),
+                patch.object(wr, "owner_stopped", return_value=True),
+                patch.object(wr, "process_references", return_value=[]) as discovery,
+            ):
+                for tree in trees:
+                    self.assertEqual(
+                        maintenance._safe(self.cfg.state, tree, {"process": {}}, locked=True),
+                        "await-mount-evidence",
+                    )
+                discovery.assert_called_once()
+        finally:
+            maintenance._CHECKS.reset(token)
+        self.assertTrue(all(tree.exists() for tree in trees))
+
+    def test_unavailable_process_discovery_never_authorizes_deletion(self):
+        tree = self.cfg.state / "recovery" / "fixture" / "checkout"
+        tree.mkdir(parents=True)
+        checks = maintenance.Checks(self.cfg.state.parent)
+        with patch.object(wr, "process_references", side_effect=OSError("fixture unavailable")) as discovery:
+            for _ in range(2):
+                users, shared = checks.users(tree, None, locked=True)
+                self.assertTrue(users)
+                self.assertFalse(shared)
+            discovery.assert_called_once()
+        with patch.object(wr, "process_references", return_value=None):
+            self.assertTrue(wr.live_users(tree))
+            with patch.object(sys, "platform", "darwin"):
+                self.assertTrue(wr.live_users(tree))
+        with patch.object(wr, "process_references", return_value=[]):
+            self.assertEqual(wr.live_users(tree), [])
+
+    def test_darwin_process_references_protect_cwd_files_and_session(self):
+        class ProcessError(Exception):
+            pass
+
+        class Gone(ProcessError):
+            pass
+
+        class Denied(ProcessError):
+            pass
+
+        def process(pid, cwd="/", files=()):
+            value = Mock(pid=pid)
+            value.status.return_value = "running"
+            value.uids.return_value = SimpleNamespace(real=os.getuid(), effective=os.geteuid())
+            value.cwd.return_value = cwd
+            value.open_files.return_value = [SimpleNamespace(path=path) for path in files]
+            return value
+
+        tree = self.root / "retained"
+        tree.mkdir()
+        alias = self.root / "retained-alias"
+        alias.symlink_to(tree, target_is_directory=True)
+        own = process(os.getpid(), str(tree))
+        own.parents.return_value = [SimpleNamespace(pid=101)]
+        parent = process(101, str(tree))
+        cwd = process(102, str(tree / "nested"))
+        opened = process(103, "/", [str(tree / "Draft.lean")])
+        member = process(104)
+        sibling = process(105, str(tree) + "-other")
+        foreign = process(106)
+        foreign.uids.return_value = SimpleNamespace(real=os.getuid() + 1, effective=os.geteuid() + 1)
+        zombie = process(107, str(tree))
+        zombie.status.return_value = "zombie"
+        procs = {p.pid: p for p in (own, parent, cwd, opened, member, sibling, foreign, zombie)}
+
+        def lookup(pid=None):
+            if pid == 108:
+                raise Gone()
+            return procs[os.getpid() if pid is None else pid]
+
+        api = SimpleNamespace(
+            Process=Mock(side_effect=lookup),
+            pids=lambda: [*procs, 108],
+            Error=ProcessError,
+            NoSuchProcess=Gone,
+            AccessDenied=Denied,
+            STATUS_ZOMBIE="zombie",
+            STATUS_DEAD="dead",
+        )
+        with (
+            patch.dict(sys.modules, psutil=api),
+            patch.object(sys, "platform", "darwin"),
+            patch.object(os, "geteuid", return_value=501),
+            patch.object(os, "getuid", return_value=501),
+            patch.object(os, "getsid", side_effect=lambda pid: 104 if pid == 104 else 1),
+            patch.object(Path, "read_text", side_effect=AssertionError("Darwin must not read procfs")),
+        ):
+            # Fixture UIDs were initialized before the host UID mocks.
+            for p in (cwd, opened, member, sibling):
+                p.uids.return_value = SimpleNamespace(real=501, effective=501)
+            foreign.uids.return_value = SimpleNamespace(real=502, effective=502)
+            with patch.object(os.path, "realpath", side_effect=AssertionError("do not resolve observed paths")):
+                refs = wr.process_references()
+            self.assertEqual(wr.referenced_users(alias, refs), ["102 (process)", "103 (process)"])
+            self.assertIn("104 (owner session)", wr.referenced_users(tree, refs, session=104))
+            parent.cwd.assert_not_called()
+            foreign.cwd.assert_not_called()
+            cwd.open_files.side_effect = OSError("fixture unreadable private descriptors")
+            self.assertIn("102 (process)", wr.referenced_users(tree, wr.process_references()))
+            member.cwd.side_effect = ProcessError("fixture unreadable private cwd")
+            member.open_files.side_effect = Denied("fixture inaccessible private descriptors")
+            self.assertIn("104 (owner session)", wr.referenced_users(tree, wr.process_references(), session=104))
+            api.pids = Mock(side_effect=ProcessError("fixture unavailable inventory"))
+            self.assertIsNone(wr.process_references())
+            self.assertTrue(wr.live_users(tree))
+
+    def test_darwin_missing_psutil_defers_cleanup_and_launchers_declare_it(self):
+        repo = Path(__file__).resolve().parents[1]
+        header = (repo / "tauceti").read_text().split("# /// script\n", 1)[1].split("# ///", 1)[0]
+        shim = tomllib.loads("\n".join(line.removeprefix("# ") for line in header.splitlines()))
+        project = tomllib.loads((repo / "pyproject.toml").read_text())["project"]
+        for metadata in (shim, project):
+            self.assertIn("psutil>=7; sys_platform == 'darwin'", metadata["dependencies"])
+        with patch.dict(sys.modules, psutil=None), patch.object(sys, "platform", "darwin"):
+            self.assertTrue(wr.live_users(self.co))
+            self.assertIsNone(maintenance.retention.mount_points())
+
+    def test_darwin_candidate_uses_kernel_spelling_for_live_references_and_mounts(self):
+        kernel_path = self.co.with_name("TAUCETI")
+        references = [("123", None, "123 (process)", [str(kernel_path / "Draft.lean")])]
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(fcntl, "F_GETPATH", 50, create=True),
+            patch.object(fcntl, "fcntl", return_value=os.fsencode(kernel_path) + b"\0"),
+        ):
+            self.assertEqual(wr.referenced_users(self.co, references), ["123 (process)"])
+            with (
+                patch.object(wr, "owner_stopped", return_value=True),
+                patch.object(wr, "live_users", return_value=[]),
+                patch.object(maintenance.retention, "mount_points", return_value=[kernel_path / ".lake"]),
+            ):
+                self.assertEqual(maintenance._safe(self.cfg.state, self.co, {"process": {}}), "await-mount-lease")
+            with patch.object(fcntl, "fcntl", side_effect=OSError("fixture unavailable candidate descriptor")):
+                self.assertEqual(wr.referenced_users(self.co, references), ["candidate path unavailable"])
+
+    def test_darwin_owner_session_survives_leader_exit_but_not_pid_reuse_or_reboot(self):
+        owner = dict(pid=123, session=123, start="1:2", boot="fixture boot")
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(usage_lifecycle, "darwin_boot", return_value=owner["boot"]),
+            patch.object(usage_lifecycle, "darwin_process", side_effect=ProcessLookupError),
+        ):
+            self.assertEqual(wr.owner_session(owner), 123)
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(usage_lifecycle, "darwin_boot", return_value=owner["boot"]),
+            patch.object(usage_lifecycle, "darwin_process", return_value=(dict(owner, start="3:4"), 2)),
+            patch.object(os, "getsid", return_value=123),
+        ):
+            self.assertIsNone(wr.owner_session(owner))
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(usage_lifecycle, "darwin_boot", return_value="new boot"),
+        ):
+            self.assertIsNone(wr.owner_session(owner))
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(usage_lifecycle, "alive", return_value=True) as alive,
+        ):
+            self.assertFalse(wr.owner_stopped(owner))
+            alive.assert_called_once_with({key: owner[key] for key in ("pid", "start", "boot")})
+
+    def test_darwin_cleanup_and_record_retirement_without_procfs(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        tree = record / "checkout"
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(tree)], check=True)
+        cache = tree / ".lake/generated"
+        cache.parent.mkdir()
+        cache.write_text("disposable cache")
+        alias = self.root / "state-alias"
+        alias.symlink_to(self.cfg.state, target_is_directory=True)
+        alias_record = alias / "recovery" / record.name
+        wr.atomic_json(record / "cache-use.json", dict(generation="fixture stopped use"))
+        maintenance.defer_caches(self.cfg.state, record)
+        api = SimpleNamespace(disk_partitions=Mock(return_value=[SimpleNamespace(mountpoint="/")]))
+        read_text = Path.read_text
+
+        def read_without_procfs(path, *args, **kwargs):
+            if path.is_relative_to("/proc"):
+                raise AssertionError("Darwin must not read procfs")
+            return read_text(path, *args, **kwargs)
+
+        with (
+            patch.dict(sys.modules, psutil=api),
+            patch.object(sys, "platform", "darwin"),
+            patch.object(wr, "owner_stopped", return_value=True),
+            patch.object(wr, "_darwin_process_references", return_value=[]),
+            patch.object(Path, "read_text", read_without_procfs),
+        ):
+            checks = maintenance.Checks(self.cfg.state.parent)
+            self.assertEqual(checks.users(tree, None, locked=True), ([], True))
+            token = maintenance._CHECKS.set(checks)
+            try:
+                self.assertIsNone(maintenance._safe(self.cfg.state, tree, {"process": {}}, locked=True))
+            finally:
+                maintenance._CHECKS.reset(token)
+        # Exercise real cache eviction and the separate terminal-record path.
+        with (
+            patch.dict(sys.modules, psutil=api),
+            patch.object(sys, "platform", "darwin"),
+            patch.object(wr, "owner_stopped", return_value=True),
+            patch.object(wr, "_darwin_process_references", return_value=[]),
+        ):
+            self.tick()
+            self.assertFalse(cache.exists())
+            maintenance.atomic_json(record / "recovery.json", dict(state="obsolete"))
+            api.disk_partitions.return_value = [SimpleNamespace(mountpoint=str(tree / "mounted"))]
+            with patch.object(Path, "resolve", side_effect=AssertionError("do not resolve observed mounts")):
+                self.assertEqual(maintenance.retention.mount_points(), [tree / "mounted"])
+            self.assertFalse(maintenance.discard_record(alias, alias_record))
+            api.disk_partitions.side_effect = OSError("fixture unavailable mounts")
+            self.assertFalse(maintenance.discard_record(self.cfg.state, record))
+            api.disk_partitions.side_effect = None
+            api.disk_partitions.return_value = [SimpleNamespace(mountpoint="/")]
+
+            # A native process scan slower than the slice must finish, rather
+            # than restarting retirement forever at its next charged operation.
+            def slow_scan():
+                time.sleep(0.15)
+                return []
+
+            token = wr._WORK.set(wr.Work(seconds=0.1))
+            try:
+                with patch.object(wr, "_darwin_process_references", slow_scan):
+                    self.assertTrue(maintenance.discard_record(self.cfg.state, record))
+            finally:
+                wr._WORK.reset(token)
+        api.disk_partitions.assert_called_with(all=True)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS process observations")
+    def test_native_darwin_process_references_and_owner_birth(self):
+        import select
+
+        import psutil
+
+        tree = self.root / "native-checkout"
+        tree.mkdir()
+        source = tree / "Draft.lean"
+        source.write_text("keep live source")
+        code = (
+            "import json, sys, time; from tauceti_worker.work_recovery import process_owner; "
+            "held = open(sys.argv[1]); print(json.dumps(process_owner()), flush=True); time.sleep(30)"
+        )
+        with subprocess.Popen(
+            [sys.executable, "-c", code, str(source)],
+            cwd=Path(__file__).resolve().parents[1],
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        ) as child:
+            try:
+                self.assertTrue(select.select([child.stdout], [], [], 5)[0], "fixture child did not start")
+                owner = json.loads(child.stdout.readline())
+                self.assertEqual(owner["session"], child.pid)
+                self.assertFalse(wr.owner_stopped(owner))
+                # Constrain discovery to this fixture; use real native calls for it.
+                with patch.object(psutil, "pids", return_value=[child.pid]):
+                    self.assertEqual(wr.live_users(tree), [f"{child.pid} (process)"])
+                    self.assertEqual(wr.owner_session(owner), child.pid)
+            finally:
+                child.terminate()
+                child.wait(timeout=5)
+        self.assertTrue(wr.owner_stopped(owner))
+        with patch.object(psutil, "pids", return_value=[child.pid]):
+            self.assertEqual(wr.live_users(tree), [])
+        self.assertTrue(maintenance.retention.mount_points())
+
+        alias = self.root / "native-checkout-alias"
+        alias.symlink_to(tree, target_is_directory=True)
+        with subprocess.Popen(["sleep", "30"], cwd=alias) as child:
+            try:
+                with patch.object(psutil, "pids", return_value=[child.pid]):
+                    self.assertEqual(wr.live_users(alias), [f"{child.pid} (process)"])
+                    other_case = tree.with_name(tree.name.upper())
+                    if other_case.exists():  # Exercise case-insensitive APFS without assuming volume settings.
+                        self.assertEqual(wr.live_users(other_case), [f"{child.pid} (process)"])
+            finally:
+                child.terminate()
+                child.wait(timeout=5)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS session observations")
+    def test_native_darwin_session_survives_leader_exit(self):
+        import select
+
+        import psutil
+
+        tree = self.root / "unused-checkout"
+        tree.mkdir()
+        code = """import json, os, time
+from tauceti_worker.work_recovery import process_owner
+owner = process_owner()
+child = os.fork()
+if child == 0:
+    os.close(1)
+    time.sleep(60)
+    os._exit(0)
+print(json.dumps(dict(owner=owner, child=child)), flush=True)
+"""
+        with subprocess.Popen(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).resolve().parents[1],
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        ) as leader:
+            child_pid = None
+            try:
+                self.assertTrue(select.select([leader.stdout], [], [], 5)[0], "fixture session did not start")
+                result = json.loads(leader.stdout.readline())
+                child_pid = result["child"]
+                owner = result["owner"]
+                self.assertEqual(leader.wait(timeout=5), 0)
+                self.assertTrue(wr.owner_stopped(owner))
+                self.assertEqual(wr.owner_session(owner), leader.pid)
+                with patch.object(psutil, "pids", return_value=[child_pid]):
+                    refs = wr.process_references()
+                    self.assertEqual(wr.referenced_users(tree, refs), [])
+                    self.assertEqual(
+                        wr.referenced_users(tree, refs, session=leader.pid), [f"{child_pid} (owner session)"]
+                    )
+            finally:
+                # Only this disposable fixture's newly created session/group.
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(leader.pid, signal.SIGTERM)
+                leader.wait(timeout=5)
+                if child_pid is not None:
+                    with contextlib.suppress(psutil.NoSuchProcess):
+                        psutil.Process(child_pid).wait(timeout=5)
+
+    def test_cache_reuse_during_discovery_withholds_only_that_eviction(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        tree = record / "checkout"
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(tree)], check=True)
+        (tree / ".lake").mkdir()
+        (tree / ".lake/generated").write_text("keep new invocation cache")
+        maintenance.defer_caches(self.cfg.state, record)
+        path = next((self.cfg.state / "recovery-cleanup/cache-roots").glob("*.json"))
+        registry = wr.read_json(path) | {"registry": str(path)}
+
+        def reuse(*args, **kwargs):
+            wr.atomic_json(record / "cache-use.json", dict(generation="new invocation"))
+            return None
+
+        observation = {}
+        with patch.object(maintenance, "_safe", reuse):
+            maintenance._cleanup_cache_tree(self.cfg.state, tree, registry, wr.Work(), observation)
+        self.assertEqual(observation["next_action"], "retry-changed-cache")
+        self.assertTrue((tree / ".lake/generated").exists())
+
+    def test_fresh_collector_invocations_rotate_after_an_expensive_candidate(self):
+        for worker in ("a", "z"):
+            state = self.cfg.state.parent / worker
+            parent = self.root / "checkouts" / worker / "retained-checkouts"
+            (parent / "tree").mkdir(parents=True)
+            maintenance.register(state, parent, "TauCeti", "fixture/repo")
+        attempted = []
+
+        def expensive(state, tree, root, work, observation):
+            attempted.append(state.name)
+            maintenance._write_job(maintenance._job_path(state, tree), dict(tree=str(tree), phase="save", stack=[""]))
+            raise wr.BudgetExhausted("fixture expensive source preservation")
+
+        with patch.object(maintenance, "_cleanup", expensive):
+            self.tick()
+            maintenance._SWEEPS.clear()  # a new native timer process
+            self.tick()
+        self.assertCountEqual(attempted, ["a", "z"])
+
+    def test_inventory_skips_finished_cache_trees_and_unrelated_directories(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        tree = record / "checkout"
+        tree.mkdir()
+        (record / "source-outcomes").mkdir()
+        (record / "handoff-sources").mkdir()
+        maintenance.defer_caches(self.cfg.state, record)
+        path = next((self.cfg.state / "recovery-cleanup/cache-roots").glob("*.json"))
+        registry = wr.read_json(path)
+        registry["completed"] = dict(checkout=[tree.stat().st_dev, tree.stat().st_ino])
+        wr.atomic_json(path, registry)
+        report = self.tick(cleanup=False)
+        self.assertFalse(report["cleanup_pending"])
+        self.assertEqual(wr.summary(self.cfg.state.parent)["cleanup_backlog"], 0)
+
+    def test_cache_eviction_yields_its_record_lock_with_resumable_progress(self):
+        self.dirty()
+        record = wr.guard(self.cfg, self.co).record
+        tree = record / "checkout"
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(tree)], check=True)
+        cache = tree / ".lake"
+        cache.mkdir()
+        for i in range(40):
+            (cache / f"artifact-{i}").write_text("generated")
+        maintenance.defer_caches(self.cfg.state, record)
+        path = next((self.cfg.state / "recovery-cleanup/cache-roots").glob("*.json"))
+        registry = wr.read_json(path) | {"registry": str(path)}
+        unlink = os.unlink
+
+        def slow_unlink(name, *args, **kwargs):
+            if str(name).startswith("artifact-"):
+                time.sleep(0.02)
+            return unlink(name, *args, **kwargs)
+
+        observation = {}
+        with patch.object(maintenance, "_safe", return_value=None), patch.object(os, "unlink", slow_unlink):
+            maintenance._cleanup_cache_tree(self.cfg.state, tree, registry, wr.Work(seconds=30), observation)
+        self.assertEqual(observation["next_action"], "resume-cache-removal")
+        self.assertGreater(len(list(cache.iterdir())), 0)
+        self.assertLess(len(list(cache.iterdir())), 40)
+        with patch.object(maintenance, "_safe", return_value=None):
+            maintenance._cleanup_cache_tree(self.cfg.state, tree, registry, wr.Work(seconds=30), {})
+        self.assertFalse(cache.exists())
+        self.assertTrue((tree / "A.lean").exists())
 
     def test_warm_lookup_independent_of_history(self):
         self.dirty()
@@ -208,6 +891,90 @@ class RecoveryMaintenance(unittest.TestCase):
         self.assertFalse(tree.exists())
         saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
         self.restored(saved, expected)
+
+    def test_recent_retention_of_old_directory_saves_source_before_abandonment(self):
+        expected = self.dirty()
+        old = time.time() - 3 * maintenance.RECOVERY_RECORD_TTL
+        os.utime(self.co, (old, old))
+        tree = self.retained()
+        # Old collector versions also derived the job clock from the root mtime.
+        maintenance._write_job(
+            maintenance._job_path(self.cfg.state, tree),
+            dict(tree=str(tree), phase="save", created_at=old, stack=[""]),
+        )
+        self.tick()
+        saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
+        self.restored(saved, expected)
+        owner = maintenance._metadata(tree.with_name(tree.name + ".owner.json"))
+        self.assertNotIn("abandonment_reason", owner)
+
+    def test_expired_intent_cannot_abandon_a_younger_replacement(self):
+        self.dirty()
+        tree = self.retained()
+        info = tree.stat()
+        path = maintenance._job_path(self.cfg.state, tree)
+        maintenance._write_job(
+            path,
+            dict(
+                tree=str(tree),
+                phase="save",
+                created_at=time.time() - maintenance.RECOVERY_RECORD_TTL - 1,
+                tree_identity=[info.st_dev, info.st_ino],
+            ),
+        )
+        replacement = self.root / "replacement"
+        shutil.copytree(tree, replacement)
+        (replacement / "Draft.lean").write_text("younger unrelated source")
+        tree.rename(self.root / "old-retained")
+        replacement.rename(tree)
+        with patch.object(wr, "inspect", side_effect=AssertionError("stale intent cannot authorize new source work")):
+            self.tick()
+        self.assertTrue(tree.exists())
+        self.assertEqual((tree / "Draft.lean").read_text(), "younger unrelated source")
+        job = maintenance._read_job(path)
+        self.assertEqual(job["tree_identity"], [tree.stat().st_dev, tree.stat().st_ino])
+        self.assertLess(time.time() - job["created_at"], maintenance.RECOVERY_RECORD_TTL)
+
+    def test_expired_owned_retained_tree_needs_no_git_salvage(self):
+        self.dirty()
+        tree = self.retained()
+        shutil.rmtree(tree / ".git")
+        job = maintenance._job_path(self.cfg.state, tree)
+        maintenance._write_job(
+            job,
+            dict(
+                tree=str(tree),
+                phase="save",
+                created_at=time.time() - maintenance.RECOVERY_RECORD_TTL - 1,
+                tree_identity=[tree.stat().st_dev, tree.stat().st_ino],
+            ),
+        )
+        old = time.time() - maintenance.RECOVERY_RECORD_TTL - 1
+        os.utime(tree.with_name(tree.name + ".owner.json"), (old, old))
+        with patch.object(wr, "inspect", side_effect=AssertionError("abandoned task must not need salvage")):
+            self.tick()
+        self.assertFalse(tree.exists())
+        owner = maintenance._metadata(tree.with_name(tree.name + ".owner.json"))
+        self.assertEqual(owner["abandonment_reason"], "recovery-lifetime-exhausted")
+        self.assertFalse(job.exists())
+
+    def test_expired_retained_tree_still_waits_for_owner_evidence(self):
+        self.dirty()
+        tree = self.retained()
+        tree.with_name(tree.name + ".owner.json").unlink()
+        job = maintenance._job_path(self.cfg.state, tree)
+        maintenance._write_job(
+            job,
+            dict(
+                tree=str(tree),
+                phase="save",
+                created_at=time.time() - maintenance.RECOVERY_RECORD_TTL - 1,
+                tree_identity=[tree.stat().st_dev, tree.stat().st_ino],
+            ),
+        )
+        self.tick()
+        self.assertTrue(tree.exists())
+        self.assertEqual(maintenance._read_job(job)["next_action"], "await-owner")
 
     def test_parked_candidates_do_not_repeat_source_analysis(self):
         self.dirty()
@@ -397,7 +1164,7 @@ print(json.dumps(dict(owner=process_owner(), child=child.pid)))
         self.assertGreater(decision.details["preparation"]["hash_bytes"], 10000)
         self.restored(saved, expected)
 
-    def test_crash_before_descriptor_rename_leaves_exact_source(self):
+    def test_cancellation_before_descriptor_rename_removes_partial_and_keeps_source(self):
         expected = self.dirty()
         rename = os.rename
 
@@ -409,8 +1176,129 @@ print(json.dumps(dict(owner=process_owner(), child=child.pid)))
         with patch.object(wr.os, "rename", crash), self.assertRaises(Crash):
             wr.guard(self.cfg, self.co)
         self.assertEqual(snapshot_tree(self.co), expected)
-        self.assertTrue(list((self.cfg.state / "recovery").glob(".tmp-*")))
+        self.assertFalse(list((self.cfg.state / "recovery").glob(".tmp-*")))
         self.restored(wr.guard(self.cfg, self.co).record, expected)
+
+    def age_partial(self, record):
+        old = time.time() - wr.INCOMPLETE_SAVE_TTL - 10
+        for path in [record, *record.iterdir()]:
+            os.utime(path, (old, old), follow_symlinks=False)
+
+    def test_abandoned_partial_expires_but_fresh_writes_and_complete_records_survive(self):
+        expected = self.dirty()
+        complete = wr.guard(self.cfg, self.co).record
+        root = self.cfg.state / "recovery"
+        old = root / ".tmp-abandoned"
+        old.mkdir()
+        (old / "unstaged.patch").write_text("discard this incomplete save")
+        self.age_partial(old)
+        fresh = root / ".tmp-fresh"
+        fresh.mkdir()
+        (fresh / "unstaged.patch").write_text("still preparing")
+        self.tick()
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+        self.restored(complete, expected)
+        for _ in range(2):
+            self.tick()
+        self.assertFalse(list((self.cfg.state / "recovery-cleanup/discarded").glob("*")))
+        self.assertEqual(wr.summary(self.cfg.state.parent)["incomplete"], 0)
+
+    def test_save_lease_and_live_users_protect_even_old_partials(self):
+        root = self.cfg.state / "recovery"
+        root.mkdir(parents=True)
+        partial = root / ".tmp-active"
+        partial.mkdir()
+        self.age_partial(partial)
+        with (self.cfg.state / "recovery-save.lock").open("a+b") as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertIsNone(maintenance.abandon_incomplete(self.cfg.state, partial))
+        with patch.object(wr, "live_users", return_value=["active child"]):
+            self.assertIsNone(maintenance.abandon_incomplete(self.cfg.state, partial))
+        with patch.object(maintenance.retention, "mount_points", return_value=[partial]):
+            self.assertIsNone(maintenance.abandon_incomplete(self.cfg.state, partial))
+        self.assertTrue(partial.exists())
+        with patch.object(maintenance.retention, "mount_points", return_value=[]):
+            self.assertIsNotNone(maintenance.abandon_incomplete(self.cfg.state, partial))
+
+    def test_partial_changed_during_live_use_check_is_not_discarded(self):
+        partial = self.cfg.state / "recovery/.tmp-changing"
+        partial.mkdir(parents=True)
+        patch_file = partial / "unstaged.patch"
+        patch_file.write_text("old partial")
+        self.age_partial(partial)
+
+        def late_write(path):
+            patch_file.write_text("new writes must survive")
+            return []
+
+        with patch.object(wr, "live_users", side_effect=late_write):
+            self.assertIsNone(maintenance.abandon_incomplete(self.cfg.state, partial))
+        self.assertEqual(patch_file.read_text(), "new writes must survive")
+
+    def test_bounded_git_honors_short_timeout_inside_a_larger_housekeeping_budget(self):
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            wr._bounded_git(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                os.environ.copy(),
+                wr.Work(seconds=5),
+                timeout=0.05,
+            )
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_bundle_has_no_fixed_cutoff_and_budget_failure_preserves_original_source(self):
+        (self.co / "A.lean").write_text("local unpublished commit")
+        git(self.co, "commit", "-qam", "unfinished")
+        expected = snapshot_tree(self.co)
+        original = wr._git
+        timeouts = []
+
+        def slow_bundle(repo, *args, **kwargs):
+            if args[:2] == ("bundle", "create"):
+                timeouts.append(kwargs.get("timeout"))
+                raise subprocess.TimeoutExpired("git bundle", kwargs["timeout"])
+            return original(repo, *args, **kwargs)
+
+        with patch.object(wr, "_git", slow_bundle), self.assertRaises(wr.RecordError):
+            wr._record(self.cfg, self.co, wr.inspect(self.co), "TauCeti", wr.TAUCETI)
+        self.assertEqual(timeouts, [None])
+        self.assertEqual(git(self.co, "for-each-ref", "refs/tauceti-pending"), "")
+        self.assertFalse(list((self.cfg.state / "recovery").glob(".tmp-*")))
+        self.assertEqual(snapshot_tree(self.co), expected)
+
+    def test_killed_save_is_later_abandoned_and_git_inherits_the_save_lease(self):
+        expected = self.dirty()
+        source = str(Path(__file__).resolve().parent.parent)
+        script = """import sys,os
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0, sys.argv[1])
+from tauceti_worker import work_recovery as wr
+cfg=SimpleNamespace(state=Path(sys.argv[2]), checkout=Path(sys.argv[3]), wid='w')
+wr._archive=lambda *args,**kwargs: os._exit(73)
+wr.guard(cfg,cfg.checkout)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script, source, str(self.cfg.state), str(self.co)], capture_output=True, timeout=15
+        )
+        self.assertEqual(result.returncode, 73, result.stderr)
+        partials = list((self.cfg.state / "recovery").glob(".tmp-*"))
+        self.assertEqual(len(partials), 1)
+        self.age_partial(partials[0])
+        self.tick()
+        self.assertFalse(partials[0].exists())
+        self.assertEqual(snapshot_tree(self.co), expected)
+        with (self.cfg.state / "recovery-save.lock").open("a+b") as lease:
+            token = wr._SAVE_LEASE.set(lease.fileno())
+            try:
+                with patch.object(
+                    wr.subprocess, "run", return_value=SimpleNamespace(stdout=b"", stderr=b"", returncode=0)
+                ) as run:
+                    wr._git(self.co, "version")
+                self.assertIn(lease.fileno(), run.call_args.kwargs["pass_fds"])
+            finally:
+                wr._SAVE_LEASE.reset(token)
 
     def test_large_cache_cleanup_resumes_with_all_budgets_and_restart(self):
         expected = self.dirty()

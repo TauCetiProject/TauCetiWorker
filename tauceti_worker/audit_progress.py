@@ -6,7 +6,7 @@ import json
 import re
 from pathlib import Path
 
-from .audit_reader import pages
+from .audit_reader_v3 import pages
 from .config import Die
 
 GOAL_OBJECTIVE = (
@@ -47,8 +47,13 @@ INLINE_POLICY = (
 )
 
 
-def coverage(batch: dict, receipt: Path) -> dict:
+def coverage(batch: dict, receipt: Path, *, protocol: int = 3) -> dict:
     """Validate the owned receipt; absence means no source has been delivered yet."""
+    if protocol == 4:
+        from .audit_reader import Reader
+
+        proof = Reader(batch, receipt).coverage()
+        return {**proof, "read": proof["served"], "missing": list(range(len(proof["served"]), proof["pages"]))}
     count = len(pages(batch))
     if not receipt.exists():
         return {"pages": count, "read": [], "missing": list(range(count)), "last_token": None}
@@ -105,13 +110,25 @@ def legacy_coverage_only(value, batch: dict, receipt: Path) -> bool:
     )
 
 
-def continuation_prompt(batch: dict, receipt: Path) -> str:
-    proof = coverage(batch, receipt)
+def continuation_prompt(batch: dict, receipt: Path, *, protocol: int = 3) -> str:
+    proof = coverage(batch, receipt, protocol=protocol)
     remaining = proof["missing"]
     if remaining:
         status = f"{len(remaining)} pages remain unread; next_unread_page={remaining[0]}."
     else:
         status = "All pages were delivered; finish the safety judgment, retaining every source concern."
+    if protocol == 4:
+        return (
+            "The trusted Worker has not accepted a complete safety judgment. "
+            + (
+                f"{len(remaining)} chunks remain unserved; next_unserved_page={remaining[0]}. "
+                if remaining
+                else "All chunks were served; finish the safety judgment. "
+            )
+            + "Continue this SAME inspection, preserving ALL findings and code uncertainty. "
+            "Request the next unserved page by number; reread earlier pages when needed. "
+            "Served coverage does not establish safety or understanding.\n"
+        )
     return (
         "The trusted Worker has not accepted a complete safety judgment. " + status + " "
         "Continue this SAME retained inspection and goal, preserving all findings and code uncertainty. "
@@ -121,8 +138,12 @@ def continuation_prompt(batch: dict, receipt: Path) -> str:
     )
 
 
-def snapshot(batch: dict, receipt: Path, work: Path) -> str:
-    proof = coverage(batch, receipt)
+def snapshot(batch: dict, receipt: Path, work: Path, *, protocol: int = 3) -> str:
+    proof = coverage(batch, receipt, protocol=protocol)
+    if protocol == 4:
+        path = work / "coverage-before.json"
+        path.write_text(json.dumps({k: proof[k] for k in ("protocol_version", "input_digest", "pages", "served")}))
+        return continuation_prompt(batch, path, protocol=protocol)
     value = {
         "input_digest": batch["input_digest"],
         "pages": proof["pages"],
@@ -137,19 +158,19 @@ def snapshot(batch: dict, receipt: Path, work: Path) -> str:
 
 
 def continuable(
-    transcript: str, batch: dict, receipt: Path, work: Path, *, legacy=False, allowed=(), paged=True
+    transcript: str, batch: dict, receipt: Path, work: Path, *, legacy=False, allowed=(), paged=True, protocol=3
 ) -> bool:
     from . import security_audit as sa
     from .audit_recovery import native_finals, safe_history
 
     try:
-        if not safe_history(work, batch, paged, legacy=legacy, allowed=allowed):
+        if not safe_history(work, batch, paged, legacy=legacy, allowed=allowed, protocol=protocol):
             return False
         events = sa.codex_events(transcript, paged)
         thread = sa.retained_thread(work)
         if any(e.get("type") == "thread.started" and e.get("thread_id") != thread for e in events):
             return False
-        proof = coverage(batch, receipt) if paged else None
+        proof = coverage(batch, receipt, protocol=protocol) if paged else None
         messages = [
             e for e in events if e.get("type") == "item.completed" and e.get("item", {}).get("type") == "agent_message"
         ]
@@ -163,13 +184,25 @@ def continuable(
             return False
         if (
             not isinstance(value, dict)
-            or set(value) != {"verdict", "findings", "read_token"}
+            or set(value) != ({"verdict", "findings"} | ({"read_token"} if protocol < 4 else set()))
             or value["findings"] != []
         ):
             return False
+        if protocol == 4:
+            return value["verdict"] == "unfinished" or (value["verdict"] == "pass" and bool(proof["missing"]))
         token = value["read_token"]
-        if not isinstance(token, str) or (proof["read"] and token != proof["last_token"]):
+        if not isinstance(token, str):
             return False
-        return value["verdict"] == "unfinished" or (value["verdict"] == "pass" and bool(proof["missing"]))
+        # An unfinished answer never authorizes advancement. A copied token can
+        # be damaged without losing the owned receipt or the native inspection;
+        # continuation replays the last page with an empty token. Passing answers
+        # still need the exact delivery token, including premature passes.
+        if value["verdict"] == "unfinished":
+            return True
+        return (
+            value["verdict"] == "pass"
+            and bool(proof["missing"])
+            and (not proof["read"] or token == proof["last_token"])
+        )
     except (Die, OSError, ValueError, KeyError, TypeError, AttributeError):
         return False

@@ -25,19 +25,14 @@ If the branch already includes current `main`, semantic repair may still be need
 - Use `namespace TauCeti` by default. For dot-notation APIs whose first explicit argument has an
   existing Lean or Mathlib type, put declarations in that type's existing namespace (e.g. root
   `Set` or `RingEquiv`), as required by the naming rubric; do not nest it under `TauCeti`.
-- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If your work needs one, follow the durable blocked-PR procedure below rather than leaving the decision in your final report.
+- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`. Resolve roadmap scope findings using the PR outcome instructions below: adapt to an existing target or close your own PR with an explanation.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and never silence a linter.
 
 Merging upstream workflow or pin changes as part of bringing in `main` is expected. Do not author independent changes to those human-owned files. The sweep request is bound to the old head; after a successful push it no longer schedules rebase work. Do not remove the request label yourself or reset any attempt counter.
 
 ## Verify before pushing (all MUST pass, after the merge/rebase)
 __LOCAL_VERIFICATION__
-Use the request's evidence to reproduce the diagnosis with the specific failing step, not a rerun of
-every check. After the merge/rebase and any repair, run the final verification once: `lake exe cache
-get` (if you have not run it this session, or the merge changed the pins), `lake build --iofail`, then the
-scope recipe and the scoped audit above. The recipe's base is the canonical main you integrated, so
-it covers this PR's changed modules and everything importing them. Iterate until green. Never push
-red: a botched conflict resolution that builds red is worse than the conflict.
+Use the request's evidence to diagnose the specific failure. After integration and repair, run the shared final verification above once. Its whole-library build covers affected importers; its local axiom diagnostics cover changed modules. Never push red.
 
 **Do this synchronously, in this one turn.** You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. When a repair is needed, do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 

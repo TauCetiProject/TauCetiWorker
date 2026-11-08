@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -24,7 +25,7 @@ class Retention(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="tauceti-retention-")
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.state = self.root / "state" / "retired"
         self.state.mkdir(parents=True)
         self.checkout = self.root / "checkouts" / "retired" / "TauCeti"
@@ -50,6 +51,7 @@ class Retention(unittest.TestCase):
                 {
                     "TAUCETI_ACTIVITY_DIR": str(self.root / "activity"),
                     "TAUCETI_BUILD_CACHE_ROOT": str(self.root / "build-cache"),
+                    "TAUCETI_REVIEW_MATHLIB_CACHE": str(self.root / "review-sources"),
                     "TAUCETI_SHARED_MATHLIB_ROOT": str(self.root / "pool"),
                     "TAUCETI_WORKERS_STATE_DIR": str(self.root / "managed"),
                 },
@@ -70,6 +72,51 @@ class Retention(unittest.TestCase):
         self.git("add", ".")
         self.git("commit", "-qm", "seed")
         work_recovery.mark_published(self.checkout, "seed", self.git("rev-parse", "HEAD").strip())
+
+    def test_older_review_install_does_not_abort_other_cleanup(self):
+        with patch.dict(sys.modules, {"runner.source_cache": None}):
+            result = retention.sweep(now=self.clock)
+        self.assertTrue(any("review source cleanup:" in row for row in result["errors"]))
+        self.assertIn("removed_count", result)
+        self.assertIn("protected_count", result)
+
+    def test_review_source_collection_is_wired_to_sweep_and_dry_run(self):
+        from runner import source_cache
+
+        directory = Path(os.environ["TAUCETI_REVIEW_MATHLIB_CACHE"])
+        root = source_cache._root(directory, create=True)
+        pin = "a" * 40
+        with source_cache._lock(root, pin, write=True):
+            stage = root / (pin + ".staging")
+            stage.mkdir()
+            (stage / "partial").write_text("interrupted source publication")
+        report = retention.sweep(now=self.clock, dry=True)
+        self.assertTrue(stage.exists())
+        self.assertIn(str(stage), report["removed"])
+        report = retention.sweep(now=self.clock)
+        self.assertFalse(stage.exists())
+        self.assertIn(str(stage), report["removed"])
+        self.assertTrue((root / "locks" / pin).exists())
+
+    @unittest.skipUnless(sys.platform == "linux", "systemd unit fixture")
+    def test_cleanup_unit_preserves_review_source_overrides(self):
+        from tauceti_worker import worker_manager
+
+        unit = self.root / "systemd/worker.service"
+        environment = {
+            "TAUCETI_REVIEW_MATHLIB_CACHE": "/custom/review-cache",
+            "TAUCETI_SHARED_REPOSITORIES_DIR": "/custom/repositories",
+            "TAUCETI_GITHUB_SHARED_DIR": "/custom/github",
+        }
+        with (
+            patch.object(retention, "self_env", return_value=environment),
+            patch.object(worker_manager, "_service_path", return_value=unit),
+            patch.object(retention.subprocess, "run"),
+        ):
+            retention.install_timer()
+        text = (unit.parent / "tauceti-cleanup.service").read_text()
+        for key, value in environment.items():
+            self.assertIn(key + "=" + value, text)
 
     def git(self, *args):
         return subprocess.run(
@@ -118,7 +165,6 @@ class Retention(unittest.TestCase):
         private = self.cfg.state / "home/.cache/lake/payload"
         private.parent.mkdir(parents=True)
         private.write_text("old artifact")
-        retention.recycle(self.cfg, now=self.clock)
         atomic_json(
             activity.root() / "cache-pressure.json",
             dict(requested_at=self.clock + 10, until=self.clock + 200, workers=[self.cfg.wid]),
@@ -131,9 +177,18 @@ class Retention(unittest.TestCase):
         retention.recycle(self.cfg, now=self.clock + 30)
         self.assertTrue(private.exists())
 
-    def test_critical_space_reclaims_idle_private_cache_before_admission(self):
+    def test_critical_space_recovers_independently_and_through_hysteresis(self):
+        self.clock = time.time()
         cache = self.cache()
         self.cfg.state.mkdir(parents=True, exist_ok=True)
+        atomic_json(self.cfg.state / "cache-generation.json", dict(started_at=self.clock))
+        private = self.cfg.state / "home/.cache/lake/payload"
+        private.parent.mkdir(parents=True)
+        private.write_text("artifact")
+        atomic_json(
+            activity.root() / "cache-pressure.json",
+            dict(requested_at=self.clock, until=0, workers=[]),
+        )
         usage = shutil._ntuple_diskusage(1000, 960, 40)
         with (
             patch.object(retention.shutil, "disk_usage", return_value=usage),
@@ -143,9 +198,33 @@ class Retention(unittest.TestCase):
                 with round_.RoundContext(self.cfg):
                     self.fail("critical storage must defer new work")
         self.assertFalse(cache.exists())
+        self.assertFalse(private.exists())
+        cache = self.cache()
+        private.parent.mkdir(parents=True, exist_ok=True)
+        private.write_text("artifact")
+        atomic_json(
+            activity.root() / "cache-pressure.json",
+            dict(requested_at=self.clock + 1, until=self.clock + 200, workers=[]),
+        )
+        with patch.object(retention.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(1000, 900, 100)):
+            retention.recycle(self.cfg, now=self.clock + 301)
+        self.assertFalse(private.exists())
+        self.assertFalse(cache.exists())
         # Deferral released the round lock, and does not need an activity/paid round.
         with retention.locked(self.cfg.state / "round.lock"):
             pass
+
+    def test_critical_recovery_does_not_require_a_healthy_collector(self):
+        for request in ({}, {"requested_at": self.clock - 7201}, {"devices": 1, "until": "damaged"}):
+            with self.subTest(request=request):
+                cache = self.cache()
+                atomic_json(
+                    self.cfg.state / "cache-generation.json", dict(started_at=self.clock, last_pressure_at="damaged")
+                )
+                atomic_json(activity.root() / "cache-pressure.json", request)
+                with patch.object(retention.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(1000, 960, 40)):
+                    retention.recycle(self.cfg, now=self.clock + 1)
+                self.assertFalse(cache.exists())
 
     def test_short_rounds_do_not_renew_generation(self):
         cache = self.cache()
@@ -521,7 +600,7 @@ class Retention(unittest.TestCase):
         retention.recycle(self.cfg, now=self.clock + 1)
         self.assertTrue(fresh.exists())
 
-    def test_retained_source_uses_its_own_owner_and_removes_sidecar(self):
+    def test_expired_retained_source_uses_its_own_owner_and_keeps_abandonment_evidence(self):
         retained = self.checkout.parent / work_recovery.RETAINED_DIR / "TauCeti-old"
         retained.parent.mkdir()
         subprocess.run(["git", "clone", "-q", str(self.checkout), str(retained)], check=True)
@@ -539,16 +618,17 @@ class Retention(unittest.TestCase):
             )
         )
         atomic_json(sidecar, dict(pr=42, round_id="old-round", work="fix", process=dead))
+        os.utime(sidecar, (0, 0))
         os.utime(retained, (0, 0))
         retention.sweep(now=self.clock)
-        self.assertTrue(retained.exists())  # storage timer only registers the retained root
-        work_recovery.housekeep(self.state.parent, seconds=5, entries=50000)
+        # The existing collector now owns retained work too, without waiting for
+        # the activity preparer's small foreground allowance.
         self.assertFalse(retained.exists())
-        self.assertFalse(sidecar.exists())
-        [record] = list(work_recovery.records(self.state.parent))
-        self.assertEqual(record[2]["pr"], 42)
-        self.assertEqual(record[2]["source_round"], "old-round")
-        self.assertEqual(record[3]["state"], "checkout-reset")
+        owner = read_json(sidecar)
+        self.assertEqual(owner["pr"], 42)
+        self.assertEqual(owner["round_id"], "old-round")
+        self.assertEqual(owner["abandonment_reason"], "recovery-lifetime-exhausted")
+        self.assertEqual(list(work_recovery.records(self.state.parent)), [])
 
     def test_stash_reflog_and_credentials_prevent_full_checkout_discard(self):
         self.old()
@@ -786,12 +866,17 @@ class Retention(unittest.TestCase):
     def test_same_device_bind_mount_and_unavailable_mount_evidence_are_protected(self):
         cache = self.cache()
         root = self.checkout / ".lake"
-        for mounts in ([root / "build"], None):
-            report = retention.fresh_report()
-            with patch.object(retention, "mount_points", return_value=mounts):
-                retention.remove(root, self.checkout.parent.parent, report)
-            self.assertTrue(cache.exists())
-            self.assertTrue(report["protected"])
+        for platform in ("linux", "darwin"):
+            for mounts in ([root / "build"], None):
+                report = retention.fresh_report()
+                with (
+                    patch.object(sys, "platform", platform),
+                    patch.object(work_recovery, "live_users", return_value=[]),
+                    patch.object(retention, "mount_points", return_value=mounts),
+                ):
+                    retention.remove(root, self.checkout.parent.parent, report)
+                self.assertTrue(cache.exists())
+                self.assertTrue(report["protected"])
 
     def test_replacement_does_not_bypass_protection_on_existing_deletion(self):
         cache = self.cache()
@@ -847,6 +932,125 @@ class Retention(unittest.TestCase):
                 config._LOG_FH.close()
             self.assertEqual((self.cfg.logdir / "work-20261021.log").read_text().count("concurrent rollover"), 8)
 
+    def test_managed_review_scratch_is_queued_after_failure_and_crash(self):
+        with self.assertRaisesRegex(RuntimeError, "review failed"):
+            with retention.review_workspace(self.cfg) as scratch:
+                (scratch / "mathlib").mkdir()
+                (scratch / "mathlib/Input.lean").write_text("disposable input")
+                report = retention.fresh_report()
+                retention.collect_review_scratch(self.cfg, report)
+                self.assertTrue(scratch.exists(), "active scratch must survive collection")
+                raise RuntimeError("review failed")
+        self.assertFalse(scratch.exists())
+        stale = self.cfg.state / "review-work/review-crashed"
+        stale.mkdir()
+        atomic_json(stale / "owner.json", dict(process=work_recovery.process_owner() | dict(pid=99999999)))
+        retention.collect_review_scratch(self.cfg, retention.fresh_report())
+        self.assertFalse(stale.exists())
+        discarded = self.cfg.state / "recovery-cleanup/discarded"
+        self.assertTrue(list(discarded.iterdir()))
+        from tauceti_worker.recovery_maintenance import collect_discarded
+
+        collect_discarded(self.cfg.state.parent)
+        self.assertFalse(list(discarded.iterdir()))
+
+    def test_requests_preserve_new_demand_while_debouncing_service_start(self):
+        directory = activity.root()
+        atomic_json(directory / "cleanup-service.json", dict(installed=True))
+        with patch.object(subprocess, "run") as run, patch.object(retention.time, "time", return_value=1000):
+            retention.request_cleanup()
+        with patch.object(subprocess, "run") as again, patch.object(retention.time, "time", return_value=1001):
+            retention.request_cleanup()
+        self.assertEqual(run.call_count, 1)
+        again.assert_not_called()
+        self.assertEqual(read_json(directory / "cleanup-request.json"), dict(at=1001, started_at=1000))
+
+    def test_one_service_run_drains_slices_and_observes_new_request(self):
+        from tauceti_worker import recovery_maintenance as maintenance
+        from tauceti_worker import verification_storage
+
+        reports = [
+            dict(removed_entries=1, sweep_complete=False, metadata_entries=2),
+            dict(removed_entries=1, sweep_complete=True),
+            dict(sweep_complete=True),
+            dict(sweep_complete=True),
+        ]
+
+        def prepare(*args, **kwargs):
+            result = reports.pop(0)
+            if len(reports) == 1:
+                atomic_json(activity.root() / "cleanup-request.json", dict(at=2000))
+            return result
+
+        with (
+            patch.object(retention, "sweep", return_value=retention.fresh_report()),
+            patch.object(retention.time, "time", return_value=1000),
+            patch.object(maintenance, "prepare", side_effect=prepare),
+            patch.object(maintenance, "collect_discarded", return_value=dict(errors=[])),
+            patch.object(verification_storage, "housekeep", return_value={}),
+        ):
+            report = retention.run()
+        self.assertFalse(reports)
+        self.assertEqual(report["drain"]["slices"], 4)
+        self.assertEqual(report["drain"]["removed_entries"], 2)
+
+    def test_initial_disposal_turn_yields_to_other_stores_despite_backlog(self):
+        from tauceti_worker import recovery_maintenance as maintenance
+        from tauceti_worker import verification_storage
+
+        with (
+            patch.object(
+                maintenance, "prepare", return_value=dict(removed_entries=1, sweep_complete=False, metadata_entries=1)
+            ) as prepare,
+            patch.object(maintenance, "collect_discarded", return_value={}),
+            patch.object(verification_storage, "housekeep", return_value={}),
+        ):
+            retention.drain_pending([(self.root, {}), (self.root, {})], once=True)
+        self.assertEqual(prepare.call_count, 2)
+
+    def test_continuous_requests_cannot_repeat_a_stalled_drain_forever(self):
+        from tauceti_worker import recovery_maintenance as maintenance
+        from tauceti_worker import verification_storage
+
+        calls = []
+
+        def prepare(*args, **kwargs):
+            calls.append(1)
+            atomic_json(activity.root() / "cleanup-request.json", dict(at=2000 + len(calls)))
+            return dict(sweep_complete=True)
+
+        with (
+            patch.object(retention.time, "time", return_value=1000),
+            patch.object(maintenance, "prepare", side_effect=prepare),
+            patch.object(maintenance, "collect_discarded", return_value={}),
+            patch.object(verification_storage, "housekeep", return_value={}) as housekeep,
+        ):
+            retention.drain_pending([(self.root, {})])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(housekeep.call_args.kwargs["now"], 1000)
+
+    def test_drain_rotates_roots_before_repeating_progress(self):
+        from tauceti_worker import recovery_maintenance as maintenance
+        from tauceti_worker import verification_storage
+
+        first, second = self.root / "first", self.root / "second"
+        seen = []
+
+        def prepare(*args, **kwargs):
+            selected = Path(os.environ["TAUCETI_LEGACY_DATA_ROOT"])
+            seen.append(selected)
+            return dict(removed_entries=int(selected == first and seen.count(first) == 1))
+
+        with (
+            patch.object(maintenance, "prepare", side_effect=prepare),
+            patch.object(maintenance, "collect_discarded", return_value={}),
+            patch.object(verification_storage, "housekeep", return_value={}),
+            patch.object(retention, "worker_state_root", return_value=self.state),
+            patch.object(retention, "worker_configs", return_value=[]),
+        ):
+            retention.drain_pending([(first, {}), (second, {})])
+        self.assertEqual(seen, [first, second, first])
+
     def test_daily_timer_is_persistent_and_low_priority(self):
         with (
             patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "xdg")}),
@@ -893,7 +1097,11 @@ class Retention(unittest.TestCase):
         login_cache = self.cfg.home / ".cache/lake/operator-artifact"
         login_cache.parent.mkdir(parents=True)
         login_cache.write_text("operator cache")
-        with patch.object(sys, "platform", "darwin"):
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(work_recovery, "_darwin_process_references", return_value=[]),
+            patch.object(retention, "mount_points", return_value=[Path("/")]),
+        ):
             retention.recycle(self.cfg, now=self.clock)
         self.assertFalse(cache.exists())
         self.assertEqual(credentials.read_text(), "credentials")

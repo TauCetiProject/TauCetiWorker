@@ -51,7 +51,7 @@ REVIEW_PROVIDER_DOWN_EXIT = 3
 # not recognise and every report wedges. Bump this together with the two pins in
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
 PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
-PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "2d7bd8b7636560a50acf1b419761186f247009b9")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "bae9af5ba114a73e0cc15823f335f503618b327b")
 # A repaired tool gets a fresh error budget. Failures of an older pinned release must not
 # permanently suppress progress after an upgrade; the attempt gap still limits retries.
 # Keep the usual immutable SHA readable, and hash other refs so a branch name containing
@@ -133,7 +133,7 @@ LINT_REPAIR_HEAD_PREFIX = "lint-repair/"
 
 # Backpressure: don't author into the selected roadmap scope while this many of our PRs in that scope
 # are open.
-MAX_OPEN_PRS = 8
+MAX_OPEN_PRS = 32
 
 # The status labels TauCeti's CI keeps on every open PR to track where it sits in the review pipeline.
 # The survey counts open PRs into these buckets for the per-round "open PRs" line, in lifecycle order
@@ -166,6 +166,8 @@ EX_ADMISSION_WAIT = 76  # Fleet capacity/API funding/queue/throughput wait, outs
 EX_GITHUB_WAIT = 77  # GitHub quota/publication recovery pause, without failed-round backoff
 EX_RECOVERY_IDLE = 80  # Mechanical recovery found no available work; select normal work immediately
 EX_CLAIM_COLLISION = 81  # Peer owns the candidate; skip or briefly reselect, never failure backoff
+REVIEW_HEAD_CHANGED_EXIT = 82  # Review command refused a superseded selection before inference
+REVIEW_PREPARATION_WAIT_EXIT = 83  # Transport/host preparation failed before any paid review
 
 BACKOFF_BASE = int(os.environ.get("TAUCETI_BACKOFF_BASE", "30"))  # first no-progress sleep (doubles each round)
 
@@ -242,18 +244,6 @@ SBCACHE_BACKSTOP_S = int(os.environ.get("TAUCETI_META_BACKSTOP", "1800"))
 
 COMMENTS_MEMO_S = 5  # in-memory window over which one survey pass coalesces its issue-comment fetches
 
-# (scoreboard meta + in-flight marker share one read); << the round/dashboard cadence
-
-# In-flight review de-contention. The review engine (TauCetiReview) posts a PR comment marking a head
-# as under review and embeds an `expires_at` so a crashed reviewer self-clears. De-contention is on the
-# head ALONE (a commit is reviewed once, regardless of model), and the engine's coordinate() remains the
-# authoritative claim. The worker reads the SAME marker during the survey so it can skip a head a peer is
-# already reviewing BEFORE paying the engine's build+launch cost — and, crucially, without busy-looping
-# on the one PR a peer holds. The marker format is owned by the engine; we parse only the head and the
-# expiry, so the engine's TTL value stays its own concern.
-REVIEW_INPROGRESS_RE = re.compile(r"<!--tauceti-review-in-progress (.*?)-->", re.S)
-
-
 # Agents.
 OPENROUTER_MODELS = {
     "deepseek": os.environ.get("DEEPSEEK_MODEL", "deepseek/deepseek-v4-pro"),
@@ -279,7 +269,7 @@ AUTHORING_DEFAULTS = {
     # Prefer flagship Sol for authoring. A cached preflight probe selects Luna only when Codex confirms
     # that this repository default is unavailable to the current subscription.
     "codex": ("gpt-6.1-sol", "high"),
-    # Pin Claude authoring, reviews and quota bootstrap to an exact model, not the moving opus alias.
+    # Pin Claude authoring and reviews to an exact model, not the moving opus alias.
     # The review engine must price a new model first, so update TauCetiReview before this default.
     "claude": ("claude-opus-5-5", "high"),
     # Never use Kiro's Auto router. Operators can select another exact entitled

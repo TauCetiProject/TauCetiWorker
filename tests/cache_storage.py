@@ -125,6 +125,19 @@ class Storage(unittest.TestCase):
             storage.admit(cfg)
         self.assertFalse(list(self.pool.glob("critical-*.json")))
 
+    def test_large_disk_recovers_old_latch_with_hundreds_of_gib_free(self):
+        gib = 1024**3
+        marker = self.root / "activity" / f"critical-{self.root.stat().st_dev}.json"
+        atomic_json(marker, dict(active=True))
+        with patch.object(
+            storage.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(3500 * gib, 3220 * gib, 280 * gib)
+        ):
+            storage.admit(SimpleNamespace(state=self.root))
+        self.assertFalse(marker.exists())
+        self.assertEqual(storage.headroom(3500 * gib, storage.CRITICAL), 20 * gib)
+        self.assertEqual(storage.headroom(3500 * gib, storage.LOW), 40 * gib)
+        self.assertEqual(storage.headroom(3500 * gib, storage.TARGET), 60 * gib)
+
     def test_live_checkout_hardlinks_do_not_flush_pool_or_request_recycle(self):
         entry = self.entry()
         canonical = self.pool / "artifacts/data"
@@ -150,7 +163,7 @@ class Storage(unittest.TestCase):
 
     def test_pressure_requests_one_old_worker_and_obeys_cooldown(self):
         configs = []
-        for index in (1, 2):
+        for index in (1, 2, 3):
             state = self.root / str(index)
             private = state / "home/.cache/lake"
             private.mkdir(parents=True)
@@ -161,6 +174,17 @@ class Storage(unittest.TestCase):
             patch.dict(os.environ, {"TAUCETI_CACHE_MAX_GIB": "0.000001"}),
             patch.object(storage, "MIN_PRIVATE_RECLAIM", 4096),
         ):
+            with (
+                retention.locked(configs[0].state / "round.lock"),
+                retention.locked(configs[1].state / "verification-jobs/held.lock"),
+            ):
+                self.assertEqual(storage.collect(configs)["private_reclamation_worker"], "3")
+                self.assertEqual(storage.collect(configs, opened=None)["private_reclamation_worker"], "1")
+                with (
+                    retention.locked(configs[1].state / "round.lock"),
+                    retention.locked(configs[2].state / "round.lock"),
+                ):
+                    self.assertEqual(storage.collect(configs)["private_reclamation_worker"], "1")
             first = storage.collect(configs)
             self.assertEqual(first["private_reclamation_worker"], "1")
             atomic_json(configs[0].state / "cache-generation.json", dict(started_at=1, last_pressure_at=time.time()))

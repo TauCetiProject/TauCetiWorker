@@ -74,6 +74,36 @@ print("[OK ] claude env drops ANTHROPIC_API_KEY")
 a, env = tc.host_agent_argv(P, "deepseek")
 check("deepseek", a, [tc.PI_RUN, "openrouter", tc.OPENROUTER_MODELS["deepseek"], "--prompt", P])
 
+# A prompt longer than one argv string may be (Linux: MAX_ARG_STRLEN, 128 KiB) leaves argv for stdin:
+# `claude -p` with no prompt argument and `codex exec ... -` both read the whole of stdin.
+LONG = "x" * (tc.PROMPT_ARGV_LIMIT + 1)
+a, _, stdin = tc.host_agent_launch(P, "claude")
+check("claude short prompt stays in argv", (a[1:3], stdin), (["-p", P], None))
+a, _, stdin = tc.host_agent_launch(LONG, "claude")
+check(
+    "claude long prompt on stdin",
+    (a, stdin == LONG),
+    (
+        [
+            "claude",
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            "claude-opus-5-5",
+            "--effort",
+            "high",
+            "--dangerously-skip-permissions",
+        ],
+        True,
+    ),
+)
+a, _, stdin = tc.host_agent_launch(LONG, "codex")
+check("codex long prompt on stdin", (a[-2:], stdin == LONG), (["--skip-git-repo-check", "-"], True))
+a, _, stdin = tc.host_agent_launch(LONG, "deepseek")
+check("pi takes the prompt in argv only", (a[-1] == LONG, stdin), (True, None))
+
 a, env = tc.host_agent_argv(P, "kiro")
 check(
     "kiro",
@@ -285,6 +315,66 @@ try:
         tc.agents.subprocess.Popen = worked_then_provider_failure
         tc.run_agent_proc(["claude"], env={}, logdir=Path(td), label="agent-claude", provider="claude")
         check("structured work prevents a false attempt refund", tc.take_last_agent_infra_failure(), None)
+
+        fixture = REPO / "tests/fixtures/claude_credit_refusal_2_1_316.jsonl"
+        native_credit = [tc.json.loads(line) for line in fixture.read_text().splitlines()]
+
+        def credit_process(events):
+            return lambda *_args, **_kwargs: FakeProc(
+                "\n".join(tc.json.dumps(item) for item in events) + "\n", returncode=1
+            )
+
+        for streaming in (False, True):
+            tc.agents.subprocess.Popen = credit_process(native_credit)
+            if streaming:
+                os.environ["TAUCETI_STREAM"] = "1"
+            with redirect_stdout(io.StringIO()):
+                rc = tc.run_agent_proc(["claude"], env={}, logdir=Path(td), label="agent-claude", provider="claude")
+            os.environ.pop("TAUCETI_STREAM", None)
+            check(f"credit refusal exits failed (stream={streaming})", rc, 1)
+            check(
+                f"native zero-token credit refusal is infrastructure (stream={streaming})",
+                tc.take_last_agent_infra_failure(),
+                "provider credit balance exhausted",
+            )
+
+        credit_variants = []
+        for name in (
+            "missing synthetic flag",
+            "real model",
+            "paid tokens",
+            "unknown usage",
+            "synthetic message paid tokens",
+            "synthetic message unknown usage",
+            "ordinary 400",
+        ):
+            events = tc.json.loads(tc.json.dumps(native_credit))
+            if name == "missing synthetic flag":
+                events[0].pop("is_api_error_message")
+            elif name == "real model":
+                events[0]["message"]["model"] = "claude-opus-5-5"
+            elif name == "paid tokens":
+                events[-1]["usage"]["input_tokens"] = 1
+            elif name == "unknown usage":
+                events[-1].pop("usage")
+            elif name == "synthetic message paid tokens":
+                events[0]["message"]["usage"]["input_tokens"] = 1
+            elif name == "synthetic message unknown usage":
+                events[0]["message"].pop("usage")
+            else:
+                events[0]["message"]["content"][0]["text"] = "Bad Request"
+                events[-1]["result"] = "Bad Request"
+            credit_variants.append((name, events))
+        for kind in ("text", "tool_use"):
+            block = {"type": "text", "text": "work began"} if kind == "text" else {"type": "tool_use", "name": "Read"}
+            credit_variants.append(
+                (f"earlier {kind}", [{"type": "assistant", "message": {"content": [block]}}, *native_credit])
+            )
+        for name, events in credit_variants:
+            tc.agents.subprocess.Popen = credit_process(events)
+            with redirect_stdout(io.StringIO()):
+                tc.run_agent_proc(["claude"], env={}, logdir=Path(td), label="agent-claude", provider="claude")
+            check(f"credit refund rejected: {name}", tc.take_last_agent_infra_failure(), None)
 finally:
     process_module.reap_round_group = saved_sweep
     tc.agents.subprocess.Popen = saved_popen

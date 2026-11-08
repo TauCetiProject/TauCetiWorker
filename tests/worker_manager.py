@@ -36,6 +36,13 @@ import tauceti_worker.worker_manager as wm
 from tauceti_worker.cli import build_parser
 from tauceti_worker.runtime_status import report_failure, report_runtime
 
+# A wrapper raises its own OOM score from the environment, but never lowers it.
+score = root / "oom_score_adj"
+for current, wanted, expected in (("0", "500", "500"), ("700", "500", "700"), ("0", "", "0"), ("0", "x", "0")):
+    score.write_text(current + "\n")
+    wm.raise_oom_score({"TAUCETI_WORKER_OOM_SCORE_ADJ": wanted}, score)
+    assert score.read_text().strip() == expected, (current, wanted, score.read_text())
+
 
 def wait_for(predicate, timeout=10):
     deadline = time.monotonic() + timeout
@@ -118,6 +125,7 @@ try:
         roadmap_skip=("Algebra",),
         roadmap_extra_identities=("Maintainer",),
         respect_claims=False,
+        extra_roadmap_prompt="Work on the material relevant to Higher Topos Theory",
         source="https://example.invalid/source",
         author_model="gpt-5",
         author_effort="high",
@@ -172,12 +180,23 @@ try:
         # The whole spec travels as one command-line argument, so an unbounded table becomes E2BIG.
         ({"env": {"BIG": "x" * (16 * 1024 + 1)}}, "oversized table"),
         ({"env": ["A=b"]}, "array instead of a table"),
+        # `apply --check` must reject what `tauceti work` would refuse at launch.
+        ({"only": ["security-audit"], "agent": "kiro"}, "security-audit on an unsupported agent"),
+        (
+            {"only": ["security-audit"], "agent": "codex", "author_model": "gpt"},
+            "security-audit with an authoring override",
+        ),
+        ({"only": ["bump", "security-audit"], "agent": "claude", "claude_billing": "api"}, "security-audit on API"),
     ):
         try:
             wm.WorkerSpec.from_dict({"id": "exp", **bad}, 0)
             raise AssertionError(f"{why} should have been rejected: {bad}")
         except wm.WorkersError:
             pass
+
+    # security-audit may accompany any other phases.
+    mixed = ["bump", "progress", "security-audit", "overlap-scan", "overlap-fix", "review"]
+    assert wm.WorkerSpec.from_dict({"id": "audit", "agent": "codex", "only": mixed}, 0).only == tuple(mixed)
 
     # Desired fields win over a stale actual status generation in CLI/TUI snapshots.
     wm.update_status(
@@ -244,6 +263,7 @@ try:
                         "roadmap_skip": ["Algebra"],
                         "roadmap_extra_identities": ["maintainer"],
                         "respect_claims": False,
+                        "extra_roadmap_prompt": "Work on the material relevant to Higher Topos Theory",
                         "source": "https://example.invalid/source",
                         "author_model": "claude-opus-5",
                         "author_effort": "high",
@@ -293,6 +313,7 @@ worker3 — backing off
             skip: Algebra
             also treat as self: maintainer
             claims: ignored
+  guidance: Work on the material relevant to Higher Topos Theory
   source:   https://example.invalid/source
   author:   model claude-opus-5 · high effort
   options:  stream output
@@ -491,6 +512,41 @@ worker3 — backing off
         except subprocess.TimeoutExpired:
             runner.kill()
             runner.wait(timeout=10)
+
+    # Twenty slow status reads must not keep control requests queued until the
+    # whole reconciliation finishes. This uses disabled fixture workers only.
+    latency_config = root / "latency-workers.toml"
+    wm.save_worker_specs(latency_config, [wm.WorkerSpec(id=f"slow{n}", enabled=False) for n in range(20)])
+    latency_run, latency_state = root / "latency-run", root / "latency-state"
+    entered = root / "latency-entered"
+    code = """
+import sys,time
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from tauceti_worker import worker_manager as w
+def slow(*args,**kwargs):
+    Path(sys.argv[3]).touch()
+    time.sleep(.08)
+    return {}
+w.runner_status=slow
+raise SystemExit(w.run_manager(Path(sys.argv[2]),interval=.05))
+"""
+    probe = subprocess.Popen(
+        [sys.executable, "-c", code, str(REPO), str(latency_config), str(entered)],
+        env=dict(os.environ, TAUCETI_RUNTIME_DIR=str(latency_run), TAUCETI_WORKERS_STATE_DIR=str(latency_state)),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        wait_for(entered.exists)
+        reply = wm._socket_request(latency_run / "manager.sock", {"action": "ping"}, timeout=0.5)
+        assert reply and reply.get("ok"), "control request waited behind a fleet-wide status scan"
+        assert wm._socket_request(latency_run / "manager.sock", {"action": "shutdown"}, timeout=2)
+        probe.wait(5)
+    finally:
+        if probe.poll() is None:
+            probe.terminate()
+            probe.wait(5)
 
     print("worker manager: OK")
 finally:

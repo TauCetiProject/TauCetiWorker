@@ -7,6 +7,7 @@ import fcntl
 import json
 import math
 import os
+import sqlite3
 import sys
 import time
 import uuid
@@ -20,6 +21,13 @@ class BudgetError(ValueError):
     pass
 
 
+class LedgerError(BudgetError):
+    """Unavailable accounting history; runtime work may continue without it."""
+
+
+ACCOUNTING_ERRORS = (LedgerError, OSError, sqlite3.Error)
+
+
 def admission_pause(snapshot, *, worker=None, model=None, now=None):
     """Cheap preflight; invocation admission remains the authoritative atomic check."""
     now = time.time() if now is None else now
@@ -27,8 +35,6 @@ def admission_pause(snapshot, *, worker=None, model=None, now=None):
     if model is None and worker is not None:
         previous = next((item for item in waiting if item["worker"] == worker), None)
         model = previous.get("model") if previous else None
-    if snapshot.get("ledger_repair_required"):
-        return "ledger repair requires reconciliation"
     if model and snapshot.get("cooldowns", {}).get(model, 0) > now:
         return "API throughput cooldown"
     if model and model in snapshot.get("calibrating_models", []):
@@ -131,6 +137,7 @@ class Budget:
         self.directory = directory or budget_dir()
         self.ledger = self.directory / "events.jsonl"
         self.clock = clock
+        self._ledger_failure = None
 
     @contextlib.contextmanager
     def locked(self):
@@ -138,28 +145,74 @@ class Budget:
         fd = os.open(self.directory / "budget.lock", os.O_CREAT | os.O_RDWR, 0o600)
         with os.fdopen(fd, "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            self.recover_tail()
             yield
 
-    def records(self, data: bytes | None = None) -> list[dict]:
+    def recover_tail(self):
+        """Discard an interrupted append under budget.lock; archives are best effort."""
+        try:
+            stream = self.ledger.open("r+b")
+        except FileNotFoundError:
+            return
+        with stream:
+            end = stream.seek(0, os.SEEK_END)
+            if not end:
+                return
+            stream.seek(end - 1)
+            if stream.read(1) == b"\n":
+                return
+            offset = end
+            chunks = []
+            while offset:
+                size = min(offset, 8192)
+                offset -= size
+                stream.seek(offset)
+                chunk = stream.read(size)
+                if (newline := chunk.rfind(b"\n")) >= 0:
+                    offset += newline + 1
+                    chunks.append(chunk[newline + 1 :])
+                    break
+                chunks.append(chunk)
+            suffix = b"".join(reversed(chunks))
+            # A complete transaction missing only its newline can be retained.
+            try:
+                record = json.loads(suffix)
+                complete = record["version"] == 1 and isinstance(record["events"], list)
+            except (ValueError, KeyError, TypeError):
+                complete = False
+            if complete:
+                stream.seek(end)
+                stream.write(b"\n")
+                stream.flush()
+            else:
+                archive = self.directory / f"events.discarded-{uuid.uuid4().hex}.json"
+                with contextlib.suppress(OSError):
+                    fd = os.open(archive, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    with os.fdopen(fd, "wb") as out:
+                        out.write(suffix)
+                stream.truncate(offset)
+            os.fsync(stream.fileno())
+
+    def records(self, data: bytes | None = None, *, start=0) -> list[dict]:
         if data is None:
             try:
                 data = self.ledger.read_bytes()
             except FileNotFoundError:
                 return []
         if data and not data.endswith(b"\n"):
-            raise BudgetError(f"torn ledger write: {self.ledger}; preserve it and use budget --repair-ledger")
+            raise LedgerError(f"incomplete ledger tail: {self.ledger}")
         records = []
-        for i, line in enumerate(data.splitlines(), 1):
+        for i, line in enumerate(data.splitlines(), start + 1):
             try:
                 rec = json.loads(line)
                 if rec["version"] != 1 or rec["seq"] != i or not isinstance(rec["events"], list):
                     raise ValueError("invalid sequence or schema")
                 records.append(rec)
             except (ValueError, KeyError, TypeError):
-                raise BudgetError(f"invalid ledger record {i}: {self.ledger}") from None
+                raise LedgerError(f"invalid ledger record {i}: {self.ledger}") from None
         return records
 
-    def replay(self, records: list[dict] | None = None, *, _state=None):
+    def replay(self, records: list[dict] | None = None, *, _state=None, _samples=True):
         state = (
             _state
             if _state is not None
@@ -219,8 +272,6 @@ class Budget:
                         cost = money(event["cost"])
                         state["balance"] -= cost
                         state["spent"] += cost
-                        key = session["model"] + ":" + session["phase"]
-                        state["samples"].setdefault(key, []).append(cost)
                     elif kind == "unresolved":
                         session = state["sessions"][event["id"]]
                         session["status"] = "provisional" if event.get("provisional") else "unresolved"
@@ -239,15 +290,117 @@ class Budget:
                     elif kind == "cooldown":
                         state["cooldowns"][event["model"]] = event["until"]
                     else:
-                        raise BudgetError(f"unknown ledger event {kind}")
-        except (KeyError, TypeError, InvalidOperation) as exc:
-            raise BudgetError(f"invalid accounting event in {self.ledger}: {exc}") from None
+                        raise LedgerError(f"unknown ledger event {kind}")
+        except (KeyError, TypeError, InvalidOperation, BudgetError) as exc:
+            raise LedgerError(f"invalid accounting event in {self.ledger}: {exc}") from None
+        if not _samples:
+            return state
         state["samples"] = {}
         for session in state["sessions"].values():
             if session["status"] == "settled":
                 key = session["model"] + ":" + session["phase"]
                 state["samples"].setdefault(key, []).append(money(session["cost"]))
         return state
+
+    def current(self):
+        """Read indexed state under locked(); the JSONL ledger remains authoritative."""
+        import sqlite3
+
+        from .budget_projection import Projection
+
+        if self._ledger_failure:
+            stamp, error = self._ledger_failure
+            if self.ledger_stamp() == stamp:
+                raise LedgerError(error)
+            self._ledger_failure = None
+        projection = Projection(self)
+        try:
+            return projection.load()
+        except LedgerError as error:
+            self._ledger_failure = (self.ledger_stamp(), str(error))
+            raise
+        except (sqlite3.Error, OSError, BudgetError):
+            # A disposable optimization must never become a funding outage.
+            try:
+                projection.discard()
+            except OSError:
+                pass
+            try:
+                return self.replay()
+            except LedgerError as error:
+                self._ledger_failure = (self.ledger_stamp(), str(error))
+                raise
+
+    def ledger_stamp(self):
+        try:
+            info = self.ledger.stat()
+            return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+        except FileNotFoundError:
+            return None
+
+    @staticmethod
+    def sessions(state, **filters):
+        sessions = state["sessions"]
+        if hasattr(sessions, "select"):
+            return sessions.select(**filters)
+        rows = list(sessions.values())
+        for name, value in filters.items():
+            if name == "active" and value:
+                rows = [s for s in rows if s["status"] != "settled"]
+            elif name == "settled" and value:
+                rows = [s for s in rows if s["status"] == "settled"]
+            elif name in ("model", "phase") and value is not None:
+                rows = [s for s in rows if s[name] == value]
+            elif name == "estimated" and value:
+                rows = [s for s in rows if s.get("cost_provenance") in ESTIMATE_PROVENANCES]
+            elif name == "positive" and value:
+                rows = [s for s in rows if money(s.get("cost", "0")) > 0]
+            elif name == "native" and value:
+                rows = [s for s in rows if s.get("cost_provenance", "native-reported") == "native-reported"]
+            elif name in {"finished_after", "finished_before"} and value is not None:
+                rows = [
+                    s
+                    for s in rows
+                    if type(s.get("finished")) in (str, int, float)
+                    and (
+                        money(s["finished"]) >= money(value)
+                        if name == "finished_after"
+                        else money(s["finished"]) <= money(value)
+                    )
+                ]
+        return rows[-filters["limit"] :] if filters.get("limit") is not None else rows
+
+    @staticmethod
+    def related(state, providers, include=None):
+        sessions = state["sessions"]
+        if hasattr(sessions, "related"):
+            return sessions.related(providers, include=include)
+        return [
+            s
+            for s in sessions.values()
+            if s["id"] == include
+            or (set(s.get("totals", {})) | set(s.get("lower_bound_totals", {}))) & set(providers)
+            or s.get("resume") in providers
+        ]
+
+    def evidence_sessions(self, state, invocation):
+        """Copy the small provider-linked history before releasing the file lock."""
+        session = state["sessions"].get(invocation)
+        if not session:
+            return {}
+        providers = set(session.get("totals", {})) | set(session.get("lower_bound_totals", {}))
+        if session.get("resume"):
+            providers.add(session["resume"])
+        if session.get("bridge"):
+            from .claude_api import safe_message
+
+            try:
+                receipt = safe_message(Path(session["bridge"]) / "inbox" / (invocation + ".receipt"))
+                if isinstance(receipt, dict) and receipt.get("id") == invocation:
+                    providers.update(receipt.get("lower_bound_totals", {}))
+            except (OSError, ValueError, TypeError):
+                pass
+        return {s["id"]: s for s in self.related(state, providers, include=invocation)}
 
     def accrue(self, state):
         now = max(state["watermark"], money(self.clock()))
@@ -278,17 +431,30 @@ class Budget:
         data = self.record_bytes(state, events)
         transaction = json.loads(data)["transaction"]
         fd = os.open(self.ledger, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+        before = None
         try:
+            before = os.fstat(fd)
             while data:
                 written = os.write(fd, data)
                 if written <= 0:
                     raise OSError("ledger write made no progress")
                 data = data[written:]
-            os.fsync(fd)
+        except OSError:
+            if data and before is not None:
+                # A failed short write must not poison every later reader.
+                # A complete write whose fsync failed remains available to replay.
+                with contextlib.suppress(OSError):
+                    os.ftruncate(fd, before.st_size)
+                    os.utime(fd, ns=(before.st_atime_ns, before.st_mtime_ns))
+            raise
         finally:
+            # Write durability is best effort; complete records remain usable.
+            with contextlib.suppress(OSError):
+                os.fsync(fd)
             os.close(fd)
         # Persist a newly created ledger's directory entry as well as its contents.
-        self.sync_directory()
+        with contextlib.suppress(OSError):
+            self.sync_directory()
         return dict(transaction=transaction, ledger_sequence=state["seq"] + 1)
 
     def configure(self, *, grant=None, set_grant=None, rate=None):
@@ -302,7 +468,7 @@ class Budget:
         if rate is not None and rate < 0:
             raise BudgetError("--grant-rate must be nonnegative")
         with self.locked():
-            state = self.replay()
+            state = self.current()
             events = [self.accrue(state)]
             if grant is not None:
                 events.append(dict(type="grant", delta=str(grant)))
@@ -339,7 +505,7 @@ class Budget:
 
     def refresh_waiter(self, worker):
         with self.locked():
-            state = self.replay()
+            state = self.current()
             queue = self.waiting_state(state)
             if worker in queue and self.clock() - queue[worker].get("seen", 0) < 120:
                 queue[worker]["seen"] = self.clock()
@@ -350,7 +516,7 @@ class Budget:
 
     def wait_for_admission(self, worker, model, phase, reason):
         with self.locked():
-            state = self.replay()
+            state = self.current()
             queue = self.waiting_state(state)
             previous = queue.get(worker, {})
             now = self.clock()
@@ -370,30 +536,42 @@ class Budget:
             self.save_waiting(queue)
 
     def estimate(self, state, model, phase=None, *, include_pending=True):
-        costs = [c for c in state["samples"].get(model + ":" + phase, []) if c > 0] if phase else []
+        costs = (
+            [
+                money(s["cost"])
+                for s in self.sessions(state, model=model, phase=phase, settled=True, positive=True, limit=20)
+            ]
+            if phase
+            else []
+        )
         costs = costs or [
-            money(s["cost"])
-            for s in state["sessions"].values()
-            if s["model"] == model and s["status"] == "settled" and money(s["cost"]) > 0
+            money(s["cost"]) for s in self.sessions(state, model=model, settled=True, positive=True, limit=20)
         ]
         if not costs and include_pending:
             costs = [
                 money(s["reserve"])
-                for s in state["sessions"].values()
-                if s["model"] == model and s["status"] != "settled" and money(s.get("reserve", "0")) > 0
+                for s in self.sessions(state, model=model, active=True)
+                if money(s.get("reserve", "0")) > 0
             ]
         costs = sorted(costs[-20:])
         if costs:
             return costs, costs[math.ceil(len(costs) * 0.75) - 1]
-        recent = [money(s["cost"]) for s in state["sessions"].values() if s["status"] == "settled"][-20:]
+        recent = [money(s["cost"]) for s in self.sessions(state, settled=True, limit=20)]
         return costs, max([Decimal(1), *recent])
 
     def snapshot(self, *, worker=None, model=None, phase=None):
         with self.locked():
-            state = self.replay()
+            state = self.current()
             self.accrue(state)
             state["waiting"] = self.waiting_state(state)
-        active = [s for s in state["sessions"].values() if s["status"] != "settled"]
+            active = [s for s in self.sessions(state, active=True) if not s.get("archive")]
+            estimate = self.estimate(state, model, phase)[1] if model else Decimal(0)
+            now = self.clock()
+            calibrating = [
+                name
+                for name in {s["model"] for s in active if s["status"] == "active" and not orphaned_bridge(s, now)}
+                if not self.estimate(state, name)[0]
+            ]
         pending = sum((money(s.get("reserve", s["estimate"])) for s in active), Decimal(0))
         now = self.clock()
         available = state["balance"] - pending
@@ -411,7 +589,7 @@ class Budget:
             if previous:
                 threshold = money(previous["estimate"])
             elif model:
-                threshold = self.estimate(state, model, phase)[1]
+                threshold = estimate
         funding_at = None
         if worker is not None and state["rate"] > 0 and available < max(threshold, Decimal("0.000000001")):
             funding_at = now + float((max(threshold, Decimal("0.000000001")) - available) * 3600 / state["rate"])
@@ -423,7 +601,7 @@ class Budget:
             available=str(available),
             active_sessions=active,
             unresolved=[s["id"] for s in active if s["status"] == "unresolved"],
-            ledger_repair_required=any(s.get("archive") for s in active),
+            ledger_repair_required=False,
             provisional=[s["id"] for s in active if s["status"] == "provisional"],
             provisional_lower_bound_usd=str(
                 sum((money(s["lower_bound_cost"]) for s in active if s["status"] == "provisional"), Decimal(0))
@@ -435,22 +613,49 @@ class Budget:
             clock_backwards=money(now) < state["watermark"],
             ledger=str(self.ledger),
             cooldowns=state["cooldowns"],
-            calibrating_models=[
-                name
-                for name in {s["model"] for s in active if s["status"] == "active" and not orphaned_bridge(s, now)}
-                if not self.estimate(state, name)[0]
-            ],
+            calibrating_models=calibrating,
         )
+
+    def runtime_snapshot(self, **kwargs):
+        """Accounting outages are not an instruction to stop worker progress."""
+        try:
+            return self.snapshot(**kwargs)
+        except ACCOUNTING_ERRORS:
+            return None
+
+    def admit_work(self, *args, **kwargs):
+        """Apply available budget policy; allow work when bookkeeping is unavailable."""
+        try:
+            return self.admit(*args, **kwargs)
+        except ACCOUNTING_ERRORS as error:
+            invocation, worker, model, phase = args
+            event = dict(
+                type="admit",
+                id=invocation,
+                worker=worker,
+                model=model,
+                phase=phase,
+                estimate="0",
+                status="active",
+                started=self.clock(),
+                **{key: value for key, value in kwargs.items() if key != "lifecycle"},
+            )
+            return dict(allowed=True, recorded=False, accounting_error=str(error), unrecorded_admit=event)
+
+    def restore_admission(self, event):
+        """Record work that already ran during an outage, without a new funding decision."""
+        with self.locked():
+            state = self.current()
+            if event["id"] not in state["sessions"]:
+                self.append(state, [self.accrue(state), event])
 
     def admit(self, invocation, worker, model, phase, *, bridge=None, resume=None, owner=None, lifecycle=None):
         with self.locked():
-            state = self.replay()
+            state = self.current()
             if invocation in state["sessions"]:
                 raise BudgetError("an invocation ID cannot be launched twice")
             events = [self.accrue(state)]
-            active = [s for s in state["sessions"].values() if s["status"] != "settled"]
-            if resume and not any(resume in s.get("totals", {}) for s in state["sessions"].values()):
-                raise BudgetError("resuming requires a recorded cost baseline for that provider session ID")
+            active = [s for s in self.sessions(state, active=True) if not s.get("archive")]
             for session in active:
                 if orphaned_bridge(session, self.clock()):
                     session["status"] = "unresolved"
@@ -476,14 +681,8 @@ class Budget:
                 default=None,
             )
             reason = None
-            if any(s.get("archive") for s in active):
-                reason = "ledger repair requires reconciliation"
-            elif resume and any(s.get("resume") == resume for s in active):
-                reason = (
-                    "provider session already being resumed"
-                    if any(s.get("resume") == resume for s in live)
-                    else "provider session cost baseline unresolved"
-                )
+            if resume and any(s.get("resume") == resume for s in live):
+                reason = "provider session already being resumed"
             elif state["cooldowns"].get(model, 0) > now:
                 reason = "API throughput cooldown"
             elif not costs and any(s["model"] == model for s in live):
@@ -504,10 +703,11 @@ class Budget:
                     estimate=str(estimate),
                 )
                 queue[worker] = wait
-                self.save_waiting(queue)
-                if previous.get("reason") != reason or len(events) > 1:
-                    events.append(wait)
-                    self.append(state, events)
+                with contextlib.suppress(OSError):
+                    self.save_waiting(queue)
+                    if previous.get("reason") != reason or len(events) > 1:
+                        events.append(wait)
+                        self.append(state, events)
                 return dict(allowed=False, reason=reason, estimate=str(estimate), balance=str(state["balance"]))
             events.append(
                 dict(
@@ -527,7 +727,8 @@ class Budget:
             )
             self.append(state, events)
             queue.pop(worker, None)
-            self.save_waiting(queue)
+            with contextlib.suppress(OSError):
+                self.save_waiting(queue)
             return dict(allowed=True, estimate=str(estimate))
 
     def settle(
@@ -545,7 +746,7 @@ class Budget:
         if value is not None and value < 0:
             raise BudgetError("session cost cannot be negative")
         with self.locked():
-            state = self.replay()
+            state = self.current()
             if invocation not in state["sessions"]:
                 raise BudgetError("unknown invocation")
             session = state["sessions"][invocation]
@@ -593,7 +794,7 @@ class Budget:
         if value < 0:
             raise BudgetError("cost cannot be negative")
         with self.locked():
-            state = self.replay()
+            state = self.current()
             session = state["sessions"].get(invocation)
             if not session:
                 raise BudgetError("unknown invocation")
@@ -667,7 +868,7 @@ class Budget:
                 raise BudgetError("receipt totals cannot be negative")
         cost = None
         with self.locked():
-            state = self.replay()
+            state = self.current()
             session = state["sessions"].get(receipt["id"])
             if not session:
                 raise BudgetError("receipt has no recorded admission")
@@ -699,10 +900,10 @@ class Budget:
                 or money(finished) > money(self.clock())
             ):
                 raise BudgetError("invalid receipt finish time")
-            ordered = list(state["sessions"].values())
+            ordered = self.related(state, set(totals or {}) | set(lower or {}), include=receipt["id"])
             position = next(i for i, entry in enumerate(ordered) if entry["id"] == receipt["id"])
             baseline = {}
-            for prior in state["sessions"].values():
+            for prior in ordered:
                 if prior["id"] == receipt["id"]:
                     break
                 for provider_id, value in prior.get("totals", {}).items():
@@ -869,6 +1070,13 @@ class Budget:
                                 **({"finished": finished} if finished is not None else {}),
                             )
                         )
+                    from .budget_recovery import live_identity
+
+                    affected = {e["id"] for e in events if e.get("id") and e["id"] != receipt["id"]}
+                    if any(
+                        live_identity(state["sessions"][key], self.clock(), self.directory)["live"] for key in affected
+                    ):
+                        raise BudgetError("cumulative correction would change a live session; reconcile after it stops")
                     self.append(state, events)
                     return
         if session["status"] != "settled":
@@ -893,7 +1101,7 @@ class Budget:
             )
 
         with self.locked():
-            sessions = self.replay()["sessions"]
+            sessions = self.evidence_sessions(self.current(), invocation)
         session = sessions.get(invocation)
         if not session or session["status"] == "settled" or live(session):
             return None
@@ -901,7 +1109,7 @@ class Budget:
         if not saved or not saved["items"]:
             return None
         with self.locked():
-            state = self.replay()
+            state = self.current()
             session = state["sessions"].get(invocation)
             if not session or session["status"] == "settled" or live(session):
                 return None
@@ -953,7 +1161,7 @@ class Budget:
                 totals = {}
                 if primary and primary != "unknown":
                     baseline = Decimal(0)
-                    for prior in state["sessions"].values():
+                    for prior in self.related(state, [primary], include=invocation):
                         if prior["id"] == invocation:
                             break
                         baseline = max(baseline, money(prior.get("totals", {}).get(primary, "0")))
@@ -1004,56 +1212,12 @@ class Budget:
 
     def cooldown(self, model, seconds):
         with self.locked():
-            state = self.replay()
+            state = self.current()
             until = max(state["cooldowns"].get(model, 0), self.clock() + max(0, seconds))
             self.append(state, [self.accrue(state), dict(type="cooldown", model=model, until=until)])
 
     def repair(self, note):
-        """Archive exact damaged bytes and start a new ledger by replaying only the verified prefix."""
+        """Compatibility command: normal locked access already repairs interrupted appends."""
         if not note.strip():
             raise BudgetError("ledger repair requires --note")
-        with self.locked():
-            raw = self.ledger.read_bytes()
-            # Only a torn final line is repairable automatically. Complete invalid records require investigation.
-            if raw.endswith(b"\n"):
-                raise BudgetError("only a torn final write can be repaired automatically")
-            prefix = raw[: raw.rfind(b"\n") + 1]
-            state = self.replay(self.records(prefix))
-            archive = self.directory / f"events.damaged-{uuid.uuid4().hex}.jsonl"
-            replacement = self.directory / f"events.repair-{uuid.uuid4().hex}.tmp"
-            try:
-                fd = os.open(archive, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                with os.fdopen(fd, "wb") as out:
-                    out.write(raw)
-                    out.flush()
-                    os.fsync(out.fileno())
-                self.sync_directory()
-                # A torn suffix may represent a paid launch or a settlement. Freeze admissions until audited.
-                events = [
-                    self.accrue(state),
-                    dict(
-                        type="admit",
-                        id="repair-" + uuid.uuid4().hex,
-                        worker="ledger-repair",
-                        model="unknown",
-                        phase="repair",
-                        estimate="0",
-                        status="unresolved",
-                        started=self.clock(),
-                        archive=str(archive),
-                        note=note,
-                    ),
-                ]
-                fd = os.open(replacement, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                with os.fdopen(fd, "wb") as out:
-                    out.write(prefix + self.record_bytes(state, events))
-                    out.flush()
-                    os.fsync(out.fileno())
-                # The authoritative path is always either the damaged original (which fails closed)
-                # or a complete replacement containing the unresolved repair marker.
-                os.replace(replacement, self.ledger)
-                self.sync_directory()
-            except BaseException:
-                # Preserve both files on failure; never silently restore a discarded suffix.
-                raise BudgetError(f"repair incomplete; original bytes preserved at {archive}") from None
         return self.snapshot()

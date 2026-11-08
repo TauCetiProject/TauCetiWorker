@@ -56,16 +56,38 @@ class GitHubPauseTests(unittest.TestCase):
             work_units._check_stage_read_quota("fix")
         with (
             patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://fixture.invalid"}),
-            patch.object(transport, "observed_budget", return_value={"core": (0, 2000), "graphql": (0, 2000)}),
+            patch.object(transport, "observed_budget", return_value={"core": (1, 2000), "graphql": (0, 2000)}),
         ):
             work_units._check_stage_read_quota("review")
+        with (
+            patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://fixture.invalid"}),
+            patch.object(transport, "observed_budget", return_value={"core": (0, 2000), "graphql": (5000, 2000)}),
+            self.assertRaises(GitHubUnavailable) as waiting,
+        ):
+            work_units._check_stage_read_quota("review")
+        self.assertEqual(waiting.exception.retry_at, 2000)
 
     def test_post_write_progress_bypasses_webhook_lag(self):
+        from tauceti_worker.github import GitHub
+
+        with patch("tauceti_worker.github.gh_run", return_value=SimpleNamespace(returncode=1)) as read:
+            with transport.read_context(fresh=True, direct=True, retry=False):
+                GitHub("org/repo")._gh(["pr", "view", "7"])
+        self.assertEqual(read.call_args.kwargs["max_wait"], 0)
+        with patch("tauceti_worker.github.gh_run", return_value=SimpleNamespace(returncode=1)) as read:
+            with transport.read_context(fresh=True, direct=True):
+                GitHub("org/repo")._gh(["pr", "view", "7"])
+        self.assertNotIn("max_wait", read.call_args.kwargs)
         gh = SimpleNamespace(
             pr_progress_state=lambda _: {"head": "new" if transport.direct_reads() else "old", "ncomments": 0}
         )
-        self.assertTrue(
+        self.assertIsNone(
             work_units._progressed(SimpleNamespace(gh=gh), SimpleNamespace(pr=7), {"head": "old", "ncomments": 0})
+        )
+        self.assertTrue(
+            work_units._progressed(
+                SimpleNamespace(gh=gh), SimpleNamespace(pr=7), {"head": "old", "ncomments": 0, "published": "new"}
+            )
         )
         self.assertFalse(transport.direct_reads())
 
@@ -148,6 +170,7 @@ class GitHubPauseTests(unittest.TestCase):
         with (
             patch.dict(os.environ, {"TAUCETI_USE_BUDGET": "0", "TAUCETI_GITHUB_STATE_URL": "https://fixture.invalid"}),
             patch.object(loop, "api_mode", return_value=True),
+            patch.object(loop, "github_budget", return_value={}),
             patch.object(loop, "run_round_subprocess", side_effect=codes),
             patch.object(loop, "runtime_snapshot", return_value={"next_action_at": retry_at, "detail": "quota reset"}),
             patch.object(loop, "report_runtime", side_effect=lambda state=None, **kw: statuses.append((state, kw))),

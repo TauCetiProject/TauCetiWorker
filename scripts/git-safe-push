@@ -95,7 +95,7 @@ if git -c push.followTags=false push --porcelain --force-with-lease="$REF:$EXPEC
        git update-ref "refs/tauceti/published/push/${REF#refs/heads/}" "$OID" 2>/dev/null; then
         git update-ref -d "$PENDING" 2>/dev/null || true
     fi
-    if [[ -n "${TAUCETI_FLEET_EVENTS:-}" && -n "${TAUCETI_FLEET_PYTHON:-}" && -n "${TAUCETI_FLEET_EMITTER:-}" ]]; then
+    if [[ "$CHANGED" == 1 && -n "${TAUCETI_FLEET_EVENTS:-}" && -n "${TAUCETI_FLEET_PYTHON:-}" && -n "${TAUCETI_FLEET_EMITTER:-}" ]]; then
         "$TAUCETI_FLEET_PYTHON" -I "$TAUCETI_FLEET_EMITTER" pushed 2>/dev/null || true
     fi
     exit 0

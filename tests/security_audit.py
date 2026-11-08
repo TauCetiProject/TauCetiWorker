@@ -16,8 +16,9 @@ from unittest.mock import DEFAULT, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import audit_alerts as alerts
+from tauceti_worker import audit_clients as clients
 from tauceti_worker import audit_progress as progress
-from tauceti_worker import audit_reader as ar
+from tauceti_worker import audit_reader_v3 as ar
 from tauceti_worker import audit_recovery as recovery
 from tauceti_worker import cli
 from tauceti_worker import security_audit as sa
@@ -141,7 +142,7 @@ class WorkerBoundJudgments(unittest.TestCase):
             "attempt": str(self.original),
             "reason": "security-audit: reviewer did not read the complete input",
         }
-        quota = patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False))
+        quota = patch("tauceti_worker.loop.resolve_work_model", return_value="codex")
         quota.start()
         self.addCleanup(quota.stop)
         self.evidence()
@@ -201,7 +202,7 @@ class WorkerBoundJudgments(unittest.TestCase):
         }
         if not legacy:
             execution.update(
-                protocol_version=2 if version2 else sa.PROTOCOL_VERSION,
+                protocol_version=2 if version2 else sa.TOKEN_PROTOCOL_VERSION,
                 batch_identity={
                     "input_digest": self.batch["input_digest"],
                     "commits": [c["sha"] for c in self.batch["commits"]],
@@ -519,6 +520,20 @@ class WorkerBoundJudgments(unittest.TestCase):
             self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
         model.assert_not_called()
 
+    def test_old_reader_path_can_be_pruned_or_updated_when_frozen_bytes_match(self):
+        execution_path = self.original / "execution.json"
+        execution = json.loads(execution_path.read_text())
+        index = next(i for i, arg in enumerate(execution["argv"]) if arg.startswith("mcp_servers.audit.args="))
+        args = json.loads(execution["argv"][index].split("=", 1)[1])
+        old_reader = self.work / "old-release" / "audit_reader.py"
+        args[1] = str(old_reader)
+        execution["argv"][index] = "mcp_servers.audit.args=" + json.dumps(args)
+        execution_path.write_text(sa.serialize(execution))
+        recovery.retained(self.work, self.block)
+        old_reader.parent.mkdir()
+        old_reader.write_bytes(sa.reader_path(4).read_bytes())
+        recovery.retained(self.work, self.block)
+
     def test_public_answer_must_match_the_native_final(self):
         history = self.original / "model-rollout-0.jsonl"
         history.write_text(history.read_text().splitlines()[0] + "\n")
@@ -632,12 +647,29 @@ class WorkerBoundJudgments(unittest.TestCase):
             ignore_quota=True,
         )
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)) as quota,
+            patch("tauceti_worker.loop.resolve_work_model", return_value="codex") as quota,
             patch.object(sa, "inspect", return_value=sa.bind_verdict({"verdict": "pass", "findings": []}, self.batch)),
             patch.object(sa, "advance", return_value="b" * 40),
         ):
             self.assertTrue(recovery.recover(self.cfg, opts, self.block))
         quota.assert_called_once_with(self.cfg, "codex", dry=False, ignore_quota=True, fresh=True)
+
+    def test_recovery_preserves_parent_soft_pacing_without_outage_permission(self):
+        opts = wu.RoundOpts(
+            only=["security-audit"],
+            agent="claude",
+            work_model="claude",
+            sandbox_host=True,
+            dry_run=False,
+            loop_paced=True,
+        )
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value="codex") as quota,
+            patch.object(sa, "inspect", return_value=sa.bind_verdict({"verdict": "pass", "findings": []}, self.batch)),
+            patch.object(sa, "advance", return_value="b" * 40),
+        ):
+            self.assertTrue(recovery.recover(self.cfg, opts, self.block))
+        quota.assert_called_once_with(self.cfg, "codex", dry=False, ignore_quota=False, fresh=True, already_paced=True)
 
     def replace_answer(self, value):
         native = self.original / "model-rollout-0.jsonl"
@@ -726,6 +758,42 @@ class WorkerBoundJudgments(unittest.TestCase):
                 recovery.recover(self.cfg, self.opts, self.block)
         advance.assert_not_called()
         self.assertTrue((self.work / "blocked.json").exists())
+
+    def test_unfinished_with_damaged_token_resumes_same_inspection_without_approval(self):
+        value = self.unfinished_evidence()
+        value["read_token"] = "damaged-token"
+        self.replace_answer(value)
+        original = (self.original / "model-transcript.jsonl").read_bytes()
+        with (
+            patch.object(sa, "inspect", side_effect=OSError("retry later")) as model,
+            patch.object(sa, "advance") as advance,
+            self.assertRaises(NoProgress),
+        ):
+            recovery.recover(self.cfg, self.opts, self.block)
+        self.assertEqual(model.call_args.kwargs["resume_from"], self.original)
+        self.assertTrue(model.call_args.kwargs["continue_reading"])
+        advance.assert_not_called()
+        self.assertEqual((self.original / "model-transcript.jsonl").read_bytes(), original)
+        self.assertTrue((self.work / "blocked.json").exists())
+
+    def test_damaged_progress_token_does_not_relax_passing_or_receipt_checks(self):
+        value = self.unfinished_evidence()
+        value.update(verdict="pass", read_token="damaged-token")
+        self.replace_answer(value)
+        with patch.object(sa, "inspect") as model, patch.object(sa, "advance") as advance:
+            self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+        model.assert_not_called()
+        advance.assert_not_called()
+        value["verdict"] = "unfinished"
+        self.replace_answer(value)
+        receipt = self.original / "read-receipt.json"
+        proof = json.loads(receipt.read_text())
+        proof["input_digest"] = "wrong-batch"
+        receipt.write_text(sa.serialize(proof))
+        with patch.object(sa, "inspect") as model, patch.object(sa, "advance") as advance:
+            self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+        model.assert_not_called()
+        advance.assert_not_called()
 
     def test_unfinished_with_source_concern_and_inspected_code_uncertainty_are_held(self):
         for verdict in ("finding", "incomplete", "unfinished"):
@@ -865,8 +933,62 @@ class WorkerBoundJudgments(unittest.TestCase):
     def test_migrated_coverage_diagnostic_remains_verified_after_another_restart(self):
         self.run_three_turns_then_recover_after_restart(version2=True)
 
-    def run_three_turns_then_recover_after_restart(self, *, version2):
-        self.unfinished_evidence(version2=version2)
+    def test_new_reading_progress_shortens_cooldown_without_approval_or_resetting_attempts(self):
+        self.run_three_turns_then_recover_after_restart(version2=False, read_more=True)
+
+    def test_new_pages_with_findings_or_damaged_receipts_keep_original_backoff(self):
+        for damage in ("finding", "uncertainty", "receipt", "thread", "exit", "timeout"):
+            with self.subTest(damage=damage):
+                self.unfinished_evidence()
+                (self.work / "operational-recovery.json").unlink(missing_ok=True)
+                (self.work / "ledger.jsonl").write_text("")
+
+                def model(batch, provider, attempt, *, damage=damage, **kwargs):
+                    verdict = (
+                        "finding" if damage == "finding" else "incomplete" if damage == "uncertainty" else "unfinished"
+                    )
+                    self.evidence(
+                        original=attempt,
+                        verdict=verdict,
+                        findings=["IO concern"] if damage in ("finding", "uncertainty") else [],
+                    )
+                    if damage in ("finding", "uncertainty"):
+                        return sa.bind_verdict({"verdict": verdict, "findings": ["IO concern"]}, batch)
+                    if damage == "exit":
+                        raise Die("security-audit: codex failed; see model-stderr.txt")
+                    if damage == "timeout":
+                        raise subprocess.TimeoutExpired("codex", 1800)
+                    if damage == "receipt":
+                        p = attempt / "read-receipt.json"
+                        p.write_text(sa.serialize({**json.loads(p.read_text()), "input_digest": "other"}))
+                    else:
+                        p = attempt / "model-rollout-0.jsonl"
+                        rows = list(map(json.loads, p.read_text().splitlines()))
+                        rows[0]["payload"]["id"] = "22222222-2222-4333-8444-555555555555"
+                        p.write_text("\n".join(map(sa.serialize, rows)) + "\n")
+                    raise Die("security-audit: inspection unfinished; retained for same-session continuation")
+
+                with (
+                    patch.object(recovery.time, "time", return_value=1000),
+                    patch.object(sa, "inspect", side_effect=model),
+                    patch.object(sa, "advance") as advance,
+                    self.assertRaises(NoProgress),
+                ):
+                    recovery.recover(self.cfg, self.opts, self.block)
+                advance.assert_not_called()
+                state = json.loads((self.work / "operational-recovery.json").read_text())
+                self.assertEqual(next(iter(state.values())), {"attempts": 1, "retry_at": 1300})
+
+    def test_advisory_coverage_failure_does_not_remove_service_recovery_eligibility(self):
+        self.evidence(service=True)
+        p = self.original / "read-receipt.json"
+        p.write_text(sa.serialize({**json.loads(p.read_text()), "last_token": ""}))
+        with patch.object(sa, "inspect", side_effect=OSError("provider down")) as model, self.assertRaises(NoProgress):
+            recovery.recover(self.cfg, self.opts, self.block)
+        model.assert_called_once()
+
+    def run_three_turns_then_recover_after_restart(self, *, version2, read_more=False):
+        self.unfinished_evidence(version2=version2, large=read_more)
         (self.work / "auth.json").write_text('{"tokens":{"access_token":"provider-only","refresh_token":"fixture"}}')
         calls = 0
         states = []
@@ -887,6 +1009,9 @@ class WorkerBoundJudgments(unittest.TestCase):
                         reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": i, "token": reader.token}})
                 verdict = "pass"
             else:
+                if read_more:
+                    page = next(i for i in range(len(reader.pages)) if i not in reader.seen)
+                    reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page, "token": reader.token}})
                 verdict = "unfinished"
             value = {"verdict": verdict, "findings": [], "read_token": reader.token}
             append_native(kwargs["cwd"], value, self.thread)
@@ -907,14 +1032,18 @@ class WorkerBoundJudgments(unittest.TestCase):
                 recovery.recover(self.cfg, self.opts, self.block)
             self.assertEqual(calls, 3)
             advance.assert_not_called()
+            state = json.loads((self.work / "operational-recovery.json").read_text())
+            self.assertEqual(next(iter(state.values())), {"attempts": 1, "retry_at": 1060 if read_more else 1300})
             previous = json.loads((self.work / "blocked.json").read_text())
             with patch.object(recovery.time, "time", return_value=1001), self.assertRaisesRegex(NoProgress, "cooldown"):
                 recovery.recover(self.cfg, self.opts, previous)
             self.assertEqual(calls, 3)
-            with patch.object(recovery.time, "time", return_value=1301):
+            with patch.object(recovery.time, "time", return_value=1061 if read_more else 1301):
                 self.assertTrue(recovery.recover(self.cfg, self.opts, previous))
             self.assertEqual(calls, 4)
             advance.assert_called_once()
+            state = json.loads((self.work / "operational-recovery.json").read_text())
+            self.assertEqual(next(iter(state.values()))["attempts"], 2)
         self.assertEqual(states[0], states[1])
         self.assertEqual(states[1], states[2])
         self.assertNotEqual(states[2], states[3])
@@ -1333,7 +1462,7 @@ class Authority(unittest.TestCase):
                     run_round=DEFAULT,
                 ) as mocks,
             ):
-                mocks["resolve_work_model"].return_value = ("codex", False)
+                mocks["resolve_work_model"].return_value = "codex"
                 mocks["run_round"].return_value = 0
                 cli.cmd_work(
                     SimpleNamespace(worker_id="default", dry_run=True, ignore_quota=ignored),
@@ -1350,14 +1479,18 @@ class Authority(unittest.TestCase):
         self.assertNotIn("security-audit", cli.resolve_tasks([], ["review"]))
         self.assertEqual(cli.resolve_tasks(["security-audit"], []), ["security-audit"])
 
-    def test_maintenance_combination_still_requires_admin(self):
-        for only in (["security-audit"], ["bump", "progress", "security-audit"]):
+    def test_any_combination_still_requires_admin(self):
+        for only in (
+            ["security-audit"],
+            ["bump", "progress", "security-audit"],
+            ["review", "overlap-scan", "overlap-fix", "security-audit"],
+        ):
             with patch.object(sa, "require_admin", side_effect=Die("not admin")) as admin:
                 with self.assertRaisesRegex(Die, "not admin"):
                     cli.cmd_work(SimpleNamespace(), only=only, agent="claude", one_round=True)
             admin.assert_called_once()
-        with patch.object(sa, "require_admin") as admin, self.assertRaisesRegex(Die, "bump/progress"):
-            cli.cmd_work(SimpleNamespace(), only=["review", "security-audit"], agent="claude", one_round=True)
+        with patch.object(sa, "require_admin") as admin, self.assertRaisesRegex(Die, "--pr"):
+            cli.cmd_work(SimpleNamespace(), only=["review", "security-audit"], agent="claude", one_round=True, prs=(1,))
         admin.assert_not_called()
 
     def test_admin_must_be_literal_true(self):
@@ -1476,7 +1609,7 @@ class Authority(unittest.TestCase):
                 patch.object(sa, "codex_dir", return_value=work),
                 patch.object(sa, "run_process", side_effect=model),
             ):
-                self.assertEqual(sa.inspect(batch, "codex", work), verdict)
+                self.assertEqual(sa.inspect(batch, "codex", work, protocol=3), verdict)
         self.assertIn("--ignore-user-config", sa.reviewer_argv("codex"))
         self.assertIn("shell_tool", sa.reviewer_argv("codex"))
         args = sa.reviewer_argv("claude")
@@ -1660,6 +1793,7 @@ class CompactingInspection(unittest.TestCase):
         if resume:
             original = self.work / "original"
             original.mkdir()
+            (original / "execution.json").write_text('{"protocol_version":3}')
             (original / "model-rollout-0.jsonl").write_text(
                 json.dumps({"type": "session_meta", "payload": {"id": thread}}) + "\n"
             )
@@ -1744,9 +1878,11 @@ class CompactingInspection(unittest.TestCase):
         ):
             if repair_always:
                 with self.assertRaisesRegex(Die, "inconsistent findings"):
-                    sa.inspect(self.batch, "codex", self.work, resume_from=original)
+                    sa.inspect(self.batch, "codex", self.work, resume_from=original, protocol=3)
             else:
-                self.assertEqual(sa.inspect(self.batch, "codex", self.work, resume_from=original), self.verdict)
+                self.assertEqual(
+                    sa.inspect(self.batch, "codex", self.work, resume_from=original, protocol=3), self.verdict
+                )
             self.assertEqual(run.call_count, 3 if repair_always else 2 if repair_once else 1)
         self.assertTrue((self.work / "read-receipt.json").exists())
 
@@ -1980,7 +2116,7 @@ class CompactingInspection(unittest.TestCase):
             patch.object(sa, "claude_dir", return_value=self.work),
             patch.object(sa, "run_process", side_effect=model),
         ):
-            self.assertEqual(sa.inspect(self.batch, "claude", self.work)["verdict"], "finding")
+            self.assertEqual(sa.inspect(self.batch, "claude", self.work, protocol=3)["verdict"], "finding")
 
     def test_claude_trace_rejects_other_tools_and_unreadable_inline_compaction(self):
         (self.work / ".credentials.json").write_text('{"claudeAiOauth":{"accessToken":"provider-only"}}')
@@ -2002,7 +2138,7 @@ class CompactingInspection(unittest.TestCase):
                 ),
                 self.assertRaises(Die),
             ):
-                sa.inspect(batch, "claude", self.work)
+                sa.inspect(batch, "claude", self.work, protocol=3)
 
     def test_inline_clean_stop_without_answer_resumes_same_conversation(self):
         (self.work / "auth.json").write_text('{"tokens":{"access_token":"provider-only","refresh_token":"fixture"}}')
@@ -2031,7 +2167,7 @@ class CompactingInspection(unittest.TestCase):
             patch.object(sa, "run_process", side_effect=model),
             patch.object(sa.time, "sleep"),
         ):
-            self.assertEqual(sa.inspect(batch, "codex", self.work)["verdict"], "pass")
+            self.assertEqual(sa.inspect(batch, "codex", self.work, protocol=3)["verdict"], "pass")
         self.assertEqual(calls, 2)
         self.assertEqual(sa.retained_thread(self.work), thread)
 
@@ -2071,7 +2207,7 @@ class CompactingInspection(unittest.TestCase):
             patch.object(sa, "run_process", side_effect=model),
             patch.object(sa.time, "sleep"),
         ):
-            self.assertEqual(sa.inspect(self.batch, "codex", self.work), self.verdict)
+            self.assertEqual(sa.inspect(self.batch, "codex", self.work, protocol=3), self.verdict)
         self.assertEqual(calls, 3)
         self.assertEqual(len(set(states)), 1)
         proof = json.loads((self.work / "read-receipt.json").read_text())
@@ -2117,7 +2253,7 @@ class CompactingInspection(unittest.TestCase):
                 patch.object(sa, "codex_dir", return_value=self.work),
                 patch.object(sa, "run_process", side_effect=model) as run,
             ):
-                actual = sa.inspect(self.batch, "codex", self.work)
+                actual = sa.inspect(self.batch, "codex", self.work, protocol=3)
             self.assertEqual(actual["verdict"], kind)
             self.assertEqual(actual["findings"], ["Macro can access the filesystem"])
             self.assertEqual(run.call_count, 1)
@@ -2130,7 +2266,10 @@ class Run(unittest.TestCase):
         self.state = Path(self.tmp.name)
         self.old, self.target = "a" * 40, "b" * 40
         self.batch = {"from_sha": self.old, "input_digest": "digest", "commits": [{"sha": self.target, "files": [{}]}]}
-        self.opts = SimpleNamespace(dry_run=False, work_model="codex", claude_bootstrap=False)
+        self.opts = SimpleNamespace(dry_run=False, work_model="codex")
+        protocol = patch.object(clients, "selected_protocol", return_value=3)
+        protocol.start()
+        self.addCleanup(protocol.stop)
         for name, kwargs in (
             ("require_admin", {}),
             ("remote_sha", {"return_value": self.old}),
@@ -2142,6 +2281,17 @@ class Run(unittest.TestCase):
             mock = patch.object(sa, name, **kwargs)
             mock.start()
             self.addCleanup(mock.stop)
+
+    def test_ordinary_launch_needs_no_bootstrap_telemetry(self):
+        opts = SimpleNamespace(dry_run=False, work_model="claude")
+        with (
+            patch("tauceti_worker.quota.Quota") as quota,
+            patch.object(sa, "inspect", return_value={"verdict": "pass", "findings": []}) as model,
+            patch.object(sa, "advance", return_value=self.target),
+        ):
+            self.assertEqual(sa.run(SimpleNamespace(state=self.state), opts), 0)
+            model.assert_called_once()
+            quota.assert_not_called()
 
     def test_pending_threshold_skips_all_model_and_planning_work(self):
         for count in (0, 1, 19):
@@ -2254,7 +2404,7 @@ class Run(unittest.TestCase):
         }
         (work / "blocked.json").write_text(sa.serialize(block))
 
-        def inspection(*args):
+        def inspection(*args, protocol):
             archived = list(work.glob("superseded-size-block-*.json"))
             self.assertEqual(len(archived), 1)
             self.assertEqual(json.loads(archived[0].read_text()), block)
@@ -2356,7 +2506,7 @@ class Run(unittest.TestCase):
 
         with (
             patch.object(sa, "validate_history", return_value=[self.target]),
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="codex"),
             patch.object(sa, "inspect", side_effect=inspect) as model,
             patch.object(sa, "advance", return_value=self.target),
         ):
@@ -2436,7 +2586,7 @@ class Run(unittest.TestCase):
 
         with (
             patch.object(sa, "validate_history", return_value=[self.target]),
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="codex"),
             patch.object(sa, "inspect", side_effect=model) as inspect,
             patch.object(sa, "advance", return_value=self.target),
         ):
@@ -2492,7 +2642,7 @@ class Run(unittest.TestCase):
 
         with (
             patch.object(sa, "validate_history", return_value=[self.target]),
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="codex"),
             patch.object(sa, "inspect", side_effect=model) as inspect,
             patch.object(sa, "advance", return_value=self.target),
         ):
@@ -2551,7 +2701,7 @@ class Run(unittest.TestCase):
 
         with (
             patch.object(sa, "validate_history", return_value=[self.target]),
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="codex"),
             patch.object(sa, "inspect", side_effect=incomplete_model) as model,
             patch.object(sa, "advance") as advance,
             self.assertRaises(Die),
@@ -2577,7 +2727,7 @@ class Run(unittest.TestCase):
         cfg = SimpleNamespace(state=self.state)
         with (
             patch.object(sa, "validate_history", return_value=[self.target]),
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("codex", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="codex"),
             patch.object(sa, "inspect", side_effect=Die("malformed output")) as model,
             patch.object(sa, "advance") as advance,
         ):

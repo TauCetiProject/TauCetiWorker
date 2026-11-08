@@ -10,7 +10,7 @@ tauceti activity --worker reviewer --json
 tauceti activity --group FLEET_MACHINE_ID
 ```
 
-Finished rounds use their finish receipt in trailing 3-hour, 24-hour, and 7-day
+Finished rounds use their finish receipt in trailing 1-hour, 3-hour, 24-hour, and 7-day
 windows and an All time column. The type is the final selected work unit,
 such as `roadmap`, `review`, `fix`, or `security-audit`; fallback candidates are
 not additional rounds. All supported round types appear even when their counts
@@ -21,8 +21,15 @@ included, with a failure subset (including timeouts). Running rounds and
 processes interrupted without a finish receipt are separate. The current
 "workers working" count is distinct workers with an active work round, excluding
 workers waiting for capacity or budget; it can lag until the next preparation.
-Discovery of an
-interruption never supplies a fabricated finish time.
+Discovery of an interruption never supplies a fabricated finish time. The
+"Round reporting gaps" line shows 1-hour and 24-hour counts by round **start
+time**, and the age of the latest affected start. It is omitted when all gaps
+have starts older than 24 hours. A gap from the last hour also shows the worker
+and round ID for finding its log. A missing finish can follow an intentional
+stop or a crash; it is not pending work, and no exit cause or time is inferred.
+Historical totals and exact identities remain in JSON. Older prepared summaries
+show the retained total with recent counts marked unavailable. Fleet recent
+counts require timing details from every host.
 
 PR authorship comes from successful tracked creation, not the entire GitHub
 account's history. Authored counts use creation time; landed counts use landing
@@ -36,7 +43,7 @@ missing-landing warning.
 
 ## Costs and initiated PR output
 
-Average API spending has **3h**, **24h**, **7d** and **All time** columns in
+Average API spending has **1h**, **3h**, **24h**, **7d** and **All time** columns in
 $/hour. It uses accrued conversation costs, including running and interrupted work
 and reviews. Admission reservations do not enter this rate. Each average divides by elapsed recorded time within that window, so a
 new installation is not diluted by hours before recording began. `Worker-hours
@@ -44,7 +51,9 @@ recorded` adds time across completed and currently running native rounds, clippe
 to each window. Capacity/budget/quota waiting and interruptions without a known
 end do not inflate it. Failed rounds with recorded durations still count. The
 report shows worker-hours first, then API dollars per worker-hour (accrued
-spending divided by worker-hours) and API dollars per elapsed hour. Active-session
+spending divided by worker-hours) and API dollars per elapsed hour. Both spending
+rows include the minute-scale live estimate when available, falling back to
+recorded usage for older snapshots. Active-session
 cost reservations do not enter either spending rate. Zero recorded worker-hours
 leave the worker-hour rate unavailable.
 Fleet averages pool spending over the longest recorded
@@ -53,25 +62,42 @@ wall-clock hours. Missing spending data leaves the fleet rate unavailable.
 Preparation reuses the existing local budget cache and collector, with no extra
 tasks or GitHub requests.
 
-Cost estimates have **7 days** and **All time** columns. They pool every
+Cost estimates have **24h**, **7 days** and **All time** columns. They pool every
 conversation in the reported worker/machine scope, including reviews and fixes
 on PRs initiated elsewhere. Native final costs correct response-level estimates at their usage timestamps;
 ongoing sessions use recorded usage, shown separately as running usage.
 Legacy costs without response timing are spread over their conversation duration. These are API costs,
 not machine charges or subscription fees. Reading the ledger never changes it.
+Closed history is indexed once; routine preparation processes only ledger changes,
+changed/live invocation evidence, and reporting-window expirations.
+The cost breakdown lists completed sessions, live usage, and the estimated total.
+Unresolved stopped usage estimates appear only when nonzero or unavailable;
+an all-zero row is omitted. Settled estimates already belong to completed sessions;
+recovered estimates are a subset of those. These diagnostic subsets remain in JSON
+but are omitted from the display to avoid suggesting they should be added again.
+Healthy accounting adds no diagnostic lines. Unresolved stopped conversations
+and stale live estimates still produce warnings.
 
-The seven-day denominator contains only PRs initiated within those seven days;
+The 24-hour and seven-day denominators contain only PRs initiated within their respective windows;
 all-time contains all retained initiated PRs. Each verified landed PR contributes
 its Lean lines added, each currently open PR contributes half its Lean lines
 added, and a closed unmerged PR contributes nothing. Reviews and other assists
 never add another author's LOC to this denominator. Fleet totals pool costs and
 weighted LOC before dividing; they do not average machine ratios.
 
-LOC comes from complete file lists already cached by the shared GitHub state
-server. Immutable file URLs must match the PR head (or base for deleted files),
-and cached file totals must agree with available PR headers. The observation
-route never schedules file collection or falls back to GitHub. Missing or stale
-LOC is extrapolated from measured PRs in the same window: measured weighted LOC
+PR state, landing evidence and exact head/base identities come from the shared
+GitHub state server. LOC uses its cached measurement when available. Otherwise,
+the existing background refresher fetches the recorded commits into a local bare
+Git cache and counts `.lean` additions and deletions in `base...head`. Renames
+use the destination filename, and complete diff totals must agree with available
+PR metadata. Ordinary Git refs preserve downloaded history for later fetches.
+Failed or missing state observations never trigger Git work; failed Git work
+leaves the count unknown and normal refresh retries. No Git work runs in `status`.
+
+File-derived measurements require complete cached file lists and immutable URL
+and total validation; Git-derived measurements bind the exact head/base pair.
+The observation route never schedules collection or falls back to GitHub.
+Missing or stale LOC is extrapolated from measured PRs in the same window: measured weighted LOC
 per measured PR weight, multiplied by total eligible PR weight (landed = 1,
 open = ½). Unknown PR states contribute zero. These estimates carry `~` and show
 measured-PR coverage. With no measured LOC, missing LOC contributes zero; positive
@@ -106,13 +132,31 @@ retains last-known data after a failure and exposes that failure and data age.
 Summaries older than three minutes are labelled stale. Windows end at each
 summary's preparation time.
 
+PR evidence is silent during normal operation. Status warns only when an
+unresolved authored PR's stored observation is more than two hours old, or when
+a PR has waited more than two hours since creation for its first observation.
+This allows for hourly shared-server inventory reconciliation and a missed cycle;
+the preparer's five-minute observation reads do not refresh the underlying facts.
+Closed PRs and PRs with verified landing evidence are excluded because their
+historical observations may stop updating permanently. The original all-history
+observation/check timestamps remain available in JSON. Older summaries without
+unresolved-PR freshness fields do not produce an age warning. Coverage errors
+remain visible independently of these age warnings.
+Repository access warnings identify which open/landed counts may be stale and
+that background preparation retries. Stored observation errors are discarded
+once the repository has no remaining refresh work, so removed or fully settled
+repositories do not leave permanent warnings.
+Worker and group reports include repository failures only when their own PRs or
+contributions track that repository; unrelated local history does not warn every
+fleet group. Installation-wide JSON retains the full set of current errors.
+
 Each worker and fleet group has its own small summary file, so status does not
 load the entire historical inventory. A separate prepared PR identity inventory
 supports deduplicated aggregation: `tauceti activity --inventory` (optionally
 scoped by worker or group).
 
 ```sh
-# Explicit preparation, using configured shared-server credentials; never GitHub.
+# Explicit preparation, using configured shared-server observations and cached Git comparisons.
 tauceti activity refresh --config ~/.config/tauceti/workers.toml
 # Import PR creation receipts since activity recording began; follow by offset.
 tauceti activity refresh --backfill
@@ -165,8 +209,9 @@ cache). Reporting never downloads or refreshes that database.
 ## Accrued spending
 
 Spending rows use recorded usage from running, completed and interrupted
-conversations. Admission reservations are excluded. The existing rows show one
-estimated rate in each 3h/24h/7d/All-time window, followed by a compact quality note.
+conversations, including the cached live adjustment for usage not yet in the
+historical baseline. Admission reservations are excluded. The existing rows show
+one estimated rate in each 1h/3h/24h/7d/All-time window.
 Worker-hours sum recorded work intervals; elapsed hours measure the covered
 wall-clock interval. Fleet rates pool dollars and worker-hours before dividing;
 elapsed time is shared across machines, not summed.
@@ -186,3 +231,20 @@ the rate. Costs remain seven days and all time; hourly rates retain four windows
 
 Preparation is local and runs in the existing background collector. Reading
 `status` performs no transcript scans, SQL queries or additional GitHub requests.
+
+## Incremental historical preparation
+
+Historical cost preparation owns an independent SQLite projection and a durable
+queue of changed invocations. It never takes the admission projection lock.
+Indexed provider/message ownership limits corrections to affected invocations;
+settled journals are not rechecked on each report. Recent final-checkpoint races
+have a bounded retry period. Per-invocation errors roll back and retry separately
+without repeatedly preparing successful changes; incomplete costs remain visibly
+unavailable until the retry succeeds.
+
+Persisted prefix totals advance the 1h/3h/24h/7d boundaries by consuming only
+crossing events. Completed history is not loaded into Python to rebuild totals.
+The same totals cover worker time, rounds, PR/LOC output, contributions and CI.
+A new schema or discarded/replaced cache may require one migration scan.
+`--inventory` explicitly reads the prepared PR table; the collector does not
+serialize the entire inventory every minute.

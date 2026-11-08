@@ -1,0 +1,297 @@
+[
+  {
+    "schema": "tauceti.operations.queue-update/v1",
+    "source": {
+      "id": "00000000-0000-0000-0000-000000000001",
+      "epoch": 1,
+      "sequence": 1
+    },
+    "snapshot": "00000000-0000-0000-0000-000000000002",
+    "base": null,
+    "part": 0,
+    "parts": 1,
+    "changes": [
+      {
+        "collection": "batches",
+        "id": "1",
+        "value": {
+          "id": "1",
+          "repository": "TauCetiProject/TauCeti",
+          "version": 2,
+          "base": "1c2218bc29604ef6c4b924a5f9877a3c48662fed",
+          "tip": "77cd322987a044380d8b3125e1febb3edb6e568a",
+          "state": "head",
+          "size": 2,
+          "created_at": "2027-01-15T08:00:00Z",
+          "sealed_at": "2027-01-15T08:00:00Z",
+          "landed_at": null,
+          "first_dispatch_at": "2027-01-15T08:00:00Z",
+          "pre_rebase_state": "",
+          "pre_rebase_tip": null,
+          "pre_rebase_onto": null,
+          "prepared_tip": null
+        }
+      },
+      {
+        "collection": "batches",
+        "id": "2",
+        "value": {
+          "id": "2",
+          "repository": "TauCetiProject/TauCeti",
+          "version": 0,
+          "base": "1c2218bc29604ef6c4b924a5f9877a3c48662fed",
+          "tip": "1c2218bc29604ef6c4b924a5f9877a3c48662fed",
+          "state": "open",
+          "size": 0,
+          "created_at": "2027-01-15T08:00:00Z",
+          "sealed_at": null,
+          "landed_at": null,
+          "first_dispatch_at": null,
+          "pre_rebase_state": "",
+          "pre_rebase_tip": null,
+          "pre_rebase_onto": null,
+          "prepared_tip": null
+        }
+      },
+      {
+        "collection": "inputs",
+        "id": "2",
+        "value": {
+          "id": "2",
+          "repository": "TauCetiProject/TauCeti",
+          "pr": "102",
+          "accepted_head": "f722105b332cab0369d59491e1374b70b5e4be61",
+          "state": "inserted",
+          "batch_id": "1",
+          "title": "Change 102",
+          "approved_at": "2027-01-15T08:00:00Z",
+          "landed_at": null,
+          "landed_commit": null,
+          "no_repair": false
+        }
+      },
+      {
+        "collection": "inputs",
+        "id": "1",
+        "value": {
+          "id": "1",
+          "repository": "TauCetiProject/TauCeti",
+          "pr": "101",
+          "accepted_head": "b1dd3b5c81c57928424fbc8ba71674b1ca4e2e4e",
+          "state": "inserted",
+          "batch_id": "1",
+          "title": "Change 101",
+          "approved_at": "2027-01-15T08:00:00Z",
+          "landed_at": null,
+          "landed_commit": null,
+          "no_repair": false
+        }
+      },
+      {
+        "collection": "members",
+        "id": "2",
+        "value": {
+          "id": "2",
+          "repository": "TauCetiProject/TauCeti",
+          "pr": "101",
+          "batch_id": "1",
+          "batch_version": 2,
+          "position": 1,
+          "accepted_head": "b1dd3b5c81c57928424fbc8ba71674b1ca4e2e4e",
+          "commit": "77cd322987a044380d8b3125e1febb3edb6e568a",
+          "title": "Change 101",
+          "author": "alice",
+          "approved_at": "2027-01-15T08:00:00Z",
+          "inserted_at": "2027-01-15T08:00:00Z",
+          "landed_at": null,
+          "provenance": "clean",
+          "disposition": "clean_replay",
+          "empty": false,
+          "removed": false,
+          "no_repair": false,
+          "withdrawn": false,
+          "explanation": "",
+          "pr_url": "https://github.com/TauCetiProject/TauCeti/pull/101",
+          "commit_url": "https://github.com/TauCetiProject/TauCeti/commit/77cd322987a044380d8b3125e1febb3edb6e568a"
+        }
+      },
+      {
+        "collection": "members",
+        "id": "1",
+        "value": {
+          "id": "1",
+          "repository": "TauCetiProject/TauCeti",
+          "pr": "102",
+          "batch_id": "1",
+          "batch_version": 2,
+          "position": 0,
+          "accepted_head": "f722105b332cab0369d59491e1374b70b5e4be61",
+          "commit": "b1c6f95f3ff6a3e20cba3c4097383df2cd89f22e",
+          "title": "Change 102",
+          "author": "alice",
+          "approved_at": "2027-01-15T08:00:00Z",
+          "inserted_at": "2027-01-15T08:00:00Z",
+          "landed_at": null,
+          "provenance": "clean",
+          "disposition": "clean_replay",
+          "empty": false,
+          "removed": false,
+          "no_repair": false,
+          "withdrawn": false,
+          "explanation": "",
+          "pr_url": "https://github.com/TauCetiProject/TauCeti/pull/102",
+          "commit_url": "https://github.com/TauCetiProject/TauCeti/commit/b1c6f95f3ff6a3e20cba3c4097383df2cd89f22e"
+        }
+      },
+      {
+        "collection": "attempts",
+        "id": "1",
+        "value": {
+          "id": "1",
+          "batch_id": "1",
+          "version": 2,
+          "candidate": "77cd322987a044380d8b3125e1febb3edb6e568a",
+          "base": "1c2218bc29604ef6c4b924a5f9877a3c48662fed",
+          "run_id": null,
+          "run_attempt": null,
+          "status": "",
+          "conclusion": null,
+          "outcome": "pending",
+          "dispatched_at": "2027-01-15T08:00:00Z",
+          "started_at": null,
+          "completed_at": null,
+          "cancelled_at": null,
+          "last_progress_at": "2027-01-15T08:00:00Z",
+          "observed_at": null,
+          "runner": "",
+          "labels": [],
+          "url": null,
+          "verdicts": {},
+          "phases": []
+        }
+      },
+      {
+        "collection": "events",
+        "id": "10",
+        "value": {
+          "id": "10",
+          "at": "2027-01-15T08:00:00Z",
+          "kind": "dispatched",
+          "batch_id": "1"
+        }
+      },
+      {
+        "collection": "events",
+        "id": "9",
+        "value": {
+          "id": "9",
+          "at": "2027-01-15T08:00:00Z",
+          "kind": "batch-opened",
+          "batch_id": "2"
+        }
+      },
+      {
+        "collection": "events",
+        "id": "8",
+        "value": {
+          "id": "8",
+          "at": "2027-01-15T08:00:00Z",
+          "kind": "sealed",
+          "batch_id": "1"
+        }
+      },
+      {
+        "collection": "events",
+        "id": "7",
+        "value": {
+          "id": "7",
+          "at": "2027-01-15T08:00:00Z",
+          "kind": "inserted",
+          "batch_id": "1"
+        }
+      },
+      {
+        "collection": "events",
+        "id": "6",
+        "value": {
+          "id": "6",
+          "at": "2027-01-15T08:00:00Z",
+          "kind": "inserted",
+          "batch_id": "1"
+        }
+      },
+      {
+        "collection": "events",
+        "id": "5",
+        "value": {
+          "id": "5",
+          "at": "2027-01-15T08:00:00Z",
+          "kind": "batch-opened",
+          "batch_id": "1"
+        }
+      }
+    ],
+    "metadata": {
+      "schema": "tauceti.operations.queue/v1",
+      "observed_at": "2027-01-15T08:00:00Z",
+      "source_revision": "",
+      "coverage": "observed",
+      "truncated": false,
+      "collection_complete": {
+        "batches": true,
+        "members": true,
+        "inputs": true,
+        "attempts": true,
+        "tasks": true,
+        "events": true
+      },
+      "scope": {
+        "repositories": [
+          "TauCetiProject/TauCeti"
+        ]
+      },
+      "service": {
+        "revision": "",
+        "started_at": "",
+        "mode": "unknown",
+        "controller": "unknown",
+        "publication_enabled": null
+      },
+      "status_observed_at": null,
+      "conditions": [],
+      "outbox": [
+        {
+          "kind": "labels",
+          "state": "done",
+          "count": 2
+        },
+        {
+          "kind": "retain_ref",
+          "state": "done",
+          "count": 4
+        }
+      ],
+      "settings": {},
+      "claims": [],
+      "event_history_truncated": false,
+      "claim_history_truncated": false,
+      "workers": [],
+      "collection_counts": {
+        "batches": 2,
+        "inputs": 2,
+        "members": 2,
+        "attempts": 1,
+        "tasks": 0,
+        "events": 6
+      },
+      "retained_batch_ids": [
+        "1",
+        "2"
+      ],
+      "active_batch_ids": [
+        "1",
+        "2"
+      ]
+    }
+  }
+]

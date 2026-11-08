@@ -38,9 +38,9 @@ class FakeRS:
     """The review state as it looks on a LIVE re-read, with a busted() flag so the test can prove the
     cache was dropped rather than consulted."""
 
-    def __init__(self, *, meta=None, clean_head="", held=(), contest=None):
+    def __init__(self, *, meta=None, clean_head="", contest=None):
         self.meta = meta if meta is not None else tc.Meta({"head_sha": HEAD}, "fresh")
-        self._clean_head, self._held, self._contest = clean_head, set(held), contest
+        self._clean_head, self._contest = clean_head, contest
         self.busted, self.forced = [], []
 
     def bust(self, pr):
@@ -55,10 +55,6 @@ class FakeRS:
 
     def ledger_blocking(self, pr, head):
         return True
-
-    def inflight_review(self, pr, head, *, force=False):
-        self.forced.append(("markers", force))
-        return set(self._held)
 
     def newest_contest_reply(self, pr, *, force=False):
         self.forced.append(("contest", force))
@@ -81,7 +77,10 @@ class FakeGH:
 
 def worker(rs, gh=None):
     return SimpleNamespace(
-        rs=rs, gh=gh or FakeGH(), counters=SimpleNamespace(read=lambda key: 0), cfg=SimpleNamespace(wid="test")
+        rs=rs,
+        gh=gh or FakeGH(),
+        counters=SimpleNamespace(read=lambda key: 0, write=lambda *_: None),
+        cfg=SimpleNamespace(wid="test"),
     )
 
 
@@ -121,8 +120,11 @@ for pause in ("hold", "on-hold", "human"):
     gh.view["labels"] = [{"name": pause}]
     check("live pause declines review: " + pause, still("review", FakeRS(), gh=gh), False)
 
-check("a head a peer now holds is declined", still("review", FakeRS(held=("codex",))), False)
 check("a head reviewed since the survey is declined", still("review", FakeRS(clean_head=HEAD)), False)
+carried = FakeRS(meta=tc.Meta({"head_sha": HEAD, "states": {"reuse": "green"}, "runs": []}, "fresh"))
+carried.ledger_clean_head = lambda pr: tc.ReviewState.ledger_clean_head(carried, pr)
+check("carried verdicts decline dispatch using the real predicate", still("review", carried), False)
+
 
 contest_c = tc.Candidate(1, HEAD, "", contest="reuse", contest_reply_id=7)
 check(
@@ -185,7 +187,11 @@ for label, gh in (
     ("a PR we could not re-read at all", FakeGH(view=False)),
 ):
     for stage in ("review", "fix"):
-        check(f"{label} declines the {stage} candidate", still(stage, FakeRS(), gh=gh), False)
+        check(
+            f"{label} revalidates the {stage} candidate",
+            still(stage, FakeRS(), gh=gh),
+            None if stage == "fix" and not gh.view else False,
+        )
 
 
 # --- fix ------------------------------------------------------------------------------------------
@@ -222,7 +228,7 @@ for provenance in ("stale", "fetch_failed"):
         check(
             f"a {provenance} re-read declines the {stage} candidate",
             still(stage, FakeRS(meta=tc.Meta({"head_sha": HEAD}, provenance))),
-            False,
+            None if stage == "fix" else False,
         )
 
 # --- stages that do not read review state are not charged for a re-read ---------------------------

@@ -30,7 +30,7 @@ RETRIES = (60, 300, 1800)
 MAX_INSPECT = 8
 RESERVATION_SECONDS = 300
 PROTOCOL = 3
-RETRYABLE = {"invocation-failed", "recovery-exhausted", "content-allowance", "publication-revalidation-failed"}
+RETRYABLE = {"invocation-failed", "publication-revalidation-failed"}
 ACTIVE_HANDOFF = {"source-handed-to-normal-round", "source-handoff-source-pending", "source-handoff-reconciliation"}
 HOLDS = {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
 LOCAL_WAITS = {"work-policy", "pr-policy", "profile-policy", "roadmap-policy"}
@@ -55,6 +55,23 @@ PERMANENT_BLOCKS = {
     "billing-policy",
     "expected-head-missing",
 }
+CONTINUATION_BLOCKS = {"profile-missing", "unsupported-continuation-provider", "billing-policy"}
+
+
+def verification_tools_changed(journal):
+    if not journal.get("failed_source") or journal.get("state") != "blocked":
+        return False
+    code = (journal.get("reason") or {}).get("code")
+    if code not in CONTINUATION_BLOCKS:
+        return False
+    from .verification import Incomplete
+    from .verification_tools import Unavailable, identity
+
+    previous = journal.get("verification_retry_identity", journal.get("failed_tool_identity"))
+    try:
+        return previous != identity()
+    except (OSError, Unavailable, Incomplete):
+        return False  # An optional scheduling hint must not stop unrelated work.
 
 
 class Wait(Exception):
@@ -101,6 +118,13 @@ def write(record, journal, state, **fields):
     handoff = fields.get("handoff", journal.get("handoff")) or {}
     if state == "obsolete" and handoff.get("state") == "offered" and code in ACTIVE_HANDOFF:
         state = "resuming"  # a live source handoff is active work, never finished history
+    if (
+        code in {"content-allowance", "recovery-exhausted"}
+        and handoff.get("state") != "offered"
+        and not uncertain_publication(journal)
+        and not normal_publication(record, {}, journal)
+    ):
+        state = "obsolete"
     if state == "blocked" and code in RETRYABLE:
         state = "eligible"
     journal.update(
@@ -223,6 +247,8 @@ class Recovery:
 
     def run(self):
         """One owned invocation; caller holds the worker round lock and record flock."""
+        from .verification_tools import identity as tool_identity
+
         m, b, j = self.manifest, self.backend, self.journal
         if not (self.record / "recovery.json").exists():
             self.transition("retained")
@@ -242,17 +268,29 @@ class Recovery:
                 ),
             )
             return False
+        from .recovery_maintenance import abandonment_reason
+
+        if exhausted := abandonment_reason(self.record, j):
+            self.transition("obsolete", reason=reason(Obsolete(exhausted, "Abandoned recovery; select fresh work")))
+            b.evict_caches(self.record)
+            return False
         if j.get("protocol") != PROTOCOL:
             # Re-evaluate old operator-dependent dispositions under autonomous rules,
             # without resetting either paid content counters or infrastructure failures.
             self.transition(j.get("state", "retained"), retry_at=0)
         selected = selection(b.opts.only, b.opts.prs, b.opts.sandbox_host, b.opts.agent)
         changed_selection = selection_changed(j.get("selection"), selected)
-        if j.get("retry_at", 0) > time.time() and not changed_selection:
+        changed_tools = verification_tools_changed(j)
+        if j.get("retry_at", 0) > time.time() and not changed_selection and not changed_tools:
             return False
         charged = False
         try:
-            facts = b.facts(m)
+            try:
+                facts = b.facts(m)
+            except Wait:
+                raise
+            except Exception as error:
+                raise Wait("metadata-unavailable", f"Await current PR state: {error}") from error
             j["observed_head"] = facts["head"]
             normal_pending = normal_publication(self.record, m, j)
             if normal_pending:
@@ -314,26 +352,20 @@ class Recovery:
                     reason=None,
                 )
             b.policy(m, facts)
+            if changed_tools:
+                self.transition(j["state"], verification_retry_identity=tool_identity(), retry_at=0)
             if (m.get("round_outcome") or {}).get("published_head") not in (None, m.get("expected_remote_head")):
                 raise Obsolete(
                     "post-publication-leftovers",
                     "The original round already published through git-safe-push; these later edits have no publication authorization",
                 )
-            if j.get("attempts", 0) >= 3:
-                recheck = j.get("mechanical_recheck_at") or time.time() + RETRIES[-1]
-                if time.time() < recheck:
-                    self.transition(
-                        "blocked",
-                        reason=dict(
-                            code="recovery-exhausted",
-                            detail="Three infrastructure failures; scheduled mechanical reevaluation precedes any further source reasoning",
-                            next_action="scheduled-mechanical-recheck",
-                        ),
-                        mechanical_recheck_at=recheck,
-                        retry_at=recheck,
+            if j.get("attempts", 0) >= len(RETRIES):
+                if uncertain_publication(j):
+                    raise Wait(
+                        "publication-revalidation-failed",
+                        "Source recovery exhausted; reconcile the existing publication before selecting fresh work",
                     )
-                    return False
-                self.transition("eligible", attempts=0, mechanical_recheck_at=None, reason=None)
+                raise Obsolete("recovery-exhausted", "Recovery allowance exhausted; select fresh work")
             if j.get("retry_at", 0) > time.time() and not changed_selection:
                 return False
             prior_checkout = self.record / "checkout"
@@ -341,6 +373,7 @@ class Recovery:
                 j.get("failed_head") == facts["head"]
                 and (j.get("reason") or {}).get("code") != "content-allowance"
                 and j.get("failed_source")
+                and j.get("failed_tool_identity") == tool_identity()
                 and j.get("failed_recheck_at", 0) > time.time()
                 and (prior_checkout / ".git").exists()
                 and saved.inspect(prior_checkout).fingerprint == j["failed_source"]
@@ -348,6 +381,8 @@ class Recovery:
                 # A known failed source needs reasoning. Admission waits must not
                 # warm caches or repeat the same expensive failed build each time.
                 b.continuation_admission(self.record, m, j)
+            prior = prior_checkout if prior_checkout.is_dir() else b.w.cfg.checkout
+            b.check_verification_tools(prior)
             b.acquire(m, facts)
             # No attempt is consumed until a real claim and all prerequisites are available.
             claimed = b.facts(m)
@@ -463,9 +498,16 @@ class Recovery:
                 next_action="scheduled-mechanical-recheck" if attempts >= 3 else "retry-infrastructure",
                 retry_when="scheduled-backoff-or-changed-authorized-external-facts",
             )
-            # Infrastructure failures always retry automatically. The delay is
-            # bounded; exhausting invocation attempts never parks a recovery.
-            state = "eligible"
+            # Spend the existing allowance once. Uncertain publication still needs
+            # reconciliation, but failed source recovery must not retry forever.
+            exhausted = (
+                attempts >= len(RETRIES)
+                and not uncertain_publication(j)
+                and not normal_publication(self.record, m or {}, j)
+            )
+            state = "obsolete" if exhausted else "eligible"
+            if exhausted:
+                failure.update(code="recovery-exhausted", next_action="continue-normal-selection", retry_when=None)
             self.transition(
                 state,
                 attempts=attempts,
@@ -544,7 +586,7 @@ class WorkerBackend:
             with read_context(fresh=True, direct=True):
                 data = self.w.gh.pr_view(m["pr"], fields)
         if not data:
-            raise RuntimeError("Cannot read current PR state")
+            raise Wait("metadata-unavailable", "Await current PR state; no source recovery attempt was made")
         return dict(
             head=data["headRefOid"],
             state=data["state"],
@@ -622,11 +664,6 @@ class WorkerBackend:
             raise Wait("work-policy", "Checkpoint work type is outside this round's --only authorization")
         if self.opts.prs and m["pr"] not in self.opts.prs:
             raise Wait("pr-policy", "Checkpoint is outside this round's --pr authorization")
-        if self.w.rs.maintenance_blocked(m["pr"], facts["head"], facts["author"], selected=True):
-            raise Block(
-                "maintenance-blocked",
-                "Current durable PR policy blocks maintenance",
-            )
 
     def acquire(self, m, facts):
         owner, repo = facts["repository"].split("/")
@@ -1161,8 +1198,15 @@ class WorkerBackend:
         )
 
     def verify(self, checkout, m, facts):
-        from .agents import prepare_host_build_caches, scope_policy
+        import sys
+
+        from .agents import host_build_cache_context, scope_policy
+        from .paths import HERE
+        from .processes import run as run_process
         from .verification import Verification
+        from .verification_tools import identity as tool_identity
+
+        self.check_verification_tools(checkout)
 
         policy = scope_policy(
             facts["labels"], facts["ref"], bump=m.get("authorization", {}).get("automatic_bump", False)
@@ -1170,38 +1214,80 @@ class WorkerBackend:
         if getattr(self, "record", None):
             (self.record / "cache-evicted.json").unlink(missing_ok=True)
         with environment(**self.verification_environment(checkout)):
-            # Restore ordinary dependency/artifact prerequisites before fingerprinting;
-            # an empty isolated clone must not compile missing Mathlib from scratch.
-            if any((checkout / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
-                prepare_host_build_caches(checkout, dict(os.environ), self.w.cfg.logdir)
-            if getattr(self, "record", None):
-                self.prepare_source(checkout, self.record, m, self.journal)
-            verifier = Verification(
-                checkout,
-                self.w.cfg.state,
-                base=saved._rev(checkout, f"origin/{BASE_BRANCH}"),
-                policy=policy,
-                deadline=self.w.rc.deadline,
-            )
-            j = getattr(self, "journal", {})
-            current = self.verification_fingerprint(checkout, m, facts)
-            if j.get("failed_fingerprint") == current and j.get("failed_recheck_at", 0) > time.time():
-                return j["failed_receipt"]
-            result = verifier.run()
-            if result.get("status") == "failed" and getattr(self, "record", None):
-                failures = j.get("verification_failures", 0) + 1 if j.get("failed_fingerprint") == current else 1
-                write(
-                    self.record,
-                    j,
-                    "resuming",
-                    failed_fingerprint=current,
-                    failed_head=facts["head"],
-                    failed_source=saved.inspect(checkout).fingerprint,
-                    failed_receipt=result,
-                    verification_failures=failures,
-                    failed_recheck_at=time.time() + min(21600, 1800 * 2 ** min(failures - 1, 4)),
-                )
+            cache_env = dict(os.environ)
+            with host_build_cache_context(checkout, cache_env, self.w.cfg.logdir) as prefix:
+                if getattr(self, "record", None):
+                    self.prepare_source(checkout, self.record, m, self.journal)
+                base = saved._rev(checkout, f"origin/{BASE_BRANCH}")
+                j = getattr(self, "journal", {})
+                current = self.verification_fingerprint(checkout, m, facts)
+                if (
+                    j.get("failed_fingerprint") == current
+                    and j.get("failed_tool_identity") == tool_identity()
+                    and j.get("failed_recheck_at", 0) > time.time()
+                ):
+                    return j["failed_receipt"]
+                if prefix:
+                    # The supervisor is outside the agent's mount namespace. Run
+                    # the existing verifier inside the same merged Mathlib view,
+                    # rather than rehydrating another full private dependency build.
+                    env = dict(cache_env, TAUCETI_VERIFY_STATE=str(self.w.cfg.state), TAUCETI_VERIFY_POLICY=policy)
+                    if os.environ.get("LAKE_CONFIG"):
+                        env["LAKE_CONFIG"] = os.environ["LAKE_CONFIG"]
+                    if self.w.rc.deadline is not None:
+                        env["TAUCETI_ROUND_DEADLINE"] = str(self.w.rc.deadline)
+                    logpath = self.w.cfg.logdir / "recovery-verification.log"
+                    with logpath.open("a") as output:
+                        checked = run_process(
+                            [
+                                *prefix,
+                                sys.executable,
+                                str(HERE / "scripts/tauceti-verify"),
+                                "--json",
+                                "--base",
+                                base,
+                            ],
+                            cwd=checkout,
+                            env=env,
+                            text=True,
+                            stdout=subprocess.PIPE,
+                            stderr=output,
+                        )
+                    try:
+                        result = json.loads(checked.stdout)
+                    except ValueError:
+                        result = dict(
+                            status="incomplete", error=f"verification helper produced no receipt; see {logpath}"
+                        )
+                else:
+                    verifier = Verification(
+                        checkout,
+                        self.w.cfg.state,
+                        base=base,
+                        policy=policy,
+                        deadline=self.w.rc.deadline,
+                    )
+                    result = verifier.run()
+                if result.get("status") == "failed" and getattr(self, "record", None):
+                    failures = j.get("verification_failures", 0) + 1 if j.get("failed_fingerprint") == current else 1
+                    write(
+                        self.record,
+                        j,
+                        "resuming",
+                        failed_fingerprint=current,
+                        failed_head=facts["head"],
+                        failed_source=saved.inspect(checkout).fingerprint,
+                        failed_tool_identity=tool_identity(),
+                        failed_receipt=result,
+                        verification_failures=failures,
+                        failed_recheck_at=time.time() + min(21600, 1800 * 2 ** min(failures - 1, 4)),
+                    )
         return result
+
+    def check_verification_tools(self, checkout):
+        from .verification_tools import check
+
+        check(checkout, required=True)
 
     def continuation_admission(self, record, m, j):
         from .agents import AuthoringProfile
@@ -1259,8 +1345,8 @@ class WorkerBackend:
         if capacity := admission_reason(self.w.cfg.wid):
             raise Wait("worker-capacity", capacity)
         try:
-            chosen, pending = (
-                ("claude", False)
+            chosen = (
+                "claude"
                 if api_mode() and profile.provider == "claude"
                 else resolve_work_model(
                     self.w.cfg,
@@ -1273,13 +1359,17 @@ class WorkerBackend:
             )
         except Exception as error:
             raise Wait("budget-refused", str(error)) from error
-        if chosen != profile.provider or pending:
+        if chosen != profile.provider:
             raise Wait("budget-refused", "Fresh provider admission did not authorize the original profile")
         raise_on_account_mismatch(self.w.cfg, auth.get("account") or self.opts.account, profile.provider, "recovery")
         return auth, profile, keys
 
     def continue_source(self, checkout, record, m, facts, why, j):
-        from .agents import BuildCacheUnavailable, run_agent_host, take_last_agent_infra_failure
+        from .agents import (
+            BuildCacheUnavailable,
+            run_agent_host,
+            take_last_agent_infra_failure,
+        )
         from .budget import BudgetError
         from .claude_api import api_context, api_mode
         from .config import AdmissionUnavailable
@@ -1352,6 +1442,7 @@ class WorkerBackend:
                             session_path=record / "continuation-session.json",
                             session_actor=auth.get("actor"),
                             session_scope=scope,
+                            quota_cfg=self.w.cfg,
                         )
                     except BuildCacheUnavailable as error:
                         refund_content(known_no_launch=True)
@@ -1386,14 +1477,20 @@ class WorkerBackend:
             from .constants import MAX_INFRA_REFUNDS
 
             infra = take_last_agent_infra_failure()
+            account_limit = infra in {"provider subscription limit reached", "provider credit balance exhausted"}
             if (
                 infra
                 and not infra.startswith("local API admission")
                 and not (api and api.blocked_reason)
-                and j.get("provider_refunds", 0) < MAX_INFRA_REFUNDS
+                and (account_limit or j.get("provider_refunds", 0) < MAX_INFRA_REFUNDS)
             ):
                 refund_content(known_no_launch=True)
-                write(record, j, "resuming", provider_refunds=j.get("provider_refunds", 0) + 1)
+                write(
+                    record,
+                    j,
+                    "resuming",
+                    provider_refunds=j.get("provider_refunds", 0) + (0 if account_limit else 1),
+                )
                 raise RuntimeError(f"Provider failed before structured work: {infra}")
             raise ContentFailure(
                 "continuation-source-failed",
@@ -1682,6 +1779,8 @@ def due(cfg, *, only=None, prs=(), sandbox_host=True, agent=None):
             return True  # The next owned round reconciles an unfinished normal task.
         if journal.get("state") in TERMINAL:
             continue
+        if verification_tools_changed(journal):
+            return True
         if (journal.get("reason") or {}).get("code") in RETRYABLE and journal.get("retry_at", 0) > time.time():
             continue
         if journal.get("protocol") != PROTOCOL:
@@ -2281,7 +2380,8 @@ def recover(w, opts):
             j.get("selection"), selection(opts.only, opts.prs, opts.sandbox_host, opts.agent)
         )
         permanent = j.get("state") == "blocked" and (j.get("reason") or {}).get("code") in PERMANENT_BLOCKS
-        if current_protocol and permanent and same_selection:
+        changed_tools = verification_tools_changed(j)
+        if current_protocol and permanent and same_selection and not changed_tools:
             # Metadata-only external-fact probe. No payload hashing or source work,
             # using existing shared state only, never a new direct GitHub poll.
             manifest = read_json(record / "manifest.json")
@@ -2304,7 +2404,7 @@ def recover(w, opts):
                 except Exception as error:
                     write(record, j, "blocked", probe_at=time.time() + 1800, probe_error=str(error))
             continue
-        if current_protocol and j.get("retry_at", 0) > time.time() and same_selection:
+        if current_protocol and j.get("retry_at", 0) > time.time() and same_selection and not changed_tools:
             continue
         if inspected >= MAX_INSPECT:
             break

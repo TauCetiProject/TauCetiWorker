@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from .agents import _shq
-from .config import Config, _only_label, _skip_label, roadmap_areas, roadmap_only, roadmap_skip
+from .config import Config, _only_label, _skip_label, extra_roadmap_prompt, roadmap_areas, roadmap_only, roadmap_skip
 from .constants import ALLOWED_TASKS, KIND_BY_NAME, KIND_KEYS, TAUCETI
 from .github import GitHub
 from .paths import entry_cmd
@@ -166,6 +166,7 @@ def launch_cmd(
     roadmap_only: str | None = None,
     roadmap_skip: str | None = None,
     github_account: str | None = None,
+    extra_roadmap_prompt: str | None = None,
 ) -> list[str]:
     """Build the exact `tauceti work` command a TUI action runs/spawns (also shown via 'copy command').
     `roadmap_only`/`roadmap_skip` (the raw env values for the current roadmap dials) are embedded as
@@ -188,6 +189,8 @@ def launch_cmd(
         cmd += ["--roadmap-only", roadmap_only]
     if roadmap_skip is not None:
         cmd += ["--roadmap-skip", roadmap_skip]
+    if extra_roadmap_prompt is not None:
+        cmd.append(f"--extra-roadmap-prompt={extra_roadmap_prompt}")  # one argument: the text may start with `-`
     return cmd
 
 
@@ -802,8 +805,19 @@ def _dashboard_app(cfg, loader=None):
             if self.view == "workers":
                 return
             skip = os.environ.get("TAUCETI_ROADMAP_SKIP")
-            one = " ".join(_shq(a) for a in launch_cmd(None, self.model_dial, self.bubble, False, roadmap_only(), skip))
-            loop = " ".join(_shq(a) for a in launch_cmd(None, self.model_dial, self.bubble, True, roadmap_only(), skip))
+            guidance = extra_roadmap_prompt()
+            one = " ".join(
+                _shq(a)
+                for a in launch_cmd(
+                    None, self.model_dial, self.bubble, False, roadmap_only(), skip, extra_roadmap_prompt=guidance
+                )
+            )
+            loop = " ".join(
+                _shq(a)
+                for a in launch_cmd(
+                    None, self.model_dial, self.bubble, True, roadmap_only(), skip, extra_roadmap_prompt=guidance
+                )
+            )
             copied = True
             try:
                 self.copy_to_clipboard(one)
@@ -814,7 +828,10 @@ def _dashboard_app(cfg, loader=None):
         def _launch(self, *, loop: bool, only_selected: bool) -> None:
             only = ALLOWED_TASKS[self.sel] if only_selected else None
             skip = os.environ.get("TAUCETI_ROADMAP_SKIP")
-            cmd = launch_cmd(only, self.model_dial, self.bubble, loop, roadmap_only(), skip)
+            guidance = extra_roadmap_prompt()
+            cmd = launch_cmd(
+                only, self.model_dial, self.bubble, loop, roadmap_only(), skip, extra_roadmap_prompt=guidance
+            )
             if loop:
                 try:
                     spec = add_dashboard_worker(
@@ -825,6 +842,7 @@ def _dashboard_app(cfg, loader=None):
                         roadmap_only=roadmap_only(),
                         roadmap_skip=skip,
                         github_account=os.environ.get("TAUCETI_GITHUB_ACCOUNT"),
+                        extra_roadmap_prompt=guidance,
                     )
                     self.notify(
                         f"saved {spec.id} in {self.workers_config}\nmanager will keep it running",

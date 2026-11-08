@@ -57,9 +57,20 @@ record is initially trusted only when every payload matches; restore always repe
 exact digest validation. Warm preparation may reuse that verification receipt while
 the manifest and every payload retain the same device, inode, size, mtime and ctime.
 A damaged record is reported as corrupt, kept, and
-replaced by a fresh copy. An interrupted save leaves at most a `.tmp-*`
-directory, which status reports as incomplete. Nothing in `state/*/recovery`
-is ever deleted automatically.
+replaced by a fresh copy. Normal exceptions and shutdown interruptions remove
+an unfinished `.tmp-*` save immediately. Foreground Git bundle creation has no fixed
+timeout, so growing history cannot cross an arbitrary bundle deadline. Background
+housekeeping still obeys its existing adaptive work budget. Failed saves leave the
+original checkout intact or retained under the ordinary guard.
+
+A hard kill can still leave a partial directory. Partials are disposable staging,
+not recovery records, and do not appear as operator recovery tasks. After one hour
+without new payload writes, background housekeeping abandons them to the existing
+bounded trash collector. Saves serialize on a per-worker `recovery-save.lock` lease
+inherited by Git children. Cleanup requires that lease plus clear live-use,
+verification-reference and mount checks, so it cannot remove an active save.
+This partial-save policy does not try to salvage `.tmp-*` contents. Completed saves
+have the separate finite lifetime described below.
 
 Excluded by name: dependency and build caches (`.lake`, `node_modules`,
 `__pycache__`, top-level `build`, `*.olean` and similar) and credential-like
@@ -81,6 +92,7 @@ stop a worker. Preparation always saves first and then always continues:
   is then reset in place. The same source fingerprint reuses its completed descriptor;
   `refs/tauceti/preserved/<record>/...` remain available for compatibility.
 - **A process still uses the checkout** (Linux `/proc` cwd/root/open files,
+  or macOS working directories and open files observed through psutil,
   even when the checkout is clean), saving fails (no space, permissions, the
   archive bound, a git error), the tree keeps changing, or the git state is
   broken (no `.git` after an interrupted clone, a stale `index.lock`, a failed
@@ -88,10 +100,15 @@ stop a worker. Preparation always saves first and then always continues:
   `<checkout parent>/retained-checkouts/<name>-<time>-<id>`, a same-directory rename that
   needs no free space, and preparation clones a fresh checkout. Any process
   still working in the old one keeps working there.
-- **Retained checkouts clean themselves up in activity housekeeping**. Work-start
-  preparation never walks or removes historical trees. The ordinary activity
-  collector normally uses a shared 250 ms, 4,096-entry, 16 MiB read and 256 MiB
-  removal budget per tick. Low free space raises removal to 1 GiB and 8,192 entries.
+- **The existing cleanup service reclaims retained checkouts**. Work-start
+  preparation never walks or removes historical trees. With the cleanup timer
+  installed, activity preparation only inventories local metadata and requests the
+  collector asynchronously. The collector gives retained work a 30-second scheduling
+  slice, 262,144 entries, 1 GiB of reads and 32 GiB of removal. It yields between
+  candidates or resumable deletion batches. Individual ownership/reference checks
+  finish even when they exceed a scheduling slice; their elapsed time and process
+  scan count are reported separately. Installations without the timer retain their
+  existing activity-driven housekeeping, including the completed-check behavior.
   A source candidate that exhausts its allowance gets persisted backoff (60–1,800
   seconds) and a capped allowance on a later tick: at most 30 seconds, 262,144
   entries and 1 GiB of reads. Effective limits are included in prepared timing
@@ -106,13 +123,30 @@ stop a worker. Preparation always saves first and then always continues:
   live users, surviving members of a recorded ordinary round session on the same
   boot, and visible mounts withhold the candidate. Independently started tool
   sessions remain covered by the best-effort cwd/open-file checks; this is no
-  guarantee of collecting deliberately detached descendants. Process birth checks do not
-  require PID namespace APIs. Repair-cache cleanup takes the consumer's existing
-  per-record recovery lock and checks its actual-use generation. No cleanup takes
+  guarantee of collecting deliberately detached descendants. On macOS, native
+  boot/start identities protect recorded sessions without procfs
+  across leader exit, PID reuse and reboot. Mount discovery uses all visible
+  psutil partitions on macOS and the kernel mount table on Linux. Unavailable
+  process inventories withhold deletion. Individual private cwd/open-file fields
+  remain best effort on both platforms; an unreadable field never erases visible
+  references or a recorded session membership.
+  Only the managed candidate path is canonicalized, using Darwin's kernel spelling
+  to handle case-insensitive volume aliases: kernel-reported process and
+  mount paths are compared without probing unrelated mounted filesystems.
+  Both installed workers and the source-checkout launcher declare psutil on macOS;
+  a missing installation leaves observations unavailable and defers deletion.
+  Automatic process observations support Linux and macOS; other platforms retain
+  checkouts instead of treating unavailable observations as evidence of no live users.
+  Process birth checks do not require PID namespace APIs. Repair-cache cleanup takes
+  the consumer's existing per-record recovery lock and checks its actual-use generation. No cleanup takes
   the worker round lock. Unknown or unreadable ownership or mount information skips
   that candidate and leaves a retryable next action while other work continues.
   Old containment markers and proofs are ignored. Housekeeping neither creates
   nor maintains them.
+  A pass-local process/mount observation is reused for recovery caches only while
+  holding that record lock and checking its unchanged actual-use generation and
+  tree identity. Changed candidates and legacy retained trees receive fresh checks;
+  a shared observation's absence of references alone never permits their deletion.
   Traversal never follows symlinks or crosses filesystems. A deletion marker alone
   never authorizes destruction. Known untracked top-level caches can be reclaimed
   incrementally; tracked cache-named paths remain source. Before removing source,
@@ -203,6 +237,23 @@ clean local-only commits reuse their completed bundle; any dirty tree is saved
 before the reset, with independent payloads for each changed source snapshot.
 Finished and unrecoverable recovery records are removed from discovery and deleted by
 bounded activity housekeeping; they are not kept as an operator task history.
+All remaining completed saves have an absolute 24-hour lifetime from their immutable
+manifest creation time (manifest mtime for older/malformed timestamps). Retries,
+handoffs, journal updates and lack of model credits do not extend that lifetime.
+An exhausted original content allowance permits immediate abandonment. At expiry,
+metadata-only housekeeping removes the record from recovery discovery and hands its
+payloads to bounded trash deletion, even while paid workers are disabled. Pending
+or uncertain publication in a record does not authorize replay or extend its life;
+independent GitHub publication outboxes are untouched. This deliberately gives up
+unpublished edits once the limit is reached.
+
+Cleanup takes the existing recovery lock, checks live users and mounts, and protects
+a live receiving handoff round. Active use defers disposal until release; an old
+handoff label alone does not retain a record indefinitely, nor does an unrelated
+new round using the same checkout. Physical reclamation may take additional bounded
+collector passes. Metadata retirement has a durable cursor, separate from inventory
+and large payload deletion, so collector restarts cannot starve later records.
+Thus each inactive record retires by the first completed metadata sweep after its deadline, without paid work, GitHub queries, or human intervention.
 
 To roll back, set `TAUCETI_WORK_RECOVERY=off` (for example in a worker's `env`
 table). This stops index lookup/publication and background housekeeping, including
@@ -363,15 +414,14 @@ without model funding, with a shared thirty-minute scheduling throttle so a bloc
 backlog cannot continuously replace normal work. Checks observe PR closure or head changes
 through the existing shared state service, without a direct GitHub fallback or
 payload hashing. Infrastructure retries back off for
-60, 300 and 1800 seconds. Failed invocations remain eligible for scheduled mechanical
-rechecks, even without model funding. They never become a permanent blocked task and
-do not evict their warm artifacts on an infrastructure pause.
-Cumulative failure counts
-remain recorded; unchanged repeated infrastructure failures increase backoff
-up to six hours. Repeated exact-input verification failures also increase their
-mechanical recheck interval up to six hours, even when source and funding have
-not changed. Changed external facts reset this delay. Exhausted content allowances permit mechanical reevaluation
-and normal work, without authorizing another identical paid attempt.
+60, 300 and 1800 seconds. After the existing three-invocation allowance is spent,
+source recovery becomes obsolete and its private materialization is discarded by
+the existing collector. Exhausted content allowances use the same abandonment
+path. Fresh normal work continues. Active handoffs remain owned by the receiving
+round; uncertain publication retains its intent and reconciliation evidence and
+cannot authorize a new content attempt. The existing source lifetime still ends
+source repair: derived checkouts enter discarded storage while immutable source
+records and uncertain publication intent remain as compact evidence.
 Claim, capacity, policy, budget and content waits do not consume infrastructure
 attempts. Content remains bounded by the original workflow's existing counters.
 Consumer protocol 3 automatically re-evaluates older operator-dependent blocks

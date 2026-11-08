@@ -15,7 +15,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   typically by restructuring a large `decide` over a finite type so that the kernel checks less at
   once. If every changed file is well under and the build stage below passes locally, treat the stop as
   transient.
-- The single `build` check runs these stages in order: the expired-shim check, `lake build --iofail`,
+- The `build` check includes source guards, `lake build --iofail`, shim checks,
   the audit driver (global duplicate declarations, then axioms), the module-system audit, the
   environment lint (`lint-env`) and the source style lint (`lint-style`). Find the stage that failed
   in the log, then use the corresponding local check when it covers that failure. Local axiom checks
@@ -44,7 +44,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 - Use `namespace TauCeti` by default. For dot-notation APIs whose first explicit argument has an
   existing Lean or Mathlib type, put declarations in that type's existing namespace (e.g. root
   `Set` or `RingEquiv`), as required by the naming rubric; do not nest it under `TauCeti`.
-- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If your work needs one, follow the durable blocked-PR procedure below.
+- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`. Resolve roadmap scope findings using the PR outcome instructions below: adapt to an existing target or close your own PR with an explanation.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force the build green — that defeats the point.
 
 ## Verify before pushing (ALL MUST pass)

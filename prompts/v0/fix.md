@@ -24,15 +24,12 @@ For each finding, judge whether it is actually correct:
 - Use `namespace TauCeti` by default. For dot-notation APIs whose first explicit argument has an
   existing Lean or Mathlib type, put declarations in that type's existing namespace (e.g. root
   `Set` or `RingEquiv`), as required by the naming rubric; do not nest it under `TauCeti`.
-- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If a finding means the PR's target is not on any roadmap, follow the durable blocked-PR procedure below.
+- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`. Resolve roadmap scope findings using the PR outcome instructions below: adapt to an existing target or close your own PR with an explanation.
 - Must stay green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force a change through — that is itself a reason to push back on the finding.
 
 ## Verify before pushing (all MUST pass)
 __LOCAL_VERIFICATION__
-While fixing, use `lake build` (incremental) to check each edit. When every fix is in, run the final
-verification once: `lake exe cache get` (if you have not run it this session), `lake build --iofail`, then
-the scope recipe and the scoped audit above. Iterate until green. Never push red. If you changed no
-source (every finding contested), there is nothing new to verify: do not rebuild or re-audit.
+While fixing, use incremental builds or the failing shared phase. Run the shared final verification above once after the last edit; never push red. If no source changed, do not repeat successful checks.
 
 **Do this synchronously, in this one turn.** You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 

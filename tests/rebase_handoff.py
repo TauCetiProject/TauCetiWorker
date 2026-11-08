@@ -205,6 +205,7 @@ def test_launch_rechecks_head_hold_and_active_marker():
     with (
         patch.object(gh, "pr_view", return_value=live),
         patch.object(gh, "rebase_requested", return_value=True) as marker,
+        patch("tauceti_worker.state_repair.repair_selected") as repair,
     ):
         assert _still_actionable("rebase", SimpleNamespace(gh=gh), None, candidate)
         live["labels"] = [{"name": "hold"}]
@@ -217,6 +218,7 @@ def test_launch_rechecks_head_hold_and_active_marker():
         assert not _still_actionable("rebase", SimpleNamespace(gh=gh), None, candidate)
         live["mergeable"] = "CONFLICTING"
         assert _still_actionable("rebase", SimpleNamespace(gh=gh), None, candidate)
+        assert repair.call_count == 1 and repair.call_args.args[2] == "b" * 40
 
 
 def test_semantic_evidence_reaches_claimed_repair(provisional=False):
@@ -243,6 +245,8 @@ def test_semantic_evidence_reaches_claimed_repair(provisional=False):
         patch.object(survey_mod, "me", return_value="me"),
         patch.object(gh, "open_prs", return_value=[raw]),
         patch.object(gh, "issue_comments", return_value=[{"user": {"login": "tau-ceti-bors[bot]"}, "body": body}]),
+        patch.object(gh, "pr_progress_state", return_value=None),
+        patch.object(gh, "pr_view", return_value={**raw, "state": "OPEN", "isDraft": False}),
     ):
         sv = survey_mod.survey(SimpleNamespace(wid="test"), gh, None, SimpleNamespace(read=lambda name: 0), deep=False)
         candidate = sv.rebaseable.actionable[0]
@@ -262,7 +266,8 @@ def test_semantic_evidence_reaches_claimed_repair(provisional=False):
         assert "Nobody reads your final transcript" in prompt
         assert "You may close this PR" in prompt
         assert "gh pr close 20 --repo TauCetiProject/TauCeti" in prompt
-        assert "<!--tauceti-blocked:v1 " + HEAD + "-->" in prompt
+        assert "tauceti-blocked" not in prompt
+        assert "Resolve review disagreements" in prompt
         if provisional:
             assert "attribution **unconfirmed**" in prompt
             assert "still complete all verification below" in prompt

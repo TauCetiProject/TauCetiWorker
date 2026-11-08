@@ -99,10 +99,17 @@ launches. All participants must resolve the same directory; different OS users
 need an explicitly shared directory and suitable permissions.
 
 `events.jsonl` is the authoritative append-only ledger. `budget.lock` serializes
-transactions with `flock`; a snapshot may accelerate replay but is disposable.
+transactions with `flock`. `projection.sqlite` is a disposable indexed projection: it
+records the processed byte offset and sequence and replays only the appended tail.
+Current sessions, recent cost samples and cumulative provider baselines are indexed;
+routine admission and settlement do not load every historical session. A lost,
+corrupt or replaced projection rebuilds automatically from the ledger. A client
+using the older JSONL-only implementation may still append under the same lock;
+the next reader incorporates its events. If projection storage is unavailable,
+operations fall back to full authoritative replay.
 Create private directories/files by default. No API key, prompt, or response
-content belongs in this ledger. Routine operations never rewrite, truncate,
-rotate, or delete history. An adjustment or correction appends a new event.
+content belongs in this ledger. Complete history is retained; recovery may
+discard an incomplete final append. An adjustment or correction appends a new event.
 
 Each committed JSONL record contains a schema version, increasing sequence,
 transaction ID, UTC timestamp, actor, and its ordered event batch. Event types
@@ -112,9 +119,11 @@ unresolved. Session events carry invocation ID, worker ID, phase, model,
 provider session ID when available, estimate/cost, and outcome. Settlements
 have idempotency keys so reprocessing cannot debit the same invocation twice.
 
-Under the lock, replay the ledger, accrue elapsed credits, validate the requested
+Under the lock, catch the projection up with the ledger, accrue elapsed credits, validate the requested
 operation against current state, append the complete transaction, and `fsync`
-before allowing a paid process to start. An optional snapshot is written only
+when storage is available. Ledger failures permit runtime work to continue with
+incomplete accounting; bookkeeping durability is not a launch requirement.
+An optional snapshot is written only
 after the ledger commits and never overrides ledger history. Use decimal money
 and retain fractional accrual internally; rounding for display must not change
 accounting. Queries project accrual to the current instant without appending a
@@ -126,13 +135,24 @@ clock movement earns no negative credits and cannot count an interval twice;
 keep a persisted accrual watermark and report clock anomalies. A forward clock
 change affects this wall-clock policy and should be visible in the history.
 
-Malformed records, sequence gaps, or a torn final write block new admissions and
-report the problem. For a torn final write, `budget --repair-ledger --note TEXT` archives the
-original bytes, atomically replaces the ledger with the verified prefix plus an unresolved
-repair entry naming the archive. Admissions remain blocked until that entry is
-reconciled after investigation. Complete invalid records require manual
-investigation; they are never silently skipped. A valid transaction whose acknowledgement
-was lost is discovered by replay and its idempotency key.
+On every locked access, an interrupted final write is recovered automatically.
+A complete JSON record missing only its newline is retained. Otherwise its
+fragment is saved as `events.discarded-*.json` when possible and removed from
+the ledger; archive failure never blocks recovery. A failed short append also
+tries to remove the bytes it just wrote. No unresolved repair marker is created,
+and legacy repair markers do not pause work or reserve funds.
+`budget --repair-ledger --note TEXT` remains a compatibility command for this
+automatic recovery. Complete invalid records and sequence gaps are reported by
+accounting commands, while runtime admissions continue without usable ledger
+state. A failed admission write likewise permits work; available funding and
+cooldown decisions still apply when the ledger can be read. Process supervision
+continues independently of ledger availability, and surviving usage receipts
+remain available for later accounting recovery. An unrecorded admission is
+retained in its existing lifecycle file. The bridge or supervisor records it
+idempotently when the ledger becomes usable, then applies its native receipt.
+This recovery records work that already ran and makes no new funding decision.
+A corrupt ledger does not invalidate a healthy projection or trigger repeated
+full replays; the supervisor resumes accounting when the ledger bytes change.
 
 ## Admission and concurrent sessions
 
@@ -201,9 +221,11 @@ review engine's API-authentication path, not unrelated host/build subprocesses.
 Capture structured result data before transcript normalization. Persist a
 minimal cost receipt for each invocation separately from readable narration;
 record success and failure costs. Use the final cumulative `total_cost_usd`,
-including Claude-managed subagents, once per fresh invocation. An explicit `--resume SESSION_ID` requires a recorded provider session
-baseline; `--continue` is refused because it cannot identify that baseline before
-launch. Resumed sessions subtract already recorded totals; multiple cumulative results must
+including Claude-managed subagents, once per fresh invocation. An explicit
+`--resume SESSION_ID` uses the recorded provider session baseline when available;
+otherwise cumulative costs are recorded from zero. `--continue` is refused
+because it cannot identify the provider session. Resumed sessions subtract
+already recorded totals; multiple cumulative results must
 not be summed. Session resets require accounting for each segment separately.
 
 Claude's cost figures are local estimates, not authoritative Console charges.
@@ -212,11 +234,10 @@ receipt and mark the invocation unresolved. Retain its existing pending estimate
 until the cost is recovered or an operator records a correction with an
 explanation. Unresolved costs are audit work, not a fleet-wide admission pause;
 funded workers continue, and orphaned sessions do not occupy calibration slots.
-An unsettled resumed invocation holds only that provider session's resumption
-slot. Recovering its cumulative receipt prevents double-counting on subsequent
-resumes. A cost-only manual reconciliation releases the hold without restoring
-the cumulative baseline, so it is insufficient to resume that provider session
-with accurate accounting.
+A running resumed invocation holds only that provider session's resumption
+slot. Missing costs from a stopped invocation do not prevent further resumes.
+Recovering its cumulative receipt improves accounting accuracy on subsequent
+resumes; a cost-only manual reconciliation does not restore that baseline.
 On Linux, recorded bridge process identities include boot and process start
 markers. A live owner prevents orphan detection, receipt recovery or active
 reconciliation based solely on a delayed heartbeat.
@@ -294,8 +315,8 @@ set while sessions run changes the current balance but preserves future debits.
 
 Exercise simultaneous admission and settlement in separate processes,
 idempotent receipt replay, partial writes, and crashes before/after ledger commit
-and process launch. Verify a full replay matches snapshots and that corruption
-blocks new work without stopping active work. Verify fair waiting and pending
+and process launch. Verify a full replay matches snapshots and that ledger
+failures do not block runtime work. Verify fair waiting and pending
 estimates prevent every worker from claiming the same money.
 
 Use a fake long session whose cost exceeds its estimate and balance. Assert it
@@ -308,7 +329,7 @@ reviewer, and external runner paths, including secrets redaction and cleanup.
 Verify cumulative/subagent costs are counted once, failures can incur spending,
 and missing costs remain visible for reconciliation without pausing funded
 workers. Verify orphaned calibration sessions can be replaced, unresolved
-estimates remain reserved, and ledger-repair markers still require audit.
+estimates remain reserved, and ledger-repair markers do not block work.
 Exercise provider cooldowns separately
 from funding waits. Retain existing subscription behavior and its checks.
 
@@ -323,6 +344,14 @@ stdout event or final Claude result. Atomic checkpoints and the preceding valid
 journal prefix survive process termination and torn writes. Bubble mounts only its own round
 usage directory separately from the bridge and never receives the ledger.
 
+Full checkpoints are written at initialization, on explicit/final flush, and at
+most once per minute during normal observation. The durable delta journal still
+precedes event forwarding. A checkpoint records its exact consumed byte offset,
+file identity and prefix anchor so readers can replay only the newer suffix.
+A small best-effort `.summary` reports running priced usage and the matching
+byte offset without duplicating the message dictionary. Summary writes add no
+durability barrier and their failure does not invalidate durable usage evidence.
+
 New invocations also record their exact admission ticket, invocation ID, bridge,
 shim and native process birth identities in `budget/lifecycles/`. The admission
 ledger event includes the initial lifecycle identity, so a bridge crash before
@@ -331,9 +360,12 @@ and recovery, outside both the round process group and any agent sandbox. It sta
 round boundaries. Restarting it replays the local evidence automatically; it does
 not poll providers or GitHub. Recovery progress is persisted, and a separate
 heartbeat remains responsive during ledger recovery. Admission checks restart a
-lost supervisor; source updates retire it at an invocation boundary. Only registered
-new invocations participate in this automatic recovery; historical cleanup remains
-separate. Reconciled native receipts are archived under `lifecycles/done/`;
+lost supervisor; source updates retire it at an invocation boundary. Supervisors
+without ledger-independent processing are replaced automatically, while the existing
+protocol remains compatible with older workers. Exact native-process supervision
+uses registered launch identities; the minute stopped-policy pass can also repair
+retained legacy admissions after their bridge liveness checks permit recovery.
+Reconciled native receipts are archived under `lifecycles/done/`;
 unchanged provisional journals are checked by file stamp without reparsing them.
 
 Every native launch, including an explicit resume or copied Bubble shim, must
@@ -390,6 +422,11 @@ requests still in flight remain incomplete rather than becoming zero-cost comple
 
 `tauceti budget --recover --dry-run --json` prepares a content-free manifest under
 `budget/recovery-audits/` without changing the ledger or deleting bridge keys.
+It copies the ledger under the accounting lock, then parses history and plans
+against that snapshot without the lock, so a large preview does not delay live
+admissions. Its manifest sequence and hash identify the copied ledger even if
+new transactions arrive while it runs; applying a pinned plan still requires
+those inputs to match.
 Every invocation has its recorded owner identity, current owner/heartbeat check,
 evidence source, known prefix, existing charge, reservation, proposed estimate,
 final total, spend delta and released reservation recorded. The manifest includes
@@ -444,8 +481,14 @@ reservation releases separately: releasing a reservation is neither spending nor
 a refund. Repeat recovery makes no monetary change. A late native receipt replaces
 an estimate through idempotent corrections, including resumed cumulative baselines.
 During ordinary live teardown, `recover_usage` still charges known prefixes and
-retains reservations when evidence is incomplete; only explicit stopped recovery
-applies this policy.
+retains reservations when evidence is incomplete. The detached supervisor's
+minute pass subsequently applies this policy to eligible stopped invocations,
+including retained legacy records, using a small provider-linked snapshot.
+Evidence reading and rate calculations happen outside the admission lock;
+commit revalidates the affected history, evidence, comparables and liveness.
+Unrelated admissions do not invalidate the proposal. A live resumed successor
+defers the group, and unchanged settled history makes no repeated monetary change.
+The explicit recovery command remains available for inspection and bulk repair.
 
 Usage evidence is collected outside the fleet ledger lock; planning replays the
 current ledger incrementally inside the lock and skips estimates with no new native
@@ -459,6 +502,29 @@ Estimates use their recorded interval in rate windows; without an interval they 
 placed at admission instead of being spread across downtime until repair.
 Reservations never enter spend reports;
 `status` still reads prepared local data without GitHub calls or recovery analysis.
+
+The manager separately refreshes a disposable live spending overlay once per
+minute, even while historical preparation is busy. The supervisor supplies the
+small active/terminal invocation view. The sampler reads only journal metadata,
+using cached summary counters as an anchor and calibrated USD per byte for
+unobserved growth. Cohorts separate model, phase, journal format and price table;
+resumes keep the attributed prefix rather than estimating replayed bytes.
+`spending` retains recorded usage; `spending_including_live` adds only the amount
+missing from the matching baseline and exposes observed/unobserved components.
+Native totals replace heuristics, including downward corrections. Terminal costs
+remain in the overlay until historical preparation incorporates their settlement.
+Baseline generations and atomic publication prevent cross-refresh double counts.
+An unchanged journal accrues no guessed wall-clock spend; observation timestamps
+and stale state remain visible. These estimates never mutate the budget ledger.
+
+Historical preparation owns a separate disposable accounting projection under
+the activity directory. It consumes complete new ledger transactions, preserves
+first-settlement times and rebuilds on cache corruption or ledger replacement.
+It never opens the admission projection or holds the fleet lock for reporting.
+Response allocation still recomputes globally to preserve response deduplication,
+late cumulative corrections and worker-scope changes. Native-settled closed usage
+is cached without repeated filesystem checks; missing/incomplete evidence retries.
+Preparation metrics expose ledger replay bytes, timing and invocation counts.
 
 The authoritative ledger and retained recovery manifests are append-only evidence.
 Ledger repair transactions name their manifest; a manifest records a plan, and the

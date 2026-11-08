@@ -19,8 +19,24 @@ from __future__ import annotations
 
 from tauceti_tools.project import bootstrap as _bootstrap_project
 
+
+def _bootstrap_worker_project():
+    project = _bootstrap_project()
+    if project is None:
+        return
+    # Tools may enable other consumers before Worker's remaining adapters are
+    # ready. Keep this consumer's activation decision in Worker as well.
+    from tauceti_tools.forge import GITHUB, resolve_repository
+
+    references = list(project.raw["repositories"].values())
+    references += [tool["repo"] for tool in project.raw.get("tools", {}).values()]
+    references += [upstream["repo"] for upstream in project.raw.get("upstreams", [])]
+    if any(resolve_repository(value, project.raw.get("forges")).forge != GITHUB for value in references):
+        raise ValueError("Worker Forgejo activation requires the remaining source and CI adapters")
+
+
 try:
-    _bootstrap_project()
+    _bootstrap_worker_project()
 except (ValueError, OSError) as _configuration_error:
     import sys
 

@@ -3,6 +3,7 @@ behind a short-TTL cache, with the predicates the cascade gates on."""
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -12,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .github_state import enabled as github_state_enabled
+
 if TYPE_CHECKING:  # annotation only; survey is a higher layer
     from .survey import Counters
 
@@ -19,7 +22,7 @@ from .config import Config
 from .constants import COMMENTS_MEMO_S, SBCACHE_BACKSTOP_S, SBCACHE_TTL
 from .github import GitHub
 from .github_transport import cache_hit, invalidate, read_context
-from .survey_facts import markers, newest_contest, scoreboard
+from .survey_facts import newest_contest, scoreboard
 
 # ============================================================================
 # ReviewState — the PR scoreboard comment is the multi-agent source of truth; a
@@ -49,14 +52,25 @@ class ReviewState:
     def __init__(self, cfg: Config, gh: GitHub):
         self.cfg = cfg
         self.gh = gh
+        self._direct_source = getattr(gh, "direct_source", False) is True
         self.sbcache = cfg.sbcache
-        self._comments: dict[int, tuple[float, list[dict] | None]] = {}
+        if self._direct_source:
+            # Numeric PRs, logins and worker IDs are not repository/credential
+            # boundaries. Recovered sidecars must remain in the source scope.
+            if not re.fullmatch(r"[0-9a-f]{64}", gh.cache_namespace):
+                raise ValueError("direct source cache namespace must be a qualified identity digest")
+            self.sbcache = self.sbcache / "sources" / gh.cache_namespace
+        self._comments: dict[int, tuple[float, list[dict] | None, bool]] = {}
         self._observed: dict[int, str] = {}
-        self._shared_issue_hit: dict[int, bool] = {}
         self._survey_facts: dict[int, dict] = {}
 
     def seed_survey(self, rows=()):
         """Facts last only for this pass. Force reads and post-write busts bypass them."""
+        if self._direct_source:
+            # Existing survey facts are GitHub-service records with no qualified
+            # source/credential provenance. They cannot entitle this reader.
+            self._survey_facts = {}
+            return
         self._survey_facts = {row["pr"]["number"]: row["review"] for row in rows}
 
     def observe(self, prs) -> None:
@@ -104,7 +118,9 @@ class ReviewState:
         keep two processes sharing a worker id (a round and the dashboard) off each other's half."""
         # The shared service can observe deletions and reactions without a PR updatedAt change.
         # Let it answer each pass instead of hiding those changes behind this local age cache.
-        if os.environ.get("TAUCETI_GITHUB_STATE_URL"):
+        if self._direct_source and not self.gh.binding_current():
+            return None
+        if self._uses_state_service():
             return None
         key = self._observed.get(pr)
         if not key:
@@ -116,15 +132,25 @@ class ReviewState:
         if not isinstance(sc, dict) or sc.get("updated_at") != key:
             return None
         fetched = sc.get("fetched_at")
-        if not isinstance(fetched, (int, float)) or not 0 <= time.time() - fetched < SBCACHE_BACKSTOP_S:
+        backstop = min(SBCACHE_BACKSTOP_S, self.gh.ttl) if self._direct_source else SBCACHE_BACKSTOP_S
+        if not isinstance(fetched, (int, float)) or not 0 <= time.time() - fetched < backstop:
             return None  # also rejects a future timestamp: a clock we cannot place is not a fresh one
-        return sc
+        return sc if not self._direct_source or self.gh.binding_current() else None
 
-    def _write_sidecar(self, path: Path, pr: int, payload: dict) -> None:
+    def _write_sidecar(self, path: Path, pr: int, payload: dict, *, observed_at=None) -> None:
         """Atomically, and only ever after a SUCCESSFUL read. A failed fetch must leave the previous key
         in place: advancing it would let the next pass treat the failure as a confirmed answer."""
-        payload = {**payload, "updated_at": self._observed.get(pr, ""), "fetched_at": time.time()}
+        fetched = time.time() if observed_at is None else observed_at
+        payload = {**payload, "updated_at": self._observed.get(pr, ""), "fetched_at": fetched}
         try:
+            if self._direct_source:
+                self._write_source_cache(
+                    path,
+                    payload,
+                    prune=path != self._key_path(pr) or payload.get("status") != "present",
+                    observed_at=fetched,
+                )
+                return
             self.sbcache.mkdir(parents=True, exist_ok=True)
             # A temp name unique per WRITE, not per process: `status`, the dashboard and a round can
             # share a worker id, and the dashboard refreshes on a background thread, so neither a
@@ -132,64 +158,72 @@ class ReviewState:
             tmp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
             tmp.write_text(json.dumps(payload) + "\n")
             os.replace(tmp, path)
-        except OSError:
+        except (OSError, ValueError):
             pass  # a cache we cannot write is a slow round, not a wrong one
 
-    def maintenance_blocked(self, pr: int, head: str, author: str, *, selected=False) -> bool:
-        from .survey_facts import blocked
+    def _prune_source_cache(self):
+        if self._direct_source:
+            from .forgejo_reads import prune_state_cache
 
-        facts = self._survey_facts.get(pr)
-        if facts is not None:
-            # Older materializations contain no blocker markers. New comments
-            # update this additive projection without a history backfill.
-            rows = facts.get("blocked", [])
-        else:
-            cached = self._comments.get(pr)
-            comments = cached[1] if cached else None
-            if selected and not os.environ.get("TAUCETI_GITHUB_STATE_URL"):
-                comments = self._issue_comments(pr)
-            rows = blocked(comments)
-        return any(
-            isinstance(row, dict) and row.get("head") == head and row.get("author") == author.lower() for row in rows
-        )
+            prune_state_cache(self.sbcache.parent)
 
-    def _issue_comments(self, pr: int, *, force: bool = False) -> list[dict] | None:
-        """A PR's issue comments, memoized briefly so the two readers in one survey pass — the scoreboard
-        meta and the in-flight review marker — share ONE fetch (a cold meta read plus a marker check
-        would otherwise double-read the same paginated endpoint). The window is a few seconds: long
-        enough to coalesce within a pass, far short of the round/dashboard cadence, so each pass still
-        reads fresh markers (the loop-breaking guarantee). None (a fetch failure) is memoized too, so a
-        blip isn't retried twice in one pass."""
-        hit = None if force else self._comments.get(pr)
+    def _write_source_cache(self, path, value, *, prune=True, observed_at=None):
+        """Private atomic source cache writes, without following a target symlink."""
+        self.sbcache.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory = os.open(self.sbcache, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp").name
+        observed_at = time.time() if observed_at is None else observed_at
+        try:
+            os.fchmod(directory, 0o700)
+            # Serialize only local atomic replacements. No network read holds
+            # this lock; using the directory avoids persistent lock files.
+            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                if os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mtime > observed_at:
+                    return  # An independently fetched later observation won.
+            except FileNotFoundError:
+                pass
+            descriptor = os.open(
+                temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                output.write(json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n")
+            os.utime(temporary, (observed_at, observed_at), dir_fd=directory, follow_symlinks=False)
+            os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+        finally:
+            try:
+                try:
+                    os.unlink(temporary, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
+            finally:
+                os.close(directory)
+        if prune:
+            self._prune_source_cache()
+
+    def _issue_comments(self, pr: int, *, force: bool = False) -> tuple[list[dict] | None, bool]:
+        """Memoize legacy reads within a pass; direct sources own their bounded cache."""
+        if self._direct_source and not self.gh.binding_current():
+            return None, False
+        # Direct sources already provide bounded coalescing and failure handling.
+        # Retaining whole histories here would defeat that cache's byte bound.
+        hit = None if force or self._direct_source else self._comments.get(pr)
         if hit and time.time() - hit[0] < COMMENTS_MEMO_S:
-            return hit[1]
+            return hit[1], hit[2]
         with read_context(fresh=force, revision=self._observed.get(pr, "")):
             cs = self.gh.issue_comments(pr)
-            self._shared_issue_hit[pr] = cache_hit()
-        self._comments[pr] = (time.time(), cs)
-        return cs
+            reused = cache_hit()
+        if not self._direct_source:
+            self._comments[pr] = (time.time(), cs, reused)
+        return cs, reused
 
-    def inflight_review(self, pr: int, head: str, *, force: bool = False) -> set[str]:
-        """Providers holding this EXACT head via an unexpired in-progress marker — the engine's
-        de-contention, read worker-side so a held head is skipped before the engine is launched. Shares
-        the memoized comment fetch with gh_meta so the survey reads each PR's comments at most once.
+    def _uses_state_service(self):
+        return not self._direct_source and github_state_enabled()
 
-        Markers are served from the sidecar when the PR has not moved, with their `expires_at` kept
-        intact and re-checked against the clock here, so a cached marker still self-clears on time
-        rather than freezing a holder in place. What the cache cannot see is a marker DELETED without
-        another change to the PR, which would read as held until the backstop; that is why dispatch()
-        re-reads this live for the one candidate it is about to spend on, where it also lands closer to
-        launch than a survey-time read does."""
-        sc = None if force else self._sidecar(self._key_path(pr), pr)
-        markers = sc.get("markers") if sc else None
-        if isinstance(markers, list):
-            return providers_from_markers(markers, head, int(time.time()))
-        if force:
-            self._survey_facts.pop(pr, None)
-        facts = self._survey_facts.get(pr)
-        if facts and facts.get("issue_complete"):
-            return providers_from_markers(facts["markers"], head, int(time.time()))
-        return inflight_review_providers(self._issue_comments(pr, force=force), head, int(time.time()))
+    def _meta(self, data, provenance):
+        if self._direct_source and not self.gh.binding_current():
+            return Meta({}, "fetch_failed")
+        return Meta(data, provenance)
 
     def gh_meta(self, pr: int, *, force: bool = False) -> Meta:
         """Newest scoreboard's <!--tauceti-meta:v1 {...}--> JSON, identified by the <!--tauceti-scoreboard-->
@@ -208,12 +242,15 @@ class ReviewState:
         returns '{}' even with a cache, so a scoreboard that was deleted/edited away (or a forged one a
         worker briefly cached) can't be served as fresh past the TTL.
         """
+        started = time.time()
+        if self._direct_source and not self.gh.binding_current():
+            return self._meta({}, "fetch_failed")
         if force:
             self._survey_facts.pop(pr, None)
         facts = self._survey_facts.get(pr)
         if facts and facts.get("issue_complete"):
             meta = facts.get("meta")
-            return Meta(meta if meta is not None else {}, "fresh" if meta is not None else "missing")
+            return self._meta(meta if meta is not None else {}, "fresh" if meta is not None else "missing")
         cache = self._cache_path(pr)
         sc = None if force else self._sidecar(self._key_path(pr), pr)
         if sc is not None:
@@ -221,25 +258,25 @@ class ReviewState:
             # `assumed`, not `fresh` — and a recorded ABSENCE stays an absence: a cached `missing` must
             # not come back as a present-but-empty scoreboard, which reads as a real one to callers.
             if sc.get("status") == "present" and isinstance(sc.get("meta"), dict):
-                return Meta(sc["meta"], "assumed")
+                return self._meta(sc["meta"], "assumed")
             if sc.get("status") == "missing":
-                return Meta({}, "missing")
-        if (
-            not force
-            and not os.environ.get("TAUCETI_GITHUB_STATE_URL")
-            and not self._observed.get(pr)
-            and cache.exists()
-        ):
+                return self._meta({}, "missing")
+        if not force and not self._uses_state_service() and not self._observed.get(pr) and cache.exists():
             # No clock to compare against (a caller outside a survey pass): the plain TTL, as before.
             # `assumed`, not `fresh` — it was not read from GitHub during this pass, and `fresh` is the
             # word the mutating path trusts.
             age = time.time() - cache.stat().st_mtime
             cached = self._load(cache)
-            if age < SBCACHE_TTL and cached is not None:
-                return Meta(cached, "assumed")
+            ttl = min(SBCACHE_TTL, self.gh.ttl) if self._direct_source else SBCACHE_TTL
+            if age < ttl and cached is not None and (not self._direct_source or age >= 0):
+                return self._meta(cached, "assumed")
 
-        comments = self._issue_comments(pr, force=force)
+        comments, reused = self._issue_comments(pr, force=force)
         fetch_failed = comments is None
+        # Source timestamps are normalized to fixed-width UTC by the adapter.
+        # Stable timestamp sorting in the reducer then breaks ties by native ID.
+        if self._direct_source and comments is not None:
+            comments = sorted(comments, key=lambda comment: comment["id"], reverse=True)
         data = scoreboard(comments)
 
         if data is None:
@@ -247,23 +284,39 @@ class ReviewState:
             # scoreboard means there genuinely isn't one now — don't keep serving a now-absent meta.
             prior = self._load(cache) if fetch_failed else None
             if prior is not None:
-                return Meta(prior, "stale")
+                return self._meta(prior, "stale")
             if not fetch_failed:
                 # A confirmed absence is worth caching: without it, every pass re-reads every PR that
                 # has no scoreboard yet, which is most of a healthy queue. Drop the payload with it —
                 # left behind, the TTL path would keep serving a board we just confirmed is gone.
-                self._write_sidecar(self._key_path(pr), pr, {"status": "missing", "markers": distil_markers(comments)})
+                if not self._direct_source or not reused:
+                    self._write_sidecar(
+                        self._key_path(pr),
+                        pr,
+                        {"status": "missing"},
+                        observed_at=started if self._direct_source else None,
+                    )
                 cache.unlink(missing_ok=True)
-            return Meta({}, "fetch_failed" if fetch_failed else "missing")
+            return self._meta({}, "fetch_failed" if fetch_failed else "missing")
+        if self._direct_source and reused:
+            return self._meta(data, "assumed")  # Do not reset a reused observation's disk TTL.
         self._write_sidecar(
-            self._key_path(pr), pr, {"status": "present", "meta": data, "markers": distil_markers(comments)}
+            self._key_path(pr),
+            pr,
+            {"status": "present", "meta": data},
+            observed_at=started if self._direct_source else None,
         )
         try:  # the legacy copy: the stale-on-failure fallback reads it, nothing entitled does
-            self.sbcache.mkdir(parents=True, exist_ok=True)
-            cache.write_text(json.dumps(data) + "\n")
-        except OSError:
+            if self._direct_source:
+                self._write_source_cache(cache, data, prune=False, observed_at=started)
+            else:
+                self.sbcache.mkdir(parents=True, exist_ok=True)
+                cache.write_text(json.dumps(data) + "\n")
+        except (OSError, ValueError):
             pass
-        return Meta(data, "assumed" if self._shared_issue_hit.get(pr) else "fresh")
+        finally:
+            self._prune_source_cache()
+        return self._meta(data, "assumed" if reused else "fresh")
 
     @staticmethod
     def _load(cache: Path) -> dict | None:
@@ -281,19 +334,35 @@ class ReviewState:
         The memo matters as much as the files. bust() is called right after the worker itself posts,
         and a memo left warm would rebuild the cache from the comments as they were BEFORE that post,
         re-caching the state we just invalidated."""
-        invalidate()
+        if self._direct_source:
+            self.gh.invalidate(pr)
+        else:
+            invalidate()
         self._cache_path(pr).unlink(missing_ok=True)
         self._key_path(pr).unlink(missing_ok=True)
         self._contest_path(pr).unlink(missing_ok=True)
         self._comments.pop(pr, None)
-        self._shared_issue_hit.pop(pr, None)
         self._survey_facts.pop(pr, None)
 
     # --- predicates over the meta (the cascade's clean-head / blocking rules) ---
     def ledger_clean_head(self, pr: int) -> str:
-        runs = self.gh_meta(pr).data.get("runs") or []
+        meta = self.gh_meta(pr).data
+        if meta.get("mode") == "init":
+            return ""
+        states = meta.get("states") or {}
+        if states:
+            # Carried verdicts can complete a head without generating any new runs.
+            completed = {"green", "blocking_request", "blocking_block"}
+            # Adverse findings defer stale approvals; a block also defers absent rubrics.
+            allowed = completed | (
+                {"stale"} if any(v in ("blocking_request", "blocking_block") for v in states.values()) else set()
+            )
+            if "blocking_block" in states.values():
+                allowed.add("absent")
+            return str(meta.get("head_sha") or "") if all(v in allowed for v in states.values()) else ""
+        runs = meta.get("runs") or []
         if runs and all(r.get("verdict") != "error" for r in runs):
-            return str(self.gh_meta(pr).data.get("head_sha") or "")
+            return str(meta.get("head_sha") or "")
         return ""
 
     def review_rounds(self, pr: int, counters: Counters) -> int:
@@ -355,33 +424,3 @@ class ReviewState:
             return any(v not in ("green", "stale") for v in states.values())
         runs = m.get("runs") or []
         return any(r.get("verdict") not in ("approve", "error") for r in runs)
-
-
-def inflight_review_providers(comments: list[dict] | None, head: str, now: int) -> set[str]:
-    """Providers named by any UNEXPIRED in-progress review marker on this EXACT head (a new push is a
-    new unit, so the head must match). Mirrors the review engine's de-contention read so the worker can
-    skip a head a peer already holds before launching the engine. Empty set when none apply; a fetch
-    failure (comments is None) is treated as 'not held' and proceeds — fail-open, matching the engine
-    (a rare duplicate review at worst, the engine's own claim still being the backstop)."""
-    return providers_from_markers(distil_markers(comments), head, now)
-
-
-def distil_markers(comments: list[dict] | None) -> list[dict]:
-    """Every in-progress marker a PR's comments carry, as {head, expires_at, providers}.
-
-    Kept separate from the expiry decision so a marker can be CACHED without freezing time with it: the
-    expiry travels with the marker and is judged against the clock at read time, so a cached marker
-    expires on its own schedule exactly as a freshly read one does."""
-    return markers(comments)
-
-
-def providers_from_markers(markers: list[dict], head: str, now: int) -> set[str]:
-    """The providers holding `head` right now, per markers already distilled by distil_markers."""
-    cov: set[str] = set()
-    for d in markers:
-        if not isinstance(d, dict) or not isinstance(d.get("expires_at"), int) or d["expires_at"] <= now:
-            continue
-        if d.get("head") != head:  # exact: a new push is a new unit, not covered by an old marker
-            continue
-        cov.update(p for p in (d.get("providers") or []) if isinstance(p, str))
-    return cov

@@ -282,7 +282,7 @@ def can_push(repo: str) -> bool | None:
         out = (r.stdout or "").strip()
         return True if out == "true" else False if out == "false" else None
 
-    return transport.shared_read(["permissions", repo], fetch)
+    return transport.shared_read(["permissions", repo], fetch, ttl=300)
 
 
 def claims_repo() -> str:
@@ -661,19 +661,47 @@ _ACTIVE_RUN_STATUSES = ("requested", "waiting", "pending", "queued", "in_progres
 
 
 class GitHub:
+    @classmethod
+    def for_repository(cls, repository, *, api=None, cache=None, ttl=15):
+        """Select a qualified read source; never guess its credential or mirror.
+
+        Forgejo supports metadata/discussion and read-only survey inventory.
+        Full worker activation and writes retain their separate migration guard.
+        """
+        from tauceti_tools.forge import GITHUB, RepositoryRef
+
+        if not isinstance(repository, RepositoryRef):
+            raise ValueError("source selection requires a qualified RepositoryRef")
+        if repository.forge == GITHUB:
+            if api is not None or cache is not None:
+                raise ValueError("GitHub reads use their existing transport")
+            return cls(repository.name)
+        if repository.forge.kind != "forgejo" or api is None:
+            raise ValueError("Forgejo reads require an explicitly bound direct client")
+        from .forgejo_reads import ForgejoReadSource
+
+        return ForgejoReadSource(repository, api, cache=cache, ttl=ttl)
+
     def __init__(self, repo: str = TAUCETI):
+        if not isinstance(repo, str):
+            raise ValueError("qualified repositories require GitHub.for_repository")
         self.repo = repo
         self._review_nodes = {}
 
     def _gh(self, args: list[str]) -> subprocess.CompletedProcess:
         readonly = _gh_read_only(["gh", *args])
         if not readonly:
-            transport.invalidate()
+            transport.invalidate(args)
         try:
+            if readonly and not transport.retry_reads():
+                # Optional current-state checks must not park the round in an
+                # in-place retry sleep. The caller can select other work or
+                # continue its existing investigation on an unavailable read.
+                return gh_run(["gh", *args], max_wait=0)
             return gh_run(["gh", *args])
         finally:
             if not readonly:
-                transport.invalidate()
+                transport.invalidate(args)
 
     def open_prs(self, *, page: int = OPEN_PR_PAGE) -> list[dict]:
         from .github_state import read
@@ -778,10 +806,14 @@ class GitHub:
         args = ["issue", "list", "--repo", repo, "--state", state, "--limit", str(limit), "--json", ",".join(fields)]
         for label in labels or []:
             args += ["--label", label]
-        p = self._gh(args)
-        if p.returncode != 0:
-            raise GitHubError(f"gh issue list failed: {p.stderr.strip()}")
-        return json.loads(p.stdout or "[]")
+
+        def fetch():
+            p = self._gh(args)
+            if p.returncode != 0:
+                raise GitHubError(f"gh issue list failed: {p.stderr.strip()}")
+            return json.loads(p.stdout or "[]")
+
+        return transport.shared_read(["issue_list", repo, fields, labels, state, limit], fetch, ttl=120)
 
     def pr_view(self, pr: int, fields: list[str]) -> dict | None:
         from .github_state import read
@@ -1145,7 +1177,7 @@ class GitHub:
         owner, _, name = self.repo.partition("/")
         q = (
             "query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){"
-            "pullRequest(number:$pr){headRefOid state comments{totalCount}"
+            "pullRequest(number:$pr){headRefOid state isDraft labels(first:100){nodes{name}} comments{totalCount}"
             "reviewThreads(first:100){totalCount nodes{comments{totalCount}}}}}}"
         )
         p = self._gh(
@@ -1162,7 +1194,16 @@ class GitHub:
             if threads["totalCount"] > 100:  # beyond one page — get the exact count via REST
                 return self._pr_progress_state_rest(pr, d["headRefOid"], d.get("state"))
             nc = d["comments"]["totalCount"] + sum(t["comments"]["totalCount"] for t in threads["nodes"])
-            return {"head": d["headRefOid"], "ncomments": nc, "state": d.get("state")}
+            return {
+                "head": d["headRefOid"],
+                "ncomments": nc,
+                "state": d.get("state"),
+                **(
+                    {"isDraft": d["isDraft"], "labels": d["labels"]["nodes"]}
+                    if "isDraft" in d and "labels" in d
+                    else {}
+                ),
+            }
         except (json.JSONDecodeError, KeyError, TypeError):
             return None
 

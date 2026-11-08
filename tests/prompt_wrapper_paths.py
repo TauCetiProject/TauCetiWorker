@@ -49,7 +49,6 @@ CALL_SITES = {
         PR=123,
         HEAD="a" * 40,
         CLOSE_AUTHORITY="Closure authority is pinned by the worker.",
-        BLOCK_AUTHORITY="Block authority is pinned.",
     ),
     "overlap-scan.md": dict(BATCH="/tmp/batch.json", RESULT="/tmp/result.json"),
     "overlap-fix.md": dict(ISSUE=123, BODY="Evidence", FORK="alice/TauCeti", FORK_OWNER="alice", BIN="/bin", **VERIFY),
@@ -58,9 +57,7 @@ CALL_SITES = {
     "rebase.md": FIXLIKE,
     "bump.md": dict(FIXLIKE, SCOPE_POLICY="bump"),
     "lint-repair.md": dict(FIXLIKE, SCOPE_POLICY="lint-repair"),
-    "local-verification.md": dict(
-        SCOPE_POLICY="ordinary", LOCAL_AXIOMS="/bin/tauceti-local-axioms", LOCAL_LINT="/bin/tauceti-local-lint"
-    ),
+    "local-verification.md": dict(SCOPE_POLICY="ordinary", LOCAL_CHECKS="/bin/tauceti-local-checks"),
     "roadmap.md": dict(
         ONLY="CFSGStatement",
         SKIP="none",
@@ -72,6 +69,7 @@ CALL_SITES = {
         REVIEW_DIR="/opt/review",
         RUBRICS="/opt/rubrics/rubrics.md",
         SOURCE_GUIDANCE="",
+        EXTRA_ROADMAP_PROMPT="",
         BIN="/bin",
         **VERIFY,
     ),
@@ -136,8 +134,8 @@ def main():
             )
             text = fill_prompt(PROMPTS / name, **substitutions)
             check(
-                f"{name}: V0 rollback restores scope recipe",
-                "<<'TAUCETI_SCOPE'" in text and "/tauceti-verify" not in text,
+                f"{name}: default prompts use shared local checks",
+                "/tauceti-local-checks" in text and "/tauceti-verify" not in text,
             )
 
     # 4) Shim expiry is an autonomous repair input, not a notification-only dead end. Both workers

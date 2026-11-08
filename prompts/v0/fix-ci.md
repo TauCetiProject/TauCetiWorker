@@ -4,40 +4,19 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 - See which checks failed and read their logs:
   - `gh pr checks __PR__ --repo TauCetiProject/TauCeti`
   - `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed` (use the run id from the failing check)
-- The single `build` check runs these stages in order: the expired-shim check, `lake build --iofail`,
+- The `build` check includes source guards, `lake build --iofail`, shim checks,
   the audit driver (global duplicate declarations, then axioms), the module-system audit, the
   environment lint (`lint-env`) and the source style lint (`lint-style`). Find the stage that failed
   in the log, then reproduce THAT stage locally; the log alone is not the source of truth, but do not
   rerun every stage to diagnose one failure.
-  - Shim expiry:
-    ```
-    git fetch -q origin main
-    shim_args=(--fail-on-available); base_shims="$(mktemp)"; base_root="$(mktemp -d)"; have_base=0
-    base_ref="$(git merge-base origin/main HEAD)"
-    if git show "$base_ref":TauCeti/mathlib-shims.json > "$base_shims" 2>/dev/null; then git archive "$base_ref" TauCeti | tar -x -C "$base_root"; shim_args+=(--base-manifest "$base_shims" --base-root "$base_root"); have_base=1; fi
-    if [ "$have_base" = 1 ] && git diff --quiet "$base_ref" -- lake-manifest.json lean-toolchain; then shim_args+=(--only-new); fi
-    if [ -f scripts/check-expired-mathlib-shims.py ]; then python3 scripts/check-expired-mathlib-shims.py "${shim_args[@]}"; fi
-    rm -f "$base_shims"; rm -rf "$base_root"
-    ```
-  - Build: `lake exe cache get` (once per session), then `lake build --iofail`.
-  - Duplicate declarations or axioms: diagnose the named declarations and modules from the CI log,
-    repair their source, then build and run the changed-file check below. It does not reproduce
-    global duplicate ownership, transitive dependency or unchanged importer failures. A local pass
-    never dismisses those failures or proves they were transient; do not run a full local audit.
-  - Module system: `lake build`, then `lake exe module-system`.
-  - Environment lint: `lake build`, the scope recipe, then the scoped lint below. This round's
-    policy is `__SCOPE_POLICY__`. Only when it is `full-lint` does CI lint the whole library, so the
-    changed modules are not enough: also lint the modules defining each declaration the failing log
-    flags (`<linter> <declaration>`). Append them to the recipe's list before the scoped lint:
-    ```
-    list="$(git rev-parse --show-toplevel)/.lake/tauceti-scope/modules.txt"
-    for name in <last component of each flagged declaration name>; do
-      grep -rlw --include='*.lean' -- "$name" TauCeti
-    done | sed 's/\.lean$//; s|/|.|g' | cat - "$list" | LC_ALL=C sort -u -o "$list"
-    ```
-    If `lint-env` flags a declaration that is NOT in your diff, your branch is likely behind main
-    (CI overlays your `TauCeti/` onto current main): merge `main` into the branch and re-check.
-  - Style lint: `bash scripts/lint-style.sh`.
+  - Reproduce the failing stage through the shared local checker below. The phase names are
+    `sources`, `shim-expiry`, `axioms`, `module-system`, `style` and `environment`;
+    use `lake build --iofail` for the build itself.
+  - Local axiom checks do not reproduce global duplicate ownership or transitive failures.
+    Fix declarations identified by CI; a local pass does not dismiss a CI audit failure.
+  - For lint findings in unchanged modules, include their defining modules with
+    `--lint-modules /absolute/path/to/modules.txt` in local verification. Keep this file
+    outside the checkout. Each line is a dotted module name. Use the same list for final verification.
 
 ## Fix it on its merits
 - Diagnose the real cause (a broken proof, a renamed/missing Mathlib lemma, a linter error, an axiom-audit failure, a flaky/transient infra error). Fix the underlying problem.
@@ -50,17 +29,12 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 - Use `namespace TauCeti` by default. For dot-notation APIs whose first explicit argument has an
   existing Lean or Mathlib type, put declarations in that type's existing namespace (e.g. root
   `Set` or `RingEquiv`), as required by the naming rubric; do not nest it under `TauCeti`.
-- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If your work needs one, follow the durable blocked-PR procedure below.
+- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`. Resolve roadmap scope findings using the PR outcome instructions below: adapt to an existing target or close your own PR with an explanation.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force the build green — that defeats the point.
 
 ## Verify before pushing (ALL MUST pass)
 __LOCAL_VERIFICATION__
-After the fix, run the final verification once, covering what the `build` check runs: the
-shim-expiry command above, `lake build --iofail`, the scope recipe and scoped audit, `lake exe module-system`,
-and the scoped environment lint (with the flagged modules appended under the `full-lint` policy),
-which must print `LINT-ENV: PASS`. A green `lake build` alone is NOT enough: the `build` check also
-fails on a shim-expiry, axiom-audit, module-system or lint-env violation (e.g. a missing docstring).
-If a step fails, fix it and rerun only the steps whose inputs your fix changed. Never push red.
+After the fix, run the shared final verification above once, with any additional lint modules. Fix failures and rerun only checks affected by further edits. Never push red.
 
 **Do this synchronously, in this one turn.** You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 

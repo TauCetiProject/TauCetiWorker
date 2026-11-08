@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -138,6 +139,215 @@ class SharedTests(unittest.TestCase):
         (self.mathlib / "Mathlib/Test.lean").write_text("changed")
         with self.assertRaises(s.Unavailable):
             s.signature(self.cwd, self.env)
+
+    def test_large_disk_can_publish_with_abundant_bytes_below_ten_percent(self):
+        gib = 1024**3
+        usage = shutil._ntuple_diskusage(3500 * gib, 3326 * gib, 174 * gib)
+        with patch.object(s.shutil, "disk_usage", return_value=usage):
+            key, spec = s.signature(self.cwd, self.env)
+            entry, hit = s.publish(self.pool, key, spec, self.cwd, self.env, self.root / "logs", self.extract)
+        self.assertFalse(hit)
+        self.assertTrue((entry / "ready.json").is_file())
+
+    def test_host_snapshot_materializes_merged_cache_after_agent_view_exits(self):
+        self.require_overlay()
+        from tauceti_worker.verification import inventory
+        from tauceti_worker.verification_jobs import snapshot
+
+        build = self.mathlib / ".lake/build"
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            subprocess.run(
+                prefix
+                + [
+                    "sh",
+                    "-c",
+                    'printf private > "$1/lib/lean/Mathlib.olean"; rm "$1/lib/lean/Mathlib/Test.olean"',
+                    "sh",
+                    str(build),
+                ],
+                check=True,
+                pass_fds=s.lease_fds(self.env),
+            )
+        self.assertFalse((build / "lib/lean/Mathlib.ilean").exists())
+        target = self.root / "state/verification-candidates" / ("a" * 32)
+        target.parent.mkdir(parents=True)
+        with patch.dict(os.environ, self.env):
+            snapshot(self.cwd, target, inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")))
+        copied = target / ".lake/packages/mathlib/.lake"
+        self.assertEqual((copied / "build/lib/lean/Mathlib.olean").read_bytes(), b"private")
+        self.assertEqual((copied / "build/lib/lean/Mathlib.ilean").read_bytes(), b"verified artifact")
+        self.assertFalse((copied / "build/lib/lean/Mathlib/Test.olean").exists())
+        self.assertFalse((copied / "tauceti-overlay-work").exists())
+        self.assertFalse((copied / "tauceti-shared-mathlib.json").exists())
+
+    def test_disposable_overlay_is_volatile_without_leaking_the_mount_helper(self):
+        self.require_overlay()
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            upper = self.mathlib / ".lake/build"
+            code = "import os,sys;from pathlib import Path;assert 'overlay-mount' not in os.environ.get('LD_PRELOAD','');line=next(x for x in Path('/proc/self/mountinfo').read_text().splitlines() if x.split()[4]==sys.argv[1]);assert any(x in ('volatile','fsync=volatile') for x in line.split()[-1].split(','))"
+            subprocess.run(
+                prefix + [sys.executable, "-c", code, str(upper)], check=True, pass_fds=s.lease_fds(self.env)
+            )
+
+    def test_snapshot_storage_pressure_remains_retryable_across_mount_subprocess(self):
+        self.require_overlay()
+        from tauceti_worker.verification import inventory
+        from tauceti_worker.verification_jobs import snapshot
+        from tauceti_worker.verification_storage import Pressure
+
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+            pass
+        target = self.root / "state/verification-candidates" / ("b" * 32)
+        target.parent.mkdir(parents=True)
+        with patch.dict(os.environ, {**self.env, "TAUCETI_VERIFY_MIN_FREE_BYTES": str(10**30)}):
+            with self.assertRaises(Pressure) as raised:
+                snapshot(self.cwd, target, inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")))
+        self.assertEqual(raised.exception.reason, "filesystem-headroom")
+        self.assertFalse(target.exists())
+        self.assertTrue((self.cwd / "lakefile.toml").is_file())
+
+    def test_snapshot_discards_pre_reboot_volatile_cache_and_prepares_fresh_view(self):
+        self.require_overlay()
+        from tauceti_worker.verification import inventory
+        from tauceti_worker.verification_jobs import snapshot
+
+        build = self.mathlib / ".lake/build"
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            subprocess.run(
+                prefix + ["sh", "-c", 'printf torn > "$1/lib/lean/Mathlib.olean"', "sh", str(build)],
+                check=True,
+                pass_fds=s.lease_fds(self.env),
+            )
+        marker = build.parent / "tauceti-shared-mathlib.json"
+        row = json.loads(marker.read_text())
+        row["boot_id"] = "old-boot"
+        marker.write_text(json.dumps(row))
+
+        @contextlib.contextmanager
+        def prepare(cwd, env, logdir):
+            with s.view(cwd, self.env, logdir, self.extract) as prefix:
+                yield prefix
+
+        target = self.root / "state/verification-candidates" / ("c" * 32)
+        target.parent.mkdir(parents=True)
+        with (
+            patch.dict(os.environ, self.env),
+            patch("tauceti_worker.agents.host_build_cache_context", side_effect=prepare),
+        ):
+            snapshot(self.cwd, target, inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")))
+        self.assertEqual(
+            (target / ".lake/packages/mathlib/.lake/build/lib/lean/Mathlib.olean").read_bytes(), b"verified artifact"
+        )
+
+    def test_stale_marker_under_linked_readonly_packages_preserves_private_sources_without_recursion(self):
+        from tauceti_worker.verification import inventory
+        from tauceti_worker.verification_jobs import snapshot
+
+        packages = self.cwd / ".lake/packages"
+        external = self.root / "caller-owned-packages"
+        packages.rename(external)
+        packages.symlink_to(external, target_is_directory=True)
+        build = self.mathlib / ".lake/build"
+        build.mkdir(parents=True)
+        (build / "sparse.olean").write_text("incomplete old upper")
+        marker = build.with_name("tauceti-shared-mathlib.json")
+        atomic_json(marker, dict(key="1" * 64, pool=str(self.pool), boot_id="old-boot"))
+        (self.mathlib / "Mathlib/Test.lean").write_text("def private_edit := 2\n")
+        directories = [external, *(p for p in external.rglob("*") if p.is_dir())]
+        for path in directories:
+            path.chmod(0o555)
+        target = self.root / "state/verification-candidates" / ("d" * 32)
+        target.parent.mkdir(parents=True)
+        try:
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        **self.env,
+                        "TAUCETI_VERIFY_STORAGE_DIR": str(self.root / "verify-ledger"),
+                        "TAUCETI_VERIFY_MIN_FREE_BYTES": "1",
+                        "TAUCETI_VERIFY_MIN_FREE_PERCENT": "0",
+                    },
+                ),
+                patch("tauceti_worker.agents.host_build_cache_context", side_effect=AssertionError("repeated warming")),
+            ):
+                snapshot(
+                    self.cwd,
+                    target,
+                    inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")),
+                    immutable_packages=external,
+                )
+            copied = target / ".lake/packages/mathlib"
+            self.assertFalse((target / ".lake/packages").is_symlink())
+            self.assertEqual((copied / "Mathlib/Test.lean").read_text(), "def private_edit := 2\n")
+            self.assertFalse((copied / ".lake/build").exists())
+            self.assertFalse((copied / ".lake/tauceti-shared-mathlib.json").exists())
+            (copied / ".lake/build").mkdir()
+            (copied / ".git/index.lock").write_text("private Git metadata")
+            self.assertTrue(marker.is_file())
+            self.assertEqual((build / "sparse.olean").read_text(), "incomplete old upper")
+            self.assertEqual((self.mathlib / ".lake").stat().st_mode & 0o777, 0o555)
+            self.assertFalse((self.mathlib / ".git/index.lock").exists())
+        finally:
+            for path in directories:
+                path.chmod(0o755)
+
+    def test_snapshot_detachment_failure_remains_a_retryable_cache_wait(self):
+        from tauceti_worker.verification import inventory
+        from tauceti_worker.verification_jobs import snapshot
+        from tauceti_worker.verification_storage import Pressure
+
+        build = self.mathlib / ".lake/build"
+        build.mkdir(parents=True)
+        atomic_json(
+            build.with_name("tauceti-shared-mathlib.json"),
+            dict(key="1" * 64, pool=str(self.pool), boot_id="old-boot"),
+        )
+        target = self.root / "state/verification-candidates" / ("e" * 32)
+        target.parent.mkdir(parents=True)
+        with (
+            patch.dict(os.environ, {**self.env, "TAUCETI_VERIFY_STORAGE_DIR": str(self.root / "verify-ledger")}),
+            patch.object(s, "detach_upper", side_effect=s.Unavailable("detachment unavailable")),
+        ):
+            with self.assertRaises(Pressure) as raised:
+                snapshot(self.cwd, target, inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")))
+        self.assertEqual(raised.exception.reason, "cache")
+        self.assertFalse(target.exists())
+        self.assertTrue((self.cwd / "lakefile.toml").is_file())
+
+    def test_merged_copy_resolves_private_and_lower_backing_files_for_reflink(self):
+        self.require_overlay()
+        build = self.mathlib / ".lake/build"
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            lower = self.pool / "entries" / self.env["TAUCETI_SHARED_MATHLIB_KEY"] / "build"
+            code = """import sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from tauceti_worker.verification_jobs import backing_source,copy_file
+build,lower,output=map(Path,sys.argv[2:])
+(build/'lib/lean/Mathlib.olean').write_bytes(b'private')
+for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified artifact')]:
+ source=backing_source(build/'lib/lean'/name,build,lower)
+ assert not source.is_relative_to(build),source
+ copy_file(source,output/name)
+ assert (output/name).read_bytes()==expected
+"""
+            output = self.root / "copied"
+            output.mkdir()
+            subprocess.run(
+                prefix
+                + [
+                    sys.executable,
+                    "-c",
+                    code,
+                    str(Path(__file__).resolve().parents[1]),
+                    str(build),
+                    str(lower),
+                    str(output),
+                ],
+                check=True,
+                pass_fds=s.lease_fds(self.env),
+            )
 
     def test_signature_binds_external_lake_config_by_content_and_cache_selection(self):
         config = self.root / "lake.toml"
@@ -752,7 +962,7 @@ class SharedTests(unittest.TestCase):
             self.assertEqual(result.stdout, b"verified artifact")
         self.assertEqual(self.downloads, 2)
 
-    def test_off_moves_sparse_delta_aside_before_private_warming(self):
+    def test_off_discards_sparse_delta_before_private_warming(self):
         self.require_overlay()
         upper = self.mathlib / ".lake/build"
         with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
@@ -765,7 +975,339 @@ class SharedTests(unittest.TestCase):
         with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
             self.assertEqual(prefix, [])
             self.assertEqual(list(upper.iterdir()), [])
-            self.assertTrue((upper.with_name("build-shared-delta") / "lib/lean/Mathlib.olean").exists())
+            self.assertFalse(upper.with_name("build-shared-delta").exists())
+
+    def test_repeated_off_path_reclaims_obsolete_delta_and_backup_without_touching_private_build(self):
+        upper = self.mathlib / ".lake/build"
+        upper.mkdir(parents=True)
+        (upper / "private.olean").write_text("current private build")
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
+        for _ in range(2):
+            for name in ("build-shared-delta", "build-before-sharing"):
+                old = upper.with_name(name)
+                old.mkdir()
+                (old / "old.olean").write_text("obsolete")
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+                self.assertEqual((upper / "private.olean").read_text(), "current private build")
+                self.assertFalse(upper.with_name("build-shared-delta").exists())
+                self.assertFalse(upper.with_name("build-before-sharing").exists())
+
+    def test_detach_clears_old_delta_without_a_marker(self):
+        upper = self.mathlib / ".lake/build"
+        delta = upper.with_name("build-shared-delta")
+        delta.mkdir(parents=True)
+        (delta / "obsolete.olean").write_text("old sparse layer")
+        s.detach_upper(upper, upper.with_name("tauceti-shared-mathlib.json"))
+        self.assertFalse(delta.exists())
+        self.assertFalse(upper.exists())
+        upper.mkdir()
+        (upper / "private.olean").write_text("private build")
+        s.detach_upper(upper, upper.with_name("tauceti-shared-mathlib.json"))
+        self.assertEqual((upper / "private.olean").read_text(), "private build")
+
+    def test_off_discards_marked_sparse_upper_and_work_without_an_overlay(self):
+        upper = self.mathlib / ".lake/build"
+        upper.mkdir(parents=True)
+        (upper / "sparse.olean").write_text("incomplete layer")
+        upper.with_name("tauceti-shared-mathlib.json").write_text("{}")
+        work = upper.with_name("tauceti-overlay-work")
+        work.mkdir()
+        (work / "work").mkdir(mode=0)
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            self.assertEqual(prefix, [])
+            self.assertEqual(list(upper.iterdir()), [])
+            self.assertFalse(upper.with_name("build-shared-delta").exists())
+            self.assertFalse(work.exists())
+
+    def test_optional_disposal_failure_does_not_fail_private_round(self):
+        upper = self.mathlib / ".lake/build"
+        upper.mkdir(parents=True)
+        (upper / "private.olean").write_text("private build")
+        stale = upper.with_name("build-shared-delta")
+        stale.mkdir()
+        (stale / "old.olean").write_text("obsolete")
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
+        with patch.object(s, "remove_tree", side_effect=OSError("temporary removal failure")) as remove:
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+                self.assertEqual((upper / "private.olean").read_text(), "private build")
+                remove.assert_called()
+                self.assertTrue(stale.exists())
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+            self.assertFalse(stale.exists())
+
+    def test_unreadable_discard_inventory_does_not_fail_private_round(self):
+        upper = self.mathlib / ".lake/build"
+        upper.mkdir(parents=True)
+        (upper / "private.olean").write_text("current private build")
+        discarded = upper.with_name("build-shared-deltas")
+        (discarded / ("a" * 32)).mkdir(parents=True)
+        original = Path.iterdir
+
+        def unreadable(path):
+            if path == discarded:
+                raise PermissionError("temporary scratch inventory failure")
+            return original(path)
+
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
+        with patch.object(Path, "iterdir", unreadable):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+                self.assertEqual((upper / "private.olean").read_text(), "current private build")
+
+    def test_failed_mandatory_detachment_keeps_the_sparse_upper_and_marker(self):
+        upper = self.mathlib / ".lake/build"
+        upper.mkdir(parents=True)
+        (upper / "sparse.olean").write_text("incomplete layer")
+        marker = upper.with_name("tauceti-shared-mathlib.json")
+        marker.write_text("{}")
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
+        with patch.object(s.os, "replace", side_effect=OSError("detachment slot is unavailable")):
+            with self.assertRaisesRegex(s.Unavailable, "detachment failed"):
+                with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+                    self.fail("private warming started on a sparse layer")
+        self.assertTrue(marker.exists())
+        self.assertEqual((upper / "sparse.olean").read_text(), "incomplete layer")
+
+    def test_off_cleanup_does_not_follow_a_symlinked_build_parent(self):
+        private = self.root / "caller-owned-lake"
+        private.mkdir()
+        (private / "build-before-sharing").mkdir()
+        (private / "build-before-sharing/source").write_text("caller owned")
+        (self.mathlib / ".lake").symlink_to(private)
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+            self.assertEqual((private / "build-before-sharing/source").read_text(), "caller owned")
+
+    def test_auto_sharing_does_not_modify_a_symlinked_build_parent(self):
+        private = self.root / "caller-owned-lake"
+        private.mkdir()
+        (private / "build-before-sharing").mkdir()
+        (self.mathlib / ".lake").symlink_to(private)
+        with patch.object(s, "capability", side_effect=AssertionError("symlinked layout probed sharing")):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+        self.assertTrue((private / "build-before-sharing").is_dir())
+
+    def test_marked_upper_generation_cleanup_failure_still_allows_private_warming(self):
+        upper = self.mathlib / ".lake/build"
+        upper.mkdir(parents=True)
+        (upper / "sparse.olean").write_text("old sparse layer")
+        marker = upper.with_name("tauceti-shared-mathlib.json")
+        marker.write_text("{}")
+        work = upper.with_name("tauceti-overlay-work")
+        work.mkdir()
+        original = s.remove_tree
+
+        def fail_work(path):
+            if path.parent.name == "build-shared-deltas":
+                raise OSError("temporary generation removal failure")
+            original(path)
+
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
+        with patch.object(s, "remove_tree", side_effect=fail_work):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+                self.assertEqual(list(upper.iterdir()), [])
+                self.assertFalse(marker.exists())
+
+    def test_namespace_outside_mathlib_cwd_protects_its_upper(self):
+        self.require_overlay()
+        self.pool.mkdir()
+        lower = self.pool / "lower"
+        lower.mkdir()
+        (lower / "base.olean").write_text("immutable")
+        upper = self.mathlib / ".lake/build"
+        upper.mkdir(parents=True)
+        (upper / "private.olean").write_text("live private layer")
+        marker = upper.with_name("tauceti-shared-mathlib.json")
+        marker.write_text("{}")
+        work = upper.with_name("tauceti-overlay-work")
+        work.mkdir()
+        ready = self.root / "namespace-ready"
+        command = s.overlay_command(lower, upper, work, upper, self.pool)
+        # A non-dumpable helper can expose neither cwd nor FDs, while retaining
+        # the namespace. Its real UID and mountinfo still identify the live view.
+        helper = (
+            "import ctypes,os,sys,time; "
+            "assert ctypes.CDLL(None).prctl(4,0)==0; "
+            "open(sys.argv[1]+'.tmp','w').write(str(os.getpid())); "
+            "os.replace(sys.argv[1]+'.tmp',sys.argv[1]); time.sleep(60)"
+        )
+        process = subprocess.Popen(command + [sys.executable, "-c", helper, str(ready)], start_new_session=True)
+        owner = None
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(ready.exists())
+            owner = s.process_identity(int(ready.read_text()))
+            self.assertIsNotNone(owner)
+            self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
+            with patch.object(s, "remove_tree", side_effect=AssertionError("live bare workdir was deleted")):
+                s._discard_scratch(work)
+            self.assertTrue(work.is_dir())
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+                self.assertFalse(marker.exists())
+                self.assertEqual(list(upper.iterdir()), [])
+            discarded = upper.with_name("build-shared-deltas")
+            generations = list(discarded.iterdir())
+            self.assertEqual(len(generations), 1)
+            self.assertEqual((generations[0] / "build/private.olean").read_text(), "live private layer")
+            # A lingering namespace keeps its own generation, while a later
+            # completed generation is disposable without waiting for it.
+            (upper / "later.olean").write_text("finished later round")
+            marker.write_text("{}")
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+                self.assertEqual(list(upper.iterdir()), [])
+            self.assertEqual(list(discarded.iterdir()), generations)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+            if owner is not None:
+                deadline = time.monotonic() + 5
+                while s.process_identity(owner["pid"]) == owner and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertNotEqual(s.process_identity(owner["pid"]), owner)
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+            self.assertFalse(upper.with_name("build-shared-deltas").exists())
+
+    def test_failed_new_view_restores_the_current_preparation_backup(self):
+        self.require_overlay()
+        upper = self.mathlib / ".lake/build"
+        upper.mkdir(parents=True)
+        (upper / "private.olean").write_text("previous complete private build")
+        original = s.overlay_command
+
+        def fail_view(lower, candidate_upper, work, target, pool, **kwargs):
+            if target == upper:
+                return ["false"]
+            return original(lower, candidate_upper, work, target, pool, **kwargs)
+
+        with patch.object(s, "overlay_command", side_effect=fail_view):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertEqual(prefix, [])
+                self.assertEqual((upper / "private.olean").read_text(), "previous complete private build")
+                self.assertFalse(upper.with_name("build-before-sharing").exists())
+                self.assertFalse(upper.with_name("tauceti-shared-mathlib.json").exists())
+                self.assertFalse(upper.with_name("tauceti-overlay-work").exists())
+
+    def test_uncertain_legacy_work_is_parked_before_a_new_shared_view(self):
+        self.require_overlay()
+        upper = self.mathlib / ".lake/build"
+        upper.mkdir(parents=True)
+        (upper / "private.olean").write_text("complete private build")
+        work = upper.with_name("tauceti-overlay-work")
+        work.mkdir()
+        (work / "legacy").write_text("possibly referenced work")
+        original = s._scratch_unused
+
+        def uncertain(path):
+            return False if path == upper.parent else original(path)
+
+        with patch.object(s, "_scratch_unused", side_effect=uncertain):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertTrue(prefix)
+                self.assertFalse((work / "legacy").exists())
+                self.assertEqual(len(list(upper.with_name("build-shared-deltas").glob("*/work/legacy"))), 1)
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+            self.assertFalse(upper.with_name("build-shared-deltas").exists())
+
+    def test_failed_private_build_restoration_is_a_preparation_failure(self):
+        self.require_overlay()
+        upper = self.mathlib / ".lake/build"
+        upper.mkdir(parents=True)
+        (upper / "private.olean").write_text("previous private build")
+        backup = upper.with_name("build-before-sharing")
+        original_overlay, original_replace = s.overlay_command, os.replace
+
+        def fail_probe(lower, candidate_upper, work, target, pool, **kwargs):
+            if target == upper:
+                return ["false"]
+            return original_overlay(lower, candidate_upper, work, target, pool, **kwargs)
+
+        def fail_restore(source, target):
+            if source == backup:
+                raise OSError("private restoration temporarily unavailable")
+            return original_replace(source, target)
+
+        with (
+            patch.object(s, "overlay_command", side_effect=fail_probe),
+            patch.object(s.os, "replace", side_effect=fail_restore),
+        ):
+            with self.assertRaisesRegex(s.Unavailable, "rollback failed"):
+                with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+                    self.fail("round started after its private build restoration failed")
+        self.assertEqual((backup / "private.olean").read_text(), "previous private build")
+
+    def test_live_private_backup_survives_sharing_and_later_rounds(self):
+        self.require_overlay()
+        upper = self.mathlib / ".lake/build"
+        backup = upper.with_name("build-before-sharing")
+        upper.mkdir(parents=True)
+        (upper / "private.olean").write_text("possibly referenced private build")
+        original = s._scratch_unused
+
+        def referenced(path):
+            return False if path == backup or (path / "build/private.olean").exists() else original(path)
+
+        with patch.object(s, "_scratch_unused", side_effect=referenced):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertTrue(prefix)
+            self.assertEqual((backup / "private.olean").read_text(), "possibly referenced private build")
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+                self.assertTrue(prefix)
+                retained = list(upper.with_name("build-shared-deltas").glob("*/build/private.olean"))
+                self.assertEqual(len(retained), 1)
+                self.assertEqual(retained[0].read_text(), "possibly referenced private build")
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            self.assertTrue(prefix)
+        self.assertFalse(backup.exists())
+        self.assertEqual(list(upper.with_name("build-shared-deltas").glob("*/build/private.olean")), [])
+
+    def test_dangling_overlay_work_symlink_does_not_prevent_sharing(self):
+        self.require_overlay()
+        upper = self.mathlib / ".lake/build"
+        upper.parent.mkdir(parents=True, exist_ok=True)
+        work = upper.with_name("tauceti-overlay-work")
+        work.symlink_to(self.root / "missing-work")
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            self.assertTrue(prefix)
+            self.assertFalse(work.is_symlink())
+
+    def test_rollback_detach_failure_keeps_backup_and_blocks_inference(self):
+        self.require_overlay()
+        upper = self.mathlib / ".lake/build"
+        upper.mkdir(parents=True)
+        (upper / "private.olean").write_text("complete private build")
+        original_overlay, original_detach = s.overlay_command, s.detach_upper
+
+        def fail_probe(lower, candidate_upper, work, target, pool, **kwargs):
+            if target == upper:
+                return ["false"]
+            return original_overlay(lower, candidate_upper, work, target, pool, **kwargs)
+
+        def fail_marked_detach(candidate_upper, marker):
+            if marker.exists():
+                raise OSError("probe namespace detachment temporarily unavailable")
+            return original_detach(candidate_upper, marker)
+
+        with (
+            patch.object(s, "overlay_command", side_effect=fail_probe),
+            patch.object(s, "detach_upper", side_effect=fail_marked_detach),
+        ):
+            with self.assertRaisesRegex(s.Unavailable, "detachment failed"):
+                with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+                    self.fail("inference started after rollback detachment failed")
+        self.assertEqual(
+            (upper.with_name("build-before-sharing") / "private.olean").read_text(), "complete private build"
+        )
+        self.assertTrue(upper.with_name("tauceti-shared-mathlib.json").exists())
 
     def test_auto_fallback_releases_snapshot_lock_before_private_round(self):
         self.require_overlay()
@@ -913,6 +1455,28 @@ class SharedTests(unittest.TestCase):
         row["supervisor"]["start"] = "dead-process"
         atomic_json(path, row)
         self.assertEqual(s.summary(self.env)["preparing"], 0)
+
+    def test_summary_keeps_worker_states_with_reasons(self):
+        reason = "Mathlib dependency is not available for sharing"
+        for worker, mode, message in (
+            ("private-one", "private", reason),
+            ("private-two", "private", reason),
+            ("idle", "idle", "shared view released; awaiting next natural round"),
+            ("blocked", "blocked", reason),
+            ("preparing", "overlay-ready", "warming caches"),
+        ):
+            s.report(self.pool, {**self.env, "TAUCETI_WORKER_ID": worker}, mode=mode, reason=message)
+        summary = s.summary(self.env)
+        self.assertEqual(summary["private"], 2)
+        self.assertEqual(
+            summary["reasons_by_mode"],
+            {
+                "private": [reason],
+                "idle": ["shared view released; awaiting next natural round"],
+                "blocked": [reason],
+                "preparing": ["warming caches"],
+            },
+        )
 
     def test_summary_rejects_invalid_lock_key(self):
         s.report(self.pool, self.env, mode="shared", key="../unexpected")

@@ -293,6 +293,8 @@ with tempfile.TemporaryDirectory(prefix="tauceti-github-accounts-") as tmp:
         with (
             patch.object(loop, "choose_model", return_value=("claude", {})),
             patch.object(loop, "github_budget", return_value={}),
+            patch("tauceti_worker.github_transport.observed_budget", return_value={}),
+            patch("tauceti_worker.github_transport.scope", return_value="fixture"),
             patch.object(loop, "run_round_subprocess", side_effect=capture),
         ):
             loop.cmd_loop(

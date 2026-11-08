@@ -1,0 +1,1293 @@
+{
+ "candidates": {
+  "keys": {
+   "admissions": {
+    "items": {
+     "keys": {
+      "batch_id": {
+       "types": [
+        "int"
+       ]
+      },
+      "id": {
+       "types": [
+        "int"
+       ]
+      },
+      "link_id": {
+       "types": [
+        "int"
+       ]
+      },
+      "observed_at": {
+       "types": [
+        "int"
+       ]
+      },
+      "snapshot": {
+       "keys": {
+        "base": {
+         "types": [
+          "str"
+         ]
+        },
+        "bundle_id": {
+         "types": [
+          "null"
+         ]
+        },
+        "head_sha": {
+         "types": [
+          "str"
+         ]
+        },
+        "manual_approval": {
+         "keys": {
+          "actor_id": {
+           "types": [
+            "int"
+           ]
+          },
+          "head_sha": {
+           "types": [
+            "str"
+           ]
+          },
+          "merge_base_sha": {
+           "types": [
+            "str"
+           ]
+          }
+         },
+         "required": [
+          "actor_id",
+          "head_sha",
+          "merge_base_sha"
+         ],
+         "types": [
+          "dict",
+          "null"
+         ]
+        },
+        "original_admitted_at": {
+         "types": [
+          "int"
+         ]
+        },
+        "parent_admission_id": {
+         "types": [
+          "int",
+          "null"
+         ]
+        },
+        "parent_batch_id": {
+         "types": [
+          "int",
+          "null"
+         ]
+        },
+        "parent_candidate_id": {
+         "types": [
+          "int",
+          "null"
+         ]
+        },
+        "patch_id": {
+         "types": [
+          "int"
+         ]
+        },
+        "pr": {
+         "types": [
+          "int"
+         ]
+        },
+        "queue_age_retries": {
+         "types": [
+          "int"
+         ]
+        },
+        "remainder_retries": {
+         "types": [
+          "int"
+         ]
+        },
+        "retry_reason": {
+         "types": [
+          "null",
+          "str"
+         ]
+        },
+        "reviewer": {
+         "types": [
+          "str"
+         ]
+        },
+        "scheduling": {
+         "keys": {
+          "label_hint": {
+           "keys": {
+            "binding": {
+             "types": [
+              "str"
+             ]
+            },
+            "head_sha": {
+             "types": [
+              "str"
+             ]
+            },
+            "labels": {
+             "items": {
+              "types": [
+               "str"
+              ]
+             },
+             "types": [
+              "list"
+             ]
+            },
+            "observed_at": {
+             "types": [
+              "int"
+             ]
+            },
+            "pr": {
+             "types": [
+              "int"
+             ]
+            },
+            "project_id": {
+             "types": [
+              "int"
+             ]
+            },
+            "schema": {
+             "types": [
+              "str"
+             ]
+            },
+            "source": {
+             "types": [
+              "str"
+             ]
+            },
+            "timestamp_unit": {
+             "types": [
+              "str"
+             ]
+            }
+           },
+           "required": [
+            "binding",
+            "head_sha",
+            "labels",
+            "observed_at",
+            "pr",
+            "project_id",
+            "schema",
+            "source",
+            "timestamp_unit"
+           ],
+           "types": [
+            "dict"
+           ]
+          },
+          "policy": {
+           "types": [
+            "str"
+           ]
+          },
+          "priority": {
+           "types": [
+            "int"
+           ]
+          },
+          "singleton": {
+           "types": [
+            "bool"
+           ]
+          }
+         },
+         "required": [
+          "label_hint",
+          "policy",
+          "priority",
+          "singleton"
+         ],
+         "types": [
+          "dict"
+         ]
+        },
+        "source": {
+         "types": [
+          "str"
+         ]
+        }
+       },
+       "required": [
+        "base",
+        "bundle_id",
+        "head_sha",
+        "manual_approval",
+        "original_admitted_at",
+        "parent_admission_id",
+        "parent_batch_id",
+        "parent_candidate_id",
+        "patch_id",
+        "pr",
+        "queue_age_retries",
+        "remainder_retries",
+        "retry_reason",
+        "reviewer",
+        "scheduling",
+        "source"
+       ],
+       "types": [
+        "dict"
+       ]
+      }
+     },
+     "required": [
+      "batch_id",
+      "id",
+      "link_id",
+      "observed_at",
+      "snapshot"
+     ],
+     "types": [
+      "dict"
+     ]
+    },
+    "types": [
+     "list"
+    ]
+   },
+   "base": {
+    "types": [
+     "str"
+    ]
+   },
+   "batch_id": {
+    "types": [
+     "int",
+     "null"
+    ]
+   },
+   "candidates": {
+    "items": {
+     "keys": {
+      "batch_id": {
+       "types": [
+        "int"
+       ]
+      },
+      "events": {
+       "items": {
+        "keys": {
+         "details": {
+          "open": true,
+          "types": [
+           "dict"
+          ]
+         },
+         "id": {
+          "types": [
+           "int"
+          ]
+         },
+         "kind": {
+          "types": [
+           "str"
+          ]
+         },
+         "observed_at": {
+          "types": [
+           "int"
+          ]
+         },
+         "source": {
+          "types": [
+           "str"
+          ]
+         }
+        },
+        "required": [
+         "details",
+         "id",
+         "kind",
+         "observed_at",
+         "source"
+        ],
+        "types": [
+         "dict"
+        ]
+       },
+       "types": [
+        "list"
+       ]
+      },
+      "generation": {
+       "types": [
+        "int"
+       ]
+      },
+      "id": {
+       "types": [
+        "int"
+       ]
+      },
+      "observed_at": {
+       "types": [
+        "int"
+       ]
+      },
+      "runner_assigned_at": {
+       "types": [
+        "int",
+        "null"
+       ]
+      },
+      "runner_finished_at": {
+       "types": [
+        "int",
+        "null"
+       ]
+      },
+      "runner_started_at": {
+       "types": [
+        "int",
+        "null"
+       ]
+      },
+      "snapshot": {
+       "keys": {
+        "base": {
+         "types": [
+          "str"
+         ]
+        },
+        "base_sha": {
+         "types": [
+          "str"
+         ]
+        },
+        "contract": {
+         "types": [
+          "str"
+         ]
+        },
+        "members": {
+         "items": {
+          "keys": {
+           "admission_id": {
+            "types": [
+             "int"
+            ]
+           },
+           "assembly_head_sha": {
+            "types": [
+             "str"
+            ]
+           },
+           "base": {
+            "types": [
+             "str"
+            ]
+           },
+           "bundle_id": {
+            "types": [
+             "null"
+            ]
+           },
+           "head_sha": {
+            "types": [
+             "str"
+            ]
+           },
+           "link_id": {
+            "types": [
+             "int"
+            ]
+           },
+           "manual_approval": {
+            "keys": {
+             "actor_id": {
+              "types": [
+               "int"
+              ]
+             },
+             "head_sha": {
+              "types": [
+               "str"
+              ]
+             },
+             "merge_base_sha": {
+              "types": [
+               "str"
+              ]
+             }
+            },
+            "required": [
+             "actor_id",
+             "head_sha",
+             "merge_base_sha"
+            ],
+            "types": [
+             "dict",
+             "null"
+            ]
+           },
+           "original_admitted_at": {
+            "types": [
+             "int"
+            ]
+           },
+           "parent_admission_id": {
+            "types": [
+             "int",
+             "null"
+            ]
+           },
+           "parent_batch_id": {
+            "types": [
+             "int",
+             "null"
+            ]
+           },
+           "parent_candidate_id": {
+            "types": [
+             "int",
+             "null"
+            ]
+           },
+           "patch_id": {
+            "types": [
+             "int"
+            ]
+           },
+           "pr": {
+            "types": [
+             "int"
+            ]
+           },
+           "queue_age_retries": {
+            "types": [
+             "int"
+            ]
+           },
+           "remainder_retries": {
+            "types": [
+             "int"
+            ]
+           },
+           "retry_reason": {
+            "types": [
+             "null",
+             "str"
+            ]
+           },
+           "reviewer": {
+            "types": [
+             "str"
+            ]
+           },
+           "scheduling": {
+            "keys": {
+             "label_hint": {
+              "keys": {
+               "binding": {
+                "types": [
+                 "str"
+                ]
+               },
+               "head_sha": {
+                "types": [
+                 "str"
+                ]
+               },
+               "labels": {
+                "items": {
+                 "types": [
+                  "str"
+                 ]
+                },
+                "types": [
+                 "list"
+                ]
+               },
+               "observed_at": {
+                "types": [
+                 "int"
+                ]
+               },
+               "pr": {
+                "types": [
+                 "int"
+                ]
+               },
+               "project_id": {
+                "types": [
+                 "int"
+                ]
+               },
+               "schema": {
+                "types": [
+                 "str"
+                ]
+               },
+               "source": {
+                "types": [
+                 "str"
+                ]
+               },
+               "timestamp_unit": {
+                "types": [
+                 "str"
+                ]
+               }
+              },
+              "required": [
+               "binding",
+               "head_sha",
+               "labels",
+               "observed_at",
+               "pr",
+               "project_id",
+               "schema",
+               "source",
+               "timestamp_unit"
+              ],
+              "types": [
+               "dict"
+              ]
+             },
+             "policy": {
+              "types": [
+               "str"
+              ]
+             },
+             "priority": {
+              "types": [
+               "int"
+              ]
+             },
+             "singleton": {
+              "types": [
+               "bool"
+              ]
+             }
+            },
+            "required": [
+             "label_hint",
+             "policy",
+             "priority",
+             "singleton"
+            ],
+            "types": [
+             "dict"
+            ]
+           },
+           "source": {
+            "types": [
+             "str"
+            ]
+           }
+          },
+          "required": [
+           "admission_id",
+           "assembly_head_sha",
+           "base",
+           "bundle_id",
+           "head_sha",
+           "link_id",
+           "manual_approval",
+           "original_admitted_at",
+           "parent_admission_id",
+           "parent_batch_id",
+           "parent_candidate_id",
+           "patch_id",
+           "pr",
+           "queue_age_retries",
+           "retry_reason",
+           "reviewer",
+           "scheduling",
+           "source"
+          ],
+          "types": [
+           "dict"
+          ]
+         },
+         "types": [
+          "list"
+         ]
+        },
+        "previous_generation_id": {
+         "types": [
+          "int",
+          "null"
+         ]
+        },
+        "speculative_predecessor_id": {
+         "types": [
+          "int",
+          "null"
+         ]
+        }
+       },
+       "required": [
+        "base",
+        "base_sha",
+        "contract",
+        "members",
+        "previous_generation_id",
+        "speculative_predecessor_id"
+       ],
+       "types": [
+        "dict"
+       ]
+      },
+      "unknown_reason": {
+       "types": [
+        "null",
+        "str"
+       ]
+      }
+     },
+     "required": [
+      "batch_id",
+      "events",
+      "generation",
+      "id",
+      "observed_at",
+      "runner_assigned_at",
+      "runner_finished_at",
+      "runner_started_at",
+      "snapshot",
+      "unknown_reason"
+     ],
+     "types": [
+      "dict"
+     ]
+    },
+    "types": [
+     "list"
+    ]
+   },
+   "historical_unknown_reason": {
+    "types": [
+     "str"
+    ]
+   },
+   "queue_authority": {
+    "types": [
+     "bool"
+    ]
+   },
+   "repo": {
+    "types": [
+     "str"
+    ]
+   },
+   "schema": {
+    "types": [
+     "str"
+    ]
+   },
+   "timestamp_unit": {
+    "types": [
+     "str"
+    ]
+   }
+  },
+  "required": [
+   "admissions",
+   "base",
+   "batch_id",
+   "candidates",
+   "historical_unknown_reason",
+   "queue_authority",
+   "repo",
+   "schema",
+   "timestamp_unit"
+  ],
+  "types": [
+   "dict"
+  ]
+ },
+ "derived_from": {
+  "candidates": "candidates-latest.json",
+  "observation": "active-batches-2026-11-04T0745Z.json"
+ },
+ "observation": {
+  "keys": {
+   "base": {
+    "types": [
+     "str"
+    ]
+   },
+   "batch_ids": {
+    "items": {
+     "types": [
+      "int"
+     ]
+    },
+    "types": [
+     "list"
+    ]
+   },
+   "batches": {
+    "items": {
+     "keys": {
+      "base": {
+       "types": [
+        "str"
+       ]
+      },
+      "base_sha": {
+       "types": [
+        "null",
+        "str"
+       ]
+      },
+      "head_sha": {
+       "types": [
+        "null",
+        "str"
+       ]
+      },
+      "id": {
+       "types": [
+        "int"
+       ]
+      },
+      "members": {
+       "items": {
+        "keys": {
+         "head_sha": {
+          "types": [
+           "str"
+          ]
+         },
+         "pr": {
+          "types": [
+           "int"
+          ]
+         }
+        },
+        "required": [
+         "head_sha",
+         "pr"
+        ],
+        "types": [
+         "dict"
+        ]
+       },
+       "types": [
+        "list"
+       ]
+      },
+      "promotion_failures": {
+       "types": [
+        "int"
+       ]
+      },
+      "promotion_retry_at": {
+       "types": [
+        "int"
+       ]
+      },
+      "recovery_after": {
+       "types": [
+        "int"
+       ]
+      },
+      "recovery_failures": {
+       "types": [
+        "int"
+       ]
+      },
+      "sealed": {
+       "types": [
+        "bool"
+       ]
+      },
+      "state": {
+       "types": [
+        "str"
+       ]
+      },
+      "train": {
+       "keys": {
+        "candidate_id": {
+         "types": [
+          "int"
+         ]
+        },
+        "generation": {
+         "types": [
+          "int"
+         ]
+        },
+        "predecessor_id": {
+         "types": [
+          "null"
+         ]
+        },
+        "staging_ref": {
+         "types": [
+          "str"
+         ]
+        }
+       },
+       "required": [
+        "candidate_id",
+        "generation",
+        "predecessor_id",
+        "staging_ref"
+       ],
+       "types": [
+        "dict",
+        "null"
+       ]
+      }
+     },
+     "required": [
+      "base",
+      "base_sha",
+      "head_sha",
+      "id",
+      "members",
+      "promotion_failures",
+      "promotion_retry_at",
+      "recovery_after",
+      "recovery_failures",
+      "sealed",
+      "state",
+      "train"
+     ],
+     "types": [
+      "dict"
+     ]
+    },
+    "types": [
+     "list"
+    ]
+   },
+   "bump_repairs": {
+    "items": {
+     "keys": {
+      "batch_id": {
+       "types": [
+        "int"
+       ]
+      },
+      "head_sha": {
+       "types": [
+        "str"
+       ]
+      },
+      "pr": {
+       "types": [
+        "int"
+       ]
+      }
+     },
+     "open": true,
+     "required": [
+      "batch_id",
+      "head_sha",
+      "pr"
+     ],
+     "types": [
+      "dict"
+     ]
+    },
+    "types": [
+     "list"
+    ]
+   },
+   "handoff": {
+    "keys": {
+     "backend": {
+      "types": [
+       "str"
+      ]
+     },
+     "bors_count": {
+      "types": [
+       "int"
+      ]
+     },
+     "candidate_scan_complete": {
+      "types": [
+       "bool"
+      ]
+     },
+     "candidate_snapshot_at": {
+      "types": [
+       "null"
+      ]
+     },
+     "eligible": {
+      "items": {
+       "keys": {
+        "head_sha": {
+         "types": [
+          "str"
+         ]
+        },
+        "pr": {
+         "types": [
+          "int"
+         ]
+        },
+        "queued": {
+         "types": [
+          "bool"
+         ]
+        },
+        "ready": {
+         "types": [
+          "bool"
+         ]
+        }
+       },
+       "required": [
+        "head_sha",
+        "pr",
+        "queued",
+        "ready"
+       ],
+       "types": [
+        "dict"
+       ]
+      },
+      "types": [
+       "list"
+      ]
+     },
+     "github_count": {
+      "types": [
+       "int"
+      ]
+     },
+     "observed_at": {
+      "types": [
+       "str"
+      ]
+     },
+     "overlap": {
+      "types": [
+       "bool"
+      ]
+     },
+     "pending": {
+      "types": [
+       "int"
+      ]
+     },
+     "reason": {
+      "types": [
+       "str"
+      ]
+     },
+     "released_github_prs": {
+      "items": {
+       "types": [
+        "int"
+       ]
+      },
+      "types": [
+       "list"
+      ]
+     },
+     "updated_at": {
+      "types": [
+       "str"
+      ]
+     }
+    },
+    "required": [
+     "backend",
+     "bors_count",
+     "candidate_scan_complete",
+     "candidate_snapshot_at",
+     "eligible",
+     "github_count",
+     "observed_at",
+     "overlap",
+     "pending",
+     "reason",
+     "released_github_prs",
+     "updated_at"
+    ],
+    "types": [
+     "dict"
+    ]
+   },
+   "held": {
+    "items": {
+     "keys": {
+      "head_sha": {
+       "types": [
+        "str"
+       ]
+      },
+      "pr": {
+       "types": [
+        "int"
+       ]
+      }
+     },
+     "required": [
+      "head_sha",
+      "pr"
+     ],
+     "types": [
+      "dict"
+     ]
+    },
+    "types": [
+     "list"
+    ]
+   },
+   "outcomes": {
+    "items": {
+     "keys": {
+      "batch_id": {
+       "types": [
+        "int"
+       ]
+      },
+      "head_sha": {
+       "types": [
+        "str"
+       ]
+      },
+      "pr": {
+       "types": [
+        "int"
+       ]
+      },
+      "state": {
+       "types": [
+        "str"
+       ]
+      }
+     },
+     "required": [
+      "batch_id",
+      "head_sha",
+      "pr",
+      "state"
+     ],
+     "types": [
+      "dict"
+     ]
+    },
+    "types": [
+     "list"
+    ]
+   },
+   "repo": {
+    "types": [
+     "str"
+    ]
+   },
+   "requested_batch": {
+    "keys": {
+     "base": {
+      "types": [
+       "str"
+      ]
+     },
+     "base_sha": {
+      "types": [
+       "null",
+       "str"
+      ]
+     },
+     "head_sha": {
+      "types": [
+       "null",
+       "str"
+      ]
+     },
+     "id": {
+      "types": [
+       "int"
+      ]
+     },
+     "members": {
+      "items": {
+       "keys": {
+        "head_sha": {
+         "types": [
+          "str"
+         ]
+        },
+        "pr": {
+         "types": [
+          "int"
+         ]
+        }
+       },
+       "required": [
+        "head_sha",
+        "pr"
+       ],
+       "types": [
+        "dict"
+       ]
+      },
+      "types": [
+       "list"
+      ]
+     },
+     "promotion_failures": {
+      "types": [
+       "int"
+      ]
+     },
+     "promotion_retry_at": {
+      "types": [
+       "int"
+      ]
+     },
+     "recovery_after": {
+      "types": [
+       "int"
+      ]
+     },
+     "recovery_failures": {
+      "types": [
+       "int"
+      ]
+     },
+     "sealed": {
+      "types": [
+       "bool"
+      ]
+     },
+     "state": {
+      "types": [
+       "str"
+      ]
+     },
+     "train": {
+      "keys": {
+       "candidate_id": {
+        "types": [
+         "int"
+        ]
+       },
+       "generation": {
+        "types": [
+         "int"
+        ]
+       },
+       "predecessor_id": {
+        "types": [
+         "null"
+        ]
+       },
+       "staging_ref": {
+        "types": [
+         "str"
+        ]
+       }
+      },
+      "required": [
+       "candidate_id",
+       "generation",
+       "predecessor_id",
+       "staging_ref"
+      ],
+      "types": [
+       "dict",
+       "null"
+      ]
+     }
+    },
+    "required": [
+     "base",
+     "base_sha",
+     "head_sha",
+     "id",
+     "members",
+     "promotion_failures",
+     "promotion_retry_at",
+     "recovery_after",
+     "recovery_failures",
+     "sealed",
+     "state",
+     "train"
+    ],
+    "types": [
+     "dict",
+     "null"
+    ]
+   },
+   "schema": {
+    "types": [
+     "str"
+    ]
+   },
+   "scope_approvals": {
+    "items": {
+     "keys": {
+      "actor_id": {
+       "types": [
+        "int"
+       ]
+      },
+      "head_sha": {
+       "types": [
+        "str"
+       ]
+      },
+      "merge_base_sha": {
+       "types": [
+        "str"
+       ]
+      },
+      "pr": {
+       "types": [
+        "int"
+       ]
+      }
+     },
+     "required": [
+      "actor_id",
+      "head_sha",
+      "merge_base_sha",
+      "pr"
+     ],
+     "types": [
+      "dict"
+     ]
+    },
+    "types": [
+     "list"
+    ]
+   }
+  },
+  "required": [
+   "base",
+   "batch_ids",
+   "batches",
+   "bump_repairs",
+   "handoff",
+   "held",
+   "outcomes",
+   "repo",
+   "requested_batch",
+   "schema",
+   "scope_approvals"
+  ],
+  "types": [
+   "dict"
+  ]
+ }
+}

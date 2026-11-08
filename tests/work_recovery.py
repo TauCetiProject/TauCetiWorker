@@ -15,7 +15,7 @@ Pinned here, with local git fixtures only (no GitHub, no agents):
   6. Save failures (no space, permission, archive bound), a live process using the checkout, and an
      unstable tree move the whole checkout aside unmodified and preparation continues on a fresh
      clone; a later preparation saves and removes the retained copy once nothing uses it.
-  7. Interrupted saves, corrupt manifests and damaged payloads are never trusted or deleted.
+  7. Interrupted saves are never trusted; abandoned partials expire. Completed corrupt records stay intact.
   8. Host work (`prepare_checkout`, roadmap) and progress preparation proceed after saving.
 
 Exit 0 = all assertions hold; 1 = a mismatch.
@@ -400,12 +400,12 @@ def test_move_aside(root):
     check("unsavable and unmovable: refused, retried next round", not d.ok and "left intact" in d.reason)
     check("unsavable and unmovable: checkout intact", (co / "Draft.lean").read_text() == "x\n")
 
-    # A crash mid-save leaves a .tmp directory: never mistaken for a record, counted as incomplete.
+    # A crash mid-save leaves temporary debris, never an operator recovery task.
     rec = cfg.state / "recovery"
     rec.mkdir(parents=True, exist_ok=True)
     (rec / ".tmp-crashed-1-abcd").mkdir()
     s = prepared_summary(root / "stuck" / "state")
-    check("interrupted save counted incomplete", s["incomplete"] == 1 and s["records"] == 0)
+    check("interrupted save not a recovery task", s["incomplete"] == 0 and s["records"] == 0)
 
     # Corrupt manifest and damaged payloads: neither reused nor deleted.
     origin, co, cfg = fixture(root / "corrupt")
@@ -545,6 +545,15 @@ def test_push_and_owner(root):
     git(co, "commit", "-qam", "pushed")
     pushed = git(co, "rev-parse", "HEAD").strip()
     env = {**os.environ, "TAUCETI_PUSH_REF": "feature", "TAUCETI_PUSH_REMOTE": str(origin), "TAUCETI_CLAIM_KEY": ""}
+    events = root / "push-events"
+    emitter = root / "push-emitter.py"
+    emitter.write_text(f"from pathlib import Path\nwith Path({str(events)!r}).open('a') as f: f.write('changed\\n')\n")
+    env.update(
+        TAUCETI_FLEET_EVENTS=str(events),
+        TAUCETI_FLEET_PYTHON=sys.executable,
+        TAUCETI_FLEET_EMITTER=str(emitter),
+        TAUCETI_PUSH_SCOPE="first-push",
+    )
     env.pop("TAUCETI_PUSH_EXPECT", None)
     rc = subprocess.run([str(REPO / "scripts" / "git-safe-push")], cwd=co, env=env, capture_output=True).returncode
     check("git-safe-push: pushed", rc == 0 and git(origin, "rev-parse", "feature").strip() == pushed)
@@ -553,6 +562,18 @@ def test_push_and_owner(root):
         git(co, "rev-parse", "refs/tauceti/published/push/feature").strip() == pushed,
     )
     check("pushed work needs no record", wr.guard(cfg, co).state == "clean")
+    env.update(TAUCETI_PUSH_EXPECT=pushed, TAUCETI_PUSH_SCOPE="unchanged-push")
+    repeat = subprocess.run([str(REPO / "scripts" / "git-safe-push")], cwd=co, env=env, capture_output=True)
+    check(
+        "up-to-date push succeeds without counting another publication",
+        repeat.returncode == 0 and events.read_text().splitlines() == ["changed"],
+    )
+    absent = subprocess.run(
+        ["git", "rev-parse", "--verify", "refs/tauceti/published/scope/unchanged-push/feature"],
+        cwd=co,
+        capture_output=True,
+    )
+    check("up-to-date push creates no round-scoped changed-publication marker", absent.returncode != 0)
 
     saved_sync, saved_atomic = tc.agents.sync_mathlib_pool, wr.atomic_json
     tc.agents.sync_mathlib_pool = lambda cfg: None
@@ -652,13 +673,13 @@ def test_work_paths(root):
     cfg.logdir = root / "paths" / "logs"
     (co / "Draft.lean").write_text("unfinished\n")
     wu = tc.work_units
-    names = ("fetch_ref", "run_agent_host", "roadmap_areas", "ensure_fork", "administrative_hold_avoid_list")
+    names = ("fetch_ref", "run_agent_host", "roadmap_areas", "ensure_fork", "avoid_list")
     saved = {k: getattr(wu, k) for k in names}
     saved_sync = tc.agents.sync_mathlib_pool
     launched = []
     wu.fetch_ref = lambda *a, **k: True
     wu.ensure_fork = lambda: "alice/TauCeti"
-    wu.administrative_hold_avoid_list = lambda *_a: "none"
+    wu.avoid_list = lambda *_a: "none"
     wu.roadmap_areas = lambda gh: ["algebra"]
     wu.run_agent_host = lambda *a, **k: launched.append(a) or 0
     tc.agents.sync_mathlib_pool = lambda cfg: None
@@ -713,7 +734,7 @@ def test_activity(root):
     with patch.object(wr, "HERE", root / "act"), patch.object(activity, "_refresh_prs", lambda *a: None):
         value = activity.prepare()
     rec = value["all"]["work_recovery"]
-    check("activity: retained and incomplete counted", rec["retained"] >= 1 and rec["incomplete"] == 1)
+    check("activity: retained counted, temporary writes omitted", rec["retained"] >= 1 and rec["incomplete"] == 0)
     check("activity: reason names the worker", any(r.startswith("w: ") for r in rec["reasons"]))
     summary = activity.cached()
     combined = activity_summary.combine([summary, summary])

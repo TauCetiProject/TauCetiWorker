@@ -11,12 +11,14 @@ import sys
 import tempfile
 import time
 import unittest
+import venv
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from process_cleanup import running
 
+from tauceti_worker import verification_tools
 from tauceti_worker.verification import (
     Verification,
     _HashCache,
@@ -49,7 +51,14 @@ class Receipts(unittest.TestCase):
         git(self.root, "init", "-q")
         git(self.root, "config", "user.name", "Fixture")
         git(self.root, "config", "user.email", "fixture@example.org")
-        for name in ("TauCeti/A.lean", "TauCeti/B.lean", "lean-toolchain", "lake-manifest.json", "lakefile.toml"):
+        for name in (
+            "TauCeti.lean",
+            "TauCeti/A.lean",
+            "TauCeti/B.lean",
+            "lean-toolchain",
+            "lake-manifest.json",
+            "lakefile.toml",
+        ):
             write(self.root, name, "fixture\n")
         write(self.root, ".gitignore", ".lake/\nTauCeti/Ignored.lean\n")
         write(self.root, "scripts/lint-env.sh", 'echo "LINT-ENV: PASS"\n')
@@ -68,6 +77,10 @@ class Receipts(unittest.TestCase):
 import sys
 from pathlib import Path
 if sys.argv[1:] == ['--print-prefix']: print({str(self.prefix)!r})
+elif '--run' in sys.argv:
+    import json
+    text = sys.stdin.read()
+    if text: print(json.dumps(dict(checked=len(json.loads(text)),problems=[])))
 else: Path('Main.c').write_text('fixture compiler output')
 """,
         )
@@ -271,10 +284,10 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["commands"][-1]["exit"], 23)
         os.environ.pop("FIXTURE_MODE")
+        # Candidate-owned style scripts cannot replace the shared implementation.
         write(self.root, "scripts/lint-style.sh", "false | cat\n")
         result = self.verify(stage="lint")
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["commands"][-1]["exit"], 1)
+        self.assertEqual(result["status"], "success", result.get("error"))
 
     def test_local_axioms_never_initialize_lake_or_fall_back_to_full(self):
         write(self.root, "TauCeti/A.lean", "changed")
@@ -484,6 +497,169 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.verify(stage="shim-expiry", base=base)
         self.assertNotIn("--only-new", json.loads((self.root / ".lake/shim-args").read_text()))
 
+    def test_shim_wrapper_uses_worker_python_and_preserves_nested_sibling_imports(self):
+        os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+        bare = self.home / "bare-python"
+        venv.EnvBuilder(with_pip=False, symlinks=True).create(bare)
+        os.environ["PATH"] = f"{self.bin}:{bare / 'bin'}:{os.environ['PATH']}"
+        script = write(
+            self.root,
+            "scripts/check-expired-mathlib-shims.py",
+            "import sys\nfrom pathlib import Path\n"
+            "from tauceti_tools.templates import run_script\n"
+            "import tauceti_tools.templates as templates\n"
+            "templates.ASSETS = Path(__file__).parent / 'shared'\n"
+            "templates.bootstrap = lambda args: None\n"
+            "Path('.lake').mkdir(exist_ok=True)\n"
+            "Path('.lake/shim-python').write_text(sys.executable)\n"
+            "raise SystemExit(run_script('shim.py', sys.argv[1:]))\n",
+        )
+        write(self.root, "scripts/shared/scripts/sibling.py", "VALUE = 'nested checker completed'\n")
+        write(
+            self.root,
+            "scripts/shared/scripts/shim.py",
+            "from pathlib import Path\nfrom sibling import VALUE\nPath('.lake/nested-shim').write_text(VALUE)\n",
+        )
+        old = subprocess.run(["python3", str(script)], cwd=self.root, capture_output=True, text=True)
+        self.assertNotEqual(old.returncode, 0)
+        self.assertIn("No module named 'tauceti_tools'", old.stderr)
+        result = self.verify(stage="shim-expiry")
+        self.assertEqual(result["status"], "success", result.get("error"))
+        self.assertEqual((self.root / ".lake/shim-python").read_text(), sys.executable)
+        self.assertEqual((self.root / ".lake/nested-shim").read_text(), "nested checker completed")
+
+    def test_missing_tools_is_incomplete_before_lake_and_recovers_without_latch(self):
+        write(self.root, "scripts/check-expired-mathlib-shims.py", "from tauceti_tools import templates\n")
+        with patch.object(verification_tools, "check", side_effect=verification_tools.Unavailable("missing Tools")):
+            for stage in ("shim-expiry", "lint"):
+                result = self.verify(stage=stage)
+                self.assertEqual(result["status"], "incomplete")
+                self.assertEqual(result["incomplete_reason"], "tool-missing")
+                self.assertEqual(result["commands"], [])
+        self.assertEqual(self.verify(stage="shim-expiry")["status"], "success")
+
+    def test_early_source_checker_unavailable_is_incomplete_before_build(self):
+        actual = Verification.command
+
+        def unavailable(verifier, phase, argv, **kwargs):
+            if phase == "lint" and "sources" in argv:
+                raise subprocess.CalledProcessError(75, argv)
+            return actual(verifier, phase, argv, **kwargs)
+
+        with patch.object(Verification, "command", unavailable):
+            result = self.verify(stage="all")
+        self.assertEqual(result["status"], "incomplete", result.get("error"))
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+        self.assertNotIn("build", result["phases"])
+
+    def test_module_system_does_not_require_changed_module_scope(self):
+        write(self.root, ".git/shallow", self.base + "\n")
+        result = self.verify(stage="module-system")
+        self.assertEqual(result["scope"]["mode"], "unknown")
+        self.assertEqual(result["status"], "success", result.get("error"))
+
+    def test_probe_preserves_mounted_pythonpath_and_observes_package_repair(self):
+        bare = self.home / "mounted-python"
+        venv.EnvBuilder(with_pip=False, symlinks=True).create(bare)
+        mounted = self.home / "mounted-tools"
+        write(self.root, "scripts/check-expired-mathlib-shims.py", "from tauceti_tools import templates\n")
+        env = dict(os.environ, PYTHONPATH=str(mounted))
+        with patch.object(sys, "executable", str(bare / "bin/python")):
+            with self.assertRaises(verification_tools.Unavailable):
+                verification_tools.check(self.root, env=env)
+            write(mounted, "tauceti_tools/__init__.py", "")
+            write(mounted, "tauceti_tools/templates.py", "# repaired mounted package\n")
+            verification_tools.check(self.root, env=env)
+
+    def test_tools_disappearing_after_preflight_are_incomplete(self):
+        write(
+            self.root,
+            "scripts/check-expired-mathlib-shims.py",
+            "from tauceti_tools import templates\nraise SystemExit(1)\n",
+        )
+        with patch.object(
+            verification_tools, "check", side_effect=[None, None, verification_tools.Unavailable("Tools removed")]
+        ):
+            result = self.verify(stage="shim-expiry")
+        self.assertEqual(result["status"], "incomplete", result.get("error"))
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+
+    def test_temporary_probe_failures_are_retryable_not_blocked_tools(self):
+        write(self.root, "scripts/check-expired-mathlib-shims.py", "from tauceti_tools import templates\n")
+        for failure in (OSError("temporary process exhaustion"), subprocess.TimeoutExpired("probe", 30)):
+            with patch("tauceti_worker.processes.run", side_effect=failure):
+                result = self.verify(stage="shim-expiry")
+            self.assertEqual(result["status"], "incomplete")
+            self.assertEqual(result["incomplete_reason"], "verification-busy")
+        self.assertEqual(self.verify(stage="shim-expiry")["status"], "success")
+
+    def test_candidate_import_shadowing_is_source_failure_not_missing_worker_tools(self):
+        write(self.root, "scripts/ast.py", "raise RuntimeError('candidate module shadow')\n")
+        write(
+            self.root,
+            "scripts/check-expired-mathlib-shims.py",
+            "from tauceti_tools import templates\nimport ast\n",
+        )
+        result = self.verify(stage="shim-expiry")
+        self.assertEqual(result["status"], "failed", result.get("error"))
+
+    def test_missing_parent_tools_do_not_crash_identity_readiness_or_json_receipt(self):
+        from tauceti_worker.verification_jobs import tool_readiness
+
+        with patch.object(verification_tools, "root", side_effect=verification_tools.Unavailable("Tools removed")):
+            self.assertIsInstance(verification_tools.identity(), str)
+            self.assertIsInstance(tool_readiness({}), str)
+            result = self.verify(stage="build")
+        self.assertEqual(result["status"], "incomplete", result.get("error"))
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+
+    def test_recovery_tool_identity_ignores_runtime_and_config_snapshot_paths(self):
+        import shutil
+
+        first = self.home / "runtime-one"
+        second = self.home / "runtime-two"
+        write(first, "tools/templates.py", "# identical installed Tools\n")
+        write(first, "snapshot-one.toml", "# identical project policy\n")
+        executable = first / "bin/python"
+        executable.parent.mkdir()
+        shutil.copy2(Path(sys.executable).resolve(), executable)
+        shutil.copytree(first, second)
+        (second / "snapshot-one.toml").rename(second / "snapshot-two.toml")
+        identities = []
+        for runtime, snapshot in ((first, "snapshot-one.toml"), (second, "snapshot-two.toml")):
+            with (
+                patch.object(verification_tools, "root", return_value=runtime / "tools"),
+                patch.object(sys, "executable", str(runtime / "bin/python")),
+                patch.dict(os.environ, TAUCETI_CONF_SNAPSHOT=str(runtime / snapshot)),
+            ):
+                identities.append(verification_tools.identity())
+        self.assertEqual(*identities)
+
+    def test_shim_failure_codes_remain_source_failures_with_working_tools(self):
+        for code in (1, 2, 3, 75):
+            write(
+                self.root,
+                "scripts/check-expired-mathlib-shims.py",
+                f"from tauceti_tools import templates\nraise SystemExit({code})\n",
+            )
+            result = self.verify(stage="shim-expiry", reuse=False)
+            self.assertEqual(result["status"], "failed", (code, result.get("error")))
+
+    def test_tools_changes_invalidate_receipts_and_readiness(self):
+        from tauceti_worker.verification_jobs import tool_readiness
+
+        tools = self.home / "installed-tools"
+        marker = write(tools, "checker.py", "# installed Tools revision one\n")
+        with patch.object(verification_tools, "root", return_value=tools):
+            first = self.verify(stage="build")
+            before = tool_readiness({})
+            marker.write_text("# installed Tools revision two\n")
+            second = self.verify(stage="build")
+            self.assertNotEqual(before, tool_readiness({}))
+        self.assertEqual(first["status"], "success", first.get("error"))
+        self.assertEqual(second["status"], "success", second.get("error"))
+        self.assertNotEqual(first["fingerprint"], second["fingerprint"])
+
     def test_old_cleanup_markers_do_not_block_verification(self):
         markers = self.home / "activity/containment-unconfirmed"
         markers.mkdir(parents=True)
@@ -502,9 +678,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         write(self.root, "scripts/lint-env.sh", 'cat "$LINT_ONLY_MODULES"\n')
         result = self.verify(stage="lint", lint_modules=modules)
         self.assertEqual(result["status"], "success", result.get("error"))
-        lint = next(
-            c for c in result["commands"] if any(str(arg).endswith("/scripts/tauceti-local-lint") for arg in c["argv"])
-        )
+        lint = next(c for c in result["commands"] if "environment" in c["argv"])
         self.assertIn("TauCeti.B", Path(lint["argv"][-1]).read_text())
         self.assertFalse(any("scripts/lint-env.sh" in c["argv"] for c in result["commands"]))
         modules.write_text("TauCeti.A\n")
@@ -563,14 +737,24 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--lint-modules", result.stdout)
 
-    def test_host_wrapper_uses_worker_python_and_long_timeout(self):
+    def test_host_wrapper_keeps_shell_work_foreground_and_bounds_each_command(self):
         from tauceti_worker.agents import host_agent_argv, local_verification
 
         with patch.dict(os.environ, TAUCETI_ROUND_DEADLINE=str(time.time() + 1800)):
             _, env = host_agent_argv("fixture prompt", "claude")
         self.assertEqual(env["TAUCETI_VERIFY_PYTHON"], sys.executable)
-        self.assertGreater(int(env["BASH_MAX_TIMEOUT_MS"]), 1000000)
+        self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], "600000")
+        self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "600000")
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
         self.assertIn(sys.executable, local_verification("ordinary"))
+
+        with (
+            patch("tauceti_worker.agents.time.time", return_value=1000),
+            patch.dict(os.environ, TAUCETI_ROUND_DEADLINE="1030"),
+        ):
+            _, env = host_agent_argv("fixture prompt", "claude")
+        self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], "30000")
+        self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "30000")
 
     def test_installed_wrapper_permission(self):
         from tauceti_worker import cli

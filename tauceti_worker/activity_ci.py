@@ -46,16 +46,15 @@ def summarize(db, now, windows, column=None, identity=None):
     cursor = db.execute("SELECT value FROM meta WHERE key='activity_ci_cursor'").fetchone()
     if column == "worker" or not cursor or not json.loads(cursor[0]).get("complete", False):
         return None
-    condition, args = ("AND scope=?", [identity]) if column else ("", [])
-    result = {}
-    for name, seconds in windows.items():
-        since = now - seconds if seconds is not None else 0
-        rows = list(db.execute(f"SELECT * FROM ci_activity WHERE at>=? AND at<=? {condition}", [since, now, *args]))
-        result[name] = dict(
-            attempts=len(rows),
-            successes=sum(r["conclusion"] == "success" for r in rows),
-            failures=sum(r["conclusion"] == "failure" for r in rows),
-            wait_seconds=sum(r["wait_seconds"] or 0 for r in rows),
-            run_seconds=sum(r["run_seconds"] or 0 for r in rows),
-        )
-    return result
+    from .activity_rollup import snapshot
+    from .activity_rollup_sources import flush
+
+    flush(db, now)
+    _, totals = snapshot(db, now, windows, column=column, identity=identity)
+    return {
+        window: {
+            key: float(values.get("ci_" + key, 0))
+            for key in ("attempts", "successes", "failures", "wait_seconds", "run_seconds")
+        }
+        for window, values in totals.items()
+    }

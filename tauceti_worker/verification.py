@@ -29,16 +29,16 @@ from pathlib import Path
 
 from .config import Die
 from .constants import LEAN_ROOT
-from .paths import HERE
+from .paths import HERE, legacy_data_root
 from .processes import owned_process
 from .runtime_status import read_json, report_runtime
 from .verification_installations import Installations
 from .verification_scope import git, local_main, scope, untracked
-from .verification_storage import Limit, Pressure, cache_generation
+from .verification_storage import Pressure, cache_generation
 
 SCHEMA = "tauceti-verification/v1"
 POLICY_VERSION = 6
-LOCAL_CHECKERS = ("tauceti-local-axioms", "LocalAxioms.lean", "tauceti-local-lint", "LocalLint.lean")
+LOCAL_CHECKERS = ("tauceti-local-axioms", "tauceti-local-lint", "tauceti-local-checks")
 HASH_CACHE_LIMIT = 200000
 _HASH_CACHE = contextvars.ContextVar("verification_hash_cache", default=None)
 LEAN_DIR = LEAN_ROOT.replace(".", "/")
@@ -505,6 +505,19 @@ class Verification:
             }
         }
 
+    def tools_inputs(self):
+        from . import verification_tools
+
+        config = verification_tools.configuration()
+        try:
+            return dict(
+                root=str(verification_tools.root()),
+                files=self.installations.inventory(verification_tools.root()),
+                configuration=file_record(config) if config else None,
+            )
+        except verification_tools.Unavailable as error:
+            raise Incomplete(str(error), reason=error.reason) from error
+
     def validate_inputs(self, inputs, *, full=False):
         self.at_boundary = True
         try:
@@ -517,6 +530,7 @@ class Verification:
                     inventory(self.root, self.base) == inputs["sources"]
                     and scope(self.root, self.base, self.policy) == inputs["scope"]
                     and self.environment() == inputs["environment"]
+                    and self.tools_inputs() == inputs["tools"]
                     and (file_record(Path(config)) if config else None) == inputs["configuration"]
                     and (file_record(Path(self.lint_modules)) if self.lint_modules else None) == inputs["lint_modules"]
                     and POLICY_VERSION == inputs["policy_version"]
@@ -580,6 +594,7 @@ class Verification:
             policy_version=POLICY_VERSION,
             cache_generation=cache_generation(self.state, self.root),
             python=dict(version=sys.version, executable=file_record(Path(sys.executable))),
+            tools=self.tools_inputs(),
             lint_modules=file_record(Path(self.lint_modules)) if self.lint_modules else None,
         )
 
@@ -609,31 +624,6 @@ class Verification:
                     env,
                 )
             ]
-        if phase == "module-system":
-            return [(["lake", "exe", "module-system"], env)]
-        if phase == "lint":
-            if selected["mode"] == "unknown":
-                raise Incomplete("lint: changed modules unknown; CI owns the full environment lint")
-            commands = [(["bash", "-o", "pipefail", "scripts/lint-style.sh"], env)]
-            lint_list = self.directory / "lint-modules.txt"
-            lint_modules = set(selected["modules"])
-            if self.lint_modules:
-                for module in Path(self.lint_modules).read_text().splitlines():
-                    module = module.strip()
-                    if not module:
-                        continue
-                    path = module.replace(".", "/") + ".lean"
-                    from .verification_scope import MODULE
-
-                    if not MODULE.fullmatch(path) or not (self.root / path).is_file():
-                        raise Incomplete(f"invalid explicit lint module: {module}")
-                    lint_modules.add(module)
-            lint_list.write_text("".join(f"{m}\n" for m in sorted(lint_modules)))
-            if lint_modules:
-                commands.append(
-                    ([sys.executable, "-I", str(HERE / "scripts/tauceti-local-lint"), "--modules", str(lint_list)], env)
-                )
-            return commands
         if phase == "shim-expiry":
             script = self.root / "scripts/check-expired-mathlib-shims.py"
             if not script.exists():
@@ -646,7 +636,8 @@ class Verification:
             merge = selected["merge_base"]
             if not merge:
                 raise Incomplete("shim-expiry: cannot determine merge-base registry")
-            args = ["python3", str(script), "--fail-on-available"]
+            self.check_tools()
+            args = [sys.executable, str(script), "--fail-on-available"]
             baseline = self.directory / "base"
             baseline.mkdir(exist_ok=True)
             try:
@@ -673,7 +664,40 @@ class Verification:
                 if not pins and self.policy != "bump":
                     args += ["--only-new"]
             return [(args, env)]
-        raise ValueError(f"unknown verification phase {phase}")
+        if phase not in {"module-system", "lint"}:
+            raise ValueError(f"unknown verification phase {phase}")
+        if phase == "lint" and selected["mode"] == "unknown":
+            raise Incomplete(f"{phase}: changed modules unknown; CI owns the full checks")
+        self.check_tools()
+        shared = [sys.executable, str(HERE / "scripts/tauceti-local-checks")]
+        common = ["--base", self.base, "--policy", self.policy, "--modules", str(modules)]
+        if phase == "lint":
+            lint_list = self.directory / "lint-modules.txt"
+            selected_modules = set(selected["modules"])
+            if self.lint_modules:
+                from .verification_scope import MODULE
+
+                for module in Path(self.lint_modules).read_text().splitlines():
+                    module = module.strip()
+                    if module and (
+                        not MODULE.fullmatch(module.replace(".", "/") + ".lean")
+                        or not (self.root / (module.replace(".", "/") + ".lean")).is_file()
+                    ):
+                        raise Incomplete(f"invalid explicit lint module: {module}")
+                    if module:
+                        selected_modules.add(module)
+            lint_list.write_text("".join(m + "\n" for m in sorted(selected_modules)))
+            common = ["--base", self.base, "--policy", self.policy, "--modules", str(lint_list)]
+            return [(shared + [part] + common, env) for part in ("sources", "style", "environment")]
+        return [(shared + [phase] + common, env)]
+
+    def check_tools(self):
+        from . import verification_tools
+
+        try:
+            verification_tools.check(self.root, required=True)
+        except verification_tools.Unavailable as error:
+            raise Incomplete(str(error), reason=error.reason) from error
 
     def run(self):
         self.save()
@@ -687,6 +711,8 @@ class Verification:
         )
         cache_token = _HASH_CACHE.set(cache)
         try:
+            if any(phase in self.requested for phase in ("shim-expiry", "axioms", "module-system", "lint")):
+                self.check_tools()
 
             def interrupted(signum, _):
                 raise Incomplete(f"verification interrupted by signal {signum}", reason="signal")
@@ -704,7 +730,7 @@ class Verification:
                     self.storage_lease.__enter__()
                 except BlockingIOError:
                     self.storage_lease = None
-                    raise Pressure("candidate storage is being reclaimed; retry verification") from None
+                    raise Pressure("candidate storage is being reclaimed; retry verification", reason="busy") from None
                 reserve(self.state, self.root.name)
                 self.storage_monitor = Monitor(self.state, self.root.name)
                 # A direct invocation claims this as an editable workspace, not a disposable
@@ -747,6 +773,10 @@ class Verification:
                 if isinstance(entry, dict) and "path" in entry
             ]
             extra.append(Path(sys.executable))
+            from . import verification_tools
+
+            if config := verification_tools.configuration():
+                extra.append(config)
             self.static_names = {root: {str(p) for p in files_under(root)} for root in self.installations.walked}
             if os.environ.get("LAKE_CONFIG"):
                 extra.append(Path(os.environ["LAKE_CONFIG"]))
@@ -766,17 +796,38 @@ class Verification:
             modules = self.directory / "modules.txt"
             modules.write_text("".join(f"{m}\n" for m in self.receipt["scope"]["modules"]))
             self.save()
-            early_style = (
+            early_sources = (
                 len(self.requested) > 1
                 and "lint" in self.requested
+                and self.receipt["scope"]["mode"] != "unknown"
                 and not (self.reuse and self.find_reuse(fingerprint, "lint"))
             )
-            if early_style:
+            if early_sources:
                 from .verification_jobs import preserve_candidate
 
                 preserve_candidate(self, disposable_only=True)
                 self.receipt["phases"]["lint"] = dict(status="incomplete", started_at=time.time(), ended_at=None)
-                self.command("lint", ["bash", "-o", "pipefail", "scripts/lint-style.sh"], env=dict(os.environ))
+                try:
+                    self.command(
+                        "lint",
+                        [
+                            sys.executable,
+                            str(HERE / "scripts/tauceti-local-checks"),
+                            "sources",
+                            "--base",
+                            self.base,
+                            "--policy",
+                            self.policy,
+                        ],
+                        env=dict(os.environ),
+                    )
+                except subprocess.CalledProcessError as error:
+                    if error.returncode in {2, 75}:
+                        raise Incomplete(
+                            "local source checker unavailable; see the phase log",
+                            reason="tool-missing" if error.returncode == 75 else "invalid-input",
+                        ) from error
+                    raise
             for phase in self.requested:
                 self.watch()
                 reused = self.find_reuse(fingerprint, phase) if self.reuse else None
@@ -796,12 +847,14 @@ class Verification:
                 self.receipt["phases"][phase] = record
                 self.save()
                 for argv, env in self.phase_commands(phase, modules):
-                    if early_style and phase == "lint" and "scripts/lint-style.sh" in argv:
+                    if early_sources and phase == "lint" and "sources" in argv:
                         continue
                     try:
                         self.command(phase, argv, env=env)
                     except subprocess.CalledProcessError as error:
-                        local_lint = any(str(arg).endswith("/scripts/tauceti-local-lint") for arg in error.cmd)
+                        if phase == "shim-expiry":
+                            self.check_tools()  # A removed runtime dependency is not a source defect.
+                        local_lint = any(str(arg).endswith("/scripts/tauceti-local-checks") for arg in error.cmd)
                         if (phase == "axioms" or local_lint) and error.returncode in {2, 75}:
                             raise Incomplete(
                                 f"local {phase} checker unavailable; see the phase log",
@@ -832,10 +885,14 @@ class Verification:
                 if error.reason == "limit"
                 else "storage-configuration"
                 if error.reason == "configuration"
+                else "verification-busy"
+                if error.reason == "busy"
                 else "disk-pressure",
                 result_type="incomplete",
-                next_action="adjust verification storage limits/inputs and invoke verify again"
-                if error.reason in {"limit", "configuration"}
+                next_action="correct filesystem-headroom settings and invoke verify again"
+                if error.reason == "configuration"
+                else "retry after the current verification/cleanup owner finishes"
+                if error.reason == "busy"
                 else "reclaim verification storage and retry verify in this workspace",
             )
         except Incomplete as error:
@@ -930,7 +987,7 @@ class Verification:
     def checkpoint_sources(self, inputs):
         """Preserve pre-verification Bubble edits before its disposable container can disappear."""
         from .retention import locked
-        from .verification_storage import LimitedWriter, release, reserve_checkpoint, settle
+        from .verification_storage import SpaceWriter, release, reserve_checkpoint, settle
 
         key = digest(dict(base=self.base, sources=inputs["sources"]))
         target = self.state / "verification-checkpoints" / key
@@ -940,20 +997,18 @@ class Verification:
                     patch = git(self.root, "diff", "--binary", "--no-ext-diff", self.base, "--")
                     names = sorted(untracked(self.root))
                     size = len(patch) + sum((self.root / name).lstat().st_size for name in names)
-                    # Charge the bounded archive estimate, rather than a whole maximum-sized
-                    # checkpoint for a tiny patch. The writer still enforces the granted bytes.
+                    # Observe the archive estimate without gating preservation on an arbitrary
+                    # logical-byte target. Only actual filesystem headroom may interrupt writes.
                     estimate = size + 16384 + sum(len(name.encode()) * 2 + 8192 for name in names)
-                    limit = reserve_checkpoint(self.state, key, amount=estimate)
+                    reserve_checkpoint(self.state, key, amount=estimate)
                     target.mkdir(mode=0o700, parents=True, exist_ok=True)
                     try:
-                        if size > limit:
-                            raise Limit("source checkpoint exceeds its reserved byte budget; original source retained")
                         with (target / "source.patch").open("wb") as out:
-                            out.write(patch)
+                            SpaceWriter(out, target).write(patch)
                             out.flush()
                             os.fsync(out.fileno())
                         with (target / "untracked.tar").open("wb") as out:
-                            with tarfile.open(fileobj=LimitedWriter(out, limit - len(patch)), mode="w") as archive:
+                            with tarfile.open(fileobj=SpaceWriter(out, target), mode="w") as archive:
                                 for name in names:
                                     archive.add(self.root / name, arcname=name, recursive=False)
                             out.flush()
@@ -1010,7 +1065,8 @@ def add_parser(sub):
 
 def command(args):
     state = Path(
-        os.environ.get("TAUCETI_VERIFY_STATE") or HERE / "state" / os.environ.get("TAUCETI_WORKER_ID", "local")
+        os.environ.get("TAUCETI_VERIFY_STATE")
+        or legacy_data_root(HERE) / "state" / os.environ.get("TAUCETI_WORKER_ID", "local")
     )
     try:
         root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").decode().strip()).resolve()

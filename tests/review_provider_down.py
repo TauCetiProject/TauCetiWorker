@@ -28,13 +28,14 @@ Exit 0 = all assertions hold; 1 = a mismatch.
 
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 import tauceti_worker as tc
-from tauceti_worker.constants import MAX_REVIEW_ERRORS, REVIEW_PROVIDER_DOWN_EXIT
+from tauceti_worker.constants import MAX_REVIEW_ERRORS, REVIEW_PREPARATION_WAIT_EXIT, REVIEW_PROVIDER_DOWN_EXIT
 from tauceti_worker.review_diagnostics import classify_failure, read_review_failure
 
 fails = 0
@@ -100,6 +101,40 @@ def main():
         check("provider-down says it is not charged", "not charged" in str(raised))
         check("provider-down charges no review error", w.counters.read("review-err-42") == 0)
         check("provider-down retains no per-PR failure", not read_review_failure(state, 42))
+
+        # Preparation outages must have the same uncharged scheduling semantics
+        # through both launchers, even after more attempts than the stuck limit.
+        from unittest.mock import patch
+
+        for bubble in (False, True):
+            for _ in range(MAX_REVIEW_ERRORS + 2):
+                w = fake_worker(state)
+                w.counters.write("review-err-42", 1)
+                c = types.SimpleNamespace(pr=42, head="a" * 40, contest=None, contest_reply_id=None)
+                with (
+                    patch.object(tc.work_units, "run_to_logfile", return_value=REVIEW_PREPARATION_WAIT_EXIT),
+                    patch.object(tc.work_units, "review_in_bubble", return_value=REVIEW_PREPARATION_WAIT_EXIT),
+                    patch.object(tc.work_units, "me", return_value="tester"),
+                    patch.object(tc.work_units, "record_review_failure") as record,
+                    patch.object(tc.work_units, "_sync_review_outbox") as sync,
+                    patch.object(w.rs, "bust") as bust,
+                ):
+                    try:
+                        tc.work_units.do_review(
+                            w, types.SimpleNamespace(), c, types.SimpleNamespace(work_model="claude"), bubble=bubble
+                        )
+                    except tc.config.NoProgress:
+                        pass
+                    else:
+                        raise AssertionError("preparation outage did not back off")
+                    assert w.counters.read("review-err-42") == 1
+                    from tauceti_worker.state_repair import retry_key
+
+                    assert w.counters.read(retry_key(42, c.head)) > time.time()
+                    record.assert_not_called()
+                    sync.assert_not_called()
+                    bust.assert_called_once_with(42)
+        check("preparation outages preserve existing error allowance in both launchers", True)
 
         # 2) an ordinary engine failure keeps the existing behaviour.
         w2, raised2, out2 = drive(1, state)

@@ -43,6 +43,15 @@ def fixture():
     }
     gh = GitHub()
     gh.issue_comments = Mock(return_value=[comment])
+    gh.pr_progress_state = Mock(
+        side_effect=lambda _: dict(
+            head=live["head"]["sha"],
+            state=live["state"].upper(),
+            isDraft=live["draft"],
+            labels=live["labels"],
+            ncomments=1,
+        )
+    )
 
     def api(path, jq):
         if path.endswith("/pulls/13940"):

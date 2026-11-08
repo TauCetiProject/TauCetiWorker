@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tauceti_worker import repair_recovery as rr
+from tauceti_worker import verification_tools
 from tauceti_worker import work_recovery as saved
 from tauceti_worker.agents import AuthoringProfile
 from tauceti_worker.agents import run_agent_host as run_real_agent_host
@@ -249,7 +250,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=resolve) as model,
         ):
@@ -312,7 +313,7 @@ class Fixture(unittest.TestCase):
             raise Death()
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=resolve_and_die),
         ):
@@ -358,7 +359,7 @@ class Fixture(unittest.TestCase):
             raise Death()
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=interrupted),
         ):
@@ -383,7 +384,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=resolve),
         ):
@@ -401,7 +402,7 @@ class Fixture(unittest.TestCase):
             raise Death()
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=resolve_and_die),
         ):
@@ -420,10 +421,145 @@ class Fixture(unittest.TestCase):
         self.assertEqual(FakeVerification.calls, 1)
         self.assertEqual(self.journal()["attempts"], 0)
 
+    def test_missing_verification_tools_never_acquire_or_warm_or_launch_source_repair(self):
+        counts = dict(self.values)
+        with (
+            patch.object(
+                self.backend, "check_verification_tools", side_effect=verification_tools.Unavailable("missing")
+            ),
+            patch.object(self.backend, "acquire", side_effect=AssertionError("acquired with missing tooling")),
+            patch.object(self.backend, "restore", side_effect=AssertionError("restored with missing tooling")),
+            patch(
+                "tauceti_worker.agents.host_build_cache_context",
+                side_effect=AssertionError("warmed with missing tools"),
+            ),
+        ):
+            for _ in range(2):
+                self.assertFalse(self.run_recovery())
+                self.assertEqual(self.journal()["reason"]["code"], "invocation-failed")
+                self.assertNotIn("failed_source", self.journal())
+                self.retry_now()
+        self.assertEqual(self.values, counts)
+        self.assertEqual(FakeVerification.calls, 0)
+        self.assertTrue(self.run_recovery())
+
+    def test_legacy_continuation_block_reverifies_once_after_tool_change(self):
+        FakeVerification.failures = 1
+        with patch.object(self.backend, "continuation_admission", side_effect=rr.Block("profile-missing", "no model")):
+            self.assertFalse(self.run_recovery())
+        j = self.journal()
+        j.pop("failed_tool_identity")  # An existing deployed record predates this field.
+        rr.write(self.record, j, "blocked", retry_at=10**12, probe_at=10**12)
+        with patch(
+            "tauceti_worker.agents.run_agent_host", side_effect=AssertionError("mechanical check needs no model")
+        ):
+            self.assertTrue(rr.due(self.cfg))
+            self.assertTrue(rr.recover(self.w, self.opts))
+        self.assertEqual(self.journal()["state"], "published")
+        self.assertEqual(FakeVerification.calls, 2)
+        self.assertEqual(self.values["historical-paid"], 17)
+        self.assertEqual(saved._complete(self.record), self.manifest)
+
+    def test_unchanged_tools_do_not_reopen_continuation_block(self):
+        rr.write(
+            self.record,
+            {},
+            "blocked",
+            failed_source="saved source",
+            failed_tool_identity=verification_tools.identity(),
+            reason=rr.reason(rr.Block("profile-missing", "no model")),
+            retry_at=10**12,
+            probe_at=10**12,
+        )
+        self.assertFalse(rr.due(self.cfg))
+        with patch.object(rr.Recovery, "run", side_effect=AssertionError("unchanged blocked record retried")):
+            self.assertFalse(rr.recover(self.w, self.opts))
+
+    def test_unreadable_tool_identity_does_not_crash_scheduler(self):
+        rr.write(
+            self.record,
+            {},
+            "blocked",
+            failed_source="saved source",
+            reason=dict(code="profile-missing"),
+            retry_at=10**12,
+            probe_at=10**12,
+        )
+        with patch.object(verification_tools, "identity", side_effect=PermissionError("temporarily unreadable")):
+            self.assertFalse(rr.due(self.cfg))
+            self.assertFalse(rr.recover(self.w, self.opts))
+
+    def test_tool_change_does_not_reopen_unrelated_permanent_authorization_block(self):
+        rr.write(
+            self.record,
+            {},
+            "blocked",
+            failed_source="saved source",
+            failed_tool_identity="old Tools",
+            reason=rr.reason(rr.Block("foreign-scope", "not authorized")),
+            retry_at=10**12,
+            probe_at=10**12,
+        )
+        self.assertFalse(rr.due(self.cfg))
+        with patch.object(rr.Recovery, "run", side_effect=AssertionError("foreign work retried")):
+            self.assertFalse(rr.recover(self.w, self.opts))
+
+    def test_unchanged_missing_tools_after_reopen_obey_infrastructure_backoff(self):
+        rr.write(
+            self.record,
+            {},
+            "blocked",
+            failed_source="saved source",
+            failed_tool_identity="old Tools",
+            reason=dict(code="profile-missing"),
+            retry_at=10**12,
+        )
+        with patch.object(
+            self.backend, "check_verification_tools", side_effect=verification_tools.Unavailable("missing")
+        ):
+            self.assertFalse(self.run_recovery())
+        self.assertFalse(rr.due(self.cfg))
+        with patch.object(self.backend, "check_verification_tools", side_effect=AssertionError("ignored retry time")):
+            self.assertFalse(self.run_recovery())
+
+    def test_reopened_check_survives_claim_wait_before_verification(self):
+        FakeVerification.failures = 1
+        with patch.object(self.backend, "continuation_admission", side_effect=rr.Block("profile-missing", "no model")):
+            self.assertFalse(self.run_recovery())
+        j = self.journal()
+        j.pop("failed_tool_identity")
+        rr.write(self.record, j, "blocked", retry_at=10**12)
+        with patch.object(self.backend, "acquire", side_effect=rr.Wait("claim-unavailable", "busy")):
+            self.assertFalse(self.run_recovery())
+        self.retry_now()
+        with patch.object(self.backend, "continuation_admission", side_effect=AssertionError("stale source verdict")):
+            self.assertTrue(self.run_recovery())
+        self.assertEqual(FakeVerification.calls, 2)
+
+    def test_changed_tools_do_not_bypass_metadata_or_infrastructure_retry_times(self):
+        for code, state in [
+            ("pr-held", "blocked"),
+            ("ownership-changed", "blocked"),
+            ("invocation-failed", "eligible"),
+        ]:
+            rr.write(
+                self.record,
+                {},
+                state,
+                failed_source="old source",
+                failed_tool_identity="old Tools",
+                reason=dict(code=code),
+                retry_at=10**12,
+                probe_at=10**12,
+            )
+            self.assertFalse(rr.due(self.cfg), code)
+            with patch.object(rr.Recovery, "run", side_effect=AssertionError("ignored external wait")):
+                self.assertFalse(rr.recover(self.w, self.opts), code)
+
     def test_verified_provider_outage_refunds_content_but_counts_infrastructure(self):
         FakeVerification.failures = 1
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", return_value=1),
             patch("tauceti_worker.agents.take_last_agent_infra_failure", return_value="529 before work"),
@@ -434,10 +570,39 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.journal()["provider_refunds"], 1)
         self.assertEqual(self.values["fix-10-head"], 0)
 
+    def test_subscription_refusal_preserves_recovery_at_the_infra_cap(self):
+        self.check_provider_limit_refusal("provider subscription limit reached")
+
+    def test_credit_refusal_preserves_recovery_at_the_infra_cap(self):
+        self.check_provider_limit_refusal("provider credit balance exhausted")
+
+    def check_provider_limit_refusal(self, reason):
+        from tauceti_worker.constants import MAX_INFRA_REFUNDS
+
+        FakeVerification.failures = 100
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", return_value=1),
+            patch(
+                "tauceti_worker.agents.take_last_agent_infra_failure",
+                return_value=reason,
+            ),
+        ):
+            self.assertFalse(self.run_recovery())
+            j = self.journal()
+            j["provider_refunds"] = MAX_INFRA_REFUNDS
+            rr.write(self.record, j, j["state"])
+            self.retry_now()
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["content_attempts"], 0)
+        self.assertEqual(self.journal()["provider_refunds"], MAX_INFRA_REFUNDS)
+        self.assertNotEqual(self.journal()["state"], "content-failed")
+
     def test_post_launch_file_error_does_not_refund_content(self):
         FakeVerification.failures = 1
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=FileNotFoundError("after launch")),
         ):
@@ -450,7 +615,7 @@ class Fixture(unittest.TestCase):
 
         FakeVerification.failures = 1
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=AgentLaunchUnavailable("missing binary")),
         ):
@@ -483,7 +648,7 @@ class Fixture(unittest.TestCase):
         self.assertEqual(tail[tail.index("--recovery-agent") + 1], "auto")
         self.assertIn("--recovery-unpinned-profile", tail)
 
-    def test_blocked_head_change_reenables_mechanical_recovery(self):
+    def test_head_change_does_not_revive_abandoned_content(self):
         rr.write(
             self.record,
             {},
@@ -492,8 +657,8 @@ class Fixture(unittest.TestCase):
             reason=rr.reason(rr.Block("content-allowance", "spent")),
         )
         self.advance_writer()
-        self.assertTrue(rr.recover(self.w, self.opts))
-        self.assertEqual(self.journal()["state"], "published")
+        self.assertFalse(rr.recover(self.w, self.opts))
+        self.assertEqual(self.journal()["state"], "obsolete")
 
     def test_archived_backlog_does_not_delay_new_checkpoint(self):
         for n in range(30):
@@ -564,7 +729,7 @@ class Fixture(unittest.TestCase):
 
         FakeVerification.failures = 2
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=repair),
         ):
@@ -582,7 +747,7 @@ class Fixture(unittest.TestCase):
         self.values["fix-10-head"] = 3
         FakeVerification.failures = 1
         self.assertFalse(self.run_recovery())
-        self.assertEqual(self.journal()["state"], "eligible")
+        self.assertEqual(self.journal()["state"], "obsolete")
         self.assertEqual(self.journal()["reason"]["next_action"], "continue-normal-selection")
         self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
         self.assertEqual(self.values["fix-10-head"], 3)
@@ -599,7 +764,8 @@ class Fixture(unittest.TestCase):
         ):
             rr.write(self.record, {}, state, reason=rr.reason(rr.Block(code, "unavailable")))
             self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
-            self.assertIn(str(self.record), rr.retained_context(self.cfg, "upstream/repo", 10))
+            if code not in {"content-allowance", "recovery-exhausted"}:
+                self.assertIn(str(self.record), rr.retained_context(self.cfg, "upstream/repo", 10))
         self.assertEqual(saved._complete(self.record), self.manifest)
         self.assertFalse((self.record / "operator.json").exists())
 
@@ -634,7 +800,7 @@ class Fixture(unittest.TestCase):
             self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
         self.retry_now()
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=self.model_repair) as model,
         ):
@@ -657,7 +823,7 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.journal()["attempts"], 3)
         self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
 
-    def test_old_one_continuation_block_uses_remaining_original_budget(self):
+    def test_legacy_exhausted_content_does_not_restart_paid_repair(self):
         self.values["fix-10-head"] = 1
         FakeVerification.failures = 2
         calls = []
@@ -668,7 +834,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=repair),
         ):
@@ -677,10 +843,10 @@ class Fixture(unittest.TestCase):
             journal.pop("protocol")
             journal.update(state="blocked", reason=dict(code="content-allowance"), retry_at=10**12)
             rr.atomic_json(self.record / "recovery.json", journal)
-            self.assertTrue(rr.recover(self.w, self.opts))
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(self.values["fix-10-head"], 3)
-        self.assertEqual(self.journal()["state"], "published")
+            self.assertFalse(rr.recover(self.w, self.opts))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.values["fix-10-head"], 2)
+        self.assertEqual(self.journal()["state"], "obsolete")
         self.assertFalse((self.record / "operator.json").exists())
 
     def test_blocked_record_allows_fresh_dispatch_under_normal_quota_checks(self):
@@ -713,7 +879,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=import_history),
         ):
@@ -824,18 +990,18 @@ class Fixture(unittest.TestCase):
         self.assertEqual(git(self.remote, "rev-parse", "main"), writer)
         self.assertEqual(FakeVerification.calls, 1)
 
-    def test_three_failures_release_pr_and_changed_head_rearms(self):
+    def test_three_failures_release_pr_without_reviving_abandoned_work(self):
         with patch.object(self.backend, "verify", side_effect=RuntimeError("disk full")):
             for n in range(1, 4):
                 self.assertFalse(self.run_recovery())
                 self.assertEqual(self.journal()["attempts"], n)
                 self.retry_now()
-            self.assertEqual(self.journal()["state"], "eligible")
+            self.assertEqual(self.journal()["state"], "obsolete")
             self.assertFalse(self.run_recovery())
         self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
         self.advance_writer()
         self.retry_now()  # simulate the bounded external-fact probe becoming due
-        self.assertTrue(self.run_recovery())
+        self.assertFalse(self.run_recovery())
         self.assert_retained()
 
     def test_claim_wait_does_not_consume_attempt(self):
@@ -944,6 +1110,33 @@ class Fixture(unittest.TestCase):
         self.assertTrue(self.run_recovery())
         self.assertEqual(git(self.remote, "rev-list", "--count", "main"), "2")
 
+    def test_metadata_outage_before_claim_does_not_spend_source_attempts(self):
+        with patch.object(self.backend, "facts", side_effect=RuntimeError("shared state offline")):
+            for _ in range(4):
+                self.assertFalse(self.run_recovery())
+                self.retry_now()
+        self.assertEqual(self.journal()["attempts"], 0)
+        self.assertEqual(self.journal()["state"], "eligible")
+        self.assertEqual(self.journal()["reason"]["code"], "metadata-unavailable")
+        self.assertTrue(self.run_recovery())
+
+    def test_exhausted_uncertain_publication_keeps_reconciliation_scheduled(self):
+        with patch.object(self.backend, "reconcile", side_effect=RuntimeError("remote unavailable")):
+            for _ in range(3):
+                self.run_recovery()
+                self.retry_now()
+        published = git(self.remote, "rev-parse", "main")
+        git(self.remote, "update-ref", "refs/heads/main", self.base)
+        self.current["head"] = self.base
+        with patch.object(self.backend, "reconcile", return_value="not-published"):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(self.journal()["state"], "eligible", self.journal())
+        self.assertEqual(self.journal()["reason"]["code"], "publication-revalidation-failed")
+        git(self.remote, "update-ref", "refs/heads/main", published)
+        self.current["head"] = published
+        self.retry_now()
+        self.assertTrue(self.run_recovery())  # Remote commit already exists; reconcile only.
+
     def test_changed_source_after_verify_not_published(self):
         actual = self.backend.prepare
 
@@ -986,7 +1179,7 @@ class Fixture(unittest.TestCase):
         FakeVerification.failures = 1
         self.opts.ignore_quota = True
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)) as admission,
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude") as admission,
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=self.model_repair) as model,
         ):
@@ -1013,7 +1206,7 @@ class Fixture(unittest.TestCase):
         recovery = rr.Recovery(self.record, self.backend)
         recovery.manifest["conversation"] = dict(actor="other", identity="old-account", profile={"model": "other"})
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=self.model_repair) as model,
         ):
@@ -1187,14 +1380,14 @@ class Fixture(unittest.TestCase):
                 self.retry_now() if self.journal() else None
                 self.assertFalse(self.run_recovery())
                 self.assertEqual(self.journal()["attempts"], count)
-        self.assertEqual(self.journal()["state"], "eligible")
+        self.assertEqual(self.journal()["state"], "obsolete")
 
     def test_no_model_cache_outage_preserves_content_allowance(self):
         from tauceti_worker.agents import BuildCacheUnavailable
 
         FakeVerification.failures = 1
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=BuildCacheUnavailable("cache offline")),
         ):
@@ -1313,7 +1506,7 @@ class Fixture(unittest.TestCase):
         )
         with (
             patch.object(rr, "conversation_identity", return_value="account-a"),
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=self.model_repair) as model,
         ):
@@ -1351,17 +1544,15 @@ class Fixture(unittest.TestCase):
         with patch.object(self.backend, "verify", try_push):
             self.assertTrue(self.run_recovery())
 
-    def test_lifted_hold_reenables_a_previously_exhausted_checkpoint(self):
+    def test_lifted_hold_does_not_revive_abandoned_exhausted_work(self):
         with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")):
             for _ in range(3):
                 self.run_recovery()
                 self.retry_now()
-        self.current["labels"] = ["hold"]
-        self.assertFalse(self.run_recovery())
-        self.assertEqual(self.journal()["reason"]["code"], "pr-held")
-        self.current["labels"] = []
-        self.retry_now()
-        self.assertTrue(self.run_recovery())
+        for labels in (["hold"], []):
+            self.current["labels"] = labels
+            self.assertFalse(self.run_recovery())
+            self.assertEqual(self.journal()["state"], "obsolete")
 
     def test_changed_round_scope_reenables_local_policy_wait(self):
         self.opts.only = ["review"]
@@ -1423,7 +1614,7 @@ class Fixture(unittest.TestCase):
 
         FakeVerification.failures = 1
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch(
                 "tauceti_worker.agents.run_agent_host",
@@ -1547,7 +1738,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=resolve) as model,
         ):
@@ -1582,7 +1773,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=resolve),
         ):
@@ -1671,30 +1862,28 @@ class Fixture(unittest.TestCase):
         self.assertEqual((clone / "A.lean").read_text(), "latest partial\n")
         self.assertEqual(saved._complete(self.record), self.manifest)
 
-    def test_content_limit_schedules_mechanical_recheck_without_more_paid_work(self):
+    def test_content_limit_abandons_without_more_paid_or_mechanical_work(self):
         self.values["fix-10-head"] = 3
         FakeVerification.failures = 1
         self.assertFalse(self.run_recovery())
         self.assertEqual(self.journal()["reason"]["code"], "content-allowance")
         self.assertFalse(rr.due(self.cfg, only=["fix"]))
         with patch.object(rr.time, "time", return_value=self.journal()["retry_at"] + 1):
-            self.assertTrue(rr.due(self.cfg, only=["fix"]))
-            self.test_loop_recovery_precedes_model_budget()
-            self.assertTrue(rr.recover(self.w, self.opts))
-        self.assertEqual(FakeVerification.calls, 2)
+            self.assertFalse(rr.due(self.cfg, only=["fix"]))
+            self.assertFalse(rr.recover(self.w, self.opts))
+        self.assertEqual(FakeVerification.calls, 1)
         self.assertEqual(self.values["fix-10-head"], 3)
 
-    def test_infrastructure_backoff_eventually_rechecks_automatically(self):
-        with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")):
+    def test_exhausted_infrastructure_selects_fresh_work_without_rechecking_forever(self):
+        with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")) as verify:
             for _ in range(3):
                 self.assertFalse(self.run_recovery())
                 self.retry_now()
-        due = self.journal()["mechanical_recheck_at"]
-        with patch.object(rr.time, "time", return_value=due + 1):
-            self.assertTrue(rr.due(self.cfg, only=["fix"]))
-            self.assertTrue(rr.recover(self.w, self.opts))
-        self.assertEqual(self.journal()["infrastructure_failures"], 3)
-        self.assertEqual(self.journal()["state"], "published")
+        with patch.object(self.backend, "verify", side_effect=AssertionError("abandoned work retried")):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(verify.call_count, 3)
+        self.assertEqual(self.journal()["state"], "obsolete")
+        self.assertFalse(rr.due(self.cfg, only=["fix"]))
 
     def test_handoff_excludes_foreign_and_automatic_bump_source(self):
         for restriction in ("foreign", "automatic_bump"):
@@ -1735,14 +1924,14 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=import_history),
         ):
             self.assertFalse(self.run_recovery())
         self.retry_now()
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=repair),
         ):
@@ -1786,7 +1975,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=import_old_target),
         ):
@@ -1877,7 +2066,7 @@ class Fixture(unittest.TestCase):
     def test_zero_exit_with_conflicts_can_retarget_and_resolve(self):
         self.rewritten_checkpoint(conflicting=True)
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", return_value=0),
         ):
@@ -1893,7 +2082,7 @@ class Fixture(unittest.TestCase):
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=resolve),
         ):
@@ -2411,17 +2600,17 @@ class Fixture(unittest.TestCase):
         self.assertEqual(FakeVerification.calls, 2)
         self.assertEqual(self.values.get("fix-10-head", 0), 0)
 
-    def test_repeated_unchanged_infrastructure_failure_backs_off_to_hours(self):
+    def test_repeated_unchanged_infrastructure_failure_abandons_at_existing_allowance(self):
         now = rr.time.time()
         with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")):
             for _ in range(9):
                 with patch.object(rr.time, "time", return_value=now):
                     self.assertFalse(self.run_recovery())
-                delay = self.journal()["retry_at"] - now
                 now = self.journal()["retry_at"] + 1
-        self.assertGreaterEqual(delay, 7200)
-        self.assertEqual(self.journal()["infrastructure_streak"], 9)
-        self.assertEqual(self.journal()["infrastructure_failures"], 9)
+        self.assertEqual(self.journal()["state"], "obsolete")
+        self.assertEqual(self.journal()["reason"]["code"], "recovery-exhausted")
+        self.assertEqual(self.journal()["infrastructure_streak"], 3)
+        self.assertEqual(self.journal()["infrastructure_failures"], 3)
         self.assertEqual(self.values.get("fix-10-head", 0), 0)
 
     def test_forensic_handoff_cannot_return_to_automatic_publication(self):
@@ -2440,12 +2629,12 @@ class Fixture(unittest.TestCase):
         script = "from pathlib import Path; Path('A.lean').write_text('fresh fixture repair\\n')"
         with (
             patch.dict(sys.modules, {"tauceti_worker.containment": None}),
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch.object(rr, "conversation_identity", return_value="fixture-account"),
             patch(
                 "tauceti_worker.agents.host_agent_argv",
-                side_effect=lambda *a: ([sys.executable, "-c", script], os.environ.copy()),
+                side_effect=lambda *a, **k: ([sys.executable, "-c", script], os.environ.copy()),
             ),
             patch("tauceti_worker.agents.host_build_cache_context", side_effect=lambda *a: contextlib.nullcontext([])),
             patch("tauceti_worker.fleet_capacity.check_launch_admission") as admission,
@@ -2579,7 +2768,7 @@ fi
             self.assertEqual(self.journal()["attempts"], count)
             self.assertNotIn("publication", self.journal())
             self.retry_now()
-        self.assertEqual(self.journal()["state"], "eligible")
+        self.assertEqual(self.journal()["state"], "obsolete")
         self.assertIn("server policy rejected", self.journal()["reason"]["detail"])
         self.assertEqual(self.values.get("fix-10-head", 0), 0)
         self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
@@ -2628,11 +2817,10 @@ fi
         for _ in range(6):
             with patch.object(rr.time, "time", return_value=now):
                 self.assertFalse(self.run_recovery())
-            delay = self.journal()["retry_at"] - now
             now = self.journal()["retry_at"] + 1
-        self.assertEqual(FakeVerification.calls, 6)
-        self.assertEqual(self.journal()["verification_failures"], 6)
-        self.assertEqual(delay, 21600)
+        self.assertEqual(FakeVerification.calls, 1)
+        self.assertEqual(self.journal()["verification_failures"], 1)
+        self.assertEqual(self.journal()["state"], "obsolete")
         self.assertEqual(self.values["fix-10-head"], 3)
 
     def test_non_owned_operation_on_rewritten_source_gets_narrow_reasoning(self):
@@ -2648,7 +2836,7 @@ fi
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=finish) as model,
         ):
@@ -2667,7 +2855,7 @@ fi
             raise Death()
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=unfinished),
             self.assertRaises(Death),
@@ -2679,7 +2867,7 @@ fi
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=finish) as model,
         ):
@@ -2844,7 +3032,7 @@ fi
             return 0
 
         with (
-            patch("tauceti_worker.loop.resolve_work_model", return_value=("claude", False)),
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
             patch("tauceti_worker.work_units.raise_on_account_mismatch"),
             patch("tauceti_worker.agents.run_agent_host", side_effect=merge_old_lineage),
         ):
@@ -2867,7 +3055,7 @@ fi
                 self.assertFalse(self.run_recovery())
                 self.retry_now()
         self.assertEqual(self.journal()["infrastructure_failures"], 3)
-        self.assertEqual(self.journal()["state"], "eligible")
+        self.assertEqual(self.journal()["state"], "obsolete")
         self.assertNotIn("publication", self.journal())
         self.assertEqual(git(self.remote, "rev-parse", "main"), self.base)
 
@@ -2999,6 +3187,36 @@ class ConversationIsolation(unittest.TestCase):
 
 
 class RealVerifierIntegration(unittest.TestCase):
+    def test_shared_view_uses_the_existing_verifier_cli_and_resolved_base(self):
+        from verification import Receipts
+
+        case = Receipts()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        cfg = SimpleNamespace(state=case.state, logdir=case.home / "logs")
+        cfg.logdir.mkdir()
+        w = SimpleNamespace(cfg=cfg, rc=SimpleNamespace(deadline=__import__("time").time() + 60))
+        backend = rr.WorkerBackend(w, SimpleNamespace())
+        import contextlib
+
+        from tauceti_worker import processes
+
+        @contextlib.contextmanager
+        def prepared(checkout, env, logdir):
+            env["LAKE_CONFIG"] = str(case.home / "throwaway-cache-config.toml")
+            yield ["env"]
+
+        with (
+            patch("tauceti_worker.agents.host_build_cache_context", side_effect=prepared),
+            patch.object(processes, "run", wraps=processes.run) as helper,
+        ):
+            result = backend.verify(case.root, dict(authorization={}), dict(labels=[], ref="repair", head=case.base))
+        self.assertEqual(
+            helper.call_args.kwargs["env"]["LAKE_CONFIG"], str(case.root.parent / "verification-lake.toml")
+        )
+        self.assertEqual(result["status"], "success", result.get("error"))
+        self.assertEqual(result["scope"]["base"], case.base)
+
     def test_real_receipt_reuse_and_final_input_check(self):
         from verification import Receipts
 

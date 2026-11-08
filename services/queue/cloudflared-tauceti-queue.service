@@ -1,0 +1,22 @@
+# The Cloudflare tunnel that publishes queue.taucetiproject.org from this host
+# (docs/queue/operations.md, "Public endpoint"). A systemd user unit, like the service itself,
+# so it needs no root and survives logout once lingering is enabled for the account.
+
+[Unit]
+Description=Cloudflare tunnel for queue.taucetiproject.org
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:%h/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env cloudflared tunnel --no-autoupdate --config %h/.cloudflared/config.yml run
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cloudflared-tauceti-queue
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

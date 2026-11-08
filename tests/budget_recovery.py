@@ -1,5 +1,7 @@
 """Stopped-session policy, evidence priority, identity protection and audit reconciliation."""
 
+import fcntl
+import hashlib
 import json
 import os
 import sys
@@ -284,6 +286,30 @@ class RecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(BudgetError, "no longer matches"):
             self.budget.recover("stale plan", plan=preview["recovery_manifest"])
 
+    def test_preview_planning_releases_lock_and_keeps_snapshot_identity(self):
+        from tauceti_worker.budget_recovery import historical_estimate
+
+        target = self.session()
+        original = self.budget.ledger.read_bytes()
+        sequence = self.budget.replay()["seq"]
+
+        def concurrent_admission(*args):
+            # A separate descriptor must acquire the actual fleet lock while
+            # the slow policy calculation runs. Record a concurrent ledger
+            # change as well, to ensure the audit still identifies its snapshot.
+            with (self.root / "budget.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.budget.configure(grant=1)
+            return historical_estimate(*args)
+
+        with patch("tauceti_worker.budget_recovery.historical_estimate", side_effect=concurrent_admission):
+            preview = self.budget.recover("", dry_run=True)
+        manifest = json.loads(Path(preview["recovery_manifest"]).read_text())
+        self.assertEqual(manifest["ledger_sequence"], sequence)
+        self.assertEqual(manifest["ledger_sha256"], hashlib.sha256(original).hexdigest())
+        self.assertNotEqual(self.budget.ledger.read_bytes(), original)
+        self.assertEqual(self.state(target)["status"], "provisional")
+
     def test_existing_308_charge_and_221_reservation_are_separate(self):
         charged = self.session(prefix="308", reserve="308")
         stale = self.session(estimate="221", reserve="221")
@@ -525,6 +551,65 @@ class RecoveryTests(unittest.TestCase):
         self.budget.clock = lambda: NOW + 100
         self.repair()
         self.assertEqual(Decimal(self.budget.snapshot()["balance"]), 10095)
+
+    def test_automatic_group_uses_same_policy_and_releases_reserve(self):
+        from tauceti_worker.budget_recovery import recover_stopped
+
+        for cost in (1, 2, 3):
+            self.session(cost=cost, age=2000, duration=100)
+        key = self.session(age=1000, duration=100, prefix="1", reserve="9")
+        self.saved(key, output=50000)
+        preview = self.budget.recover("", dry_run=True)
+        expected = next(r for r in preview["recovery_actions"] if r["id"] == key)
+        self.assertTrue(recover_stopped(self.budget, key))
+        settled = self.state(key)
+        self.assertEqual(Decimal(settled["cost"]), Decimal(expected["final_charge_usd"]))
+        self.assertEqual(settled["cost_provenance"], expected["confidence"])
+        self.assertEqual(self.budget.snapshot()["pending"], "0")
+        before = self.budget.ledger.read_bytes()
+        self.assertFalse(recover_stopped(self.budget, key))
+        self.assertEqual(before, self.budget.ledger.read_bytes())
+
+    def test_automatic_plans_outside_lock_and_accepts_unrelated_grant(self):
+        from tauceti_worker.budget_recovery import historical_estimate, recover_stopped
+
+        key = self.session(duration=None)
+
+        def calculate(*args):
+            with (self.root / "budget.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.budget.configure(grant=1)
+            return historical_estimate(*args)
+
+        with patch("tauceti_worker.budget_recovery.historical_estimate", side_effect=calculate):
+            self.assertTrue(recover_stopped(self.budget, key))
+        self.assertEqual(Decimal(self.state(key)["cost"]), 7)
+
+    def test_automatic_defers_live_successor_and_evidence_changes(self):
+        from tauceti_worker.budget_recovery import historical_estimate, recover_stopped
+
+        key = self.session(duration=None)
+        journal = self.saved(key, output=10000)
+        successor = self.session(age=10, duration=None, resume="s", owner=process_identity())
+        before = self.budget.ledger.read_bytes()
+        self.assertFalse(recover_stopped(self.budget, key))
+        self.assertEqual(before, self.budget.ledger.read_bytes())
+        self.budget.settle(successor, 1)
+
+        def changed(*args):
+            journal.observe(
+                dict(
+                    type="assistant",
+                    session_id="s",
+                    message=dict(id="new", model=MODEL, usage=dict(input_tokens=0, output_tokens=100)),
+                )
+            )
+            return historical_estimate(*args)
+
+        before = self.budget.ledger.read_bytes()
+        with patch("tauceti_worker.budget_recovery.historical_estimate", side_effect=changed):
+            self.assertFalse(recover_stopped(self.budget, key))
+        self.assertEqual(before, self.budget.ledger.read_bytes())
 
 
 if __name__ == "__main__":

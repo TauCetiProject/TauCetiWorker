@@ -17,7 +17,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .budget import Budget, BudgetError, bridge_owner_alive, money
+from .budget import ACCOUNTING_ERRORS, Budget, BudgetError, LedgerError, bridge_owner_alive, money
 from .claude_api import safe_message
 from .usage_accounting import session_usage, usage_path
 from .usage_lifecycle import alive, durable, identity, resolve
@@ -215,7 +215,7 @@ def reserve_unknown_usage(budget, value, stamp):
     from .budget_usage import evidence
 
     with budget.locked():
-        sessions = budget.replay()["sessions"]
+        sessions = budget.evidence_sessions(budget.current(), value["id"])
     session = sessions.get(value["id"])
     if not session or session["status"] == "settled":
         return
@@ -223,7 +223,7 @@ def reserve_unknown_usage(budget, value, stamp):
     if not saved:
         return
     with budget.locked():
-        state = budget.replay()
+        state = budget.current()
         session = state["sessions"][value["id"]]
         if session["status"] == "settled":
             return
@@ -283,9 +283,37 @@ def tick(budget, cache=None, stop=None):
     cache = {} if cache is None else cache
     ledger_stamp = stat_stamp(budget.ledger)
     if cache.get("ledger_stamp") != ledger_stamp or "sessions" not in cache:
-        with budget.locked():
-            sessions = budget.replay()["sessions"]
-        for session in sessions.values():
+        initial = "sessions" not in cache
+        try:
+            with budget.locked():
+                state = budget.current()
+                rows = budget.sessions(state, active=True)
+                if "sessions" not in cache:
+                    rows += budget.sessions(state, settled=True, estimated=True)
+                sessions = {session["id"]: session for session in rows}
+                for path in (budget.directory / "lifecycles").glob("*.json"):
+                    value = state["sessions"].get(path.stem)
+                    if value:
+                        sessions.setdefault(path.stem, value)
+                        if value["status"] == "settled":
+                            # Short invocations can start and finish between
+                            # minute samples. Remember their final cost before
+                            # archiving the launch sidecar, without scanning history.
+                            pending = cache.setdefault("live_pending", {})
+                            seen = cache.setdefault("live_terminal_seen", {})
+                            if path.stem not in seen or seen[path.stem] != value.get("cost"):
+                                pending[path.stem] = dict(
+                                    cost=value.get("cost"), ledger_sequence=0 if initial else state["seq"]
+                                )
+                                seen[path.stem] = value.get("cost")
+            cache["ledger_available"] = True
+        except ACCOUNTING_ERRORS as error:
+            # Launch supervision must keep running while ledger reads recover.
+            rows, sessions = [], cache.get("sessions", {})
+            cache["ledger_available"] = False
+            if not isinstance(error, LedgerError):
+                ledger_stamp = None  # Retry transient storage errors, not unchanged corrupt bytes.
+        for session in rows:
             if session.get("lifecycle"):
                 register(budget.directory, session["lifecycle"])
         cache.update(ledger_stamp=ledger_stamp, sessions=sessions)
@@ -295,6 +323,8 @@ def tick(budget, cache=None, stop=None):
     for path in paths:
         if stop is not None and stop.is_set():
             return
+        if budget.clock() < cache.get("stopped_next_poll", {}).get(path.stem, 0):
+            continue
         try:
             recover_invocation(budget, path, cache=cache, session=cache["sessions"].get(path.stem))
             errors.pop(path.stem, None)
@@ -303,6 +333,49 @@ def tick(budget, cache=None, stop=None):
             if errors.get(path.stem) != stamp:
                 print(f"{path.stem}: usage recovery retained for retry: {type(error).__name__}: {error}", flush=True)
                 errors[path.stem] = stamp
+    remaining = {path.stem for path in paths if path.exists()}
+    cache["sessions"] = {
+        key: session for key, session in cache["sessions"].items() if session["status"] != "settled" or key in remaining
+    }
+    cache["live_terminal_seen"] = {
+        key: cost for key, cost in cache.get("live_terminal_seen", {}).items() if key in remaining
+    }
+    try:
+        from .activity_live import publish_sessions
+
+        publish_sessions(budget, cache, budget.clock())
+    except Exception:
+        pass  # Optional reporting never interferes with launch supervision.
+    now = budget.clock()
+    last_recovery = cache.setdefault("stopped_recovered_at", now)
+    try:
+        mode = recovery_mode(budget.directory)
+    except ValueError:
+        mode = None  # Individual launch/recovery errors above retain their diagnostics.
+    if now - last_recovery >= 60 and mode == "auto":
+        from .budget_recovery import live_identity, recover_stopped
+
+        cache["stopped_recovered_at"] = now
+        rows = [s for s in cache.get("sessions", {}).values() if s["status"] != "settled"]
+        # Continue the queue across minute passes; one slow group cannot starve
+        # later eligible work. Each proposal runs outside the admission lock.
+        start = cache.get("stopped_cursor", 0) % max(1, len(rows))
+        deadline = time.monotonic() + 1
+        for offset in range(len(rows)):
+            s = rows[(start + offset) % len(rows)]
+            cache["stopped_cursor"] = start + offset + 1
+            if len(s["id"]) != 32 or any(c not in "0123456789abcdef" for c in s["id"]):
+                continue
+            try:
+                if not live_identity(s, now, budget.directory)["live"]:
+                    recover_stopped(budget, s["id"])
+            except Exception as error:
+                message = f"{type(error).__name__}: {error}"
+                if errors.get("automatic-" + s["id"]) != message:
+                    print(f"{s['id']}: stopped usage policy retained for retry: {message}", flush=True)
+                    errors["automatic-" + s["id"]] = message
+            if time.monotonic() >= deadline:
+                break
 
 
 def recovery_mode(directory):
@@ -315,13 +388,88 @@ def recovery_mode(directory):
     return mode
 
 
+def definitely_dead(producer):
+    """Retirement requires birth evidence; malformed or unreadable means unknown."""
+    if not isinstance(producer, dict) or producer.get("unsupported") or producer.get("remote"):
+        return False
+    required = ("pid", "boot", "start", "view") if sys.platform == "linux" else ("pid", "boot", "start")
+    if sys.platform not in {"linux", "darwin"} or not all(producer.get(key) is not None for key in required):
+        return False
+    try:
+        if sys.platform == "linux" and producer["view"] != os.readlink("/proc/self/ns/pid"):
+            return False
+        pid = int(producer["pid"])
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    try:
+        observed = identity(pid)
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+    if any(observed.get(key) != producer[key] for key in ("boot", "start")):
+        return True
+    try:
+        if sys.platform == "linux":
+            status = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            return status in {"Z", "X"}
+        from .usage_lifecycle import darwin_process
+
+        return darwin_process(pid)[1] == 5
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def delivery_finished(directory, value):
+    if value.get("external") or not definitely_dead(value.get("shim")) or not definitely_dead(value.get("owner")):
+        return False
+    native, gate = value.get("native"), value.get("gate")
+    if value.get("phase") == "stopped" and (not native or not gate):
+        return False
+    if native and not definitely_dead(native):
+        return False
+    if gate and not definitely_dead(gate):
+        # resolve() persisted the host identity corresponding to this exact
+        # gate before granting the permit, even across PID namespaces.
+        if not (
+            native
+            and all(gate.get(k) is not None and gate.get(k) == native.get(k) for k in ("boot", "start", "namespace"))
+        ):
+            return False
+    if definitely_dead(value.get("parent")):
+        return True
+    try:
+        ending = safe_message(Path(directory) / "round-exits" / round_key(value.get("owner")))
+        return ending.get("owner") == value["owner"] and ending.get("kind") in {"exit", "signal", "timeout"}
+    except (OSError, ValueError):
+        return False
+
+
 def recover_invocation(budget, path, *, cache=None, session=None):
     mode = recovery_mode(budget.directory)
     value = read_lifecycle(budget.directory, path.stem)
     bridge, invocation = Path(value["bridge"]), value["id"]
     inbox, outbox = bridge / "inbox", bridge / "outbox"
     stamp = evidence_stamp(budget.directory, value)
+    sealed_estimate = (
+        mode == "auto"
+        and session
+        and session["status"] == "settled"
+        and value["phase"] in {"stopped", "no-inference"}
+        and delivery_finished(budget.directory, value)
+    )
     if value["phase"] in {"stopped", "no-inference"} and value.get("recovery_stamp") == stamp:
+        if sealed_estimate:
+            # Every recorded producer is gone. Preserve all evidence in done/,
+            # without polling settled historical lifecycles forever. A producer
+            # whose identity/liveness is unknown keeps the late-receipt watch.
+            archive_lifecycle(path, value)
+            return
+        if cache is not None:
+            cache.setdefault("stopped_next_poll", {})[invocation] = budget.clock() + 60
         return
     if value.get("unknown_reserve_stamp") == stamp and any(
         e["kind"] == "remote-liveness-unconfirmed" for e in value["events"]
@@ -406,7 +554,7 @@ def recover_invocation(budget, path, *, cache=None, session=None):
     )
     if value.get("external") and not stopped:
         event("remote-liveness-unconfirmed")
-    journal = session_usage(budget.directory, value)
+    journal = session_usage(budget.directory, value) if stopped else None
     has_usage = bool(journal and journal["messages"]) or bool(session and money(session.get("cost", "0")) > 0)
     if stopped:
         event("stopped")
@@ -420,6 +568,8 @@ def recover_invocation(budget, path, *, cache=None, session=None):
             changed = True
     if changed:
         durable(path, value)
+    if cache is not None and not cache.get("ledger_available", True):
+        return  # Supervision above still runs; defer ledger work until it is readable.
     if not stopped or not value["budgeted"]:
         if value["budgeted"] and value.get("external") and mode == "auto":
             prior_stamp = value.get("unknown_reserve_stamp")
@@ -434,6 +584,8 @@ def recover_invocation(budget, path, *, cache=None, session=None):
     receipt_path = inbox / (invocation + ".receipt")
     if value.get("recovery_stamp") == stamp or (cache is not None and cache.get(invocation) == stamp):
         return
+    if value.get("unrecorded_admit"):
+        budget.restore_admission(value["unrecorded_admit"])
     if session and session["status"] == "settled" and session.get("cost_provenance") == "native-reported":
         value["recovery_stamp"] = stamp
         durable(path, value)
@@ -459,13 +611,16 @@ def recover_invocation(budget, path, *, cache=None, session=None):
     # Missing evidence also retains the admission reserve. Do not keep
     # appending unresolved events on every supervisor pass.
     with budget.locked():
-        session = budget.replay()["sessions"].get(invocation)
+        session = budget.current()["sessions"].get(invocation)
     if session and session["status"] == "active":
         budget.settle(invocation, None, "stopped; missing usage evidence")
     value["recovery_stamp"] = stamp
     durable(path, value)
     if cache is not None:
         cache[invocation] = stamp
+        cache.setdefault("stopped_next_poll", {})[invocation] = budget.clock() + 60
+    if sealed_estimate:
+        archive_lifecycle(path, value)
 
 
 def ensure_supervisor(directory, *, refresh=False):
@@ -477,7 +632,9 @@ def ensure_supervisor(directory, *, refresh=False):
     try:
         value = safe_message(ready)
         same_source = value.get("source") == str(Path(__file__).resolve())
-        if alive(value["owner"]) and (refresh or same_source and value.get("code_version") != version):
+        if alive(value["owner"]) and (
+            refresh or not value.get("ledger_optional") or same_source and value.get("code_version") != version
+        ):
             durable(directory / "usage-supervisor-retire.json", dict(owner=value["owner"], at=time.time()))
             deadline = time.monotonic() + 10
             while alive(value["owner"]) and time.monotonic() < deadline:
@@ -503,7 +660,12 @@ def ensure_supervisor(directory, *, refresh=False):
     while time.monotonic() < deadline:
         try:
             value = safe_message(ready)
-            if alive(value["owner"]) and value.get("protocol") == 1 and time.time() - value["heartbeat"] < 10:
+            if (
+                alive(value["owner"])
+                and value.get("protocol") == 1
+                and value.get("ledger_optional")
+                and time.time() - value["heartbeat"] < 10
+            ):
                 # Reap duplicate starters which lost the singleton lock.
                 threading.Thread(target=process.wait, daemon=True).start()
                 return
@@ -518,7 +680,15 @@ def ensure_supervisor(directory, *, refresh=False):
 def code_version():
     import hashlib
 
-    names = ("usage_supervisor.py", "usage_lifecycle.py", "usage_accounting.py", "budget.py", "budget_usage.py")
+    names = (
+        "usage_supervisor.py",
+        "usage_lifecycle.py",
+        "usage_accounting.py",
+        "budget.py",
+        "budget_usage.py",
+        "budget_recovery.py",
+        "activity_live.py",
+    )
     return hashlib.sha256(b"".join(Path(__file__).with_name(name).read_bytes() for name in names)).hexdigest()
 
 
@@ -550,6 +720,7 @@ def run(directory):
                             heartbeat=time.time(),
                             code_version=version,
                             protocol=1,
+                            ledger_optional=True,
                             source=str(Path(__file__).resolve()),
                         ),
                     )

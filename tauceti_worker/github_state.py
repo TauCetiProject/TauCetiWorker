@@ -6,6 +6,7 @@ No installation credentials leave the server. Conditional reads always contact i
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import hashlib
 import http.client
@@ -31,6 +32,8 @@ class StateQueryError(ValueError):
 
 
 DEPENDENCY = "github-state"
+DEFAULT_URL = "https://github-state.taucetiproject.org"
+PUBLIC_REPOSITORY = "TauCetiProject/TauCeti"
 # Reasons a caller can act on. Authentication/configuration needs an operator; the rest recover.
 ACTIONABLE = frozenset({"client_auth_configuration"})
 _last_failure: contextvars.ContextVar[dict | None] = contextvars.ContextVar("github_state_failure", default=None)
@@ -155,8 +158,16 @@ def _backoff(failures: int) -> float:
     return min(300.0, 30.0 * (1 << min(max(failures - 3, 0), 4))) * random.uniform(0.8, 1.2)
 
 
+def _configured_url() -> str:
+    # Explicit empty configuration disables the service, including downstream
+    # projects whose manifest selects mode=off. Unconfigured Tau Ceti workers
+    # share the public mirror without a credential on each machine.
+    default = DEFAULT_URL if os.environ.get("TAUCETI_REPO", PUBLIC_REPOSITORY) == PUBLIC_REPOSITORY else ""
+    return os.environ.get("TAUCETI_GITHUB_STATE_URL", default).rstrip("/")
+
+
 def _url() -> str | None:
-    value = os.environ.get("TAUCETI_GITHUB_STATE_URL", "").rstrip("/")
+    value = _configured_url()
     if not value:
         return None
     parsed = urllib.parse.urlsplit(value)
@@ -167,6 +178,97 @@ def _url() -> str | None:
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise StateQueryError("GitHub state URL must not contain credentials, query or fragment")
     return value
+
+
+def enabled() -> bool:
+    """Whether this worker uses a configured or default GitHub state service."""
+    return bool(_configured_url()) and not transport.direct_reads()
+
+
+def refresh_pr(repo: str, number: int, expected: str, observed: str = "") -> dict:
+    """Optional synchronous correction. Its failure never opens the discovery circuit.
+
+    Retry deadlines belong to this PR, not the identity-wide read cooldown. In
+    particular, do not route HTTP errors through read() or _classify().
+    """
+    unavailable = dict(status="unavailable", reason="refresh_unavailable", retry_at=time.time() + 30)
+    try:
+        url = _url()
+        if not url or not re.fullmatch(r"[a-f0-9]{40}", expected):
+            return unavailable
+        token_file = os.environ.get("TAUCETI_GITHUB_STATE_TOKEN_FILE")
+        if not token_file:
+            return {**unavailable, "reason": "refresh_auth_required"}
+        token = Path(token_file).expanduser().read_text().strip()
+        body = dict(repository=repo, number=number, expected_head=expected)
+        if re.fullmatch(r"[a-f0-9]{40}", observed):
+            body["observed_head"] = observed
+        ensure_ssl_cert_file()
+        request = urllib.request.Request(
+            url + "/v1/refresh-pr",
+            data=json.dumps(body).encode(),
+            headers={
+                "Authorization": "Bearer " + token,
+                "Content-Type": "application/json",
+                "User-Agent": "TauCetiWorker/1.0",
+            },
+        )
+        # The existing round deadline owns cancellation. A separate socket
+        # deadline can discard a successful shared repair still being committed.
+        with urllib.request.urlopen(request, timeout=None) as response:
+            result = json.load(response)
+        if (
+            not isinstance(result, dict)
+            or result.get("version") != 1
+            or result.get("repository") != repo
+            or result.get("operation") != "pr"
+        ):
+            return unavailable
+        if (
+            result.get("status") == "ok"
+            and result.get("complete") is True
+            and isinstance(result.get("data"), dict)
+            and result["data"].get("number") == number
+            and re.fullmatch(r"[a-f0-9]{40}", str(result["data"].get("headRefOid", "")))
+        ):
+            outcome = result.get("outcome")
+            if outcome not in ("refreshed", "already-changed", "recently-verified"):
+                return unavailable
+            return dict(status="ok", data=result["data"], outcome=outcome)
+        retry = result.get("retry_at")
+        retry = retry / 1000 if isinstance(retry, (int, float)) and math.isfinite(retry) else unavailable["retry_at"]
+        reason = result.get("reason")
+        if reason not in (
+            "refresh_unavailable",
+            "refresh_failed",
+            "refresh_timeout",
+            "superseded",
+            "capacity",
+            "secondary",
+            "primary:core",
+            "primary:graphql",
+            "primary",
+        ):
+            reason = "refresh_unavailable"
+        return {
+            **unavailable,
+            "reason": reason,
+            "retry_at": min(time.time() + MAX_RETRY_AFTER, max(time.time() + 1, retry)),
+        }
+    except urllib.error.HTTPError as error:
+        reason = (
+            "refresh_unsupported"
+            if error.code in (400, 404, 405)
+            else "refresh_auth_required"
+            if error.code in (401, 403)
+            else "refresh_http_error"
+        )
+        error.close()
+        return {**unavailable, "reason": reason}
+    except TimeoutError:
+        return {**unavailable, "reason": "refresh_timeout"}
+    except (OSError, ValueError, TypeError, RecursionError, http.client.HTTPException, StateQueryError):
+        return unavailable
 
 
 def _wire(data, operation):
@@ -218,24 +320,20 @@ def _renew(state, probe):
     return {**state, "probe_until": time.time() + PROBE_LEASE} if state.get("probe") == probe else state
 
 
-def _recovered(state, started, probe, key):
-    if state.get("failed_at", 0) > started and (probe is None or state.get("probe") != probe):
-        return state  # A request that began before a newer recorded failure is not evidence of recovery.
-    now = time.time()
-    cooling = {k: v for k, v in state.get("coverage_until", {}).items() if k != key and v > now}
-    return {
-        "failures": 0,
-        "until": 0,
-        **({"coverage_until": cooling, "coverage_reason": state.get("coverage_reason", "")} if cooling else {}),
-    }
+def _recovered(state):
+    # A complete response accepted now proves the mirror can answer, even if
+    # concurrent requests failed after this one began. Keeping the circuit open
+    # would discard healthy responses and amplify a short timeout burst.
+    if not state:
+        return state  # Healthy queries need no persistent circuit file.
+    recovered = {"failures": 0, "until": 0}
+    return state if recovered == state else recovered
 
 
-def _cooldown(state, operation, key, until, reason):
+def _cooldown(state, operation, until, reason):
     if operation != "survey":
         return state
-    now = time.time()
-    active = {k: v for k, v in state.get("coverage_until", {}).items() if v > now}
-    return {**state, "coverage_until": {**active, key: until}, "coverage_reason": reason}
+    return {**state, "coverage_until": until, "coverage_reason": reason}
 
 
 def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=False, _optional=False, **args):
@@ -253,14 +351,20 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
     url = _url()
     if not url:
         return False, None
+    if url == DEFAULT_URL and repo != PUBLIC_REPOSITORY and "TAUCETI_GITHUB_STATE_TOKEN_FILE" not in os.environ:
+        return False, None
     ensure_ssl_cert_file()
-    try:
-        token = Path(os.environ["TAUCETI_GITHUB_STATE_TOKEN_FILE"]).read_text().strip()
-        if not token:
-            raise ValueError("empty client token")
-    except (KeyError, OSError, ValueError) as error:
-        detail = "TAUCETI_GITHUB_STATE_TOKEN_FILE is not set" if isinstance(error, KeyError) else type(error).__name__
-        return _unavailable(repo, operation, "client_auth_configuration", detail)
+    token = ""
+    token_file = os.environ.get("TAUCETI_GITHUB_STATE_TOKEN_FILE")
+    if token_file is not None:
+        try:
+            token = Path(token_file).expanduser().read_text().strip()
+            if not token:
+                raise ValueError("empty client token")
+        except (OSError, ValueError) as error:
+            return _unavailable(repo, operation, "client_auth_configuration", type(error).__name__)
+    elif url != DEFAULT_URL or repo != PUBLIC_REPOSITORY:
+        return _unavailable(repo, operation, "client_auth_configuration", "TAUCETI_GITHUB_STATE_TOKEN_FILE is not set")
     identity = hashlib.sha256((url + "\0" + token).encode()).hexdigest()
     base = transport.root() / "gateway" / identity
     binding = {"identity": identity, "repository": repo, "operation": operation, "args": args}
@@ -271,12 +375,31 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
     ).hexdigest()
     cached_path = base / "responses" / (key + ".json")
     cached = _cached(cached_path, binding)
-    probe = None
-    started = time.time()
-    # An unsupported repository/auth scope must not poison healthy TauCeti reads.
-    circuit = base / "circuits" / (hashlib.sha256(repo.encode()).hexdigest() + ".json")
+    # Retry-After is an instruction from the service, not one PR's latency.
+    cooldown = base / "retry-after.json"
     try:
-        with transport.locked(circuit.with_suffix(".lock"), timeout=1):
+        limited = json.loads(cooldown.read_text())
+        if limited.get("until", 0) > time.time():
+            return _unavailable(
+                repo,
+                operation,
+                limited["reason"],
+                limited.get("detail", ""),
+                status=limited.get("status"),
+                retry_at=limited["until"],
+                circuit="open",
+                cached=cached,
+            )
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    probe = None
+    # A slow PR history must not suppress healthy reads of every other PR.
+    # Identical queries still share the outage backoff and single recovery probe.
+    circuit = base / "circuits" / (key + ".json")
+    try:
+        with (
+            transport.locked(circuit.with_suffix(".lock"), timeout=1) if circuit.exists() else contextlib.nullcontext()
+        ):
             try:
                 state = json.loads(circuit.read_text())
             except (OSError, ValueError):
@@ -294,14 +417,14 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                     circuit="open",
                     cached=cached,
                 )
-            if operation == "survey" and state.get("coverage_until", {}).get(key, 0) > now:
+            if operation == "survey" and state.get("coverage_until", 0) > now:
                 # The global inventory is backfilling; peers share one cooldown instead of each asking.
                 return _unavailable(
                     repo,
                     operation,
                     "coverage_unavailable",
                     state.get("coverage_reason", ""),
-                    retry_at=state["coverage_until"][key],
+                    retry_at=state["coverage_until"],
                     cached=cached,
                 )
             if state.get("failures", 0) >= 3:
@@ -324,16 +447,21 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                 if cursor:
                     params["cursor"] = cursor
                 headers = {
-                    "Authorization": "Bearer " + token,
                     "Accept": "application/json",
                     "User-Agent": "TauCetiWorker/1.0 (+https://github.com/TauCetiProject/TauCetiWorker)",
                 }
+                if token:
+                    headers["Authorization"] = "Bearer " + token
                 if cached and not cursor:
                     headers["If-None-Match"] = cached.get("etag", "")
                 request = urllib.request.Request(url + "/v1/query?" + urllib.parse.urlencode(params), headers=headers)
                 try:
                     with urllib.request.urlopen(
-                        request, timeout=max(0.1, min(2.4, deadline - time.monotonic()))
+                        # A healthy read can take 3–4s while the mirror commits
+                        # webhook updates. Use the remaining five-second budget
+                        # rather than abandoning it early and retrying the work.
+                        request,
+                        timeout=max(0.1, deadline - time.monotonic()),
                     ) as response:
                         try:
                             payload = json.load(response)
@@ -355,7 +483,9 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                         ) from None
                     elif error.code in (401, 403):
                         raise _Failure(
-                            "client_auth_configuration", _classify(error, token).detail, status=error.code
+                            "client_auth_configuration" if token else "public_read_unavailable",
+                            _classify(error, token).detail,
+                            status=error.code,
                         ) from None
                     else:
                         raise _classify(error, token) from None
@@ -379,7 +509,7 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                         # The service does not serve this repository to this client: a scope/config fix.
                         return _unavailable(repo, operation, "client_auth_configuration", detail, cached=cached)
                     retry_at = time.time() + 30 * random.uniform(0.8, 1.2)
-                    _circuit_update(circuit, _cooldown, operation, key, retry_at, detail)
+                    _circuit_update(circuit, _cooldown, operation, retry_at, detail)
                     return _unavailable(
                         repo, operation, "coverage_unavailable", detail, retry_at=retry_at, cached=cached
                     )
@@ -406,7 +536,8 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                             )
                     except OSError:
                         pass  # A healthy mirror remains usable when the local cache is unavailable.
-                    _circuit_update(circuit, _recovered, started, probe, key)
+                    if circuit.exists():
+                        _circuit_update(circuit, _recovered)
                     transport.event(
                         {
                             "kind": "gateway_read",
@@ -446,7 +577,11 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
             urllib.error.URLError,
         ) as error:
             last = _classify(error, token)
-            if time.monotonic() >= deadline or last.reason == "client_auth_configuration":
+            if (
+                time.monotonic() >= deadline
+                or last.reason in ("client_auth_configuration", "public_read_unavailable")
+                or last.retry_after
+            ):
                 break
     retry_at = time.time() + max(last.retry_after or 0, 5 * random.uniform(0.8, 1.2))
 
@@ -466,10 +601,24 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
             "detail": last.detail,
             "status": last.status,
             "since": state.get("since") or now,
-            "failed_at": now,
         }
 
     _circuit_update(circuit, failed)
+    if last.retry_after:
+        until = time.time() + last.retry_after
+        _circuit_update(
+            cooldown,
+            lambda state: (
+                state
+                if state.get("until", 0) >= until
+                else {
+                    "until": until,
+                    "reason": last.reason,
+                    "detail": last.detail,
+                    "status": last.status,
+                }
+            ),
+        )
     return _unavailable(repo, operation, last.reason, last.detail, status=last.status, retry_at=retry_at, cached=cached)
 
 
@@ -519,7 +668,6 @@ def read_survey(repo, roadmap="any", skip=(), *, numbers=(), stages=None, allow_
             if (
                 facts.get("meta") is not None
                 and not isinstance(facts["meta"], dict)
-                or not isinstance(facts.get("markers"), list)
                 or not isinstance(facts.get("rebase_heads"), list)
             ):
                 raise ValueError("invalid survey facts")
@@ -544,14 +692,6 @@ def read_survey(repo, roadmap="any", skip=(), *, numbers=(), stages=None, allow_
                 not isinstance(value, str) for value in pr.get("target_focuses", [])
             ):
                 raise ValueError("invalid survey targets")
-            for marker in facts["markers"]:
-                if (
-                    not isinstance(marker, dict)
-                    or type(marker.get("expires_at")) is not int
-                    or not isinstance(marker.get("providers"), list)
-                    or any(not isinstance(provider, str) for provider in marker["providers"])
-                ):
-                    raise ValueError("invalid survey claim")
         counts = result.get("author_counts")
         if counts is not None and (
             not isinstance(counts, dict) or any(type(count) is not int or count < 0 for count in counts.values())

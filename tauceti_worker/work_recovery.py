@@ -33,6 +33,7 @@ was published from a transcript; resuming retained work is a separate consumer o
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import io
 import json
@@ -52,7 +53,7 @@ from pathlib import Path
 from . import recovery_index
 from .config import log
 from .constants import ROADMAP, TAUCETI
-from .paths import HERE
+from .paths import HERE, canonical_candidate, legacy_data_root
 from .runtime_status import atomic_json, read_json
 
 SCHEMA = "tauceti-work-recovery/v1"
@@ -60,6 +61,8 @@ PUBLISHED = "refs/tauceti/published"
 PRESERVED = "refs/tauceti/preserved"
 PENDING = "refs/tauceti-pending"  # outside refs/tauceti/, so a pending tip never counts as preserved
 PSEUDO_HEADS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD")
+
+INCOMPLETE_SAVE_TTL = 3600
 
 MAX_UNTRACKED_BYTES = 128 * 1024 * 1024
 MAX_UNTRACKED_FILES = 20000
@@ -122,6 +125,7 @@ class Work:
     read_bytes: int = 0
     hash_bytes: int = 0
     removed_bytes: int = 0
+    removed_entries: int = 0
     removal_bytes: int | None = None
     deadline: float = float("inf")
     adaptive: bool = False
@@ -155,6 +159,7 @@ class Work:
             read_bytes=self.read_bytes,
             hash_bytes=self.hash_bytes,
             removed_bytes=self.removed_bytes,
+            removed_entries=self.removed_entries,
             limits=dict(
                 seconds=None if self.seconds == float("inf") else self.seconds,
                 entries=self.entries,
@@ -166,6 +171,7 @@ class Work:
 
 
 _WORK = ContextVar("recovery_work", default=None)
+_SAVE_LEASE = ContextVar("recovery_save_lease", default=None)
 
 
 def _charge(**fields):
@@ -252,19 +258,26 @@ def _git_environment(repo):
     return env
 
 
-def _git(repo: Path, *args: str, check: bool = True, text: bool = False, timeout: int = 600):
+def _git(repo: Path, *args: str, check: bool = True, text: bool = False, timeout: float | None = 600):
     work = _WORK.get()
     if work is not None:
         work.charge(entries=1)
-        timeout = min(timeout, max(0.001, work.seconds - (time.monotonic() - work.started)))
+        remaining = max(0.001, min(work.started + work.seconds, work.deadline) - time.monotonic())
+        timeout = (None if remaining == float("inf") else remaining) if timeout is None else min(timeout, remaining)
     command = ["git", "-C", str(repo), "-c", "core.quotepath=off", *args]
     env = _git_environment(repo)
     if work is not None and work.seconds != float("inf"):
         # Bound bytes at the pipe, rather than accounting for an arbitrarily large captured
         # rev-list/diff/ls-files output after it has already been read into memory.
-        returncode, output, stderr = _bounded_git(command, env, work)
+        returncode, output, stderr = _bounded_git(command, env, work, timeout=timeout)
     else:
-        p = subprocess.run(command, capture_output=True, timeout=timeout, env=env)
+        p = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+            pass_fds=(() if _SAVE_LEASE.get() is None else (_SAVE_LEASE.get(),)),
+        )
         output, stderr, returncode = p.stdout, p.stderr, p.returncode
         _charge(read=len(output) + len(stderr))
     if check and returncode:
@@ -273,8 +286,17 @@ def _git(repo: Path, *args: str, check: bool = True, text: bool = False, timeout
     return output.decode(errors="replace") if text else output
 
 
-def _bounded_git(command, env, work):
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as process:
+def _bounded_git(command, env, work, *, timeout=600):
+    deadline = min(
+        work.started + work.seconds, work.deadline, float("inf") if timeout is None else time.monotonic() + timeout
+    )
+    with subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        pass_fds=(() if _SAVE_LEASE.get() is None else (_SAVE_LEASE.get(),)),
+    ) as process:
         output = {process.stdout: bytearray(), process.stderr: bytearray()}
         try:
             with selectors.DefaultSelector() as selector:
@@ -282,8 +304,10 @@ def _bounded_git(command, env, work):
                     selector.register(stream, selectors.EVENT_READ)
                 while selector.get_map():
                     work.charge()
-                    remaining = min(work.started + work.seconds, work.deadline) - time.monotonic()
-                    for event, _ in selector.select(max(0, remaining)):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    for event, _ in selector.select(None if remaining == float("inf") else max(0, remaining)):
                         capacity = min(65536, work.read_remaining)
                         if capacity <= 0:
                             raise BudgetExhausted("git output byte budget; retry preservation")
@@ -293,8 +317,8 @@ def _bounded_git(command, env, work):
                             output[event.fileobj].extend(data)
                         else:
                             selector.unregister(event.fileobj)
-            remaining = max(0.001, min(work.started + work.seconds, work.deadline) - time.monotonic())
-            rc = process.wait(timeout=remaining)
+            remaining = max(0.001, deadline - time.monotonic())
+            rc = process.wait(timeout=None if remaining == float("inf") else remaining)
             return rc, bytes(output[process.stdout]), bytes(output[process.stderr])
         except BaseException:
             # Only the Git subprocess started by this housekeeping operation, never a session.
@@ -635,7 +659,10 @@ def process_owner():
     from .usage_lifecycle import identity
 
     if sys.platform != "linux":
-        return identity()
+        owner = identity()
+        if sys.platform == "darwin" and os.getsid(0) == os.getpid():
+            owner["session"] = os.getpid()
+        return owner
     fields = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()
     owner = dict(pid=os.getpid(), start=fields[19], boot=Path("/proc/sys/kernel/random/boot_id").read_text().strip())
     if os.getsid(0) == os.getpid():
@@ -653,7 +680,7 @@ def owner_stopped(owner):
     if sys.platform != "linux":
         from .usage_lifecycle import alive
 
-        return not alive(owner)
+        return not alive({key: value for key, value in owner.items() if key != "session"})
     if not isinstance(owner["start"], str) or not owner["start"].isdigit() or not isinstance(owner["boot"], str):
         return False
     try:
@@ -671,6 +698,42 @@ def owner_stopped(owner):
         return Path("/proc/sys/kernel/random/boot_id").is_file() and not Path(f"/proc/{pid}").exists()
     except (OSError, ValueError, TypeError, IndexError):
         return False
+
+
+def owner_session(owner):
+    """Retain a dead leader's session until reboot or positive evidence of PID reuse."""
+    import sys
+
+    if not isinstance(owner, dict):
+        raise ValueError("missing owner identity")
+    session = owner.get("session")
+    if session is None:
+        return None
+    if not isinstance(session, int) or isinstance(session, bool) or session <= 0:
+        raise ValueError("invalid owner session")
+    if sys.platform == "darwin":
+        from .usage_lifecycle import darwin_boot, darwin_process
+
+        if owner["boot"] != darwin_boot():
+            return None
+        try:
+            current, _ = darwin_process(session)
+            if os.getsid(session) == session and current["start"] != owner["start"]:
+                return None
+        except ProcessLookupError:
+            pass  # The leader may be gone while its session still has live members.
+    elif sys.platform == "linux":
+        if owner["boot"] != Path("/proc/sys/kernel/random/boot_id").read_text().strip():
+            return None
+        try:
+            fields = Path(f"/proc/{session}/stat").read_text().rsplit(")", 1)[1].split()
+            if int(fields[3]) == session and fields[19] != owner["start"]:
+                return None
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+    else:
+        raise OSError("session observations unavailable")
+    return session
 
 
 def note_owner(cfg, label: str = "TauCeti", **fields) -> bool:
@@ -869,6 +932,28 @@ def _handoff_source_receipts(cfg, owner, checkpoint, *, checkout=None):
 
 
 def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, owner: dict | None = None) -> Path:
+    """Serialize saves and exclude partial-save cleanup, including while Git children live."""
+    root = cfg.state / "recovery"
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as error:
+        raise RecordError(f"could not create {root}: {error}") from error
+    try:
+        with (cfg.state / "recovery-save.lock").open("a+b") as lease:
+            try:
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RecordError("another source save is still running; retain the checkout") from None
+            token = _SAVE_LEASE.set(lease.fileno())
+            try:
+                return _record_locked(cfg, repo, snap, label, repository, owner=owner)
+            finally:
+                _SAVE_LEASE.reset(token)
+    except OSError as error:
+        raise RecordError(f"could not acquire source-save lease: {error}") from error
+
+
+def _record_locked(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, owner: dict | None = None) -> Path:
     """Write or reuse a complete record for this exact snapshot. Raises RecordError on any failure."""
     from .activity import current_round_id
 
@@ -945,10 +1030,11 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
                 "--not",
                 "--remotes",
                 f"--glob={PUBLISHED}",
+                timeout=None,  # Foreground bundles scale with history; housekeeping still has its Work budget.
             )
             with open(tmp / "commits.bundle", "rb+") as handle:
                 os.fsync(handle.fileno())
-            _git(repo, "bundle", "verify", "-q", str(tmp / "commits.bundle"))
+            _git(repo, "bundle", "verify", "-q", str(tmp / "commits.bundle"), timeout=None)
         _write(tmp / "staged.patch", snap.staged)
         _write(tmp / "unstaged.patch", snap.unstaged)
         _archive(repo, snap.untracked, tmp / "untracked.tar")
@@ -999,13 +1085,14 @@ def _record(cfg, repo: Path, snap: Snapshot, label: str, repository: str, *, own
         final = root / record_id
         os.rename(tmp, final)
         _fsync_dir(root)
-    except (OSError, subprocess.SubprocessError, tarfile.TarError, RecordError) as error:
-        # Only our own partial copy is removed; the checkout itself is untouched.
+    except BaseException as error:
+        # Cancellation also abandons our partial copy; the checkout itself is untouched.
         shutil.rmtree(tmp, ignore_errors=True)
-        _update_refs(repo, [f"delete {pending}/{name}" for name in bundle_refs], check=False)
-        if isinstance(error, RecordError):
-            raise
-        raise RecordError(f"could not save recovery record: {error}") from error
+        with contextlib.suppress(Exception):
+            _update_refs(repo, [f"delete {pending}/{name}" for name in bundle_refs], check=False)
+        if isinstance(error, (OSError, subprocess.SubprocessError, tarfile.TarError)):
+            raise RecordError(f"could not save recovery record: {error}") from error
+        raise
     receipt_error = None
     try:
         _handoff_source_receipts(cfg, owner, final, checkout=repo)
@@ -1039,6 +1126,7 @@ def _update_refs(repo: Path, commands: list[str], *, check: bool = True) -> None
         input="".join(c + "\n" for c in commands).encode(),
         capture_output=True,
         env=_git_environment(repo),
+        pass_fds=(() if _SAVE_LEASE.get() is None else (_SAVE_LEASE.get(),)),
     )
     if check and p.returncode:
         raise RecordError(f"git update-ref failed: {p.stderr.decode(errors='replace').strip()[-200:]}")
@@ -1054,53 +1142,124 @@ def _set_status(record: Path, state: str, reason: str = "") -> bool:
     return True
 
 
-def live_users(repo: Path, *, session=None) -> list[str]:
-    """Processes whose cwd, root, or open files lie inside the checkout (Linux /proc; read-only).
-    Detached descendants without a live reference are outside this best-effort observation."""
+def _darwin_process_references():
+    """Read visible references, with the same per-process permission limits as Linux procfs."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+
+    result = []
+    try:
+        skip = {os.getpid()} | {process.pid for process in psutil.Process().parents()}
+        for pid in psutil.pids():
+            _charge()
+            if pid <= 0:
+                continue
+            try:
+                process = psutil.Process(pid)
+                with contextlib.suppress(psutil.Error, OSError):
+                    if process.status() in {psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD}:
+                        continue
+                session = None
+                with contextlib.suppress(OSError):
+                    session = os.getsid(pid)
+                paths = []
+                if pid not in skip:
+                    visible = False
+                    with contextlib.suppress(psutil.Error, OSError):
+                        uids = process.uids()
+                        visible = os.geteuid() == 0 or uids.real == os.getuid() or uids.effective == os.geteuid()
+                    # Like Linux procfs, another user's private references are
+                    # outside this best-effort observation. Inspect all as root.
+                    if visible:
+                        with contextlib.suppress(psutil.Error, OSError):
+                            paths.append(process.cwd())
+                        with contextlib.suppress(psutil.Error, OSError):
+                            files = process.open_files()
+                            _charge(entries=len(files))
+                            paths.extend(item.path for item in files)
+                        # Kernel vnode paths are already canonical. Resolving them
+                        # could block on unrelated network mounts or autofs triggers.
+                result.append((str(pid), session, f"{pid} (process)", paths))
+            except (psutil.NoSuchProcess, ProcessLookupError):
+                continue  # Exits during observation are ordinary.
+            except (psutil.Error, OSError):
+                continue  # One private/disappearing process must not discard the inventory.
+    except (psutil.Error, OSError):
+        return None
+    return result
+
+
+def process_references():
+    """One read-only process inventory, reusable within a cleanup pass only."""
+    import sys
+
+    if sys.platform == "darwin":
+        return _darwin_process_references()
+    if sys.platform != "linux":
+        return None
     proc = Path("/proc")
     if not (proc / "self").exists():
-        return []
-    target = os.path.realpath(repo)
-    prefix = target.rstrip("/") + "/"
+        return None
     skip = set()
     pid = os.getpid()
-    while pid > 1:  # never report ourselves or the supervisors that started this round
+    while pid > 1:
         skip.add(pid)
         try:
             pid = int((proc / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[1])
         except (OSError, ValueError, IndexError):
             break
-    found = []
+    result = []
     for entry in proc.iterdir():
-        _charge()  # deadline also bounds ownership observation during housekeeping
+        _charge()
         if not entry.name.isdigit():
             continue
-        if session is not None:
-            try:
-                fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
-                if int(fields[3]) == session and fields[0] not in {"Z", "X"}:
-                    found.append(f"{entry.name} (owner session)")
-                    continue
-            except (OSError, ValueError, IndexError):
-                pass
-        if int(entry.name) in skip:
-            continue
-        links = [entry / "cwd", entry / "root"]
-        with contextlib.suppress(OSError):
-            links += list((entry / "fd").iterdir())
-        for link in links:
-            _charge()
-            try:
-                where = os.readlink(link)
-            except OSError:
-                continue
-            if where == target or where.startswith(prefix):
-                try:
-                    found.append(f"{entry.name} ({(entry / 'comm').read_text().strip()})")
-                except OSError:
-                    found.append(entry.name)
-                break
+        session = None
+        try:
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+            if fields[0] not in {"Z", "X"}:
+                session = int(fields[3])
+        except (OSError, ValueError, IndexError):
+            pass
+        paths = []
+        if int(entry.name) not in skip:
+            links = [entry / "cwd", entry / "root"]
+            with contextlib.suppress(OSError):
+                links += list((entry / "fd").iterdir())
+            for link in links:
+                _charge()
+                with contextlib.suppress(OSError):
+                    where = os.readlink(link)
+                    if where.startswith("/"):
+                        paths.append(where)
+        result.append((entry.name, session, entry.name, paths))
+    return result
+
+
+def referenced_users(repo: Path, references, *, session=None) -> list[str]:
+    if references is None:
+        return ["process observations unavailable"]
+    try:
+        target = str(canonical_candidate(repo))
+    except OSError:
+        return ["candidate path unavailable"]
+    prefix = target.rstrip("/") + "/"
+    found = []
+    for pid, process_session, label, paths in references:
+        if session is not None and process_session == session:
+            found.append(f"{pid} (owner session)")
+        elif any(where == target or where.startswith(prefix) for where in paths):
+            if label == pid:
+                with contextlib.suppress(OSError):
+                    label = f"{pid} ({(Path('/proc') / pid / 'comm').read_text().strip()})"
+            found.append(label)
     return found
+
+
+def live_users(repo: Path, *, session=None) -> list[str]:
+    """Fresh process references for ordinary callers; no cached negative liveness evidence."""
+    return referenced_users(repo, process_references(), session=session)
 
 
 # Next to the checkout, so moving aside is a same-volume rename. Not `retained`: progress parks
@@ -1413,7 +1572,7 @@ def restore(record: Path, repo: Path) -> None:
 
 def records(state_root: Path | None = None, *, workers=None):
     """Yield (worker, record dir or None for an incomplete save, manifest or None, status) locally."""
-    base = state_root or HERE / "state"
+    base = state_root or legacy_data_root(HERE) / "state"
     with contextlib.suppress(OSError):
         for worker in sorted(p for p in base.iterdir() if p.is_dir()):
             if workers is not None and worker.name not in workers:
@@ -1459,4 +1618,4 @@ def summary(state_root: Path | None = None, *, workers=None) -> dict:
 def _state_root() -> Path:
     from .config import legacy_project, worker_state_root
 
-    return HERE / "state" if legacy_project() else worker_state_root()
+    return legacy_data_root(HERE) / "state" if legacy_project() else worker_state_root()

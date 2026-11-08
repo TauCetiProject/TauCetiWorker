@@ -66,12 +66,14 @@ captured = {}
 def fake_run_in_bubble(w, target, prompt, opts, mounts=None, inner_cmd=None, cred_model=None):
     captured["inner"] = inner_cmd
     captured["cred"] = cred_model
+    captured["mounts"] = mounts
     return 0
 
 
 agents.run_in_bubble = fake_run_in_bubble
 agents.fetch_ref = lambda repo, d: True  # no network
 agents.me = lambda: "tester"  # no gh call
+agents._review_mathlib_source = lambda cfg, head: None  # no dependency in this fixture
 
 tmp = Path(tempfile.mkdtemp())
 os.environ["TAUCETI_REVIEW_ENGINE_DIR"] = str(tmp / "engine")  # skip the engine fetch
@@ -79,26 +81,44 @@ w = types.SimpleNamespace(cfg=types.SimpleNamespace(state=tmp / "state", store_d
 opts = types.SimpleNamespace()
 
 os.environ.pop("TAUCETI_REVIEW_CODEX_MODEL", None)
-agents.review_in_bubble(w, 470, "abc123", "codex", opts)
+agents._review_in_bubble(w, 470, "abc123", "codex", opts)
 check("bubble: unset -> no --codex-model, engine default stands", "--codex-model" not in captured["inner"])
 check("bubble: codex reviewer still seeds codex creds", captured["cred"] == "codex")
 
 os.environ["TAUCETI_REVIEW_CODEX_MODEL"] = "gpt-5.6-terra"
-agents.review_in_bubble(w, 470, "abc123", "codex", opts)
+agents._review_in_bubble(w, 470, "abc123", "codex", opts)
 check("bubble: set -> --codex-model gpt-5.6-terra forwarded", "--codex-model gpt-5.6-terra" in captured["inner"])
 
-agents.review_in_bubble(w, 470, "abc123", "claude", opts)
+agents._review_in_bubble(w, 470, "abc123", "claude", opts)
 check("bubble: claude reviewer -> no codex flag even when set", "--codex-model" not in captured["inner"])
 check("bubble: default Claude model is pinned", "--claude-model claude-opus-5-5" in captured["inner"])
 os.environ["TAUCETI_CLAUDE_MODEL"] = "claude-fable-5-1"
-agents.review_in_bubble(w, 470, "abc123", "claude", opts)
+agents._review_in_bubble(w, 470, "abc123", "claude", opts)
 check("bubble: explicit Claude override is forwarded", "--claude-model claude-fable-5-1" in captured["inner"])
 os.environ.pop("TAUCETI_CLAUDE_MODEL", None)
 
-agents.review_in_bubble(w, 470, "abc123", "kiro", opts)
+agents._review_in_bubble(w, 470, "abc123", "kiro", opts)
 check("bubble: Kiro exact model is forwarded", "--kiro-model claude-opus-5" in captured["inner"])
 check("bubble: Kiro reviewer seeds only Kiro creds", captured["cred"] == "kiro")
 check("bubble: Kiro credential bootstrap is present", "kiro-auth.sqlite3" in captured["inner"])
+
+result = tmp / "review-results" / "result.json"
+agents._review_in_bubble(w, 470, "abc123", "codex", opts, result_file=result)
+check("bubble: mounts only result directory", f"{result.parent}:/opt/review-result:rw" in captured["mounts"])
+check(
+    "bubble: passes exact outcome file",
+    "TAUCETI_REVIEW_RESULT_FILE=/opt/review-result/result.json" in captured["inner"],
+)
+
+check("bubble: no Mathlib snapshot -> --no-mathlib", "--no-mathlib" in captured["inner"])
+agents._review_mathlib_source = lambda cfg, head: tmp / "mathlib-src-x"
+agents._review_in_bubble(w, 470, "abc123", "claude", opts)
+check("bubble: Mathlib snapshot is mounted read-only", f"{tmp / 'mathlib-src-x'}:/opt/mathlib:ro" in captured["mounts"])
+check(
+    "bubble: engine greps the mounted Mathlib",
+    "--mathlib-dir /opt/mathlib" in captured["inner"] and "--no-mathlib" not in captured["inner"],
+)
+agents._review_mathlib_source = lambda cfg, head: None
 
 # --- host: exercise the actual do_review command construction without a provider/network ----------
 host_commands = []

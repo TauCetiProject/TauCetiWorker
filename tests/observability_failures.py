@@ -155,6 +155,41 @@ class ObservabilityTests(unittest.TestCase):
             self.assertEqual(publisher.snapshot()["state"], "running")
             self.assertEqual(publisher.snapshot()["phase"], "review")
 
+    def test_runtime_heartbeats_are_atomic_without_durable_disk_barriers(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "status.json"
+            with patch.object(rs.os, "fsync", side_effect=AssertionError("runtime status forced to disk")):
+                rs.update_status(path, state="running", wrapper_pid=123, applied_spec={"restart": "always"})
+                publisher = rs.StatusPublisher(path)
+                publisher.update(heartbeat_at=100)
+                with patch.dict(os.environ, {rs.STATUS_ENV: str(path)}):
+                    rs.report_runtime("surveying", phase="review")
+            value = rs.read_json(path)
+            self.assertEqual(value["wrapper_pid"], 123)
+            self.assertEqual(value["heartbeat_at"], 100)
+            self.assertEqual(value["state"], "surveying")
+            self.assertEqual(value["phase"], "review")
+
+    def test_restart_policy_records_keep_content_durability(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "status.json"
+            for restart in ("never", "on-failure"):
+                rs.update_status(path, applied_spec={"restart": restart})
+                with patch.object(rs.os, "fsync", wraps=os.fsync) as sync:
+                    rs.update_status(path, heartbeat_at=100)
+                    with patch.dict(os.environ, {rs.STATUS_ENV: str(path)}):
+                        rs.report_runtime("surveying")
+                    self.assertEqual(sync.call_count, 2)
+            rs.update_status(path, applied_spec={"restart": "always"})
+            for lifecycle in (
+                {"spec_hash": "new", "restart_count": 0, "stopped_at": None, "exit_code": None},
+                {"state": "exited", "stopped_at": 200, "exit_code": 0},
+                {"state": "queued", "stopped_at": None, "exit_code": None},
+            ):
+                with patch.object(rs.os, "fsync", wraps=os.fsync) as sync:
+                    rs.update_status(path, **lifecycle)
+                    self.assertEqual(sync.call_count, 1)
+
     def test_metrics_lock_cache_and_proxy_failures_do_not_block_requests(self):
         with tempfile.TemporaryDirectory() as raw, patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": raw}):
             with (Path(raw) / "accounting.lock").open("a+") as lock:

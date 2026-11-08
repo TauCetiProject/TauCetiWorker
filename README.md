@@ -8,6 +8,9 @@ This repository remains an example worker harness. Pass the same configuration t
 
 See the [architecture and manual setup](https://github.com/TauCetiProject/TauCetiTools/blob/main/docs/project-setup.md)
 for repository ownership, Apps, credentials, workflow installation and optional services.
+The manual also covers [roadmap authoring (WIP)](https://github.com/TauCetiProject/TauCetiTools/blob/main/docs/project-setup.md#roadmap-authoring-wip)
+with TauCetiRoadmapWorker and a downstream-owned job board. This optional extra is disabled
+by default; project `doctor` prints setup instructions and the dedicated roadmap doctor command.
 A configured project has its own checkouts, review store, activity and snapshots under
 `~/.local/state/tauceti/projects/OWNER__REPOSITORY/`. Starting a new worker reloads its canonical
 configuration; a running process tree keeps its saved snapshot. Worker IDs in a shared manager
@@ -80,6 +83,7 @@ instead, a small PEP 723 `uv` shim that runs the same package; every command
 below works either way, and this README writes the installed form.
 
 Local checks use [concurrent verification with exact-input receipts](docs/verification.md).
+Linux workers also [wait for spare RAM and CPU before launching Lean](docs/lean-pressure.md).
 
 ### Multiple GitHub accounts
 
@@ -155,7 +159,7 @@ A round does exactly one unit of work: the first of these that applies.
 | **Lint repair** | Fix `TauCeti/` on a red `lint-repair/` PR. PR builds lint only the modules a change touches, so TauCeti's daily full lint opens one of these when main carries environment-lint violations elsewhere (for example, a new simp lemma that takes an older one out of simp normal form). The worker never opens one itself. |
 | **Progress** | When the global eight-hour cadence is due and a roadmap has at least 25 new PRs, update its generated `STATUS.md` and `PROGRESS.md` through TauCetiProgress. |
 | **Fix CI** | Repair one of our PRs whose `build` check is red. It cannot be reviewed until it builds, so this comes before Fix. |
-| **Fix** | Address the review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. |
+| **Fix** | Address current-head review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. Existing findings can be repaired while CI is pending or unavailable; a green build is not required. |
 | **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. Maintenance on our own PRs takes priority so author-action work (`ci-failed` or `awaiting-author`) cannot be starved by unrelated reviews. |
 | **Overlap fix** | Refactor a labelled Mathlib overlap issue into a normal upstream PR, preserving additional Tau Ceti functionality. |
 | **Overlap scan** | Examine up to 160 consecutive Mathlib commits after the shared cursor, publish actionable overlaps as issues, then advance the cursor through the completed batch. |
@@ -192,16 +196,17 @@ tauceti work --only security-audit --agent codex
 tauceti work --only security-audit --agent claude --loop
 ```
 
-An admin's maintenance worker can also use `--only security-audit,bump,progress`.
-It inspects a bounded batch before ordinary maintenance when at least 20 commits
-are pending. Below that threshold it continues with bump/progress work without
-launching an audit model. Set `TAUCETI_SECURITY_AUDIT_MIN_COMMITS` to a positive
-integer to change the threshold. Audit-only runs inspect any nonempty backlog.
-Findings, unresolved inspections and operational failures stop audit advancement
-and preserve their blocks and evidence. The combined worker continues with
-bump/progress work; this never clears a block or bypasses release gating.
-Other work phases and `--pr` cannot be
-combined with the audit phase. Its isolated Luna/Haiku reviewer is unchanged.
+An admin's worker can combine the audit with any other phases, for example
+`--only security-audit,bump,progress,overlap-scan`. It inspects a bounded batch
+before its other work when at least 20 commits are pending. Below that threshold
+it continues with its other phases without launching an audit model. Set
+`TAUCETI_SECURITY_AUDIT_MIN_COMMITS` to a positive integer to change the
+threshold. Audit-only runs inspect any nonempty backlog. Findings, unresolved
+inspections and operational failures stop audit advancement and preserve their
+blocks and evidence. The combined worker continues with its other phases; this
+never clears a block or bypasses release gating. `--pr` cannot be combined with
+the audit phase. Its isolated Luna/Haiku reviewer is unchanged, and the worker's
+other phases use their default authoring profile.
 
 It advances TauCeti's protected `security-audit` branch through main's first-parent
 history, inspecting only `TauCeti/` and `TauCeti.lean` for IO and executable meta code.
@@ -210,28 +215,65 @@ Each session inspects complete per-commit diffs and before/after file contents,
 up to 20 commits with a 2 MiB workload target. A single larger commit is inspected
 alone without an aggregate byte cap, through the same compacting session. Each
 source blob remains limited to 4 MiB, and each model launch to 30 minutes.
-The batching target is separate from the model's live context window. Small inputs are supplied inline; larger
-inputs are available through one read-only `audit.read_page` tool. It accepts only
-a numbered page and a continuation token, with no filesystem paths, URLs, commands
-or writes. Each read returns the token for the next call; a stale nonempty token
-is rejected. To recover a lost token, explicitly send an empty token: the reader
-replays the last full page with a fresh token. It does not count the requested new
-page as read. The same Luna/Haiku conversation can compact its history and
-re-read pages as needed, then returns one verdict covering the entire batch. There
-are no independent partial inspections or combined partial approvals. A pass is
-rejected unless the reader's receipt accounts for every page and the verdict echoes
-the token that follows the last page's contents. Delivery coverage
-does not prove the model understood the source; compaction can lose details, so
-the prompt requires retaining findings and unresolved questions, re-reading when
-needed, and returning incomplete if the full inspection cannot be completed.
+The batching target is separate from the model's live context window. Small
+inputs are supplied inline; larger inputs use one read-only `audit.read_page` tool.
+In protocol 4 it accepts only a numbered chunk, with no paths, commands or copied
+identifiers. The reader serves the next unserved chunk or an earlier reread and
+rejects skipping ahead. The complete encoded tool response is capped at 64 KiB,
+with headroom under the configured 120k output allowance. It validates size and
+flushes the response before atomically recording served coverage. Failed writes
+receive no credit; a crash before the receipt is committed can require a reread.
+The Worker saves coverage before each client call and reconciles it with the
+client's successful tool-call reports afterwards, including on timeout or failure.
+For Codex recovery, each successful read must also have its matching complete
+source sections in the saved native conversation that will be resumed. The Worker
+keeps the contiguous confirmed prefix and rereads only the unconfirmed remainder in the
+same conversation. This works independently of parallel tool-call ordering.
+If the Worker dies without saving a transcript, the launch's new reads are replayed.
+Earlier findings and uncertainty are preserved;
+partial progress never substitutes for a final safety judgment.
+
+Protocol 4 trusts the verified client to deliver successful tool responses intact.
+Served coverage proves neither model receipt nor understanding. The same isolated
+Luna/Haiku conversation may compact and reread source, then returns only `verdict`
+and `findings` for the entire batch. The Worker supplies the immutable digest and
+ordered commit list. Missing chunks, earlier source concerns and malformed final
+answers block approval. There are no independent partial approvals. The prompt
+requires retaining findings and uncertainty across compaction and returning
+incomplete if the inspection cannot be completed.
+
+New inspections use protocol 4 only after the installed client passes an intact
+response check for this Worker release. The Worker runs this check automatically
+when verification is missing or stale, serializes concurrent checks, and caches
+failures for five minutes before retrying. A changed client bypasses that failure
+cooldown. The selected protocol and verification failures are logged, with failure
+details retained in `client-coverage-failures.json`. The same check is available
+manually for diagnosis:
+
+```bash
+python3 -m tauceti_worker.audit_client_check --provider codex --state /path/to/worker/state/security-audit
+python3 -m tauceti_worker.audit_client_check --provider claude --state /path/to/worker/state/security-audit
+```
+
+This runs the real client and reader against a loopback test endpoint, with
+synthetic source and no subscription credentials or real model requests. It
+compares the complete chunks in actual reviewer requests and, for Codex, in the
+saved native conversation, including Unicode and escaped text. It writes a private
+`client-coverage.json` compatibility record.
+The record is tied to client paths, file hashes, version and the reader, launcher,
+catalog and verification code. A client or Worker upgrade requires verification
+again, which the Worker performs automatically. A failed verification leaves new
+inspections on historical protocol 3 until a later check succeeds. Verification
+supports native executables and the managed
+Codex launcher; other wrappers keep protocol 3 because their underlying code
+cannot be identified reliably. Retained protocol-4 inspections retry verification
+automatically while keeping their original protocol. Existing protocol-3 inspections keep their exact
+reader, page layout, prompts and token checks; they are never reinterpreted as
+protocol-4 approvals. `audit_reader_v3.py` preserves that historical reader.
 
 Luna/Haiku receives no GitHub credential or general command/edit tools; trusted
-Worker code alone verifies ancestry and moves the ref. In judgment protocol v3,
-the model returns only `verdict` and `findings`, plus the final `read_token` for
-paged inputs. The Worker attaches the immutable input digest and ordered commit
-list from the launch record. Neither commit SHAs nor a digest are copied from
-model output. Unknown response fields are rejected. Coverage and final-token
-checks remain mandatory; host-owned identity does not establish source safety.
+Worker code alone verifies ancestry and moves the ref. Host-owned identity and
+served coverage do not establish source safety.
 No Lean builds or candidate scripts run. A finding, incomplete inspection, unsupported
 source blob or unrecoverable model error stops advancement. Read the retained `security-audit/blocked.json`
 in that worker's state directory. Resolve findings by explicit human attestation,
@@ -280,8 +322,9 @@ structured-output request. Objective, status and accounting are preserved separa
 from temporary provider credentials. A model's goal status never approves source or
 changes the cursor.
 
-The reader rejects skipping unread pages and reports `next_unread_page` and
-`remaining_pages` after the source, before its final delivery token. When only
+The protocol-4 reader rejects skipping unserved chunks and reports
+`next_unserved_page` and `remaining_pages`. The historical protocol-3 reader uses
+`next_unread_page` and a final delivery token. When only
 reading work remains, the reviewer returns `unfinished` with no findings. That is
 progress, not a source verdict. The Worker also detects a premature empty-finding
 pass with missing coverage, or a cleanly ended turn without a final answer. It
@@ -298,13 +341,21 @@ durable while the subprocess runs, so a restart retains evidence written before
 stdout capture finishes.
 
 After those immediate requests, ordinary `work` recovers operational and unfinished
-coverage blocks without human intervention. A durable budget waits 5, 10, 20, 40,
-then 60 minutes between recovery invocations, capped at one per hour thereafter.
-Reservation precedes launch and survives restarts. Every invocation rechecks hard
-quota limits, admin authority, the current cursor, exact next main prefix,
+coverage blocks without human intervention. Failed or stalled invocations use a
+durable budget that waits 5, 10, 20, 40, then 60 minutes between recoveries, capped
+at one per hour thereafter. Reservation precedes launch and survives restarts.
+When a validated continuation delivers new pages and returns clear
+coverage-only progress, its next recovery is eligible after one minute instead
+of the failure backoff. The reserved attempt count is preserved. Rereading old
+pages, provider failures, source findings and damaged evidence never earn this
+shorter delay. Actual launches also follow the worker loop's cadence and quota
+scheduling. Reading progress changes scheduling only; it cannot approve source.
+Every invocation rechecks hard quota limits, admin authority, the current cursor,
+exact next main prefix,
 immutable input, original UUID, launch policy, reader, catalog, exact prompt and
-all prior judgments. Complete coverage, the final delivery token, a complete
-passing judgment and confirmed ref update remain mandatory for advancement.
+all prior judgments. Complete coverage, a complete passing judgment and a
+confirmed ref update remain mandatory for advancement. Protocol 3 additionally
+requires its final copied delivery token.
 
 Known Codex capacity and request-processing retry notices are nonterminal progress
 when followed by a completed turn and its answer. Unknown errors and failed turns
@@ -312,7 +363,8 @@ remain failures. If a current-protocol inspection already finished successfully
 but was blocked during result handling, the Worker can revalidate its retained
 answer without another model request or model quota check. The public answer must
 match the native final, all prior judgments must remain clear, and complete reader
-coverage and the final token must validate. Fresh admin, cursor and exact main-prefix
+coverage must validate under the original protocol, including its final token
+when that protocol requires one. Fresh admin, cursor and exact main-prefix
 checks still precede advancement; the ledger records reuse of the original attempt,
 and its evidence and block remain preserved until the ref update is confirmed.
 
@@ -328,6 +380,7 @@ mismatched evidence remain blocked. Private alerts retain their usual deduplicat
 The `retry-service` and `repair-output` administrative commands remain for their
 restricted historical recovery profiles; automatic protocol-v3 recovery uses the
 ordinary worker loop and does not need those commands or a human attestation.
+Protocol 4 uses the same recovery loop with no token-output repair path.
 
 For the recorded legacy Luna failure where the final two pages were inaccessible
 because the reader token was lost, an admin may explicitly continue the **same
@@ -396,6 +449,13 @@ Roadmap rounds steer toward one area, a subdirectory of the
   whole roadmap over time.
 - `--roadmap-skip <area>[,<area>...]` excludes areas from both the random pick
   and the all-areas case. `--roadmap-only` wins on overlap.
+- `--extra-roadmap-prompt <text>` adds operator guidance to the roadmap prompt, for
+  example `--extra-roadmap-prompt "Work on the material relevant to Higher Topos Theory"`.
+  It steers the choice of target within the designated roadmap, and the choice
+  of area too when `--roadmap-only ""` leaves that to the agent (an unpinned
+  worker still draws its area at random before the agent sees the guidance).
+  It cannot override the skip list, others' claims, or the repository's rules.
+  Fix, rebase, and review rounds ignore it.
 - `--source <path-or-url>` adapts compatible material from an existing repository,
   and needs the roadmap phase enabled plus one pinned area. It is supplementary:
   the agent prioritizes the roadmap as written, then review-quality library code,
@@ -613,7 +673,7 @@ current usage and why a provider is waiting.
 | _(default)_ | The curve `60:40`: 40% of the quota by 60% of the window, then a ramp to the full quota by the reset. Holds a reserve for work that arrives late in a window |
 | `--pace 0:10,50:70,90:90` | Use a different piecewise-linear `time%:budget%` curve: 10% allowed immediately, ramping to 70% by halfway and 90% at 90% of the window, interpolated between points. Usage must remain strictly below the current budget. Budgets ≥ 100 mean no soft cap; a window at 100% used still backs off |
 | `--pace 0:0,100:100` | Spend at clock rate: the plain `used% < elapsed%` rule, which was the default before |
-| `--ignore-quota` | Ignore soft pacing for an explicit `--agent codex` or `--agent claude`; hard limits still apply |
+| `--ignore-quota` | Ignore pacing and transient usage-telemetry outages for an explicit `--agent codex` or `--agent claude`; known hard limits still apply |
 | `--quota-cmd CMD` | Your own pacer, run as `<cmd> <agent>`: the first stdout token is the model to run; empty output means wait |
 
 `TAUCETI_PACE` and `TAUCETI_QUOTA_CMD` set the corresponding controls by
@@ -659,6 +719,10 @@ The append-only ledger lives at
 and an explicit `TAUCETI_BUDGET_DIR` override. Grants, rate changes, balance
 adjustments, session admissions, and cost settlements remain auditable. Unknown
 costs remain visible for reconciliation and retain their pending estimates.
+An interrupted final ledger record is discarded automatically under the shared
+lock; preserving its fragment is best effort. Ledger read/write failures do not
+stop worker progress: work continues with incomplete accounting until storage
+recovers. Funding and provider cooldown decisions still apply when readable.
 Workers continue whenever available funds cover the next admission; API
 throttling is handled separately from funding. Local accounting uses Claude's reported cost estimates
 and does not represent the actual credit balance in Anthropic Console.
@@ -671,12 +735,24 @@ is at least $1, or the largest of the last 20 recorded costs across all models i
 zero-cost launch failures do not establish a spending estimate. If that session
 loses its receipt, another calibration session can run; missing costs never
 pause the fleet merely because reconciliation is outstanding. Resuming the same
-provider session waits while a previous resume is unsettled; unrelated sessions
-can run. Recover the cumulative receipt before resuming that provider session;
-a cost-only manual reconciliation does not restore its cumulative baseline. No local budget amount is passed as
+provider session waits while a previous resume is still running; unrelated sessions
+can run. Recovering the cumulative receipt restores accurate accounting across
+resumes; a missing baseline does not prevent runtime work. A cost-only manual
+reconciliation does not restore that baseline. No local budget amount is passed as
 Claude's `--max-budget-usd`. After a crashed worker, first try
 `tauceti budget --recover --note "worker crash"` to recover its durable receipts
-and remove stale staged keys. Costs without a receipt still require reconciliation.
+and remove stale staged keys. Missing native totals can settle as labelled,
+correctable estimates rather than remaining unresolved indefinitely.
+
+Fleet spending also shows rates including live estimates. The existing manager
+refreshes these once per minute, independently of historical activity collection.
+It uses a small running-usage summary and, when calibrated, journal-size growth;
+sampling never parses the growing journal. Recorded spending remains available
+alongside the labelled estimate, and reservations stay excluded. Resumed sessions
+retain their attributed known prefix until deduplication supplies further usage.
+The detached usage supervisor applies the audited stopped-usage policy to eligible
+stopped invocations on ordinary minute passes; late native receipts correct those
+estimates. Reporting estimates do not change admissions or settle expenditure.
 
 Managed workers accept the same flags through `workers add`, or the
 `claude_billing = "api"`, `budget = true`, and `anthropic_api_key_file` fields
@@ -705,3 +781,18 @@ for initialization, coordination, and the live calibration results.
 Run Python host helpers from this checkout with `uv run python PATH_TO_HELPER` so they
 use the pinned shared Tools dependency. Update any local timer commands to use the same
 invocation before upgrading this checkout.
+
+GitHub transport state (shared cache, cooldowns and pending publications) lives in
+`$XDG_STATE_HOME/tauceti/github-shared` or `~/.local/state/tauceti/github-shared`,
+independently of the installed worker version. `TAUCETI_GITHUB_SHARED_DIR` overrides
+this location. Comment writes are spaced across workers sharing a GitHub identity;
+secondary throttling backs off without discarding completed agent output.
+
+Plain `gh pr view --repo OWNER/REPO --json ...` scalar metadata reads also use
+the configured shared state service. Unsupported fields, formatting options,
+unavailable service data, and explicit direct-read contexts retain the normal
+CLI path. Exact-head review claims are checked as a read-only hint before
+preflight API reads; the engine still acquires and validates its existing claim.
+Request diagnostics include JSON field names and distinguish closed-PR history
+scans from open inventories. Progress batches complete labelled histories with
+independent cursors rather than caching a potentially incomplete reporting window.

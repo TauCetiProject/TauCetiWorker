@@ -1,5 +1,13 @@
 # Persistent workers
 
+For the legacy TauCeti project, `TAUCETI_LEGACY_DATA_ROOT` selects an absolute
+directory containing `state/`, `checkouts/`, and `logs/`. Set it before starting
+a worker to reuse its existing credentials, recovery records, and checkouts
+with a different installed code revision. Round, verification, and cleanup
+subprocesses inherit the same location; bundled scripts and prompts remain with
+the code. Without this setting, the existing installation-relative layout is
+preserved. Changing the setting does not move data or merge worker histories.
+
 ## Fleet admission and reporting
 
 TauCetiFleet can supervise a separate worker configuration without adopting this
@@ -19,9 +27,35 @@ CI, reviews, merges, cache publication, or another GitHub mutation. No request
 body, command line, credential or agent prompt is retained. Event reporting is
 best effort and cannot fail a successful publication.
 
+Fleet's admission policy may also contain advisory `roadmap_focus`: `areas`
+(directory names), `workers` (designated slots), and optional `fractional_worker`
+and `fractional_percent` for a fractional slot. Designated workers select an
+area before their survey from the intersection of that list and their eligible
+live areas, then run the normal maintenance, review, and authoring cascade within
+that area. The fractional slot takes that draw with the supplied integer
+percentage each round. Other workers retain the full random draw. Explicit `--roadmap-only` and
+`--roadmap-skip` settings retain precedence; the usual maintenance and review
+priorities apply within the chosen area. Stale/malformed focus or no remaining
+eligible focus areas falls back to ordinary selection. Fleet controls this live through
+`tauceti-fleet focus HOST --percent 20 --areas PDE,SymplecticGeometry`; changing
+it does not restart workers or change admissions. The share describes focused
+slots, not runtime or output quotas. Focused slots retain the shared account-wide
+open-PR limit. If that limit prevents authoring and the selected area has no
+available maintenance, the slot falls back to the ordinary global cascade.
+
 Fleet installers can query `_fleet-protocol` to verify this integration before
 starting workers. The response is local, contains no credentials, and launches
 no agents.
+
+On Linux, Fleet sets `TAUCETI_WORKER_SLICE` to keep each worker's entire process
+tree in an independent systemd scope, sharing the existing pool's memory and CPU
+limits. A manager-service restart preserves these workers and adopts them again.
+Explicit Fleet updates stop the worker slice, including surviving scopes; a
+manager-service stop alone is not a whole-fleet stop. `manager-stop` still stops
+workers unless `--leave-workers` is selected. Scope setup errors are reported as
+degraded isolation and work continues in the same wrapper process. Journal and
+status storage are never required for recovery. Standalone and macOS managers
+retain their existing launch and shutdown behavior.
 
 Persistent workers are declarative. You describe the workers you want in
 `workers.toml`, and a manager process reconciles reality against that file:
@@ -157,8 +191,8 @@ other top-level key is an error, as is any unrecognized field inside a
 | `enabled` | bool | `true` | Desired running state. `false` stops the worker without forgetting it |
 | `agent` | string | `"auto"` | `auto`, `codex`, `claude`, `kiro`, `deepseek`, or `minimax` |
 | `github_account` | string | unset | GitHub login to select and verify for this worker. Independent of the agent account; changing it restarts the worker. Requires that account's stored gh credential or a matching environment token |
-| `max_open_prs` | positive integer | `8` | Open-PR cutoff for roadmap authoring. CLI `--max-open-prs` and `TAUCETI_MAX_OPEN_PRS` also configure it. Science-account workers use `128`. |
-| `github_state_url` | string | unset | Shared GitHub state service. Clients use its newest available data, with direct fallback on unavailable coverage or transport. See [service operations](../services/github-state/README.md). |
+| `max_open_prs` | positive integer | `32` | Open-PR cutoff for roadmap authoring. CLI `--max-open-prs` and `TAUCETI_MAX_OPEN_PRS` also configure it. Science-account workers use `128`. |
+| `github_state_url` | string | public Tau Ceti mirror | Shared GitHub state service. Clients use its newest available data, with direct fallback on unavailable coverage or transport. See [service operations](../services/github-state/README.md). |
 | `github_state_token_file` | string | unset | Private client-token file for the service; installation credentials stay on the server. |
 | `only` | string list | `[]` | Work phases: `rebase`, `bump`, `progress`, `fix-ci`, `fix`, `review`, `roadmap`, `lint-repair`, `overlap-scan`, `overlap-fix`. Empty means the automatic cascade. Set `TAUCETI_OVERLAP_BATCH_COMMITS` through `env` to override the calibrated 160-commit scan batch. |
 | `claude_billing` | string | `"subscription"` | `"api"` requires `agent = "claude"`; API mode bypasses subscription quota polling |
@@ -170,6 +204,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `roadmap_only` | string | unset | The single roadmap area for roadmap rounds. `""` means all areas; unset means a fresh random area each round |
 | `roadmap_skip` | string list | `[]` | Roadmap areas to exclude. `roadmap_only` wins on overlap |
 | `roadmap_extra_identities` | string list | `[]` | Extra GitHub logins whose claimed intentions count as this worker's own |
+| `extra_roadmap_prompt` | string | unset | Operator guidance rendered into the roadmap prompt, steering target choice within the designated roadmap. Not blank, at most 4096 characters; other phases ignore it |
 | `respect_claims` | bool | `true` | Whether to avoid intentions others have claimed |
 | `source` | string | unset | Supplementary repository directory or URL. Requires `roadmap` in `only` and a non-empty `roadmap_only` |
 | `author_model` | string | unset | Exact authoring model. Requires an `agent` other than `auto` |
@@ -234,9 +269,10 @@ is open and never takes that lock itself. Independent verification job leases an
 references protect their caches and source too. An inactive checkout can be removed in full only after source recovery
 succeeds and its remaining Git state can be safely discarded. Failed source
 preservation retains source while recognized build caches can still be reclaimed.
-The hourly collector registers retained checkout roots using metadata only. Ordinary
-activity housekeeping owns their resumable deletion under time, entry and byte
-budgets; uncertain candidates are skipped while unrelated work continues. It
+The existing cleanup service also processes retained checkout roots, using
+resumable deletion batches. Safety checks finish before scheduling yields;
+activity reporting only inventories and requests that background work when the
+timer is installed. Uncertain candidates are skipped while unrelated work continues. It
 archives extra commit/reflog tips in existing v1 bundles. Stashes, notes, native
 Git operations and credential-like files keep their original checkout when the
 recovery format cannot capture them. This is generated
@@ -268,7 +304,16 @@ from worker configuration files. There is no macOS cleanup schedule in this chan
 private cache generations still recycle at round boundaries there. Installing the Linux
 worker service installs this timer too; existing services can install it separately
 without restarting workers. Cleanup uses one collector lock and resumes interrupted
-directory deletions. A concrete out-of-space error during cache preparation also
+directory deletions. The same background collector drains already-retired recovery trash
+with a separate 30-second, 32-GiB deletion slice and the existing recovery lock/cursors.
+It never archives or deletes unpublished recovery records in that pass. Retained caches
+can be reclaimed while source preservation waits. Directed pressure requests prefer private
+artifact archives and prefer workers without active rounds or verification continuations.
+If every worker is busy, one is still selected for reclamation at its next safe boundary.
+Ordinary pressure preserves young build trees. At critical headroom, workers retain their
+independent emergency reclamation at safe round boundaries, including throughout the existing
+recovery hysteresis band; a missing collector or damaged request cannot suppress that path.
+A concrete out-of-space error during cache preparation also
 unlinks closed diagnostics before the existing single retry, without synchronously
 archiving source or recursively collecting other workers' workspaces. Further failures follow normal
 worker backoff. Byte and free-space thresholds also trigger collection before the age limit.
@@ -289,6 +334,18 @@ Mutable output/revision metadata is copied, while immutable artifacts use hard l
 possible. Recompilation unlinks outputs before replacing them. Unsupported toolchains,
 contended entries and unavailable shared storage use ordinary private caches automatically.
 Full-project verification and Lake's build-input invalidation remain enabled.
+
+Each preparation decodes the fresh download mappings once and reuses them through transfer
+and expansion. Private metadata is checked again on the next preparation; there is no
+persistent readiness marker. Hydration writes only changed mappings and missing artifacts.
+Archive seeding skips duplicates, and an archive removed concurrently by pool collection
+is an individual cache miss for Lake to fetch. Native fetch arguments and Mathlib snapshot
+keys/inventory checks are unchanged.
+
+The existing pool status receipt also records mapping/seed/install counts and per-phase
+elapsed and CPU seconds for seeding, fetching, transfer, expansion/hydration, and Mathlib
+view preparation. CPU includes the preparator and reaped children. Phases can be nested,
+so their durations must not be added together. These measurements never control admission.
 
 The pool defaults to `~/.cache/tauceti/builds` under the login user's home. Configure
 `TAUCETI_BUILD_CACHE_ROOT` before installing services to use another filesystem;
@@ -340,6 +397,7 @@ entry with `enabled = true`.
 | `--auto-refresh` | `auto_refresh` |
 | `--roadmap-only AREA` | `roadmap_only` |
 | `--roadmap-skip AREAS` | `roadmap_skip`, as a comma-separated list |
+| `--extra-roadmap-prompt TEXT` | `extra_roadmap_prompt` |
 | `--source PATH_OR_URL` | `source`; also requires `roadmap` in `--only` and a non-empty `--roadmap-only` |
 | `--author-model MODEL` | `author_model` |
 | `--author-effort EFFORT` | `author_effort`; Codex, Claude, or Kiro only |
@@ -410,6 +468,28 @@ cannot silently disable fallback discovery.
 
 The reconciler and the worker control sockets are portable Unix code. No Linux
 `/proc` interface is required.
+
+## Shared GitHub state by default
+
+Workers targeting `TauCetiProject/TauCeti` use
+`https://github-state.taucetiproject.org` for surveys and mirrored GitHub reads
+without URL flags, token files, or per-worker configuration. The service publishes
+read-only data for that public repository; GitHub writes still use the worker's
+own authenticated account. Installation credentials remain on the server.
+
+Explicit CLI and worker settings override the project configuration and default.
+Use `--github-state-url ""`, `github_state_url = ""`, or project
+`services.github_state.mode = "off"` to select direct reads. Without a project
+manifest, `TAUCETI_GITHUB_STATE_URL=` also disables the default; project bootstrap
+sets service environment bindings from the manifest. Downstream
+projects retain their configured service and explicit `mode = "off"` policy;
+other repositories are never implicitly sent to the Tau Ceti mirror. Custom and
+private services still require their scoped client-token file. If a token file
+is explicitly configured but unreadable, the client reports the configuration
+failure rather than silently switching identities.
+
+Unavailable mirror coverage or transport retains the existing direct fallback.
+Fresh dispatch checks and GitHub mutations keep their existing behavior.
 
 ## Worker ids and credential isolation
 
@@ -500,22 +580,27 @@ Each managed worker publishes a structured state such as `waiting-quota`,
 the path to its logfile. That is what `tauceti workers status` and the
 dashboard's workers view read.
 
-Every work round samples its host process tree's resident memory every two seconds,
-including agent and Lean subprocesses. Live resource statistics appear under
-`resources` in `workers status --json`. Round completion writes a `resources:` line
-to the existing worker log and appends structured measurements to
-`logs/<worker-id>/resources.jsonl`; cumulative completed-round statistics live in
+Work rounds read kernel resource counters at start and finish, with live refreshes once a
+minute. Telemetry never scans the host process table. Live statistics appear under
+`resources` in `workers status --json`; completed rounds append structured records to
+`logs/<worker-id>/resources.jsonl`. Cumulative completed-round statistics live in
 `state/<worker-id>/resources.json` and survive restarts.
 
-CPU time includes the round and running or waited-for child processes. Average CPU
-uses elapsed wall time: 100% means one logical core, and parallel builds may exceed
-100%. The worker average includes time between rounds since recording began; the
-round average covers just that round. `peak_tree_rss_bytes` is the highest sampled
-sum of resident memory across the process tree, including shared pages in each
-process. `max_process_rss_bytes` is the kernel's single-process high-water reading,
-which also catches short-lived children between samples. Neither is proportional
-set size (PSS). Container workloads in Bubble are outside these host measurements.
-Historical tree peaks before recording started cannot be reconstructed.
+Completed-round CPU includes the round and its reaped descendants, using `getrusage()`.
+A live value excludes unreaped children and has `cpu_complete=false`. Average CPU uses
+elapsed wall time: 100% means one logical core. The worker average includes time between
+rounds since recording began; the round average covers just that round.
+`max_process_rss_bytes` is the kernel's single-process high-water reading, including
+reaped children. New records do not report sampled process-tree RSS.
+
+`resources.worker_scope` separately reports cumulative CPU, anonymous/file/kernel/charged
+memory, scope-lifetime peak charged memory, task count (including threads), and optional
+per-device I/O and stall counters. This scope includes the wrapper, loop, coding rounds,
+and independent background verification. Its CPU must not be added to round CPU totals.
+Charged memory and its peak include cache and kernel memory; they are not RSS, PSS, or an
+exclusive share of shared Mathlib files. Missing counters remain unavailable, and workers
+without a dedicated Linux scope retain round CPU accounting without scope measurements.
+All cgroup access is read-only; unavailable telemetry does not delay work.
 
 Reporting does not control whether useful work may continue. Status lock waits
 are bounded and unsent fields retry on a later update; a failed status write leaves the supervisor's identity available

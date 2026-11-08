@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .constants import MAX_OPEN_PRS, ROADMAP, ROADMAP_DIR, TAUCETI
-from .paths import HERE
+from .paths import HERE, legacy_data_root
 
 _SCP_GIT_URL_RE = re.compile(r"^[^/@\s]+@[^:\s]+:.+$")
 
@@ -29,6 +29,22 @@ def positive_integer(value) -> int:
     if result < 1:
         raise ValueError("must be a positive integer")
     return result
+
+
+def security_audit_problem(only, *, agent="auto", prs=(), author_override=False, api=False) -> str | None:
+    """Static constraints on a worker that includes security-audit, shared by CLI and TOML.
+    Other phases may accompany it; admin permission is checked when the worker runs."""
+    if "security-audit" not in only:
+        return None
+    if prs:
+        return "security-audit cannot be combined with --pr"
+    if agent not in ("auto", "codex", "claude"):
+        return "security-audit supports Codex Luna or Claude Haiku only"
+    if author_override:
+        return "security-audit uses its dedicated Luna/Haiku profile; omit author-model/effort overrides"
+    if api:
+        return "security-audit currently uses paced subscription CLI sessions"
+    return None
 
 
 def max_open_prs() -> int:
@@ -62,6 +78,36 @@ def roadmap_skip() -> list[str]:
     "all areas" (any) case; an explicit --roadmap-only area takes precedence over it (see do_roadmap)."""
     raw = os.environ.get("TAUCETI_ROADMAP_SKIP", "")
     return sorted({tok for tok in (t.strip() for t in raw.split(",")) if tok})
+
+
+EXTRA_ROADMAP_PROMPT_MAX_CHARS = 4096
+
+
+def validate_extra_roadmap_prompt(value: str) -> str:
+    """Normalise an operator's extra roadmap prompt, or raise ValueError. Shared by the `--extra-roadmap-prompt` flag
+    and the `extra_roadmap_prompt` workers.toml field so a bad value fails at the configuration boundary
+    rather than inside a round. Blank text is rejected (unset is the way to have none); the cap keeps
+    a pasted file from crowding out the task prompt itself."""
+    text = value.strip()
+    if not text:
+        raise ValueError("extra roadmap prompt must not be empty")
+    if "\0" in text:
+        raise ValueError("extra roadmap prompt must not contain a NUL byte")
+    if len(text) > EXTRA_ROADMAP_PROMPT_MAX_CHARS:
+        raise ValueError(
+            f"extra roadmap prompt is {len(text)} characters; the limit is {EXTRA_ROADMAP_PROMPT_MAX_CHARS}"
+        )
+    return text
+
+
+def extra_roadmap_prompt() -> str | None:
+    """Operator-supplied guidance for roadmap rounds, read live from TAUCETI_EXTRA_ROADMAP_PROMPT so loop
+    children and dashboard-launched rounds inherit it. Rendered into the roadmap prompt as a block of
+    steering text: it refines the choice of target within the designated roadmap but never overrides
+    the skip list, other contributors' claims, or the repository's hard rules. None when unset or
+    blank."""
+    raw = os.environ.get("TAUCETI_EXTRA_ROADMAP_PROMPT", "")
+    return raw.strip() or None
 
 
 def roadmap_extra_identities() -> list[str]:
@@ -100,15 +146,36 @@ def roadmap_areas(gh) -> list[str]:
     """The roadmap areas a user can steer toward: the subdirectories of the roadmap repo (each
     holds a README.md + Suggested.lean). Listed over the API so the TUI can offer a picker. Returns []
     if it can't be fetched (the picker then falls back to free-text entry)."""
-    from .shared_repositories import snapshot
+    from .shared_repositories import borrowed_snapshot
 
     try:
-        tree = snapshot(ROADMAP, ttl=3600)
-        if tree:
-            return sorted(path.name for path in (tree / ROADMAP_DIR).iterdir() if path.is_dir())
+        with borrowed_snapshot(ROADMAP, ttl=3600) as tree:
+            if tree:
+                return sorted(path.name for path in (tree / ROADMAP_DIR).iterdir() if path.is_dir())
     except (OSError, TimeoutError, subprocess.SubprocessError):
         pass
     out = gh.api_jq(f"repos/{ROADMAP}/contents/{ROADMAP_DIR}", '.[] | select(.type=="dir") | .name')
+    return sorted(out.splitlines()) if out else []
+
+
+def roadmap_subareas(gh, area: str) -> list[str]:
+    """The sub-roadmaps nested in `area`: its subdirectories holding a Suggested.lean (a references
+    folder holds none). An intention may name only the sub-roadmap. Returns [] if it can't be fetched."""
+    from .shared_repositories import borrowed_snapshot
+
+    try:
+        with borrowed_snapshot(ROADMAP, ttl=3600) as tree:
+            if tree:
+                root = tree / ROADMAP_DIR / area
+                return (
+                    sorted(p.name for p in root.iterdir() if (p / "Suggested.lean").is_file()) if root.is_dir() else []
+                )
+    except (OSError, TimeoutError, subprocess.SubprocessError):
+        pass
+    out = gh.api_jq(
+        f"repos/{ROADMAP}/git/trees/HEAD:{ROADMAP_DIR}/{area}?recursive=1",
+        r'.tree[] | select(.type=="blob") | .path | select(test("^[^/]+/Suggested\\.lean$")) | split("/")[0]',
+    )
     return sorted(out.splitlines()) if out else []
 
 
@@ -129,7 +196,7 @@ def legacy_project() -> bool:
 
 def worker_state_root() -> Path:
     if legacy_project():
-        return HERE / "state"
+        return legacy_data_root(HERE) / "state"
     return Path(os.environ["TAUCETI_PROJECT_STATE"]) / "workers"
 
 
@@ -227,12 +294,12 @@ class Config:
             home=h,
             data_home=dh,
             state=state,
-            checkout=(HERE / "checkouts" / wid / "TauCeti")
+            checkout=(legacy_data_root(HERE) / "checkouts" / wid / "TauCeti")
             if legacy_project()
             else worker_state_root() / wid / "checkout",
             store_dir=dh / ".cache" / "tauceti-review" / wid / "store" / TAUCETI.replace("/", "__"),
             sbcache=state / "cache" / "scoreboard",
-            logdir=(HERE / "logs" / wid) if legacy_project() else state / "logs",
+            logdir=(legacy_data_root(HERE) / "logs" / wid) if legacy_project() else state / "logs",
             quota_cache=state / "cache",
         )
 

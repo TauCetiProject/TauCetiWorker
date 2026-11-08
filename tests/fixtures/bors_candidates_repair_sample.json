@@ -1,0 +1,1684 @@
+{
+ "schema": "tauceti-bors.candidates/v1",
+ "repo": "TauCetiProject/TauCeti",
+ "base": "main",
+ "timestamp_unit": "microseconds",
+ "_note": "Trimmed from the 2026-11-03/04 production snapshots for tests/queue_repair_experiment.py: seven candidates, only the events the harness reads, partition groups cut to six PRs, members cut to the suspects plus eight.",
+ "candidates": [
+  {
+   "id": 1909,
+   "batch_id": 2596,
+   "generation": 1,
+   "runner_started_at": null,
+   "runner_finished_at": null,
+   "snapshot": {
+    "base_sha": "a9d34cd6af6dc77e3a411c5f9114e07660161b03",
+    "members": [
+     {
+      "pr": 26452,
+      "head_sha": "aa6fcc519965c58bc8c54fee278433e012899939",
+      "original_admitted_at": 1793681875716540,
+      "parent_candidate_id": null,
+      "retry_reason": "merge_conflict_deferred"
+     }
+    ]
+   },
+   "events": [
+    {
+     "id": 38143,
+     "source": "bors.local_git",
+     "kind": "local_conflict",
+     "details": {
+      "base_sha": "a9d34cd6af6dc77e3a411c5f9114e07660161b03",
+      "head_sha": "aa6fcc519965c58bc8c54fee278433e012899939",
+      "kind": "merge_conflict",
+      "merge_head": "a9d34cd6af6dc77e3a411c5f9114e07660161b03",
+      "paths": [
+       "TauCeti/Geometry/Manifold/Orientation/Prod.lean"
+      ],
+      "pr": 26452
+     },
+     "observed_at": 1793718731376010
+    },
+    {
+     "id": 38144,
+     "source": "bors.local_git",
+     "kind": "failure_classified",
+     "details": {
+      "classification": "merge_conflict",
+      "evidence": {
+       "base_sha": "a9d34cd6af6dc77e3a411c5f9114e07660161b03",
+       "head_sha": "aa6fcc519965c58bc8c54fee278433e012899939",
+       "kind": "merge_conflict",
+       "merge_head": "a9d34cd6af6dc77e3a411c5f9114e07660161b03",
+       "paths": [
+        "TauCeti/Geometry/Manifold/Orientation/Prod.lean"
+       ],
+       "pr": 26452
+      },
+      "proof_authority": false
+     },
+     "observed_at": 1793718731396324
+    },
+    {
+     "id": 38145,
+     "source": "bors.failure_isolation",
+     "kind": "failure_partition",
+     "details": {
+      "groups": [],
+      "reason": "unknown, ambiguous or non-narrowing diagnostics",
+      "strategy": "deterministic_bisection"
+     },
+     "observed_at": 1793718731711295
+    }
+   ]
+  },
+  {
+   "id": 1916,
+   "batch_id": 2572,
+   "generation": 1,
+   "runner_started_at": null,
+   "runner_finished_at": null,
+   "snapshot": {
+    "base_sha": "ddf6493515728b8f1caee2a41acc40f31644ef08",
+    "members": [
+     {
+      "pr": 25416,
+      "head_sha": "a484d90ca1feb4e013361d6f644253f6087c433b",
+      "original_admitted_at": 1793679391673561,
+      "parent_candidate_id": 1871,
+      "retry_reason": "structured_conflict"
+     },
+     {
+      "pr": 21265,
+      "head_sha": "02addf98810018ea2b9b58ce2004bf4da4f20f4f",
+      "original_admitted_at": 1793676603874903,
+      "parent_candidate_id": 1871,
+      "retry_reason": "structured_conflict"
+     },
+     {
+      "pr": 23800,
+      "head_sha": "d06cdbde6f8927c27150e2880ae265c56573cf0a",
+      "original_admitted_at": 1793675405736200,
+      "parent_candidate_id": 1871,
+      "retry_reason": "structured_conflict"
+     },
+     {
+      "pr": 24660,
+      "head_sha": "bd59daf12e8d9c7d42f1a90a8ac4fbaa0de09bb2",
+      "original_admitted_at": 1793678230100595,
+      "parent_candidate_id": 1871,
+      "retry_reason": "structured_conflict"
+     },
+     {
+      "pr": 24677,
+      "head_sha": "39d57fd48eff7541357e3556ccf4bee7d0741bd6",
+      "original_admitted_at": 1793678391492038,
+      "parent_candidate_id": 1871,
+      "retry_reason": "structured_conflict"
+     },
+     {
+      "pr": 24681,
+      "head_sha": "818faa0ecb7855fae2567e2383e1888aed44c6e3",
+      "original_admitted_at": 1793678497528483,
+      "parent_candidate_id": 1871,
+      "retry_reason": "structured_conflict"
+     },
+     {
+      "pr": 24729,
+      "head_sha": "913c21a9fa379f5776bf5fc3cc25c463bc8e9e41",
+      "original_admitted_at": 1793678575985605,
+      "parent_candidate_id": 1871,
+      "retry_reason": "structured_conflict"
+     },
+     {
+      "pr": 24776,
+      "head_sha": "1d637efb7630c26998c22408c7c44f064e568d4e",
+      "original_admitted_at": 1793678598897210,
+      "parent_candidate_id": 1871,
+      "retry_reason": "structured_conflict"
+     },
+     {
+      "pr": 24808,
+      "head_sha": "85a39001d82e5acce8dd6abc2ba6b2d90f517483",
+      "original_admitted_at": 1793678638203409,
+      "parent_candidate_id": 1871,
+      "retry_reason": "structured_conflict"
+     }
+    ]
+   },
+   "events": [
+    {
+     "id": 38323,
+     "source": "bors.local_git",
+     "kind": "constructed",
+     "details": {
+      "assembly_identity": {
+       "base_sha": "ddf6493515728b8f1caee2a41acc40f31644ef08",
+       "candidate_id": 1916,
+       "generation": 1,
+       "members_digest": "062750ba3af4660af2ba3a407550acd951731d2cd8ca269de31f7170f535d019"
+      },
+      "base_sha": "ddf6493515728b8f1caee2a41acc40f31644ef08",
+      "commit": "050492fd40b40da51c9d6f6d2c6d6c9cf7da2884",
+      "toolchain": {
+       "content": "leanprover/lean4:v4.36.0-rc2\n",
+       "path": "lean-toolchain",
+       "ref": "050492fd40b40da51c9d6f6d2c6d6c9cf7da2884",
+       "sha256": "11c697aebe5b539d74f5069e497a588e7dfab1c4eeb74313f28357e351c55ca3",
+       "source": "bors.local_git_object",
+       "unknown_reason": null
+      },
+      "tree": "d7b598d7f50d3bd78e2b7c207e8d9d77d6d9bb94"
+     },
+     "observed_at": 1793723497293083
+    },
+    {
+     "id": 38345,
+     "source": "bors.terminal_logs",
+     "kind": "failure_diagnostics",
+     "details": {
+      "authority": "retry_only",
+      "binding": {
+       "base_sha": "ddf6493515728b8f1caee2a41acc40f31644ef08",
+       "candidate_id": 1916,
+       "commit": "050492fd40b40da51c9d6f6d2c6d6c9cf7da2884",
+       "generation": 1,
+       "job_ids": [
+        126054743310
+       ],
+       "members_digest": "062750ba3af4660af2ba3a407550acd951731d2cd8ca269de31f7170f535d019",
+       "run_attempt": 1,
+       "run_id": 41675315035,
+       "workflow": ".github/workflows/pr-build.yml"
+      },
+      "collision_sources": {
+       "complete": false,
+       "reason": "ineligible_collision"
+      },
+      "proof_authority": false,
+      "provider_lookup": {
+       "complete": false,
+       "reason": "ineligible_or_unmapped"
+      },
+      "result": {
+       "complete": true,
+       "cpu_ms": 127,
+       "elapsed_ms": 505,
+       "jobs": [
+        {
+         "bytes": 1024280,
+         "job_id": 126054743310,
+         "observations": [
+          {
+           "kind": "compiler_error",
+           "paths": [
+            "TauCeti/LinearAlgebra/BilinearForm/Diagonalization.lean"
+           ]
+          }
+         ],
+         "source": "job_log"
+        }
+       ],
+       "parser_version": "streaming-v2"
+      }
+     },
+     "observed_at": 1793724362117786
+    },
+    {
+     "id": 38346,
+     "source": "bors.trusted_failure",
+     "kind": "failure_classified",
+     "details": {
+      "base_sha": "ddf6493515728b8f1caee2a41acc40f31644ef08",
+      "classification": "candidate_failure",
+      "commit": "050492fd40b40da51c9d6f6d2c6d6c9cf7da2884",
+      "evidence": {
+       "conclusion": "failure",
+       "failed_steps": [
+        {
+         "job_id": 126054743310,
+         "job_name": "sandboxed-build",
+         "name": "Build exact candidate under bwrap with workflow-pinned audits, offline",
+         "number": 39,
+         "pin_validation_ran": false
+        },
+        {
+         "job_id": 126054743310,
+         "job_name": "sandboxed-build",
+         "name": "Report build and bump-guard statuses to the PR head commit",
+         "number": 44,
+         "pin_validation_ran": false
+        },
+        {
+         "job_id": 126061716103,
+         "job_name": "finalize-merge-group-build",
+         "name": "Post the terminal merge-group build status",
+         "number": 6,
+         "pin_validation_ran": false
+        }
+       ],
+       "identity": "bors branch=main batch=2572 head=050492fd40b40da51c9d6f6d2c6d6c9cf7da2884 base=ddf6493515728b8f1caee2a41acc40f31644ef08",
+       "run_attempt": 1,
+       "run_created_at": "2026-11-03T16:32:54Z",
+       "run_id": 41675315035,
+       "run_url": "https://github.com/TauCetiProject/TauCeti/actions/runs/41675315035",
+       "workflow": ".github/workflows/pr-build.yml"
+      },
+      "proof_authority": false
+     },
+     "observed_at": 1793724362825080
+    },
+    {
+     "id": 38347,
+     "source": "bors.failure_isolation",
+     "kind": "failure_partition",
+     "details": {
+      "authority": "retry_only",
+      "dependencies_complete": false,
+      "groups": [
+       [
+        25416
+       ],
+       [
+        21265,
+        23800,
+        24660,
+        24677,
+        24681,
+        24729
+       ]
+      ],
+      "ownership_complete": true,
+      "strategy": "compiler_diagnostics",
+      "verified_base_collision": null
+     },
+     "observed_at": 1793724363388399
+    },
+    {
+     "id": 38348,
+     "source": "bors.status_summary",
+     "kind": "terminal_observed",
+     "details": {
+      "commit": "050492fd40b40da51c9d6f6d2c6d6c9cf7da2884",
+      "state": "error"
+     },
+     "observed_at": 1793724396829824
+    }
+   ]
+  },
+  {
+   "id": 1926,
+   "batch_id": 2586,
+   "generation": 5,
+   "runner_started_at": null,
+   "runner_finished_at": null,
+   "snapshot": {
+    "base_sha": "1771101bff3d1afcff1b8e9f98aa8d5430032999",
+    "members": [
+     {
+      "pr": 26751,
+      "head_sha": "58173694a3b3fc28afefcca1f859d3563487ee34",
+      "original_admitted_at": 1793654569317716,
+      "parent_candidate_id": 1882,
+      "retry_reason": "bisection"
+     },
+     {
+      "pr": 25902,
+      "head_sha": "27a42fdec830829da5df0e79ad3176b438dcbc54",
+      "original_admitted_at": 1793659462358047,
+      "parent_candidate_id": 1882,
+      "retry_reason": "bisection"
+     },
+     {
+      "pr": 25905,
+      "head_sha": "2201e6f4d2a2c4cae6b7f0c7414ea4f015f79657",
+      "original_admitted_at": 1793652112219244,
+      "parent_candidate_id": 1882,
+      "retry_reason": "bisection"
+     },
+     {
+      "pr": 25906,
+      "head_sha": "5b7f99bbf7d09e2a748dd9c347db9389e3bdf9e4",
+      "original_admitted_at": 1793651311315301,
+      "parent_candidate_id": 1882,
+      "retry_reason": "bisection"
+     },
+     {
+      "pr": 25913,
+      "head_sha": "445c884e7cea1ceffed78b49fca8db1d32d8754d",
+      "original_admitted_at": 1793659590902005,
+      "parent_candidate_id": 1882,
+      "retry_reason": "bisection"
+     },
+     {
+      "pr": 25927,
+      "head_sha": "3c0e10ed3a3f86f514718ee87bff4bbb75f52fdd",
+      "original_admitted_at": 1793659787158087,
+      "parent_candidate_id": 1882,
+      "retry_reason": "bisection"
+     },
+     {
+      "pr": 25934,
+      "head_sha": "689f4c9e2f278c0b7dfd75b568abdb2c6f9fc453",
+      "original_admitted_at": 1793656476087573,
+      "parent_candidate_id": 1882,
+      "retry_reason": "bisection"
+     },
+     {
+      "pr": 25935,
+      "head_sha": "98c34bb3bae612ca745e4f701d52feb2d3b305f0",
+      "original_admitted_at": 1793655193273442,
+      "parent_candidate_id": 1882,
+      "retry_reason": "bisection"
+     },
+     {
+      "pr": 25952,
+      "head_sha": "c0ffcbfbbc673fb386a9cf10ddf5b60f555718ab",
+      "original_admitted_at": 1793655829205762,
+      "parent_candidate_id": 1882,
+      "retry_reason": "bisection"
+     }
+    ]
+   },
+   "events": [
+    {
+     "id": 38481,
+     "source": "bors.local_git",
+     "kind": "constructed",
+     "details": {
+      "assembly_identity": {
+       "base_sha": "1771101bff3d1afcff1b8e9f98aa8d5430032999",
+       "candidate_id": 1926,
+       "generation": 5,
+       "members_digest": "d706ae1a72eef5beff0f693c2e5d30d85d42c85beeea2ab003591d6688ab8c5b"
+      },
+      "base_sha": "1771101bff3d1afcff1b8e9f98aa8d5430032999",
+      "commit": "e70d78f99d7052408de2759b4f687ba0c97d1e30",
+      "toolchain": {
+       "content": "leanprover/lean4:v4.36.0-rc2\n",
+       "path": "lean-toolchain",
+       "ref": "e70d78f99d7052408de2759b4f687ba0c97d1e30",
+       "sha256": "11c697aebe5b539d74f5069e497a588e7dfab1c4eeb74313f28357e351c55ca3",
+       "source": "bors.local_git_object",
+       "unknown_reason": null
+      },
+      "tree": "325967fb40251f43f466da6d522d43e71b7004b3"
+     },
+     "observed_at": 1793732245903801
+    },
+    {
+     "id": 38495,
+     "source": "bors.terminal_logs",
+     "kind": "failure_diagnostics",
+     "details": {
+      "authority": "retry_only",
+      "binding": {
+       "base_sha": "1771101bff3d1afcff1b8e9f98aa8d5430032999",
+       "candidate_id": 1926,
+       "commit": "e70d78f99d7052408de2759b4f687ba0c97d1e30",
+       "generation": 5,
+       "job_ids": [
+        126136713713
+       ],
+       "members_digest": "d706ae1a72eef5beff0f693c2e5d30d85d42c85beeea2ab003591d6688ab8c5b",
+       "run_attempt": 1,
+       "run_id": 41698803029,
+       "workflow": ".github/workflows/pr-build.yml"
+      },
+      "collision_sources": {
+       "authority": "retry_only",
+       "binding": {
+        "base_sha": "1771101bff3d1afcff1b8e9f98aa8d5430032999",
+        "candidate_id": 1926,
+        "commit": "e70d78f99d7052408de2759b4f687ba0c97d1e30",
+        "generation": 5,
+        "job_ids": [
+         126136713713
+        ],
+        "members_digest": "d706ae1a72eef5beff0f693c2e5d30d85d42c85beeea2ab003591d6688ab8c5b",
+        "run_attempt": 1,
+        "run_id": 41698803029,
+        "workflow": ".github/workflows/pr-build.yml"
+       },
+       "complete": true,
+       "cpu_ms": 4,
+       "elapsed_ms": 32,
+       "files": [
+        {
+         "base": null,
+         "candidate": {
+          "blob": "753edf3573341fce6385767098b03d02bf94ed03",
+          "bytes": 12687
+         },
+         "path": "TauCeti/Algebra/Lie/NormTwoShell/D4/Triality.lean"
+        },
+        {
+         "base": {
+          "blob": "405da402fb7b1d9130a6fd9e7b888916c6244fd0",
+          "bytes": 8353
+         },
+         "candidate": {
+          "blob": "405da402fb7b1d9130a6fd9e7b888916c6244fd0",
+          "bytes": 8353
+         },
+         "path": "TauCeti/LinearAlgebra/Matrix/NormTwoShell/TrialityD4.lean"
+        }
+       ],
+       "policy": "collision-source-identity-v1",
+       "proof_authority": false,
+       "source_bytes": 21040
+      },
+      "proof_authority": false,
+      "provider_lookup": {
+       "complete": false,
+       "reason": "ineligible_or_unmapped"
+      },
+      "result": {
+       "complete": true,
+       "cpu_ms": 123,
+       "elapsed_ms": 542,
+       "jobs": [
+        {
+         "bytes": 1395963,
+         "job_id": 126136713713,
+         "observations": [
+          {
+           "kind": "duplicate_declaration",
+           "paths": [
+            "TauCeti/Algebra/Lie/NormTwoShell/D4/Triality.lean",
+            "TauCeti/LinearAlgebra/Matrix/NormTwoShell/TrialityD4.lean"
+           ]
+          }
+         ],
+         "source": "job_log"
+        }
+       ],
+       "parser_version": "streaming-v2"
+      }
+     },
+     "observed_at": 1793734562880217
+    },
+    {
+     "id": 38496,
+     "source": "bors.trusted_failure",
+     "kind": "failure_classified",
+     "details": {
+      "base_sha": "1771101bff3d1afcff1b8e9f98aa8d5430032999",
+      "classification": "candidate_failure",
+      "commit": "e70d78f99d7052408de2759b4f687ba0c97d1e30",
+      "evidence": {
+       "conclusion": "failure",
+       "failed_steps": [
+        {
+         "job_id": 126136713713,
+         "job_name": "sandboxed-build",
+         "name": "Build exact candidate under bwrap with workflow-pinned audits, offline",
+         "number": 39,
+         "pin_validation_ran": false
+        },
+        {
+         "job_id": 126136713713,
+         "job_name": "sandboxed-build",
+         "name": "Report build and bump-guard statuses to the PR head commit",
+         "number": 44,
+         "pin_validation_ran": false
+        },
+        {
+         "job_id": 126156425683,
+         "job_name": "finalize-merge-group-build",
+         "name": "Post the terminal merge-group build status",
+         "number": 6,
+         "pin_validation_ran": false
+        }
+       ],
+       "identity": "bors branch=main batch=2586 head=e70d78f99d7052408de2759b4f687ba0c97d1e30 base=1771101bff3d1afcff1b8e9f98aa8d5430032999",
+       "run_attempt": 1,
+       "run_created_at": "2026-11-03T18:58:06Z",
+       "run_id": 41698803029,
+       "run_url": "https://github.com/TauCetiProject/TauCeti/actions/runs/41698803029",
+       "workflow": ".github/workflows/pr-build.yml"
+      },
+      "proof_authority": false
+     },
+     "observed_at": 1793734563265564
+    },
+    {
+     "id": 38497,
+     "source": "bors.failure_isolation",
+     "kind": "failure_partition",
+     "details": {
+      "authority": "retry_only",
+      "dependencies_complete": true,
+      "groups": [
+       [
+        26751
+       ],
+       [
+        25902,
+        25905,
+        25906,
+        25913,
+        25927,
+        25934
+       ]
+      ],
+      "ownership_complete": true,
+      "strategy": "compiler_diagnostics",
+      "verified_base_collision": {
+       "binding": {
+        "base_sha": "1771101bff3d1afcff1b8e9f98aa8d5430032999",
+        "candidate_id": 1926,
+        "commit": "e70d78f99d7052408de2759b4f687ba0c97d1e30",
+        "generation": 5,
+        "job_ids": [
+         126136713713
+        ],
+        "members_digest": "d706ae1a72eef5beff0f693c2e5d30d85d42c85beeea2ab003591d6688ab8c5b",
+        "run_attempt": 1,
+        "run_id": 41698803029,
+        "workflow": ".github/workflows/pr-build.yml"
+       },
+       "pr": 26751,
+       "sources": {
+        "authority": "retry_only",
+        "binding": {
+         "base_sha": "1771101bff3d1afcff1b8e9f98aa8d5430032999",
+         "candidate_id": 1926,
+         "commit": "e70d78f99d7052408de2759b4f687ba0c97d1e30",
+         "generation": 5,
+         "job_ids": [
+          126136713713
+         ],
+         "members_digest": "d706ae1a72eef5beff0f693c2e5d30d85d42c85beeea2ab003591d6688ab8c5b",
+         "run_attempt": 1,
+         "run_id": 41698803029,
+         "workflow": ".github/workflows/pr-build.yml"
+        },
+        "complete": true,
+        "cpu_ms": 4,
+        "elapsed_ms": 32,
+        "files": [
+         {
+          "base": null,
+          "candidate": {
+           "blob": "753edf3573341fce6385767098b03d02bf94ed03",
+           "bytes": 12687
+          },
+          "path": "TauCeti/Algebra/Lie/NormTwoShell/D4/Triality.lean"
+         },
+         {
+          "base": {
+           "blob": "405da402fb7b1d9130a6fd9e7b888916c6244fd0",
+           "bytes": 8353
+          },
+          "candidate": {
+           "blob": "405da402fb7b1d9130a6fd9e7b888916c6244fd0",
+           "bytes": 8353
+          },
+          "path": "TauCeti/LinearAlgebra/Matrix/NormTwoShell/TrialityD4.lean"
+         }
+        ],
+        "policy": "collision-source-identity-v1",
+        "proof_authority": false,
+        "source_bytes": 21040
+       }
+      }
+     },
+     "observed_at": 1793734564013162
+    },
+    {
+     "id": 38498,
+     "source": "bors.failure_isolation",
+     "kind": "provisional_repair",
+     "details": {
+      "authority": "provisional_suspect",
+      "base_sha": "1771101bff3d1afcff1b8e9f98aa8d5430032999",
+      "binding": {
+       "base_sha": "1771101bff3d1afcff1b8e9f98aa8d5430032999",
+       "candidate_id": 1926,
+       "commit": "e70d78f99d7052408de2759b4f687ba0c97d1e30",
+       "generation": 5,
+       "job_ids": [
+        126136713713
+       ],
+       "members_digest": "d706ae1a72eef5beff0f693c2e5d30d85d42c85beeea2ab003591d6688ab8c5b",
+       "run_attempt": 1,
+       "run_id": 41698803029,
+       "workflow": ".github/workflows/pr-build.yml"
+      },
+      "head_sha": "58173694a3b3fc28afefcca1f859d3563487ee34",
+      "pr": 26751,
+      "proof_authority": false,
+      "remainder": [
+       [
+        25902,
+        25905,
+        25906,
+        25913,
+        25927,
+        25934
+       ]
+      ],
+      "singleton_confirmation_dispatched": false
+     },
+     "observed_at": 1793734572363889
+    },
+    {
+     "id": 38499,
+     "source": "bors.status_summary",
+     "kind": "terminal_observed",
+     "details": {
+      "commit": "e70d78f99d7052408de2759b4f687ba0c97d1e30",
+      "state": "error"
+     },
+     "observed_at": 1793734585787088
+    }
+   ]
+  },
+  {
+   "id": 1931,
+   "batch_id": 2615,
+   "generation": 1,
+   "runner_started_at": null,
+   "runner_finished_at": null,
+   "snapshot": {
+    "base_sha": "519af858c47ad028a8140a439f469a02d5ef4b05",
+    "members": [
+     {
+      "pr": 26269,
+      "head_sha": "91d9dca0a2aadd3a3f2dfa3ddeaa27666ff053c7",
+      "original_admitted_at": 1793674844711262,
+      "parent_candidate_id": 1916,
+      "retry_reason": "compiler_diagnostics"
+     },
+     {
+      "pr": 21265,
+      "head_sha": "02addf98810018ea2b9b58ce2004bf4da4f20f4f",
+      "original_admitted_at": 1793676603874903,
+      "parent_candidate_id": 1916,
+      "retry_reason": "compiler_diagnostics"
+     },
+     {
+      "pr": 23800,
+      "head_sha": "d06cdbde6f8927c27150e2880ae265c56573cf0a",
+      "original_admitted_at": 1793675405736200,
+      "parent_candidate_id": 1916,
+      "retry_reason": "compiler_diagnostics"
+     },
+     {
+      "pr": 24660,
+      "head_sha": "bd59daf12e8d9c7d42f1a90a8ac4fbaa0de09bb2",
+      "original_admitted_at": 1793678230100595,
+      "parent_candidate_id": 1916,
+      "retry_reason": "compiler_diagnostics"
+     },
+     {
+      "pr": 24677,
+      "head_sha": "39d57fd48eff7541357e3556ccf4bee7d0741bd6",
+      "original_admitted_at": 1793678391492038,
+      "parent_candidate_id": 1916,
+      "retry_reason": "compiler_diagnostics"
+     },
+     {
+      "pr": 24681,
+      "head_sha": "818faa0ecb7855fae2567e2383e1888aed44c6e3",
+      "original_admitted_at": 1793678497528483,
+      "parent_candidate_id": 1916,
+      "retry_reason": "compiler_diagnostics"
+     },
+     {
+      "pr": 24729,
+      "head_sha": "913c21a9fa379f5776bf5fc3cc25c463bc8e9e41",
+      "original_admitted_at": 1793678575985605,
+      "parent_candidate_id": 1916,
+      "retry_reason": "compiler_diagnostics"
+     },
+     {
+      "pr": 24776,
+      "head_sha": "1d637efb7630c26998c22408c7c44f064e568d4e",
+      "original_admitted_at": 1793678598897210,
+      "parent_candidate_id": 1916,
+      "retry_reason": "compiler_diagnostics"
+     },
+     {
+      "pr": 24808,
+      "head_sha": "85a39001d82e5acce8dd6abc2ba6b2d90f517483",
+      "original_admitted_at": 1793678638203409,
+      "parent_candidate_id": 1916,
+      "retry_reason": "compiler_diagnostics"
+     }
+    ]
+   },
+   "events": [
+    {
+     "id": 38624,
+     "source": "bors.local_git",
+     "kind": "constructed",
+     "details": {
+      "assembly_identity": {
+       "base_sha": "519af858c47ad028a8140a439f469a02d5ef4b05",
+       "candidate_id": 1931,
+       "generation": 1,
+       "members_digest": "2f39756dabd354a2a6bc21c0c565887be4f491bdd5389f910b9db851421f2171"
+      },
+      "base_sha": "519af858c47ad028a8140a439f469a02d5ef4b05",
+      "commit": "8c596001ee9f404666cab4a56b6ef6b313dba3a3",
+      "toolchain": {
+       "content": "leanprover/lean4:v4.36.0-rc2\n",
+       "path": "lean-toolchain",
+       "ref": "8c596001ee9f404666cab4a56b6ef6b313dba3a3",
+       "sha256": "11c697aebe5b539d74f5069e497a588e7dfab1c4eeb74313f28357e351c55ca3",
+       "source": "bors.local_git_object",
+       "unknown_reason": null
+      },
+      "tree": "1c992e0aff12b34b3720095087f2b76a51101d3c"
+     },
+     "observed_at": 1793742614985799
+    },
+    {
+     "id": 38638,
+     "source": "bors.terminal_logs",
+     "kind": "failure_diagnostics",
+     "details": {
+      "authority": "retry_only",
+      "binding": {
+       "base_sha": "519af858c47ad028a8140a439f469a02d5ef4b05",
+       "candidate_id": 1931,
+       "commit": "8c596001ee9f404666cab4a56b6ef6b313dba3a3",
+       "generation": 1,
+       "job_ids": [
+        126229633128
+       ],
+       "members_digest": "2f39756dabd354a2a6bc21c0c565887be4f491bdd5389f910b9db851421f2171",
+       "run_attempt": 1,
+       "run_id": 41725530762,
+       "workflow": ".github/workflows/pr-build.yml"
+      },
+      "collision_sources": {
+       "complete": false,
+       "reason": "ineligible_collision"
+      },
+      "private_origin_policy": "private-origin-source-v1",
+      "private_origin_sources": {
+       "complete": false,
+       "reason": "ineligible_private_origin"
+      },
+      "proof_authority": false,
+      "provider_lookup": {
+       "complete": false,
+       "reason": "ineligible_or_unmapped"
+      },
+      "raw_result": null,
+      "result": {
+       "complete": true,
+       "cpu_ms": 128,
+       "elapsed_ms": 565,
+       "jobs": [
+        {
+         "bytes": 1146699,
+         "job_id": 126229633128,
+         "observations": [
+          {
+           "kind": "compiler_error",
+           "paths": [
+            "TauCeti/AlgebraicGeometry/Modules/PseudoCoherent/Pullback.lean"
+           ]
+          }
+         ],
+         "source": "job_log"
+        }
+       ],
+       "parser_version": "streaming-v2"
+      }
+     },
+     "observed_at": 1793744218539446
+    },
+    {
+     "id": 38639,
+     "source": "bors.trusted_failure",
+     "kind": "failure_classified",
+     "details": {
+      "base_sha": "519af858c47ad028a8140a439f469a02d5ef4b05",
+      "classification": "candidate_failure",
+      "commit": "8c596001ee9f404666cab4a56b6ef6b313dba3a3",
+      "evidence": {
+       "conclusion": "failure",
+       "failed_steps": [
+        {
+         "job_id": 126229633128,
+         "job_name": "sandboxed-build",
+         "name": "Build exact candidate under bwrap with workflow-pinned audits, offline",
+         "number": 39,
+         "pin_validation_ran": false
+        },
+        {
+         "job_id": 126229633128,
+         "job_name": "sandboxed-build",
+         "name": "Report build and bump-guard statuses to the PR head commit",
+         "number": 44,
+         "pin_validation_ran": false
+        },
+        {
+         "job_id": 126242155496,
+         "job_name": "finalize-merge-group-build",
+         "name": "Post the terminal merge-group build status",
+         "number": 6,
+         "pin_validation_ran": false
+        }
+       ],
+       "identity": "bors branch=main batch=2615 head=8c596001ee9f404666cab4a56b6ef6b313dba3a3 base=519af858c47ad028a8140a439f469a02d5ef4b05",
+       "run_attempt": 1,
+       "run_created_at": "2026-11-03T21:51:18Z",
+       "run_id": 41725530762,
+       "run_url": "https://github.com/TauCetiProject/TauCeti/actions/runs/41725530762",
+       "workflow": ".github/workflows/pr-build.yml"
+      },
+      "proof_authority": false
+     },
+     "observed_at": 1793744219359745
+    },
+    {
+     "id": 38640,
+     "source": "bors.failure_isolation",
+     "kind": "failure_partition",
+     "details": {
+      "authority": "retry_only",
+      "dependencies_complete": false,
+      "groups": [
+       [
+        26269
+       ],
+       [
+        21265,
+        23800,
+        24660,
+        24677,
+        24681,
+        24729
+       ]
+      ],
+      "ownership_complete": true,
+      "strategy": "compiler_diagnostics",
+      "verified_base_collision": null
+     },
+     "observed_at": 1793744219981623
+    },
+    {
+     "id": 38641,
+     "source": "bors.failure_isolation",
+     "kind": "provisional_repair",
+     "details": {
+      "authority": "provisional_suspect",
+      "base_sha": "519af858c47ad028a8140a439f469a02d5ef4b05",
+      "binding": {
+       "base_sha": "519af858c47ad028a8140a439f469a02d5ef4b05",
+       "candidate_id": 1931,
+       "commit": "8c596001ee9f404666cab4a56b6ef6b313dba3a3",
+       "generation": 1,
+       "job_ids": [
+        126229633128
+       ],
+       "members_digest": "2f39756dabd354a2a6bc21c0c565887be4f491bdd5389f910b9db851421f2171",
+       "run_attempt": 1,
+       "run_id": 41725530762,
+       "workflow": ".github/workflows/pr-build.yml"
+      },
+      "head_sha": "91d9dca0a2aadd3a3f2dfa3ddeaa27666ff053c7",
+      "pr": 26269,
+      "proof_authority": false,
+      "remainder": [
+       [
+        21265,
+        23800,
+        24660,
+        24677,
+        24681,
+        24729
+       ]
+      ],
+      "singleton_confirmation_dispatched": false
+     },
+     "observed_at": 1793744235248642
+    },
+    {
+     "id": 38642,
+     "source": "bors.status_summary",
+     "kind": "terminal_observed",
+     "details": {
+      "commit": "8c596001ee9f404666cab4a56b6ef6b313dba3a3",
+      "state": "error"
+     },
+     "observed_at": 1793744257849024
+    }
+   ]
+  },
+  {
+   "id": 1932,
+   "batch_id": 2627,
+   "generation": 1,
+   "runner_started_at": null,
+   "runner_finished_at": null,
+   "snapshot": {
+    "base_sha": "519af858c47ad028a8140a439f469a02d5ef4b05",
+    "members": [
+     {
+      "pr": 25202,
+      "head_sha": "23b48ff6d0d1b73ccf3bba954ddacb4983c3169c",
+      "original_admitted_at": 1793679047214189,
+      "parent_candidate_id": 1931,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 21265,
+      "head_sha": "02addf98810018ea2b9b58ce2004bf4da4f20f4f",
+      "original_admitted_at": 1793676603874903,
+      "parent_candidate_id": 1931,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 23800,
+      "head_sha": "d06cdbde6f8927c27150e2880ae265c56573cf0a",
+      "original_admitted_at": 1793675405736200,
+      "parent_candidate_id": 1931,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 24660,
+      "head_sha": "bd59daf12e8d9c7d42f1a90a8ac4fbaa0de09bb2",
+      "original_admitted_at": 1793678230100595,
+      "parent_candidate_id": 1931,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 24677,
+      "head_sha": "39d57fd48eff7541357e3556ccf4bee7d0741bd6",
+      "original_admitted_at": 1793678391492038,
+      "parent_candidate_id": 1931,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 24681,
+      "head_sha": "818faa0ecb7855fae2567e2383e1888aed44c6e3",
+      "original_admitted_at": 1793678497528483,
+      "parent_candidate_id": 1931,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 24729,
+      "head_sha": "913c21a9fa379f5776bf5fc3cc25c463bc8e9e41",
+      "original_admitted_at": 1793678575985605,
+      "parent_candidate_id": 1931,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 24776,
+      "head_sha": "1d637efb7630c26998c22408c7c44f064e568d4e",
+      "original_admitted_at": 1793678598897210,
+      "parent_candidate_id": 1931,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 24808,
+      "head_sha": "85a39001d82e5acce8dd6abc2ba6b2d90f517483",
+      "original_admitted_at": 1793678638203409,
+      "parent_candidate_id": 1931,
+      "retry_reason": "provisional_remainder"
+     }
+    ]
+   },
+   "events": [
+    {
+     "id": 38651,
+     "source": "bors.local_git",
+     "kind": "constructed",
+     "details": {
+      "assembly_identity": {
+       "base_sha": "519af858c47ad028a8140a439f469a02d5ef4b05",
+       "candidate_id": 1932,
+       "generation": 1,
+       "members_digest": "88cb123097ea87b18a752dc721cf81fa0eba156e00e773e5e2f758f68aa325b2"
+      },
+      "base_sha": "519af858c47ad028a8140a439f469a02d5ef4b05",
+      "commit": "fb1b0db2d4ef86fea05043bcb2c48b7514ee3033",
+      "toolchain": {
+       "content": "leanprover/lean4:v4.36.0-rc2\n",
+       "path": "lean-toolchain",
+       "ref": "fb1b0db2d4ef86fea05043bcb2c48b7514ee3033",
+       "sha256": "11c697aebe5b539d74f5069e497a588e7dfab1c4eeb74313f28357e351c55ca3",
+       "source": "bors.local_git_object",
+       "unknown_reason": null
+      },
+      "tree": "aee518612182b282235f86c53b0d4d3e8ac83887"
+     },
+     "observed_at": 1793744303689518
+    },
+    {
+     "id": 38665,
+     "source": "bors.terminal_logs",
+     "kind": "failure_diagnostics",
+     "details": {
+      "authority": "retry_only",
+      "binding": {
+       "base_sha": "519af858c47ad028a8140a439f469a02d5ef4b05",
+       "candidate_id": 1932,
+       "commit": "fb1b0db2d4ef86fea05043bcb2c48b7514ee3033",
+       "generation": 1,
+       "job_ids": [
+        126245369076
+       ],
+       "members_digest": "88cb123097ea87b18a752dc721cf81fa0eba156e00e773e5e2f758f68aa325b2",
+       "run_attempt": 2,
+       "run_id": 41729728122,
+       "workflow": ".github/workflows/pr-build.yml"
+      },
+      "collision_sources": {
+       "complete": false,
+       "reason": "ineligible_collision"
+      },
+      "private_origin_policy": "private-origin-source-v1",
+      "private_origin_sources": {
+       "complete": false,
+       "reason": "ineligible_private_origin"
+      },
+      "proof_authority": false,
+      "provider_lookup": {
+       "complete": false,
+       "reason": "ineligible_or_unmapped"
+      },
+      "raw_result": null,
+      "result": {
+       "complete": true,
+       "cpu_ms": 128,
+       "elapsed_ms": 499,
+       "jobs": [
+        {
+         "bytes": 1539052,
+         "job_id": 126245369076,
+         "observations": [
+          {
+           "kind": "compiler_error",
+           "paths": [
+            "TauCeti/Algebra/Lie/Current/CompletedModules.lean"
+           ]
+          }
+         ],
+         "source": "job_log"
+        }
+       ],
+       "parser_version": "streaming-v2"
+      }
+     },
+     "observed_at": 1793747332794866
+    },
+    {
+     "id": 38666,
+     "source": "bors.trusted_failure",
+     "kind": "failure_classified",
+     "details": {
+      "base_sha": "519af858c47ad028a8140a439f469a02d5ef4b05",
+      "classification": "candidate_failure",
+      "commit": "fb1b0db2d4ef86fea05043bcb2c48b7514ee3033",
+      "evidence": {
+       "conclusion": "failure",
+       "failed_steps": [
+        {
+         "job_id": 126245369076,
+         "job_name": "sandboxed-build",
+         "name": "Build exact candidate under bwrap with workflow-pinned audits, offline",
+         "number": 39,
+         "pin_validation_ran": false
+        },
+        {
+         "job_id": 126245369076,
+         "job_name": "sandboxed-build",
+         "name": "Report build and bump-guard statuses to the PR head commit",
+         "number": 44,
+         "pin_validation_ran": false
+        },
+        {
+         "job_id": 126267622552,
+         "job_name": "finalize-merge-group-build",
+         "name": "Post the terminal merge-group build status",
+         "number": 6,
+         "pin_validation_ran": false
+        }
+       ],
+       "identity": "bors branch=main batch=2627 head=fb1b0db2d4ef86fea05043bcb2c48b7514ee3033 base=519af858c47ad028a8140a439f469a02d5ef4b05",
+       "run_attempt": 2,
+       "run_created_at": "2026-11-03T22:19:07Z",
+       "run_id": 41729728122,
+       "run_url": "https://github.com/TauCetiProject/TauCeti/actions/runs/41729728122",
+       "workflow": ".github/workflows/pr-build.yml"
+      },
+      "proof_authority": false
+     },
+     "observed_at": 1793747333533067
+    },
+    {
+     "id": 38667,
+     "source": "bors.failure_isolation",
+     "kind": "failure_partition",
+     "details": {
+      "authority": "retry_only",
+      "dependencies_complete": false,
+      "groups": [
+       [
+        25202
+       ],
+       [
+        21265,
+        23800,
+        24660,
+        24677,
+        24681,
+        24729
+       ]
+      ],
+      "ownership_complete": true,
+      "strategy": "compiler_diagnostics",
+      "verified_base_collision": null
+     },
+     "observed_at": 1793747334122645
+    },
+    {
+     "id": 38668,
+     "source": "bors.failure_isolation",
+     "kind": "provisional_repair",
+     "details": {
+      "authority": "provisional_suspect",
+      "base_sha": "519af858c47ad028a8140a439f469a02d5ef4b05",
+      "binding": {
+       "base_sha": "519af858c47ad028a8140a439f469a02d5ef4b05",
+       "candidate_id": 1932,
+       "commit": "fb1b0db2d4ef86fea05043bcb2c48b7514ee3033",
+       "generation": 1,
+       "job_ids": [
+        126245369076
+       ],
+       "members_digest": "88cb123097ea87b18a752dc721cf81fa0eba156e00e773e5e2f758f68aa325b2",
+       "run_attempt": 2,
+       "run_id": 41729728122,
+       "workflow": ".github/workflows/pr-build.yml"
+      },
+      "head_sha": "23b48ff6d0d1b73ccf3bba954ddacb4983c3169c",
+      "pr": 25202,
+      "proof_authority": false,
+      "remainder": [
+       [
+        21265,
+        23800,
+        24660,
+        24677,
+        24681,
+        24729
+       ]
+      ],
+      "singleton_confirmation_dispatched": false
+     },
+     "observed_at": 1793747347872885
+    },
+    {
+     "id": 38669,
+     "source": "bors.status_summary",
+     "kind": "terminal_observed",
+     "details": {
+      "commit": "fb1b0db2d4ef86fea05043bcb2c48b7514ee3033",
+      "state": "error"
+     },
+     "observed_at": 1793747369886228
+    }
+   ]
+  },
+  {
+   "id": 1934,
+   "batch_id": 2629,
+   "generation": 1,
+   "runner_started_at": null,
+   "runner_finished_at": null,
+   "snapshot": {
+    "base_sha": "333c9e49143de812ed1452b412193ee9c05501e7",
+    "members": [
+     {
+      "pr": 21265,
+      "head_sha": "02addf98810018ea2b9b58ce2004bf4da4f20f4f",
+      "original_admitted_at": 1793676603874903,
+      "parent_candidate_id": 1932,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 23800,
+      "head_sha": "d06cdbde6f8927c27150e2880ae265c56573cf0a",
+      "original_admitted_at": 1793675405736200,
+      "parent_candidate_id": 1932,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 24660,
+      "head_sha": "bd59daf12e8d9c7d42f1a90a8ac4fbaa0de09bb2",
+      "original_admitted_at": 1793678230100595,
+      "parent_candidate_id": 1932,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 24677,
+      "head_sha": "39d57fd48eff7541357e3556ccf4bee7d0741bd6",
+      "original_admitted_at": 1793678391492038,
+      "parent_candidate_id": 1932,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 24681,
+      "head_sha": "818faa0ecb7855fae2567e2383e1888aed44c6e3",
+      "original_admitted_at": 1793678497528483,
+      "parent_candidate_id": 1932,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 24729,
+      "head_sha": "913c21a9fa379f5776bf5fc3cc25c463bc8e9e41",
+      "original_admitted_at": 1793678575985605,
+      "parent_candidate_id": 1932,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 24776,
+      "head_sha": "1d637efb7630c26998c22408c7c44f064e568d4e",
+      "original_admitted_at": 1793678598897210,
+      "parent_candidate_id": 1932,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 24808,
+      "head_sha": "85a39001d82e5acce8dd6abc2ba6b2d90f517483",
+      "original_admitted_at": 1793678638203409,
+      "parent_candidate_id": 1932,
+      "retry_reason": "provisional_remainder"
+     }
+    ]
+   },
+   "events": [
+    {
+     "id": 38701,
+     "source": "bors.local_git",
+     "kind": "constructed",
+     "details": {
+      "assembly_identity": {
+       "base_sha": "333c9e49143de812ed1452b412193ee9c05501e7",
+       "candidate_id": 1934,
+       "generation": 1,
+       "members_digest": "dacebe92a8f8434764723e6c94a942d1f57c23baaa7e50ded29b5904065ed5c3"
+      },
+      "base_sha": "333c9e49143de812ed1452b412193ee9c05501e7",
+      "commit": "8e29268de79c45d1730fa54d62137f70cd24b4e3",
+      "toolchain": {
+       "content": "leanprover/lean4:v4.36.0-rc2\n",
+       "path": "lean-toolchain",
+       "ref": "8e29268de79c45d1730fa54d62137f70cd24b4e3",
+       "sha256": "11c697aebe5b539d74f5069e497a588e7dfab1c4eeb74313f28357e351c55ca3",
+       "source": "bors.local_git_object",
+       "unknown_reason": null
+      },
+      "tree": "52f565059bcca54193f379cf26dec8fd646ae706"
+     },
+     "observed_at": 1793748594096909
+    },
+    {
+     "id": 38716,
+     "source": "github.base_push_response",
+     "kind": "promoted",
+     "details": {
+      "base": "main",
+      "base_sha": "333c9e49143de812ed1452b412193ee9c05501e7",
+      "commit": "8e29268de79c45d1730fa54d62137f70cd24b4e3"
+     },
+     "observed_at": 1793758866710981
+    },
+    {
+     "id": 38717,
+     "source": "bors.status_summary",
+     "kind": "terminal_observed",
+     "details": {
+      "commit": "8e29268de79c45d1730fa54d62137f70cd24b4e3",
+      "state": "ok"
+     },
+     "observed_at": 1793758879427810
+    }
+   ]
+  },
+  {
+   "id": 1863,
+   "batch_id": 2557,
+   "generation": 1,
+   "runner_started_at": null,
+   "runner_finished_at": null,
+   "snapshot": {
+    "base_sha": "8c3e8d8caaa07a6dc5f0a54c301f9376aa333aec",
+    "members": [
+     {
+      "pr": 25177,
+      "head_sha": "5cdccbc680f2b05a8e4d951123816df48fbd3153",
+      "original_admitted_at": 1793680484047496,
+      "parent_candidate_id": 1862,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 25628,
+      "head_sha": "ddc4217665002eac0d715c87621b4c7d4c01b42d",
+      "original_admitted_at": 1793680182177032,
+      "parent_candidate_id": 1862,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 26140,
+      "head_sha": "3bc87961ae868d7dd6fbf7bf6bf5d55db2023935",
+      "original_admitted_at": 1793680552583931,
+      "parent_candidate_id": 1862,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 26155,
+      "head_sha": "2391dcca2550199cbadac94cbf9cca94a9615f3f",
+      "original_admitted_at": 1793680593431478,
+      "parent_candidate_id": 1862,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 26163,
+      "head_sha": "dfe02a71a4e795376b43e44c57c9fcac81f5669e",
+      "original_admitted_at": 1793680652233627,
+      "parent_candidate_id": 1862,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 26167,
+      "head_sha": "30c9be571c39ee664c733758519d84142f522531",
+      "original_admitted_at": 1793680777616154,
+      "parent_candidate_id": 1862,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 24669,
+      "head_sha": "4872c97655c8b4a347a6b23cf291a8f7e449e983",
+      "original_admitted_at": 1793680718255154,
+      "parent_candidate_id": 1862,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 25376,
+      "head_sha": "a8883245eeff805a80b3bb8a7af8af11ac4d4531",
+      "original_admitted_at": 1793680189562075,
+      "parent_candidate_id": 1862,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 25446,
+      "head_sha": "d9a91e85c20d7136827ff25466e0a551557cb87d",
+      "original_admitted_at": 1793681019274491,
+      "parent_candidate_id": 1862,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 26135,
+      "head_sha": "2b056a7d452d0f8eba0beb6e19b776771e3cc908",
+      "original_admitted_at": 1793680311260466,
+      "parent_candidate_id": 1862,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 26149,
+      "head_sha": "11fe5556c2216ab74ff7c53a9fddb645b2ee7c5a",
+      "original_admitted_at": 1793680567067398,
+      "parent_candidate_id": 1862,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 26157,
+      "head_sha": "c2922329ef2b15ede70c07f90bbeb11f5db3c1c5",
+      "original_admitted_at": 1793680607874676,
+      "parent_candidate_id": 1862,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 26164,
+      "head_sha": "9955989f42f56f2709089d4f9ed5e37eeea184a0",
+      "original_admitted_at": 1793680688374543,
+      "parent_candidate_id": 1862,
+      "retry_reason": "provisional_remainder"
+     },
+     {
+      "pr": 26169,
+      "head_sha": "17f651870a4b0342d7e2ff7e3af9bc1299723729",
+      "original_admitted_at": 1793680792326403,
+      "parent_candidate_id": 1862,
+      "retry_reason": "provisional_remainder"
+     }
+    ]
+   },
+   "events": [
+    {
+     "id": 37429,
+     "source": "bors.local_git",
+     "kind": "constructed",
+     "details": {
+      "assembly_identity": {
+       "base_sha": "8c3e8d8caaa07a6dc5f0a54c301f9376aa333aec",
+       "candidate_id": 1863,
+       "generation": 1,
+       "members_digest": "b72678e94b28eca249aaf5a87331f323270201150247ad2ba176c1effc224708"
+      },
+      "base_sha": "8c3e8d8caaa07a6dc5f0a54c301f9376aa333aec",
+      "commit": "936ba5eb57affa434e11bb42aef1e5936a0f206b",
+      "toolchain": {
+       "content": "leanprover/lean4:v4.36.0-rc2\n",
+       "path": "lean-toolchain",
+       "ref": "936ba5eb57affa434e11bb42aef1e5936a0f206b",
+       "sha256": "11c697aebe5b539d74f5069e497a588e7dfab1c4eeb74313f28357e351c55ca3",
+       "source": "bors.local_git_object",
+       "unknown_reason": null
+      },
+      "tree": "67960686de125e8ad17e79839a7e9d44e7089afd"
+     },
+     "observed_at": 1793687664321462
+    },
+    {
+     "id": 37442,
+     "source": "bors.terminal_logs",
+     "kind": "failure_diagnostics",
+     "details": {
+      "authority": "retry_only",
+      "binding": {
+       "base_sha": "8c3e8d8caaa07a6dc5f0a54c301f9376aa333aec",
+       "candidate_id": 1863,
+       "commit": "936ba5eb57affa434e11bb42aef1e5936a0f206b",
+       "generation": 1,
+       "job_ids": [
+        125766849259
+       ],
+       "members_digest": "b72678e94b28eca249aaf5a87331f323270201150247ad2ba176c1effc224708",
+       "run_attempt": 1,
+       "run_id": 41590773888,
+       "workflow": ".github/workflows/pr-build.yml"
+      },
+      "collision_sources": {
+       "complete": false,
+       "reason": "ineligible_collision"
+      },
+      "proof_authority": false,
+      "provider_lookup": {
+       "complete": false,
+       "reason": "ineligible_or_unmapped"
+      },
+      "result": {
+       "complete": true,
+       "cpu_ms": 96,
+       "elapsed_ms": 470,
+       "jobs": [
+        {
+         "bytes": 1396415,
+         "job_id": 125766849259,
+         "observations": [
+          {
+           "declaration": "_private.TauCeti.LowDimTopology.DehnSurgery.Slope.0.TauCeti.slopeSetoid",
+           "kind": "environment_linter",
+           "linter": "unusedArguments",
+           "paths": [],
+           "unknown": "unsupported_origin"
+          }
+         ],
+         "source": "job_log"
+        }
+       ],
+       "parser_version": "streaming-v2"
+      }
+     },
+     "observed_at": 1793689624952098
+    },
+    {
+     "id": 37444,
+     "source": "bors.trusted_failure",
+     "kind": "failure_classified",
+     "details": {
+      "base_sha": "8c3e8d8caaa07a6dc5f0a54c301f9376aa333aec",
+      "classification": "candidate_failure",
+      "commit": "936ba5eb57affa434e11bb42aef1e5936a0f206b",
+      "evidence": {
+       "conclusion": "failure",
+       "failed_steps": [
+        {
+         "job_id": 125766849259,
+         "job_name": "sandboxed-build",
+         "name": "Build exact candidate under bwrap with workflow-pinned audits, offline",
+         "number": 39,
+         "pin_validation_ran": false
+        },
+        {
+         "job_id": 125766849259,
+         "job_name": "sandboxed-build",
+         "name": "Report build and bump-guard statuses to the PR head commit",
+         "number": 44,
+         "pin_validation_ran": false
+        },
+        {
+         "job_id": 125777337861,
+         "job_name": "finalize-merge-group-build",
+         "name": "Post the terminal merge-group build status",
+         "number": 6,
+         "pin_validation_ran": false
+        }
+       ],
+       "identity": "bors branch=main batch=2557 head=936ba5eb57affa434e11bb42aef1e5936a0f206b base=8c3e8d8caaa07a6dc5f0a54c301f9376aa333aec",
+       "run_attempt": 1,
+       "run_created_at": "2026-11-03T06:34:50Z",
+       "run_id": 41590773888,
+       "run_url": "https://github.com/TauCetiProject/TauCeti/actions/runs/41590773888",
+       "workflow": ".github/workflows/pr-build.yml"
+      },
+      "proof_authority": false
+     },
+     "observed_at": 1793689625712997
+    },
+    {
+     "id": 37446,
+     "source": "bors.failure_isolation",
+     "kind": "failure_partition",
+     "details": {
+      "authority": "retry_only",
+      "dependencies_complete": true,
+      "groups": [
+       [
+        25177,
+        25628,
+        26140,
+        26155,
+        26163,
+        26167
+       ],
+       [
+        24669,
+        25376,
+        25446,
+        26135,
+        26149,
+        26157
+       ]
+      ],
+      "ownership_complete": true,
+      "strategy": "balanced_dependency_components",
+      "verified_base_collision": null
+     },
+     "observed_at": 1793689626762189
+    },
+    {
+     "id": 37447,
+     "source": "bors.status_summary",
+     "kind": "terminal_observed",
+     "details": {
+      "commit": "936ba5eb57affa434e11bb42aef1e5936a0f206b",
+      "state": "error"
+     },
+     "observed_at": 1793689647868631
+    },
+    {
+     "id": 38571,
+     "source": "bors.terminal_logs",
+     "kind": "failure_diagnostics",
+     "details": {
+      "authority": "retry_only",
+      "binding": {
+       "base_sha": "8c3e8d8caaa07a6dc5f0a54c301f9376aa333aec",
+       "candidate_id": 1863,
+       "commit": "936ba5eb57affa434e11bb42aef1e5936a0f206b",
+       "generation": 1,
+       "job_ids": [
+        125766849259
+       ],
+       "members_digest": "b72678e94b28eca249aaf5a87331f323270201150247ad2ba176c1effc224708",
+       "run_attempt": 1,
+       "run_id": 41590773888,
+       "workflow": ".github/workflows/pr-build.yml"
+      },
+      "collision_sources": {
+       "complete": false,
+       "reason": "ineligible_collision"
+      },
+      "private_origin_policy": "private-origin-source-v1",
+      "private_origin_sources": {
+       "complete": false,
+       "reason": "ineligible_private_origin"
+      },
+      "proof_authority": false,
+      "provider_lookup": {
+       "complete": false,
+       "reason": "ineligible_or_unmapped"
+      },
+      "raw_result": null,
+      "result": {
+       "complete": true,
+       "cpu_ms": 117,
+       "elapsed_ms": 567,
+       "jobs": [
+        {
+         "bytes": 1396415,
+         "job_id": 125766849259,
+         "observations": [
+          {
+           "declaration": "_private.TauCeti.LowDimTopology.DehnSurgery.Slope.0.TauCeti.slopeSetoid",
+           "kind": "environment_linter",
+           "linter": "unusedArguments",
+           "paths": [],
+           "unknown": "unsupported_origin"
+          }
+         ],
+         "source": "job_log"
+        }
+       ],
+       "parser_version": "streaming-v2"
+      }
+     },
+     "observed_at": 1793739653084468
+    }
+   ]
+  }
+ ]
+}

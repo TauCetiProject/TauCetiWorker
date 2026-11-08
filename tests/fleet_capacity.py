@@ -17,7 +17,7 @@ from tauceti_worker import activity, agents, cli, github_outbox, loop, work_unit
 from tauceti_worker.claude_api import ClaudeAPIContext
 from tauceti_worker.config import AdmissionUnavailable
 from tauceti_worker.constants import EX_ADMISSION_WAIT
-from tauceti_worker.fleet_capacity import admission_reason, admission_unit, check_launch_admission
+from tauceti_worker.fleet_capacity import admission_reason, admission_unit, check_launch_admission, roadmap_focus
 from tauceti_worker.fleet_events import emit, mutation
 from tauceti_worker.round import Claims, RoundContext
 from tauceti_worker.survey import Counters
@@ -47,6 +47,70 @@ class FleetTests(unittest.TestCase):
             ]:
                 p.write_text(json.dumps(value))
                 self.assertIn("unavailable", admission_reason("a", env=env, now=10))
+
+    def test_live_focus_is_optional_and_does_not_change_admission(self):
+        self.assertEqual(roadmap_focus("a", env={}), [])
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "admission.json"
+            env = {"TAUCETI_FLEET_ADMISSION_FILE": str(path)}
+            policy = dict(
+                version=1,
+                expires_at=20,
+                workers=["a", "b"],
+                roadmap_focus=dict(workers=["a"], areas=["PDE", "PDE", "SymplecticGeometry"]),
+            )
+            path.write_text(json.dumps(policy))
+            self.assertEqual(roadmap_focus("a", env=env, now=10), ["PDE", "SymplecticGeometry"])
+            self.assertEqual(roadmap_focus("b", env=env, now=10), [])
+            self.assertEqual(roadmap_focus("a", env=env, now=21), [])
+            self.assertEqual(roadmap_focus("a", env=env, now=-20), [])
+            self.assertIsNone(admission_reason("a", env=env, now=10))
+            self.assertIsNone(admission_reason("b", env=env, now=10))
+            for bad in (None, [], "invalid", dict(areas="PDE", workers=["a"]), dict(areas=[None], workers=["a"])):
+                policy["roadmap_focus"] = bad
+                path.write_text(json.dumps(policy))
+                self.assertEqual(roadmap_focus("a", env=env, now=10), [])
+            policy["roadmap_focus"] = dict(workers=["b"], areas=["PDE"])
+            path.write_text(json.dumps(policy))
+            self.assertEqual(roadmap_focus("a", env=env, now=10), [])
+            self.assertEqual(roadmap_focus("b", env=env, now=10), ["PDE"])
+
+    def test_fractional_slot_draws_per_round_at_small_scale(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "admission.json"
+            env = {"TAUCETI_FLEET_ADMISSION_FILE": str(path)}
+            policy = dict(
+                version=1,
+                expires_at=20,
+                workers=["a"],
+                roadmap_focus=dict(workers=[], areas=["PDE"], fractional_worker="a", fractional_percent=20),
+            )
+            path.write_text(json.dumps(policy))
+            with patch("tauceti_worker.fleet_capacity.random.randrange", side_effect=range(100)):
+                draws = [roadmap_focus("a", env=env, now=10) for _ in range(100)]
+            self.assertEqual(draws.count(["PDE"]), 20)
+            self.assertEqual(draws.count([]), 80)
+            self.assertEqual(roadmap_focus("other", env=env, now=10), [])
+
+    def test_random_authoring_focus_honors_skips_and_falls_back_when_stale(self):
+        worker = SimpleNamespace(cfg=SimpleNamespace(wid="a"), gh=None)
+        with (
+            patch.object(work_units, "roadmap_areas", return_value=["Algebra", "PDE", "SymplecticGeometry"]),
+            patch.object(work_units, "roadmap_skip", return_value=["PDE"]) as skip,
+            patch("tauceti_worker.fleet_capacity.roadmap_focus", return_value=["PDE", "SymplecticGeometry"]) as focus,
+            patch.object(work_units.random, "choice", side_effect=lambda areas: areas[0]) as choice,
+        ):
+            self.assertEqual(work_units.random_roadmap_area(worker), "SymplecticGeometry")
+            choice.assert_called_with(["SymplecticGeometry"])
+            focus.return_value = ["RemovedArea"]
+            self.assertEqual(work_units.random_roadmap_area(worker), "Algebra")
+            choice.assert_called_with(["Algebra", "SymplecticGeometry"])
+            focus.return_value = []
+            work_units.random_roadmap_area(worker)
+            choice.assert_called_with(["Algebra", "SymplecticGeometry"])
+            skip.return_value = ["Algebra", "PDE", "SymplecticGeometry"]
+            with self.assertRaisesRegex(work_units.NoProgress, "every area"):
+                work_units.random_roadmap_area(worker)
 
     def test_bridge_checks_capacity_even_without_budget_and_never_launches(self):
         context = ClaudeAPIContext("worker", "roadmap")
@@ -338,7 +402,13 @@ class FleetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)
             git = directory / "git"
-            git.write_text("#!/bin/sh\nexit 0\n")
+            git.write_text(
+                '#!/bin/sh\ncase "$*" in\n'
+                "  'rev-parse --verify'*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;\n"
+                "  mktag) cat >/dev/null; echo bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;\n"
+                "  '-c push.followTags=false push'*) printf '*\\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:refs/heads/test\\t[new branch]\\n' ;;\n"
+                "esac\nexit 0\n"
+            )
             git.chmod(0o700)
             (directory / "json.py").write_text("raise RuntimeError('untrusted import')\n")
             journal = directory / "events.jsonl"

@@ -291,7 +291,11 @@ class Candidate:
     rebase_budget_key: str = ""  # immutable budget chosen by this survey, including its verified progress epoch
     foreign_repair_base: str = ""  # explicit one-PR operator scope; never adds the fork to other stages
     bump_integration_failure: bool = False
+    final_resolution: bool = False  # existing own-PR fix budget is spent; resolve or close
     partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
+    progress: dict | None = field(
+        default=None, repr=False, compare=False
+    )  # current claimed-PR baseline; never persisted
 
 
 @dataclass
@@ -329,7 +333,6 @@ class Survey:
     overlap_scan: WorkKind = field(default_factory=lambda: WorkKind("overlap-scan"))
     overlap_fix: WorkKind = field(default_factory=lambda: WorkKind("overlap-fix"))
     me_login: str = ""
-    blocked_prs: list[int] = field(default_factory=list)
     roadmap_only: str = ""
     roadmap_skip: list[str] = field(default_factory=list)
     # This is deliberately scoped by roadmap_only/roadmap_skip: authoring backpressure in a focused
@@ -349,10 +352,6 @@ class Survey:
     # can't review them and CI's round cap can't catch them (rounds never advance), so each round
     # escalates — a loud warning + a tracking issue — rather than stranding them silently.
     review_stuck: list[int] = field(default_factory=list)
-    # Heads a peer reviewer is actively reviewing right now (an unexpired in-progress marker on the
-    # exact head). Skipped this round so the worker neither pays the engine's launch cost just to have
-    # it skip nor busy-loops on the one PR a peer holds. (pr, providers) for a one-line status note.
-    review_inflight: list[tuple[int, str]] = field(default_factory=list)
     # Tended PRs that are NOT actionable for `fix`, each with a one-line reason (awaiting first review,
     # head moved since review, reviews all green, fix attempts spent, or a transient fetch failure). A
     # fix-focused worker logs these so it explains its idleness instead of sitting on a bare "no eligible
@@ -371,6 +370,10 @@ class Survey:
         # a `--pr` round can explain a target the throttles took, instead of reporting the survey found
         # it no work.
         self._review_throttled: dict[int, str] = {}
+
+    def owns(self, pr: PRInfo) -> bool:
+        # Qualified source records cannot fall back to a GitHub display login.
+        return not hasattr(pr, "source_repository") and pr.author == self.me_login
 
     def kind(self, name: str) -> WorkKind:
         return {
@@ -410,7 +413,27 @@ class Survey:
         return ", ".join(parts)
 
 
-def bucket_status_labels(nondraft: list[PRInfo], me_login: str) -> tuple[list[tuple[str, int, int]], int]:
+def owns_pr(survey, pr: PRInfo, *, casefold_legacy=False) -> bool:
+    qualified = hasattr(pr, "source_repository") or hasattr(survey, "source_repository")
+    if casefold_legacy and not qualified:
+        author, login = getattr(pr, "author", ""), getattr(survey, "me_login", "")
+        return bool(author and login and author.casefold() == login.casefold())
+    if owns := getattr(survey, "owns", None):
+        return owns(pr)
+    return not qualified and pr.author == survey.me_login
+
+
+def owns_author(survey, author: dict | None) -> bool:
+    """Fresh projected author check; source identity never falls back to login."""
+    if hasattr(survey, "source_repository"):
+        check = getattr(survey, "owns_author", None)
+        return bool(check and check(author))
+    login = author.get("login") if isinstance(author, dict) else None
+    me_login = getattr(survey, "me_login", "")
+    return bool(isinstance(login, str) and login and me_login and login.casefold() == me_login.casefold())
+
+
+def bucket_status_labels(nondraft: list[PRInfo], me_login: str, *, owns=None) -> tuple[list[tuple[str, int, int]], int]:
     """Bucket open non-draft PRs by the STATUS_LABELS pipeline (fixed order). Returns
     (buckets, unlabeled) where each bucket is (label, total, mine) — total carrying that label, and the
     subset authored by `me_login` — and `unlabeled` counts PRs with none of the status labels. A PR
@@ -420,7 +443,12 @@ def bucket_status_labels(nondraft: list[PRInfo], me_login: str) -> tuple[list[tu
         (
             label,
             sum(1 for p in nondraft if label in p.labels),
-            sum(1 for p in nondraft if label in p.labels and p.author == me_login),
+            sum(
+                1
+                for p in nondraft
+                if label in p.labels
+                and (owns(p) if owns else not hasattr(p, "source_repository") and p.author == me_login)
+            ),
         )
         for label in STATUS_LABELS
     ]
@@ -451,14 +479,11 @@ def roadmap_open_count(prs: list[PRInfo], only: str, skip: list[str]) -> int:
 
 
 def spread_candidates(candidates: list, rng=random) -> list:
-    """Return a stage's candidates in a randomized order so several workers starting together don't all
-    converge on the same (lowest-numbered) PR and collide. The survey has already dropped work a peer is
-    KNOWN to hold; this only varies which of the remaining, apparently-free PRs each worker tries first —
-    turning systematic collisions (every worker picks the lowest, discovers the clash, repeats) into rare,
-    self-correcting ones. Pure WORKER-side work-allocation: the real de-contention is unchanged — the
-    review engine's in-progress marker for reviews, the branch claim for fix/fix-ci/rebase — this just
-    spreads the first pick. Each worker is its own process with independent RNG state, so concurrent
-    workers shuffle differently. Returns a new list."""
+    """Shuffle candidates so concurrent workers spread their first picks.
+
+    The review engine's Git lease and authoring branch claims decide contention.
+    Returns a new list; independent worker processes use independent RNG state.
+    """
     out = list(candidates)
     rng.shuffle(out)
     return out
@@ -568,7 +593,7 @@ def fix_disposition(
     if not unlimited and per_head >= MAX_FIX_ATTEMPTS:
         return (
             "exhausted",
-            f"blocking review at head, but fix attempts are spent ({per_head}/{MAX_FIX_ATTEMPTS}) — needs a human",
+            f"blocking review at head, but fix attempts are spent ({per_head}/{MAX_FIX_ATTEMPTS}) — resolve or close the authored PR",
         )
     return ("actionable", "")
 
@@ -790,7 +815,7 @@ def confirm_lost_build(gh: GitHub, pr: int, head: str, now: float) -> bool:
     the PR is still open at that head with no `build` status, the head's own runs are still lost (a
     rerun of them may have started since a cached verdict), and no dispatched replacement may still
     report (dispatch_pending). Every read goes straight to GitHub, past the shared read cache and the state
-    gateway. Any failed read answers no."""
+    gateway. A failed read answers no; GitHub being unavailable raises, as in the other stages' re-checks."""
     with transport.read_context(fresh=True, direct=True):
         live = gh.pr_view(pr, ["headRefOid", "isDraft", "state", "statusCheckRollup"])
         if not live or live.get("state") != "OPEN" or live.get("isDraft") or live.get("headRefOid") != head:
@@ -835,6 +860,19 @@ def survey(
         roadmap_only=("auto" if _f is None else (_f or "any")),
         roadmap_skip=roadmap_skip(),
     )
+    if getattr(gh, "direct_source", False) is True:
+        from .source_survey import inventory_survey
+
+        return inventory_survey(
+            cfg,
+            gh,
+            roadmap=sv.roadmap_only,
+            skip=sv.roadmap_skip,
+            deep=deep,
+            stages=enabled,
+            numbers=numbers,
+            count_all_roadmaps=count_all_roadmaps,
+        )
     compact = []
     if seed := getattr(rs, "seed_survey", None):
         seed()
@@ -936,12 +974,6 @@ def survey(
         and not {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
     ]
     facts = {row["pr"]["number"]: row["review"] for row in compact or []}
-    if deep and rs is not None and hasattr(rs, "maintenance_blocked"):
-        blocked_prs = {p.number for p in nondraft if rs.maintenance_blocked(p.number, p.head_oid, p.author)}
-        sv.blocked_prs = sorted(blocked_prs)
-        tended = [p for p in tended if p.number not in blocked_prs]
-    else:
-        blocked_prs = set()
     gaps: set[int] = set()
 
     def history_ready(p):
@@ -1050,7 +1082,7 @@ def survey(
     #    bounded by the contest caps). The only worker-side stop is the review-ERROR cap: a PR whose
     #    review keeps erroring without completing a review is escalated, not silently dropped.
     for p in nondraft if "review" in enabled else []:
-        if p.number in blocked_prs or {label.lower() for label in p.labels} & {"hold", "wip", "human", "on-hold"}:
+        if {label.lower() for label in p.labels} & {"hold", "wip", "human", "on-hold"}:
             continue
         if not p.build_success:
             continue
@@ -1090,15 +1122,6 @@ def survey(
             if not p.automatic_bump and c.attempts >= c.budget:
                 sv.reviewable.suppressed.append(c)
                 sv.review_stuck.append(p.number)  # can't be reviewed → escalate (warn + issue)
-                continue
-            # A peer reviewer holds this exact head (de-contention is on the head alone): skip it now,
-            # the same call the engine's coordinate() would make after a full build+launch. Doing it
-            # here keeps the loop off the one PR a peer is reviewing instead of re-selecting it every
-            # round and spending ~25s per pass to have the engine skip. Fail-open (a fetch failure
-            # reads as 'not held'); the engine's own claim is still the authoritative backstop.
-            cov = rs.inflight_review(p.number, p.head_oid)
-            if cov:
-                sv.review_inflight.append((p.number, ",".join(sorted(cov))))
                 continue
             sv.reviewable.actionable.append(c)
             continue
@@ -1151,10 +1174,13 @@ def survey(
         #    green, attempts spent) so a fix-focused worker explains its idleness instead of a bare
         #    "no eligible work" — reviews are async, so a one-shot fix run can precede the scoreboard.
         for p in tended:
-            if cached_only and not p.build_success:
-                continue
+            # Review findings at this head can be repaired regardless of CI status.
+            # Discovery uses shared cached facts; dispatch rechecks this PR's
+            # head and findings before acting, independently of its build status.
             if not history_ready(p):
-                if "awaiting-author" in p.labels:
+                # Preserve the existing fallback for build-green PRs with
+                # incomplete history; a label alone is not a current finding.
+                if p.build_success and "awaiting-author" in p.labels:
                     c = Candidate(
                         p.number,
                         p.head_oid,
@@ -1163,7 +1189,12 @@ def survey(
                         budget=MAX_FIX_ATTEMPTS,
                         partial_history=True,
                     )
-                    (sv.needs_fix.suppressed if c.attempts >= c.budget else sv.needs_fix.actionable).append(c)
+                    c.final_resolution = c.attempts >= c.budget - 1 and sv.owns(p) and not p.automatic_bump
+                    (
+                        sv.needs_fix.suppressed
+                        if c.attempts >= c.budget and not c.final_resolution
+                        else sv.needs_fix.actionable
+                    ).append(c)
                 continue
             meta = rs.gh_meta(p.number)
             blocking = rs.ledger_blocking(p.number, p.head_oid)
@@ -1187,7 +1218,12 @@ def survey(
                 continue
             if disp == "actionable":
                 c = Candidate(
-                    p.number, p.head_oid, "blocking review at head", attempts=per_head, budget=MAX_FIX_ATTEMPTS
+                    p.number,
+                    p.head_oid,
+                    "blocking review at head",
+                    attempts=per_head,
+                    budget=MAX_FIX_ATTEMPTS,
+                    final_resolution=per_head >= MAX_FIX_ATTEMPTS - 1 and sv.owns(p) and not p.automatic_bump,
                 )
                 sv.needs_fix.actionable.append(c)
                 continue
@@ -1196,7 +1232,12 @@ def survey(
                 c = Candidate(
                     p.number, p.head_oid, "blocking review at head", attempts=per_head, budget=MAX_FIX_ATTEMPTS
                 )
-                sv.needs_fix.suppressed.append(c)
+                if sv.owns(p) and not p.automatic_bump:
+                    c.final_resolution = True
+                    c.reason = "fix attempts spent; resolve or close the authored PR"
+                    sv.needs_fix.actionable.append(c)
+                else:
+                    sv.needs_fix.suppressed.append(c)
 
     # 4) fix-ci: tended (ours or bot-authored), build FAILED at head, under budgets. A red bump PR is
     #    the bump stage's job (its adaptation prompt knows mathlib moved), and a red lint-repair PR is
@@ -1319,6 +1360,8 @@ def survey(
 
 
 def _next_auto_stage(sv: Survey) -> str | None:
+    if hasattr(sv, "source_repository"):
+        return None  # Source inventory supplies no scheduling or publication authority.
     for stage in AUTO_STAGES:
         if sv.kind(stage).actionable:
             return stage
