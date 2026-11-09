@@ -34,6 +34,8 @@ at all (no pin, the fetch, the materialization or a driver build failed) is ``un
 recorded, and not a finding.
 
 Findings are appended to ``.tauceti-repair/errors.jsonl`` beside the compiler errors (``append_errors``).
+Warm repair/prepare agents use advisory scoped checks (``repair_targeted``) and leave this full
+verification to the worker. Other callers can still use ``helper_checks`` after their full builds.
 CI's module-system check and source style lint are not run here.
 
 ``TAUCETI_QUEUE_WORKER_AUDITS=0`` (``--no-worker-audits``) turns the worker's verification and the

@@ -10,8 +10,9 @@ or when the build ends, whichever comes first, with a "Build in progress" prompt
 files and the rule that exactly one ``lake build`` runs at a time: no build of its own while the lock
 exists, and ``.tauceti-repair/build <Module> ...`` (``repair_tools``) for a scoped build once the lock
 is free. When the build ends the worker appends a ``build finished, exit N, M errors total`` line to
-the error list and removes the lock. The agent's final whole-library ``lake build --iofail`` after its
-fixes is still the only verdict. When the build is green and the worker gave it an ``audit`` callable
+the error list and removes the lock. With worker-owned verification, the agent returns after
+scoped checks and the worker runs the final full suite; other callers retain the agent's final
+whole-library build advice. When the build is green and the worker gave it an ``audit`` callable
 (``repair_audit.check``), CI's audits and the changed-module environment lint run before the lock is
 released, and their findings are appended to the error list like compiler errors (``kind`` ``audit`` or
 ``lint``, ``module``, ``file``, ``message``, ``member``, ``commit``). The lock is ``repair_tools``'s, the one the agent's build script takes, and
