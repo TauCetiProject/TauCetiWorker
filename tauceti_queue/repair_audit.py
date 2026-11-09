@@ -34,6 +34,8 @@ at all (no pin, the fetch, the materialization or a driver build failed) is ``un
 recorded, and not a finding.
 
 Findings are appended to ``.tauceti-repair/errors.jsonl`` beside the compiler errors (``append_errors``).
+Warm repair/prepare agents use advisory scoped checks (``repair_targeted``) and leave this full
+verification to the worker. Other callers can still use ``helper_checks`` after their full builds.
 CI's module-system check and source style lint are not run here.
 
 ``TAUCETI_QUEUE_WORKER_AUDITS=0`` (``--no-worker-audits``) turns the worker's verification and the
@@ -42,6 +44,7 @@ automatic audits off.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -84,12 +87,17 @@ def enabled(environ: dict | None = None) -> bool:
 # Settings for the agent's build script
 
 
-def write_settings(worktree: Path, *, base: str, tools_root: Path, lake: tuple[str, ...] = ("lake",)) -> Path:
+def write_settings(
+    worktree: Path, *, base: str, tools_root: Path, lake: tuple[str, ...] = ("lake",), logdir: Path | None = None
+) -> Path:
     """``.tauceti-repair/audit.json``: the base the lint scope is taken against, where the TauCetiTools
     checkouts live and the Lake command, for ``.tauceti-repair/build``."""
     path = worktree / repair_tools.TOOLS_DIR / SETTINGS_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"base": base, "tools_root": str(tools_root), "lake": list(lake)}))
+    settings = {"base": base, "tools_root": str(tools_root), "lake": list(lake)}
+    if logdir is not None:
+        settings["logdir"] = str(logdir)
+    path.write_text(json.dumps(settings))
     return path
 
 
@@ -181,6 +189,7 @@ def _sandboxed(argv: list, worktree: Path, env: dict, extra: dict | None, log: P
     run_env = {**env, **extra}
     wrapped = repair_sandbox.sandboxed_lake([str(a) for a in argv], worktree, run_env, extra_env=extra)
     started = time.monotonic()
+    started_at = time.time()
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("ab") as handle:
         handle.write(f"$ {' '.join(str(a) for a in argv)}\n".encode())
@@ -198,7 +207,14 @@ def _sandboxed(argv: list, worktree: Path, env: dict, extra: dict | None, log: P
     with log.open("rb") as handle:
         handle.seek(start)
         output = handle.read().decode("utf-8", errors="replace")
-    return {"rc": rc, "seconds": round(time.monotonic() - started, 1), "log": str(log), "output": output}
+    return {
+        "rc": rc,
+        "seconds": round(time.monotonic() - started, 1),
+        "started_at": started_at,
+        "finished_at": time.time(),
+        "log": str(log),
+        "output": output,
+    }
 
 
 def _driver_key(worktree: Path, ref: str) -> str:
@@ -274,27 +290,49 @@ def check(
     started = time.monotonic()
     record: dict = {"status": "passed", "diagnostics": []}
     work = worktree / WORK_DIR
+    setup_started = time.monotonic()
     try:
         repo, ref = tools_pin(worktree)
         record["tools"] = f"{repo}@{ref}"
         checkout = tools_checkout(tools_root, repo, ref)
+        record["tools_seconds"] = round(time.monotonic() - setup_started, 3)
+        materialize_started = time.monotonic()
         scripts = materialize(checkout, worktree, work / "scripts")
+        record["materialize_seconds"] = round(time.monotonic() - materialize_started, 3)
+        drivers_started = time.monotonic()
         drivers, built = build_drivers(worktree, scripts, env, ref, logdir / "audit-drivers.log", timeout)
+        record["drivers_seconds"] = round(time.monotonic() - drivers_started, 3)
         if built:
             record["drivers"] = built
         modules = changed_modules(worktree, base)
     except (Unavailable, repair_sandbox.SandboxUnavailable, OSError) as error:
         record.update(status="unavailable", reason=str(error), seconds=round(time.monotonic() - started, 1))
         return record
+    phases_path = work / "audit-phases.tsv"
+    phase_record = logdir / ("audit-phases-" + str(time.time_ns()) + ".tsv")
+    with contextlib.suppress(OSError):
+        phases_path.unlink(missing_ok=True)
+        logdir.mkdir(parents=True, exist_ok=True)
+        phase_record.touch(exist_ok=False)
+        # The driver can write only inside .lake. A hardlink preserves its phase
+        # markers in task logs even if the parent/helper is killed mid-audit.
+        os.link(phase_record, phases_path)
+    record["audit_phases_file"] = str(phase_record)
     audit_argv = [*lake, "env", "timeout", "--signal=TERM", "--kill-after=30", f"{AUDIT_TIMEOUT_SECONDS}s"]
     audit = _sandboxed(
         [*audit_argv, drivers / "audit-driver"],
         worktree,
         env,
-        {"AUDIT_PHASES_FILE": work / "audit-phases.tsv"},
+        {"AUDIT_PHASES_FILE": phases_path},
         logdir / "audit.log",
         timeout,
     )
+    record["audit_phases"] = audit_phases(phases_path, audit)
+    with contextlib.suppress(OSError):
+        if not os.path.samefile(phases_path, phase_record):
+            shutil.copyfile(phases_path, phase_record)
+    with contextlib.suppress(OSError):
+        shutil.copyfile(phases_path, logdir / "audit-phases.tsv")
     found = findings_of("audit", "audit-driver", audit)
     record["audit"] = {k: v for k, v in audit.items() if k != "output"} | {"findings": len(found)}
     record["diagnostics"] += found
@@ -315,7 +353,42 @@ def check(
         record["lint"] = {"skipped": "no TauCeti module changed since the base"}
     record["status"] = "failed" if record["diagnostics"] else "passed"
     record["seconds"] = round(time.monotonic() - started, 1)
+    with contextlib.suppress(OSError):
+        (logdir / "checks-timing.json").write_text(
+            json.dumps({k: v for k, v in record.items() if k != "diagnostics"}, indent=2) + "\n"
+        )
     return record
+
+
+def audit_phases(path: Path, run: dict) -> list[dict]:
+    """Best-effort wall times from the pinned driver's epoch phase markers.
+
+    Missing or malformed telemetry never changes a verdict. Incomplete runs retain
+    their observed intervals, marked incomplete, rather than claiming checks passed.
+    """
+    events = []
+    try:
+        for line in path.read_text().splitlines():
+            name, stamp = line.split("\t")
+            stamp = float(stamp)
+            if name not in ("audit-import", "audit-duplicates", "audit-axioms"):
+                return []
+            if not run["started_at"] <= stamp <= run["finished_at"]:
+                continue
+            if events and stamp < events[-1][1]:
+                return []
+            events.append((name, stamp))
+    except (OSError, ValueError, KeyError):
+        return []
+    return [
+        {
+            "name": name,
+            "started_at": stamp,
+            "seconds": round((events[index + 1][1] if index + 1 < len(events) else run["finished_at"]) - stamp, 3),
+            "complete": index + 1 < len(events) or run["rc"] == 0,
+        }
+        for index, (name, stamp) in enumerate(events)
+    ]
 
 
 def append_errors(directory: Path, found: list[dict], owner=None) -> None:
@@ -398,7 +471,11 @@ def helper_checks(root: Path) -> int:
     if settings is None:
         print("audits: not configured in this worktree (.tauceti-repair/audit.json is missing); skipped", flush=True)
         return 0
-    logdir = root / repair_tools.TOOLS_DIR / "audit"
+    logdir = (
+        Path(settings["logdir"]) / ("helper-audit-" + str(time.time_ns()))
+        if settings.get("logdir")
+        else root / repair_tools.TOOLS_DIR / "audit"
+    )
     print("audits: running CI's audit driver and the changed-module environment lint", flush=True)
     result = check(
         root,

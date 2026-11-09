@@ -1244,6 +1244,7 @@ def prompt_context(
     artifacts: dict | None = None,
     listings: Path | None = None,
     shell_limit: int = repair.SHELL_LIMIT_SECONDS,
+    worker_verifies: bool = False,
 ) -> PromptContext:
     """``artifacts`` is the ``prepare_artifacts`` record (the prompt says when the build is cold);
     ``listings`` is where the member listings and the check script go (``repair.listings_path``);
@@ -1282,6 +1283,7 @@ def prompt_context(
         artifacts_cold=cold,
         artifacts_reason=(artifacts or {}).get("unavailable_reason") if cold else None,
         check_findings_known=known_check_failures(task),
+        worker_verifies=worker_verifies and not cold and task.kind in ("repair", "prepare"),
         listings_path=listings,
         shell_limit=shell_limit,
         pre_rebased=pre_rebased(task) is not None,
@@ -2067,7 +2069,7 @@ def _run_task(
         tools_root = cfg.root / repair_audit.TOOLS_DIR
         if cfg.worker_audits:
             repair_audit.write_settings(
-                worktree, base=task.validation_base, tools_root=tools_root, lake=tuple(cfg.lake)
+                worktree, base=task.validation_base, tools_root=tools_root, lake=tuple(cfg.lake), logdir=logdir
             )
         if streaming and (outcome.get("artifacts") or {}).get("available"):
             stream = repair_stream.start_build(
@@ -2178,11 +2180,16 @@ def _run_task(
                     artifacts=outcome.get("artifacts") or state.record.get("artifacts"),
                     listings=repair.listings_path(worktree),
                     shell_limit=int(cfg.shell_limit),
+                    worker_verifies=cfg.worker_audits,
                 )
                 context.repair_context = ownership
+                if context.worker_verifies:
+                    from tauceti_queue import repair_targeted
+
+                    repair_targeted.write(worktree / repair.LISTINGS_DIR, candidate=task.tip, findings=findings)
                 prompt = repair.compose_prompt(context, findings, chain_before, cfg.clone)
                 if stream is not None:
-                    prompt = stream.annotate(prompt)
+                    prompt = stream.annotate(prompt, worker_verifies=context.worker_verifies)
                 if resume_session:
                     prompt = (
                         "The worker running this task was interrupted and has resumed your session; the worktree is "
