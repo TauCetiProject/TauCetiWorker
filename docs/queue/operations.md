@@ -911,6 +911,25 @@ set `publication_enabled = false` (restart). The service returns to shadow mode 
 resumes approval intake. Approved inputs the service holds at that moment are re-approved under Bors by
 their authors or the review App; the service's observation feed lists them.
 
+### Forgejo Stage 1 authority transfer
+
+The [Stage 1 cutover runbook](../forgejo-stage1-cutover.md) defines a separately
+authorized transfer to human-operated Forgejo development. While that authority
+transfer is active, keep the old GitHub queue's persisted `publication_enabled`
+setting false and its service disabled. Do not use the Bors rollback above to
+restore a second GitHub merge writer.
+
+`services/queue/install.sh` enables and starts the controller even with
+`--no-restart`. Do not run it on a host fenced for Forgejo cutover without the
+explicit authority decision. Preserve the host's deployment notice, old ledger,
+prepared work, and configured settings; a file seed or fresh database must not
+silently restore publication. The GitHub mirror can share the old queue App
+identity, so a branch exception alone does not distinguish those processes.
+
+This is a cutover condition, not an instruction to stop current production during
+preparation. Keep normal worker/CI admissions enabled until the authorized
+project-specific authority switch.
+
 ### Rebuilding the head
 
 `POST /admin/rebuild-head` (bearer token of a repository admin, body `{}`) rebuilds the head's chain
