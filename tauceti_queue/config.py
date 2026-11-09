@@ -189,12 +189,15 @@ def _apply(config: Config, name: str, value: Any, source: str) -> None:
     config.sources[name] = source
 
 
-def read_file(path: Path) -> dict[str, Any]:
+def read_file(path: Path, *, snapshot: bytes | None = None) -> dict[str, Any]:
     """Parse the TOML file; unknown keys are errors so a typo cannot silently keep a default."""
     try:
-        with open(path, "rb") as handle:
-            data = tomllib.load(handle)
-    except tomllib.TOMLDecodeError as exc:
+        if snapshot is None:
+            with open(path, "rb") as handle:
+                data = tomllib.load(handle)
+        else:
+            data = tomllib.loads(snapshot.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeError) as exc:
         raise ConfigError(f"{path}: {exc}") from None
     flat: dict[str, Any] = {}
     for key, value in data.items():
@@ -212,9 +215,16 @@ def read_file(path: Path) -> dict[str, Any]:
     return flat
 
 
-def load(path: str | os.PathLike[str] | None = None, environ: Mapping[str, str] | None = None) -> Config:
+def load(
+    path: str | os.PathLike[str] | None = None,
+    environ: Mapping[str, str] | None = None,
+    *,
+    snapshot: bytes | None = None,
+) -> Config:
     """Defaults, then the file (if it exists), then `TAUCETI_QUEUE_*` environment overrides."""
     environ = os.environ if environ is None else environ
+    if snapshot is not None and (not path or not isinstance(snapshot, bytes)):
+        raise ConfigError("a configuration snapshot requires bytes and an explicit path")
     config = Config()
     for name in (*_FIELDS, *SETTING_FIELDS):
         config.sources[name] = "default"
@@ -224,9 +234,9 @@ def load(path: str | os.PathLike[str] | None = None, environ: Mapping[str, str] 
     chosen = path or environ.get(CONFIG_ENV) or DEFAULT_CONFIG_PATH
     file_path = Path(os.path.expanduser(str(chosen)))
     explicit = bool(path or environ.get(CONFIG_ENV))
-    if file_path.exists():
+    if snapshot is not None or file_path.exists():
         config.path = file_path
-        for name, value in read_file(file_path).items():
+        for name, value in read_file(file_path, snapshot=snapshot).items():
             _apply(config, name, value, "file")
     elif explicit:
         raise ConfigError(f"configuration file not found: {file_path}")
@@ -242,8 +252,8 @@ def load(path: str | os.PathLike[str] | None = None, environ: Mapping[str, str] 
     return config
 
 
-def validate(config: Config) -> list[str]:
-    """Problems that would stop `serve`; an empty list means the configuration is usable."""
+def validate(config: Config, *, check_credentials: bool = True) -> list[str]:
+    """Runtime problems; native callers already checked their credential snapshots."""
     problems: list[str] = []
     if not _REPOSITORY_RE.match(config.repository):
         problems.append(f"repository must be owner/name, got {config.repository!r}")
@@ -277,6 +287,8 @@ def validate(config: Config) -> list[str]:
     for name in ("content_clone", "database", "log_dir", "credentials_dir"):
         if not getattr(config, name).is_absolute():
             problems.append(f"{name} must be an absolute path, got {getattr(config, name)}")
+    if not check_credentials:
+        return problems
     if not config.credentials_dir.is_dir():
         problems.append(f"credentials_dir does not exist: {config.credentials_dir}")
     else:

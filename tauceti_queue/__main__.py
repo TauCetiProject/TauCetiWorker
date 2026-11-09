@@ -53,6 +53,7 @@ import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -243,9 +244,20 @@ class Service:
         controller_status = None
         if self.controller is not None:
             controller_status = self.controller.status() if wait is None else self.controller.status(wait=wait)
-        return rt.status_document(
+        document = rt.status_document(
             self.runtime, self.config.settings.as_dict(), controller_status, self.unavailable_reason
         )
+        if self.native is not None:
+            policy = self.native.execution_policy
+            document["service"].update(
+                source_repository=policy.source.record(),
+                execution_repository=policy.execution.record(),
+                workflow_revision=self.native.workflow_revision,
+            )
+            # Compatibility feeds use the GitHub ID namespace and are refused
+            # by the native server until qualified feeds are implemented.
+            document["feeds"] = None
+        return document
 
     def effective_settings(self) -> dict[str, int]:
         if self.controller is not None:
@@ -313,8 +325,15 @@ def _install_signal_handlers(stop: rt.StopSignal) -> None:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    config = configuration.load(args.config)
-    problems = configuration.validate(config)
+    launch = None
+    if getattr(args, "native_launch", None):
+        from .native_launch import NativeLaunch
+
+        launch = NativeLaunch.load(args.native_launch)
+        config = launch.config
+    else:
+        config = configuration.load(args.config)
+    problems = configuration.validate(config, check_credentials=launch is None)
     if problems:
         for problem in problems:
             _log(f"configuration problem: {problem}")
@@ -324,23 +343,38 @@ def cmd_serve(args: argparse.Namespace) -> int:
         config.sources["canonical_branch"] = "discovered"
     config.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     runtime = rt.ServiceRuntime.start(config)
-    service = Service(config, runtime)
+    service = Service(config, runtime, native=launch.bootstrap) if launch else Service(config, runtime)
     _install_signal_handlers(service.stop)
     _log(
         f"revision {runtime.revision.sha}{' (dirty)' if runtime.revision.dirty else ''} "
         f"({runtime.revision.source}) started {runtime.started_at} on {config.host}; "
         f"{config.repository}@{config.canonical_branch}; mode {config.mode}"
     )
-    service.open_store()
-    service.open_github()
-    service.build_controller()
-    service.seed_settings()
-    if service.controller is None:
-        _log(f"controller unavailable: {service.unavailable_reason}; serving status only")
-    service.start_server()
-    _log(f"listening on {config.listen_url} (public {config.public_url})")
     try:
+        service.open_store()
+        service.open_github()
+        service.build_controller()
+        service.seed_settings()
+        if service.controller is None:
+            _log(f"controller unavailable: {service.unavailable_reason}; serving status only")
+        service.start_server()
+        _log(f"listening on {config.listen_url} (public {config.public_url})")
         service.run_loop()
+    except Exception as error:
+        if launch is None:
+            raise
+        from .control_policy_file import ControlPolicyError
+        from .source_authority import SourceAccessDenied, SourceAuthorityUnavailable
+
+        detail = type(error).__name__
+        if isinstance(error, SourceAccessDenied | SourceAuthorityUnavailable | ControlPolicyError):
+            detail = str(error)  # These exceptions contain fixed local diagnostics.
+        elif isinstance(error, OSError):
+            import errno
+
+            detail = errno.errorcode.get(error.errno, "OSError")
+        _log(f"native queue startup/runtime failed ({detail})")
+        return 1
     finally:
         _log(f"stopping ({service.stop.reason or 'loop ended'})")
         service.shutdown()
@@ -417,27 +451,40 @@ def _stored_settings(config: Config) -> dict[str, dict[str, Any]] | None:
 
 
 def cmd_check_config(args: argparse.Namespace) -> int:
+    launch = None
     try:
-        config = configuration.load(args.config)
+        if getattr(args, "native_launch", None):
+            from .native_launch import NativeLaunch
+
+            launch = NativeLaunch.load(args.native_launch)
+            config = launch.config
+        else:
+            config = configuration.load(args.config)
     except ConfigError as exc:
         _log(str(exc))
         return 1
-    problems = configuration.validate(config)
+    problems = configuration.validate(config, check_credentials=launch is None)
     stored = _stored_settings(config)
+    values = config.as_dict()
+    if launch:
+        values["webhook_url"] = config.public_url.rstrip("/") + "/webhook/forgejo"
+        values.pop("review_app_id", None)
+        values["sources"].pop("review_app_id", None)
     if args.print:
-        values = config.as_dict()
         if args.print not in values:
             _log(f"unknown key {args.print!r}; known: {', '.join(sorted(values))}")
             return 1
         value = values[args.print]
         print(json.dumps(value) if isinstance(value, dict | list | bool) or value is None else value)
         return 0
-    if args.json:
+    if args.json or launch:
         document = {
-            **config.as_dict(),
+            **values,
             "effective_settings": configuration.effective_runtime_settings(config, stored),
             "problems": problems,
         }
+        if launch:
+            document["native"] = launch.summary()
         print(json.dumps(document, indent=2, sort_keys=True))
     else:
         print(configuration.format_effective(config, problems, stored))
@@ -574,9 +621,11 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     serve = commands.add_parser("serve", help="run the service")
-    serve.add_argument(
+    serve_source = serve.add_mutually_exclusive_group()
+    serve_source.add_argument(
         "--config", help=f"TOML file (default ${configuration.CONFIG_ENV} or {configuration.DEFAULT_CONFIG_PATH})"
     )
+    serve_source.add_argument("--native-launch", type=Path, help="explicit private Forgejo launch profile")
 
     status = commands.add_parser("status", help="print the status document or its summary")
     status.add_argument("--url", help="service base URL (default: the configured listen address)")
@@ -586,7 +635,9 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--expect-revision", help="exit 2 unless the running revision starts with this SHA")
 
     check = commands.add_parser("check-config", help="print the effective configuration and its problems")
-    check.add_argument("--config", help="TOML file")
+    check_source = check.add_mutually_exclusive_group()
+    check_source.add_argument("--config", help="TOML file")
+    check_source.add_argument("--native-launch", type=Path, help="validate an explicit private Forgejo launch profile")
     check.add_argument("--json", action="store_true")
     check.add_argument("--print", metavar="KEY", help="print one effective value and nothing else")
 
