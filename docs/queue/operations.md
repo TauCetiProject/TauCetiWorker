@@ -960,3 +960,40 @@ service's candidates feed and the Bors baseline window ([journal-report.md](jour
 PRs per hour, head cycle time and its CI/repair split, repair rounds per landed head, repair time and
 inference cost per task, shrink events, singleton builds (expected zero), claim collisions, PR waiting
 age, inference holds and stall conditions, each beside its baseline value.
+
+### Repair cache retention
+
+Set `TAUCETI_QUEUE_CACHE_ROOT` identically for all colocated repair workers, for example
+`/home/operator/TauCetiQueue-data/repair-shared`, and pass that path to
+`services/queue/install-repair-cleanup.sh --cache-root PATH` along with every worker root.
+They share one `lake-cache` and its ownership lease, while credentials/configuration,
+worktrees, logs and task checkpoints stay in their separate worker roots. Tasks persist
+their selected cache root so a restart/configuration change cannot move an active attempt.
+Publishers receive that exact root in their spec.
+
+The minute-by-minute cleanup timer migrates idle legacy pools into the common pool
+using atomic hardlinks without overwriting existing destination names, then removes
+the redundant private directories. Busy legacy attempts keep their old pools until
+completion; migration retries automatically without changing admissions. The timer
+also collects idle `lake-cache` pools.
+Each pool retains at most two distinct snapshots per package from the last seven days,
+within a total 32 GiB artifact budget (one budget for the shared pool). Active attempts
+can temporarily exceed the budget; collection waits for their leases. Recent complete
+dependency output records without revision maps share this budget. Successful local publication manifests count as
+snapshots, including publications made before retention was deployed. If a snapshot
+would exceed the budget, it is not retained; a future task can fetch it from the cache service.
+
+Retention follows both compressed archives and every expanded native output facet,
+removing obsolete output indexes and artifact aliases (including hardlinks). External
+hardlinks remain valid; reported freed bytes count only final links. Diagnostic logs,
+task checkpoints and source Git references remain available.
+
+Worker attempts and background publishers hold a shared root cache lease; collection
+takes it exclusively without waiting. Cleanup also runs before a new attempt
+when its pool has no worktrees. Shared-pool collection requires all participating
+attempts and publishers to be idle; it never interrupts them to enforce the budget.
+Any remaining worktree, live local task claim or
+recent publisher handoff also prevents collection, protecting older worker processes.
+Unknown metadata or symlinks fail closed before any cache files are removed. Cleanup
+prints per-pool retained bytes, removed artifacts/indexes and physically freed bytes.
+The usual cleanup command without `--apply` previews the plan.

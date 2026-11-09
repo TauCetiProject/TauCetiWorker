@@ -65,6 +65,7 @@ RUN_STDLIB=(
   queue_repair_task.py
   queue_repair_locks.py
   queue_repair_cleanup.py
+  queue_repair_cache.py
   queue_claude_stdin.py
   expanded_cache.py
   cache_storage.py
@@ -255,7 +256,7 @@ SKIP=(egress.sh integration_repair_fixture.py integration_forgejo_reads.py integ
 # Modules whose storage fixtures compare inode/device identity and sweep real directories. They
 # failed on Namespace runners' filesystem (#409) and run on GitHub's native ubuntu-24.04 image in
 # CI; everything else is the `portable` group and runs anywhere.
-NATIVE_FS=(cache_storage.py shared_mathlib.py verification_storage.py retention.py)
+NATIVE_FS=(queue_repair_cache.py cache_storage.py shared_mathlib.py verification_storage.py retention.py)
 # Modules that read README.md, docs/*.md or workers.toml.example and assert on their contents. A
 # change that touches only documentation can break these and nothing else, so CI runs just this
 # group for it. The guard below keeps the list honest.

@@ -466,6 +466,9 @@ def start_background(
         return record
     spec = {
         "worktree": str(worktree),
+        "cache_root": str(Path(env["LAKE_CACHE_DIR"]).parent)
+        if env.get("LAKE_CACHE_DIR")
+        else str(worktree.parent.parent),
         "revision": revision,
         "settings": settings.to_json(),
         "logdir": str(logdir),
@@ -528,11 +531,12 @@ def start_background(
 
 
 def run_spec(spec_path: Path) -> int:
+    from tauceti_queue.repair_cache import cache_lease
     from tauceti_queue.repair_cleanup import worktree_lease
 
     spec = json.loads(spec_path.read_text())
     root = Path(spec["worktree"]).parent.parent
-    with worktree_lease(root, spec["task_id"]):
+    with cache_lease(Path(spec.get("cache_root", root))), worktree_lease(root, spec["task_id"]):
         return _run_spec(spec_path)
 
 

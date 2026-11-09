@@ -10,14 +10,18 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--database', type=Path, required=True)
 parser.add_argument('--clone', type=Path, required=True)
 parser.add_argument('--root', type=Path, action='append', required=True)
+parser.add_argument('--cache-root', type=Path, help='one shared repair cache root; migrate idle private pools')
 args = parser.parse_args()
 if not args.database.is_file() or not (args.clone / '.git').is_dir():
     parser.error('database and repair clone must already exist on this host')
 config = Path.home() / '.config/tauceti-queue/repair-cleanup.json'
 config.parent.mkdir(parents=True, exist_ok=True)
 with open(config, 'w', opener=lambda path, flags: os.open(path, flags, 0o600)) as output:
-    json.dump({'database': str(args.database.resolve()), 'clone': str(args.clone.resolve()),
-               'roots': [str(root.resolve()) for root in args.root]}, output, indent=2)
+    data = {'database': str(args.database.resolve()), 'clone': str(args.clone.resolve()),
+            'roots': [str(root.resolve()) for root in args.root]}
+    if args.cache_root:
+        data['cache_root'] = str(args.cache_root.resolve())
+    json.dump(data, output, indent=2)
     output.write('\n')
 config.chmod(0o600)
 PY

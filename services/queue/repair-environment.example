@@ -78,3 +78,9 @@ TAUCETI_QUEUE_PROVIDERS=claude,codex,api
 # disjoint files, no imports between them), each in its own worktree of the tip; 0 or 1 keeps every
 # repair sequential. Builds are serialized by .tauceti-repair/build.lock in the task's worktree.
 #TAUCETI_QUEUE_PARALLEL_AGENTS=3
+
+# Use the SAME root for every colocated repair worker. Task logs/worktrees remain separate.
+# Existing attempts keep their previous pool until completion; new tasks bind to this root.
+# Configure install-repair-cleanup.sh --cache-root with the identical path to migrate idle
+# private pools and apply retention to the shared cache.
+#TAUCETI_QUEUE_CACHE_ROOT=/home/operator/TauCetiQueue-data/repair-shared

@@ -594,7 +594,7 @@ def link_shared_packages(worktree: Path, seed_packages: Path) -> None:
     target.symlink_to(seed_packages)
 
 
-def lake_env(root: Path, base_env: dict | None = None) -> dict:
+def lake_env(root: Path, base_env: dict | None = None, *, cache_root: Path | None = None) -> dict:
     """The workers' artifact-cache environment: the public service and a private artifact pool."""
     root.mkdir(parents=True, exist_ok=True)
     config = root / "lake.toml"
@@ -606,7 +606,7 @@ def lake_env(root: Path, base_env: dict | None = None) -> dict:
         )
     env = dict(os.environ if base_env is None else base_env)
     env["LAKE_CONFIG"] = str(config)
-    env["LAKE_CACHE_DIR"] = str(root / "lake-cache")
+    env["LAKE_CACHE_DIR"] = str((cache_root or root) / "lake-cache")
     env["LAKE_ARTIFACT_CACHE"] = "1"
     env["LAKE_RESTORE_ARTIFACTS"] = "1"
     env.pop("TAUCETI_PR_CACHE_MISS", None)
