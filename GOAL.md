@@ -4,19 +4,26 @@ Make `https://git.taucetiproject.org/` the home of TauCeti development, with
 Forgejo owning pull requests and merges, `main` mirrored back to GitHub, and
 GitHub Actions retained for CI.
 
-Prioritize the earliest usable migration. Stage 1 establishes a working,
-operator-controlled development path. Stage 2 completes autonomous operation,
-the remaining integrations, and shared-state retirement preparation. Stage 2
-completion is **not** a prerequisite for the first cutover.
+The immediate goal is **Stage 1: prepare and rehearse the earliest usable migration**.
+It establishes a working development path with humans supervising review, CI
+dispatch, and merges. Keep GitHub Actions as the execution backend and keep the
+familiar agent-facing `gh` interface.
+
+Stage 2 restores full autonomous operation, completes the remaining integrations,
+and prepares shared-state retirement. **Stage 2 completion is not a prerequisite
+for migrating the main TauCeti repository.**
 
 | Stage | Deliverable | Completion gate |
 | --- | --- | --- |
-| **1: Migration readiness** | Forgejo contributions, human-supervised review and merge, real GitHub CI, and a `main` mirror with working builds, caches, and docs. | An isolated end-to-end rehearsal and an executable cutover/rollback package. |
-| **2: Remaining integration** | Autonomous Worker/Review/Progress and queue operation, remaining portability and fleet work, and shared-state retirement preparation. | The full autonomous lifecycle, recovery and capacity evidence, and final operational handover. |
+| **1: Earliest migration** | Forgejo contributions, human-supervised review and merge, real GitHub CI, and a `main` mirror with working builds, caches, and docs. | An isolated end-to-end rehearsal and an executable cutover/rollback package, ready for a separate cutover decision. |
+| **2: Remaining work** | Autonomous Worker/Review/Progress and queue operation, remaining portability and fleet work, and shared-state retirement preparation. | The full autonomous lifecycle, recovery and capacity evidence, and final operational handover. |
 
 Work on Stage 1 first. Defer Stage 2 implementation unless a demonstrated Stage 1
 blocker requires a specific part of it. Live migration and eventual service shutdown
 each require separate authorization.
+
+These are requirements and completion gates, not a claim that every item remains
+unimplemented. Reuse completed work and record the evidence; do not rebuild it.
 
 Tracker: [TauCetiWorker #602](https://github.com/TauCetiProject/TauCetiWorker/issues/602).
 The [original work packages](https://github.com/TauCetiProject/TauCetiTools/blob/8f30faab8f3545ce688c199c34efa780c0603111/docs/forgejo-preparation.md)
@@ -50,7 +57,7 @@ not discard the unfinished requirements.
   for in-flight work and transfer authority for the affected project; it must not
   leave GitHub and Forgejo acting as independent merge authorities.
 
-## Stage 1 — Ready for the earliest operational migration
+## Stage 1 — Prepare and rehearse the earliest operational migration
 
 ### Delivery order
 
@@ -168,17 +175,32 @@ GitHub automation changes, backups, verification, and how to settle interrupted 
 
 ### Stage 1 completion and cutover boundary
 
-Stage 1 is complete when all of the above is demonstrated and the operator has a
-reviewable, executable migration package with no unresolved essential-path blocker.
+Stage 1 is complete when the operator can review evidence for all six gates:
+
+- **Destination:** access, protections, backup/recovery, and operational owners are
+  confirmed for the intended destination.
+- **Work preservation:** required Git objects and active work are accounted for,
+  including claims, spending records, prepared outputs, and transfer decisions.
+- **Contribution path:** a real failing contribution is refused, its corrected
+  revision passes GitHub CI, and stale review or CI evidence cannot authorize merge.
+- **Merge and outputs:** the exact tested candidate lands, only `main` mirrors back,
+  and actual main builds, caches, and documentation produce verified outputs.
+- **Recovery:** interrupted operations, mirror repair, and rollback have been
+  exercised without losing a contribution or repeating paid work.
+- **Handover:** executable cutover/rollback commands, immutable pins, linked evidence,
+  temporary manual duties, and their owners are recorded, with no unresolved
+  essential-path blocker.
+
 It does **not** require autonomous Review/Progress, all support repositories moved,
-full-fleet capacity validation, or shared-state shutdown.
+full-fleet capacity validation, or shared-state shutdown. Present the migration
+package for the cutover decision; unfinished Stage 2 items stay in Stage 2.
 
 The live cutover remains a separate, explicitly authorized operation. After that
 authorization, execute the rehearsed procedure and verify the running destinations,
 useful completions, mirror, outputs, and any interrupted work. Readiness evidence
 must not be reported as proof that the production migration already happened.
 
-## Stage 2 — Complete autonomous operation and the remaining preparation
+## Stage 2 — Complete autonomous operation and the remaining work
 
 Restore the full development workflow on Forgejo without undoing the Stage 1
 operating path. Work may proceed before or after the live cutover, but unfinished
