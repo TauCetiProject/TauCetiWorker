@@ -219,6 +219,9 @@ this command is not an autonomous cross-repository transaction.
   a source/execution role change after requests exist requires a separately
   prepared ledger while retaining and settling the old one.
 
+The complete authority switch, work-preservation checklist, and rollback procedure
+are in the [Stage 1 cutover runbook](forgejo-stage1-cutover.md).
+
 ## Automatic main mirror and repair
 
 Enable `mirror_main: true` only after provisioning the GitHub App installation

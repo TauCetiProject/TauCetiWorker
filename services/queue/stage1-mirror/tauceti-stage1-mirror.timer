@@ -1,0 +1,12 @@
+[Unit]
+Description=Check the Stage 1 Forgejo main mirror every five minutes
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=5min
+AccuracySec=5s
+RandomizedDelaySec=5s
+Unit=tauceti-stage1-mirror.service
+
+[Install]
+WantedBy=timers.target
