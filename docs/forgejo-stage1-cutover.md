@@ -52,11 +52,18 @@ version and capabilities; do not deploy a server fork as an implicit prerequisit
    `contents: read`, scoped to the execution repository. It must have no
    `contents: write`, `workflows: write`, or administration permission. A
    repository-scoped App token minted with this subset or an equivalent
-   fine-grained token is suitable. Keep the App key and administrator token
-   outside the dispatcher environment. Test permission-level write refusal,
+   fine-grained token is suitable. Record the issuing App/account and its
+   permissions. Mint an installation token in a separate administrative step for
+   each dispatch, then deliver only that short-lived token to the dispatch
+   process and delete its file afterwards. The trusted operator host may also
+   hold the mirror key; this separates credentials delivered to the process,
+   not OS users. Test permission-level write refusal,
    separately from branch-policy refusal, for this credential and the observer.
    The earlier administrator-triggered CI proves the build path, not the final
    dispatcher role; do not relabel that bootstrap credential as workflow-only.
+   The final scoped credential must also dispatch a real protected parent whose
+   child is adopted through its verified receipt. A rejected mint or negative
+   push test alone does not prove this positive path.
 2. Preserve history and active work. Keep exact Git objects for required branches,
    tags, dependency pins, PR heads, and queue candidates. Verify the self-contained
    bundles and restore them independently. Keep historical GitHub discussions and
@@ -182,8 +189,8 @@ promote and complete the relevant Stage 2 prerequisites before this operation.
    `tauceti workers --config PATH disable ID`. Record the explicit configuration
    path and approved affected worker IDs; the operator host currently uses
    `~/.config/tauceti/workers.toml`. Confirm its source bindings at cutover rather
-   than selecting every worker by name. For each affected worker, after its paid
-   session has checkpointed or finished under the recorded disposition. Observe
+   than selecting every worker by name. After the affected worker's paid session
+   has checkpointed or finished under the recorded disposition, observe
    a fresh runner snapshot at the same safe point used by the installed manager's
    read-policy reload: `state` is `idle`, `backoff`, `waiting-github`,
    `waiting-budget`, or `waiting-quota`; `next_action_at` is at least 15 seconds
@@ -232,6 +239,13 @@ promote and complete the relevant Stage 2 prerequisites before this operation.
    **Do not run `services/queue/install.sh` on the fenced host:** it enables and
    starts this service even with `--no-restart`. Leave a durable host/deployment
    notice and the same restriction in the queue operations record.
+   The same restriction applies to `services/queue/install-repair.sh`, which
+   enables the repair unit even with `--no-restart`. Record the identity and scope
+   behind each repair runtime's configured token and any fallback
+   `GH_TOKEN`/`gh auth token` login. Retire its runtime access; a repository-admin
+   credential may remain only in the separately named administrative profile,
+   not an unattended repair environment. Remove or revoke other retained repair
+   credentials under the recorded owner/recovery plan.
 
    After their paid work is settled, disable the installed repair units
    `tauceti-queue-repair.service`, `tauceti-queue-repair@2.service`, and
@@ -248,6 +262,16 @@ promote and complete the relevant Stage 2 prerequisites before this operation.
    Retire old automated credential access as well as stopping jobs. Every holder
    of the same App key can mint the mirror role; an App-only allowlist does not
    distinguish its old queue or Review/Progress callers from the new mirror.
+
+   Inspect GitHub's native merge queue and armed PR auto-merge separately from
+   the custom queue database. If any entry or armed request exists, preserve its
+   PR/head and disposition, dequeue/disarm it under the old authority, and read
+   back that none remain before the switch. Disabling a workflow or retiring a
+   key does not cancel an already queued server-side merge. Disable repository
+   auto-merge for the mirror and explicitly retire any GitHub native merge-queue
+   admission rule that would continue authorizing source changes. These actions
+   apply only at the authorized cutover; inventory/commands are in the
+   [automation disposition](forgejo-stage1-automations.md).
 
    Account for late old-work publications and route new
    source work through the native human workflow. This is a project authority
@@ -315,6 +339,11 @@ promote and complete the relevant Stage 2 prerequisites before this operation.
    an empty allowlist, or a Git dry run is insufficient. Keep this gate incomplete
    until the final roles and App-only policy pass; do not call the temporary
    administrator bootstrap configuration ready.
+   A raw mirror push must also be permitted by any remaining PR, merge-queue or
+   status-check rules. Remove obsolete GitHub source-admission requirements from
+   the execution mirror, or record an approved mirror-App bypass limited to those
+   requirements. Preserve source CI/acceptance and expected-old, fast-forward and
+   deletion protections; do not waive source checks to make the mirror push work.
 5. Confirm the mirror App is installed on the exact execution repository and can
    mint the scoped `contents: write`/`workflows: write` token. Set `mirror_main: true`
    and confirm the equal bootstrap tips:
@@ -366,8 +395,13 @@ python -m tauceti_queue.stage1 --profile "$profile" prepare \
   --pr "$native_pr" --accept-head "$reviewed_head"
 python -m tauceti_queue.stage1 --profile "$profile" handoff \
   --attempt "$attempt" --out "$private_directory/input.json"
-gh workflow run stage1-dispatch.yml --repo "$execution_repository" \
-  --ref main --json < "$private_directory/input.json"
+(
+  set -e
+  trap 'rm -f "$dispatcher_token_file"' EXIT
+  GH_TOKEN="$(cat "$dispatcher_token_file")" \
+    gh workflow run stage1-dispatch.yml --repo "$execution_repository" \
+    --ref main --json < "$private_directory/input.json"
+)
 ```
 
 Invoke the parent once. Retain its run ID and intent; a lost response does not

@@ -118,22 +118,31 @@ Here `$profile` is the absolute profile path; `$attempt` is the ID returned by
    ```sh
    python -m tauceti_queue.stage1 --profile "$profile" handoff \
      --attempt "$attempt" --out "$private_directory/handoff.json"
-   GH_TOKEN="$(cat "$dispatcher_token_file")" \
-     gh workflow run stage1-dispatch.yml --repo "$execution_repository" \
-     --ref main --json < "$private_directory/handoff.json"
+   (
+     set -e
+     trap 'rm -f "$dispatcher_token_file"' EXIT
+     GH_TOKEN="$(cat "$dispatcher_token_file")" \
+       gh workflow run stage1-dispatch.yml --repo "$execution_repository" \
+       --ref main --json < "$private_directory/handoff.json"
+   )
    ```
 
    This `gh` invocation uses the genuine GitHub CLI in the operator environment,
    explicitly targeting the execution repository. `$dispatcher_token_file` is
    a private file containing the approved repository-scoped token with
    `actions: write` and at most `contents: read`; it is not the administrator's
-   bootstrap token or the mirror's contents/workflows-write token. Keep minting
-   keys outside this environment. Verify this role's content-write refusal in
+   bootstrap token or the mirror's contents/workflows-write token. Mint an App
+   installation token in a separate administrative step for each dispatch;
+   record issuer, scope and expiry, deliver only the token to this process,
+   and delete its file afterwards. The trusted operator host may hold the mirror
+   key; it is not passed to `gh` or candidate execution. Verify this role's content-write refusal in
    the isolated rehearsal; an administrator-triggered run does not prove it.
    Record the resulting parent
    run's URL. Submit one parent per request; uploading the same file into a new
    parent is another dispatch, not recovery. The first verified child owns the
    request; a matching run title alone is insufficient.
+   Successful real dispatch and verified child adoption with this final scoped
+   role are required rehearsal evidence, alongside its write-refusal tests.
 
 4. Find the child under the execution repository's source-candidate workflow and
    adopt it only through receipt verification:

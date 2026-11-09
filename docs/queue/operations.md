@@ -926,6 +926,12 @@ prepared work, and configured settings; a file seed or fresh database must not
 silently restore publication. The GitHub mirror can share the old queue App
 identity, so a branch exception alone does not distinguish those processes.
 
+`services/queue/install-repair.sh` also enables its unit with `--no-restart`.
+Keep it out of updates to a fenced host without the explicit authority decision.
+Record the identity behind each repair token and fallback login; retain any
+repository-admin credential only in the named administrative profile, outside
+retired unattended repair runtimes. Preserve the corresponding recovery records.
+
 This is a cutover condition, not an instruction to stop current production during
 preparation. Keep normal worker/CI admissions enabled until the authorized
 project-specific authority switch.

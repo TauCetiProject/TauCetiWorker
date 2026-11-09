@@ -110,6 +110,7 @@ Complete a row for every actual holder in the deployment record:
 | Repair workers, workflow backstop and timers on each host | Record actual unit/configuration IDs and project bindings; settle paid work, disable the affected units, verify inactive/disabled state and no pending timer invocation. Preserve unrelated workers. |
 | Execution repository workflows, including removed files | Disable each retired registered workflow ID and verify `disabled_manually`, settle already queued/running writers, and retire their source-writing credential bindings. |
 | Callers of Review's `merge-only.yml` and `merge-sweep.yml` targeting TauCeti | Record each caller repository and workflow ID. These reusable definitions receive `APP_ID`/`APP_PRIVATE_KEY` from their caller; the library's repository is not the credential context. Disable the affected caller ID and retire its credential binding, preserving unrelated callers and library CI. |
+| Review's own manual workflows | `TauCetiReview`'s `review.yml` also supports direct `workflow_dispatch`; `shadow-review.yml` is manually dispatchable. These invocations use Review's own repository/environment/organization secret scopes. If their App can write or authorize the migrated source, record and fence these workflow IDs and credential bindings too. |
 | Progress/Roadmap and other supporting automation | Record actual App IDs and key/secret bindings, including Roadmap's `progress-merge.yml` caller of Progress's `merge.yml`, and Roadmap `auto-merge.yml`. Different App IDs and unrelated targets must be distinguished. If a holder shares the mirror key or can write/authorize the migrated source, fence its affected caller/credential; do not disable unrelated Roadmap operations by filename alone. |
 | Repository, environment and organization secret scopes | Record every scope exposing a retired source-write credential to those callers, its owning administrator, retirement command, read-back and private recovery source. Secret names alone do not establish an App ID or prove different keys. |
 
@@ -152,6 +153,69 @@ or unknown scope needs an explicit owner-approved retirement decision; do not
 silently change organization-wide visibility. Keep the gate incomplete until
 every affected holder has a recorded command and verified result, or provision
 a distinct mirror App through a separately approved setup.
+
+If a secret scope holding the proposed mirror App's key also serves workflows
+that must keep running, and that binding cannot be retired without disrupting
+them, do not reuse that App for the mirror. Provision a distinct mirror App with
+a different numeric App ID through the approved setup instead. A token minted
+for only Roadmap does not constrain the private key itself. Do not widen a shared
+App's permissions to solve dispatcher provisioning without that owner's explicit
+review of every holder.
+
+Use each holder's own administrator credential for its commands. Substitute
+`holder_administrator_token_file` for `administrator_token_file` when another
+repository, environment, organization or host has a different owner; possessing
+the execution-repository administrator profile does not establish that authority.
+
+## GitHub-native queued and automatic merges
+
+The custom queue export does not inventory GitHub's server-side merge queue or
+PR auto-merge requests. Capture these separately using the administrator profile
+and GitHub identities, never native Forgejo PR numbers:
+
+```sh
+cat > "$deployment_record/github-native-merges.graphql" <<'GRAPHQL'
+query($owner:String!, $name:String!, $endCursor:String) {
+  repository(owner:$owner, name:$name) {
+    databaseId
+    pullRequests(first:100, after:$endCursor, states:OPEN) {
+      nodes { id number headRefOid autoMergeRequest { enabledAt } mergeQueueEntry { id } }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+GRAPHQL
+GH_TOKEN="$(cat "$administrator_token_file")" \
+  "$administrator_gh" api graphql --hostname github.com --paginate --slurp \
+    -f owner="$execution_owner" -f name="$execution_name" \
+    -F "query=@$deployment_record/github-native-merges.graphql" \
+    > "$deployment_record/github-native-merges.json"
+```
+
+Require complete pagination without GraphQL errors and the expected repository
+ID. At the authorized cutoff, record a disposition for every armed or queued PR,
+then dequeue and disarm each retained item with the IDs from this inventory:
+
+```sh
+GH_TOKEN="$(cat "$administrator_token_file")" \
+  "$administrator_gh" api graphql --hostname github.com \
+    -f query='mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}' \
+    -f id="$github_pull_node_id"
+GH_TOKEN="$(cat "$administrator_token_file")" \
+  "$administrator_gh" pr merge "$github_pr_number" --disable-auto -R "$execution_repository"
+GH_TOKEN="$(cat "$administrator_token_file")" \
+  "$administrator_gh" api --hostname github.com --method PATCH \
+    "repos/$execution_owner/$execution_name" -F allow_auto_merge=false
+```
+
+Only dequeue items that are still queued, and only disarm requests that are still
+armed. Run the read-only inventory again and require both fields to be null for
+all remaining open PRs; verify repository `allow_auto_merge` is false. If active
+rules contain `merge_queue`, record and execute the approved change that retires
+that source-admission path on the mirror. Preserve unrelated rules/projects; do
+not delete an inherited ruleset wholesale. An old queued entry can land without
+another workflow invocation, so workflow disable and key retirement alone do
+not establish this postcondition.
 
 After the mirror push, read the registered workflow states again, verify that
 only the intended essential runs started, and verify the retained historical
