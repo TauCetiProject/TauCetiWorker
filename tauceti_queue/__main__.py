@@ -17,7 +17,7 @@
         `publication_enabled`) it reads the store without writing and shows the effective value:
         the store's, with the actor that wrote it, or the file's while the store has none.
     tauceti-queue settings show [--url URL]
-    tauceti-queue settings set KEY VALUE [--url URL] [--token TOKEN | --token-file FILE]
+    tauceti-queue settings [--url URL] set KEY VALUE [--token TOKEN | --token-file FILE]
         Read or change the runtime controls through the service's admin endpoint. KEY is any key of
         the controller's `DEFAULT_SETTINGS`; VALUE is parsed by the type of that key's initial value
         (a non-negative integer, at least 1 for the `[settings]` keys of the configuration file,
@@ -428,6 +428,10 @@ def fetch_json(
         raise RuntimeError(
             f"{method} {url}: HTTP {exc.code}: {parsed.get('detail') or parsed.get('error') or detail}"
         ) from None
+    except (OSError, ValueError):
+        if allow_redirects:
+            raise
+        raise RuntimeError("operator request unavailable or returned invalid JSON") from None
 
 
 def _status_url(args: argparse.Namespace) -> str:
@@ -523,7 +527,9 @@ def _operator_token(explicit: str | None, token_file: Path | None = None) -> str
             if not 0 < len(token) <= 4096 or any(not 33 <= char <= 126 for char in token):
                 raise ValueError
             return token.decode("ascii")
-        except (ControlPolicyError, ValueError):
+        except ControlPolicyError as error:
+            raise RuntimeError(str(error)) from None
+        except ValueError:
             raise RuntimeError("operator token file is unavailable or invalid") from None
     if explicit:
         return explicit

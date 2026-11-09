@@ -93,6 +93,8 @@ HTTP proxies, refuses redirects,
 and never discovers a token from the environment or `gh`. Its file uses the same
 private reader as launch inputs: absolute path, private user-owned parent (0700),
 and a user-owned file of mode 0400/0600. It is mutually exclusive with `--token`.
+HTTP failures report the status code without echoing response bodies. File
+ownership/mode failures report the checked reader's local diagnostic.
 Ordinary commands without `--token-file` retain their GitHub token selection.
 The option is also accepted by `import-bors` and `reconcile-approvals` for GitHub
 operators, but those endpoints still reject native requests. Native recovery

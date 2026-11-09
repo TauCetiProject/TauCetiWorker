@@ -111,6 +111,7 @@ raise SystemExit(main(['serve','--native-launch',sys.argv[3]]))
                 TAUCETI_QUEUE_CONFIG="/missing/ambient-credentials",
                 TAUCETI_GITHUB_STATE_URL="https://github-state.taucetiproject.org",
             )
+            saved_setting = None
             for _restart in range(2):
                 process = subprocess.Popen(
                     [sys.executable, "-c", code, repository.forge.url, str(blocked), str(fixture.path)],
@@ -136,6 +137,8 @@ raise SystemExit(main(['serve','--native-launch',sys.argv[3]]))
                         self.assertEqual(status["service"]["execution_repository"], approved.execution.record())
                         self.assertFalse(status["service"]["publication_enabled"])
                         self.assertFalse(status["settings"]["publication_enabled"])
+                        if saved_setting is not None:
+                            self.assertEqual(status["settings"]["insertion_age_window"], saved_setting)
                         desired = int(status["settings"]["insertion_age_window"]) + 1
                         operator = subprocess.run(
                             [
@@ -165,9 +168,12 @@ raise SystemExit(main(['serve','--native-launch',sys.argv[3]]))
                         with urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=5) as response:
                             observed = json.load(response)
                         self.assertEqual(observed["settings"]["insertion_age_window"], desired)
+                        saved_setting = desired
                         fixture.write(operator_file, tokens["queue"])
+                        negative_args = list(operator.args)
+                        negative_args[negative_args.index("insertion_age_window") + 1] = str(desired + 1)
                         refused_operator = subprocess.run(
-                            operator.args,
+                            negative_args,
                             cwd=Path(__file__).resolve().parents[1],
                             env=env,
                             capture_output=True,
@@ -175,6 +181,9 @@ raise SystemExit(main(['serve','--native-launch',sys.argv[3]]))
                             timeout=20,
                         )
                         self.assertEqual(refused_operator.returncode, 1)
+                        self.assertIn("HTTP 403", refused_operator.stderr)
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=5) as response:
+                            self.assertEqual(json.load(response)["settings"]["insertion_age_window"], desired)
                         fixture.write(operator_file, tokens["operator"])
                         for token in tokens.values():
                             self.assertNotIn(token, operator.stdout + operator.stderr)

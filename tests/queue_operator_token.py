@@ -85,6 +85,22 @@ class OperatorFiles(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cli.cmd_settings(self.args("http://127.0.0.1:4567" + suffix), fetch=fetch), 0)
             self.assertEqual(fetch.call_args.args[0], "http://127.0.0.1:4567/admin/settings")
+        fetch = Mock(return_value={})
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.cmd_settings(self.args("https://QUEUE.example:443/"), fetch=fetch), 0)
+        self.assertEqual(fetch.call_args.args[0], "https://queue.example/admin/settings")
+
+    def test_file_transport_errors_are_clean_and_legacy_errors_keep_their_behavior(self):
+        for error in (OSError("credential-never-echo"), ValueError("credential-never-echo")):
+            with patch.object(cli.urllib.request, "build_opener") as opener:
+                opener.return_value.open.side_effect = error
+                with self.assertRaisesRegex(RuntimeError, "operator request unavailable") as caught:
+                    cli.fetch_json(
+                        "http://127.0.0.1:1/admin/settings", token="credential-never-echo", allow_redirects=False
+                    )
+                self.assertNotIn("credential-never-echo", str(caught.exception))
+            with patch.object(cli.urllib.request, "urlopen", side_effect=error), self.assertRaises(type(error)):
+                cli.fetch_json("http://127.0.0.1:1/admin/settings", token="legacy")
 
     def test_inherited_proxy_cannot_receive_the_control_token(self):
         received = []
