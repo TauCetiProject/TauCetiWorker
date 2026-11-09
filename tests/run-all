@@ -60,6 +60,7 @@ RUN_STDLIB=(
   budget_recovery.py
   usage_accounting.py
   usage_supervisor.py
+  worker_sizing.py
   queue_repair_experiment.py
   queue_repair_task.py
   queue_repair_locks.py
