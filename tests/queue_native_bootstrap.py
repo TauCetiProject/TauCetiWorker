@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The actual Service wires native source and separately scoped execution."""
 
+import json
 import socket
 import sys
 import tempfile
@@ -127,6 +128,16 @@ class Bootstrap(unittest.TestCase):
             self.assertEqual(response.status, 200)
         with urllib.request.urlopen(f"http://{host}:{port}/status", timeout=5) as response:
             self.assertEqual(response.status, 200)
+            status = json.load(response)
+        self.assertEqual(status["service"]["source_repository"], self.policy.source.record())
+        self.assertEqual(status["service"]["execution_repository"], self.policy.execution.record())
+        self.assertIsNone(status["feeds"])
+        with self.assertRaises(urllib.error.HTTPError) as refused:
+            urllib.request.urlopen(
+                f"http://{host}:{port}/repositories/{self.policy.source.native_id}/active-batches", timeout=5
+            )
+        self.assertEqual(refused.exception.code, 503)
+        refused.exception.close()
         for headers, expected in [({}, 401), ({"Content-Length": str(1024 * 1024 + 1)}, 413)]:
             request = urllib.request.Request(f"http://{host}:{port}/webhook/forgejo", data=b"{}", headers=headers)
             with self.assertRaises(urllib.error.HTTPError) as refused:

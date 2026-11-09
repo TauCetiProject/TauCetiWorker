@@ -314,8 +314,9 @@ unknown fields and malformed source identities are refused. Errors omit private
 contents. Write replacements atomically, then restart as described below; the
 loader never reloads policy during a request or caches a successful source ACL.
 The example `services/queue/source-control-policy.json.example` is a placeholder,
-not an active enrollment. Native startup and the installer do not yet select this
-backend; wiring this loader does not enable native execution.
+not an active enrollment. Default startup and the installer keep their GitHub
+path; an explicit native launch profile selects this control policy. Native worker
+execution and the remaining activation gates are separate.
 All path components must be real directories: an operator using a symlinked home
 or configuration tree must choose its verified canonical path explicitly. File
 permissions protect against other Unix users, not the owner or root. The owner can
@@ -905,12 +906,15 @@ request ledger, native control authority, primary admission and the HTTP server.
 Source repository/branch, native publisher grants, control audience, execution
 repository ID and effective source credential permissions are checked before a
 controller starts. Startup never discovers a GitHub source App or substitutes an
-environment PAT. The default `Service` and CLI continue to select the GitHub path.
+environment PAT. The default `Service` and unqualified CLI continue to select the GitHub path.
+The explicit private-file CLI path is described in
+[native launch profiles](queue/native-launch.md).
 
 This constructor accepts independently loaded private credentials and publisher
-configuration; it does not provision them or enable native execution. Native CLI
-configuration selection, credential provisioning/rotation, ingress concurrency
-bounds, less-trusted worker admission and Review's publication ledger
+configuration; it does not provision credentials or enable native worker execution.
+The explicit native CLI loads approved private snapshots; credential
+provisioning/rotation, ingress concurrency bounds, less-trusted worker admission
+and Review's publication ledger
 remain activation gates. The actual hosted execution and full lifecycle/load
 rehearsals remain required.
 
