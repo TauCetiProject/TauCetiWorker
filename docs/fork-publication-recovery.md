@@ -10,7 +10,32 @@ Worker pins Progress `2d7bd8b7636560a50acf1b419761186f247009b9`, including publi
 
 Progress planning and facts use the compiler-produced Pages bundle when available, with strict legacy HTML discovery during transition. Each new bundle-backed plan retains a hash-named `plan.json.facts-<sha256>.json.gz` sibling. Worker verifies the plan/facts documentation identities and the sibling hash before launching the writer, installs the sibling before its canonical plan, and retains it with archived or parked reports. Worker promotions and archives share same-filesystem bundle bytes through hard links; other filesystems use an atomic durable copy. The independent Progress cache and selected immutable generations remain retained for rollback. The immutable cache defaults to `state/<worker>/progress/facts-cache` (overridable with `TAUCETI_FACTS_CACHE`) and survives mechanical attempts; only the mutable HTML cache is isolated per attempt. Mechanical exit 76 triggers at most three free attempts; facts-stage exit 78 permits a fresh plan, stopping immediately if it selects the same invalid identity. Plan-stage exit 78 waits immediately. Invalid plan/bundle recovery waits back off from five minutes to the ordinary eight-hour attempt gap, and remain visible in stage logs and runtime details. Exit 77 immediately waits for documentation with bounded backoff. These waits do not spend the report cadence, repair budget, error streak or a paid writer attempt. An already prepared publication resumes from its receipted plan/prose even if an auxiliary facts copy has disappeared; it never refetches current documentation or regenerates prose.
 
-Rollback preserves the outbox, `.complete` fork evidence, `progress/work/publication*.json`, `progress/retained/`, plan, prose, hash-named facts siblings, the immutable facts cache, and local branches. Stop progress selection before rolling back to a version that lacks receipt-aware resume; that older version would delete saved prose on its next new report attempt. Never mark an uncertain write rejected to make rollback replay it.
+Plans with a history-migration policy retain `plan.json.history-<sha256>.json`
+beside the existing facts bundle. The worker verifies its bounded canonical bytes
+before paid writing and installs it before the referencing plan. Keep this file
+with work, mechanical-attempt archives, and parked publication bundles. Its digest
+participates in mechanical retry and writer-input identity; changing the policy
+cannot reuse an old interpretation of a window. Parked windows remain blocked
+across policy changes, so an unrelated map edit cannot pay for that window again.
+This fence does not reuse its old facts or authorize publication. Legacy metadata
+is compared as the empty policy. Losing auxiliary files does not discard publication receipts or
+paid prose: publication retains or parks them for repair. Upgrade the Progress
+pin and coordinate worker/merge-workflow policy pins before enabling a nonempty
+map. First resolve legacy active publication receipts whose plan lacks
+`history_migration_sha256`: Progress refuses those plans once a nonempty map is
+configured. Keep the map variable unset when manually resuming a legacy bundle,
+and coordinate the merge gate's policy before enabling a nonempty map.
+
+A missing or corrupt nonempty policy on publication resume parks the report with
+its paid prose intact and blocks that window. Before manual apply, restore
+`plan.json.history-<sha256>.json` beside the saved plan from a mechanical-attempt
+or other retained copy with exactly the expected SHA256. Verify its bytes; do
+not substitute the current policy. If no matching copy exists, retain the bundle
+for operator recovery. This support alone does not enable native Progress source
+access. Binding retained local/remote publication commits to the policy that
+produced their prose remains required before nonempty-policy activation.
+
+Rollback preserves the outbox, `.complete` fork evidence, `progress/work/publication*.json`, `progress/retained/`, plan, prose, hash-named facts and history-policy siblings, the immutable facts cache, and local branches. Stop progress selection before rolling back to a version that lacks receipt-aware resume; that older version would delete saved prose on its next new report attempt. Never mark an uncertain write rejected to make rollback replay it.
 
 Standalone Progress journals uncertain mutations privately. Under Worker, the installed proxy owns the sole mutation journal; local quota waits do not consume mutation replay allowances. Authoritative pre-request or quota rejections refund the Worker fork replay allowance. A compound close-plus-comment is never replayed merely because the PR remains open: the comment may already have been posted.
 
