@@ -169,6 +169,7 @@ RUN_STDLIB=(
   queue_workflow_token.py
   queue_source_ci.py
   queue_stage1.py
+  queue_stage1_mirror.py
   queue_source_authority.py
   queue_task_identity.py
   queue_task_transport.py

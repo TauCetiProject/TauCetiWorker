@@ -155,17 +155,6 @@ class Stage1(unittest.TestCase):
         self.clone = self.root / "operator"
         git(self.root, "init", "-q", "--bare", str(self.remote))
         git(self.root, "init", "-q", "-b", "main", str(self.author))
-        (self.author / "Math").mkdir()
-        (self.author / "Math/Proof.lean").write_text("theorem first : True := trivial\n")
-        git(self.author, "add", ".")
-        git(self.author, "commit", "-qm", "base")
-        self.base = git(self.author, "rev-parse", "HEAD")
-        git(self.author, "push", "-q", str(self.remote), "HEAD:refs/heads/main")
-        (self.author / "Math/Proof.lean").write_text("theorem first : True := by trivial\n")
-        git(self.author, "commit", "-qam", "member")
-        self.head = git(self.author, "rev-parse", "HEAD")
-        git(self.author, "push", "-q", str(self.remote), "HEAD:refs/pull/1/head")
-        git(self.root, "init", "-q", str(self.clone))
         forge = Forge("forgejo", "https://source.example")
         self.policy = cc.ExecutionPolicy(
             cc.RepositoryIdentity(RepositoryRef(forge, "team/Math"), 11),
@@ -179,6 +168,20 @@ class Stage1(unittest.TestCase):
             True,
             hashlib.sha256(CONFIG).hexdigest(),
         )
+        (self.author / "tauceti.toml").write_bytes(CONFIG)
+        (self.author / ".tauceti").mkdir()
+        (self.author / ".tauceti/ci-source.json").write_text(json.dumps(self.policy.record(with_config=False)))
+        (self.author / "Math").mkdir()
+        (self.author / "Math/Proof.lean").write_text("theorem first : True := trivial\n")
+        git(self.author, "add", ".")
+        git(self.author, "commit", "-qm", "base")
+        self.base = git(self.author, "rev-parse", "HEAD")
+        git(self.author, "push", "-q", str(self.remote), "HEAD:refs/heads/main")
+        (self.author / "Math/Proof.lean").write_text("theorem first : True := by trivial\n")
+        git(self.author, "commit", "-qam", "member")
+        self.head = git(self.author, "rev-parse", "HEAD")
+        git(self.author, "push", "-q", str(self.remote), "HEAD:refs/pull/1/head")
+        git(self.root, "init", "-q", str(self.clone))
         for name, data in [("configuration", CONFIG), ("token", b"fixture-source-token")]:
             path = self.root / name
             path.write_bytes(data)

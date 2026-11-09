@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import stat
+import subprocess
 import sys
 import time
 import urllib.request
@@ -89,7 +90,7 @@ def _read_json(path):
 
 
 class Operator:
-    def __init__(self, profile, *, execution=None, client=None, source=None, clock=time.time):
+    def __init__(self, profile, *, execution=None, client=None, source=None, mirror=None, clock=time.time):
         expected = {
             "schema",
             "configuration",
@@ -101,7 +102,7 @@ class Operator:
             "execution_credentials_dir",
             "reviewer_ids",
         }
-        optional = {"execution_mode", "execution_read_token_file"}
+        optional = {"execution_mode", "execution_read_token_file", "mirror_main"}
         if not isinstance(profile, dict) or set(profile) - optional != expected or profile["schema"] != SCHEMA:
             raise ValueError("invalid Stage 1 operator profile")
         reviewers = profile["reviewer_ids"]
@@ -117,6 +118,7 @@ class Operator:
         self.policy = cc.ExecutionPolicy.parse(profile["execution_policy"], configuration=self.configuration)
         self.project = parse(self.configuration)
         self.workflow_revision = _sha(profile["workflow_revision"])
+        self.profile_caller_revision = self.workflow_revision
         self.clone, self.database = _path(profile["clone"]), _path(profile["database"])
         if self.clone.is_symlink() or not self.clone.is_dir() or self.database.is_symlink():
             raise ValueError("operator clone/database must use explicit real paths")
@@ -147,6 +149,11 @@ class Operator:
             execution = GitHubSourceExecution(tokens)
         self.execution = execution
         self.execution_mode = mode
+        self.mirror_main = profile.get("mirror_main", False)
+        if type(self.mirror_main) is not bool:
+            raise ValueError("mirror_main must be an explicit boolean")
+        self.mirror_credentials_dir = _path(profile["execution_credentials_dir"])
+        self.mirror_publisher = mirror
         self.store = None
 
     @contextmanager
@@ -205,14 +212,14 @@ class Operator:
                 self.store.close()
                 self.store = None
 
-    def _actor(self):
+    def _actor(self, *, require_push=True):
         self.source._bound(self.policy.source.repository.key)
         actor = self.api.current_user()
         native_id = actor.get("id")
         if type(native_id) is not int or native_id not in self.reviewers:
             raise ValueError("authenticated source actor is not an approved Stage 1 reviewer")
         access = self.api.repository(self.policy.source.repository)
-        if access.get("permissions", {}).get("push") is not True:
+        if require_push and access.get("permissions", {}).get("push") is not True:
             raise ValueError("operator source actor lacks current repository write permission")
         return native_id
 
@@ -240,6 +247,8 @@ class Operator:
         row = self._pull(number, head)
         base = self.source.ref_sha(self.policy.source.repository.key, "refs/heads/" + self.policy.base_branch)
         _sha(base)
+        self.workflow_revision = self._caller_revision(base)
+        self.ledger.workflow_revision = self.workflow_revision
         # Exact repeats return the prior request; a retry does not allocate a
         # new request or dispatch merely because the operator command restarted.
         for attempt in self.store.rows("ci_attempts", {"base_sha": base}, order="id DESC"):
@@ -280,6 +289,10 @@ class Operator:
                     )
         if not built.commits or any(record.empty or record.landed_on_base for record in built.commits):
             raise ValueError("PR is already landed or has no changes to apply; settle it without another CI run")
+        if self.mirror_main:
+            from .stage1_mirror import MainMirror
+
+            MainMirror.check_controls(self.clone, self.profile_caller_revision, built.tip)
         # CI executes the trusted policy and sandbox; local preparation does
         # no checkout or execution of contributor-provided code.
         self._pull(number, head)
@@ -415,7 +428,7 @@ class Operator:
             raise ValueError("request was abandoned; late results cannot authorize promotion")
         if frozen.policy != self.policy:
             raise ValueError("archived request differs from the selected policy")
-        if frozen.request.workflow_revision != self.workflow_revision:
+        if frozen.request.workflow_revision != self._caller_revision(frozen.request.base):
             raise ValueError("protected caller revision changed; accept and test a new request")
         accepted = self.store.get_setting(f"stage1:acceptance:{attempt_id}")
         if (
@@ -435,6 +448,65 @@ class Operator:
         if current != frozen.request.base:
             raise ValueError("source main changed; prepare and test a new candidate")
         return frozen
+
+    def _verified_promotion(self, head):
+        for row in self.store.rows("ci_attempts", {"head_sha": head}, order="id DESC"):
+            if row["outcome"] not in {"pending", "pass"}:
+                continue
+            frozen = self.ledger.load(row["id"])
+            intent = self.store.get_setting(f"stage1:promotion-intent:{row['id']}") or {}
+            acceptance = self.store.get_setting(f"stage1:acceptance:{row['id']}") or {}
+            if (
+                frozen.policy.source == self.policy.source
+                and frozen.policy.execution == self.policy.execution
+                and intent.get("request_digest") == frozen.request.digest
+                and intent.get("classification") == "passed"
+                and intent.get("candidate") == head
+                and type(intent.get("actor")) is int
+                and intent["actor"] > 0
+                and type(acceptance.get("reviewer_id")) is int
+                and acceptance["reviewer_id"] > 0
+                and acceptance.get("candidate") == head
+                and acceptance.get("policy_digest") == frozen.policy.digest
+            ):
+                if row["outcome"] == "pending":
+                    if self.source.ref_sha(self.policy.source.repository.key, "refs/heads/main") != head:
+                        continue
+                    self._completed(frozen, intent["run_id"])
+                    self.store.journal(
+                        self.clock(),
+                        "stage1-promotion-confirmed",
+                        candidate=head,
+                        batch_id=frozen.request.batch_id,
+                        actor=intent["actor"],
+                        reconciled=True,
+                    )
+                return frozen
+        raise ValueError("source main has no matching completed Stage 1 promotion; inspect authority before mirroring")
+
+    def _caller_revision(self, base):
+        if not self.mirror_main:
+            return self.workflow_revision
+        # main advances on every mirror even when its workflow bytes do not.
+        # The explicit profile pin is the approved control-file anchor; only a
+        # recorded promotion with unchanged controls may become a later caller.
+        approved = _sha(self.profile_caller_revision)
+        if base != approved:
+            self._verified_promotion(base)
+        missing = [sha for sha in {base, approved} if not chain.object_exists(self.clone, sha)]
+        if missing:
+            self.source.fetch_refs(self.policy.source.repository.key, missing)
+        from .stage1_mirror import MainMirror
+
+        MainMirror.check_controls(self.clone, approved, base)
+        configuration = MainMirror.local_git(self.clone, "show", approved + ":tauceti.toml")
+        metadata = MainMirror.local_git(self.clone, "show", approved + ":.tauceti/ci-source.json")
+        if configuration.returncode or configuration.stdout != self.configuration or metadata.returncode:
+            raise ValueError("profile configuration differs from the approved caller; finish its reviewed deployment")
+        approved_policy = cc.ExecutionPolicy.parse(cc.read_json(metadata.stdout), configuration=self.configuration)
+        if approved_policy != self.policy:
+            raise ValueError("profile policy differs from the approved caller; finish its reviewed deployment")
+        return base
 
     def observe(self, attempt_id, *, run_id=None):
         frozen = self.ledger.load(attempt_id)
@@ -485,7 +557,9 @@ class Operator:
                 actor=actor,
             )
             self._completed(frozen, intent["run_id"])
-            return {"promoted": True, "candidate": frozen.request.head, "current_main": current, "reconciled": True}
+            return self._after_promotion(
+                {"promoted": True, "candidate": frozen.request.head, "current_main": current, "reconciled": True}
+            )
         frozen = self._current(attempt_id)
         observed = self.observe(attempt_id)
         if observed["classification"] in {"source_failure", "policy_failure"}:
@@ -494,6 +568,10 @@ class Operator:
             raise ValueError("owning child has an infrastructure failure or no result; inspect and rerun that child")
         if observed["classification"] != "passed":
             raise EvidenceUnavailable("promotion requires current verified passing GitHub result evidence")
+        if self.mirror_main:
+            self._mirror_backend().preflight(
+                self.source, frozen.request.base, frozen.request.head, self.profile_caller_revision
+            )
         # Re-read native heads/base after execution observation and immediately
         # before the expected-old Git update. Rename/deletion is an operator
         # operation and must not overlap this manual publication window.
@@ -524,7 +602,96 @@ class Operator:
             run_id=observed["run_id"],
         )
         self._completed(frozen, observed["run_id"])
-        return {"promoted": True, "candidate": frozen.request.head, "run_id": observed["run_id"]}
+        return self._after_promotion({"promoted": True, "candidate": frozen.request.head, "run_id": observed["run_id"]})
+
+    def _after_promotion(self, result):
+        if self.mirror_main:
+            try:
+                result["mirror"] = self.mirror()
+            except Exception as error:
+                safe = isinstance(
+                    error, (ValueError, ForgeError, OSError, github_app.CredentialsError, EvidenceUnavailable)
+                )
+                message = "source promotion is confirmed; main mirror needs recovery: " + (
+                    str(error) if safe else type(error).__name__ + "; inspect mirror configuration and remote refs"
+                )
+                if (
+                    isinstance(error, ValueError)
+                    or (isinstance(error, github_app.CredentialsError) and not error.retryable)
+                    or (
+                        isinstance(error, ForgeError)
+                        and error.status is not None
+                        and error.status < 500
+                        and error.status != 429
+                    )
+                ):
+                    raise ValueError(message) from None
+                raise EvidenceUnavailable(message) from None
+        return result
+
+    def _mirror_backend(self):
+        if self.mirror_publisher is None:
+            from .stage1_mirror import MainMirror
+
+            try:
+                self.mirror_publisher = MainMirror(self.policy, self.clone, self.mirror_credentials_dir)
+            except (TypeError, KeyError):
+                raise ValueError("mirror App credential configuration is invalid") from None
+        return self.mirror_publisher
+
+    def mirror(self):
+        """Publish only authoritative main, including after a lost mirror acknowledgement."""
+        if not self.mirror_main:
+            raise ValueError("main mirroring is not enabled in this operator profile")
+        head = None
+        self.store.set_setting("stage1:mirror-result", {"main": None, "state": "checking"}, at=self.clock())
+        try:
+            actor = self._actor(require_push=False)
+            head = self.source.ref_sha(self.policy.source.repository.key, "refs/heads/main")
+            bootstrap = head == self.profile_caller_revision
+            if not bootstrap:
+                self._verified_promotion(head)
+            self.store.set_setting(
+                "stage1:mirror-intent",
+                {
+                    "main": head,
+                    "source": self.policy.source.record(),
+                    "execution": self.policy.execution.record(),
+                    "actor": actor,
+                },
+                actor=str(actor),
+                at=self.clock(),
+            )
+            self.store.set_setting("stage1:mirror-result", {"main": head, "state": "pending"}, at=self.clock())
+            self.store.journal(self.clock(), "stage1-main-mirror-intent", main=head, actor=actor)
+            backend = self._mirror_backend()
+            result = (
+                backend.confirm_bootstrap(self.source, head)
+                if bootstrap
+                else backend.publish(self.source, head, self.profile_caller_revision)
+            )
+        except Exception as error:
+            permanent = (
+                isinstance(error, ValueError)
+                or (isinstance(error, github_app.CredentialsError) and not error.retryable)
+                or (
+                    isinstance(error, ForgeError)
+                    and error.status is not None
+                    and error.status < 500
+                    and error.status != 429
+                )
+            )
+            self.store.set_setting(
+                "stage1:mirror-result",
+                {"main": head, "state": "refused" if permanent else "unavailable", "error_type": type(error).__name__},
+                at=self.clock(),
+            )
+            self.store.journal(self.clock(), "stage1-main-mirror-failed", main=head, error_type=type(error).__name__)
+            raise
+        result = {**result, "main": head, "state": "confirmed"}
+        self.store.set_setting("stage1:mirror-result", result, actor=str(actor), at=self.clock())
+        self.store.journal(self.clock(), "stage1-main-mirrored", **result)
+        return result
 
     def _completed(self, frozen, run_id):
         with self.store.transaction():
@@ -569,6 +736,7 @@ def main(argv=None):
     prepare = actions.add_parser("prepare", help="record explicit human acceptance and freeze one PR candidate")
     prepare.add_argument("--pr", type=int, required=True)
     prepare.add_argument("--accept-head", required=True, help="full revision reviewed by the authenticated operator")
+    actions.add_parser("mirror", help="repair/confirm the enabled main-only GitHub mirror")
     for name in ("dispatch", "handoff", "export-handoff", "observe", "promote", "abandon"):
         command = actions.add_parser(name)
         command.add_argument("--attempt", type=int, required=True)
@@ -596,6 +764,8 @@ def main(argv=None):
                 result = (
                     operator.prepare(args.pr, args.accept_head)
                     if args.action == "prepare"
+                    else operator.mirror()
+                    if args.action == "mirror"
                     else operator.observe(args.attempt, run_id=args.run_id)
                     if args.action == "observe"
                     else operator.abandon(args.attempt, args.reason)
@@ -611,10 +781,33 @@ def main(argv=None):
             return 0
         print(json.dumps(result, sort_keys=True))
         return 0
+    except BlockingIOError:
+        print("busy: another operator or queue service owns the publication lock", file=sys.stderr)
+        return 75
     except EvidenceUnavailable as error:
         print(f"waiting: {error}", file=sys.stderr)
         return 77
-    except (ValueError, ForgeError, OSError, DispatchNotAccepted) as error:
+    except subprocess.TimeoutExpired:
+        print("waiting: Git observation exceeded its deadline; retry after inspecting current refs", file=sys.stderr)
+        return 77
+    except github_app.CredentialsError as error:
+        if error.retryable:
+            print(f"waiting: {error}", file=sys.stderr)
+            return 77
+        print(f"operator recovery required: {error}", file=sys.stderr)
+        return 78
+    except ForgeError as error:
+        if error.status is None or error.status == 429 or error.status >= 500:
+            print(f"waiting: {error}", file=sys.stderr)
+            return 77
+        print(f"operator recovery required: {error}", file=sys.stderr)
+        return 78
+    except (
+        ValueError,
+        OSError,
+        DispatchNotAccepted,
+        chain.ChainError,
+    ) as error:
         print(f"operator recovery required: {error}", file=sys.stderr)
         return 78
 
