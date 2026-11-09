@@ -243,7 +243,9 @@ class ControllerLock:
     """
 
     def __init__(self) -> None:
-        self._cond = threading.Condition(threading.Lock())
+        mutex = threading.Lock()
+        self._cond = threading.Condition(mutex)
+        self._priority_cond = threading.Condition(mutex)
         self._owner: int | None = None
         self._depth = 0
         self._priority_waiting = 0
@@ -253,23 +255,31 @@ class ControllerLock:
         acquirer waits), then own it once. False when `deadline` passes first."""
         if priority:
             self._priority_waiting += 1
+        condition = self._priority_cond if priority else self._cond
         try:
             while self._owner is not None or (not priority and self._priority_waiting):
                 if deadline is None:
-                    self._cond.wait()
+                    condition.wait()
                     continue
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
-                self._cond.wait(remaining)
+                condition.wait(remaining)
             self._owner = threading.get_ident()
             self._depth = 1
             return True
         finally:
             if priority:
                 self._priority_waiting -= 1
-                if not self._priority_waiting:
-                    self._cond.notify_all()
+                if self._owner is None:
+                    self._notify_next()
+
+    def _notify_next(self) -> None:
+        """Under the shared mutex: wake one eligible acquirer. Broadcasting to every webhook
+        waiter makes draining a burst quadratic and can starve worker endpoints of CPU.
+        """
+        condition = self._priority_cond if self._priority_waiting else self._cond
+        condition.notify(1)
 
     def acquire(self, blocking: bool = True, timeout: float = -1, *, priority: bool = False) -> bool:
         with self._cond:
@@ -288,7 +298,7 @@ class ControllerLock:
             self._depth -= 1
             if not self._depth:
                 self._owner = None
-                self._cond.notify_all()
+                self._notify_next()
 
     def __enter__(self) -> ControllerLock:
         self.acquire()
@@ -331,7 +341,7 @@ class ControllerLock:
                 depth = 0
             else:
                 depth, self._depth, self._owner = self._depth, 0, None
-                self._cond.notify_all()
+                self._notify_next()
         try:
             yield
         finally:
