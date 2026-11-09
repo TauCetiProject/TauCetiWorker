@@ -76,6 +76,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # Zero disables successor sealing. Head creation never waits for this threshold.
     "sealed_successor_min_members": 100,
     "repair_concurrency": 1,
+    # A background task may start only while fewer than this many total worker claims are live.
+    # With repair_concurrency=3 and this limit=2, only head work can start the third worker.
+    "background_start_limit": 2,
     "stall_interval_seconds": 900,
     "publication_enabled": False,
     "claim_ttl_seconds": 900,
@@ -1340,9 +1343,10 @@ class Controller:
         two tiers, each by kind priority then age (`TASK_PRIORITY`): first a head task (`repair` or
         `rebase_conflict`); then an open batch's background task (`pre_rebase`, then `prepare`).
         Each batch has at most one live worker claim, including when its task changes. Background
-        claims number at most `repair_concurrency - 1`, so head work never waits behind background
-        work. With two workers one repairs the head while the other prepares or pre-rebases the
-        next batch; a worker waits when no distinct batch needs work.
+        claims number at most `repair_concurrency - 1`. Starting background work also requires
+        fewer than `background_start_limit` total live claims; only head work may increase the
+        active total beyond that limit. Head work never waits behind background work. With two workers
+        one repairs the head while the other prepares or pre-rebases the next batch; a worker waits when no distinct batch needs work.
 
         The admin check (a cached GitHub read) runs before the lock is taken, and the claim takes the
         lock's priority lane, so a claim answers while a tick is running.
@@ -1415,7 +1419,8 @@ class Controller:
         self, claimable: list[tuple[dict[str, Any], dict[str, Any]]], concurrency: int
     ) -> tuple[dict[str, Any], dict[str, Any]] | None:
         """The next task on a batch without a live worker claim: a head task, else background while
-        background claims number fewer than `concurrency - 1` (one slot is always left for head work,
+        total claims number fewer than `background_start_limit` and background claims number fewer
+        than `concurrency - 1` (one slot is always left for head work,
         so with `repair_concurrency` 1 nothing runs in the background). Selection and insertion of
         the claim share the controller lock; concurrent requests cannot select the same batch.
         """
@@ -1426,7 +1431,7 @@ class Controller:
             if pair[0]["kind"] not in BACKGROUND_TASKS:
                 return pair
         background = [claim for claim in active if claim["operation"] in BACKGROUND_OPERATIONS]
-        if len(background) < concurrency - 1:
+        if len(active) < int(self.setting("background_start_limit")) and len(background) < concurrency - 1:
             for task, batch in unheld:
                 if task["kind"] in BACKGROUND_TASKS:
                     return task, batch

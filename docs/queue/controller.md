@@ -453,7 +453,8 @@ and reported in status:
 | `insertion_age_window` | 16 | size of the age window the draw is taken from |
 | `open_batch_limit` | 2 | unsealed batches at most; the sealed successor does not consume this capacity |
 | `sealed_successor_min_members` | 100 | seal oldest unsealed batches at this size until two active batches are sealed in total, including the head; 0 disables new successor sealing |
-| `repair_concurrency` | 1 | live task claims in total; background tasks hold at most one fewer, so 1 allows no background claims |
+| `repair_concurrency` | 1 | maximum live task claims in total; background tasks hold at most one fewer, so 1 allows no background claims |
+| `background_start_limit` | 2 | a non-head task may start only while the total live claim count is below this limit; with repair concurrency 3, only a head task can increase the total from two to three |
 | `stall_interval_seconds` | 900 | build silence after which status raises a stall |
 | `publication_enabled` | false | shadow mode when false: no dispatch, promotion, comment, label, close or ref push; status says what would happen |
 | `claim_ttl_seconds` | 900 | claim lifetime between renewals |
@@ -512,8 +513,11 @@ predicate, repository admin permission (`security_audit.require_admin`), checked
   offered within `repair_concurrency` live task claims in total, in two tiers, each by kind
   priority then age: a head `repair` or `rebase_conflict` task nobody holds; then an open batch's
   background task (`pre_rebase` (above), then `prepare` (above)) on a batch where no worker holds
-  one, while background claims number fewer than `repair_concurrency - 1`, so one slot is always
-  free for head work and with `repair_concurrency` 1 nothing runs in the background.
+  one, while background claims number fewer than `repair_concurrency - 1` and total live claims
+  number fewer than `background_start_limit`. With limits 3 and 2, two background tasks may run;
+  an available head task can take the third slot. A head plus one background task already uses
+  two slots, so another background task cannot start. Head work has first claim priority, and
+  existing work keeps its lease. With `repair_concurrency` 1 nothing runs in the background.
   A task has one live owner. A spare worker waits when no distinct task is claimable; it never
   races another worker on the head. Expiry or release permits a replacement owner.
   A refusal because the total is reached while a head task waits counts in `claim_collisions`.

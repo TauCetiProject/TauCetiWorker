@@ -916,3 +916,17 @@ service's candidates feed and the Bors baseline window ([journal-report.md](jour
 PRs per hour, head cycle time and its CI/repair split, repair rounds per landed head, repair time and
 inference cost per task, shrink events, singleton builds (expected zero), claim collisions, PR waiting
 age, inference holds and stall conditions, each beside its baseline value.
+
+Production repair admission uses `repair_concurrency=3` and `background_start_limit=2`.
+Count all live claims when starting a task: a non-head task can increase the total to
+at most two, while a head task can increase it to three. Keep head priority and one
+owner per batch. Two non-head preparations can therefore run while no head needs
+repair, with a worker available when a head task appears. Claims are still pulled by
+idle workers on their polling intervals; this rule removes the wait for another
+repair to finish.
+
+Run three interchangeable processes with distinct identities and task roots. The
+additional user unit is `tauceti-queue-repair@3.service`, using the private
+`repair-environment-3` and `~/TauCetiQueue-data/repair-3`. Add that root to both repair
+worktree cleanup and public monitoring (and historical telemetry) when enabling it.
+Existing active workers need not restart for controller admission changes.

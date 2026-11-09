@@ -158,6 +158,7 @@ RUN_STDLIB=(
   queue_diagnostics.py
   queue_controller.py
   queue_sealed_successor.py
+  queue_head_capacity.py
   queue_execution.py
   queue_ci_requests.py
   queue_forgejo_git.py

@@ -120,7 +120,8 @@ Expose these runtime controls through the existing administration surface or pro
 | --- | --- |
 | `insertion_age_window` | Size of the eligible insertion window ordered by urgency, priority and age; default 16 |
 | `open_batch_limit` | Maximum open batches, each assembling on a canonical base; default 2, with 1 restoring the original increment 1 shape |
-| `repair_concurrency` | Maximum live claims across distinct tasks; each task has one owner. A second worker prepares the next eligible batch or waits, never races the head's owner. Background claims reserve a slot for head work; default 1, which disables background claims |
+| `repair_concurrency` | Maximum live claims across distinct tasks; each task has one owner. Default 1 disables background claims. Production uses 3, reserving third admissions for head work |
+| `background_start_limit` | Non-head tasks may start only while fewer than this many total claims are active; default 2. Together with repair concurrency 3, two background tasks can run and a newly available head can take the third slot. A head plus one background task prevents another background start |
 | `stall_interval_seconds` | Lack of observed progress after which status raises a stall condition; default 900 |
 
 ## Repair agent execution
