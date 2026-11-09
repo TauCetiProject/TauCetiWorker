@@ -75,8 +75,10 @@ version and capabilities; do not deploy a server fork as an implicit prerequisit
    the pinned Tools release. The flagship generator requires `features.docs = true`,
    the existing `web/`/`docbuild/` layout, and matching source/execution branch names.
    Supporting Roadmap/tools/dependencies may remain on GitHub. Identify and record
-   obsolete GitHub source writers for the authorized switch; historical GitHub analytics must remain identified as
-   historical until their Stage 2 replacements are ready.
+   obsolete GitHub source writers for the authorized switch using the
+   [automation disposition](forgejo-stage1-automations.md). Historical GitHub
+   analytics must remain identified as historical until their Stage 2 replacements
+   are ready.
 7. Match cache endpoint variables to the trusted configuration. Pass the upload key
    only to the isolated reusable publisher. Required publication must fail on
    missing configuration. Confirm published revision maps and usable documentation
@@ -165,6 +167,26 @@ promote and complete the relevant Stage 2 prerequisites before this operation.
    let paid repair sessions checkpoint/submit before stopping their workers.
    Refresh work/claim/publication inventories and backups after that boundary.
    Preserve original refs, identities, spending history, and prepared outputs.
+
+   The installed manager supports persistent per-worker disable through
+   `tauceti workers --config PATH disable ID`. Record the explicit configuration
+   path and approved affected worker IDs; the operator host currently uses
+   `~/.config/tauceti/workers.toml`. Confirm its source bindings at cutover rather
+   than selecting every worker by name. For each affected worker, after its paid
+   session has checkpointed or finished under the recorded disposition:
+
+   ```sh
+   tauceti workers --config "$workers_config" status --json
+   tauceti workers --config "$workers_config" disable "$affected_worker_id"
+   tauceti workers --config "$workers_config" status --json
+   ```
+
+   `disable` persists stopped state and the manager stops that worker; it is not
+   a graceful inference-checkpoint command. Do not use it to interrupt unpreserved
+   paid work. Repeat only for the authorized project workers, verify both stopped
+   desired state and actual process exit, and retain their stores/outboxes. Keep
+   unrelated workers and CI enabled. These are authority-transfer commands, not
+   preparation or routine deployment precautions.
 2. Fence the old GitHub merge/source writers for the affected project before
    enabling Forgejo merge authority. The old queue and new mirror can share a
    GitHub App identity: different token permission subsets do not distinguish
