@@ -3777,7 +3777,7 @@ exit 1
         self.assertNotIn("stream_build", outcome)
         calls = self.agent_calls()
         self.assertNotIn("## Build in progress", calls[0]["prompt"])
-        self.assertIn("Artifacts are warm:", calls[0]["prompt"])
+        self.assertIn("The worker owns final verification", calls[0]["prompt"])
         self.assertIsNone(calls[0]["launch"]["errors"])
         self.assertFalse(calls[0]["launch"]["lock"])
         self.assertFalse((self.repair_dir() / "build.log").exists())
@@ -4821,6 +4821,39 @@ class TargetedRepairChecks(Fixture):
         self.assertEqual(result.returncode, 2)
         self.assertIn("full verification is owned by the worker", result.stdout)
         self.assertEqual(self.lake_calls(), [])
+
+    def test_prompt_contract_requires_worker_verification_and_warm_repair_kind(self):
+        task = repair_task.Task.from_json(self.service.task_record(1, self.service.preclaim(1, "token", "worker")))
+        self.assertTrue(repair_task.prompt_context(task, None, worker_verifies=True).worker_verifies)
+        self.assertFalse(repair_task.prompt_context(task, None, worker_verifies=False).worker_verifies)
+        self.assertFalse(
+            repair_task.prompt_context(task, None, worker_verifies=True, artifacts={"cold": True}).worker_verifies
+        )
+        for kind in ("pre_rebase", "rebase_conflict"):
+            task.kind = kind
+            self.assertFalse(repair_task.prompt_context(task, None, worker_verifies=True).worker_verifies)
+
+    def test_interrupted_audit_keeps_its_phase_trace_outside_the_worktree(self):
+        sandboxed = repair_audit._sandboxed
+
+        def interrupt(argv, worktree, env, extra, log, timeout):
+            if str(argv[-1]).endswith("/audit-driver"):
+                Path(extra["AUDIT_PHASES_FILE"]).write_text(f"audit-import\t{time.time()}\n")
+                raise KeyboardInterrupt
+            return sandboxed(argv, worktree, env, extra, log, timeout)
+
+        with patch.object(repair_audit, "_sandboxed", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+            repair_audit.check(
+                self.worktree,
+                repair.lake_env(self.root / "cache"),
+                base=self.content.base,
+                tools_root=self.root / "tools",
+                logdir=self.telemetry,
+            )
+        trace = next(self.telemetry.glob("audit-phases-*.tsv"))
+        self.assertIn("audit-import", trace.read_text())
+        (self.worktree / repair_audit.WORK_DIR / "audit-phases.tsv").unlink()
+        self.assertIn("audit-import", trace.read_text(), "worktree removal must not remove the record")
 
     def test_phase_timing_is_best_effort_and_distinguishes_interruption(self):
         path = self.root / "phases.tsv"
