@@ -4707,6 +4707,132 @@ class WorkerAudits(Fixture):
         self.assertEqual(len((self.stub_dir / "audit-runs.log").read_text().splitlines()), runs)
 
 
+class KnownCheckRepairs(Fixture):
+    """Located CI check findings start inference before any build or audit pass."""
+
+    BASE_FILES = WorkerAudits.BASE_FILES
+
+    def setUp(self):
+        super().setUp()
+        os.environ[repair_audit.URL_VARIABLE] = str(TOOLS_REPOSITORY)
+        self.addCleanup(os.environ.pop, repair_audit.URL_VARIABLE, None)
+
+    def findings(self, name: str, text: str) -> None:
+        (self.stub_dir / name).write_text(text + "\n")
+
+    def known_checks_repair(self, diagnostics, *, stream_repair=True):
+        self.service.tasks[1]["diagnostics"] = diagnostics
+        cfg = self.config(stream_repair=stream_repair)
+        run_agent = repair_task.run_repair_agent
+        launches = []
+
+        def agent_after_fetch(*args, **kwargs):
+            # In particular, no cached preparation build or audit may block the
+            # first inference call. The cache fetches still precede it.
+            launches.append(True)
+            if len(launches) == 1:
+                self.assertTrue(self.lake_calls())
+                self.assertFalse(any(c.startswith("build") for c in self.lake_calls()))
+                self.assertFalse((self.stub_dir / "audit-runs.log").exists())
+            return run_agent(*args, **kwargs)
+
+        with (
+            patch.object(repair_task, "run_repair_agent", agent_after_fetch),
+            patch.object(repair_stream, "start_build", side_effect=AssertionError("unexpected discovery build")),
+        ):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertIn("pre_repair_discovery", outcome)
+        self.assertFalse(outcome["artifacts"]["incremental_build"])
+        self.assertNotIn("stream_build", outcome)
+        self.assertEqual(len(outcome["verification"]), 1)
+        self.assertTrue(outcome["verification"][0]["ok"])
+        self.assertTrue((self.stub_dir / "audit-runs.log").exists(), "final audits must run")
+        self.assertEqual(self.lake_calls().count("build --iofail"), 1, "only the final verification build")
+        prompt = self.agent_calls()[0]["prompt"]
+        self.assertIn("Start by repairing those findings", prompt)
+        self.assertIn("Cached outputs may still need unpacking", prompt)
+        self.assertNotIn("every module of this batch that compiled are already built", prompt)
+        return outcome
+
+    def test_known_lint_starts_agent_before_build_and_audits(self):
+        self.known_checks_repair(
+            [
+                {
+                    "kind": "lint",
+                    "module": "TauCeti.Two",
+                    "path": "TauCeti/Two.lean",
+                    "linter": "simpNF",
+                    "declaration": "two",
+                    "message": "simpNF: two",
+                },
+            ]
+        )
+        self.assertIn("linter `simpNF`: `two`", self.agent_calls()[0]["prompt"])
+
+    def test_known_lint_skips_sequential_preparation_too(self):
+        self.known_checks_repair(
+            [
+                {"kind": "environment_linter", "module": "TauCeti.Two", "message": "simpNF: two"},
+            ],
+            stream_repair=False,
+        )
+
+    def test_known_duplicate_starts_agent_before_build_and_audits(self):
+        self.known_checks_repair([{"kind": "audit", "message": DUPLICATE_LINE}])
+        self.assertIn("`Foo.bar` is declared in both", self.agent_calls()[0]["prompt"])
+
+    def test_known_findings_do_not_allow_failed_final_audits_to_submit(self):
+        self.service.tasks[1]["diagnostics"] = [
+            {"kind": "lint", "module": "TauCeti.Two", "message": "simpNF: two"},
+        ]
+        self.findings("audit-findings-always", DUPLICATE_LINE)
+        cfg = self.config(verify_retries=0)
+        with patch.object(repair_stream, "start_build", side_effect=AssertionError("unexpected discovery")):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "released", outcome)
+        self.assertFalse(outcome["verification"][0]["ok"])
+        self.assertEqual(self.service.results, [])
+
+    def test_known_findings_do_not_bypass_artifact_availability(self):
+        self.service.tasks[1]["diagnostics"] = [
+            {"kind": "lint", "module": "TauCeti.Two", "message": "simpNF: two"},
+        ]
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "released", outcome)
+        self.assertEqual(outcome["reason"], "artifacts_unavailable")
+        self.assertEqual(self.agent_calls(), [])
+        self.assertEqual(self.service.results, [])
+
+    def test_only_actionable_check_findings_bypass_discovery(self):
+        task = repair_task.Task.from_json(self.service.task_record(1, self.service.preclaim(1, "token", "worker")))
+        for diagnostics in (
+            [],
+            [{"kind": "admission_predictions", "proactive": True}],
+            [{"kind": "lint", "message": "lint failed"}],
+            [{"kind": "lint", "module": "TauCeti.Two"}],
+            [{"kind": "audit", "module": "TauCeti.Two"}],
+            [{"kind": "build", "module": "TauCeti.Two", "message": "build failed"}],
+            [{"kind": "compiler", "module": "TauCeti.Two", "message": "unknown identifier"}],
+        ):
+            with self.subTest(diagnostics=diagnostics):
+                task.diagnostics = diagnostics
+                self.assertFalse(repair_task.known_check_failures(task))
+        lint = {"kind": "lint", "module": "TauCeti.Two", "message": "simpNF: two"}
+        task.diagnostics = [lint]
+        self.assertTrue(repair_task.known_check_failures(task))
+        task.diagnostics.append({"kind": "compiler", "module": "TauCeti.Three", "message": "broken"})
+        self.assertFalse(repair_task.known_check_failures(task), "compiler discovery still collects all failures")
+        task.diagnostics = [{"kind": "audit", "module": "TauCeti.Two", "message": "disallowed axiom in two"}]
+        self.assertTrue(repair_task.known_check_failures(task))
+        for kind in ("prepare", "pre_rebase", "rebase_conflict"):
+            task.kind = kind
+            task.diagnostics = [lint]
+            self.assertFalse(repair_task.known_check_failures(task))
+
+
 class StreamAudits(WorkerAudits):
     """A green streaming build runs the checks before the agent starts and lists their findings."""
 
