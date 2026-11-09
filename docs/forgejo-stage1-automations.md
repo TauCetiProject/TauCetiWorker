@@ -24,6 +24,9 @@ release on GitHub. Enumerate every transitive workflow/action reference before
 fencing local helpers: a workflow still used by an approved caller must remain
 available. Supporting Tools/Review/Roadmap repositories are outside this source
 repository's workflow fence.
+Any supporting-repository job that writes or authorizes changes to the migrated
+source must also be fenced. Keeping its Git hosting does not make it a source
+authority after cutover.
 
 | Existing workflow files | Stage 1 disposition and replacement |
 | --- | --- |

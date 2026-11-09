@@ -214,7 +214,7 @@ promote and complete the relevant Stage 2 prerequisites before this operation.
    After their paid work is settled, disable the installed repair units
    `tauceti-queue-repair.service`, `tauceti-queue-repair@2.service`, and
    `tauceti-queue-repair@3.service` on their actual hosts. Fence the workflow
-   backstop and classify/disable installed source-writing workflows including
+   backstop and classify/disable installed source-related workflows including
    `update.yml`, `update-upstreams.yml`, `toolchain-tags.yml`, `auto-merge.yml`,
    `merge-sweep.yml`, `merge-only.yml`, `deprecated-prs.yml`, `merge-conflicts.yml`,
    `housekeeping.yml`, and `progress-merge.yml`. Keep the old `tau-ceti-bors`
@@ -242,6 +242,24 @@ promote and complete the relevant Stage 2 prerequisites before this operation.
    retained candidate refs. Set GitHub main protections to permit the intended
    mirror App, and remove obsolete writers/exceptions after the reviewed bootstrap.
    Confirm that a writable contributor cannot update either protected source ref.
+
+   Install the mirror App exception before removing the temporary GitHub bootstrap
+   writer. Require admin enforcement and a nonempty App-only push allowlist: no
+   human users or teams, and exactly the approved mirror App. An empty actor list
+   is not a verified deny-all policy: the isolated negative test allowed the
+   administrator to push even with `enforce_admins` enabled. Read effective settings
+   with an administrator credential, separately from the CI observer:
+
+   ```sh
+   gh api --hostname github.com \
+     "repos/$execution_owner/$execution_name/branches/main/protection" \
+     --jq '{enforce_admins:.enforce_admins.enabled,users:[.restrictions.users[].login],teams:[.restrictions.teams[].slug],apps:[.restrictions.apps[].slug]}'
+   ```
+
+   In the isolated rehearsal, verify actual main push refusal for the dispatcher
+   and observer and unchanged main tips. A settings read, an empty allowlist, or
+   a Git dry run is insufficient. Keep this gate incomplete until the App-only
+   policy has passed; do not call the temporary bootstrap configuration ready.
 5. Confirm the mirror App is installed on the exact execution repository and can
    mint the scoped `contents: write`/`workflows: write` token. Set `mirror_main: true`
    and confirm the equal bootstrap tips:
