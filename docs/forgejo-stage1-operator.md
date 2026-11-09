@@ -312,9 +312,27 @@ The CI and mirror permission subsets can come from the same App installation;
 they are not different GitHub App identities. App-level branch exceptions apply
 to both in App CI mode. Workflow CI mode uses GitHub's native job token, which can
 be excluded from the mirror App's main exception. For an unattended mirror, a
-read-scoped Forgejo token for an allowlisted account is sufficient: `mirror` checks
-source identity and retained promotion evidence but does not require source push
-permission. Human acceptance and promotion commands still require source write
-access. Scope the separate mirror profile's source token accordingly. Keep its
-`reviewer_ids` identical to the human operator profile: both use the same ledger,
-and changing that list rotates acceptance authority even for a mirror-only run.
+dedicated read-only Forgejo account should be listed in the optional
+`mirror_actor_ids` profile field. Specifying this nonempty field makes the profile
+mirror-only, and its native IDs must be distinct from `reviewer_ids`. The profile
+can confirm/repair the mirror but cannot prepare
+acceptance, hand off or dispatch CI, abandon a request, or promote source work,
+even if its repository metadata reports push permission or its token was
+accidentally replaced by a human reviewer's token. Use a human profile without
+`mirror_actor_ids` for acceptance/promotion; it can still mirror automatically.
+
+Give the dedicated account no repository write role and mint a read-scoped token.
+Repository permission metadata can describe account-level permissions rather than
+the token's scope; a human reviewer's read-scoped token is not a separate mirror
+identity. Create the human ledger first. Mirror-only sessions check their actors
+against its authoritative current reviewer list and refuse overlap. They never
+rewrite that list or journal reviewer rotation from a stale scheduled profile.
+Keep the profile's `reviewer_ids` current for clarity; human sessions alone rotate
+acceptance authority.
+For example, with native human reviewer `123` and dedicated mirror reader `456`,
+both profiles have `"reviewer_ids": [123]`; the scheduled profile additionally has
+`"mirror_actor_ids": [456]` and uses reader `456`'s token file.
+
+Profiles, ledger, clone, and App files remain trusted operator-host state. These
+command roles do not isolate untrusted code running as the same OS user. Candidate
+execution must never receive that host state or either source token.
