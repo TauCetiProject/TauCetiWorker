@@ -1858,10 +1858,15 @@ def run_task(
     resume_state: TaskState | None = None,
     stop: Stop | None = None,
 ) -> dict:
+    from tauceti_queue.repair_cache import before_task, cache_lease, task_cache
     from tauceti_queue.repair_cleanup import worktree_lease
 
     require_task_execution(cfg=cfg, task=task)
-    with worktree_lease(cfg.root, task.task_id):
+    cache_root = task_cache(cfg.root, task.task_id)
+    cache_cleanup = before_task(cache_root)
+    if cache_cleanup["state"] != "busy":
+        log(f"repair cache retention: {json.dumps(cache_cleanup, sort_keys=True)}")
+    with cache_lease(cache_root), worktree_lease(cfg.root, task.task_id):
         return _run_task(cfg, task, client, resume_state=resume_state, stop=stop)
 
 
@@ -1965,7 +1970,9 @@ def _run_task(
         state.write("claimed", worker=cfg.worker, service=cfg.service, resumed=resuming)
         if task.repository != cfg.repository:
             verify_admin(task.repository)
-        env_lake = repair.lake_env(cfg.root)
+        from tauceti_queue.repair_cache import task_cache
+
+        env_lake = repair.lake_env(cfg.root, cache_root=task_cache(cfg.root, task.task_id))
         repair_publish.configure(env_lake, cfg.publish)
         if not resuming:
             try:

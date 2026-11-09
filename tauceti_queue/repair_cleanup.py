@@ -2,7 +2,8 @@
 
 Worker attempts and publishers hold shared per-task leases; collection takes an exclusive lease.
 The lease files live outside disposable worktrees and are never unlinked. Unknown queue state,
-active claims, and live owners preserve the tree. Logs, task records, Git refs and caches are kept.
+active claims, and live owners preserve the tree. Idle caches retain bounded recent snapshots.
+Logs, task records and Git refs are kept.
 """
 
 from __future__ import annotations
@@ -148,8 +149,22 @@ def main() -> int:
     results = collect(
         Path(config["database"]), Path(config["clone"]), [Path(p) for p in config["roots"]], apply=args.apply
     )
-    print(json.dumps({"apply": args.apply, "worktrees": results}), flush=True)
-    return int(any(row["state"] == "error" for row in results))
+    from tauceti_queue import repair_cache
+
+    roots = [Path(p) for p in config["roots"]]
+    migrations = []
+    if config.get("cache_root"):
+        shared = Path(config["cache_root"])
+        migrations = repair_cache.migrate(Path(config["database"]), roots, shared, apply=args.apply)
+        cache_roots = [shared]
+    else:
+        cache_roots = roots
+    caches = repair_cache.collect(Path(config["database"]), cache_roots, apply=args.apply)
+    print(
+        json.dumps({"apply": args.apply, "worktrees": results, "caches": caches, "cache_migrations": migrations}),
+        flush=True,
+    )
+    return int(any(row["state"] == "error" for row in [*results, *caches, *migrations]))
 
 
 if __name__ == "__main__":
