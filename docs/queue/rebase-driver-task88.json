@@ -1,0 +1,118 @@
+{
+  "schema": "tauceti.rebase-replay/v1",
+  "oracle": "recorded adopted per-member trees",
+  "base": "e583e15d3be177d86491854d1db508f6edfe5ee7",
+  "input_tip": "a700b48d2fc2dca5131ce1e99822b5852dad8fd8",
+  "target": "d92acc5c0393646e14960dfd4972fc836aad3ebe",
+  "reference": "7ca783d4c8d324c9c74efaacd641c8a40f69f284",
+  "members": 349,
+  "git_conflicts": 37,
+  "clean_matches": 298,
+  "recorded_corrections": 14,
+  "restarts": 13,
+  "corrections": [
+    {
+      "source_pr": "TauCetiProject/TauCeti#32705",
+      "paths": [
+        "TauCeti/Analysis/Calculus/FDeriv/Measurable.lean"
+      ]
+    },
+    {
+      "source_pr": "TauCetiProject/TauCeti#32158",
+      "paths": [
+        "TauCeti/Geometry/Lie/CliffordAlgebra/Spin/Manifold.lean"
+      ]
+    },
+    {
+      "source_pr": "TauCetiProject/TauCeti#32356",
+      "paths": [
+        "TauCeti/MeasureTheory/Measure/IntegerValued/Selection.lean"
+      ]
+    },
+    {
+      "source_pr": "TauCetiProject/TauCeti#30594",
+      "paths": [
+        "TauCeti/Probability/Renewal/Countdown/Period.lean"
+      ]
+    },
+    {
+      "source_pr": "TauCetiProject/TauCeti#32365",
+      "paths": [
+        "TauCeti/Geometry/Manifold/Immersion/Interior.lean"
+      ]
+    },
+    {
+      "source_pr": "TauCetiProject/TauCeti#30483",
+      "paths": [
+        "TauCeti/FieldTheory/FunctionField/Examples/FierceBiquadratic.lean"
+      ]
+    },
+    {
+      "source_pr": "TauCetiProject/TauCeti#30064",
+      "paths": [
+        "TauCeti/CategoryTheory/Monoidal/Presentation.lean"
+      ]
+    },
+    {
+      "source_pr": "TauCetiProject/TauCeti#29059",
+      "paths": [
+        "TauCeti/RingTheory/Almost/Projective.lean"
+      ]
+    },
+    {
+      "source_pr": "TauCetiProject/TauCeti#32206",
+      "paths": [
+        "TauCeti/Probability/BrownianMotion/Integral/Integrable.lean"
+      ]
+    },
+    {
+      "source_pr": "TauCetiProject/TauCeti#30131",
+      "paths": [
+        "TauCeti/Analysis/Distribution/TestFunction/TensorDensity.lean"
+      ]
+    },
+    {
+      "source_pr": "TauCetiProject/TauCeti#31794",
+      "paths": [
+        "TauCeti/Probability/BrownianMotion/Integral/Measure.lean",
+        "TauCeti/Probability/Process/Predictable/Basic.lean",
+        "TauCeti/Probability/Process/Predictable/Measure.lean"
+      ]
+    },
+    {
+      "source_pr": "TauCetiProject/TauCeti#32328",
+      "paths": [
+        "TauCeti/Probability/Process/AccumulatedEnergy.lean"
+      ]
+    },
+    {
+      "source_pr": "TauCetiProject/TauCeti#31928",
+      "paths": [
+        "TauCeti/CategoryTheory/GradedObject/VecTwisted.lean"
+      ]
+    },
+    {
+      "source_pr": "TauCetiProject/TauCeti#29087",
+      "paths": [
+        "TauCeti/Algebra/Category/FiniteHopfModuleCat/FDRep.lean"
+      ]
+    }
+  ],
+  "every_member_tree_matches": true,
+  "final_tree_matches": true,
+  "seconds": 272.802,
+  "validation": {
+    "ok": true,
+    "members": 349,
+    "tip": "14dfb47904c9bf7f529eec80139d395bcd637435",
+    "errors": [],
+    "lean_validation": "not run by this experimental Git driver"
+  },
+  "agent_inference": "not run; timing does not measure fresh agent performance",
+  "lean_validation": "not run; reference adoption is not proof of a passing build",
+  "scratch_repo_retained": false,
+  "task_id": 88,
+  "batch_id": 391,
+  "timing_scope": "Replay and Git checks; excludes clone setup and agent inference.",
+  "restarts_scope": "Driver instances recreated from checkpoint every 25 members."
+}

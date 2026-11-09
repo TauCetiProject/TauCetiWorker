@@ -53,6 +53,9 @@ checkout (`Config.resolve().checkout`, the path `agents.prepare_checkout` mainta
 checkpoints and logs (`tasks/<task_id>/`), the private worktrees (`worktrees/task-<task_id>`), the
 private Lake artifact pool (`lake-cache/`, `lake.toml`) and the agent's isolated Claude config.
 
+The opt-in [experimental rebase driver](rebase-driver.md) separates local Git replay from
+conflict resolution and can replay an adopted task offline. It is not connected to this runner.
+
 ## Task protocol
 
 The semantics are the controller's (`tauceti_queue/controller.py`, `docs/queue/controller.md`,

@@ -151,6 +151,7 @@ RUN_STDLIB=(
   quota_wakeups.py
   quota_shared_usage.py
   queue_chain.py
+  queue_rebase_driver.py
   queue_commands.py
   queue_github_adapter.py
   queue_feeds.py
