@@ -1,5 +1,10 @@
 # Forgejo preparation: execution record
 
+The current delivery order and completion gates are in [GOAL.md](../GOAL.md):
+Stage 1 prepares the earliest human-operated migration; Stage 2 completes the
+remaining autonomous integration. The [Stage 1 operator commands](forgejo-stage1-operator.md)
+reuse the existing queue request ledger and exact-candidate CI path.
+
 Tracker: [Worker #602](https://github.com/TauCetiProject/TauCetiWorker/issues/602).
 Accepted architecture and ordered work packages:
 [TauCetiTools preparation document](https://github.com/TauCetiProject/TauCetiTools/blob/8f30faab8f3545ce688c199c34efa780c0603111/docs/forgejo-preparation.md).

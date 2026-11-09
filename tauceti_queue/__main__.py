@@ -145,6 +145,10 @@ class Service:
         self.config.database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         opener = getattr(module, "open", None) or module.Store
         self.store = opener(self.config.database)
+        if self.store.get_setting("queue:operating-mode") == "stage1-operator":
+            self.store.close()
+            self.store = None
+            raise ValueError("Stage 1 operator ledger cannot be opened by the queue service")
 
     def open_github(self) -> None:
         if self.native is not None:

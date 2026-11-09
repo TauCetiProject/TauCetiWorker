@@ -29,6 +29,7 @@ import dataclasses
 import json
 import os
 import pathlib
+import re
 import ssl
 import threading
 import time
@@ -102,6 +103,29 @@ class AppCredentials:
         return cls(
             app_id=app_id, slug=slug, installation_id=installation_id, private_key_pem=pem, webhook_secret=secret
         )
+
+
+def load_execution_credentials(directory):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from tauceti_tools.ci_candidate import read_json
+
+    from .control_policy_file import read_control_policy
+
+    directory = pathlib.Path(directory)
+    metadata = read_json(read_control_policy(directory / "github-app.json"), max_bytes=128 * 1024)
+    if (
+        not isinstance(metadata, dict)
+        or any(type(metadata.get(key)) is not int or metadata[key] <= 0 for key in ("id", "installation_id"))
+        or not isinstance(metadata.get("slug"), str)
+        or re.fullmatch(r"[A-Za-z0-9_-]{1,100}", metadata["slug"]) is None
+    ):
+        raise ValueError("invalid execution App metadata")
+    key = read_control_policy(directory / "github-private-key.pem")
+    if not isinstance(serialization.load_pem_private_key(key, password=None), rsa.RSAPrivateKey):
+        raise ValueError("invalid execution App key")
+    # The execution App only dispatches CI. Native ingress uses its own secret.
+    return AppCredentials(metadata["id"], metadata["slug"], metadata["installation_id"], key, b"")
 
 
 def _b64url(data: bytes) -> str:

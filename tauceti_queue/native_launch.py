@@ -20,7 +20,8 @@ from . import config as configuration
 from .control_policy_file import MAX_POLICY_BYTES, read_control_policy
 from .forgejo_source import NativePublishers
 from .github_adapter import UrllibTransport
-from .github_app import AppCredentials, InstallationTokenSource
+from .github_app import InstallationTokenSource
+from .github_app import load_execution_credentials as _execution_credentials
 from .native_bootstrap import NativeBootstrap
 from .source_authority import QueueControlPolicy
 
@@ -94,25 +95,6 @@ def _publishers(value, source):
             raise ValueError("invalid native publisher identities")
         roles[role] = frozenset(PrincipalRef(source.repository.forge, str(number)) for number in ids)
     return NativePublishers(source, **roles, generation=value["generation"])
-
-
-def _execution_credentials(directory):
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-
-    metadata = _read_json(directory / "github-app.json")
-    if (
-        not isinstance(metadata, dict)
-        or any(type(metadata.get(key)) is not int or metadata[key] <= 0 for key in ("id", "installation_id"))
-        or not isinstance(metadata.get("slug"), str)
-        or re.fullmatch(r"[A-Za-z0-9_-]{1,100}", metadata["slug"]) is None
-    ):
-        raise ValueError("invalid execution App metadata")
-    key = read_control_policy(directory / "github-private-key.pem")
-    if not isinstance(serialization.load_pem_private_key(key, password=None), rsa.RSAPrivateKey):
-        raise ValueError("invalid execution App key")
-    # The execution App only dispatches CI. Native ingress uses its own secret.
-    return AppCredentials(metadata["id"], metadata["slug"], metadata["installation_id"], key, b"")
 
 
 @dataclass(frozen=True)
