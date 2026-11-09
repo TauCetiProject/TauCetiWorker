@@ -36,6 +36,7 @@ class NativeCLI(unittest.TestCase):
             admin.request("PUT", f"repos/{repository.name}/collaborators/queue", {"permission": "admin"})
             api = Forgejo(repository.forge, token=tokens["queue"])
             reviewer = Forgejo(repository.forge, token=tokens["reviewer"])
+            operator_id = Forgejo(repository.forge, token=tokens["operator"]).current_user()["id"]
             source = RepositoryIdentity(repository, row["id"])
             project = (
                 launch_fixtures.CONFIG.replace(b"https://source.example", repository.forge.url.encode()).replace(
@@ -68,6 +69,8 @@ class NativeCLI(unittest.TestCase):
             fixture.write(fixture.root / "git-token", tokens["queue"])
             control = QueueControlPolicy(source, frozenset({control_token_fingerprint(source, tokens["operator"])}))
             fixture.write(fixture.control, json.dumps(control.record()))
+            operator_file = fixture.root / "operator-control-token"
+            fixture.write(operator_file, tokens["operator"])
             fixture.row.update(
                 queue_configuration_sha256=hashlib.sha256(runtime).hexdigest(),
                 project_configuration_sha256=hashlib.sha256(project).hexdigest(),
@@ -108,6 +111,7 @@ raise SystemExit(main(['serve','--native-launch',sys.argv[3]]))
                 TAUCETI_QUEUE_CONFIG="/missing/ambient-credentials",
                 TAUCETI_GITHUB_STATE_URL="https://github-state.taucetiproject.org",
             )
+            saved_setting = None
             for _restart in range(2):
                 process = subprocess.Popen(
                     [sys.executable, "-c", code, repository.forge.url, str(blocked), str(fixture.path)],
@@ -133,6 +137,57 @@ raise SystemExit(main(['serve','--native-launch',sys.argv[3]]))
                         self.assertEqual(status["service"]["execution_repository"], approved.execution.record())
                         self.assertFalse(status["service"]["publication_enabled"])
                         self.assertFalse(status["settings"]["publication_enabled"])
+                        if saved_setting is not None:
+                            self.assertEqual(status["settings"]["insertion_age_window"], saved_setting)
+                        desired = int(status["settings"]["insertion_age_window"]) + 1
+                        operator = subprocess.run(
+                            [
+                                sys.executable,
+                                "-m",
+                                "tauceti_queue",
+                                "settings",
+                                "--url",
+                                f"http://127.0.0.1:{port}",
+                                "set",
+                                "insertion_age_window",
+                                str(desired),
+                                "--token-file",
+                                str(operator_file),
+                            ],
+                            cwd=Path(__file__).resolve().parents[1],
+                            env=dict(env, GITHUB_TOKEN="wrong-github-token"),
+                            capture_output=True,
+                            text=True,
+                            timeout=20,
+                        )
+                        self.assertEqual(operator.returncode, 0, operator.stderr[-1200:])
+                        result = json.loads(operator.stdout)
+                        self.assertEqual(result["actor"], f"{repository.forge.key}/users/{operator_id}")
+                        self.assertEqual(result["settings"]["insertion_age_window"], desired)
+                        self.assertFalse(result["settings"]["publication_enabled"])
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=5) as response:
+                            observed = json.load(response)
+                        self.assertEqual(observed["settings"]["insertion_age_window"], desired)
+                        saved_setting = desired
+                        fixture.write(operator_file, tokens["queue"])
+                        negative_args = list(operator.args)
+                        negative_args[negative_args.index("insertion_age_window") + 1] = str(desired + 1)
+                        refused_operator = subprocess.run(
+                            negative_args,
+                            cwd=Path(__file__).resolve().parents[1],
+                            env=env,
+                            capture_output=True,
+                            text=True,
+                            timeout=20,
+                        )
+                        self.assertEqual(refused_operator.returncode, 1)
+                        self.assertIn("HTTP 403", refused_operator.stderr)
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/status", timeout=5) as response:
+                            self.assertEqual(json.load(response)["settings"]["insertion_age_window"], desired)
+                        fixture.write(operator_file, tokens["operator"])
+                        for token in tokens.values():
+                            self.assertNotIn(token, operator.stdout + operator.stderr)
+                            self.assertNotIn(token, refused_operator.stdout + refused_operator.stderr)
                         for token in tokens.values():
                             self.assertNotIn(token, json.dumps(status))
                         self.assertIsNone(status["feeds"])

@@ -79,9 +79,26 @@ It reports `feeds: null`: GitHub compatibility feeds reject native requests with
 Dispatch requires the pinned workflow revision to remain the execution default
 branch tip; a push there requires a new approved profile and service restart.
 
-Operator commands (`settings`, `import-bors`, `reconcile-approvals`) still select
-GitHub credentials. They are not native administration interfaces; native
-token-file selection and recovery commands remain activation prerequisites.
+For native settings, provision a dedicated source-bound control bearer in the
+control policy, separately from publication credentials. The bearer must still
+have current source repository admin permission. Use a checked private token file
+and an explicit queue origin:
+
+```sh
+tauceti-queue settings --url https://isolated-queue.example set publication_enabled false --token-file /absolute/private/operator-token
+```
+
+`--token-file` requires HTTPS (HTTP is allowed on loopback), bypasses inherited
+HTTP proxies, refuses redirects,
+and never discovers a token from the environment or `gh`. Its file uses the same
+private reader as launch inputs: absolute path, private user-owned parent (0700),
+and a user-owned file of mode 0400/0600. It is mutually exclusive with `--token`.
+HTTP failures report the status code without echoing response bodies. File
+ownership/mode failures report the checked reader's local diagnostic.
+Ordinary commands without `--token-file` retain their GitHub token selection.
+The option is also accepted by `import-bors` and `reconcile-approvals` for GitHub
+operators, but those endpoints still reject native requests. Native recovery
+hold/list/clear commands and restore reconciliation remain activation prerequisites.
 
 Run `python tests/queue_native_launch.py` for file/binding/CLI checks.
 `tests/integration_forgejo_native_launch.py` starts and restarts the actual CLI on
