@@ -196,6 +196,16 @@ class ReviewAttribution(unittest.TestCase):
             self.assertEqual(len(records), 1)
             self.assertEqual((records[0]["mode"], records[0]["ran"]), ("unknown", []))
 
+    def test_a_commit_review_can_also_publish_a_contest_reply(self):
+        counts = sizing.review_counts(
+            [
+                dict(at=1, pr=7, head="head", mode="commit", ran=["reuse"], threads={"reuse:reply": 99}),
+            ],
+            0,
+            2,
+        )
+        self.assertEqual(counts["contest_operations"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

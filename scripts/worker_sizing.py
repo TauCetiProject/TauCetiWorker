@@ -309,7 +309,9 @@ def review_counts(records, start, end):
         published_operations=len(selected),
         distinct_pr_heads=len(heads),
         repeated_operations=len(selected) - len(heads),
-        contest_operations=sum(r["mode"] == "reply" for r in selected),
+        contest_operations=sum(
+            r["mode"] == "reply" or any(key.endswith(":reply") for key in r.get("threads", {})) for r in selected
+        ),
         unclassified_operations=sum(r["mode"] == "unknown" for r in selected),
         inference_operations=len(inferred),
         rubric_inferences=sum(len(r["ran"]) for r in inferred.values()),
@@ -688,7 +690,7 @@ def report(directory, samples=None):
             0.055,
             0.12,
             f"Archived reviews: {counts['published_operations']} published operations / {counts['distinct_pr_heads']} distinct PR-heads; "
-            f"{counts['repeated_operations']} repeats (not all waste); {counts['contest_operations']} contest-mode operations. "
+            f"{counts['repeated_operations']} repeats (unclassified); {counts['contest_operations']} contest/reply operations. "
             f"Snapshot {time.strftime('%H:%M UTC', time.gmtime(review_snapshot['at']))}.",
             fontsize=7,
         )
