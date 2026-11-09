@@ -4,6 +4,7 @@
 import json
 import multiprocessing
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -475,13 +476,31 @@ gh: API rate limit exceeded
                 read.assert_not_called()
                 launch.assert_not_called()
 
-    # Host engine compatibility retains jq's compact/raw output and forces a live ownership read.
-    with patch.object(GitHub, "issue_comments", return_value=[{"id": 2, "body": "hello"}]) as comments:
-        p = tr.migrated_history(
-            ["api", "--paginate", "--jq", ".[] | @json", "/repos/org/repo/issues/7/comments?per_page=100"]
-        )
-        if p is not None:  # jq is optional; absent jq uses the untouched CLI path.
-            assert p.returncode == 0 and json.loads(p.stdout)["id"] == 2
+    # The actual facade must retain shared reads, including forced discovery and
+    # the engine's scoreboard/contest histories. No direct requests/pages/retries.
+    assert shutil.which("jq"), "jq is required to verify the review-history bridge"
+    mirror = [{"id": 2, "node_id": "node-2", "body": "hello"}]
+    shared_calls = []
+
+    def shared_history(repo, operation, **args):
+        assert not tr.direct_reads()
+        shared_calls.append((repo, operation, args))
+        return True, mirror
+
+    with (
+        patch("tauceti_worker.github_state.read", side_effect=shared_history),
+        patch.object(GitHub, "_issue_comments", side_effect=AssertionError("unexpected live issue history")),
+        patch.object(GitHub, "_review_comments", side_effect=AssertionError("unexpected live review history")),
+    ):
+        for endpoint in ("issues", "pulls"):
+            for projection in (".[]", ".[] | @json"):
+                p = tr.migrated_history(
+                    ["api", "--paginate", "--jq", projection, f"/repos/org/repo/{endpoint}/7/comments?per_page=100"]
+                )
+                assert p is not None and p.returncode == 0 and json.loads(p.stdout) == mirror[0]
+        with tr.read_context(fresh=True):
+            assert GitHub("org/repo").issue_comments(7) == mirror
+        assert len(shared_calls) == 5
         assert tr.migrated_history(["api", "-X", "POST", "/repos/org/repo/issues/7/comments?per_page=100"]) is None
 
 print("PASS: shared cache, complete GraphQL histories, endpoint accounting and exhaustion")
