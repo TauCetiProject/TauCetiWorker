@@ -51,6 +51,8 @@ def task_cache(root: Path, task_id: str | int) -> Path:
     if not re.fullmatch(r"[1-9][0-9]*", str(task_id)):
         raise ValueError("cache bindings require a controller task ID")
     binding = root / "tasks" / str(task_id) / "cache-root.json"
+    if binding.is_symlink():
+        raise ValueError("symlink task cache binding")
     if binding.exists():
         return Path(_record(binding)["root"])
     configured = os.environ.get("TAUCETI_QUEUE_CACHE_ROOT")
@@ -133,10 +135,22 @@ def _mapping(path: Path) -> dict[str, set[str]]:
     return entries
 
 
-def _busy(store, root: Path, now: float) -> bool:
-    trees = root / "worktrees"
-    if trees.is_symlink() or (trees.exists() and any(trees.iterdir())):
+def _uses_cache(worker_root: Path, task_id: str, cache_root: Path | None) -> bool:
+    if cache_root is None or worker_root == cache_root:
         return True
+    binding = worker_root / "tasks" / task_id / "cache-root.json"
+    # Pre-migration attempts have no binding and use their own private pool.
+    return binding.exists() and Path(_record(binding)["root"]) == cache_root
+
+
+def _busy(store, root: Path, now: float, *, cache_root: Path | None = None) -> bool:
+    trees = root / "worktrees"
+    if trees.is_symlink():
+        return True
+    for tree in trees.iterdir() if trees.exists() else ():
+        match = re.fullmatch(r"task-([1-9][0-9]*)(?:-[A-Za-z0-9_.-]+)?", tree.name)
+        if not match or _uses_cache(root, match[1], cache_root):
+            return True
     tasks = root / "tasks"
     if tasks.is_symlink():
         return True
@@ -148,9 +162,11 @@ def _busy(store, root: Path, now: float) -> bool:
         if store is not None
         else set()
     )
-    if any((tasks / task_id).exists() for task_id in claimed):
+    if any((tasks / task_id).exists() and _uses_cache(root, task_id, cache_root) for task_id in claimed):
         return True
     for publication in _files(tasks, "*/logs/publish.json"):
+        if not _uses_cache(root, publication.parent.parent.name, cache_root):
+            continue
         record = _record(publication)
         if record.get("state") == "running" and now - float(record.get("started_at", now)) < 120:
             return True
@@ -262,7 +278,7 @@ def collect(
             result = {"root": str(root)}
             try:
                 with cache_lease(root, exclusive=True) as acquired:
-                    if not acquired or any(_busy(store, source, now) for source in participants(root)):
+                    if not acquired or any(_busy(store, source, now, cache_root=root) for source in participants(root)):
                         result["state"] = "busy"
                     else:
                         result.update(_collect(root, apply=apply, now=now, max_bytes=max_bytes, max_age=max_age))
@@ -282,7 +298,7 @@ def before_task(root: Path) -> dict:
     result = {"root": str(root)}
     try:
         with cache_lease(root, exclusive=True) as acquired:
-            if not acquired or any(_busy(None, source, time.time()) for source in participants(root)):
+            if not acquired or any(_busy(None, source, time.time(), cache_root=root) for source in participants(root)):
                 result["state"] = "busy"
             else:
                 result.update(_collect(root, apply=True, now=time.time(), max_bytes=MAX_BYTES, max_age=MAX_AGE))
@@ -304,6 +320,9 @@ def migrate(database: Path, roots: list[Path], shared: Path, *, apply=False) -> 
             try:
                 if shared.resolve() == root.resolve():
                     raise ValueError("shared cache root must be separate from worker task roots")
+                origin, destination = (root / "lake-cache").resolve(), (shared / "lake-cache").resolve()
+                if origin == destination or origin in destination.parents or destination in origin.parents:
+                    raise ValueError("legacy and shared cache directories must not overlap")
                 register(shared, root)
                 with cache_lease(root, exclusive=True) as acquired:
                     if not acquired or _busy(store, root, time.time()):
@@ -328,10 +347,18 @@ def migrate(database: Path, roots: list[Path], shared: Path, *, apply=False) -> 
                         result.update(state="migrated" if apply else "eligible", files=len(paths))
                         if apply:
                             with cache_lease(shared):
+                                checked = {shared}
                                 for path in paths:
                                     target = shared / "lake-cache" / path.relative_to(source)
-                                    target.parent.mkdir(parents=True, exist_ok=True)
-                                    if target.is_symlink() or target.parent.is_symlink():
+                                    parent = shared
+                                    for component in target.relative_to(shared).parts[:-1]:
+                                        parent /= component
+                                        if parent not in checked:
+                                            if parent.is_symlink():
+                                                raise ValueError(f"symlink shared cache directory: {parent}")
+                                            parent.mkdir(exist_ok=True)
+                                            checked.add(parent)
+                                    if target.is_symlink():
                                         raise ValueError(f"symlink shared cache entry: {target}")
                                     try:
                                         os.link(path, target)

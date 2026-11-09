@@ -268,6 +268,20 @@ class Retention(unittest.TestCase):
         self.assertEqual(self.collect()["snapshots_retained"], 1)
         self.assertTrue(payload.exists())
 
+    def test_shared_collection_excludes_only_owners_of_that_pool(self):
+        legacy = self.root.parent / "legacy"
+        (legacy / "worktrees/task-3").mkdir(parents=True)
+        cache.register(self.root, legacy)
+        payload = self.artifact(1)
+        self.assertEqual(self.collect()["state"], "collected")
+        self.assertFalse(payload.exists(), "an active private pool cannot pin unrelated shared artifacts")
+        payload = self.artifact(1)
+        binding = legacy / "tasks/3/cache-root.json"
+        binding.parent.mkdir(parents=True)
+        binding.write_text(json.dumps({"root": str(self.root)}))
+        self.assertEqual(self.collect()["state"], "busy")
+        self.assertTrue(payload.exists())
+
     def test_migration_refuses_symlinks_without_deleting_source(self):
         source = self.artifact(1)
         outside = self.root.parent / "outside"
@@ -276,6 +290,24 @@ class Retention(unittest.TestCase):
         result = cache.migrate(self.database, [self.root], self.root.parent / "shared", apply=True)[0]
         self.assertEqual(result["state"], "error")
         self.assertTrue(source.exists())
+
+    def test_migration_refuses_overlapping_source_and_destination(self):
+        source = self.artifact(1)
+        shared = self.pool / "nested"
+        self.assertEqual(cache.migrate(self.database, [self.root], shared, apply=True)[0]["state"], "error")
+        self.assertTrue(source.exists())
+
+    def test_migration_does_not_follow_destination_ancestor_symlink(self):
+        source = self.artifact(1)
+        shared = self.root.parent / "shared"
+        shared.mkdir()
+        outside = self.root.parent / "outside"
+        outside.mkdir()
+        (shared / "lake-cache").symlink_to(outside, target_is_directory=True)
+        result = cache.migrate(self.database, [self.root], shared, apply=True)[0]
+        self.assertEqual(result["state"], "error")
+        self.assertTrue(source.exists())
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_old_object_and_extensionless_artifacts_are_collected(self):
         old_object = self.artifact(1, "o")
