@@ -382,6 +382,10 @@ class Controller:
         rng: random.Random | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
+        with store.transaction():
+            if store.get_setting("queue:operating-mode") not in {None, "controller"}:
+                raise ValueError("Stage 1 operator ledger cannot be opened by the autonomous controller")
+            store.set_setting("queue:operating-mode", "controller")
         self.store = store
         self.admission = None  # primary policy intake, attached by the service in policy mode
         self.source = github
