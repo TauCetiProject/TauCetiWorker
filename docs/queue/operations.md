@@ -32,6 +32,33 @@ pull request review, issue comment, status, check run, check suite, push, workfl
 the App with no webhook and discards the event subscription, so both are added on the App's settings
 page later (Public endpoint, step 7); the API can edit an App webhook but not create one.
 
+For the deployed **primary intake**, narrow the App subscriptions in
+[Permissions & events](https://github.com/organizations/TauCetiProject/settings/apps/tauceti-queue/permissions):
+first set **Checks** to **Read-only** (the live registration retained write access for the rehearsal
+tool, while production only reads checks). GitHub automatically subscribes Apps with Checks write
+access to check events. Then keep `pull_request`, `issue_comment`, `pull_request_review`, `push`, and
+`status`; deselect `check_run`, `check_suite`, and `workflow_run`. This prevents future rehearsals
+from publishing checks until write access is explicitly restored. The registration manifest above also supports legacy
+approval intake, which still needs the review App's check notifications. Primary intake uses published
+scoreboards and commit statuses; candidate CI is also polled. GitHub's App webhook REST configuration
+can change the URL/secret/content type, but does not expose the event subscriptions. Event types are
+selected in the App settings; the receiver filters branches, status contexts, labels and comment bodies.
+
+On November 9, those three CI event types accounted for about 94% of processed events between
+10:00 and noon AEDT. In primary mode the receiver now acknowledges them as `ignored` immediately
+after signature and repository validation, without admission work, a controller lock, journal writes,
+or GitHub I/O. It similarly filters branch pushes, irrelevant statuses/labels/title edits and prose.
+Relevant label changes, PR lifecycle events, scoreboard edits/deletions, human Bors commands and
+main pushes retain their existing handling. The `/status` webhook `ignored` counter exposes the drop.
+Controller lock release wakes one eligible waiter, preserving worker endpoint priority without
+broadcasting to every waiting webhook thread.
+
+Meaningful events still run synchronously. Further overload protection should persist those events
+before acknowledgement, process them with bounded workers and expose pending count/age, processing
+latency and failures independently of controller health. GitHub does **not** automatically redeliver
+failed webhooks. Polling reconciles missed state notifications; failed operator commands need explicit
+redelivery or resubmission. Do not depend on a 5xx response to cause a retry.
+
 After creation, generate a private key on the App's settings page and record it together with the
 App ID and slug:
 

@@ -756,7 +756,7 @@ class Handler(BaseHTTPRequestHandler):
         )
         try:
             disposition = self.server.receiver.handle(delivery)
-        except Exception:  # noqa: BLE001 - GitHub retries on 5xx; the failure is logged for the operator
+        except Exception:  # noqa: BLE001 - failed deliveries need explicit redelivery or reconciliation
             log.error("webhook %s %s failed:\n%s", delivery.event, delivery.delivery_id, traceback.format_exc())
             self._error(500, "delivery failed")
             return
