@@ -1010,6 +1010,7 @@ class PromptContext:
     instruction: str = AGENT_INSTRUCTION  # the plan's instruction; the service sends it with the task
     artifacts_cold: bool = False  # no warm artifacts: the agent's first build starts from nothing
     artifacts_reason: str | None = None  # ``prepare_artifacts``'s ``unavailable_reason`` when cold
+    check_findings_known: bool = False  # cached artifacts fetched; CI already supplied the failures
     listings_path: Path | None = None  # where the member listings and the check script are written
     shell_limit: int = SHELL_LIMIT_SECONDS  # what the prompt says about the foreground shell limit
     rebase_options: str = "--keep-empty --empty=keep --reapply-cherry-picks"  # the replay's git options
@@ -1443,6 +1444,19 @@ def _verification_section(
             "the original chain. Finish the rebase first, then build the resulting chain with "
             "`lake build --iofail` and judge it by its exit status; cached outputs are reused when their inputs "
             "still match. " + foreground + " " + CACHE_SENTENCE + " Do not use `--fail-fast`.",
+            *scoped,
+        ]
+    elif context.check_findings_known:
+        lines += [
+            "Artifacts were fetched into the cache without a discovery build or audit pass: CI already supplied "
+            "the located audit/lint findings above. Start by repairing those findings; do not repeat a whole-library "
+            "discovery pass before editing. Cached outputs may still need unpacking, and Lake checks their input traces. "
+            "Use the scoped build helper to check your edits, then run the whole-library `lake build --iofail` and "
+            "audits to validate the repaired chain. "
+            + foreground
+            + " "
+            + CACHE_SENTENCE
+            + " Do not use `--fail-fast`.",
             *scoped,
         ]
     else:

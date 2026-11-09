@@ -4749,6 +4749,10 @@ class KnownCheckRepairs(Fixture):
         self.assertTrue(outcome["verification"][0]["ok"])
         self.assertTrue((self.stub_dir / "audit-runs.log").exists(), "final audits must run")
         self.assertEqual(self.lake_calls().count("build --iofail"), 1, "only the final verification build")
+        prompt = self.agent_calls()[0]["prompt"]
+        self.assertIn("Start by repairing those findings", prompt)
+        self.assertIn("Cached outputs may still need unpacking", prompt)
+        self.assertNotIn("every module of this batch that compiled are already built", prompt)
         return outcome
 
     def test_known_lint_starts_agent_before_build_and_audits(self):

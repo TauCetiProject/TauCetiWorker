@@ -185,7 +185,8 @@ has a time budget holds because the service re-exposes the task.
    --rev=<revision>` into the private pool, then `lake build --iofail` at the tip, which restores every
    unchanged module and builds the batch's own modules and their dependents (for a repair with
    streaming on, the default, that build is the worker's background build described after this list,
-   and the preparation ends with the fetch). The artifacts come from
+   and the preparation ends with the fetch). Known audit/lint-only repairs also end preparation
+   with the fetch, starting inference before any build or audit discovery pass. The artifacts come from
    the newest revision the cache has: the revision the build runs on (`artifact_revisions` puts it
    first: a repair's `base`, a rebase conflict's `onto`), then its first-parent ancestors walking back
    up to `ARTIFACT_ANCESTORS` (50) commits, each asked with its own `lake cache get --rev=` until one

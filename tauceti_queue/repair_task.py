@@ -1281,6 +1281,7 @@ def prompt_context(
         ],
         artifacts_cold=cold,
         artifacts_reason=(artifacts or {}).get("unavailable_reason") if cold else None,
+        check_findings_known=known_check_failures(task),
         listings_path=listings,
         shell_limit=shell_limit,
         pre_rebased=pre_rebased(task) is not None,
