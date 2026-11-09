@@ -169,7 +169,11 @@ def run(root: Path) -> int:
                 )
                 record["lint"] = {k: v for k, v in lint.items() if k != "output"}
                 print(lint["output"], end="", flush=True)
-                if lint["rc"] or nonce not in lint["output"].splitlines():
+                if nonce not in lint["output"].splitlines():
+                    record.update(status="unavailable", reason="linter did not complete its report")
+                    print("targeted linter did not complete its report; return for worker verification", flush=True)
+                    return 1
+                if lint["rc"]:
                     return 1
             if findings["duplicates"]:
                 duplicates = audit._sandboxed(
