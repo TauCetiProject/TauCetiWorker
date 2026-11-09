@@ -1077,6 +1077,37 @@ def task_findings(task: Task) -> dict:
     return repair.findings_from_diagnostics(task.diagnostics)
 
 
+def known_check_failures(task: Task) -> bool:
+    """An audit/lint repair already has located findings for its frozen candidate.
+
+    Compiler failures still use discovery to collect independent failures. Predictions,
+    generic failed statuses and unlocated check messages are not actionable evidence.
+    This selects when inference starts; it never substitutes for final verification.
+    """
+    if task.kind != "repair":
+        return False
+    findings = task_findings(task)
+    if findings["compiler_errors"]:
+        return False
+
+    def located(value):
+        return isinstance(value, str) and (
+            value.startswith("TauCeti.") or value.startswith("TauCeti/") and value.endswith(".lean")
+        )
+
+    return (
+        any(located(f.get("path")) and f.get("declaration") for f in findings["lint"]["findings"])
+        or any(f.get("declaration") and f.get("modules") for f in findings["duplicate_declarations"])
+        or any(located(f.get("module")) and f.get("declaration") for f in findings["import_collisions"])
+        or any(
+            repair.DIAGNOSTIC_KINDS.get(f.get("kind")) == "audit"
+            and located(f.get("module"))
+            and f.get("message", "").strip()
+            for f in findings.get("other", [])
+        )
+    )
+
+
 def scope_only_repair(task: Task) -> bool:
     """A trusted scope-policy finding is not evidence that Lean needs an edit.
 
@@ -1864,7 +1895,12 @@ def _run_task(
     state.progress_outcome = outcome
     # A ``prepare`` task always streams: the streaming build is how it learns whether there is anything
     # to repair at all (the batch has not been tried, so the task carries no diagnostics).
-    streaming = (task.kind == "prepare" or (cfg.stream_repair and task.kind == "repair")) and not resuming
+    known_checks = known_check_failures(task)
+    streaming = (
+        task.kind == "prepare" or (cfg.stream_repair and task.kind == "repair" and not known_checks)
+    ) and not resuming
+    if known_checks:
+        outcome["pre_repair_discovery"] = "skipped: task already supplies located audit/lint findings"
     stream: repair_stream.StreamingBuild | None = None
     started = time.monotonic()
 
@@ -1961,7 +1997,7 @@ def _run_task(
                 lake=cfg.lake,
                 preferred=repair_publish.preferred(cfg.publish, task),
                 warm=repair_publish.warm(cfg.publish, task),
-                build=not streaming and task.kind not in repair.REBASE_KINDS,
+                build=not streaming and not known_checks and task.kind not in repair.REBASE_KINDS,
             )
             if artifacts.get("warm_attempts"):
                 warmed = artifacts.get("warmed_from") or []
@@ -1983,6 +2019,8 @@ def _run_task(
                 }
             }
             state.write("artifacts_ready" if artifacts["available"] else "artifacts_unavailable", artifacts=artifacts)
+            if known_checks:
+                log(f"task {task.task_id}: using the task's audit/lint findings; verification follows the repair")
             if stopping() and not lease.lost.is_set():
                 return cancelled("the worker stopped while the artifacts were prepared")
             if not artifacts["available"]:

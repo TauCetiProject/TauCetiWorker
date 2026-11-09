@@ -390,6 +390,16 @@ has a time budget holds because the service re-exposes the task.
    `refs/tauceti-queue/task/<id>/attempt-<n>` in the clone, and `tasks/<id>/outcome.json` holds the
    outcome record.
 
+**Known audit/lint findings.** When a repair task already carries located audit or lint
+findings for its frozen candidate, and no compiler errors, the worker fetches the warm artifacts
+and starts the agent directly. It skips both the sequential preparation build and streaming
+build/audit discovery, even under `--no-stream-repair`. The task's findings and ownership context
+are supplied in the prompt. This avoids waiting for another whole-library lint pass to rediscover
+the failures that created the task. Final build and audit verification still runs before submission;
+remaining failures go back to the agent or prevent submission. Predictions, unlocated messages,
+generic failed statuses, compiler failures, preparations and rebases keep their existing flows.
+The outcome records this choice as `pre_repair_discovery`.
+
 **Repair while the build still streams** (`tauceti_queue/repair_stream.py`; setting
 `TAUCETI_QUEUE_STREAM_REPAIR`, default on, and `--no-stream-repair`). The first production repair spent
 its whole first `lake build --iofail` pass collecting errors before touching anything, so for a repair
@@ -411,8 +421,8 @@ the build under `stream_build`. The agent's final whole-library `lake build --io
 is still the only verdict. A build still running when the task ends or is interrupted is stopped and
 its lock removed. Rebase-conflict and pre-rebase tasks fetch caches and go directly to the agent,
 which finishes the replay before building the resulting chain. Resumed tasks continue their agent
-session. `--no-stream-repair` keeps ordinary repairs sequential: the preparation's own incremental
-build, then the agent.
+session. For repairs without known audit/lint findings, `--no-stream-repair` keeps the sequential
+flow: the preparation's own incremental build, then the agent.
 
 **Preparing an open batch** (`kind: "prepare"`; `docs/queue/controller.md`, "Background
 preparation"). While the head waits on CI or is repaired the controller hands out `prepare` tasks for quiet open

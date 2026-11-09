@@ -889,7 +889,8 @@ def prepare_artifacts(
     another and a later one never displaces an artifact for a different input. A warm hit makes the
     artifacts available even when no other revision is published (``cache_revision`` is then the
     first warmed revision). ``build=False`` fetches only, so ``available`` rests on the fetch alone:
-    streaming callers build afterwards, and rebase tasks build the resulting chain after replay.
+    streaming callers build afterwards, known audit/lint repairs build during verification after
+    the agent edits, and rebase tasks build the resulting chain after replay.
     """
     record: dict = {}
     seconds = 0.0
