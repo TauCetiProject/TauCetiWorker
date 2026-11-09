@@ -272,7 +272,11 @@ promote and complete the relevant Stage 2 prerequisites before this operation.
    unexplained bootstrap difference. Reconcile any mismatch before proceeding.
 6. Announce the approved source home through the separately authorized channel.
    Give contributors the native clone/fork URLs and project-scoped `gh`
-   compatibility configuration. For an existing clone, after preserving local
+   compatibility configuration using the
+   [tested contributor setup at Tools `9285c207f338d7c2e6b4464885b0027a85dbe659`](https://github.com/TauCetiProject/TauCetiTools/blob/9285c207f338d7c2e6b4464885b0027a85dbe659/docs/forgejo-stage1-contributor.md).
+   Install the standalone client in its own pinned environment; its release does
+   not replace the operator's declared dependencies or the approved CI harness.
+   For an existing clone, after preserving local
    branches and verifying the old remote, use the native fork as `origin` when
    contributing through a fork. Use the canonical native repository only for an
    account with the intended direct-push permission:
