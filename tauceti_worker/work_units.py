@@ -2400,7 +2400,10 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
     recovery = False
 
     def plan_identity(value):
-        return {key: value.get(key) for key in ("roadmap", "from_sha", "to_sha", "prs", "documentation")}
+        return {
+            **{key: value.get(key) for key in ("roadmap", "from_sha", "to_sha", "prs", "documentation")},
+            "history_migration_sha256": publication.history_policy_digest(value),
+        }
 
     for attempt in range(3):
         # Checkout preparation and facts collection can take time. Observe
@@ -2458,6 +2461,7 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                             plan.get(k) for k in ("roadmap", "from_sha", "to_sha", "prs")
                         ):
                             raise ValueError("plan is missing its roadmap/window/PR identity")
+                        publication.history_policy_digest(plan)
                     except (OSError, ValueError) as exc:
                         _progress_mechanical_failed(w, f"progress: invalid plan artifact: {exc}")
                     if invalid_plan == plan_identity(plan):
@@ -2493,8 +2497,9 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                 else:
                     try:
                         publication.facts_bundle(plan_file, verify=True)
+                        publication.history_policy(plan_file, verify=True)
                     except (OSError, ValueError) as exc:
-                        _progress_documentation_wait(w, f"pinned facts bundle unavailable: {exc}", recovery=True)
+                        _progress_documentation_wait(w, f"pinned progress inputs unavailable: {exc}", recovery=True)
                     return plan_file, facts_file
     # This is an infrastructure wait, never a report attempt or a PR repair. The cursor lives only
     # in the roadmap's published PROGRESS.md, which no mechanical stage writes.
@@ -2654,6 +2659,8 @@ def _do_progress_inner(w, opts) -> int | None:
         # Selection explanations can change without changing any writer input.
         for field in ("reason", "skipped", "runner_up"):
             value.pop(field, None)
+        value["history_migration_sha256"] = publication.history_policy_digest(value)
+        value.pop("history_migration_file", None)
         return value, json.loads(f.read_text())
 
     try:
@@ -2667,14 +2674,15 @@ def _do_progress_inner(w, opts) -> int | None:
             previous = new_plan.parent.parent / "previous"
             previous.mkdir()
             artifacts = [plan_file, facts_file, prompt_file, status_body, section_body]
-            try:
-                if bundle := publication.facts_bundle(plan_file):
-                    artifacts.append(bundle)
-            except (OSError, ValueError):
-                pass  # preserve the old core artifacts even if their auxiliary metadata is damaged
+            for locate in (publication.facts_bundle, publication.history_policy):
+                try:
+                    if bundle := locate(plan_file):
+                        artifacts.append(bundle)
+                except (OSError, ValueError):
+                    pass  # preserve the old core artifacts even if their auxiliary metadata is damaged
             for artifact in artifacts:
                 if artifact.exists():
-                    if artifact.name.startswith("plan.json.facts-"):
+                    if artifact.name.startswith(("plan.json.facts-", "plan.json.history-")):
                         publication.retain_facts_bundle(artifact, previous / artifact.name)
                     else:
                         shutil.copyfile(artifact, previous / artifact.name)
@@ -2683,8 +2691,9 @@ def _do_progress_inner(w, opts) -> int | None:
             for body in (status_body, section_body):
                 body.unlink(missing_ok=True)
         # Install immutable bytes before the plan that refers to them.
-        if bundle := publication.facts_bundle(new_plan, verify=True):
-            publication.retain_facts_bundle(bundle, work / bundle.name)
+        for locate in (publication.facts_bundle, publication.history_policy):
+            if bundle := locate(new_plan, verify=True):
+                publication.retain_facts_bundle(bundle, work / bundle.name)
         _install_progress_body(new_plan, plan_file)
         _install_progress_body(new_facts, facts_file)
     except (OSError, ValueError) as exc:

@@ -21,6 +21,41 @@ MAX_ATTEMPTS = 6
 MAX_WAIT_AGE = 7 * 86400
 
 FILES = ("plan.json", "status-body.md", "section-body.md")
+EMPTY_HISTORY_POLICY = hashlib.sha256(
+    b'{"commits":{},"mappings":[],"schema":"tauceti-progress.migration/v1"}'
+).hexdigest()
+
+
+def history_policy_digest(plan):
+    """Legacy plans used the empty policy; a changed policy is a changed input."""
+    digest = plan.get("history_migration_sha256", EMPTY_HISTORY_POLICY)
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("invalid pinned history policy digest")
+    return digest
+
+
+def history_policy(plan_file, *, verify=False):
+    """Locate Progress's canonical configuration snapshot beside its saved plan."""
+    plan = json.loads(plan_file.read_text())
+    if not isinstance(plan, dict):
+        raise ValueError("invalid pinned history policy plan")
+    if "history_migration_file" not in plan and "history_migration_sha256" not in plan:
+        return None
+    digest = history_policy_digest(plan)
+    name = plan.get("history_migration_file")
+    if digest == EMPTY_HISTORY_POLICY:
+        return None  # the empty policy can be reconstructed without a file
+    if name != f"plan.json.history-{digest}.json":
+        raise ValueError("invalid pinned history policy sibling")
+    policy = plan_file.parent / name
+    if policy.is_symlink():
+        raise ValueError("pinned history policy must not be a symlink")
+    if verify:
+        with policy.open("rb") as stream:
+            raw = stream.read(16 * 1024 * 1024 + 1)
+        if len(raw) > 16 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != digest:
+            raise ValueError("pinned history policy hash mismatch")
+    return policy
 
 
 def facts_bundle(plan_file, *, verify=False):
@@ -180,15 +215,16 @@ def park(cfg, value, reason):
         with tempfile.TemporaryDirectory(prefix=".pending-", dir=parent) as tmp:
             staged = Path(tmp)
             names = [*FILES, "facts.json", "progress-prompt.md"]
-            try:
-                if bundle := facts_bundle(work / "plan.json"):
-                    names.append(bundle.name)
-            except (OSError, ValueError):
-                pass  # retain core publication artifacts even when auxiliary metadata is damaged
+            for locate in (facts_bundle, history_policy):
+                try:
+                    if bundle := locate(work / "plan.json"):
+                        names.append(bundle.name)
+                except (OSError, ValueError):
+                    pass  # retain core publication artifacts even when auxiliary metadata is damaged
             for name in names:
                 source = work / name
                 if source.is_file():
-                    if name.startswith("plan.json.facts-"):
+                    if name.startswith(("plan.json.facts-", "plan.json.history-")):
                         retain_facts_bundle(source, staged / name)
                         continue
                     with open(staged / name, "wb", opener=lambda p, f: os.open(p, f, 0o600)) as target:
@@ -233,6 +269,8 @@ def parked_window(cfg, plan):
             if receipt.get("status") != "parked":
                 continue
             previous = json.loads(path.read_text())
+            # A policy change cannot authorize paying again for a parked window. This is
+            # a paid-work fence, not permission to reuse the old plan or its facts.
             if all(previous.get(key) == plan.get(key) for key in ("roadmap", "from_sha", "to_sha", "prs")):
                 return path.parent
         except (OSError, ValueError, TypeError, AttributeError):
