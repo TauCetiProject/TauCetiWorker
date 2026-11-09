@@ -1020,3 +1020,28 @@ recent publisher handoff also prevents collection, protecting older worker proce
 Unknown metadata or symlinks fail closed before any cache files are removed. Cleanup
 prints per-pool retained bytes, removed artifacts/indexes and physically freed bytes.
 The usual cleanup command without `--apply` previews the plan.
+
+### Focused repair checks and worker verification
+
+For warm `repair` and `prepare` attempts with worker audits enabled, the agent repairs
+located findings and runs `.tauceti-repair/check-findings`. This helper compiles the
+finding modules and the repair's source delta from the failing candidate, then runs
+only the reported linters with the existing pinned native driver, or the pinned
+ownership-only checker for duplicate declarations. It records its advisory scope and
+timings in `tasks/<id>/logs/targeted-*/result.json`. Unavailable or unsupported checks
+are reported explicitly; they do not authorize submission.
+
+The agent can also run `.tauceti-repair/build <Module.Name> --dependents`. Its full-suite
+helper is disabled in this mode: the worker owns the whole-library build, audits and
+environment lint after the agent returns. Remaining failures go back to the agent as
+diagnostics. Rebase/cold attempts and configurations without worker verification keep
+their existing validation contract. No agent-reported or cached verdict replaces the
+worker's final verification.
+
+Verification records include wall-clock costs for tools setup, script materialization,
+driver preparation, build, audits and lint. Existing `audit-import`, `audit-duplicates`
+and `audit-axioms` timestamps are preserved as `logs/audit-phases.tsv` and summarized
+in `logs/checks-timing.json` and the outcome's verification record. Incomplete intervals
+are marked incomplete; missing telemetry never changes the checker verdict. Phase
+records survive worktree collection, so further checker optimization can be guided by
+measurements rather than inferred from one combined duration.

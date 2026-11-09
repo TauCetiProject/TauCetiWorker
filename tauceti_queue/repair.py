@@ -1033,6 +1033,7 @@ class PromptContext:
     instruction: str = AGENT_INSTRUCTION  # the plan's instruction; the service sends it with the task
     artifacts_cold: bool = False  # no warm artifacts: the agent's first build starts from nothing
     artifacts_reason: str | None = None  # ``prepare_artifacts``'s ``unavailable_reason`` when cold
+    worker_verifies: bool = False  # worker owns the final full suite; agent checks are scoped
     check_findings_known: bool = False  # cached artifacts fetched; CI already supplied the failures
     listings_path: Path | None = None  # where the member listings and the check script are written
     shell_limit: int = SHELL_LIMIT_SECONDS  # what the prompt says about the foreground shell limit
@@ -1302,7 +1303,7 @@ def write_listings(
     check = directory / CHECK_FILE
     check.write_text(check_script(context.base, context.repository))
     check.chmod(0o755)
-    repair_tools.write_build_script(directory)
+    repair_tools.write_build_script(directory, worker_verifies=context.worker_verifies)
     if context.kind in REBASE_KINDS and (context.conflict or {}).get("previous_base"):
         step = directory / STEP_FILE
         step.write_text(step_script(context.base, str(context.conflict["previous_base"]), context.rebase_options))
@@ -1418,6 +1419,32 @@ def _verification_section(
             "finish.",
             "",
         ]
+    if context.worker_verifies:
+        lines += [
+            "The worker owns final verification. Repair the reported findings first; do not run a whole-library "
+            "build, the full audit suite or the full environment lint in the agent turn. "
+            "Cached outputs may still need unpacking, and Lake checks their input traces.",
+            "",
+            f"Run `{LISTINGS_DIR}/check-findings`: it builds the finding modules and your edited modules, "
+            "then runs the reported linters or the ownership-only check. These are advisory checks, "
+            "not a claim that the entire batch passes. For additional compiler feedback use "
+            f"`{LISTINGS_DIR}/{BUILD_FILE} <Module.Name> --dependents`.",
+            "",
+            "After the focused checks and the chain check, return your summary. The worker runs the "
+            "whole-library build, full audits and environment lint before submission and sends any "
+            "remaining failures back as diagnostics. If a targeted checker is unavailable, report that "
+            "and return after scoped compilation; do not replace it with the full suite.",
+            "",
+            CACHE_SENTENCE,
+            f"Run scoped checks in the foreground: shell commands have a {_hours_text(context.shell_limit)} limit. "
+            "Do not use `--fail-fast`.",
+            "",
+            HARD_RULES,
+            "",
+            "Finish the focused work synchronously. Summarize the fixes in their owning PR commits and "
+            "the exit status of each focused check; full verification is the worker's next step.",
+        ]
+        return lines
     scoped = (
         [
             "",

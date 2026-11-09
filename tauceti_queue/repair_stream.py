@@ -227,7 +227,7 @@ class StreamingBuild:
             "seconds": self.seconds,
         }
 
-    def prompt_section(self) -> list[str]:
+    def prompt_section(self, *, worker_verifies: bool = False) -> list[str]:
         directory = self.directory.name
         count = len(self.errors)
         errors = f"{count} error{'s' if count != 1 else ''}"
@@ -259,13 +259,18 @@ class StreamingBuild:
             f"not start your own `lake build` while `{directory}/{LOCK_FILE}` exists. `{directory}/{repair_tools.BUILD_FILE} "
             "<Module> ...` waits for the lock to be free, builds only the named modules (`--dependents` adds the modules "
             "importing them) and returns Lake's exit status, so a fix is checked in seconds rather than by rerunning the "
-            "whole library; the same command with no modules runs the whole library with `--iofail`. The verdict is "
-            "still your own whole-library `lake build --iofail` after your fixes, once the lock is free.",
+            "whole library. "
+            + (
+                "Return after the scoped checks; the worker runs the final full build, audits and lint."
+                if worker_verifies
+                else "The same command with no modules runs the whole library with `--iofail`. The verdict is "
+                "still your own whole-library `lake build --iofail` after your fixes, once the lock is free."
+            ),
         ]
 
-    def annotate(self, prompt: str) -> str:
+    def annotate(self, prompt: str, *, worker_verifies: bool = False) -> str:
         """The prompt with the Build in progress section before the local verification section."""
-        section = "\n".join(self.prompt_section())
+        section = "\n".join(self.prompt_section(worker_verifies=worker_verifies))
         marker = "\n## Verifying locally"
         at = prompt.find(marker)
         if at < 0:
