@@ -1,7 +1,7 @@
 """The AI merge queue controller: records, claims, insertion, sealing, head reconciliation, tasks, status.
 
-The queue has unsealed batches receiving scripted insertions, at most one sealed successor being
-prepared, and one head that is rebased, built, repaired in place by agents claiming tasks, and
+The queue has unsealed batches receiving scripted insertions and a target of two sealed active
+batches, including at most one head. The head is rebased, built, repaired in place by agents, and
 fast-forwarded onto the canonical branch. The controller is one object shared by the
 reconciliation loop (`tauceti_queue.loop`) and the HTTP server; every public method takes the
 controller lock (`ControllerLock`: the worker endpoints take it ahead of the tick, which lets
@@ -72,7 +72,7 @@ COMMENT_MARKER = "tauceti-queue"
 DEFAULT_SETTINGS: dict[str, Any] = {
     "insertion_age_window": 16,
     "open_batch_limit": 2,
-    # Freeze the oldest unsealed batch behind the head at this size, keeping one sealed successor.
+    # Freeze oldest unsealed batches at this size until two active batches are sealed in total.
     # Zero disables successor sealing. Head creation never waits for this threshold.
     "sealed_successor_min_members": 100,
     "repair_concurrency": 1,
@@ -3373,6 +3373,7 @@ class Controller:
         if claims:
             # Keep the batch open while its owner prepares or pre-rebases it. Adoption uses the
             # ordinary open-batch validation, and the next head keeps the completed work.
+            self._seal_successor(now)
             self._reasons.append(f"open batch {batch['id']} is claimed; sealing waits for the release")
             return
         with self.store.transaction():
@@ -3405,7 +3406,7 @@ class Controller:
         self._seal_successor(now)
 
     def _seal_successor(self, now: float) -> None:
-        """Freeze the oldest unsealed batch at the threshold, without making it the head.
+        """Freeze oldest unsealed batches at the threshold until two active batches are sealed.
 
         The existing sealed flag fixes membership independently of `state`: a successor remains
         `open` for the background task protocol until promotion to `head`. An active background
@@ -3414,17 +3415,33 @@ class Controller:
         minimum = int(self.setting("sealed_successor_min_members"))
         if minimum == 0 or self._state("inference_hold") or self._external_head_blocks_sealing():
             return
-        batches = self._open_batches()
-        if not batches or any(batch["sealed"] for batch in batches):
-            return
-        batch = batches[0]
-        size = len(self._members(batch["id"]))
-        if size < minimum or any(c["operation"] not in BACKGROUND_OPERATIONS for c in self._active_claims(batch["id"])):
-            return
-        with self.store.transaction():
-            self.store.update("batches", {"id": batch["id"]}, sealed=1, sealed_at=now)
-            self._count("successors_sealed")
-            self.store.journal(now, "successor-sealed", batch["id"], version=batch["version"], size=size)
+        sealed = int(self._head() is not None) + sum(bool(batch["sealed"]) for batch in self._open_batches())
+        # Promotion may be waiting for the oldest preparation owner even after the previous
+        # head landed. That still leaves capacity for a second sealed batch; do not wait for
+        # the first to become head before freezing the next one's membership.
+        while sealed < 2:
+            batches = self._unsealed_batches()
+            if not batches:
+                return
+            batch = batches[0]
+            size = len(self._members(batch["id"]))
+            if size < minimum or any(
+                c["operation"] not in BACKGROUND_OPERATIONS for c in self._active_claims(batch["id"])
+            ):
+                return
+            with self.store.transaction():
+                self.store.update("batches", {"id": batch["id"]}, sealed=1, sealed_at=now)
+                self._count("successors_sealed")
+                self.store.journal(
+                    now,
+                    "successor-sealed",
+                    batch["id"],
+                    version=batch["version"],
+                    size=size,
+                    sealed_before=sealed,
+                    sealed_after=sealed + 1,
+                )
+            sealed += 1
 
     # --- head reconciliation -----------------------------------------------------------------------
 

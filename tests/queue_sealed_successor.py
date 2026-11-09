@@ -163,6 +163,77 @@ class SealedSuccessor(ControllerCase):
         self.assertEqual(len(self.github.runs), 2, "the new head gets authoritative CI")
         self.assertEqual(self.github.runs[-1].head_sha, self.controller._head()["tip"])
 
+    def test_headless_handoff_fills_two_seals_without_interrupting_the_preparation_owner(self):
+        first, later = self.first(), self.later()
+        third = self.later((401, 402, 403, 404, 405))
+        self.controller.tick()
+        task = self.claim_prepare()
+        run_git(
+            self.repo.clone, "push", "-q", str(self.repo.origin), f"{self.controller._head()['tip']}:refs/heads/main"
+        )
+        self.controller.tick()
+        self.assertIsNone(self.controller._head())
+        self.assertEqual([self.row(b)["sealed"] for b in (first, later, third)], [1, 1, 0])
+        self.assertEqual(self.row(later)["version"], later["version"])
+        self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["state"], "open")
+        self.controller.renew_task(task.task_id, task.claim_token)
+        active = self.controller._active_claims(first["id"], task_id=task.task_id)
+        self.assertEqual(len(active), 1)
+        self.assertIsNotNone(self.controller._open_own_base_prepare(self.row(later)))
+        self.approve(501, {"P501.lean": "501\n"})
+        self.controller.tick()
+        self.assertEqual(self.row(later)["version"], later["version"])
+        self.assertNotIn(self.controller.input_for(PROJECT, 501)["batch_id"], (first["id"], later["id"]))
+        sealed_at = self.row(later)["sealed_at"]
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        self.controller.tick()
+        self.assertEqual(self.controller._head()["id"], first["id"])
+        self.assertEqual(self.row(later)["sealed_at"], sealed_at)
+        self.assertEqual([self.row(b)["sealed"] for b in (first, later, third)], [1, 1, 0])
+
+    def test_headless_claimed_unsealed_batch_and_its_successor_both_freeze(self):
+        first, later = self.first(), self.later()
+        self.controller.set_setting("sealed_successor_min_members", 0, "test")
+        self.controller.set_setting("prepare_min_members", 1, "test")
+        self.controller.set_setting("prepare_quiet_seconds", 0, "test")
+        self.controller.tick()
+        task = self.claim_prepare()
+        self.controller.store.update("batches", {"state": "head"}, state="removed")
+        self.controller.set_setting("sealed_successor_min_members", 3, "test")
+        self.controller.tick()
+        self.assertIsNone(self.controller._head())
+        self.assertEqual((self.row(first)["sealed"], self.row(later)["sealed"]), (1, 1))
+        self.controller.renew_task(task.task_id, task.claim_token)
+
+    def test_handoff_does_not_skip_a_small_oldest_unsealed_batch(self):
+        first = self.first()
+        small = self.later((301, 302))
+        bigger = self.later((401, 402, 403, 404))
+        self.controller.tick()
+        task = self.claim_prepare()
+        run_git(
+            self.repo.clone, "push", "-q", str(self.repo.origin), f"{self.controller._head()['tip']}:refs/heads/main"
+        )
+        self.controller.tick()
+        self.assertIsNone(self.controller._head())
+        self.assertEqual([self.row(b)["sealed"] for b in (first, small, bigger)], [1, 0, 0])
+        self.controller.renew_task(task.task_id, task.claim_token)
+
+    def test_preexisting_headless_state_is_repaired_on_the_next_tick_and_survives_restart(self):
+        first, later = self.first(), self.later()
+        self.controller.tick()
+        task = self.claim_prepare()
+        self.controller.store.update("batches", {"state": "head"}, state="removed")
+        # Recover exactly the production state: one sealed preparation claim and no head.
+        self.controller = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(self.controller.store.close)
+        self.controller.recover()
+        self.controller.tick()
+        self.assertEqual((self.row(first)["sealed"], self.row(later)["sealed"]), (1, 1))
+        self.controller.renew_task(task.task_id, task.claim_token)
+        self.controller.tick()
+        self.assertEqual(len(self.controller.store.rows("journal", {"kind": "successor-sealed"})), 2)
+
     def test_unclaimed_offer_does_not_delay_promotion(self):
         first = self.first()
         self.controller.tick()

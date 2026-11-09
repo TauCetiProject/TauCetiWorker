@@ -3,7 +3,7 @@
 `tauceti_queue/controller.py` is the state machine of increment 1 of
 [`docs/redesign/specs/ai-merge-queue.md`](../redesign/specs/ai-merge-queue.md) (on the `overhaul`
 branch): open batches receiving scripted insertions (one, plus a second for inputs that conflict with
-the first; see "Open batches" below), at most one sealed successor prepared by a background worker,
+the first; see "Open batches" below), sealed batches prepared by a background worker,
 and one head that is rebased, built, repaired in place by agents and fast-forwarded onto the canonical branch. It is one object
 shared by the reconciliation loop (`tauceti_queue/loop.py`) and the HTTP server (work plan stream F),
 over one SQLite database (`tauceti_queue/store.py`) and a local clone of the content repository. It
@@ -82,8 +82,10 @@ or `readmit-refused` when the PR is no longer open at its accepted head or carri
 
 Batches: `open` -> `head` -> `landed`; an empty unsealed batch whose base is stale is
 `removed` and recreated on demand. Sealing fixes membership independently of head status: the
-one permitted successor has `state=open, sealed=1`, preserving the existing background task
-protocol. There is at most one head, one sealed successor, and `open_batch_limit` unsealed batches.
+a sealed non-head batch has `state=open, sealed=1`, preserving the existing background task
+protocol. There is at most one head and a target of two sealed active batches in total, plus
+`open_batch_limit` unsealed batches. When head promotion waits for an active preparation,
+both sealed batches can temporarily be non-head batches.
 
 Every `tick()` (one reconciliation pass) does, under the controller lock (except around its GitHub
 I/O, below):
@@ -122,12 +124,14 @@ I/O, below):
    `pre_rebase` owner keeps the batch open until adoption, release or claim expiry, so completed
    repairs enter the new head through ordinary validation. Unclaimed background offers are
    superseded (resolution `sealed`); the new head keeps what its preparations adopted.
-   With a head present and no sealed successor, seal the oldest unsealed batch once it has
+   While fewer than two active batches are sealed (counting the head), seal the oldest unsealed batch once it has
    `sealed_successor_min_members` members (default 100; 0 disables new successor sealing). A larger
    later batch never overtakes a smaller first one. Successor sealing preserves active background
    claims and versions, closes membership permanently, and makes preparation due immediately
    without a size or quiet-period gate. On promotion the successor retains its original `sealed_at`;
-   replenish the successor from the next oldest eligible batch in the same pass. Head creation
+   replenish the sealed prefix from the next oldest eligible batch in the same pass. A claimed
+   preparation can delay head promotion but cannot stop replenishing the two sealed batches.
+   Head creation
    itself never waits for the successor threshold.
 5. Head reconciliation, in the plan's order: a head under a worker's task claim is left alone;
    a head not based on the canonical commit is claimed and, when its pre-rebase (below) was made on
@@ -448,7 +452,7 @@ and reported in status:
 | --- | --- | --- |
 | `insertion_age_window` | 16 | size of the age window the draw is taken from |
 | `open_batch_limit` | 2 | unsealed batches at most; the sealed successor does not consume this capacity |
-| `sealed_successor_min_members` | 100 | seal the oldest unsealed batch behind the head at this size, retaining at most one successor; 0 disables new successor sealing |
+| `sealed_successor_min_members` | 100 | seal oldest unsealed batches at this size until two active batches are sealed in total, including the head; 0 disables new successor sealing |
 | `repair_concurrency` | 1 | live task claims in total; background tasks hold at most one fewer, so 1 allows no background claims |
 | `stall_interval_seconds` | 900 | build silence after which status raises a stall |
 | `publication_enabled` | false | shadow mode when false: no dispatch, promotion, comment, label, close or ref push; status says what would happen |
@@ -569,8 +573,8 @@ and `pre_rebase` (null, or `state`, `onto`, `tip`, `source`, `at`, `current`, `e
 open background task's `kind`, `task_id`, whether it is `claimed` and, for `prepare`, the `chain` it
 prepares, `own_base` or `pre_rebased`) and `waiting` (null, or the other `kind` and the `reason` it waits);
 `open_batch` carries the same preparation and `pre_rebase` fields; both forms include `sealed`
-and `sealed_at`, and retain the successor for compatibility); `sealed_successor` (null or the sealed
-non-head batch summary); `head` (the same plus `sealed_at`,
+and `sealed_at`, and retain the successor for compatibility); `sealed_successor` (null or the first sealed
+non-head batch summary; `open_batches` includes every sealed non-head batch); `head` (the same plus `sealed_at`,
 `expected_parent`, `based_on_canonical`, `stage` in `rebase`, `rebase_conflict`, `dispatch`, `ci`,
 `repair`, `infrastructure`, `promote`, the open `task`, and `ci` with dispatch id, run id and
 attempt, status, conclusion, timestamps, runner, labels, host, phases with timestamps, last progress,
