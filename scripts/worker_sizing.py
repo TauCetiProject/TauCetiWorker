@@ -262,7 +262,10 @@ def published_reviews(state_root, since):
     write. Re-publication receipts count separately from inference rounds.
     """
     records = []
-    for store in state_root.glob("*/home/.cache/tauceti-review/*/store/TauCetiProject__TauCeti"):
+    stores = list(state_root.glob("*/home/.cache/tauceti-review/*/store/TauCetiProject__TauCeti"))
+    if not stores:
+        raise ValueError("No review stores found under the supplied durable state root")
+    for store in stores:
         worker = store.relative_to(state_root).parts[0]
         for path in (store / "outbox/records/posts").glob("*/*.json"):
             post = read(path)
@@ -562,7 +565,7 @@ def report(directory, samples=None):
             "Ceiling",
             "Hours",
             "PRs/h",
-            "Reviews/h",
+            "Review ops/h",
             "Fixes/h",
             "Failed/h",
             "API $/h*",
@@ -674,7 +677,7 @@ def report(directory, samples=None):
         fontsize=7,
     )
     notes = [
-        "* API includes live estimates and later accounting corrections; boundary totals are prepared (~1m lag). Failed rounds are separate from published output.",
+        "* Review ops are completed worker rounds, including reuse. Archive totals are confirmed publications. API estimates/corrections and totals lag ~1m.",
         "† Queue/h: observed insertion per PR/head authored here (may be older work; up to 5m lag). Reviews/fixes can overlap; do not sum as unique PRs.",
         "Phase pressure is worker-time weighted 'some' PSI; table memory stall is worker-slice 'full' PSI. Charged RAM includes cache; root RAID busy is not saturation.",
         "Queue recovery and phase mix confound comparisons. Phase transitions are approximate. Per-scope I/O bytes unavailable; I/O pressure measured via PSI.",

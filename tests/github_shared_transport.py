@@ -479,7 +479,11 @@ gh: API rate limit exceeded
     # The actual facade must retain shared reads, including forced discovery and
     # the engine's scoreboard/contest histories. No direct requests/pages/retries.
     assert shutil.which("jq"), "jq is required to verify the review-history bridge"
-    mirror = [{"id": 2, "node_id": "node-2", "body": "hello"}]
+    mirror = [{"id": 2, "node_id": "node-2", "body": "<!--tauceti-scoreboard-->hello"}]
+    scoreboard_projection = (
+        '.[] | select((.body // "") | contains("<!--tauceti-scoreboard-->")) '
+        '| {id, login: (.user.login // ""), updated_at: (.updated_at // "")} | @json'
+    )
     shared_calls = []
 
     def shared_history(repo, operation, **args):
@@ -493,14 +497,17 @@ gh: API rate limit exceeded
         patch.object(GitHub, "_review_comments", side_effect=AssertionError("unexpected live review history")),
     ):
         for endpoint in ("issues", "pulls"):
-            for projection in (".[]", ".[] | @json"):
+            for projection in (".[]", ".[] | @json", scoreboard_projection):
                 p = tr.migrated_history(
                     ["api", "--paginate", "--jq", projection, f"/repos/org/repo/{endpoint}/7/comments?per_page=100"]
                 )
-                assert p is not None and p.returncode == 0 and json.loads(p.stdout) == mirror[0]
+                expected = (
+                    {"id": 2, "login": "", "updated_at": ""} if projection == scoreboard_projection else mirror[0]
+                )
+                assert p is not None and p.returncode == 0 and json.loads(p.stdout) == expected
         with tr.read_context(fresh=True):
             assert GitHub("org/repo").issue_comments(7) == mirror
-        assert len(shared_calls) == 5
+        assert len(shared_calls) == 7
         assert tr.migrated_history(["api", "-X", "POST", "/repos/org/repo/issues/7/comments?per_page=100"]) is None
 
 print("PASS: shared cache, complete GraphQL histories, endpoint accounting and exhaustion")
