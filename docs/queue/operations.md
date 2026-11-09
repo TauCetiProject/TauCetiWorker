@@ -205,6 +205,20 @@ Chungus2 still has `Linger=no`. The user manager provides ordinary process recov
 running, but startup after reboot or loss of that manager is not guaranteed. The explicit host move
 does not claim to complete the postponed reboot-supervision work.
 
+Production repair admission uses `repair_concurrency=3` and `background_start_limit=2`.
+Count all live claims when starting a task: a non-head task can increase the total to
+at most two, while a head task can increase it to three. Keep head priority and one
+owner per batch. Two non-head preparations can therefore run while no head needs
+repair, with a worker available when a head task appears. Claims are still pulled by
+idle workers on their polling intervals; this rule removes the wait for another
+repair to finish.
+
+Run three interchangeable processes with distinct identities and task roots. The
+additional user unit is `tauceti-queue-repair@3.service`, using the private
+`repair-environment-3` and `~/TauCetiQueue-data/repair-3`. Add that root to both repair
+worktree cleanup and public monitoring (and historical telemetry) when enabling it.
+Existing active workers need not restart for controller admission changes.
+
 Paths on chungus2, where they differ from the default layout:
 
 | Path | Content |
@@ -215,7 +229,7 @@ Paths on chungus2, where they differ from the default layout:
 | `~/TauCetiQueue-data/clone` | controller content clone, including retained private source refs |
 | `~/TauCetiQueue-data/queue.sqlite3` (+ `-wal`, `-shm`) | authoritative queue database |
 | `~/TauCetiQueue-data/logs` | service-owned files; process logs use `journalctl --user -u tauceti-queue` |
-| `~/TauCetiQueue-data/repair-clone`, `repair`, `repair-2` | separate repair Git clone and worker task/cache roots; active tasks use private writable dependencies |
+| `~/TauCetiQueue-data/repair-clone`, `repair`, `repair-2`, `repair-3` | separate repair Git clone and worker task/cache roots; active tasks use private writable dependencies |
 | `~/TauCetiQueue-data/mathlib-packages` | retained original dependency seed; no longer configured for live repairs |
 | `~/TauCetiQueue-data/monitoring/` | publisher identity/epoch/delta state, private token, prepared observations and pinned exporter release |
 | `~/TauCetiQueue-data/reports/` | retained pilot inputs and Bors baseline used by the history timer |
@@ -229,7 +243,7 @@ On chungus2:
 
 ```sh
 systemctl --user status tauceti-queue cloudflared-tauceti-queue
-systemctl --user status tauceti-queue-repair tauceti-queue-repair@2
+systemctl --user status tauceti-queue-repair tauceti-queue-repair@2 tauceti-queue-repair@3
 systemctl --user status tauceti-queue-monitoring
 systemctl --user list-timers 'tauceti-queue*'
 ```
@@ -415,7 +429,8 @@ services/queue/install-repair-cleanup.sh \
   --database ~/TauCetiQueue-data/queue.sqlite3 \
   --clone ~/TauCetiQueue-data/repair-clone \
   --root ~/TauCetiQueue-data/repair \
-  --root ~/TauCetiQueue-data/repair-2
+  --root ~/TauCetiQueue-data/repair-2 \
+  --root ~/TauCetiQueue-data/repair-3
 ```
 
 `tauceti-queue-repair-cleanup.timer` runs independently of the workers, on startup and every minute
@@ -456,7 +471,7 @@ API-provider and repair-cache upload configuration were copied privately, withou
 provider order, pacing, queue concurrency, admission or Fleet settings. The unit environment sets
 `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` for Python's TLS verification on this NixOS host.
 
-Live state on chungus2 is under `~/TauCetiQueue-data/repair{,-2}`, with the common content clone at
+Live state on chungus2 is under `~/TauCetiQueue-data/repair{,-2,-3}`, with the common content clone at
 `repair-clone`. To avoid duplicating old caches on a nearly full filesystem, the two private cache
 directories were initially seeded with hardlinks from one fresh public-main fetch. Dependency
 sources and built outputs at `mathlib-packages` were hardlinked from a compatible local checkout;
@@ -464,7 +479,7 @@ every package revision was checked against the current manifest, including Mathl
 `1b1ccf4b088b32fa3f23f2de1127433254a81e1e`. That initial read-only seed configuration was retired on
 November 8: stock Lake attempts to update artifact permissions/hash metadata even while replaying
 existing dependency outputs, which fails inside the sandbox
-(`failed to cache artifact: read-only file system`). Both environments now leave
+(`failed to cache artifact: read-only file system`). All three environments now leave
 `TAUCETI_QUEUE_SEED_PACKAGES` empty and use the normal private dependency preparation path.
 Do not restore the shared read-only symlink without validating a real `lake build`, including
 artifact-cache replay. A direct Lean compilation alone does not test this path.
@@ -479,7 +494,7 @@ repairs and retain the existing cache-pruning discipline; private dependencies c
 space.
 
 The temporary SSH observation mirror used between the November 7 repair move and the November 8
-controller move is now retired. The local monitoring publisher reads `repair` and `repair-2`
+controller move is now retired. The local monitoring publisher reads `repair`, `repair-2` and `repair-3`
 directly on chungus2, including original worker PIDs, task progress and build-log observations.
 Historical task/outcome JSON was copied from chungus; larger old transcripts and worktrees remain
 retained there. The masked repair units and archived launchers on chungus are not a second active
@@ -557,8 +572,8 @@ the status document. Each task's record is `<task root>/tasks/<id>/` (`task.json
 To stop the worker: `systemctl --user stop tauceti-queue-repair` (a running task is interrupted and
 resumed at the next start, as above); to stop it from coming back, `systemctl --user disable --now
 tauceti-queue-repair`. To stop without interrupting a task (finish the current one, claim no more),
-stop it right after `worker.json` reports `idle`. For instance 2, use
-`tauceti-queue-repair@2.service` in the same commands. Current repair workers use these units even
+stop it right after `worker.json` reports `idle`. For instances 2 and 3, use
+`tauceti-queue-repair@2.service` and `tauceti-queue-repair@3.service` in the same commands. Current repair workers use these units even
 without lingering; the host limitation concerns user-manager loss and reboot startup.
 
 If a head repair task has no live claim for `stall_interval_seconds`, `/status` reports
@@ -646,7 +661,8 @@ The runtime controls change without a PR, through the admin endpoint:
 ```sh
 uv run tauceti-queue settings show
 uv run tauceti-queue settings set insertion_age_window 8
-uv run tauceti-queue settings set repair_concurrency 2 --token "$(gh auth token)"
+uv run tauceti-queue settings set repair_concurrency 3 --token "$(gh auth token)"
+uv run tauceti-queue settings set background_start_limit 2
 uv run tauceti-queue settings set approval_poll_interval_seconds 600
 uv run tauceti-queue settings set insertion_probe_budget_seconds 10
 uv run tauceti-queue settings set lost_run_seconds 14400
@@ -671,6 +687,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `insertion_age_window` | `16` | integer, at least 1 |
 | `open_batch_limit` | `2` | integer, at least 0 |
 | `repair_concurrency` | `1` | integer, at least 1 |
+| `background_start_limit` | `2` | integer, at least 0; 0 disables new background claims |
 | `stall_interval_seconds` | `900` | integer, at least 1 |
 | `publication_enabled` | `false` | `true` or `false` |
 | `claim_ttl_seconds` | `900` | integer, at least 0 |
