@@ -17,14 +17,16 @@
         `publication_enabled`) it reads the store without writing and shows the effective value:
         the store's, with the actor that wrote it, or the file's while the store has none.
     tauceti-queue settings show [--url URL]
-    tauceti-queue settings set KEY VALUE [--url URL] [--token TOKEN]
+    tauceti-queue settings set KEY VALUE [--url URL] [--token TOKEN | --token-file FILE]
         Read or change the runtime controls through the service's admin endpoint. KEY is any key of
         the controller's `DEFAULT_SETTINGS`; VALUE is parsed by the type of that key's initial value
         (a non-negative integer, at least 1 for the `[settings]` keys of the configuration file,
         `true`/`false`, or text). The command posts `{"KEY": VALUE}` to `/admin/settings`, whose body
         is one JSON object of setting keys to values. The token is the operator's GitHub token
         (`--token`, `GITHUB_TOKEN`, or `gh auth token`); the service checks repository-admin
-        permission with the same predicate as the security audit.
+        permission with the same predicate as the security audit. `--token-file` instead reads a
+        private dedicated bearer, requires an explicit queue origin and refuses redirects. Native
+        controls still require source-bound enrollment and current source admin permission.
     tauceti-queue import-bors --feed URL|FILE [--candidates URL|FILE ...] [--dry-run] [--release-head]
         The cutover import (`tauceti_queue.bors_import`): read Bors's observation feed and candidate
         journals, post them to the service's `/admin/import-bors` endpoint, print what was (or, with
@@ -53,6 +55,7 @@ import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
+from functools import partial
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -385,8 +388,19 @@ def cmd_serve(args: argparse.Namespace) -> int:
 # --- status ----------------------------------------------------------------------------------------
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def fetch_json(
-    url: str, timeout: float = 10, method: str = "GET", body: Any = None, token: str | None = None
+    url: str,
+    timeout: float = 10,
+    method: str = "GET",
+    body: Any = None,
+    token: str | None = None,
+    *,
+    allow_redirects: bool = True,
 ) -> dict[str, Any]:
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(url, data=data, method=method)
@@ -396,9 +410,15 @@ def fetch_json(
     if token:
         request.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        opener = urllib.request.urlopen
+        if not allow_redirects:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect()).open
+        with opener(request, timeout=timeout) as response:
             return json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
+        if not allow_redirects:
+            exc.close()
+            raise RuntimeError(f"operator request failed (HTTP {exc.code})") from None
         with exc:
             detail = exc.read().decode(errors="replace")
         try:
@@ -494,7 +514,17 @@ def cmd_check_config(args: argparse.Namespace) -> int:
 # --- settings --------------------------------------------------------------------------------------
 
 
-def _operator_token(explicit: str | None) -> str:
+def _operator_token(explicit: str | None, token_file: Path | None = None) -> str:
+    if token_file is not None:
+        from .control_policy_file import ControlPolicyError, read_control_policy
+
+        try:
+            token = read_control_policy(token_file).strip()
+            if not 0 < len(token) <= 4096 or any(not 33 <= char <= 126 for char in token):
+                raise ValueError
+            return token.decode("ascii")
+        except (ControlPolicyError, ValueError):
+            raise RuntimeError("operator token file is unavailable or invalid") from None
     if explicit:
         return explicit
     if os.environ.get("GITHUB_TOKEN"):
@@ -504,6 +534,21 @@ def _operator_token(explicit: str | None) -> str:
     except (OSError, subprocess.SubprocessError):
         raise RuntimeError("no GitHub token: pass --token, set GITHUB_TOKEN, or log in with gh") from None
     return token.strip()
+
+
+def _operator_target(args, fetch):
+    """File credentials require an explicit origin and never follow redirects."""
+    if getattr(args, "token_file", None) is not None:
+        from tauceti_tools.forge import Forge
+
+        try:
+            if not args.url:
+                raise ValueError
+            origin = Forge("forgejo", args.url).url
+        except ValueError:
+            raise RuntimeError("--token-file requires an explicit HTTPS --url (HTTP allowed on loopback)") from None
+        return origin, partial(fetch, allow_redirects=False)
+    return _status_url(args), fetch
 
 
 def settable_settings() -> dict[str, Any]:
@@ -542,8 +587,8 @@ def parse_setting_value(key: str, raw: str) -> Any:
 
 
 def cmd_settings(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = fetch_json) -> int:
-    base = _status_url(args)
     try:
+        base, fetch = _operator_target(args, fetch)
         if args.action == "show":
             document = fetch(base + "/settings")
             print(json.dumps(document, indent=2, sort_keys=True))
@@ -558,7 +603,10 @@ def cmd_settings(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] 
             _log(str(exc))
             return 1
         document = fetch(
-            base + "/admin/settings", method="POST", body={args.key: value}, token=_operator_token(args.token)
+            base + "/admin/settings",
+            method="POST",
+            body={args.key: value},
+            token=_operator_token(args.token, getattr(args, "token_file", None)),
         )
         print(json.dumps(document, indent=2, sort_keys=True))
         return 0
@@ -573,7 +621,11 @@ def cmd_settings(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] 
 def cmd_import_bors(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = fetch_json) -> int:
     from . import bors_import
 
-    base = _status_url(args)
+    try:
+        base, fetch = _operator_target(args, fetch)
+    except RuntimeError as exc:
+        _log(str(exc))
+        return 1
     try:
         observation = bors_import.load_document(args.feed)
         candidates = [bors_import.reduce_candidates(bors_import.load_document(spec)) for spec in args.candidates or []]
@@ -588,7 +640,11 @@ def cmd_import_bors(args: argparse.Namespace, fetch: Callable[..., dict[str, Any
     }
     try:
         report = fetch(
-            base + "/admin/import-bors", method="POST", body=body, token=_operator_token(args.token), timeout=3600
+            base + "/admin/import-bors",
+            method="POST",
+            body=body,
+            token=_operator_token(args.token, getattr(args, "token_file", None)),
+            timeout=3600,
         )
     except RuntimeError as exc:
         _log(str(exc))
@@ -601,10 +657,14 @@ def cmd_import_bors(args: argparse.Namespace, fetch: Callable[..., dict[str, Any
 
 
 def cmd_reconcile_approvals(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = fetch_json) -> int:
-    base = _status_url(args)
     try:
+        base, fetch = _operator_target(args, fetch)
         summary = fetch(
-            base + "/admin/reconcile-approvals", method="POST", body={}, token=_operator_token(args.token), timeout=3600
+            base + "/admin/reconcile-approvals",
+            method="POST",
+            body={},
+            token=_operator_token(args.token, getattr(args, "token_file", None)),
+            timeout=3600,
         )
     except RuntimeError as exc:
         _log(str(exc))
@@ -654,7 +714,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     setter.add_argument("key", choices=sorted(settable_settings()), metavar="KEY", help="the setting to change")
     setter.add_argument("value", metavar="VALUE", help="the new value")
-    setter.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+    setter_token = setter.add_mutually_exclusive_group()
+    setter_token.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+    setter_token.add_argument(
+        "--token-file", type=Path, help="private operator bearer file; requires explicit --url; no credential discovery"
+    )
 
     importer = commands.add_parser("import-bors", help="import Bors's approved PRs and running head at the cutover")
     importer.add_argument("--feed", required=True, help="Bors's observation feed (active-batches): a URL or a file")
@@ -672,13 +736,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     importer.add_argument("--url", help="service base URL (default: the configured listen address)")
     importer.add_argument("--config", help="configuration file used to find the listen address")
-    importer.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+    importer_token = importer.add_mutually_exclusive_group()
+    importer_token.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+    importer_token.add_argument(
+        "--token-file", type=Path, help="private operator bearer file; requires explicit --url; no credential discovery"
+    )
     importer.add_argument("--json", action="store_true", help="print the full report instead of the summary")
 
     reconcile = commands.add_parser("reconcile-approvals", help="run one approval reconciliation pass now")
     reconcile.add_argument("--url", help="service base URL (default: the configured listen address)")
     reconcile.add_argument("--config", help="configuration file used to find the listen address")
-    reconcile.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+    reconcile_token = reconcile.add_mutually_exclusive_group()
+    reconcile_token.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+    reconcile_token.add_argument(
+        "--token-file", type=Path, help="private operator bearer file; requires explicit --url; no credential discovery"
+    )
     return parser
 
 
