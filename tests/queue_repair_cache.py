@@ -330,6 +330,20 @@ class Retention(unittest.TestCase):
         self.assertTrue((self.pool / "outputs/TauCeti" / f"{1:016x}.json").is_file())
         self.assertEqual(list((self.root / "cache-downloads").iterdir()), [])
 
+    def test_fetch_does_not_refresh_unused_historical_snapshot_clocks(self):
+        cache.register(self.root, self.root.parent / "worker")
+        payload = self.artifact(1)
+        old = self.snapshot(1, [[f"{1:016x}", payload.name]], age=86400)
+        stamp = old.stat().st_mtime_ns
+        with cache.downloads({"LAKE_CACHE_DIR": str(self.pool)}) as env:
+            view = Path(env["LAKE_CACHE_DIR"])
+            self.assertFalse((view / "revisions").exists())
+            fresh = view / "revisions/TauCeti" / ("a" * 40 + ".jsonl")
+            fresh.parent.mkdir(parents=True)
+            fresh.write_text(old.read_text())
+        self.assertEqual(old.stat().st_mtime_ns, stamp)
+        self.assertTrue((old.parent / fresh.name).exists())
+
     def test_idle_collection_removes_crashed_fetch_scratch_and_partial_artifacts(self):
         partial = self.write("lake-cache/artifacts/0123456789abcdef.ltar.tmp", "partial")
         scratch = self.write("cache-downloads/fetch-crashed/outputs/partial.json", "incomplete")

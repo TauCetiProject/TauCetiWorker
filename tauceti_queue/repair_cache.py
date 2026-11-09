@@ -337,10 +337,8 @@ def downloads(env: dict):
         view = Path(temporary)
         for path in _files(pool / "artifacts", "*.ltar"):
             link(path, view / "artifacts" / path.name)
-        for path in _files(pool / "revisions", "*/*.jsonl"):
-            target = view / "revisions" / path.relative_to(pool / "revisions")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(path, target)
+        # Fetch only the requested revision maps. Copying every historical map through
+        # the view would refresh their mtimes and defeat recent-snapshot retention.
         try:
             yield dict(env, LAKE_CACHE_DIR=str(view))
         finally:
