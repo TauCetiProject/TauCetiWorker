@@ -48,7 +48,8 @@ not discard the unfinished requirements.
 - Preserve existing spending history and prepared work. Migration and recovery
   must not reset budgets or repeat paid authoring/reviewing.
 - Retire the shared-state service after its consumers migrate; do not generalize
-  or redesign it. Keep it operational for consumers that still need it.
+  or redesign it. Shutdown requires separate explicit authorization. Keep it
+  operational for consumers that still need it.
 - Prefer existing implemented components. Make new changes only where they close
   a requirement or a demonstrated failure in the current stage.
 - Production remains on GitHub until a separately authorized cutover. This goal
@@ -67,7 +68,9 @@ Deliver a development path an operator can actually use, plus the evidence and
 commands needed to authorize cutover. This stage prepares and rehearses migration;
 it does not itself switch production authority.
 
-Execute in this order, collecting the active-work inventory alongside engineering:
+Use these priorities, running independent preparation in parallel. Confirm
+destination access and recovery ownership, and collect the active-work inventory,
+while connecting the existing candidate path to real CI:
 
 1. Confirm destination access and recovery ownership.
 2. Connect the existing source-candidate path to a real GitHub Lean build.
@@ -197,7 +200,7 @@ Stage 1 is complete when the operator can review evidence for all six gates:
 | **Contribution path** | A real failed candidate is refused, its corrected revision passes GitHub CI, and stale review/CI cannot authorize merge. |
 | **Merge and outputs** | The exact tested candidate lands, only `main` mirrors, and actual builds/caches/docs produce verified outputs. |
 | **Recovery** | Interrupted operations, mirror repair, and rollback exercised without losing contributions or repeating paid work. |
-| **Handover** | Executable runbooks, immutable pins, linked evidence, and named temporary manual duties, with no essential-path blocker unresolved. |
+| **Handover** | Executable cutover/rollback runbooks, immutable pins, linked evidence, and temporary manual duties with named owners, with no essential-path blocker unresolved. |
 
 It does **not** require autonomous Review/Progress, all support repositories moved,
 full-fleet capacity validation, or shared-state shutdown. Present the migration

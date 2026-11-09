@@ -11,6 +11,13 @@ Refresh it against the actual cutover revision and the execution repository's
 registered workflow IDs. It is a proposed disposition, not a record that any
 production workflow has already changed.
 
+The tree inventory is not the complete registered-workflow inventory. Include
+every ID returned by GitHub even when its file was removed from current main:
+older branches can still carry callable or dispatchable definitions. Give every
+registered ID a disposition. Fence obsolete registered IDs, including historical
+`auto-merge.yml`, `merge-sweep.yml`, or `queue-release.yml` if present. Disabling
+the ID applies across branches; deleting a file from main is not that fence.
+
 ## Minimum execution set
 
 Retain reviewed, pinned native-source replacements for `ci.yml`, `api-docs.yml`,
@@ -48,22 +55,34 @@ to get around the missing check.
 
 ## Apply only during the authorized authority transfer
 
+Use the separately named administrator profile for inventory, disable, secret
+retirement, and protection changes. The runtime dispatcher is not that profile.
+In the examples, `administrator_token_file` is its private credential file;
+`administrator_gh` is the recorded absolute native GitHub CLI executable. Secret
+administration uses this native executable because the source compatibility shim
+does not implement secret commands. Keep the administrator credential out of
+candidate jobs and the dispatcher environment.
+
 Record `execution_repository` as `github.com/OWNER/REPO` and verify its native ID
 against the deployment record. Capture current states and resolve the reviewed
 filenames to workflow IDs in that exact repository:
 
 ```sh
-gh api "repos/$execution_owner/$execution_name/actions/workflows" --paginate --slurp \
+GH_TOKEN="$(cat "$administrator_token_file")" \
+  "$administrator_gh" api "repos/$execution_owner/$execution_name/actions/workflows" --paginate --slurp \
   --hostname github.com \
   > "$deployment_record/github-workflows-before.json"
-gh workflow list -R "$execution_repository" --all
+GH_TOKEN="$(cat "$administrator_token_file")" \
+  "$administrator_gh" workflow list -R "$execution_repository" --all
 ```
 
 For each approved obsolete workflow ID, disable it and read back its state:
 
 ```sh
-gh workflow disable "$obsolete_workflow_id" -R "$execution_repository"
-gh api "repos/$execution_owner/$execution_name/actions/workflows/$obsolete_workflow_id" \
+GH_TOKEN="$(cat "$administrator_token_file")" \
+  "$administrator_gh" workflow disable "$obsolete_workflow_id" -R "$execution_repository"
+GH_TOKEN="$(cat "$administrator_token_file")" \
+  "$administrator_gh" api "repos/$execution_owner/$execution_name/actions/workflows/$obsolete_workflow_id" \
   --hostname github.com --jq '{id,path,state}'
 ```
 
@@ -74,10 +93,73 @@ prepared outputs and uncertain outcomes, before handing source authority over.
 Fence the old queue/controller as described in the cutover runbook as well;
 workflow state alone does not fence its App identity.
 
+## App-key holders and retired credentials
+
+Record the mirror App's numeric App ID and installation ID. Reusing the queue
+App is permitted only after every old automated holder of that key or other
+source-writing credentials is accounted for and fenced. An App-only main
+allowlist cannot distinguish two holders of the same App key. Unknown holders
+or unverified shutdowns leave the gate incomplete; do not silently assume a
+workflow's configured target restricts what its private key can authorize.
+
+Complete a row for every actual holder in the deployment record:
+
+| Holder/context | Required fence and read-back |
+| --- | --- |
+| Old operator-host queue | Persist publication off, disable/stop the installed service, and read settings plus service active/enabled state using the cutover runbook. |
+| Repair workers, workflow backstop and timers on each host | Record actual unit/configuration IDs and project bindings; settle paid work, disable the affected units, verify inactive/disabled state and no pending timer invocation. Preserve unrelated workers. |
+| Execution repository workflows, including removed files | Disable each retired registered workflow ID and verify `disabled_manually`, settle already queued/running writers, and retire their source-writing credential bindings. |
+| Callers of Review's `merge-only.yml` and `merge-sweep.yml` targeting TauCeti | Record each caller repository and workflow ID. These reusable definitions receive `APP_ID`/`APP_PRIVATE_KEY` from their caller; the library's repository is not the credential context. Disable the affected caller ID and retire its credential binding, preserving unrelated callers and library CI. |
+| Progress/Roadmap and other supporting automation | Record actual App IDs and key/secret bindings, including Roadmap's `progress-merge.yml` caller of Progress's `merge.yml`, and Roadmap `auto-merge.yml`. Different App IDs and unrelated targets must be distinguished. If a holder shares the mirror key or can write/authorize the migrated source, fence its affected caller/credential; do not disable unrelated Roadmap operations by filename alone. |
+| Repository, environment and organization secret scopes | Record every scope exposing a retired source-write credential to those callers, its owning administrator, retirement command, read-back and private recovery source. Secret names alone do not establish an App ID or prove different keys. |
+
+For each affected calling repository, instantiate the same per-ID fence with its
+own `holder_repository` (`github.com/OWNER/REPO`), `holder_owner`, `holder_name`
+and `holder_workflow_id`:
+
+```sh
+GH_TOKEN="$(cat "$administrator_token_file")" \
+  "$administrator_gh" workflow disable "$holder_workflow_id" -R "$holder_repository"
+GH_TOKEN="$(cat "$administrator_token_file")" \
+  "$administrator_gh" api --hostname github.com \
+    "repos/$holder_owner/$holder_name/actions/workflows/$holder_workflow_id" \
+    --jq '{id,path,state}'
+```
+
+`actions: write` can re-enable a workflow. Disabling alone is therefore not
+credential retirement. Before source authority transfers, remove the retired
+automated credential bindings or revoke/rotate the retired keys under the
+approved recovery plan. Keep original secret values in the private recovery
+owner's custody; GitHub's metadata API cannot export them. Do not delete the
+new mirror's credential or change unrelated projects' bindings.
+
+For an approved repository-secret retirement, use the native administrator CLI:
+
+```sh
+GH_TOKEN="$(cat "$administrator_token_file")" \
+  "$administrator_gh" secret delete "$retired_secret_name" -R "$holder_repository"
+GH_TOKEN="$(cat "$administrator_token_file")" \
+  "$administrator_gh" secret list -R "$holder_repository" --json name
+```
+
+For an environment secret, use the corresponding `--env "$holder_environment"`
+on both commands. Read back that the named binding is absent in the correct
+scope. For a selected-repository organization secret, its owner can remove only
+the affected repository binding through
+`DELETE /orgs/ORG/actions/secrets/NAME/repositories/REPOSITORY_ID`, then read its
+selected-repository list back. An all-repository, private-repository, inherited,
+or unknown scope needs an explicit owner-approved retirement decision; do not
+silently change organization-wide visibility. Keep the gate incomplete until
+every affected holder has a recorded command and verified result, or provision
+a distinct mirror App through a separately approved setup.
+
 After the mirror push, read the registered workflow states again, verify that
 only the intended essential runs started, and verify the retained historical
 GitHub PRs were not mutated by obsolete automation. New workflow files or missing
 IDs require review; do not infer that a filename mismatch is harmless.
+Repeat the retired-workflow and credential-binding read-backs after cutover,
+including the affected supporting callers, before handing the mirror schedule
+over to its operational owner.
 
 On rollback, preserve the post-cutover native work and fence native promotion
 first. Re-enable only the old workflows selected by the rollback record, after
