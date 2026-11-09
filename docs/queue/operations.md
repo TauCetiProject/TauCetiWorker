@@ -969,7 +969,11 @@ Set `TAUCETI_QUEUE_CACHE_ROOT` identically for all colocated repair workers, for
 They share one `lake-cache` and its ownership lease, while credentials/configuration,
 worktrees, logs and task checkpoints stay in their separate worker roots. Tasks persist
 their selected cache root so a restart/configuration change cannot move an active attempt.
-Publishers receive that exact root in their spec.
+Publishers receive that exact root in their spec. Fetches use disposable per-fetch
+views seeded by hardlinks to shared archives, then atomically transfer verified
+metadata to the common pool; this isolates stock Lake's fixed download temporary
+filenames without serializing downloads or builds. Views are removed on exit, and
+idle retention also removes scratch directories left by crashed fetches.
 
 The minute-by-minute cleanup timer migrates idle legacy pools into the common pool
 using atomic hardlinks without overwriting existing destination names, then removes

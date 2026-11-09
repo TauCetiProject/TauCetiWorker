@@ -309,6 +309,34 @@ class Retention(unittest.TestCase):
         self.assertTrue(source.exists())
         self.assertEqual(list(outside.iterdir()), [])
 
+    def test_concurrent_fetch_views_share_archives_but_isolate_temporary_files(self):
+        cache.register(self.root, self.root.parent / "worker")
+        archive = self.artifact(1)
+        env = {"LAKE_CACHE_DIR": str(self.pool)}
+        with cache.downloads(env) as first, cache.downloads(env) as second:
+            left, right = Path(first["LAKE_CACHE_DIR"]), Path(second["LAKE_CACHE_DIR"])
+            self.assertNotEqual(left, right)
+            self.assertEqual((left / "artifacts" / archive.name).stat().st_ino, archive.stat().st_ino)
+            self.assertEqual((right / "artifacts" / archive.name).stat().st_ino, archive.stat().st_ino)
+            for view, content in [(left, "first"), (right, "second")]:
+                (view / "artifacts" / (archive.name + ".tmp")).write_text(content)
+            self.assertEqual((left / "artifacts" / (archive.name + ".tmp")).read_text(), "first")
+            outputs = right / "outputs/TauCeti"
+            outputs.mkdir(parents=True)
+            (outputs / f"{1:016x}.json").write_text(json.dumps({"data": archive.name}))
+        self.assertFalse(left.exists())
+        self.assertFalse(right.exists())
+        self.assertEqual(list((self.pool / "artifacts").glob("*.tmp")), [])
+        self.assertTrue((self.pool / "outputs/TauCeti" / f"{1:016x}.json").is_file())
+        self.assertEqual(list((self.root / "cache-downloads").iterdir()), [])
+
+    def test_idle_collection_removes_crashed_fetch_scratch_and_partial_artifacts(self):
+        partial = self.write("lake-cache/artifacts/0123456789abcdef.ltar.tmp", "partial")
+        scratch = self.write("cache-downloads/fetch-crashed/outputs/partial.json", "incomplete")
+        self.collect()
+        self.assertFalse(partial.exists())
+        self.assertFalse(scratch.exists())
+
     def test_old_object_and_extensionless_artifacts_are_collected(self):
         old_object = self.artifact(1, "o")
         opaque = self.write("lake-cache/artifacts/0123456789abcdef", "old")

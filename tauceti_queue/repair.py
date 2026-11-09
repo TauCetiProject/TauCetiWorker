@@ -895,56 +895,79 @@ def prepare_artifacts(
     record: dict = {}
     seconds = 0.0
     reasons: list[str] = []
-    if mathlib_cache:
-        deps = run_logged([*lake, "exe", "cache", "get"], worktree, logdir / "cache-get-mathlib.log", env, 1800)
-        record["mathlib_cache"] = deps
-        seconds += deps["seconds"]
-        if deps["rc"] != 0:
-            reasons.append(f"lake exe cache get exited {deps['rc']}")
-    warm_attempts: list[dict] = []
-    for service, revision in dict.fromkeys((service, revision) for service, revision in warm if revision):
-        fetch = _fetch_mapping(
-            worktree, revision, env, logdir, repository=repository, lake=lake, mappings_only=False, service=service
-        )
-        fetch["distance"] = None
-        warm_attempts.append(fetch)
-        seconds += fetch["seconds"]
-    warmed = [fetch for fetch in warm_attempts if fetch["mapping_found"]]
-    record["warm_attempts"] = warm_attempts
-    record["warmed_from"] = [fetch["revision"] for fetch in warmed]
-    tried = {(fetch["service"], fetch["revision"]) for fetch in warm_attempts}
-    attempts: list[dict] = []
-    candidates = [
-        (service, revision, None) for service, revision in preferred if revision and (service, revision) not in tried
-    ] + [
-        (CACHE_SERVICE, revision, distance)
-        for revision, distance in _artifact_candidates(worktree, base, fallbacks, ancestors)
-    ]
-    for service, revision, distance in candidates:
-        fetch = _fetch_mapping(
-            worktree, revision, env, logdir, repository=repository, lake=lake, mappings_only=False, service=service
-        )
-        fetch["distance"] = distance
-        attempts.append(fetch)
-        seconds += fetch["seconds"]
-        if fetch["mapping_found"]:
-            break
-    found = attempts[-1] if attempts[-1]["mapping_found"] else None
-    record["base_cache"] = attempts[-1]
-    if found is None and warmed:
-        found = warmed[0]
-    record["cache_attempts"] = attempts
-    record["cache_revision"] = found["revision"] if found else None
-    record["cache_distance"] = found["distance"] if found else None
-    record["cache_service"] = found["service"] if found else None
-    record["cache_skipped"] = _skipped_summary(attempts, base)
-    if found is None:
-        reasons.append("; ".join(record["cache_skipped"]))
-    if candidate:
-        own = _fetch_mapping(worktree, candidate, env, logdir, repository=repository, lake=lake, mappings_only=True)
-        own["published"] = own["mapping_found"]
-        record["candidate_outputs_published"] = own
-        seconds += own["seconds"]
+    from tauceti_queue.repair_cache import downloads
+
+    with downloads(env) as fetch_env:
+        if mathlib_cache:
+            deps = run_logged(
+                [*lake, "exe", "cache", "get"], worktree, logdir / "cache-get-mathlib.log", fetch_env, 1800
+            )
+            record["mathlib_cache"] = deps
+            seconds += deps["seconds"]
+            if deps["rc"] != 0:
+                reasons.append(f"lake exe cache get exited {deps['rc']}")
+        warm_attempts: list[dict] = []
+        for service, revision in dict.fromkeys((service, revision) for service, revision in warm if revision):
+            fetch = _fetch_mapping(
+                worktree,
+                revision,
+                fetch_env,
+                logdir,
+                repository=repository,
+                lake=lake,
+                mappings_only=False,
+                service=service,
+            )
+            fetch["distance"] = None
+            warm_attempts.append(fetch)
+            seconds += fetch["seconds"]
+        warmed = [fetch for fetch in warm_attempts if fetch["mapping_found"]]
+        record["warm_attempts"] = warm_attempts
+        record["warmed_from"] = [fetch["revision"] for fetch in warmed]
+        tried = {(fetch["service"], fetch["revision"]) for fetch in warm_attempts}
+        attempts: list[dict] = []
+        candidates = [
+            (service, revision, None)
+            for service, revision in preferred
+            if revision and (service, revision) not in tried
+        ] + [
+            (CACHE_SERVICE, revision, distance)
+            for revision, distance in _artifact_candidates(worktree, base, fallbacks, ancestors)
+        ]
+        for service, revision, distance in candidates:
+            fetch = _fetch_mapping(
+                worktree,
+                revision,
+                fetch_env,
+                logdir,
+                repository=repository,
+                lake=lake,
+                mappings_only=False,
+                service=service,
+            )
+            fetch["distance"] = distance
+            attempts.append(fetch)
+            seconds += fetch["seconds"]
+            if fetch["mapping_found"]:
+                break
+        found = attempts[-1] if attempts[-1]["mapping_found"] else None
+        record["base_cache"] = attempts[-1]
+        if found is None and warmed:
+            found = warmed[0]
+        record["cache_attempts"] = attempts
+        record["cache_revision"] = found["revision"] if found else None
+        record["cache_distance"] = found["distance"] if found else None
+        record["cache_service"] = found["service"] if found else None
+        record["cache_skipped"] = _skipped_summary(attempts, base)
+        if found is None:
+            reasons.append("; ".join(record["cache_skipped"]))
+        if candidate:
+            own = _fetch_mapping(
+                worktree, candidate, fetch_env, logdir, repository=repository, lake=lake, mappings_only=True
+            )
+            own["published"] = own["mapping_found"]
+            record["candidate_outputs_published"] = own
+            seconds += own["seconds"]
     if build and not reasons:
         built = run_logged(
             repair_sandbox.sandboxed_lake([*lake, "build", "--iofail"], worktree, env),

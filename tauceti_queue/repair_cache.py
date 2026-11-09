@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import sqlite3
+import tempfile
 import time
 from pathlib import Path
 
@@ -178,7 +179,7 @@ def _collect(root: Path, *, apply: bool, now: float, max_bytes: int, max_age: fl
     if pool.is_symlink():
         raise ValueError("symlink Lake pool")
     artifacts = {p.name: p for p in _files(pool / "artifacts", "*")}
-    if any(not ARTIFACT.fullmatch(name) for name in artifacts):
+    if any(not ARTIFACT.fullmatch(name.removesuffix(".tmp")) for name in artifacts):
         raise ValueError("unrecognized Lake artifact; refusing partial collection")
     sizes = {name: path.stat().st_size for name, path in artifacts.items()}
     mappings = _files(pool / "revisions", "*/*.jsonl")
@@ -265,6 +266,13 @@ def _collect(root: Path, *, apply: bool, now: float, max_bytes: int, max_age: fl
     if apply:
         for path in [*stale_maps, *stale_outputs, *remove]:
             path.unlink()
+        # A killed fetch cannot leave permanent scratch space. The exclusive lease and
+        # owner checks above mean no live attempt can own one of these temporary views.
+        staging = root / "cache-downloads"
+        if staging.is_symlink():
+            staging.unlink()
+        elif staging.exists():
+            shutil.rmtree(staging)
     return result
 
 
@@ -305,6 +313,45 @@ def before_task(root: Path) -> dict:
     except (OSError, ValueError, KeyError, TypeError) as error:
         result.update(state="error", error=str(error))
     return result
+
+
+@contextlib.contextmanager
+def downloads(env: dict):
+    """Isolate stock Lake's fixed `.tmp` names; share completed immutable archives.
+
+    Only the fetch view is disposable. Builds and publishers continue using the common
+    pool. Transfer copies mutable indexes atomically and preserves valid native records.
+    The attempt's shared cache lease covers this entire context.
+    """
+    pool = Path(env["LAKE_CACHE_DIR"]) if env.get("LAKE_CACHE_DIR") else None
+    if pool is None or not (pool.parent / "cache-users").is_dir():
+        yield env
+        return
+    from tauceti_worker.expanded_cache import link, transfer
+
+    staging = pool.parent / "cache-downloads"
+    staging.mkdir(exist_ok=True)
+    if staging.is_symlink():
+        raise ValueError("symlink cache download directory")
+    with tempfile.TemporaryDirectory(dir=staging, prefix="fetch-") as temporary:
+        view = Path(temporary)
+        for path in _files(pool / "artifacts", "*.ltar"):
+            link(path, view / "artifacts" / path.name)
+        for path in _files(pool / "revisions", "*/*.jsonl"):
+            target = view / "revisions" / path.relative_to(pool / "revisions")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, target)
+        try:
+            yield dict(env, LAKE_CACHE_DIR=str(view))
+        finally:
+            for partial in _files(view / "artifacts", "*.tmp"):
+                partial.unlink()
+            for mapping in _files(view / "revisions", "*/*.jsonl"):
+                try:
+                    _mapping(mapping)
+                except (ValueError, TypeError):
+                    mapping.unlink()
+            transfer(view, pool)
 
 
 def migrate(database: Path, roots: list[Path], shared: Path, *, apply=False) -> list[dict]:
