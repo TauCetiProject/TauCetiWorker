@@ -179,6 +179,7 @@ RUN_STDLIB=(
   queue_admission_planning.py
   queue_fixture.py
   queue_store.py
+  queue_statistics.py
   queue_admission_state.py
   queue_admission.py
   queue_admission_adapter.py
