@@ -102,7 +102,7 @@ class Operator:
             "execution_credentials_dir",
             "reviewer_ids",
         }
-        optional = {"execution_mode", "execution_read_token_file", "mirror_main"}
+        optional = {"execution_mode", "execution_read_token_file", "mirror_main", "mirror_actor_ids"}
         if not isinstance(profile, dict) or set(profile) - optional != expected or profile["schema"] != SCHEMA:
             raise ValueError("invalid Stage 1 operator profile")
         reviewers = profile["reviewer_ids"]
@@ -114,6 +114,16 @@ class Operator:
             or len(set(reviewers)) != len(reviewers)
         ):
             raise ValueError("operator profile needs explicit distinct native reviewer IDs")
+        mirror_actors = profile.get("mirror_actor_ids")
+        if "mirror_actor_ids" in profile and (
+            not isinstance(mirror_actors, list)
+            or not mirror_actors
+            or len(mirror_actors) > 32
+            or any(type(value) is not int or value < 1 for value in mirror_actors)
+            or len(set(mirror_actors)) != len(mirror_actors)
+            or set(mirror_actors) & set(reviewers)
+        ):
+            raise ValueError("mirror actor IDs must be distinct native IDs separate from human reviewers")
         self.configuration = read_control_policy(_path(profile["configuration"]))
         self.policy = cc.ExecutionPolicy.parse(profile["execution_policy"], configuration=self.configuration)
         self.project = parse(self.configuration)
@@ -123,6 +133,7 @@ class Operator:
         if self.clone.is_symlink() or not self.clone.is_dir() or self.database.is_symlink():
             raise ValueError("operator clone/database must use explicit real paths")
         self.reviewers, self.clock = frozenset(reviewers), clock
+        self.mirror_actors = frozenset(mirror_actors) if mirror_actors is not None else None
         raw_token = read_control_policy(_path(profile["source_token_file"]))
         token = raw_token.decode("ascii").strip()
         ensure_ssl_cert_file()
@@ -150,6 +161,8 @@ class Operator:
         self.execution = execution
         self.execution_mode = mode
         self.mirror_main = profile.get("mirror_main", False)
+        if self.mirror_actors is not None and self.mirror_main is not True:
+            raise ValueError("mirror-only profile requires mirror_main enabled")
         if type(self.mirror_main) is not bool:
             raise ValueError("mirror_main must be an explicit boolean")
         self.mirror_credentials_dir = _path(profile["execution_credentials_dir"])
@@ -178,6 +191,17 @@ class Operator:
                 # points claim this setting in a transaction before other writes.
                 with self.store.transaction():
                     owner = self.store.get_setting("queue:operating-mode")
+                    if self.mirror_actors is not None:
+                        reviewers = self.store.get_setting("stage1:reviewers")
+                        if (
+                            owner != "stage1-operator"
+                            or not isinstance(reviewers, list)
+                            or not reviewers
+                            or self.mirror_actors & set(reviewers)
+                        ):
+                            raise ValueError(
+                                "mirror-only profile needs an existing human ledger with disjoint reviewers"
+                            )
                     if owner not in {None, "stage1-operator"}:
                         raise ValueError("controller-owned ledger cannot be used by the Stage 1 operator")
                     if owner is None and any(
@@ -201,11 +225,12 @@ class Operator:
                         self.configuration,
                         workflow_revision=self.workflow_revision,
                     )
-                    if previous is not None and previous != current:
+                    if self.mirror_actors is None and previous is not None and previous != current:
                         self.store.journal(
                             self.clock(), "stage1-reviewer-policy-changed", previous=previous, current=current
                         )
-                    self.store.set_setting("stage1:reviewers", current)
+                    if self.mirror_actors is None:
+                        self.store.set_setting("stage1:reviewers", current)
                 self.ci = SourceCandidateCI(self.ledger, self.execution, clock=self.clock)
                 yield self
             finally:
@@ -213,11 +238,15 @@ class Operator:
                 self.store = None
 
     def _actor(self, *, require_push=True):
+        if require_push and self.mirror_actors is not None:
+            raise ValueError("mirror-only profile cannot accept, dispatch, abandon or promote source work")
         self.source._bound(self.policy.source.repository.key)
         actor = self.api.current_user()
         native_id = actor.get("id")
-        if type(native_id) is not int or native_id not in self.reviewers:
-            raise ValueError("authenticated source actor is not an approved Stage 1 reviewer")
+        allowed = self.mirror_actors if self.mirror_actors is not None else self.reviewers
+        if type(native_id) is not int or native_id not in allowed:
+            role = "mirror actor" if self.mirror_actors is not None else "reviewer"
+            raise ValueError("authenticated source actor is not an approved Stage 1 " + role)
         access = self.api.repository(self.policy.source.repository)
         if require_push and access.get("permissions", {}).get("push") is not True:
             raise ValueError("operator source actor lacks current repository write permission")

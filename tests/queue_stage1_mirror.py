@@ -318,6 +318,86 @@ class Mirror(unittest.TestCase):
             self.assertEqual(len(f.source.promotions), 1)
             self.assertEqual(f.execution.sends, 1)
 
+    def test_dedicated_mirror_actor_cannot_grant_acceptance_or_publish_source(self):
+        f = self.fixture
+        fixtures.git(f.remote, "update-ref", "refs/heads/main", f.base, self.tip)
+        f.profile.update(mirror_main=True, workflow_revision=f.base, mirror_actor_ids=[8])
+        f.api.actor = 8
+        for writable in (False, True):
+            f.api.writable = writable
+            with (
+                self.subTest(account_reports_push=writable),
+                patch.object(self.mirror, "_run_git", side_effect=self.transport),
+                Operator(
+                    f.profile, source=f.source, client=f.api, execution=f.execution, mirror=self.mirror
+                ).session() as operator,
+            ):
+                self.assertEqual(operator.mirror()["main"], f.base)
+                operations = (
+                    lambda: operator.prepare(1, f.head),
+                    lambda: operator.dispatch(1),
+                    lambda: operator.handoff(1),
+                    lambda: operator.promote(1),
+                    lambda: operator.abandon(1, "mirror actor must not abandon human work"),
+                )
+                for operation in operations:
+                    with self.assertRaisesRegex(ValueError, "mirror-only profile"):
+                        operation()
+                self.assertEqual(operator.store.get_setting("stage1:reviewers"), [7])
+                self.assertEqual(operator.store.get_setting("stage1:acceptance:1")["reviewer_id"], 7)
+        self.assertEqual(f.execution.sends, 0)
+        self.assertEqual(f.source.promotions, [])
+
+    def test_mirror_only_profile_cannot_accept_even_with_a_human_reviewer_token(self):
+        f = self.fixture
+        profile = {**f.profile, "mirror_actor_ids": [8], "mirror_main": True}
+        f.api.actor = 7
+        f.api.writable = True
+        with Operator(
+            profile, source=f.source, client=f.api, execution=f.execution, mirror=self.mirror
+        ).session() as operator:
+            with self.assertRaisesRegex(ValueError, "mirror-only profile"):
+                operator.prepare(1, f.head)
+            with self.assertRaisesRegex(ValueError, "not an approved Stage 1 mirror actor"):
+                operator.mirror()
+
+    def test_mirror_actors_must_be_distinct_from_human_reviewers(self):
+        f = self.fixture
+        for actors in ([], None, [7], [8, 8], [True], [0], "8", list(range(8, 41))):
+            with self.subTest(actors=actors), self.assertRaisesRegex(ValueError, "separate from human reviewers"):
+                Operator(
+                    {**f.profile, "mirror_actor_ids": actors}, source=f.source, client=f.api, execution=f.execution
+                )
+
+    def test_mirror_profile_does_not_rotate_human_reviewers_and_checks_live_ledger(self):
+        f = self.fixture
+        fixtures.git(f.remote, "update-ref", "refs/heads/main", f.base, self.tip)
+        profile = {
+            **f.profile,
+            "mirror_main": True,
+            "workflow_revision": f.base,
+            "reviewer_ids": [9],
+            "mirror_actor_ids": [8],
+        }
+        f.api.actor = 8
+        with (
+            patch.object(self.mirror, "_run_git", side_effect=self.transport),
+            Operator(
+                profile, source=f.source, client=f.api, execution=f.execution, mirror=self.mirror
+            ).session() as operator,
+        ):
+            operator.mirror()
+            self.assertEqual(operator.store.get_setting("stage1:reviewers"), [7])
+            operator.store.set_setting("stage1:reviewers", [8])
+        with self.assertRaisesRegex(ValueError, "disjoint reviewers"):
+            with Operator(profile, source=f.source, client=f.api, execution=f.execution, mirror=self.mirror).session():
+                self.fail("conflicting authoritative reviewer list accepted")
+
+    def test_mirror_only_profile_requires_enabled_mirroring(self):
+        f = self.fixture
+        with self.assertRaisesRegex(ValueError, "requires mirror_main enabled"):
+            Operator({**f.profile, "mirror_actor_ids": [8]}, source=f.source, client=f.api, execution=f.execution)
+
     def test_read_only_mirror_recovers_a_lost_source_push_acknowledgement(self):
         f = self.fixture
         fixtures.git(f.remote, "update-ref", "refs/heads/main", f.base, self.tip)
@@ -341,10 +421,12 @@ class Mirror(unittest.TestCase):
                 operator.promote(row["attempt_id"])
             self.assertEqual(operator.store.row("ci_attempts", {"id": row["attempt_id"]})["outcome"], "pending")
         f.api.writable = False
+        f.api.actor = 8
+        mirror_profile = {**f.profile, "mirror_actor_ids": [8]}
         with (
             patch.object(self.mirror, "_run_git", side_effect=self.transport),
             Operator(
-                f.profile, source=f.source, client=f.api, execution=f.execution, mirror=self.mirror
+                mirror_profile, source=f.source, client=f.api, execution=f.execution, mirror=self.mirror
             ).session() as operator,
         ):
             result = operator.mirror()
