@@ -1,26 +1,26 @@
 # Move TauCeti development to Forgejo
 
-Make `https://git.taucetiproject.org/` the home of TauCeti development, with
-Forgejo owning pull requests and merges, `main` mirrored back to GitHub, and
-GitHub Actions retained for CI.
+Make `https://git.taucetiproject.org/` the home of development for the main
+TauCeti repository. Forgejo owns contributions, reviews, and merges; its `main`
+branch automatically mirrors to GitHub. Keep GitHub Actions for CI and keep
+familiar agent-facing `gh` commands through the existing compatibility layer.
 
-The immediate goal is **Stage 1: prepare and rehearse the earliest usable migration**.
-It establishes a working development path with humans supervising review, CI
-dispatch, and merges. Keep GitHub Actions as the execution backend and keep the
-familiar agent-facing `gh` interface.
+Prioritize the earliest practical migration. **Stage 1 delivers a usable,
+human-supervised development path and a rehearsed migration package. Stage 2
+completes autonomous operation and the remaining integrations.**
 
-Stage 2 restores full autonomous operation, completes the remaining integrations,
-and prepares shared-state retirement. **Stage 2 completion is not a prerequisite
-for migrating the main TauCeti repository.**
+**Finishing Stage 2 is not a prerequisite for migrating the main repository.**
 
 | Stage | Deliverable | Completion gate |
 | --- | --- | --- |
-| **1: Earliest migration** | Forgejo contributions, human-supervised review and merge, real GitHub CI, and a `main` mirror with working builds, caches, and docs. | An isolated end-to-end rehearsal and an executable cutover/rollback package, ready for a separate cutover decision. |
-| **2: Remaining work** | Autonomous Worker/Review/Progress and queue operation, remaining portability and fleet work, and shared-state retirement preparation. | The full autonomous lifecycle, recovery and capacity evidence, and final operational handover. |
+| **1: Ready to migrate** | Forgejo contributions, supervised review and merge, real GitHub CI, automatic `main` mirroring, and working builds, caches, and docs. | End-to-end rehearsal, preserved active work, and an executable cutover/rollback package ready for an explicit cutover decision. |
+| **2: Complete the transition** | Autonomous Worker/Review/Progress and queue operation, remaining portability and fleet work, and shared-state retirement preparation. | Full lifecycle, recovery, capacity, installed integration, and operational handover evidence. |
 
-Work on Stage 1 first. Defer Stage 2 implementation unless a demonstrated Stage 1
-blocker requires a specific part of it. Live migration and eventual service shutdown
-each require separate authorization.
+Work on Stage 1 first. Bring a Stage 2 item forward only when a demonstrated
+Stage 1 blocker requires it; record why and the resulting change to the critical
+path. Do not turn the urgent migration into a prerequisite to finish every
+integration. Live migration and eventual service shutdown each require separate
+authorization.
 
 These are requirements and completion gates, not a claim that every item remains
 unimplemented. Reuse completed work and record the evidence; do not rebuild it.
@@ -47,6 +47,9 @@ not discard the unfinished requirements.
   backend is part of this goal.**
 - Preserve existing spending history and prepared work. Migration and recovery
   must not reset budgets or repeat paid authoring/reviewing.
+- Retire the shared-state service after its consumers migrate; do not generalize
+  or redesign it. Shutdown requires separate explicit authorization. Keep it
+  operational for consumers that still need it.
 - Prefer existing implemented components. Make new changes only where they close
   a requirement or a demonstrated failure in the current stage.
 - Production remains on GitHub until a separately authorized cutover. This goal
@@ -59,14 +62,24 @@ not discard the unfinished requirements.
 
 ## Stage 1 — Prepare and rehearse the earliest operational migration
 
-### Delivery order
+### Deliverable and critical path
 
-Confirm destination access and recovery ownership while connecting the existing
-source-candidate CI path to a real GitHub build. Then complete the human-operated
-review/merge commands, prove the `main` mirror and post-merge outputs, and rehearse
-the cutover and rollback. Collect the active-work inventory alongside this work.
-Track unresolved access or operational dependencies explicitly; do not substitute
-more Stage 2 implementation for resolving a migration blocker.
+Deliver a development path an operator can actually use, plus the evidence and
+commands needed to authorize cutover. This stage prepares and rehearses migration;
+it does not itself switch production authority.
+
+Use these priorities, running independent preparation in parallel. Confirm
+destination access and recovery ownership, and collect the active-work inventory,
+while connecting the existing candidate path to real CI:
+
+1. Confirm destination access and recovery ownership.
+2. Connect the existing source-candidate path to a real GitHub Lean build.
+3. Complete the human-operated review, dispatch, verification, and merge commands.
+4. Prove automatic `main` mirroring and essential post-merge outputs.
+5. Rehearse interruption recovery and rollback; deliver the cutover package.
+
+Track unresolved access and operational dependencies explicitly. More Stage 2
+implementation is not a substitute for resolving an essential migration blocker.
 
 ### Intended operating mode
 
@@ -80,6 +93,9 @@ server API additions or autonomous queue a Stage 1 dependency unless a concrete
 requirement of the chosen operating mode needs them. If uninterrupted autonomous
 operation becomes a day-one requirement, explicitly promote its prerequisites
 from Stage 2 and revise the critical path; do not silently bypass their gates.
+
+Supporting repositories and immutable tool/dependency pins may remain on GitHub.
+Comprehensive GraphQL compatibility and a full-fleet rollout are not Stage 1 work.
 
 ### 1. Establish the destination and preserve development work
 
@@ -177,19 +193,14 @@ GitHub automation changes, backups, verification, and how to settle interrupted 
 
 Stage 1 is complete when the operator can review evidence for all six gates:
 
-- **Destination:** access, protections, backup/recovery, and operational owners are
-  confirmed for the intended destination.
-- **Work preservation:** required Git objects and active work are accounted for,
-  including claims, spending records, prepared outputs, and transfer decisions.
-- **Contribution path:** a real failing contribution is refused, its corrected
-  revision passes GitHub CI, and stale review or CI evidence cannot authorize merge.
-- **Merge and outputs:** the exact tested candidate lands, only `main` mirrors back,
-  and actual main builds, caches, and documentation produce verified outputs.
-- **Recovery:** interrupted operations, mirror repair, and rollback have been
-  exercised without losing a contribution or repeating paid work.
-- **Handover:** executable cutover/rollback commands, immutable pins, linked evidence,
-  temporary manual duties, and their owners are recorded, with no unresolved
-  essential-path blocker.
+| Gate | Required evidence |
+| --- | --- |
+| **Destination** | Intended destination access, protections, backup/recovery, and operational owners confirmed. |
+| **Work preservation** | Required Git objects and active work accounted for, including claims, spending records, prepared outputs, and transfer decisions. |
+| **Contribution path** | A real failed candidate is refused, its corrected revision passes GitHub CI, and stale review/CI cannot authorize merge. |
+| **Merge and outputs** | The exact tested candidate lands, only `main` mirrors, and actual builds/caches/docs produce verified outputs. |
+| **Recovery** | Interrupted operations, mirror repair, and rollback exercised without losing contributions or repeating paid work. |
+| **Handover** | Executable cutover/rollback runbooks, immutable pins, linked evidence, and temporary manual duties with named owners, with no essential-path blocker unresolved. |
 
 It does **not** require autonomous Review/Progress, all support repositories moved,
 full-fleet capacity validation, or shared-state shutdown. Present the migration
@@ -205,6 +216,11 @@ must not be reported as proof that the production migration already happened.
 Restore the full development workflow on Forgejo without undoing the Stage 1
 operating path. Work may proceed before or after the live cutover, but unfinished
 Stage 2 features stay outside production admission until their own gates pass.
+
+The sections below retain the remaining requirements from the original plan.
+They are deliberately outside the Stage 1 migration gate: autonomous agents and
+queue operation, necessary native API additions, broader compatibility and fleet
+work, full-load validation, and shared-state retirement preparation.
 
 ### 1. Complete Worker, Review, Progress, and claims integration
 

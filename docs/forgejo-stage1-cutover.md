@@ -21,6 +21,8 @@ an unproven essential rehearsal result means migration readiness is incomplete.
 | Operators | Named human reviewers, their native Forgejo IDs, dispatcher, merge operator, and cover for absence |
 | Recovery | Named Forgejo administrator and backup/recovery owner; access to Git, database, configuration, keys, and tested restoration |
 | Credentials | Human source-token files, dedicated mirror-reader account/profile, read-only CI observer, narrowly scoped GitHub workflow dispatcher, execution App directory, installation/repository selection, and main push permissions |
+| Administrative access | Separate named GitHub administrator profile for protection/secret/workflow changes; never use its token as the runtime dispatcher or observer |
+| App key holders | Mirror App ID/installation ID, every automated holder of its private keys or source-writing credentials, owning repository/host, and the exact retirement command and read-back for each |
 | Controls | Reviewed configuration/policy bytes, immutable Worker/Tools revisions, protected caller/control commit, and expected old tips |
 | Existing work | Timestamped PR/branch/tag inventory, claim namespaces, queue records, spending history, prepared outputs, and a disposition/owner for unsettled work |
 | Automation | Old source writers to fence, retained execution jobs, temporary manual duties, and the mirror repair schedule |
@@ -45,8 +47,23 @@ version and capabilities; do not deploy a server fork as an implicit prerequisit
    its `.github/workflows` are execution-mirror callers, not native runner jobs.
    CI execution never receives source merge credentials. Require operator
    `execution_mode: "workflow"` for this cutover; App-mode CI would share the
-   mirror App's main branch exception. Test that the dispatcher's workflow-only
-   credential and the CI observer cannot push GitHub main.
+   mirror App's main branch exception. Provision the dispatcher with only
+   `actions: write` and, when needed for native `gh` workflow discovery,
+   `contents: read`, scoped to the execution repository. It must have no
+   `contents: write`, `workflows: write`, or administration permission. A
+   repository-scoped App token minted with this subset or an equivalent
+   fine-grained token is suitable. Record the issuing App/account and its
+   permissions. Mint an installation token in a separate administrative step for
+   each dispatch, then deliver only that short-lived token to the dispatch
+   process and delete its file afterwards. The trusted operator host may also
+   hold the mirror key; this separates credentials delivered to the process,
+   not OS users. Test permission-level write refusal,
+   separately from branch-policy refusal, for this credential and the observer.
+   The earlier administrator-triggered CI proves the build path, not the final
+   dispatcher role; do not relabel that bootstrap credential as workflow-only.
+   The final scoped credential must also dispatch a real protected parent whose
+   child is adopted through its verified receipt. A rejected mint or negative
+   push test alone does not prove this positive path.
 2. Preserve history and active work. Keep exact Git objects for required branches,
    tags, dependency pins, PR heads, and queue candidates. Verify the self-contained
    bundles and restore them independently. Keep historical GitHub discussions and
@@ -75,8 +92,10 @@ version and capabilities; do not deploy a server fork as an implicit prerequisit
    the pinned Tools release. The flagship generator requires `features.docs = true`,
    the existing `web/`/`docbuild/` layout, and matching source/execution branch names.
    Supporting Roadmap/tools/dependencies may remain on GitHub. Identify and record
-   obsolete GitHub source writers for the authorized switch; historical GitHub analytics must remain identified as
-   historical until their Stage 2 replacements are ready.
+   obsolete GitHub source writers for the authorized switch using the
+   [automation disposition](forgejo-stage1-automations.md). Historical GitHub
+   analytics must remain identified as historical until their Stage 2 replacements
+   are ready.
 7. Match cache endpoint variables to the trusted configuration. Pass the upload key
    only to the isolated reusable publisher. Required publication must fail on
    missing configuration. Confirm published revision maps and usable documentation
@@ -165,6 +184,38 @@ promote and complete the relevant Stage 2 prerequisites before this operation.
    let paid repair sessions checkpoint/submit before stopping their workers.
    Refresh work/claim/publication inventories and backups after that boundary.
    Preserve original refs, identities, spending history, and prepared outputs.
+
+   The installed manager supports persistent per-worker disable through
+   `tauceti workers --config PATH disable ID`. Record the explicit configuration
+   path and approved affected worker IDs; the operator host currently uses
+   `~/.config/tauceti/workers.toml`. Confirm its source bindings at cutover rather
+   than selecting every worker by name. After the affected worker's paid session
+   has checkpointed or finished under the recorded disposition, observe
+   a fresh runner snapshot at the same safe point used by the installed manager's
+   read-policy reload: `state` is `idle`, `backoff`, `waiting-github`,
+   `waiting-budget`, or `waiting-quota`; `next_action_at` is at least 15 seconds
+   ahead; and there is no active round subprocess. On Linux, inspect
+   `/proc/CHILD_PID/task/CHILD_PID/children` for the snapshot's `child_pid` and
+   require it to be empty. Missing/stale process evidence is not a safe point.
+   Recheck immediately before disabling; if the worker has started work, wait for
+   another safe point rather than killing that work:
+
+   ```sh
+   tauceti workers --config "$workers_config" status --json
+   tauceti workers --config "$workers_config" disable "$affected_worker_id"
+   tauceti workers --config "$workers_config" status --json
+   ```
+
+   `disable` persists stopped state and the manager stops that worker; it is not
+   a graceful inference-checkpoint command. Do not use it to interrupt unpreserved
+   paid work. Repeat only for the authorized project workers, verify both stopped
+   desired state and actual process exit, and retain their stores/outboxes. Keep
+   unrelated workers and CI enabled. These are authority-transfer commands, not
+   preparation or routine deployment precautions.
+   The postcondition for the selected worker is `desired == "stopped"` and
+   `alive == false`. `status` exits 1 if the manager is offline or an enabled
+   worker is dead; inspect its JSON and repair that condition, rather than
+   interpreting the exit code as proof that the selected worker stopped safely.
 2. Fence the old GitHub merge/source writers for the affected project before
    enabling Forgejo merge authority. The old queue and new mirror can share a
    GitHub App identity: different token permission subsets do not distinguish
@@ -188,17 +239,39 @@ promote and complete the relevant Stage 2 prerequisites before this operation.
    **Do not run `services/queue/install.sh` on the fenced host:** it enables and
    starts this service even with `--no-restart`. Leave a durable host/deployment
    notice and the same restriction in the queue operations record.
+   The same restriction applies to `services/queue/install-repair.sh`, which
+   enables the repair unit even with `--no-restart`. Record the identity and scope
+   behind each repair runtime's configured token and any fallback
+   `GH_TOKEN`/`gh auth token` login. Retire its runtime access; a repository-admin
+   credential may remain only in the separately named administrative profile,
+   not an unattended repair environment. Remove or revoke other retained repair
+   credentials under the recorded owner/recovery plan.
 
    After their paid work is settled, disable the installed repair units
    `tauceti-queue-repair.service`, `tauceti-queue-repair@2.service`, and
    `tauceti-queue-repair@3.service` on their actual hosts. Fence the workflow
-   backstop and classify/disable installed source-writing workflows including
+   backstop and classify/disable installed source-related workflows including
    `update.yml`, `update-upstreams.yml`, `toolchain-tags.yml`, `auto-merge.yml`,
    `merge-sweep.yml`, `merge-only.yml`, `deprecated-prs.yml`, `merge-conflicts.yml`,
    `housekeeping.yml`, and `progress-merge.yml`. Keep the old `tau-ceti-bors`
    installation suspended. Do not execute the older Bors rollback procedure while
    Forgejo owns merges. Confirm the actual workflow/unit inventory rather than
    assuming every listed historical name is still installed.
+   Complete the [App-key holder inventory](forgejo-stage1-automations.md#app-key-holders-and-retired-credentials)
+   across hosts, calling repositories, environments, and organization secrets.
+   Retire old automated credential access as well as stopping jobs. Every holder
+   of the same App key can mint the mirror role; an App-only allowlist does not
+   distinguish its old queue or Review/Progress callers from the new mirror.
+
+   Inspect GitHub's native merge queue and armed PR auto-merge separately from
+   the custom queue database. If any entry or armed request exists, preserve its
+   PR/head and disposition, dequeue/disarm it under the old authority, and read
+   back that none remain before the switch. Disabling a workflow or retiring a
+   key does not cancel an already queued server-side merge. Disable repository
+   auto-merge for the mirror and explicitly retire any GitHub native merge-queue
+   admission rule that would continue authorizing source changes. These actions
+   apply only at the authorized cutover; inventory/commands are in the
+   [automation disposition](forgejo-stage1-automations.md).
 
    Account for late old-work publications and route new
    source work through the native human workflow. This is a project authority
@@ -220,6 +293,57 @@ promote and complete the relevant Stage 2 prerequisites before this operation.
    retained candidate refs. Set GitHub main protections to permit the intended
    mirror App, and remove obsolete writers/exceptions after the reviewed bootstrap.
    Confirm that a writable contributor cannot update either protected source ref.
+
+   Install the mirror App exception before removing the temporary GitHub bootstrap
+   writer. Require admin enforcement and a nonempty App-only push allowlist: no
+   human users or teams, and exactly the approved mirror App. An empty actor list
+   is not a verified deny-all policy: the isolated negative test allowed the
+   administrator to push even with `enforce_admins` enabled. Read effective settings
+   with the separate administrator profile, rather than the dispatcher/observer.
+   Record classic protection and applicable rulesets, including inherited ruleset
+   details and bypass actors; this first endpoint alone is not the effective
+   policy. A missing restriction is a failure:
+
+   ```sh
+   GH_TOKEN="$(cat "$administrator_token_file")" \
+     "$administrator_gh" api --hostname github.com \
+     "repos/$execution_owner/$execution_name/branches/main/protection" \
+     --jq '. as $p | (.restrictions // error("no push restrictions")) as $r | {enforce_admins:$p.enforce_admins.enabled,users:[$r.users[].login],teams:[$r.teams[].slug],apps:[$r.apps[]|{id,slug}],allow_force_pushes:$p.allow_force_pushes.enabled,allow_deletions:$p.allow_deletions.enabled}'
+   GH_TOKEN="$(cat "$administrator_token_file")" \
+     "$administrator_gh" api --hostname github.com \
+     "repos/$execution_owner/$execution_name/rules/branches/main" \
+     > "$deployment_record/github-main-rules.json"
+   GH_TOKEN="$(cat "$administrator_token_file")" \
+     "$administrator_gh" api --hostname github.com --paginate --slurp \
+     "repos/$execution_owner/$execution_name/rulesets?includes_parents=true" \
+     > "$deployment_record/github-rulesets.json"
+   ```
+
+   For every listed repository or inherited organization ruleset, resolve its
+   detail endpoint on the approved GitHub API origin, record it as
+   `ruleset_detail_endpoint`, and retain its enforcement and `bypass_actors`:
+
+   ```sh
+   GH_TOKEN="$(cat "$administrator_token_file")" \
+     "$administrator_gh" api --hostname github.com "$ruleset_detail_endpoint" \
+     > "$deployment_record/ruleset-$ruleset_id.json"
+   ```
+
+   Listing rule summaries does not replace these details. Unreadable or unknown
+   inherited policy leaves the protection gate incomplete.
+
+   In the isolated rehearsal, verify actual main push refusal for the dispatcher
+   and observer, unchanged main tips, and the protection/ruleset read-back taken
+   immediately before each probe. Also verify the narrowed dispatcher cannot
+   write repository contents regardless of the main branch rule. A settings read,
+   an empty allowlist, or a Git dry run is insufficient. Keep this gate incomplete
+   until the final roles and App-only policy pass; do not call the temporary
+   administrator bootstrap configuration ready.
+   A raw mirror push must also be permitted by any remaining PR, merge-queue or
+   status-check rules. Remove obsolete GitHub source-admission requirements from
+   the execution mirror, or record an approved mirror-App bypass limited to those
+   requirements. Preserve source CI/acceptance and expected-old, fast-forward and
+   deletion protections; do not waive source checks to make the mirror push work.
 5. Confirm the mirror App is installed on the exact execution repository and can
    mint the scoped `contents: write`/`workflows: write` token. Set `mirror_main: true`
    and confirm the equal bootstrap tips:
@@ -232,7 +356,11 @@ promote and complete the relevant Stage 2 prerequisites before this operation.
    unexplained bootstrap difference. Reconcile any mismatch before proceeding.
 6. Announce the approved source home through the separately authorized channel.
    Give contributors the native clone/fork URLs and project-scoped `gh`
-   compatibility configuration. For an existing clone, after preserving local
+   compatibility configuration using the
+   [tested contributor setup at Tools `9285c207f338d7c2e6b4464885b0027a85dbe659`](https://github.com/TauCetiProject/TauCetiTools/blob/9285c207f338d7c2e6b4464885b0027a85dbe659/docs/forgejo-stage1-contributor.md).
+   Install the standalone client in its own pinned environment; its release does
+   not replace the operator's declared dependencies or the approved CI harness.
+   For an existing clone, after preserving local
    branches and verifying the old remote, use the native fork as `origin` when
    contributing through a fork. Use the canonical native repository only for an
    account with the intended direct-push permission:
@@ -267,8 +395,13 @@ python -m tauceti_queue.stage1 --profile "$profile" prepare \
   --pr "$native_pr" --accept-head "$reviewed_head"
 python -m tauceti_queue.stage1 --profile "$profile" handoff \
   --attempt "$attempt" --out "$private_directory/input.json"
-gh workflow run stage1-dispatch.yml --repo "$execution_repository" \
-  --ref main --json < "$private_directory/input.json"
+(
+  set -e
+  trap 'rm -f "$dispatcher_token_file"' EXIT
+  GH_TOKEN="$(cat "$dispatcher_token_file")" \
+    gh workflow run stage1-dispatch.yml --repo "$execution_repository" \
+    --ref main --json < "$private_directory/input.json"
+)
 ```
 
 Invoke the parent once. Retain its run ID and intent; a lost response does not
