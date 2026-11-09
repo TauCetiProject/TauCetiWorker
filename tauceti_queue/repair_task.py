@@ -1928,6 +1928,10 @@ def _run_task(
         the record says so and nothing starts."""
         if cfg.publish.when == "before":
             return
+        early = repair_publish.early_record(logdir, revision, cfg.publish)
+        if early:
+            outcome["publish"] = {**early, "early": True}
+            return  # frozen outputs do not need the live worktree kept alive
         record = repair_publish.start_background(
             worktree,
             revision,
@@ -2067,6 +2071,14 @@ def _run_task(
         )
         outcome["repair_context"] = ownership.summary()
         tools_root = cfg.root / repair_audit.TOOLS_DIR
+        repair_publish.write_early_settings(
+            worktree,
+            settings=cfg.publish,
+            logdir=logdir,
+            task_id=task.task_id,
+            repository=task.repository,
+            lake=tuple(cfg.lake),
+        )
         if cfg.worker_audits:
             repair_audit.write_settings(
                 worktree, base=task.validation_base, tools_root=tools_root, lake=tuple(cfg.lake), logdir=logdir

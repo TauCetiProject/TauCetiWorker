@@ -253,6 +253,19 @@ class Cleanup(unittest.TestCase):
         with patch.object(repair_publish, "_run_spec", side_effect=publish):
             self.assertEqual(repair_publish.run_spec(spec), 0)
 
+    def test_early_snapshot_handoff_is_protected_then_terminal_scratch_is_removed(self):
+        tree = self.tree(state="submitted", suffix="-publish-" + "a" * 40)
+        (tree / "outputs.jsonl").write_text('"2026-03-17"\n')
+        (tree / ("1" * 16 + ".ltar")).write_text("frozen artifact")
+        logdir = self.worker / "tasks/1/logs/publications" / ("a" * 40)
+        logdir.mkdir(parents=True)
+        record = logdir / "publish.json"
+        record.write_text(json.dumps({"state": "running", "started_at": time.time()}))
+        self.assertEqual(self.collect()[0]["state"], "publisher-starting")
+        record.write_text(json.dumps({"state": "running", "started_at": 0}))
+        self.assertEqual(self.collect()[0]["state"], "removed")
+        self.assertFalse(tree.exists(), "a crashed early publisher cannot leave frozen artifacts behind")
+
     def test_installer_writes_private_configuration_and_installs_both_units(self):
         home = self.root / "home"
         bindir = self.root / "bin"

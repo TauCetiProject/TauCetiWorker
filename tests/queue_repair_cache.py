@@ -129,6 +129,16 @@ class Retention(unittest.TestCase):
         self.assertEqual(self.collect()["snapshots_retained"], 1)
         self.assertTrue(path.exists())
 
+    def test_nested_early_publication_outputs_are_retained_for_reuse(self):
+        path = self.artifact(1)
+        directory = "tasks/7/logs/publications/" + "a" * 40
+        self.write(
+            directory + "/repair-outputs.jsonl", "\n".join(map(json.dumps, ["2026-03-17", [f"{1:016x}", path.name]]))
+        )
+        self.write(directory + "/publish.json", json.dumps({"published": True, "revision": "a" * 40}))
+        self.assertEqual(self.collect()["snapshots_retained"], 1)
+        self.assertTrue(path.exists())
+
     def test_failed_publication_is_not_a_reusable_snapshot(self):
         path = self.artifact(1)
         self.write(

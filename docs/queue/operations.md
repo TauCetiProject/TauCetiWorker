@@ -1051,3 +1051,28 @@ in `logs/checks-timing.json` and the outcome's verification record. Incomplete i
 are marked incomplete; missing telemetry never changes the checker verdict. Phase
 records survive worktree collection, so further checker optimization can be guided by
 measurements rather than inferred from one combined duration.
+
+### Overlap repair publication with verification
+
+With the default `TAUCETI_REPAIR_PUBLISH=after`, a green whole-library build freezes its
+output map and archive hardlinks before the remaining audit/lint checks start. A normal
+background publisher uploads the snapshot using stock `lake cache put-staged --rev=...`;
+it does not depend on the live source tree or read a later checkout's Git revision.
+This applies to worker verification, clean preparation and the rebase agent's full-build
+helper. Snapshots require platform-independent root-package outputs and a fixed toolchain
+name; unsupported layouts retain the existing late publisher.
+
+Early publication does not pass an audit or authorize submission. Failed checks still
+go back to repair, and staging starts immediately after adoption without waiting for
+upload completion. An exact-revision early upload is reused; a changed revision, failed
+upload or unavailable snapshot falls back to the existing after-submission path. Rebase
+prompts ask agents to finalize fixups and message explanations before their full build,
+so the snapshot names the revision eventually submitted.
+
+Early logs and retained output manifests live in `tasks/<id>/logs/publications/<revision>/`.
+Frozen payloads live in `worktrees/task-<id>-publish-<revision>` and are removed after upload.
+They hold the same task/cache leases, and the existing terminal-task cleanup also removes
+crashed publishers' snapshots. Cache retention follows successful early manifests.
+The upload receives the key only in its own environment. There is no staging polling,
+waiter or cross-service coordination. This gives uploads a head start; it does not
+guarantee a hit if publication remains slower than verification and staging setup.

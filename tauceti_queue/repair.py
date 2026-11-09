@@ -1411,6 +1411,12 @@ def _verification_section(
 ) -> list[str]:
     conflict = context.conflict if context.kind in REBASE_KINDS else None
     lines = ["", "## Verifying locally", ""]
+    if not context.worker_verifies:
+        lines += [
+            "Fold fixups and finalize all commit-message explanations before the final whole-library build. "
+            "That lets the worker start publishing outputs for the final revision while audits and lint run.",
+            "",
+        ]
     if check_command:
         lines += [
             f"`{check_command}` verifies the chain: linear on `{base_short}`, exactly one commit per `Source-PR` trailer "
