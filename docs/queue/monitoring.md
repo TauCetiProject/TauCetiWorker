@@ -115,3 +115,13 @@ read R2 only, never this file or the queue's database. Queue publication has a
 fail before network calls. Normal batches do not change queue scheduling to fit
 monitoring limits. Explicit retained-batch scope lets the receiver retire old
 terminal details without guessing that capped absence means a deleted live item.
+
+
+`GET /statistics` on the current queue controller provides a consistent read-only
+ledger projection (`tauceti-queue.statistics/v1`) for 1h, 3h, 24h and 7d windows.
+Distinct PR landing receipts and landed batches are separate from CI attempt
+outcomes. CI run duration percentiles include setup, result reporting and publication;
+they are not build-only durations. No GitHub calls, source fetches or reconciliation
+are triggered. The retired Bors `/repositories/1/statistics` snapshot is historical
+and must not be presented as current queue history. Native source statistics require
+an explicit qualified public scope and are not exposed by this endpoint.

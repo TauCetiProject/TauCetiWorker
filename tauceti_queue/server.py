@@ -536,6 +536,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b"ok\n", "text/plain")
         elif path in ("/status", "/status/"):
             self._call(self._status)
+        elif path == "/statistics":
+            self._call(self._statistics)
         elif path == "/healthz":
             self._call(self._healthz)
         elif path == "/settings":
@@ -687,6 +689,17 @@ class Handler(BaseHTTPRequestHandler):
         if not admin:
             self._error(403, f"{login} is not a repository admin")
         return admin
+
+    def _statistics(self) -> dict:
+        from .statistics import snapshot
+
+        controller = self.server.controller
+        if self.server.source_authority is not None or not hasattr(controller, "store"):
+            raise ValueError("controller ledger statistics are unavailable")
+        repository = getattr(controller, "repository", None)
+        if repository not in self.server.config.repositories.values():
+            raise ValueError("repository statistics are not public")
+        return snapshot(controller.store.path, repository, controller.canonical_branch, now=self.server.config.clock())
 
     def _feed_reply(self, which: str, repo: str, query: dict) -> None:
         if self.server.source_authority is not None:
