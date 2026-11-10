@@ -990,10 +990,12 @@ def _defer_reload(spec: WorkerSpec, live: dict) -> bool:
         desired.pop(field, None)
     if old != desired:
         return False
-    if live.get("state") not in ("idle", "backoff", "waiting-github", "waiting-budget", "waiting-quota"):
-        return True
-    if (live.get("next_action_at") or 0) - time.time() < 15:
-        return True
+    # A worker waiting for fleet admission polls every five seconds and has no round to lose.
+    if live.get("state") != "waiting-capacity":
+        if live.get("state") not in ("idle", "backoff", "waiting-github", "waiting-budget", "waiting-quota"):
+            return True
+        if (live.get("next_action_at") or 0) - time.time() < 15:
+            return True
     pid = live.get("child_pid")
     if sys.platform == "linux" and isinstance(pid, int):
         try:

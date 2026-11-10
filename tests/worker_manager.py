@@ -202,6 +202,7 @@ try:
     slot = wm.WorkerSpec(id="slot", agent="codex", only=("review",), author_model="gpt-5")
     in_round = {"applied_spec": slot.as_dict(), "state": "running"}
     parked = {"applied_spec": slot.as_dict(), "state": "waiting-quota", "next_action_at": time.time() + 3600}
+    unadmitted = {"applied_spec": slot.as_dict(), "state": "waiting-capacity", "next_action_at": time.time() + 5}
     for retune in (
         {"agent": "claude", "author_model": None},
         {"only": ("review", "fix")},
@@ -213,6 +214,7 @@ try:
         retuned = dataclasses.replace(slot, **retune)
         assert wm._defer_reload(retuned, in_round), retune
         assert not wm._defer_reload(retuned, parked), retune
+        assert not wm._defer_reload(retuned, unadmitted), retune
     # Any other field in the same edit keeps the immediate restart.
     for other in ({"sandbox": "bubble"}, {"roadmap_only": "Algebra"}, {"env": (("A", "b"),)}, {"pace": "0:10"}):
         assert not wm._defer_reload(dataclasses.replace(slot, agent="claude", author_model=None, **other), in_round)

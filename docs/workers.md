@@ -245,8 +245,8 @@ An edit confined to `agent`, `only`, `author_model`, `author_effort`,
 `max_open_prs`, `github_state_url`, and `github_state_token_file` waits for the
 round in flight. The worker restarts at its next round boundary: when it is
 idle between rounds, backing off, or waiting on quota, budget, or GitHub, with
-its next action at least 15 seconds away. A worker already parked there
-restarts at once. Until then its status record carries the waiting definition's
+its next action at least 15 seconds away, or when it is waiting for fleet
+admission. A worker already parked there restarts at once. Until then its status record carries the waiting definition's
 fingerprint as `pending_read_policy`, and `workers status` reports it as
 `restarting`. An edit that also changes any other field restarts the worker
 immediately, as does `tauceti workers restart ID`.
