@@ -5507,8 +5507,14 @@ class EarlyPublication(Fixture):
         repair_publish.write_early_settings(
             worktree, settings=self.settings, logdir=logdir, task_id="7", repository=PROJECT, lake=("lake",)
         )
-        with patch.object(repair_publish, "_spawn") as spawn:
+        worker_python = sys.executable
+        # The agent's helper Python can lack the worker's installed packages.
+        with (
+            patch.object(repair_publish.sys, "executable", "/agent/python"),
+            patch.object(repair_publish, "_spawn") as spawn,
+        ):
             record = repair_publish.start_early(worktree, repair.lake_env(self.root / "state"))
+            self.assertEqual(spawn.call_args.args[0][0], worker_python)
             spec_path = Path(spawn.call_args.args[0][-1])
         self.assertTrue(record["launched"], record)
         shutil.rmtree(worktree)
@@ -5521,6 +5527,30 @@ class EarlyPublication(Fixture):
         self.assertTrue(result["published"], result)
         self.assertEqual(result["revision"], revision)
         self.assertFalse(Path(spec["frozen"]["path"]).exists())
+
+    def test_publisher_import_failure_records_failure_and_cleans_snapshot(self):
+        import builtins
+
+        logdir = self.root / "startup-failure"
+        logdir.mkdir()
+        stage = logdir / "snapshot"
+        stage.mkdir()
+        record = {"revision": "a" * 40, "record": str(logdir / "publish.json"), "state": "running"}
+        spec_path = logdir / "publish-spec.json"
+        spec_path.write_text(json.dumps({"record": record, "frozen": {"path": str(stage)}}))
+        original_import = builtins.__import__
+
+        def importing(name, *args, **kwargs):
+            if name == "tauceti_queue.repair_cache":
+                raise ModuleNotFoundError("missing worker dependency")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=importing):
+            self.assertEqual(repair_publish.run_spec(spec_path), 1)
+        result = json.loads(Path(record["record"]).read_text())
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("missing worker dependency", result["error"])
+        self.assertFalse(stage.exists())
 
     def test_later_commit_revision_does_not_reuse_an_older_upload(self):
         logdir = self.root / "publication-lookup"
