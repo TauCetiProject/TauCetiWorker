@@ -5682,7 +5682,11 @@ class Controller:
                 continue
             commit = chain.read_commit(self.clone, member["commit_sha"])
             empty = len(commit.parents) == 1 and commit.tree == chain.tree_of(self.clone, commit.parents[0])
-            if empty and not chain.carries_landed_note(commit.message):
+            if (
+                empty
+                and not chain.carries_landed_note(commit.message)
+                and self._landed_on(member["number"], batch["base"]) is None
+            ):
                 rejected.append(member)
             else:
                 members.append(member)
@@ -5806,7 +5810,7 @@ class Controller:
                 error=diff["error"],
             )
             label = self.setting("repaired_label")
-            if label and not self._landed_outside_queue(member):
+            if label and not self._landed_outside_queue(member, base=batch["base"]):
                 self._enqueue(
                     "labels",
                     f"repaired-label:{batch['id']}:{number}",
@@ -5827,12 +5831,14 @@ class Controller:
         )
         self._enqueue("close_pr", f"landed-close:{batch['id']}:{number}", {"number": number})
 
-    def _landed_outside_queue(self, member: dict[str, Any]) -> bool:
-        """Whether the member's landed commit is the empty one carrying the landing note: its PR was
-        already on `main`, so the queue emptied it rather than repairing it."""
+    def _landed_outside_queue(self, member: dict[str, Any], *, base: str | None = None) -> bool:
+        """Whether an empty member is already merged, from its landing note or the batch's base history."""
         try:
             commit = chain.read_commit(self.clone, member["commit_sha"])
-            return chain.carries_landed_note(commit.message) and self._commit_empty(member["commit_sha"])
+            return self._commit_empty(member["commit_sha"]) and (
+                chain.carries_landed_note(commit.message)
+                or (base is not None and self._landed_on(member["number"], base) is not None)
+            )
         except chain.ChainError:
             return False
 
@@ -5961,21 +5967,24 @@ class Controller:
             "finding": finding_match["finding"] if finding_match else None,
         }
 
-    def _on_canonical(self, number: int) -> bool:
-        """Whether a non-empty commit on the canonical branch names PR `number` (` (#N)` subject or `Source-PR`)."""
-        if self._canonical is None:
-            return False
+    def _landed_on(self, number: int, revision: str) -> str | None:
+        """A nonempty commit naming this PR in the given history; Git errors must not imply rejection."""
         # Git uses POSIX ERE, whose literal escaping differs from Python re.escape.
         repository = "".join("\\" + char if char in ".[](){}*+?^$|\\" else char for char in self.provenance_repository)
         pattern = rf"(\(#{number}\)$|^{chain.SOURCE_PR_TRAILER}: {repository}#{number}$)"
         if self.native_source:
             pattern = rf"^{chain.SOURCE_PR_TRAILER}: {repository}#{number}$"
-        result = chain._git(
-            self.clone, "log", "-n", "5", "--format=%H", "-E", f"--grep={pattern}", self._canonical, "--"
-        )
-        if result.returncode != 0:
+        commits = chain.git(self.clone, "log", "--format=%H", "-E", f"--grep={pattern}", revision, "--")
+        return next((sha for sha in commits.split() if not self._commit_empty(sha)), None)
+
+    def _on_canonical(self, number: int) -> bool:
+        """Whether a nonempty commit on the canonical branch names this PR."""
+        if self._canonical is None:
             return False
-        return any(not self._commit_empty(sha) for sha in result.stdout.split())
+        try:
+            return self._landed_on(number, self._canonical) is not None
+        except chain.ChainError:
+            return False
 
     def _interacting_state(self, number: int) -> str:
         """`landed` (on `main`), `queued` (an input waiting or a member), `gone` (left the queue without
