@@ -392,7 +392,9 @@ class Task:
 class Adoption:
     """The controller's answer to a submitted chain.
 
-    `accepted` means the chain is now the batch's authoritative tip at `version`. A rejected
+    `accepted` confirms adoption. `already-adopted` replays a receipt for the exact claim/tip
+    after a lost response (no new adoption; version is None). Otherwise the chain is now the batch's
+    authoritative tip at `version`. A rejected
     submission keeps its commits retained under `retained_ref` so they can be reused; `reason` is a
     stable code (`claim-expired`, `claim-superseded`, `version-mismatch`, `not-authorized`,
     `invalid-chain`, `explanation-required`, `no-repair-edited`, `unknown-task`) and `violations` carries the chain

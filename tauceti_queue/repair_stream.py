@@ -161,7 +161,9 @@ class StreamingBuild:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.errors_path.write_text("")
         repair_tools.take_lock(self.lock_path, log=lambda *a, **k: None)
-        argv = [*self.lake, "build", "--iofail"]
+        from tauceti_queue.repair_publish import build_flags
+
+        argv = [*self.lake, "build", *build_flags(self.worktree)]
         self.started_at = time.monotonic()
         with self.log_path.open("wb") as handle:
             handle.write(f"$ {' '.join(argv)}\n".encode())

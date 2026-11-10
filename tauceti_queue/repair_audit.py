@@ -1,55 +1,27 @@
-"""CI's audits and changed-module environment lint on the repair worker (``docs/redesign/specs/ai-merge-queue.md``,
-improvement 13 of the improvements from the first production repair).
+"""Worker-owned whole-library verification using the candidate's pinned CI tools.
 
-Head 2's first CI round after a green worker build failed in the audit phase on one duplicate declaration
-(``duplicate-declarations: SimpleGraph.Walk.IsPath.start_notMem_tail_support is declared in both
-TauCeti.Combinatorics.SimpleGraph.Connectivity.Menger and TauCeti.Combinatorics.SimpleGraph.Paths``) that the
-agent's text scan had listed and set aside, because nothing on the worker ran the real audit. Checks are
-not left to the agent: the worker runs them after every green whole-library ``lake build`` it performs
-and refuses to submit while any finding remains, and the agent reads the findings as ordinary diagnostics.
+Repairs, preparations and rebases receive a final build followed by the native
+compiled audit and lint drivers. Without frozen GitHub lint-scope policy, use
+staging's conservative full-library fallback. Findings return to the existing
+repair loop; staging remains the authoritative landing verdict.
 
-CI's required build (TauCeti ``.github/workflows/pr-build.yml``, step "Build exact candidate under bwrap
-with workflow-pinned audits, offline", running TauCetiTools ``sandbox-build.sh``) runs, after its green
-``lake build --iofail``:
-
-* the ``audit-driver`` (TauCetiTools ``Axioms.lean``, compiled by ``build-audit-driver.sh``) under
-  ``lake env timeout 3000s``: one import of every TauCeti module (phase ``audit-import``), the per-module
-  ownership check (``audit-duplicates``) and the axiom scan (``audit-axioms``);
-* the environment lint ``lint-env.sh`` with the ``lint-env-driver`` (``LintEnvDriver.lean``, compiled by
-  ``build-lint-driver.sh`` against the project's Batteries), on the modules ``lint-scope.sh`` selects:
-  the TauCeti modules the change touches, ``git diff --no-renames --diff-filter=d`` of its base and head.
-
-This module runs the same from the same sources. The TauCetiTools pin the worktree's ``tauceti.toml``
-names (``[tools.tools] repo`` and ``ref``) is fetched once into ``<root>/tauceti-tools/<ref>`` and
-materialized with ``python -m tauceti_tools materialize`` (the TauCetiTools setup action's step, with the
-worktree's ``scripts/`` as the policy directory) into ``.lake/tauceti-repair-audit/scripts``. Both
-drivers are compiled from it inside the sandbox (``repair_sandbox``) into
-``.lake/tauceti-repair-audit/drivers``, once per worktree, pin, toolchain and manifest, and the audit and
-the lint run in the sandbox over the built environment, the lint on the modules changed between the
-task's base and HEAD. Their output is read with ``diagnostics.parse_log``, the controller's own reader of
-CI logs, so a finding is the diagnostic CI would have produced: ``{"kind": "audit", "module", "path",
-"message": "duplicate-declarations: ..."}`` once per TauCeti module named, ``lint`` with its location. A
-nonzero exit without a parsed finding is one diagnostic carrying the output's tail. What could not run
-at all (no pin, the fetch, the materialization or a driver build failed) is ``unavailable``: logged,
-recorded, and not a finding.
-
-Findings are appended to ``.tauceti-repair/errors.jsonl`` beside the compiler errors (``append_errors``).
-Warm repair/prepare agents use advisory scoped checks (``repair_targeted``) and leave this full
-verification to the worker. Other callers can still use ``helper_checks`` after their full builds.
-CI's module-system check and source style lint are not run here.
-
-``TAUCETI_QUEUE_WORKER_AUDITS=0`` (``--no-worker-audits``) turns the worker's verification and the
-automatic audits off.
+Measure check phases and sampled process-tree RSS in existing task logs. A
+matching previous measurement and ample host/cgroup headroom permit two checks
+to overlap over read-only compiled outputs under the caller's build lock.
+Unmeasured or unsafe runs stay serial. Every check is joined before cleanup.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
+import functools
 import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -183,22 +155,53 @@ def materialize(checkout: Path, worktree: Path, dest: Path) -> Path:
     return dest
 
 
-def _sandboxed(argv: list, worktree: Path, env: dict, extra: dict | None, log: Path, timeout: float | None) -> dict:
+def _sandboxed(
+    argv: list,
+    worktree: Path,
+    env: dict,
+    extra: dict | None,
+    log: Path,
+    timeout: float | None,
+    *,
+    read_only_build: bool = False,
+) -> dict:
     """``argv`` in the build sandbox with ``extra`` set inside it; output to ``log``."""
     extra = {k: str(v) for k, v in (extra or {}).items()}
     run_env = {**env, **extra}
     wrapped = repair_sandbox.sandboxed_lake([str(a) for a in argv], worktree, run_env, extra_env=extra)
+    if read_only_build and not repair_sandbox.disabled():
+        boundary = wrapped.index("--")
+        for build in [worktree / ".lake/build", *worktree.glob(".lake/packages/*/.lake/build")]:
+            if build.is_dir():
+                wrapped[boundary:boundary] = ["--ro-bind", str(build.resolve()), str(build.resolve())]
+                boundary += 3
     started = time.monotonic()
     started_at = time.time()
+    peak = 0
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("ab") as handle:
         handle.write(f"$ {' '.join(str(a) for a in argv)}\n".encode())
         handle.flush()
         start = handle.tell()
         try:
-            rc = subprocess.run(
-                wrapped, cwd=worktree, env=run_env, stdout=handle, stderr=subprocess.STDOUT, timeout=timeout
-            ).returncode
+            with subprocess.Popen(
+                wrapped, cwd=worktree, env=run_env, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True
+            ) as proc:
+                try:
+                    while True:
+                        peak = max(peak, process_tree_rss(proc.pid))
+                        if timeout is not None and time.monotonic() - started >= timeout:
+                            raise subprocess.TimeoutExpired(wrapped, timeout)
+                        try:
+                            rc = proc.wait(timeout=0.2)
+                            break
+                        except subprocess.TimeoutExpired:
+                            pass
+                finally:
+                    # Also collect a failed sibling; no check child outlives this task.
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
         except subprocess.TimeoutExpired:
             rc = 124
         except OSError as error:
@@ -209,12 +212,73 @@ def _sandboxed(argv: list, worktree: Path, env: dict, extra: dict | None, log: P
         output = handle.read().decode("utf-8", errors="replace")
     return {
         "rc": rc,
+        "sampled_peak_rss_bytes": peak,
         "seconds": round(time.monotonic() - started, 1),
         "started_at": started_at,
         "finished_at": time.time(),
         "log": str(log),
         "output": output,
     }
+
+
+def process_tree_rss(pid: int) -> int:
+    """Best-effort sampled RSS, including bwrap and all descendants; telemetry only."""
+    total = 0
+    pending = [pid]
+    seen = set()
+    while pending:
+        child = pending.pop()
+        if child in seen:
+            continue
+        seen.add(child)
+        try:
+            status = Path(f"/proc/{child}/status").read_text()
+            total += next(int(line.split()[1]) * 1024 for line in status.splitlines() if line.startswith("VmRSS:"))
+            pending.extend(int(n) for n in Path(f"/proc/{child}/task/{child}/children").read_text().split())
+        except (OSError, ValueError, StopIteration):
+            continue
+    return total
+
+
+def available_memory() -> int:
+    """Host and capped ancestor headroom; unknown measurements disable overlap."""
+    try:
+        available = next(
+            int(line.split()[1]) * 1024
+            for line in Path("/proc/meminfo").read_text().splitlines()
+            if line.startswith("MemAvailable:")
+        )
+        relative = next(
+            line.split(":", 2)[2]
+            for line in Path("/proc/self/cgroup").read_text().splitlines()
+            if line.startswith("0::")
+        )
+        root = Path("/sys/fs/cgroup")
+        group = root / relative.lstrip("/")
+        for ancestor in (group, *group.parents):
+            if not ancestor.is_relative_to(root):
+                break
+            maximum = (ancestor / "memory.max").read_text().strip()
+            if maximum != "max":
+                available = min(available, int(maximum) - int((ancestor / "memory.current").read_text()))
+        return max(available, 0)
+    except (OSError, ValueError, StopIteration):
+        return 0
+
+
+def can_overlap(logdir: Path, key: str) -> bool:
+    if repair_sandbox.disabled():
+        return False  # output immutability requires the sandbox
+    try:
+        previous = json.loads((logdir / "checks-timing.json").read_text())
+        peaks = [previous[name]["sampled_peak_rss_bytes"] for name in ("audit", "lint")]
+        return (
+            previous.get("driver_key") == key
+            and all(p > 0 for p in peaks)
+            and available_memory() > 2 * sum(peaks) + 8 * 1024**3
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 def _driver_key(worktree: Path, ref: str) -> str:
@@ -284,7 +348,7 @@ def check(
     lake: tuple[str, ...] = ("lake",),
     timeout: float | None = None,
 ) -> dict:
-    """CI's audits, then the environment lint on the changed modules, over the environment already built
+    """CI's audits and full environment lint, over the environment already built
     in ``worktree``; the caller holds the build lock. ``status`` is ``passed``, ``failed`` (``diagnostics``
     lists the findings in the controller's shape) or ``unavailable`` (``reason``)."""
     started = time.monotonic()
@@ -309,7 +373,6 @@ def check(
         record["drivers_seconds"] = round(time.monotonic() - drivers_started, 3)
         if built:
             record["drivers"] = built
-        modules = changed_modules(worktree, base)
     except (Unavailable, repair_sandbox.SandboxUnavailable, OSError) as error:
         record.update(status="unavailable", reason=str(error), seconds=round(time.monotonic() - started, 1))
         return record
@@ -324,14 +387,45 @@ def check(
         os.link(phase_record, phases_path)
     record["audit_phases_file"] = str(phase_record)
     audit_argv = [*lake, "env", "timeout", "--signal=TERM", "--kill-after=30", f"{AUDIT_TIMEOUT_SECONDS}s"]
-    audit = _sandboxed(
+    audit_job = functools.partial(
+        _sandboxed,
         [*audit_argv, drivers / "audit-driver"],
         worktree,
         env,
         {"AUDIT_PHASES_FILE": phases_path},
         logdir / "audit.log",
         timeout,
+        read_only_build=True,
     )
+    # The task has no frozen GitHub label/branch policy that could justify scoped
+    # lint. Use staging's conservative full-library fallback, including unchanged
+    # declarations affected by new simp lemmas or other global environment changes.
+    extra = {
+        "TAUCETI_PROJECT_ROOT": worktree,
+        "TAUCETI_TRUSTED_SCRIPTS": scripts,
+        "LINT_DRIVER_EXE": drivers / "lint-env-driver",
+        "LINT_ONLY_MODULES": "",
+        "LINT_CHANGED_ONLY": "0",
+        "TAUCETI_LINT_PROFILE": env.get("TAUCETI_LINT_PROFILE", "0"),
+    }
+    lint_job = functools.partial(
+        _sandboxed,
+        ["bash", scripts / "lint-env.sh"],
+        worktree,
+        env,
+        extra,
+        logdir / "lint-env.log",
+        timeout,
+        read_only_build=True,
+    )
+    record["driver_key"] = _driver_key(worktree, ref)
+    record["overlap"] = can_overlap(logdir, record["driver_key"])
+    if record["overlap"]:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as checks:
+            audit_future, lint_future = checks.submit(audit_job), checks.submit(lint_job)
+            audit, lint = audit_future.result(), lint_future.result()
+    else:
+        audit, lint = audit_job(), lint_job()
     record["audit_phases"] = audit_phases(phases_path, audit)
     with contextlib.suppress(OSError):
         if not os.path.samefile(phases_path, phase_record):
@@ -341,21 +435,9 @@ def check(
     found = findings_of("audit", "audit-driver", audit)
     record["audit"] = {k: v for k, v in audit.items() if k != "output"} | {"findings": len(found)}
     record["diagnostics"] += found
-    if modules:
-        scope = work / "lint-modules.txt"
-        scope.write_text("".join(m + "\n" for m in modules))
-        extra = {
-            "TAUCETI_PROJECT_ROOT": worktree,
-            "TAUCETI_TRUSTED_SCRIPTS": scripts,
-            "LINT_DRIVER_EXE": drivers / "lint-env-driver",
-            "LINT_ONLY_MODULES": scope,
-        }
-        lint = _sandboxed(["bash", scripts / "lint-env.sh"], worktree, env, extra, logdir / "lint-env.log", timeout)
-        found = findings_of("lint", "lint-env.sh", lint)
-        record["lint"] = {k: v for k, v in lint.items() if k != "output"} | {"modules": modules, "findings": len(found)}
-        record["diagnostics"] += found
-    else:
-        record["lint"] = {"skipped": "no TauCeti module changed since the base"}
+    found = findings_of("lint", "lint-env.sh", lint)
+    record["lint"] = {k: v for k, v in lint.items() if k != "output"} | {"scope": "full", "findings": len(found)}
+    record["diagnostics"] += found
     record["status"] = "failed" if record["diagnostics"] else "passed"
     record["seconds"] = round(time.monotonic() - started, 1)
     with contextlib.suppress(OSError):
@@ -440,7 +522,11 @@ def verify(
     lock = lock or worktree / repair_tools.TOOLS_DIR / repair_tools.LOCK_DIR
     repair_tools.take_lock(lock, log=lambda *a, **k: None)
     try:
-        build = _sandboxed([*lake, "build", "--iofail"], worktree, env, None, logdir / "verify-build.log", timeout)
+        from tauceti_queue.repair_publish import build_flags
+
+        build = _sandboxed(
+            [*lake, "build", *build_flags(worktree)], worktree, env, None, logdir / "verify-build.log", timeout
+        )
         record["build"] = {k: v for k, v in build.items() if k != "output"}
         if build["rc"] != 0:
             found = [d for d in diagnostics.parse_log(build["output"].splitlines()) if d["kind"] == "compiler"]

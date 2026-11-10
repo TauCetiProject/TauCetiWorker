@@ -134,7 +134,9 @@ if "--dependents" in sys.argv:
         modules += [d for d, deps in table.items() if m in deps and d not in modules]
 take_lock(lock := LOCK)
 try:
-    rc = subprocess.run(sandboxed_lake(["lake", "build", "--iofail", *modules], ROOT), cwd=ROOT).returncode
+    from tauceti_queue.repair_publish import build_flags
+    flags = ["--iofail"] if scoped else build_flags(ROOT)
+    rc = subprocess.run(sandboxed_lake(["lake", "build", *flags, *modules], ROOT), cwd=ROOT).returncode
     if rc == 0 and scoped:
         print("audits: CI's audits and lint run after a whole-library build (no module arguments)", flush=True)
     elif rc == 0 and "--no-audit" not in sys.argv:

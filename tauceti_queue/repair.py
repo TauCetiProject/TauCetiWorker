@@ -1433,8 +1433,9 @@ def _verification_section(
             "",
             f"Run `{LISTINGS_DIR}/check-findings`: it builds the finding modules and your edited modules, "
             "then runs the reported linters or the ownership-only check. These are advisory checks, "
-            "not a claim that the entire batch passes. For additional compiler feedback use "
-            f"`{LISTINGS_DIR}/{BUILD_FILE} <Module.Name> --dependents`.",
+            "not a claim that the entire batch passes. During a rebase, check edited modules directly; "
+            "finish all conflicts before checking their combined downstream closure. The worker performs "
+            "that closure check in its final whole-library verification.",
             "",
             "After the focused checks and the chain check, return your summary. The worker runs the "
             "whole-library build, full audits and environment lint before submission and sends any "
