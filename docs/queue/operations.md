@@ -212,13 +212,39 @@ uv run tauceti-queue status --url https://queue.taucetiproject.org   # through t
 
 ## Current deployment
 
-The controller, SQLite store, content clone, public tunnel, repair workers, monitoring publisher,
-history timer and backup timer run as `kim` on **chungus2**. Repair execution moved on November 7;
-the remaining controller services moved on November 8. Both public hostnames,
-`queue.taucetiproject.org` and `bors.taucetiproject.org`, now terminate at the same tunnel on
-chungus2. The configured canonical branch remains `main` and publication/admission remain enabled.
-Read the actual revision from `/status`; the relocation retained `6348a0116c2c` rather than
-combining a host move with an upgrade.
+The controller, SQLite store, content clone, public tunnel, monitoring publisher,
+history timer and backup timer run as `kim` on **tauchonki2** since November 10.
+Both public hostnames, `queue.taucetiproject.org` and `bors.taucetiproject.org`,
+terminate at the existing tunnel identity on that host. Canonical `main`, publication,
+automatic admission and the persisted three-worker concurrency policy are unchanged.
+
+Repair workers transfer individually at fresh idle heartbeats with no live claims.
+During the transition, existing claims continue on chungus2 and renew against the
+same public queue URL; replacement workers use `@tauchonki2` identities. A finite
+handoff service on chungus2 stops each old worker only when idle, starts its
+counterpart on tauchonki2, mirrors retained task observations, and collects source
+worktrees against a fresh read-only snapshot of the destination database. Never
+restart a retired source worker to repair apparent inactivity without checking
+current claims and the handoff receipt first.
+
+New staging builds are pinned by repository variable `STAGING_RUNS_ON` to
+`fleet-74773fc7f54d4877add11d80113fe340`, tauchonki2's reserved staging-only runner.
+Its CPU weight is 10000 versus 100 for ordinary PR runners. Staging compiler
+memory-admission sleeps are disabled; ordinary CI retains its admission policy.
+Physical VM/cgroup limits still apply. Already-running staging builds finish on
+their original host; neither routing changes nor controller relocation moves them.
+
+The November 10 cutover stopped the old writer and tunnel, transferred a consistent
+SQLite backup with verified integrity and table counts, synchronized final source
+refs and publisher state, and verified local health before enabling the destination
+tunnel. Public service returned after approximately 40 seconds. Active staging and
+repair processes retained their run identities. The source controller, tunnel,
+monitoring and backup units are disabled and masked to prevent competing writers
+or stale publication. The App delivery journal covered the cutover window: all eight
+relevant missed deliveries were confirmed successful; 1,417 failed notifications
+were discarded by the existing primary-intake filter. Migration evidence and final source snapshot are under
+`~/TauCetiQueue-data/migration-tauchonki2-20261110/` on chungus2; the destination
+holds its runtime checks and transfer receipts under the same path.
 
 All active processes use systemd user units. There are no detached controller/tunnel supervisors
 on the destination. The retired units on chungus are masked and its `run-service.sh`,
@@ -228,9 +254,8 @@ final database backup and migration evidence remain under
 and agent logs remain there as history; task JSON needed for reporting was copied to chungus2.
 Do not resurrect any retired unit while the new controller is authoritative.
 
-Chungus2 still has `Linger=no`. The user manager provides ordinary process recovery while it is
-running, but startup after reboot or loss of that manager is not guaranteed. The explicit host move
-does not claim to complete the postponed reboot-supervision work.
+Tauchonki2 has `Linger=yes`; the enabled user units and timers start with its user manager
+after reboot. Verify the public endpoint, backup, monitoring and worker claims after recovery.
 
 Production repair admission uses `repair_concurrency=3` and `background_start_limit=2`.
 Count all live claims when starting a task: a non-head task can increase the total to
@@ -246,27 +271,27 @@ additional user unit is `tauceti-queue-repair@3.service`, using the private
 worktree cleanup and public monitoring (and historical telemetry) when enabling it.
 Existing active workers need not restart for controller admission changes.
 
-Paths on chungus2, where they differ from the default layout:
+Paths on tauchonki2, where they differ from the default layout:
 
 | Path | Content |
 | --- | --- |
 | `~/TauCetiQueue` | shared code checkout for controller and repair workers at the installed revision |
-| `~/.config/tauceti-queue/config.toml` | `host = "chungus2"`, existing App/review/admission configuration and data paths |
+| `~/.config/tauceti-queue/config.toml` | `host = "tauchonki2"`, existing App/review/admission configuration and data paths |
 | `~/.config/tauceti-queue/environment` | controller overrides, including `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` for NixOS TLS trust |
 | `~/TauCetiQueue-data/clone` | controller content clone, including retained private source refs |
 | `~/TauCetiQueue-data/queue.sqlite3` (+ `-wal`, `-shm`) | authoritative queue database |
 | `~/TauCetiQueue-data/logs` | service-owned files; process logs use `journalctl --user -u tauceti-queue` |
 | `~/TauCetiQueue-data/repair-clone`, `repair`, `repair-2`, `repair-3` | separate repair Git clone and worker task/cache roots; active tasks use private writable dependencies |
-| `~/TauCetiQueue-data/mathlib-packages` | retained original dependency seed; no longer configured for live repairs |
+| `~/TauCetiQueue-data/repair-shared/lake-cache` | one shared Lake cache for all repair workers, seeded from the source host |
 | `~/TauCetiQueue-data/monitoring/` | publisher identity/epoch/delta state, private token, prepared observations and pinned exporter release |
 | `~/TauCetiQueue-data/reports/` | retained pilot inputs and Bors baseline used by the history timer |
 | `~/.local/state/tauceti-queue/backups/` | daily and pre-deployment SQLite backups; an immediate destination backup was verified |
-| `~/.cloudflared/config.yml`, `<tunnel id>.json`, `cert.pem` | existing tunnel identity and configuration; DNS did not change |
-| `~/TauCetiQueue-data/controller-migration-20261108/` | final source snapshot, member/settings comparison, webhook recovery and destination migration evidence |
+| `~/.config/tauceti-queue/tunnel/config.yml`, `<tunnel id>.json` | existing tunnel identity and configuration; DNS did not change |
+| `~/TauCetiQueue-data/migration-tauchonki2-20261110/` | cutover checks, runtime setup and worker-handoff evidence |
 
 ### Supervision and deployment
 
-On chungus2:
+On tauchonki2:
 
 ```sh
 systemctl --user status tauceti-queue cloudflared-tauceti-queue
@@ -277,8 +302,9 @@ systemctl --user list-timers 'tauceti-queue*'
 
 The controller and repair units use `LimitNOFILE=65536`. Their process supervisors remain outside
 worker OOM victim groups. Monitoring/history units retain their previous limits and run independently
-of scheduling. The old repair-observation SSH mirror is retired: the publisher now reads the local
-worker roots and verifies their local processes directly.
+of scheduling. The publisher reads local worker roots directly. During the November 10 transition,
+retained source observations are mirrored under `legacy-chungus2/`; remote PID liveness
+is unverified. The finite handoff service refreshes those observations until each old worker stops.
 
 Before an update, take an online backup with `services/queue/backup.sh`, verify the target revision
 and fast-forward the checkout. Use the service installer for controller deployment or explicitly
@@ -342,7 +368,7 @@ members/settings and source objects before starting the new controller. Switch t
 only after local health is verified. Audit/redeliver outage webhooks, run a destination backup and
 verify monitoring/history and worker claims.
 
-Rollback to chungus requires transferring the **current** chungus2 database and source/publisher
+Rollback to the previous host requires transferring the **current** tauchonki2 database and source/publisher
 state after stopping its authoritative services. The old pre-move backup is historical, not a safe
 replacement for work accepted since cutover. Restore/unmask the source units and configuration only
 once destination ownership has ended. Retained credentials and originals make rollback possible;
