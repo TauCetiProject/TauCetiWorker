@@ -86,7 +86,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # An in-progress run counts as lost only when neither its jobs nor GitHub's direct read of the run
     # (`updated_at`) have moved for this long; until then a long build is a `stall` reason line.
     "lost_run_seconds": 14400,
-    "infrastructure_retry_limit": 3,
     "infrastructure_retry_backoff_seconds": 60,
     "inference_failure_threshold": 3,
     "inference_hold_backoff_seconds": 60,
@@ -4398,15 +4397,6 @@ class Controller:
         else:
             self._observe_attempt(head, attempt, now)
 
-    def _recover_exhausted(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> bool:
-        """Keep looking for a late live run after exhaustion, at the normal poll rate."""
-        if now - (attempt["last_observed_at"] or attempt["dispatched_at"]) < int(
-            self.setting("polling_interval_seconds")
-        ):
-            return False
-        self.store.update("ci_attempts", {"id": attempt["id"]}, last_observed_at=now)
-        return self._readopt_live_run(head, now)
-
     def _ci(self, head: dict[str, Any], now: float) -> None:
         attempt = self._current_attempt(head)
         if attempt is None or attempt["outcome"] == OUTCOME_SUPERSEDED:
@@ -4424,27 +4414,9 @@ class Controller:
             )
             retries = sum(a["dispatch_state"] != "rejected" for a in failures)
             rejected = attempt["dispatch_state"] == "rejected"
-            permanent_rejections = sum(
-                a["dispatch_state"] == "rejected" and not a["dispatch_retryable"] for a in failures
-            )
-            limit = int(self.setting("infrastructure_retry_limit"))
-            if rejected and not attempt["dispatch_retryable"] and permanent_rejections > limit:
-                if self._recover_exhausted(head, attempt, now):
-                    return
-                self._reasons.append(
-                    f"head {head['id']}: permanent dispatch rejections exhausted retries; repair configuration and use retry_ci"
-                )
-                return
-            if not rejected and retries > limit:
-                if self._recover_exhausted(head, attempt, now):
-                    return
-                self._reasons.append(
-                    f"head {head['id']}: {retries} infrastructure failures ({attempt['outcome_detail']}); retries exhausted, use retry_ci"
-                )
-                return
             # Proven non-sends need no CI-run retry budget. Keep retrying with bounded
             # backoff, respecting a backend's persisted rate-limit deadline.
-            exponent = min(3, len(failures) - retries - 1) if rejected else retries - 1
+            exponent = min(3, max(0, len(failures) - retries - 1 if rejected else retries - 1))
             backoff = int(self.setting("infrastructure_retry_backoff_seconds")) * (2 ** max(0, exponent))
             due = (attempt["last_observed_at"] or attempt["dispatched_at"]) + backoff
             due = max(due, attempt.get("dispatch_retry_at") or 0)
@@ -5167,6 +5139,29 @@ class Controller:
         if current["outcome"] == OUTCOME_PENDING and self.setting("publication_enabled"):
             self._cancel_superseded_runs(head["id"], now, reason=f"superseded by attempt {attempt_id}", by=attempt_id)
 
+    def _retry_status_delivery(self, attempt: dict[str, Any], run: CandidateRun, now: float) -> None:
+        """Reuse the durable outbox and existing intent-only workflow, without a retry limit."""
+        if self.candidate_ci is not None:
+            return  # native execution receipts use their existing result protocol
+        key = f"status-delivery:{attempt['id']}"
+        existing = self.store.row("outbox", {"key": key})
+        if existing is None:
+            self._enqueue(
+                "retry_status_delivery",
+                key,
+                {
+                    "attempt_id": attempt["id"],
+                    "run_id": run.run_id,
+                    "run_attempt": run.attempt or 1,
+                    "base_ref": attempt["base_ref"],
+                },
+            )
+        elif existing["state"] == "done" and now - (existing["done_at"] or 0) >= LOG_GRACE_SECONDS:
+            # A successful dispatch is not successful delivery. If its job died,
+            # timed out or lost the reply, retry the same retained original-run
+            # intents. Workflow concurrency coalesces these reporting jobs only.
+            self.store.update("outbox", {"id": existing["id"]}, state="pending", next_attempt_at=now)
+
     def _check_lost_run(
         self, head: dict[str, Any], attempt: dict[str, Any], run: CandidateRun, values: dict[str, Any], now: float
     ) -> None:
@@ -5378,23 +5373,14 @@ class Controller:
         if status.state == "success":
             unbound = [context for context in VERDICT_CONTEXTS if not bound[context]]
             if unbound:
-                # The finalizer posts all three statuses in the one step that posts `build`; a bound
-                # `build` with the others absent is that step still in flight (or a post that failed).
-                # Look again for a little while, then treat it as the missing `build` case above.
-                if now - values["run_completed_at"] < LOG_GRACE_SECONDS:
-                    self._reasons.append(
-                        f"head {head['id']}: run {run.run_id} posted build, waiting for {', '.join(unbound)}"
-                    )
-                    self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
-                    return
-                values.update(
-                    outcome=OUTCOME_INFRASTRUCTURE,
-                    outcome_detail=f"missing-status: the completed run posted no bound {', '.join(unbound)} status",
-                )
-                self.store.journal(
-                    now, "ci-infrastructure", head["id"], attempt_id=attempt["id"], detail=values["outcome_detail"]
+                # Compilation and exact cache publication already succeeded.
+                # Preserve this attempt forever while required status delivery
+                # recovers; a transport failure must not schedule another build.
+                self._reasons.append(
+                    f"head {head['id']}: verified run {run.run_id} awaits delivery of {', '.join(unbound)}"
                 )
                 self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
+                self._retry_status_delivery(attempt, run, now)
                 return
             failed = [context for context in VERDICT_CONTEXTS if statuses[context].state != "success"]
             if failed:
@@ -6465,7 +6451,7 @@ class Controller:
     def _outbox_failed(self, entry: dict[str, Any], history: list[Any], error: Exception, now: float) -> None:
         attempts = entry["attempts"] + 1
         backoff = min(
-            int(self.setting("outbox_retry_seconds")) * (2 ** (attempts - 1)),
+            int(self.setting("outbox_retry_seconds")) * (2 ** min(20, attempts - 1)),
             int(self.setting("outbox_retry_max_seconds")),
         )
         history.append({"at": now, "error": str(error)[:500]})
@@ -6574,6 +6560,22 @@ class Controller:
             return "closed"
         if kind == "promote":
             return self._perform_promotion(payload, now)
+        if kind == "retry_status_delivery":
+            attempt = self.store.row("ci_attempts", {"id": payload["attempt_id"]})
+            head = self._head()
+            if (
+                attempt is None
+                or head is None
+                or attempt["batch_id"] != head["id"]
+                or attempt["batch_version"] != head["version"]
+                or attempt["outcome"] != OUTCOME_PENDING
+                or attempt["run_id"] != payload["run_id"]
+            ):
+                return "superseded status delivery"
+            self.execution.retry_status_delivery(
+                repo, payload["run_id"], payload["run_attempt"], base_ref=payload["base_ref"]
+            )
+            return "status recovery requested"
         if kind == "cancel_run":
             # The one retry of a cancel that failed inline: a second failure is recorded, not retried.
             try:

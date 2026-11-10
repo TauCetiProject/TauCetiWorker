@@ -236,20 +236,42 @@ class Verdicts(ControllerCase):
             self.controller.store.row("tasks", {"batch_id": head["id"], "state": "open"})["kind"], "repair"
         )
 
-    def test_build_alone_waits_for_the_other_verdicts_then_counts_as_a_missing_status(self):
+    def test_verified_build_retries_status_delivery_forever_without_rebuilding(self):
         head, attempt = self.observe("build-only")
-        self.assertEqual(attempt["outcome"], "pending", "a bound build with the others absent is not yet a verdict")
-        self.assertEqual(attempt["needs_observation"], 0)
-        self.assertEqual(self.verdict_states(), {"build": "success", "bump-guard": "absent", "scope": "absent"})
-        self.assertIn("waiting for bump-guard, scope", " ".join(self.controller.status()["reasons"]))
-        self.clock.advance(LOG_GRACE_SECONDS)
-        self.controller.tick()
-        attempt = self.attempt(head)
-        self.assertEqual(attempt["outcome"], "infrastructure")
-        self.assertEqual(
-            attempt["outcome_detail"], "missing-status: the completed run posted no bound bump-guard, scope status"
-        )
-        self.assertNotEqual(self.repo.main_sha(), head["tip"])
+        self.assertEqual(attempt["outcome"], "pending")
+        self.assertIn("awaits delivery of bump-guard, scope", " ".join(self.controller.status()["reasons"]))
+        self.assertEqual(len(self.github.dispatches), 1)
+        for _ in range(7):
+            self.clock.advance(LOG_GRACE_SECONDS + 1)
+            self.controller.tick()
+        current = self.attempt(head)
+        self.assertEqual((current["id"], current["outcome"]), (attempt["id"], "pending"))
+        self.assertEqual(len(self.github.dispatches), 1, "healthy source was never rebuilt")
+        deliveries = [call for call in self.github.calls if call[0] == "retry_status_delivery"]
+        self.assertGreaterEqual(len(deliveries), 7)
+        # The durable same entry survives controller restart, then ordinary status
+        # observation lands the original verified candidate when delivery recovers.
+        self.assertEqual(self.controller.store.count("outbox", {"kind": "retry_status_delivery"}), 1)
+        restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(restarted.store.close)
+        build = self.github.statuses[(head["tip"], "build")]
+        for context in ("scope", "bump-guard"):
+            self.github.statuses[(head["tip"], context)] = build
+        self.clock.advance(LOG_GRACE_SECONDS + 1)
+        restarted.tick()
+        self.assertEqual(self.repo.main_sha(), head["tip"])
+        self.assertEqual(len(self.github.dispatches), 1)
+
+    def test_reporting_dispatch_failure_remains_pending_in_the_existing_outbox(self):
+        self.github.fail_next["retry_status_delivery"] = 6
+        head, attempt = self.observe("build-only")
+        for _ in range(7):
+            self.clock.advance(3601)
+            self.controller.tick()
+        entry = self.controller.store.row("outbox", {"kind": "retry_status_delivery"})
+        self.assertGreaterEqual(entry["attempts"], 7)
+        self.assertEqual(self.attempt(head)["outcome"], "pending")
+        self.assertEqual(len(self.github.dispatches), 1)
 
     def test_delayed_build_status_can_land_without_redispatch(self):
         head, attempt = self.observe("no-status")
