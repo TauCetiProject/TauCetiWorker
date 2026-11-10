@@ -4730,6 +4730,20 @@ class WorkerAudits(Fixture):
         self.assertEqual({d["kind"] for d in record["diagnostics"]}, {"audit", "lint"})
         self.assertTrue(all(record[name]["finished_at"] for name in ("audit", "lint")))
 
+    @unittest.skipUnless(Path("/proc/self/task").is_dir(), "requires Linux process accounting")
+    def test_rss_counts_a_child_spawned_by_another_thread(self):
+        child = 'import time; data=bytearray(48*1024**2); print("ready", flush=True); time.sleep(4)'
+        script = 'import sys,subprocess,threading; t=threading.Thread(target=lambda:subprocess.run([sys.executable,"-c",sys.argv[1]]));t.start();t.join()'
+        with subprocess.Popen(
+            [sys.executable, "-c", script, child], stdout=subprocess.PIPE, text=True, start_new_session=True
+        ) as process:
+            try:
+                self.assertEqual(process.stdout.readline().strip(), "ready")
+                self.assertGreaterEqual(repair_audit.process_tree_rss(process.pid), 48 * 1024**2)
+            finally:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+
     def test_overlap_requires_matching_measurements_and_memory_headroom(self):
         logdir = self.root / "timing"
         logdir.mkdir()
@@ -4743,6 +4757,11 @@ class WorkerAudits(Fixture):
             patch.object(repair_audit, "available_memory", return_value=80 * 1024**3),
         ):
             self.assertFalse(repair_audit.can_overlap(logdir, "key"))
+            (logdir / "checks-timing.json").write_text(json.dumps(timing))
+            self.assertFalse(
+                repair_audit.can_overlap(logdir, "key"), "old undercounted samples cannot authorize overlap"
+            )
+            timing["rss_sampling"] = repair_audit.RSS_SAMPLING
             (logdir / "checks-timing.json").write_text(json.dumps(timing))
             self.assertTrue(repair_audit.can_overlap(logdir, "key"))
             self.assertFalse(repair_audit.can_overlap(logdir, "other-key"))
