@@ -410,7 +410,7 @@ def publish_frozen(spec: dict) -> dict:
         if reason:
             record["skipped"] = reason
             return record
-        env = dict(os.environ, LAKE_CACHE_KEY=settings.key() or "")
+        env = dict(os.environ, LAKE_CACHE_KEY=settings.key() or "", ELAN_TOOLCHAIN=frozen["toolchain"])
         argv = [
             *spec["lake"],
             "cache",
