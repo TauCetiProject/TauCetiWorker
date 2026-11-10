@@ -95,7 +95,8 @@ def source_version(source: dict, revision: str, no_repair_labels=()) -> str:
             "statuses": {
                 key: (source.get("statuses", {}).get(key) or "").lower()
                 for key in sorted(
-                    set(CONTEXTS) | {k for k in source.get("statuses", {}) if k.startswith("self-tested/")}
+                    set(CONTEXTS)
+                    | {k for k in source.get("statuses", {}) if k.startswith(("self-tested/", "_native_"))}
                 )
             },
         }
@@ -107,7 +108,13 @@ def recovery_heads(comments):
 
 
 def relevant_comment(comment):
-    return policy.SCOREBOARD_MARKER in (comment.get("body") or "") or bool(recovery_heads([comment]))
+    body = comment.get("body") or ""
+    return (
+        policy.SCOREBOARD_MARKER in body
+        or bool(recovery_heads([comment]))
+        or body.startswith("Merge-queue recovery for head `")
+        and "<!--tauceti-source:v2 " in body
+    )
 
 
 class AdmissionPolicy:
@@ -201,8 +208,9 @@ class AdmissionPoller:
         self.clock = clock
         self.state = AdmissionState(controller.store, repo, clock=clock)
         client = getattr(adapter, "client", None)
-        if client is not None:
-            client.restore_deadlines(controller.store.get_setting(self.state.resource_key, {}))
+        restore = getattr(client, "restore_deadlines", None)
+        if restore is not None:
+            restore(controller.store.get_setting(self.state.resource_key, {}))
         self._lock = threading.Lock()
         self._discovery_lock = threading.Lock()
         self._discovery_serial = 0
@@ -299,6 +307,7 @@ class AdmissionPoller:
                 kind == "status"
                 and detail.get("context") not in CONTEXTS
                 and not str(detail.get("context", "")).startswith("self-tested/")
+                and not str(detail.get("context", "")).startswith(("tauceti-review/", "tauceti-recovery/"))
             ):
                 return
             if kind == "check_run" and detail.get("name") == "merge eligibility":
@@ -343,18 +352,24 @@ class AdmissionPoller:
             version = (
                 ("incomplete:" + digest(pull.admission))
                 if "incomplete" in pull.admission
-                else self._version(pull.admission)
+                else pull.admission.get("discovery_version") or self._version(pull.admission)
             )
             self.state.observe(pull.number, pull.head_sha, version)
 
     def run_once(self, *, reason="interval"):
         with self._lock:
             client = getattr(self.adapter, "client", None)
-            context = client.deferred_requests() if client is not None else nullcontext()
+            deferred = getattr(client, "deferred_requests", None)
+            context = deferred() if deferred is not None else nullcontext()
             with context:
                 return self._run(reason)
 
     def _run(self, reason):
+        configure_polling = getattr(self.adapter, "configure_admission_polling", None)
+        if configure_polling is not None:
+            configure_polling(
+                clock=self.clock, refresh_seconds=self.controller.setting("approval_poll_interval_seconds")
+            )
         summary = {
             "at": self.clock(),
             "reason": reason,
@@ -430,9 +445,17 @@ class AdmissionPoller:
                     "inputs", {"repository": self.repo, "number": work["number"], "state": ["waiting", "reserved"]}
                 )
             )
-            with client.deferred_requests(urgent=revocation) if client is not None else nullcontext():
+            deferred = getattr(client, "deferred_requests", None)
+            with deferred(urgent=revocation) if deferred is not None else nullcontext():
                 self._evaluate(work, summary)
         except Exception as error:
+            if (
+                getattr(error, "publication_kind", None) == "recovery"
+                and getattr(error, "number", None) == work["number"]
+            ):
+                reconcile = getattr(self.controller, "reconcile_source_recovery", None)
+                if reconcile is not None:
+                    reconcile(work["number"], getattr(error, "head", None), getattr(error, "nonce", None))
             self.state.defer(
                 work,
                 self._retry_at(error),
@@ -562,6 +585,7 @@ class AdmissionPoller:
                 and result["review_safe"]
                 and not labels & KEEP
                 and requested
+                and not result.get("recovery_authority_hold")
             ):
                 held, labelled = pull.head_sha in requested, "needs-rebase" in labels
                 if held != labelled:
@@ -592,7 +616,7 @@ class AdmissionPoller:
                     self.clock(),
                 )
                 disposition = "closed" if pull.state != "open" else "draft"
-            elif not result["review_safe"]:
+            elif not result["review_safe"] or result.get("recovery_authority_hold"):
                 withdrawn = self.controller._withdraw(self.repo, pull.number, "review-unsafe", "tauceti-queue policy")
                 summary["revoked"] += int(withdrawn["withdrawn"])
                 disposition = "review-unsafe"
@@ -631,7 +655,7 @@ class AdmissionPoller:
                 "admission_work",
                 {"id": work["id"]},
                 head_sha=pull.head_sha,
-                observed_version=version,
+                observed_version=snapshot.discovery_version or version,
                 decision=dumps({**result, "evidence": evidence}),
             )
             self.state.complete(work, version, authorization, disposition)
@@ -657,6 +681,8 @@ class AdmissionPoller:
         scoreboard into authority. Reads of effective admin permission happen
         outside the controller lock and failures leave this evaluation pending.
         """
+        if not getattr(self.policy, "human_owned_approvals", True):
+            return False
         if scoreboard or not current or current["state"] not in ("waiting", "reserved", "inserted"):
             return False
         pull = snapshot.pull

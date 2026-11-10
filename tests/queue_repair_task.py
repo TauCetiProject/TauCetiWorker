@@ -30,6 +30,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import stat
 import subprocess
@@ -105,7 +106,7 @@ if args == ["build", "--iofail"] and os.environ.get("STUB_LAKE_BUILD_SCRIPT") an
     sys.exit(0)
 if args[:1] == ["env"]:
     os.execvp(args[1], args[1:])
-if args[:2] == ["cache", "put"]:
+if args[:2] in (["cache", "put"], ["cache", "put-staged"]):
     import json, shutil, subprocess
     (stub / "lake-put-key").write_text(os.environ.get("LAKE_CACHE_KEY", ""))
     if os.environ.get("STUB_LAKE_PUT_FAIL") == "1":
@@ -113,17 +114,26 @@ if args[:2] == ["cache", "put"]:
     remote = stub / "remote"
     (remote / "artifacts").mkdir(parents=True, exist_ok=True)
     uploads = (remote / "uploads.log").open("a")
-    for line in Path(args[2]).read_text().splitlines():
+    staged = args[1] == "put-staged"
+    mapping = Path(args[2]) / "outputs.jsonl" if staged else Path(args[2])
+    artifact_root = Path(args[2]) if staged else Path(os.environ["LAKE_CACHE_DIR"]) / "artifacts"
+    if staged:
+        (stub / "staged-upload-started").touch()
+        gate = stub / "staged-upload-gate"
+        while gate.exists():
+            time.sleep(0.05)
+    for line in mapping.read_text().splitlines():
         row = json.loads(line)
         if isinstance(row, list):
-            shutil.copy(Path(os.environ["LAKE_CACHE_DIR"]) / "artifacts" / row[1], remote / "artifacts" / row[1])
+            shutil.copy(artifact_root / row[1], remote / "artifacts" / row[1])
             uploads.write(f"artifact {row[1]}\n")
             uploads.flush()
     if os.environ.get("STUB_LAKE_PUT_FAIL") == "partial":
         sys.exit(1)
-    rev = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    rev = (next(a.split("=", 1)[1] for a in args if a.startswith("--rev=")) if staged else
+           subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip())
     (remote / "revisions").mkdir(exist_ok=True)
-    shutil.copy(args[2], remote / "revisions" / f"{rev}.jsonl")
+    shutil.copy(mapping, remote / "revisions" / f"{rev}.jsonl")
     uploads.write(f"mapping {rev}\n")
     sys.exit(0)
 if args[:2] == ["cache", "get"] and "tauceti-repair" in args:
@@ -443,12 +453,16 @@ for source in policy.glob("*.txt") if policy.is_dir() else ():
 """
 
 AUDIT_DRIVER = r"""#!/usr/bin/env python3
-import os, sys
+import os, sys, time
 from pathlib import Path
 stub = Path(os.environ["STUB_DIR"])
 with (stub / "audit-runs.log").open("a") as log:
     log.write(os.getcwd() + "\n")
 print("audit-driver: phase audit-import")
+phase_file = os.environ.get("AUDIT_PHASES_FILE")
+if phase_file:
+    with Path(phase_file).open("a") as phases:
+        phases.write(f"audit-import\t{time.time()}\n")
 lines = []
 for name in ("audit-findings", "audit-findings-always"):
     path = stub / name
@@ -457,6 +471,9 @@ for name in ("audit-findings", "audit-findings-always"):
         if name == "audit-findings":
             path.rename(stub / "audit-findings.reported")
 print("audit-driver: phase audit-duplicates")
+if phase_file:
+    with Path(phase_file).open("a") as phases:
+        phases.write(f"audit-duplicates\t{time.time()}\n")
 for line in lines:
     print(line, file=sys.stderr)
 if not lines:
@@ -464,8 +481,25 @@ if not lines:
 sys.exit(1 if lines else 0)
 """
 
+LINT_DRIVER = r"""#!/usr/bin/env python3
+import os, sys, json
+from pathlib import Path
+args = sys.argv[1:]
+assert args[0] == "--only-listed", args
+_, tag, marker, scope, *linters = args
+stub = Path(os.environ["STUB_DIR"])
+with (stub / "targeted-lint-runs.jsonl").open("a") as log:
+    log.write(json.dumps({"modules": Path(scope).read_text().splitlines(), "linters": linters}) + "\n")
+if (stub / "targeted-lint-fail").exists():
+    print("simpNF: finding persists")
+    sys.exit(1)
+if not (stub / "targeted-no-marker").exists():
+    print(Path(marker).read_text(), end="")
+"""
+
 TOOLS_SCRIPTS = {
-    "build-lint-driver.sh": 'printf "#!/bin/sh\\nexit 0\\n" > "$3/lint-env-driver"; chmod +x "$3/lint-env-driver"\n',
+    "build-lint-driver.sh": 'cp "$(dirname "$2")/lint-driver.py" "$3/lint-env-driver"; chmod +x "$3/lint-env-driver"\n',
+    "lint-driver.py": LINT_DRIVER,
     "build-audit-driver.sh": 'cp "$2/audit-driver.py" "$3/audit-driver"; chmod +x "$3/audit-driver"\n',
     "audit-driver.py": AUDIT_DRIVER,
     "LintEnvDriver.lean": "-- stand-in\n",
@@ -3694,7 +3728,7 @@ exit 1
         self.assertIn("`.tauceti-repair/build <Module> ...` waits for the lock", prompt)
         self.assertIn("`--dependents` adds the modules importing them", prompt)
         self.assertIn("build finished, exit N, M errors total", prompt)
-        self.assertIn("verdict is still your own whole-library `lake build --iofail`", prompt)
+        self.assertIn("the worker runs the final full build, audits and lint", prompt)
         # The scoped build helper waited for the lock, ran lake for the named module and returned its status.
         agent = json.loads((self.stub_dir / "stream-agent.json").read_text())
         self.assertEqual(agent["helper_rc"], 0, agent)
@@ -3753,7 +3787,7 @@ exit 1
         self.assertNotIn("stream_build", outcome)
         calls = self.agent_calls()
         self.assertNotIn("## Build in progress", calls[0]["prompt"])
-        self.assertIn("Artifacts are warm:", calls[0]["prompt"])
+        self.assertIn("The worker owns final verification", calls[0]["prompt"])
         self.assertIsNone(calls[0]["launch"]["errors"])
         self.assertFalse(calls[0]["launch"]["lock"])
         self.assertFalse((self.repair_dir() / "build.log").exists())
@@ -4565,6 +4599,7 @@ class WorkerAudits(Fixture):
     """CI's audits and changed-module lint on the worker (``repair_audit``), with the fake TauCetiTools pin."""
 
     BASE_FILES = {
+        ".gitignore": ".lake/\n",
         "tauceti.toml": f'[tools.tools]\nrepo = "TauCetiProject/TauCetiTools"\nref = "{TOOLS_REF}"\n',
         "scripts/lint-baseline.txt": "",
     }
@@ -4634,7 +4669,7 @@ class WorkerAudits(Fixture):
         # The finding reached the agent as a diagnostic naming both modules, with their owners.
         calls = self.agent_calls()
         self.assertEqual(len(calls), 2)
-        self.assertIn(repair.AUDIT_SENTENCE, calls[0]["prompt"])
+        self.assertIn("The worker owns final verification", calls[0]["prompt"])
         prompt = calls[1]["prompt"]
         self.assertIn("The worker's verification of the chain failed", prompt)
         self.assertIn(DUPLICATE_LINE, prompt)
@@ -4705,6 +4740,279 @@ class WorkerAudits(Fixture):
         self.assertEqual(scoped.returncode, 0, scoped.stdout + scoped.stderr)
         self.assertIn("audits: CI's audits and lint run after a whole-library build", scoped.stdout)
         self.assertEqual(len((self.stub_dir / "audit-runs.log").read_text().splitlines()), runs)
+
+
+class TargetedRepairChecks(Fixture):
+    BASE_FILES = WorkerAudits.BASE_FILES
+
+    def setUp(self):
+        super().setUp()
+        from tauceti_queue import repair_targeted
+
+        os.environ[repair_audit.URL_VARIABLE] = str(TOOLS_REPOSITORY)
+        self.addCleanup(os.environ.pop, repair_audit.URL_VARIABLE, None)
+        self.targeted = repair_targeted
+        self.worktree = self.root / "targeted-worktree"
+        subprocess.run(["git", "clone", "--quiet", str(self.content.clone), str(self.worktree)], check=True)
+        sh(self.worktree, "checkout", "--quiet", "--detach", self.content.tip)
+        (self.worktree / "TauCeti/Two.lean").write_text("theorem two : True := trivial\n")
+        self.telemetry = self.root / "targeted-logs"
+        repair_audit.write_settings(
+            self.worktree, base=self.content.base, tools_root=self.root / "tools", logdir=self.telemetry
+        )
+        self.finding = {
+            "kind": "lint",
+            "module": "TauCeti.One",
+            "path": "TauCeti/One.lean",
+            "linter": "simpNF",
+            "declaration": "one",
+            "message": "simpNF: one",
+        }
+
+    def command(self, diagnostics=None):
+        script = self.targeted.write(
+            self.worktree / ".tauceti-repair",
+            candidate=self.content.tip,
+            findings=repair.findings_from_diagnostics(diagnostics or [self.finding]),
+        )
+        env = {**repair.lake_env(self.root / "targeted-cache"), "STUB_DIR": str(self.stub_dir)}
+        return subprocess.run([str(script)], cwd=self.worktree, env=env, capture_output=True, text=True)
+
+    def test_targeted_helper_builds_finding_and_repair_delta_then_only_reported_linter(self):
+        result = self.command()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("build --iofail TauCeti.One TauCeti.Two", self.lake_calls())
+        calls = [json.loads(line) for line in (self.stub_dir / "targeted-lint-runs.jsonl").read_text().splitlines()]
+        self.assertEqual(calls, [{"modules": ["TauCeti.One", "TauCeti.Two"], "linters": ["simpNF"]}])
+        self.assertFalse((self.stub_dir / "audit-runs.log").exists())
+        self.assertNotIn("build --iofail", self.lake_calls(), "agent helper must not build the whole library")
+        record = json.loads(next(self.telemetry.glob("targeted-*/result.json")).read_text())
+        self.assertTrue(record["advisory"])
+        self.assertEqual(record["status"], "passed")
+
+    def test_focused_scope_includes_staged_and_untracked_repairs(self):
+        path = self.worktree / "TauCeti/NewRepair.lean"
+        path.write_text("theorem new_repair : True := trivial\n")
+        sh(self.worktree, "add", "TauCeti/Two.lean")
+        self.assertEqual(
+            self.targeted.edited_modules(self.worktree, self.content.tip), {"TauCeti.Two", "TauCeti.NewRepair"}
+        )
+
+    def test_targeted_lint_failure_reaches_the_agent(self):
+        (self.stub_dir / "targeted-lint-fail").touch()
+        result = self.command()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("finding persists", result.stdout)
+
+    def test_targeted_driver_cannot_silently_skip_the_check(self):
+        (self.stub_dir / "targeted-no-marker").touch()
+        self.assertEqual(self.command().returncode, 1)
+
+    def test_failed_scoped_compilation_does_not_run_lint(self):
+        (self.worktree / "TauCeti/Two.lean").write_text("BROKEN\n")
+        self.assertEqual(self.command().returncode, 1)
+        self.assertFalse((self.stub_dir / "targeted-lint-runs.jsonl").exists())
+
+    def test_unknown_checks_report_partial_coverage(self):
+        result = self.command([{"kind": "audit", "module": "TauCeti.One", "message": "disallowed axiom"}])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("some findings need worker verification", result.stdout)
+
+    def test_duplicate_findings_use_only_the_ownership_driver(self):
+        result = self.command([{"kind": "audit", "message": DUPLICATE_LINE}])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = [call["argv"] for call in self.bwrap_calls() if any(a.endswith("/audit-driver") for a in call["argv"])]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][-1], "--duplicates-only")
+
+    def test_worker_owned_helper_rejects_a_redundant_full_suite(self):
+        script = repair_tools.write_build_script(self.worktree / ".tauceti-repair", worker_verifies=True)
+        result = subprocess.run([str(script)], cwd=self.worktree, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("full verification is owned by the worker", result.stdout)
+        self.assertEqual(self.lake_calls(), [])
+
+    def test_prompt_contract_requires_worker_verification_and_warm_repair_kind(self):
+        task = repair_task.Task.from_json(self.service.task_record(1, self.service.preclaim(1, "token", "worker")))
+        self.assertTrue(repair_task.prompt_context(task, None, worker_verifies=True).worker_verifies)
+        self.assertFalse(repair_task.prompt_context(task, None, worker_verifies=False).worker_verifies)
+        self.assertFalse(
+            repair_task.prompt_context(task, None, worker_verifies=True, artifacts={"cold": True}).worker_verifies
+        )
+        for kind in ("pre_rebase", "rebase_conflict"):
+            task.kind = kind
+            self.assertFalse(repair_task.prompt_context(task, None, worker_verifies=True).worker_verifies)
+
+    def test_interrupted_audit_keeps_its_phase_trace_outside_the_worktree(self):
+        sandboxed = repair_audit._sandboxed
+
+        def interrupt(argv, worktree, env, extra, log, timeout):
+            if str(argv[-1]).endswith("/audit-driver"):
+                Path(extra["AUDIT_PHASES_FILE"]).write_text(f"audit-import\t{time.time()}\n")
+                raise KeyboardInterrupt
+            return sandboxed(argv, worktree, env, extra, log, timeout)
+
+        with patch.object(repair_audit, "_sandboxed", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+            repair_audit.check(
+                self.worktree,
+                repair.lake_env(self.root / "cache"),
+                base=self.content.base,
+                tools_root=self.root / "tools",
+                logdir=self.telemetry,
+            )
+        trace = next(self.telemetry.glob("audit-phases-*.tsv"))
+        self.assertIn("audit-import", trace.read_text())
+        (self.worktree / repair_audit.WORK_DIR / "audit-phases.tsv").unlink()
+        self.assertIn("audit-import", trace.read_text(), "worktree removal must not remove the record")
+
+    def test_phase_timing_is_best_effort_and_distinguishes_interruption(self):
+        path = self.root / "phases.tsv"
+        path.write_text("audit-import\t101\naudit-duplicates\t104\naudit-axioms\t109\n")
+        run = {"started_at": 100, "finished_at": 115, "rc": 0}
+        rows = repair_audit.audit_phases(path, run)
+        self.assertEqual([r["seconds"] for r in rows], [3, 5, 6])
+        self.assertTrue(all(r["complete"] for r in rows))
+        self.assertFalse(repair_audit.audit_phases(path, {**run, "rc": 137})[-1]["complete"])
+        path.write_text("invalid telemetry")
+        self.assertEqual(repair_audit.audit_phases(path, run), [])
+        path.unlink()
+        self.assertEqual(repair_audit.audit_phases(path, run), [])
+
+
+class KnownCheckRepairs(Fixture):
+    """Located CI check findings start inference before any build or audit pass."""
+
+    BASE_FILES = WorkerAudits.BASE_FILES
+
+    def setUp(self):
+        super().setUp()
+        os.environ[repair_audit.URL_VARIABLE] = str(TOOLS_REPOSITORY)
+        self.addCleanup(os.environ.pop, repair_audit.URL_VARIABLE, None)
+
+    def findings(self, name: str, text: str) -> None:
+        (self.stub_dir / name).write_text(text + "\n")
+
+    def known_checks_repair(self, diagnostics, *, stream_repair=True):
+        self.service.tasks[1]["diagnostics"] = diagnostics
+        cfg = self.config(stream_repair=stream_repair)
+        run_agent = repair_task.run_repair_agent
+        launches = []
+
+        def agent_after_fetch(*args, **kwargs):
+            # In particular, no cached preparation build or audit may block the
+            # first inference call. The cache fetches still precede it.
+            launches.append(True)
+            if len(launches) == 1:
+                self.assertTrue(self.lake_calls())
+                self.assertFalse(any(c.startswith("build") for c in self.lake_calls()))
+                self.assertFalse((self.stub_dir / "audit-runs.log").exists())
+            return run_agent(*args, **kwargs)
+
+        with (
+            patch.object(repair_task, "run_repair_agent", agent_after_fetch),
+            patch.object(repair_stream, "start_build", side_effect=AssertionError("unexpected discovery build")),
+        ):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertIn("pre_repair_discovery", outcome)
+        self.assertFalse(outcome["artifacts"]["incremental_build"])
+        self.assertNotIn("stream_build", outcome)
+        self.assertEqual(len(outcome["verification"]), 1)
+        self.assertTrue(outcome["verification"][0]["ok"])
+        self.assertTrue((self.stub_dir / "audit-runs.log").exists(), "final audits must run")
+        self.assertEqual(self.lake_calls().count("build --iofail"), 1, "only the final verification build")
+        checks = outcome["verification"][0]["checks"]
+        self.assertEqual([p["name"] for p in checks["audit_phases"]], ["audit-import", "audit-duplicates"])
+        self.assertTrue(all(p["seconds"] >= 0 for p in checks["audit_phases"]))
+        self.assertTrue((self.root / "state/tasks/1/logs/audit-phases.tsv").exists())
+        self.assertTrue(Path(checks["audit_phases_file"]).exists())
+        self.assertTrue((self.root / "state/tasks/1/logs/checks-timing.json").exists())
+        prompt = self.agent_calls()[0]["prompt"]
+        self.assertIn("Repair the reported findings first", prompt)
+        self.assertIn("check-findings", prompt)
+        self.assertIn("The worker owns final verification", prompt)
+        self.assertNotIn("then run the whole-library", prompt)
+        self.assertNotIn("exit status of the final `lake build --iofail`", prompt)
+        self.assertIn("Cached outputs may still need unpacking", prompt)
+        self.assertNotIn("every module of this batch that compiled are already built", prompt)
+        return outcome
+
+    def test_known_lint_starts_agent_before_build_and_audits(self):
+        self.known_checks_repair(
+            [
+                {
+                    "kind": "lint",
+                    "module": "TauCeti.Two",
+                    "path": "TauCeti/Two.lean",
+                    "linter": "simpNF",
+                    "declaration": "two",
+                    "message": "simpNF: two",
+                },
+            ]
+        )
+        self.assertIn("linter `simpNF`: `two`", self.agent_calls()[0]["prompt"])
+
+    def test_known_lint_skips_sequential_preparation_too(self):
+        self.known_checks_repair(
+            [
+                {"kind": "environment_linter", "module": "TauCeti.Two", "message": "simpNF: two"},
+            ],
+            stream_repair=False,
+        )
+
+    def test_known_duplicate_starts_agent_before_build_and_audits(self):
+        self.known_checks_repair([{"kind": "audit", "message": DUPLICATE_LINE}])
+        self.assertIn("`Foo.bar` is declared in both", self.agent_calls()[0]["prompt"])
+
+    def test_known_findings_do_not_allow_failed_final_audits_to_submit(self):
+        self.service.tasks[1]["diagnostics"] = [
+            {"kind": "lint", "module": "TauCeti.Two", "message": "simpNF: two"},
+        ]
+        self.findings("audit-findings-always", DUPLICATE_LINE)
+        cfg = self.config(verify_retries=0)
+        with patch.object(repair_stream, "start_build", side_effect=AssertionError("unexpected discovery")):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "released", outcome)
+        self.assertFalse(outcome["verification"][0]["ok"])
+        self.assertEqual(self.service.results, [])
+
+    def test_known_findings_do_not_bypass_artifact_availability(self):
+        self.service.tasks[1]["diagnostics"] = [
+            {"kind": "lint", "module": "TauCeti.Two", "message": "simpNF: two"},
+        ]
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "released", outcome)
+        self.assertEqual(outcome["reason"], "artifacts_unavailable")
+        self.assertEqual(self.agent_calls(), [])
+        self.assertEqual(self.service.results, [])
+
+    def test_only_actionable_check_findings_bypass_discovery(self):
+        task = repair_task.Task.from_json(self.service.task_record(1, self.service.preclaim(1, "token", "worker")))
+        for diagnostics in (
+            [],
+            [{"kind": "admission_predictions", "proactive": True}],
+            [{"kind": "lint", "message": "lint failed"}],
+            [{"kind": "lint", "module": "TauCeti.Two"}],
+            [{"kind": "audit", "module": "TauCeti.Two"}],
+            [{"kind": "build", "module": "TauCeti.Two", "message": "build failed"}],
+            [{"kind": "compiler", "module": "TauCeti.Two", "message": "unknown identifier"}],
+        ):
+            with self.subTest(diagnostics=diagnostics):
+                task.diagnostics = diagnostics
+                self.assertFalse(repair_task.known_check_failures(task))
+        lint = {"kind": "lint", "module": "TauCeti.Two", "message": "simpNF: two"}
+        task.diagnostics = [lint]
+        self.assertTrue(repair_task.known_check_failures(task))
+        task.diagnostics.append({"kind": "compiler", "module": "TauCeti.Three", "message": "broken"})
+        self.assertFalse(repair_task.known_check_failures(task), "compiler discovery still collects all failures")
+        task.diagnostics = [{"kind": "audit", "module": "TauCeti.Two", "message": "disallowed axiom in two"}]
+        self.assertTrue(repair_task.known_check_failures(task))
+        for kind in ("prepare", "pre_rebase", "rebase_conflict"):
+            task.kind = kind
+            task.diagnostics = [lint]
+            self.assertFalse(repair_task.known_check_failures(task))
 
 
 class StreamAudits(WorkerAudits):
@@ -5121,6 +5429,127 @@ class RepairContextTests(unittest.TestCase):
         )
         self.assertIn({"file": "TauCeti/Uses.lean", "main": True, "lines": [20]}, ripple["references"])
         self.assertTrue(all(r.get("pr") in (39, 99) for r in ripple["references"] if not r.get("main")))
+
+
+class EarlyPublication(Fixture):
+    BASE_FILES = {
+        "lakefile.toml": 'name = "TauCeti"\nplatformIndependent = true\n',
+        "lean-toolchain": "leanprover/lean4:v4.36.0-rc2\n",
+        "tauceti.toml": f'[tools.tools]\nrepo = "TauCetiProject/TauCetiTools"\nref = "{TOOLS_REF}"\n',
+        "scripts/lint-baseline.txt": "",
+        ".gitignore": ".lake/\n",
+    }
+
+    def setUp(self):
+        super().setUp()
+        os.environ[repair_audit.URL_VARIABLE] = str(TOOLS_REPOSITORY)
+        self.addCleanup(os.environ.pop, repair_audit.URL_VARIABLE, None)
+        key = self.root / "cache-key"
+        key.write_text("test-id:test-secret")
+        self.settings = repair_publish.Settings(url="https://repair-cache.example", key_file=key)
+
+    def test_upload_overlaps_audits_and_is_reused_without_waiting_for_completion(self):
+        gate = self.stub_dir / "staged-upload-gate"
+        gate.touch()
+        self.addCleanup(lambda: gate.unlink(missing_ok=True))
+        audit = repair_audit._sandboxed
+        seen = []
+
+        def checking(argv, *args, **kwargs):
+            if any(str(a).endswith("/audit-driver") for a in argv):
+                deadline = time.monotonic() + 10
+                while not (self.stub_dir / "staged-upload-started").exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue((self.stub_dir / "staged-upload-started").exists())
+                self.assertEqual(self.service.results, [], "checks still block submission")
+                seen.append(True)
+            return audit(argv, *args, **kwargs)
+
+        cfg = self.config(publish=self.settings)
+        try:
+            with patch.object(repair_audit, "_sandboxed", side_effect=checking):
+                outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+            self.assertEqual(outcome["status"], "adopted", outcome)
+            self.assertTrue(seen)
+            self.assertTrue(outcome["publish"]["early"])
+            self.assertFalse((self.stub_dir / "remote/revisions").exists(), "submission does not wait for upload")
+            self.assertEqual(len(repair_publish.BACKGROUND.running), 1, "no duplicate late publisher")
+            self.assertFalse((cfg.root / "worktrees/task-1").exists(), "frozen uploader does not retain source")
+        finally:
+            gate.unlink(missing_ok=True)
+        records = repair_publish.BACKGROUND.wait(20)
+        self.assertTrue(records[0]["published"], records)
+        self.assertTrue((self.stub_dir / "remote/revisions" / (outcome["tip"] + ".jsonl")).is_file())
+        self.assertEqual(list((cfg.root / "worktrees").glob("task-1-publish-*")), [])
+        self.assertNotIn("cache put ", "\n".join(self.lake_calls()))
+        self.assertIsNone(self.agent_calls()[0]["env"]["LAKE_CACHE_KEY"])
+
+    def test_full_check_failures_still_block_submission_despite_early_upload(self):
+        (self.stub_dir / "audit-findings-always").write_text(DUPLICATE_LINE + "\n")
+        cfg = self.config(publish=self.settings, verify_retries=0)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "released")
+        self.assertEqual(self.service.results, [])
+        records = repair_publish.BACKGROUND.wait(20)
+        self.assertTrue(records and records[0]["published"], records)
+        self.assertFalse(outcome["verification"][0]["ok"])
+
+    def test_frozen_upload_uses_captured_revision_after_source_worktree_is_removed(self):
+        worktree = self.root / "state/worktrees/task-7"
+        worktree.mkdir(parents=True)
+        (worktree / "lakefile.toml").write_text('name = "TauCeti"\nplatformIndependent = true\n')
+        (worktree / "lean-toolchain").write_text("leanprover/lean4:v4.36.0-rc2\n")
+        subprocess.run(["git", "init", "-q", str(worktree)], check=True)
+        sh(worktree, "add", "-A")
+        sh(worktree, "-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-qm", "base")
+        revision = sh(worktree, "rev-parse", "HEAD")
+        logdir = self.root / "state/tasks/7/logs"
+        repair_publish.write_early_settings(
+            worktree, settings=self.settings, logdir=logdir, task_id="7", repository=PROJECT, lake=("lake",)
+        )
+        with patch.object(repair_publish, "_spawn") as spawn:
+            record = repair_publish.start_early(worktree, repair.lake_env(self.root / "state"))
+            spec_path = Path(spawn.call_args.args[0][-1])
+        self.assertTrue(record["launched"], record)
+        shutil.rmtree(worktree)
+        spec = json.loads(spec_path.read_text())
+        spec["settings"]["key_file"] = str(self.settings.key_file)
+        # The child receives Lake config/cache settings from systemd or the subprocess env.
+        with patch.dict(os.environ, repair.lake_env(self.root / "state")):
+            self.assertEqual(repair_publish.run_spec(spec_path), 0)
+        result = json.loads(Path(record["record"]).read_text())
+        self.assertTrue(result["published"], result)
+        self.assertEqual(result["revision"], revision)
+        self.assertFalse(Path(spec["frozen"]["path"]).exists())
+
+    def test_later_commit_revision_does_not_reuse_an_older_upload(self):
+        logdir = self.root / "publication-lookup"
+        old_revision = "a" * 40
+        path = logdir / "publications" / old_revision / "publish.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"revision": old_revision, "published": True, "state": "published"}))
+        self.assertIsNotNone(repair_publish.early_record(logdir, old_revision, self.settings))
+        self.assertIsNone(repair_publish.early_record(logdir, "b" * 40, self.settings))
+        path.write_text(json.dumps({"revision": old_revision, "published": False, "state": "failed"}))
+        self.assertIsNone(repair_publish.early_record(logdir, old_revision, self.settings))
+
+    def test_failed_early_start_falls_back_to_final_publication(self):
+        spawn = repair_publish._spawn
+        calls = []
+
+        def launching(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 1:
+                raise OSError("temporary spawn failure")
+            return spawn(*args, **kwargs)
+
+        cfg = self.config(publish=self.settings)
+        with patch.object(repair_publish, "_spawn", side_effect=launching):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(repair_publish.BACKGROUND.wait(20)[0]["published"])
+        self.assertEqual(list((cfg.root / "worktrees").glob("task-1-publish-*")), [])
 
 
 if __name__ == "__main__":

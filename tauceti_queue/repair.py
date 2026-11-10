@@ -594,7 +594,7 @@ def link_shared_packages(worktree: Path, seed_packages: Path) -> None:
     target.symlink_to(seed_packages)
 
 
-def lake_env(root: Path, base_env: dict | None = None) -> dict:
+def lake_env(root: Path, base_env: dict | None = None, *, cache_root: Path | None = None) -> dict:
     """The workers' artifact-cache environment: the public service and a private artifact pool."""
     root.mkdir(parents=True, exist_ok=True)
     config = root / "lake.toml"
@@ -606,7 +606,7 @@ def lake_env(root: Path, base_env: dict | None = None) -> dict:
         )
     env = dict(os.environ if base_env is None else base_env)
     env["LAKE_CONFIG"] = str(config)
-    env["LAKE_CACHE_DIR"] = str(root / "lake-cache")
+    env["LAKE_CACHE_DIR"] = str((cache_root or root) / "lake-cache")
     env["LAKE_ARTIFACT_CACHE"] = "1"
     env["LAKE_RESTORE_ARTIFACTS"] = "1"
     env.pop("TAUCETI_PR_CACHE_MISS", None)
@@ -889,61 +889,85 @@ def prepare_artifacts(
     another and a later one never displaces an artifact for a different input. A warm hit makes the
     artifacts available even when no other revision is published (``cache_revision`` is then the
     first warmed revision). ``build=False`` fetches only, so ``available`` rests on the fetch alone:
-    streaming callers build afterwards, and rebase tasks build the resulting chain after replay.
+    streaming callers build afterwards, known audit/lint repairs build during verification after
+    the agent edits, and rebase tasks build the resulting chain after replay.
     """
     record: dict = {}
     seconds = 0.0
     reasons: list[str] = []
-    if mathlib_cache:
-        deps = run_logged([*lake, "exe", "cache", "get"], worktree, logdir / "cache-get-mathlib.log", env, 1800)
-        record["mathlib_cache"] = deps
-        seconds += deps["seconds"]
-        if deps["rc"] != 0:
-            reasons.append(f"lake exe cache get exited {deps['rc']}")
-    warm_attempts: list[dict] = []
-    for service, revision in dict.fromkeys((service, revision) for service, revision in warm if revision):
-        fetch = _fetch_mapping(
-            worktree, revision, env, logdir, repository=repository, lake=lake, mappings_only=False, service=service
-        )
-        fetch["distance"] = None
-        warm_attempts.append(fetch)
-        seconds += fetch["seconds"]
-    warmed = [fetch for fetch in warm_attempts if fetch["mapping_found"]]
-    record["warm_attempts"] = warm_attempts
-    record["warmed_from"] = [fetch["revision"] for fetch in warmed]
-    tried = {(fetch["service"], fetch["revision"]) for fetch in warm_attempts}
-    attempts: list[dict] = []
-    candidates = [
-        (service, revision, None) for service, revision in preferred if revision and (service, revision) not in tried
-    ] + [
-        (CACHE_SERVICE, revision, distance)
-        for revision, distance in _artifact_candidates(worktree, base, fallbacks, ancestors)
-    ]
-    for service, revision, distance in candidates:
-        fetch = _fetch_mapping(
-            worktree, revision, env, logdir, repository=repository, lake=lake, mappings_only=False, service=service
-        )
-        fetch["distance"] = distance
-        attempts.append(fetch)
-        seconds += fetch["seconds"]
-        if fetch["mapping_found"]:
-            break
-    found = attempts[-1] if attempts[-1]["mapping_found"] else None
-    record["base_cache"] = attempts[-1]
-    if found is None and warmed:
-        found = warmed[0]
-    record["cache_attempts"] = attempts
-    record["cache_revision"] = found["revision"] if found else None
-    record["cache_distance"] = found["distance"] if found else None
-    record["cache_service"] = found["service"] if found else None
-    record["cache_skipped"] = _skipped_summary(attempts, base)
-    if found is None:
-        reasons.append("; ".join(record["cache_skipped"]))
-    if candidate:
-        own = _fetch_mapping(worktree, candidate, env, logdir, repository=repository, lake=lake, mappings_only=True)
-        own["published"] = own["mapping_found"]
-        record["candidate_outputs_published"] = own
-        seconds += own["seconds"]
+    from tauceti_queue.repair_cache import downloads
+
+    with downloads(env) as fetch_env:
+        if mathlib_cache:
+            deps = run_logged(
+                [*lake, "exe", "cache", "get"], worktree, logdir / "cache-get-mathlib.log", fetch_env, 1800
+            )
+            record["mathlib_cache"] = deps
+            seconds += deps["seconds"]
+            if deps["rc"] != 0:
+                reasons.append(f"lake exe cache get exited {deps['rc']}")
+        warm_attempts: list[dict] = []
+        for service, revision in dict.fromkeys((service, revision) for service, revision in warm if revision):
+            fetch = _fetch_mapping(
+                worktree,
+                revision,
+                fetch_env,
+                logdir,
+                repository=repository,
+                lake=lake,
+                mappings_only=False,
+                service=service,
+            )
+            fetch["distance"] = None
+            warm_attempts.append(fetch)
+            seconds += fetch["seconds"]
+        warmed = [fetch for fetch in warm_attempts if fetch["mapping_found"]]
+        record["warm_attempts"] = warm_attempts
+        record["warmed_from"] = [fetch["revision"] for fetch in warmed]
+        tried = {(fetch["service"], fetch["revision"]) for fetch in warm_attempts}
+        attempts: list[dict] = []
+        candidates = [
+            (service, revision, None)
+            for service, revision in preferred
+            if revision and (service, revision) not in tried
+        ] + [
+            (CACHE_SERVICE, revision, distance)
+            for revision, distance in _artifact_candidates(worktree, base, fallbacks, ancestors)
+        ]
+        for service, revision, distance in candidates:
+            fetch = _fetch_mapping(
+                worktree,
+                revision,
+                fetch_env,
+                logdir,
+                repository=repository,
+                lake=lake,
+                mappings_only=False,
+                service=service,
+            )
+            fetch["distance"] = distance
+            attempts.append(fetch)
+            seconds += fetch["seconds"]
+            if fetch["mapping_found"]:
+                break
+        found = attempts[-1] if attempts[-1]["mapping_found"] else None
+        record["base_cache"] = attempts[-1]
+        if found is None and warmed:
+            found = warmed[0]
+        record["cache_attempts"] = attempts
+        record["cache_revision"] = found["revision"] if found else None
+        record["cache_distance"] = found["distance"] if found else None
+        record["cache_service"] = found["service"] if found else None
+        record["cache_skipped"] = _skipped_summary(attempts, base)
+        if found is None:
+            reasons.append("; ".join(record["cache_skipped"]))
+        if candidate:
+            own = _fetch_mapping(
+                worktree, candidate, fetch_env, logdir, repository=repository, lake=lake, mappings_only=True
+            )
+            own["published"] = own["mapping_found"]
+            record["candidate_outputs_published"] = own
+            seconds += own["seconds"]
     if build and not reasons:
         built = run_logged(
             repair_sandbox.sandboxed_lake([*lake, "build", "--iofail"], worktree, env),
@@ -1009,6 +1033,8 @@ class PromptContext:
     instruction: str = AGENT_INSTRUCTION  # the plan's instruction; the service sends it with the task
     artifacts_cold: bool = False  # no warm artifacts: the agent's first build starts from nothing
     artifacts_reason: str | None = None  # ``prepare_artifacts``'s ``unavailable_reason`` when cold
+    worker_verifies: bool = False  # worker owns the final full suite; agent checks are scoped
+    check_findings_known: bool = False  # cached artifacts fetched; CI already supplied the failures
     listings_path: Path | None = None  # where the member listings and the check script are written
     shell_limit: int = SHELL_LIMIT_SECONDS  # what the prompt says about the foreground shell limit
     rebase_options: str = "--keep-empty --empty=keep --reapply-cherry-picks"  # the replay's git options
@@ -1277,7 +1303,7 @@ def write_listings(
     check = directory / CHECK_FILE
     check.write_text(check_script(context.base, context.repository))
     check.chmod(0o755)
-    repair_tools.write_build_script(directory)
+    repair_tools.write_build_script(directory, worker_verifies=context.worker_verifies)
     if context.kind in REBASE_KINDS and (context.conflict or {}).get("previous_base"):
         step = directory / STEP_FILE
         step.write_text(step_script(context.base, str(context.conflict["previous_base"]), context.rebase_options))
@@ -1385,6 +1411,12 @@ def _verification_section(
 ) -> list[str]:
     conflict = context.conflict if context.kind in REBASE_KINDS else None
     lines = ["", "## Verifying locally", ""]
+    if not context.worker_verifies:
+        lines += [
+            "Fold fixups and finalize all commit-message explanations before the final whole-library build. "
+            "That lets the worker start publishing outputs for the final revision while audits and lint run.",
+            "",
+        ]
     if check_command:
         lines += [
             f"`{check_command}` verifies the chain: linear on `{base_short}`, exactly one commit per `Source-PR` trailer "
@@ -1393,6 +1425,32 @@ def _verification_section(
             "finish.",
             "",
         ]
+    if context.worker_verifies:
+        lines += [
+            "The worker owns final verification. Repair the reported findings first; do not run a whole-library "
+            "build, the full audit suite or the full environment lint in the agent turn. "
+            "Cached outputs may still need unpacking, and Lake checks their input traces.",
+            "",
+            f"Run `{LISTINGS_DIR}/check-findings`: it builds the finding modules and your edited modules, "
+            "then runs the reported linters or the ownership-only check. These are advisory checks, "
+            "not a claim that the entire batch passes. For additional compiler feedback use "
+            f"`{LISTINGS_DIR}/{BUILD_FILE} <Module.Name> --dependents`.",
+            "",
+            "After the focused checks and the chain check, return your summary. The worker runs the "
+            "whole-library build, full audits and environment lint before submission and sends any "
+            "remaining failures back as diagnostics. If a targeted checker is unavailable, report that "
+            "and return after scoped compilation; do not replace it with the full suite.",
+            "",
+            CACHE_SENTENCE,
+            f"Run scoped checks in the foreground: shell commands have a {_hours_text(context.shell_limit)} limit. "
+            "Do not use `--fail-fast`.",
+            "",
+            HARD_RULES,
+            "",
+            "Finish the focused work synchronously. Summarize the fixes in their owning PR commits and "
+            "the exit status of each focused check; full verification is the worker's next step.",
+        ]
+        return lines
     scoped = (
         [
             "",
@@ -1442,6 +1500,19 @@ def _verification_section(
             "the original chain. Finish the rebase first, then build the resulting chain with "
             "`lake build --iofail` and judge it by its exit status; cached outputs are reused when their inputs "
             "still match. " + foreground + " " + CACHE_SENTENCE + " Do not use `--fail-fast`.",
+            *scoped,
+        ]
+    elif context.check_findings_known:
+        lines += [
+            "Artifacts were fetched into the cache without a discovery build or audit pass: CI already supplied "
+            "the located audit/lint findings above. Start by repairing those findings; do not repeat a whole-library "
+            "discovery pass before editing. Cached outputs may still need unpacking, and Lake checks their input traces. "
+            "Use the scoped build helper to check your edits, then run the whole-library `lake build --iofail` and "
+            "audits to validate the repaired chain. "
+            + foreground
+            + " "
+            + CACHE_SENTENCE
+            + " Do not use `--fail-fast`.",
             *scoped,
         ]
     else:

@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect terminal queue repair worktrees every minute
+
+[Timer]
+OnStartupSec=30s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+Unit=tauceti-queue-repair-cleanup.service
+
+[Install]
+WantedBy=timers.target

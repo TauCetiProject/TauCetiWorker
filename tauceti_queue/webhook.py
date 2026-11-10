@@ -12,8 +12,14 @@ webhook secret over the raw request body. `WebhookReceiver.handle` then routes o
   `check_run`, `check_suite`, `push`, `workflow_run`) is passed to `controller.handle_event(kind,
   payload)` so the controller can bind statuses and runs to its candidates.
 
-Deliveries are deduplicated by `X-GitHub-Delivery` over a bounded window, because GitHub redelivers
-on timeout and a duplicated approval must not become two admissions.
+Primary intake needs only PRs, comments, reviews, main pushes and relevant commit statuses. It
+discards the much larger stream of check/workflow notifications before taking the controller lock;
+commit statuses wake candidate observation, with periodic polling as a backstop. Legacy intake
+retains its review-App check handling.
+
+Deliveries are deduplicated by `X-GitHub-Delivery` over a bounded window for explicit redeliveries.
+GitHub does not automatically retry failed deliveries. Polling reconciles missed notifications;
+failed operator commands need explicit redelivery or resubmission.
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ EVENTS = (
     "push",
     "workflow_run",
 )
+PRIMARY_EVENTS = frozenset(EVENTS) - {"check_run", "check_suite", "workflow_run"}
 # The review App that approves on TauCetiReview's behalf (bors-ng deploy/cloudflare/README.md).
 REVIEW_APP_ID = 3947238
 
@@ -107,23 +114,73 @@ class WebhookReceiver:
             self.ignored += 1
             return "ignored"
         admission = getattr(self.controller, "admission", None)
-        if admission is not None:
-            try:
+        if admission is not None and self._irrelevant_primary(delivery):
+            self.ignored += 1
+            return "ignored"
+        try:
+            if admission is not None:
                 admission.handle_event(delivery.event, payload)
-            except BaseException:
-                # A failed durable invalidation must be retried on redelivery, not remembered
-                # as successfully handled by the in-memory delivery optimization.
-                with self._lock:
-                    self._seen.pop(delivery.delivery_id, None)
-                raise
-        if delivery.event == "issue_comment":
-            self._issue_comment(repo, payload)
-        elif delivery.event == "pull_request_review":
-            self._review(repo, payload)
-        elif delivery.event == "check_run":
-            self._check_run(repo, payload)
-        self.controller.handle_event(delivery.event, payload)
+            if delivery.event == "issue_comment":
+                self._issue_comment(repo, payload)
+            elif delivery.event == "pull_request_review":
+                self._review(repo, payload)
+            elif delivery.event == "check_run":
+                self._check_run(repo, payload)
+            self.controller.handle_event(delivery.event, payload)
+        except BaseException:
+            # A failed delivery must remain eligible for explicit redelivery, including failures
+            # after admission invalidation or during command/controller processing.
+            with self._lock:
+                self._seen.pop(delivery.delivery_id, None)
+            raise
         return "ok"
+
+    def _irrelevant_primary(self, delivery: Delivery) -> bool:
+        """Cheap routing before controller mutation or GitHub I/O. Signature/repository checks have
+        already passed. Keep uncertain payloads for reconciliation rather than guessing their effect.
+        """
+        if delivery.event not in PRIMARY_EVENTS:
+            return True
+        payload = delivery.payload
+        action = payload.get("action")
+        if delivery.event == "push":
+            return payload.get("ref") != f"refs/heads/{self.controller.canonical_branch}"
+        if delivery.event == "status":
+            from .admission import CONTEXTS
+
+            context = payload.get("context")
+            return context not in CONTEXTS and not str(context or "").startswith("self-tested/")
+        if delivery.event == "pull_request":
+            if action in ("labeled", "unlabeled"):
+                label_payload = payload.get("label")
+                label = label_payload.get("name") if isinstance(label_payload, dict) else None
+                relevant = (
+                    eligibility.KEEP
+                    | self.controller._no_repair_labels()
+                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair"}
+                )
+                return isinstance(label, str) and bool(label) and label.lower() not in relevant
+            if action == "edited":
+                changes = payload.get("changes")
+                return isinstance(changes, dict) and bool(changes) and set(changes) <= {"title"}
+            return action in {"assigned", "unassigned", "review_requested", "review_request_removed"}
+        if delivery.event == "pull_request_review":
+            return action != "submitted" or not commands.parse((payload.get("review") or {}).get("body"))
+        if delivery.event == "issue_comment":
+            if "pull_request" not in (payload.get("issue") or {}):
+                return True
+            if action == "deleted":
+                return False  # a missing deleted body must still invalidate stored review evidence
+            from .admission import relevant_comment
+
+            comment = payload.get("comment") or {}
+            old_body = ((payload.get("changes") or {}).get("body") or {}).get("from") or ""
+            if relevant_comment(comment) or relevant_comment(dict(comment, body=old_body)):
+                return False
+            app = comment.get("performed_via_github_app") or {}
+            review_app = bool(self.review_app_id) and app.get("id") == self.review_app_id
+            return action != "created" or review_app or not commands.parse(comment.get("body"))
+        return False
 
     def _check_run(self, repo: str, payload: dict) -> None:
         """A `merge eligibility` check from the review App is the App's approval or revocation."""

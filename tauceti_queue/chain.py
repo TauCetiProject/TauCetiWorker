@@ -328,7 +328,7 @@ def landed_prs(repo: str | os.PathLike[str], since: str, until: str) -> dict[str
 def landed_commit(landed: dict[str, str], source_pr: str) -> str | None:
     """The commit from `landed_prs` that landed `owner/repo#N`, by trailer identity or subject number."""
     sha = landed.get(source_pr)
-    if sha is None and "#" in source_pr:
+    if sha is None and "#" in source_pr and not source_pr.startswith("forgejo:"):
         sha = landed.get("#" + source_pr.rsplit("#", 1)[1])
     return sha
 

@@ -3,8 +3,8 @@
 `tauceti_queue/controller.py` is the state machine of increment 1 of
 [`docs/redesign/specs/ai-merge-queue.md`](../redesign/specs/ai-merge-queue.md) (on the `overhaul`
 branch): open batches receiving scripted insertions (one, plus a second for inputs that conflict with
-the first; see "Open batches" below), at most one sealed head that is rebased, built, repaired in
-place by agents and fast-forwarded onto the canonical branch. It is one object
+the first; see "Open batches" below), sealed batches prepared by a background worker,
+and one head that is rebased, built, repaired in place by agents and fast-forwarded onto the canonical branch. It is one object
 shared by the reconciliation loop (`tauceti_queue/loop.py`) and the HTTP server (work plan stream F),
 over one SQLite database (`tauceti_queue/store.py`) and a local clone of the content repository. It
 talks to GitHub only through the `GitHubPort` protocol in `tauceti_queue/ports.py`; all chain work is
@@ -80,8 +80,12 @@ or `readmit-refused` when the PR is no longer open at its accepted head or carri
 `superseded` when the PR was approved again meanwhile. Comment shapes: `docs/queue/github.md`,
 "Repair or reject".
 
-Batches: `open` -> `head` (sealed) -> `landed`; an empty open batch whose base is stale is
-`removed` and recreated on demand. There is at most one open and at most one head batch.
+Batches: `open` -> `head` -> `landed`; an empty unsealed batch whose base is stale is
+`removed` and recreated on demand. Sealing fixes membership independently of head status: the
+a sealed non-head batch has `state=open, sealed=1`, preserving the existing background task
+protocol. There is at most one head and a target of two sealed active batches in total, plus
+`open_batch_limit` unsealed batches. When head promotion waits for an active preparation,
+both sealed batches can temporarily be non-head batches.
 
 Every `tick()` (one reconciliation pass) does, under the controller lock (except around its GitHub
 I/O, below):
@@ -108,17 +112,27 @@ I/O, below):
    per batch (`probe_conflicts`), the base it conflicted against: the input is not probed against
    that batch again while its base is unchanged (the conflict is with content already in the
    chain, so appending members cannot resolve it) but against the next open batch, created when
-   none exists and fewer than `open_batch_limit` are open; a conflict against the canonical commit
+   none exists and fewer than `open_batch_limit` are unsealed; a conflict against the canonical commit
    itself cancels the input and posts the conflict request. Any error returns the input to waiting
    and releases the claim. Empty open batches beyond the first are removed at the end of the pass.
-   A batch a `prepare` task holds (below) is skipped, so inflow goes on into the next open batch.
+   Sealed successors and batches a `prepare` task holds (below) are skipped, so inflow goes on into
+   another unsealed batch.
 4. Seal: when there is no head, the oldest open batch is nonempty, no claim is active on it, no
    inference hold is in force and Bors's external head (below) is not awaited, it becomes the head
    in the same pass; the other open batches stay open and keep receiving insertions, and a new open
    batch is created only when none remains. There is no collection window. An active `prepare` or
    `pre_rebase` owner keeps the batch open until adoption, release or claim expiry, so completed
    repairs enter the new head through ordinary validation. Unclaimed background offers are
-   superseded (resolution `sealed`); the batch seals with what its preparations adopted.
+   superseded (resolution `sealed`); the new head keeps what its preparations adopted.
+   While fewer than two active batches are sealed (counting the head), seal the oldest unsealed batch once it has
+   `sealed_successor_min_members` members (default 100; 0 disables new successor sealing). A larger
+   later batch never overtakes a smaller first one. Successor sealing preserves active background
+   claims and versions, closes membership permanently, and makes preparation due immediately
+   without a size or quiet-period gate. On promotion the successor retains its original `sealed_at`;
+   replenish the sealed prefix from the next oldest eligible batch in the same pass. A claimed
+   preparation can delay head promotion but cannot stop replenishing the two sealed batches.
+   Head creation
+   itself never waits for the successor threshold.
 5. Head reconciliation, in the plan's order: a head under a worker's task claim is left alone;
    a head not based on the canonical commit is claimed and, when its pre-rebase (below) was made on
    exactly that commit, based there from the pre-rebased chain without a replay; otherwise replayed (`chain.replay`), a clean
@@ -144,14 +158,16 @@ without being drawn and resets on a draw.
 Open batches: increment 1 has one open batch, and an approved PR whose replay conflicts textually
 with content in it waits until that batch seals and lands. A step beyond increment 1 (operator
 decision, 2026-11-05, with about 190 approved inputs waiting behind a 1,200-member open batch in
-production) allows up to `open_batch_limit` open batches (default 2; 1 restores increment 1), ordered
+production) allows up to `open_batch_limit` unsealed batches (default 2; 1 allows one), ordered
 by id. An input is probed against the first open batch; one whose recorded conflict is against that
 batch's current base is probed against the next, which is created on the canonical commit (never on
 another batch's tip: batches are never stacked on an unlanded predecessor) when none exists. An
 input that conflicts with every open batch waits as before. Sealing takes the oldest open batch;
 when it lands and the canonical commit advances, the next sealed head is rebased by the ordinary
 path and its conflicts become `rebase_conflict` tasks for the agent, which is the intended place for
-them. The urgent lane still inserts into the first open batch, which seals when the head lands.
+them. The urgent lane still inserts into the first unsealed batch; it cannot extend the sealed successor.
+A sealed successor does not consume unsealed capacity. Its membership remains closed after its
+preparation finishes, including after a controller restart or disabling new successor sealing.
 
 Missing-source insertion probes wait only for sources absent from the probed batch's base and tip
 that another active batch introduces or the current canonical tree supplies. An older open batch
@@ -167,7 +183,8 @@ the head's tip) and its internal failures are repaired by an agent, so that it i
 seals. When `prepare_open_batches` is on, every open batch with at least `prepare_min_members`
 members, no insertion for `prepare_quiet_seconds`, a `prepared_version` other than its version, and
 no `prepare` task open or settled (adopted, clean or failed) at that version gets one `prepare`
-task: `base` and `tip` are the batch's, `onto` is `base`, diagnostics are empty. This happens whether
+task: `base` and `tip` are the batch's, `onto` is `base`, diagnostics are empty. A sealed successor
+bypasses both size and quiet gates; its preparation is preferred over other own-base preparations. This happens whether
 or not the head has a task of its own, since the long head repairs are when the batch would
 otherwise sit idle. `claim_task` offers it after every head task nobody holds, one claim per batch,
 within `repair_concurrency` claims in total and at most `repair_concurrency - 1` background claims
@@ -185,8 +202,8 @@ be `open`: the member commits, provenance and explanations are adopted, the vers
 batch stays open and `prepared_version` becomes the new version. A worker whose build is green
 releases the task as `prepared_clean`, which records the current version as prepared; a release as
 `agent_failed` or `push_failed` resolves the task as `failed` and it is not offered again at that
-version. An insertion after preparation advances the version, so the batch is prepared again (as a
-whole) once it is quiet. A green background build is never a verdict: the head's CI round, after
+version. For an unsealed batch, an insertion after preparation advances the version, so the batch
+is prepared again (as a whole) once it is quiet. A sealed successor stays closed to insertions. A green background build is never a verdict: the head's CI round, after
 the rebase onto the canonical commit of that time, remains the only one.
 
 One background task per batch: `prepare` and `pre_rebase` (`BACKGROUND_TASKS`) are never open
@@ -434,8 +451,10 @@ and reported in status:
 | setting | initial | meaning |
 | --- | --- | --- |
 | `insertion_age_window` | 16 | size of the age window the draw is taken from |
-| `open_batch_limit` | 2 | open batches at most; an input conflicting with the first is assembled into the next (1 restores increment 1) |
-| `repair_concurrency` | 1 | live task claims in total; background tasks hold at most one fewer, so 1 allows no background claims |
+| `open_batch_limit` | 2 | unsealed batches at most; the sealed successor does not consume this capacity |
+| `sealed_successor_min_members` | 100 | seal oldest unsealed batches at this size until two active batches are sealed in total, including the head; 0 disables new successor sealing |
+| `repair_concurrency` | 1 | maximum live task claims in total; background tasks hold at most one fewer, so 1 allows no background claims |
+| `background_start_limit` | 2 | a non-head task may start only while the total live claim count is below this limit; with repair concurrency 3, only a head task can increase the total from two to three |
 | `stall_interval_seconds` | 900 | build silence after which status raises a stall |
 | `publication_enabled` | false | shadow mode when false: no dispatch, promotion, comment, label, close or ref push; status says what would happen |
 | `claim_ttl_seconds` | 900 | claim lifetime between renewals |
@@ -494,8 +513,11 @@ predicate, repository admin permission (`security_audit.require_admin`), checked
   offered within `repair_concurrency` live task claims in total, in two tiers, each by kind
   priority then age: a head `repair` or `rebase_conflict` task nobody holds; then an open batch's
   background task (`pre_rebase` (above), then `prepare` (above)) on a batch where no worker holds
-  one, while background claims number fewer than `repair_concurrency - 1`, so one slot is always
-  free for head work and with `repair_concurrency` 1 nothing runs in the background.
+  one, while background claims number fewer than `repair_concurrency - 1` and total live claims
+  number fewer than `background_start_limit`. With limits 3 and 2, two background tasks may run;
+  an available head task can take the third slot. A head plus one background task already uses
+  two slots, so another background task cannot start. Head work has first claim priority, and
+  existing work keeps its lease. With `repair_concurrency` 1 nothing runs in the background.
   A task has one live owner. A spare worker waits when no distinct task is claimable; it never
   races another worker on the head. Expiry or release permits a replacement owner.
   A refusal because the total is reached while a head task waits counts in `claim_collisions`.
@@ -554,7 +576,9 @@ and `pre_rebase` (null, or `state`, `onto`, `tip`, `source`, `at`, `current`, `e
 `prepare_blocked`, why an unprepared chain has no task); and `background`, `active` (null, or the
 open background task's `kind`, `task_id`, whether it is `claimed` and, for `prepare`, the `chain` it
 prepares, `own_base` or `pre_rebased`) and `waiting` (null, or the other `kind` and the `reason` it waits);
-`open_batch` carries the same preparation and `pre_rebase` fields); `head` (the same plus `sealed_at`,
+`open_batch` carries the same preparation and `pre_rebase` fields; both forms include `sealed`
+and `sealed_at`, and retain the successor for compatibility); `sealed_successor` (null or the first sealed
+non-head batch summary; `open_batches` includes every sealed non-head batch); `head` (the same plus `sealed_at`,
 `expected_parent`, `based_on_canonical`, `stage` in `rebase`, `rebase_conflict`, `dispatch`, `ci`,
 `repair`, `infrastructure`, `promote`, the open `task`, and `ci` with dispatch id, run id and
 attempt, status, conclusion, timestamps, runner, labels, host, phases with timestamps, last progress,
@@ -643,3 +667,8 @@ is F `PreRebase` (made once the head is dispatched, held while it has a task, re
 used by the seal with no replay; a conflict task with cross-batch ripples resolved by the agent and
 sealed from; a head tip change superseding an open task) and C `PreRebase` (never before the head's
 chain is submitted, never while it has a task, discarded by a rebuild, the setting).
+
+Successor sealing and handoff are exercised against real Git chains in
+`tests/queue_sealed_successor.py`: oldest-first selection, the size boundary, immediate preparation,
+continued admissions before/after preparation, claim preservation, restart/expiry recovery,
+pre-rebase reuse, successor replenishment and fresh authoritative CI after promotion.

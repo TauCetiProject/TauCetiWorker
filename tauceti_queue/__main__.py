@@ -17,14 +17,16 @@
         `publication_enabled`) it reads the store without writing and shows the effective value:
         the store's, with the actor that wrote it, or the file's while the store has none.
     tauceti-queue settings show [--url URL]
-    tauceti-queue settings set KEY VALUE [--url URL] [--token TOKEN]
+    tauceti-queue settings [--url URL] set KEY VALUE [--token TOKEN | --token-file FILE]
         Read or change the runtime controls through the service's admin endpoint. KEY is any key of
         the controller's `DEFAULT_SETTINGS`; VALUE is parsed by the type of that key's initial value
         (a non-negative integer, at least 1 for the `[settings]` keys of the configuration file,
         `true`/`false`, or text). The command posts `{"KEY": VALUE}` to `/admin/settings`, whose body
         is one JSON object of setting keys to values. The token is the operator's GitHub token
         (`--token`, `GITHUB_TOKEN`, or `gh auth token`); the service checks repository-admin
-        permission with the same predicate as the security audit.
+        permission with the same predicate as the security audit. `--token-file` instead reads a
+        private dedicated bearer, requires an explicit queue origin and refuses redirects. Native
+        controls still require source-bound enrollment and current source admin permission.
     tauceti-queue import-bors --feed URL|FILE [--candidates URL|FILE ...] [--dry-run] [--release-head]
         The cutover import (`tauceti_queue.bors_import`): read Bors's observation feed and candidate
         journals, post them to the service's `/admin/import-bors` endpoint, print what was (or, with
@@ -53,6 +55,8 @@ import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
+from functools import partial
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -84,7 +88,7 @@ def _optional(module: str) -> ModuleType | None:
 class Service:
     """The wired process: configuration, runtime facts, and whichever components are installed."""
 
-    def __init__(self, config: Config, runtime: rt.ServiceRuntime) -> None:
+    def __init__(self, config: Config, runtime: rt.ServiceRuntime, *, native=None) -> None:
         self.config = config
         self.runtime = runtime
         self.stop = rt.StopSignal()
@@ -96,11 +100,44 @@ class Service:
         self.poller: Any = None
         self.loop_module: ModuleType | None = None
         self.unavailable_reason: str | None = None
+        self.native = native
+        self.native_http = None
+        self._native_store_lock = None
+        self._native_listener = None
+        if native is not None:
+            from .native_bootstrap import NativeBootstrap
+
+            if not isinstance(native, NativeBootstrap):
+                raise ValueError("native service requires an explicit trusted bootstrap")
 
     # Stream E and F integration points. Each is a small function so reconciling an interface
     # change is one edit here.
 
     def open_store(self) -> None:
+        if self.native is not None:
+            # Reserve the existing store before a constructor can commit any
+            # binding or publisher rotation. Two native services must not share
+            # a writable queue, even if they listen on different ports.
+            import fcntl
+            import stat
+
+            database = self.config.database.resolve()
+            database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(str(database) + ".native-service.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            try:
+                info = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o077
+                    or info.st_nlink != 1
+                ):
+                    raise ValueError("native service lock must be an owned private regular file")
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BaseException:
+                os.close(fd)
+                raise
+            self._native_store_lock = fd
         module = _optional("store")
         if module is None:
             self.unavailable_reason = "tauceti_queue.store is not installed"
@@ -108,8 +145,14 @@ class Service:
         self.config.database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         opener = getattr(module, "open", None) or module.Store
         self.store = opener(self.config.database)
+        if self.store.get_setting("queue:operating-mode") == "stage1-operator":
+            self.store.close()
+            self.store = None
+            raise ValueError("Stage 1 operator ledger cannot be opened by the queue service")
 
     def open_github(self) -> None:
+        if self.native is not None:
+            return  # execution credentials were explicitly supplied by the trusted bootstrap
         app_module, adapter_module = _optional("github_app"), _optional("github_adapter")
         if app_module is None or adapter_module is None:
             self.unavailable_reason = (
@@ -125,6 +168,30 @@ class Service:
         self.github = adapter_module.GitHubAdapter(app, self.config.repository, clone_dir=self.config.content_clone)
 
     def build_controller(self) -> None:
+        if self.native is not None:
+            if self.store is None:
+                raise ValueError("native service requires its existing durable queue store")
+            import socket
+
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind((self.config.listen_host, self.config.listen_port))
+                listener.listen()
+                wired = self.native.build(self.config, self.store, revision=self.runtime.revision.sha)
+            except BaseException:
+                listener.close()
+                raise
+            self._native_listener = listener
+            self.github, self.controller, self.poller, self.native_http = (
+                wired.source,
+                wired.controller,
+                wired.poller,
+                wired.http,
+            )
+            self.native_http.prebound_socket = listener
+            self.loop_module = _optional("loop")
+            return
         module = _optional("controller")
         if module is None or self.store is None or self.github is None:
             self.unavailable_reason = self.unavailable_reason or "tauceti_queue.controller is not installed"
@@ -184,9 +251,20 @@ class Service:
         controller_status = None
         if self.controller is not None:
             controller_status = self.controller.status() if wait is None else self.controller.status(wait=wait)
-        return rt.status_document(
+        document = rt.status_document(
             self.runtime, self.config.settings.as_dict(), controller_status, self.unavailable_reason
         )
+        if self.native is not None:
+            policy = self.native.execution_policy
+            document["service"].update(
+                source_repository=policy.source.record(),
+                execution_repository=policy.execution.record(),
+                workflow_revision=self.native.workflow_revision,
+            )
+            # Compatibility feeds use the GitHub ID namespace and are refused
+            # by the native server until qualified feeds are implemented.
+            document["feeds"] = None
+        return document
 
     def effective_settings(self) -> dict[str, int]:
         if self.controller is not None:
@@ -198,7 +276,7 @@ class Service:
         if module is not None and self.controller is not None:
             self.server = module.create_server(
                 self.controller,
-                self.config,
+                self.native_http if self.native_http is not None else self.config,
                 status=self.status_document,
                 adapter=self.github,
                 app=self.app,
@@ -237,6 +315,12 @@ class Service:
                 close()
         if self.store is not None:
             self.store.close()
+        if self._native_listener is not None:
+            self._native_listener.close()
+            self._native_listener = None
+        if self._native_store_lock is not None:
+            os.close(self._native_store_lock)
+            self._native_store_lock = None
 
 
 def _install_signal_handlers(stop: rt.StopSignal) -> None:
@@ -248,8 +332,15 @@ def _install_signal_handlers(stop: rt.StopSignal) -> None:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    config = configuration.load(args.config)
-    problems = configuration.validate(config)
+    launch = None
+    if getattr(args, "native_launch", None):
+        from .native_launch import NativeLaunch
+
+        launch = NativeLaunch.load(args.native_launch)
+        config = launch.config
+    else:
+        config = configuration.load(args.config)
+    problems = configuration.validate(config, check_credentials=launch is None)
     if problems:
         for problem in problems:
             _log(f"configuration problem: {problem}")
@@ -259,23 +350,38 @@ def cmd_serve(args: argparse.Namespace) -> int:
         config.sources["canonical_branch"] = "discovered"
     config.log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     runtime = rt.ServiceRuntime.start(config)
-    service = Service(config, runtime)
+    service = Service(config, runtime, native=launch.bootstrap) if launch else Service(config, runtime)
     _install_signal_handlers(service.stop)
     _log(
         f"revision {runtime.revision.sha}{' (dirty)' if runtime.revision.dirty else ''} "
         f"({runtime.revision.source}) started {runtime.started_at} on {config.host}; "
         f"{config.repository}@{config.canonical_branch}; mode {config.mode}"
     )
-    service.open_store()
-    service.open_github()
-    service.build_controller()
-    service.seed_settings()
-    if service.controller is None:
-        _log(f"controller unavailable: {service.unavailable_reason}; serving status only")
-    service.start_server()
-    _log(f"listening on {config.listen_url} (public {config.public_url})")
     try:
+        service.open_store()
+        service.open_github()
+        service.build_controller()
+        service.seed_settings()
+        if service.controller is None:
+            _log(f"controller unavailable: {service.unavailable_reason}; serving status only")
+        service.start_server()
+        _log(f"listening on {config.listen_url} (public {config.public_url})")
         service.run_loop()
+    except Exception as error:
+        if launch is None:
+            raise
+        from .control_policy_file import ControlPolicyError
+        from .source_authority import SourceAccessDenied, SourceAuthorityUnavailable
+
+        detail = type(error).__name__
+        if isinstance(error, SourceAccessDenied | SourceAuthorityUnavailable | ControlPolicyError):
+            detail = str(error)  # These exceptions contain fixed local diagnostics.
+        elif isinstance(error, OSError):
+            import errno
+
+            detail = errno.errorcode.get(error.errno, "OSError")
+        _log(f"native queue startup/runtime failed ({detail})")
+        return 1
     finally:
         _log(f"stopping ({service.stop.reason or 'loop ended'})")
         service.shutdown()
@@ -286,8 +392,19 @@ def cmd_serve(args: argparse.Namespace) -> int:
 # --- status ----------------------------------------------------------------------------------------
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def fetch_json(
-    url: str, timeout: float = 10, method: str = "GET", body: Any = None, token: str | None = None
+    url: str,
+    timeout: float = 10,
+    method: str = "GET",
+    body: Any = None,
+    token: str | None = None,
+    *,
+    allow_redirects: bool = True,
 ) -> dict[str, Any]:
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(url, data=data, method=method)
@@ -297,9 +414,15 @@ def fetch_json(
     if token:
         request.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        opener = urllib.request.urlopen
+        if not allow_redirects:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect()).open
+        with opener(request, timeout=timeout) as response:
             return json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
+        if not allow_redirects:
+            exc.close()
+            raise RuntimeError(f"operator request failed (HTTP {exc.code})") from None
         with exc:
             detail = exc.read().decode(errors="replace")
         try:
@@ -309,6 +432,10 @@ def fetch_json(
         raise RuntimeError(
             f"{method} {url}: HTTP {exc.code}: {parsed.get('detail') or parsed.get('error') or detail}"
         ) from None
+    except (OSError, ValueError):
+        if allow_redirects:
+            raise
+        raise RuntimeError("operator request unavailable or returned invalid JSON") from None
 
 
 def _status_url(args: argparse.Namespace) -> str:
@@ -352,27 +479,40 @@ def _stored_settings(config: Config) -> dict[str, dict[str, Any]] | None:
 
 
 def cmd_check_config(args: argparse.Namespace) -> int:
+    launch = None
     try:
-        config = configuration.load(args.config)
+        if getattr(args, "native_launch", None):
+            from .native_launch import NativeLaunch
+
+            launch = NativeLaunch.load(args.native_launch)
+            config = launch.config
+        else:
+            config = configuration.load(args.config)
     except ConfigError as exc:
         _log(str(exc))
         return 1
-    problems = configuration.validate(config)
+    problems = configuration.validate(config, check_credentials=launch is None)
     stored = _stored_settings(config)
+    values = config.as_dict()
+    if launch:
+        values["webhook_url"] = config.public_url.rstrip("/") + "/webhook/forgejo"
+        values.pop("review_app_id", None)
+        values["sources"].pop("review_app_id", None)
     if args.print:
-        values = config.as_dict()
         if args.print not in values:
             _log(f"unknown key {args.print!r}; known: {', '.join(sorted(values))}")
             return 1
         value = values[args.print]
         print(json.dumps(value) if isinstance(value, dict | list | bool) or value is None else value)
         return 0
-    if args.json:
+    if args.json or launch:
         document = {
-            **config.as_dict(),
+            **values,
             "effective_settings": configuration.effective_runtime_settings(config, stored),
             "problems": problems,
         }
+        if launch:
+            document["native"] = launch.summary()
         print(json.dumps(document, indent=2, sort_keys=True))
     else:
         print(configuration.format_effective(config, problems, stored))
@@ -382,7 +522,19 @@ def cmd_check_config(args: argparse.Namespace) -> int:
 # --- settings --------------------------------------------------------------------------------------
 
 
-def _operator_token(explicit: str | None) -> str:
+def _operator_token(explicit: str | None, token_file: Path | None = None) -> str:
+    if token_file is not None:
+        from .control_policy_file import ControlPolicyError, read_control_policy
+
+        try:
+            token = read_control_policy(token_file).strip()
+            if not 0 < len(token) <= 4096 or any(not 33 <= char <= 126 for char in token):
+                raise ValueError
+            return token.decode("ascii")
+        except ControlPolicyError as error:
+            raise RuntimeError(str(error)) from None
+        except ValueError:
+            raise RuntimeError("operator token file is unavailable or invalid") from None
     if explicit:
         return explicit
     if os.environ.get("GITHUB_TOKEN"):
@@ -392,6 +544,21 @@ def _operator_token(explicit: str | None) -> str:
     except (OSError, subprocess.SubprocessError):
         raise RuntimeError("no GitHub token: pass --token, set GITHUB_TOKEN, or log in with gh") from None
     return token.strip()
+
+
+def _operator_target(args, fetch):
+    """File credentials require an explicit origin and never follow redirects."""
+    if getattr(args, "token_file", None) is not None:
+        from tauceti_tools.forge import Forge
+
+        try:
+            if not args.url:
+                raise ValueError
+            origin = Forge("forgejo", args.url).url
+        except ValueError:
+            raise RuntimeError("--token-file requires an explicit HTTPS --url (HTTP allowed on loopback)") from None
+        return origin, partial(fetch, allow_redirects=False)
+    return _status_url(args), fetch
 
 
 def settable_settings() -> dict[str, Any]:
@@ -430,8 +597,8 @@ def parse_setting_value(key: str, raw: str) -> Any:
 
 
 def cmd_settings(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = fetch_json) -> int:
-    base = _status_url(args)
     try:
+        base, fetch = _operator_target(args, fetch)
         if args.action == "show":
             document = fetch(base + "/settings")
             print(json.dumps(document, indent=2, sort_keys=True))
@@ -446,7 +613,10 @@ def cmd_settings(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] 
             _log(str(exc))
             return 1
         document = fetch(
-            base + "/admin/settings", method="POST", body={args.key: value}, token=_operator_token(args.token)
+            base + "/admin/settings",
+            method="POST",
+            body={args.key: value},
+            token=_operator_token(args.token, getattr(args, "token_file", None)),
         )
         print(json.dumps(document, indent=2, sort_keys=True))
         return 0
@@ -461,7 +631,11 @@ def cmd_settings(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] 
 def cmd_import_bors(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = fetch_json) -> int:
     from . import bors_import
 
-    base = _status_url(args)
+    try:
+        base, fetch = _operator_target(args, fetch)
+    except RuntimeError as exc:
+        _log(str(exc))
+        return 1
     try:
         observation = bors_import.load_document(args.feed)
         candidates = [bors_import.reduce_candidates(bors_import.load_document(spec)) for spec in args.candidates or []]
@@ -476,7 +650,11 @@ def cmd_import_bors(args: argparse.Namespace, fetch: Callable[..., dict[str, Any
     }
     try:
         report = fetch(
-            base + "/admin/import-bors", method="POST", body=body, token=_operator_token(args.token), timeout=3600
+            base + "/admin/import-bors",
+            method="POST",
+            body=body,
+            token=_operator_token(args.token, getattr(args, "token_file", None)),
+            timeout=3600,
         )
     except RuntimeError as exc:
         _log(str(exc))
@@ -489,10 +667,14 @@ def cmd_import_bors(args: argparse.Namespace, fetch: Callable[..., dict[str, Any
 
 
 def cmd_reconcile_approvals(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = fetch_json) -> int:
-    base = _status_url(args)
     try:
+        base, fetch = _operator_target(args, fetch)
         summary = fetch(
-            base + "/admin/reconcile-approvals", method="POST", body={}, token=_operator_token(args.token), timeout=3600
+            base + "/admin/reconcile-approvals",
+            method="POST",
+            body={},
+            token=_operator_token(args.token, getattr(args, "token_file", None)),
+            timeout=3600,
         )
     except RuntimeError as exc:
         _log(str(exc))
@@ -509,9 +691,11 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     serve = commands.add_parser("serve", help="run the service")
-    serve.add_argument(
+    serve_source = serve.add_mutually_exclusive_group()
+    serve_source.add_argument(
         "--config", help=f"TOML file (default ${configuration.CONFIG_ENV} or {configuration.DEFAULT_CONFIG_PATH})"
     )
+    serve_source.add_argument("--native-launch", type=Path, help="explicit private Forgejo launch profile")
 
     status = commands.add_parser("status", help="print the status document or its summary")
     status.add_argument("--url", help="service base URL (default: the configured listen address)")
@@ -521,7 +705,9 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--expect-revision", help="exit 2 unless the running revision starts with this SHA")
 
     check = commands.add_parser("check-config", help="print the effective configuration and its problems")
-    check.add_argument("--config", help="TOML file")
+    check_source = check.add_mutually_exclusive_group()
+    check_source.add_argument("--config", help="TOML file")
+    check_source.add_argument("--native-launch", type=Path, help="validate an explicit private Forgejo launch profile")
     check.add_argument("--json", action="store_true")
     check.add_argument("--print", metavar="KEY", help="print one effective value and nothing else")
 
@@ -538,7 +724,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     setter.add_argument("key", choices=sorted(settable_settings()), metavar="KEY", help="the setting to change")
     setter.add_argument("value", metavar="VALUE", help="the new value")
-    setter.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+    setter_token = setter.add_mutually_exclusive_group()
+    setter_token.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+    setter_token.add_argument(
+        "--token-file", type=Path, help="private operator bearer file; requires explicit --url; no credential discovery"
+    )
 
     importer = commands.add_parser("import-bors", help="import Bors's approved PRs and running head at the cutover")
     importer.add_argument("--feed", required=True, help="Bors's observation feed (active-batches): a URL or a file")
@@ -556,13 +746,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     importer.add_argument("--url", help="service base URL (default: the configured listen address)")
     importer.add_argument("--config", help="configuration file used to find the listen address")
-    importer.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+    importer_token = importer.add_mutually_exclusive_group()
+    importer_token.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+    importer_token.add_argument(
+        "--token-file", type=Path, help="private operator bearer file; requires explicit --url; no credential discovery"
+    )
     importer.add_argument("--json", action="store_true", help="print the full report instead of the summary")
 
     reconcile = commands.add_parser("reconcile-approvals", help="run one approval reconciliation pass now")
     reconcile.add_argument("--url", help="service base URL (default: the configured listen address)")
     reconcile.add_argument("--config", help="configuration file used to find the listen address")
-    reconcile.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+    reconcile_token = reconcile.add_mutually_exclusive_group()
+    reconcile_token.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+    reconcile_token.add_argument(
+        "--token-file", type=Path, help="private operator bearer file; requires explicit --url; no credential discovery"
+    )
     return parser
 
 

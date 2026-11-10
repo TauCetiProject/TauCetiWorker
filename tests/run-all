@@ -60,9 +60,12 @@ RUN_STDLIB=(
   budget_recovery.py
   usage_accounting.py
   usage_supervisor.py
+  worker_sizing.py
   queue_repair_experiment.py
   queue_repair_task.py
   queue_repair_locks.py
+  queue_repair_cleanup.py
+  queue_repair_cache.py
   queue_claude_stdin.py
   expanded_cache.py
   cache_storage.py
@@ -157,12 +160,26 @@ RUN_STDLIB=(
   queue_eligibility.py
   queue_diagnostics.py
   queue_controller.py
+  queue_sealed_successor.py
+  queue_head_capacity.py
+  queue_webhook_load.py
   queue_execution.py
   queue_ci_requests.py
+  queue_forgejo_git.py
+  queue_forgejo_source.py
   queue_ci_execution.py
+  queue_workflow_token.py
   queue_source_ci.py
+  queue_stage1.py
+  queue_stage1_mirror.py
   queue_source_authority.py
   queue_task_identity.py
+  queue_task_transport.py
+  queue_control_policy_file.py
+  queue_native_bootstrap.py
+  queue_native_launch.py
+  queue_operator_token.py
+  queue_forgejo_webhook.py
   queue_monitoring.py
   queue_task_progress.py
   queue_monitoring_protocol.py
@@ -170,6 +187,7 @@ RUN_STDLIB=(
   queue_admission_planning.py
   queue_fixture.py
   queue_store.py
+  queue_statistics.py
   queue_admission_state.py
   queue_admission.py
   queue_admission_adapter.py
@@ -234,12 +252,12 @@ RUN_SH=(docker_entrypoint.sh lifecycle.sh)
 # Deliberate manual checks: egress needs the bubble sandbox/proxy; the cross-repo
 # repair fixture needs Lean, Elixir and a bors checkout (see its module docstring).
 # The source-read fixture starts a disposable Forgejo given FORGEJO_BINARY.
-SKIP=(egress.sh integration_repair_fixture.py integration_forgejo_reads.py)
+SKIP=(egress.sh integration_repair_fixture.py integration_forgejo_reads.py integration_forgejo_git.py integration_forgejo_source.py integration_forgejo_bootstrap.py integration_forgejo_native_launch.py)
 
 # Modules whose storage fixtures compare inode/device identity and sweep real directories. They
 # failed on Namespace runners' filesystem (#409) and run on GitHub's native ubuntu-24.04 image in
 # CI; everything else is the `portable` group and runs anywhere.
-NATIVE_FS=(cache_storage.py shared_mathlib.py verification_storage.py retention.py)
+NATIVE_FS=(queue_repair_cache.py cache_storage.py shared_mathlib.py verification_storage.py retention.py)
 # Modules that read README.md, docs/*.md or workers.toml.example and assert on their contents. A
 # change that touches only documentation can break these and nothing else, so CI runs just this
 # group for it. The guard below keeps the list honest.

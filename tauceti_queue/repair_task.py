@@ -74,6 +74,7 @@ from tauceti_queue import (
     repair_publish,
     repair_sandbox,
     repair_stream,
+    task_transport,
 )
 from tauceti_queue.repair import PromptContext, checkout_worktree, git, read_chain
 from tauceti_queue.task_identity import (
@@ -144,6 +145,10 @@ def log(message: str) -> None:
 
 class ServiceError(Exception):
     """The service could not be reached or answered 5xx; the call may be retried."""
+
+
+class NativeTaskDeliveryUncertain(ServiceError):
+    """A native POST may have committed; reconcile it instead of resending."""
 
 
 class ClaimRefused(Exception):
@@ -361,8 +366,14 @@ class TaskClient:
         if binding is not None and not isinstance(binding, TaskBinding):
             raise ValueError("a trusted qualified task binding is required")
         self.binding = binding
-        self._opener = None
         if binding is not None:
+            task_transport.check_timeout(timeout)
+            if (
+                not isinstance(worker, str)
+                or not 0 < len(worker) <= 256
+                or not all(33 <= ord(c) <= 126 for c in worker)
+            ):
+                raise ValueError("native task worker must be a bounded printable ASCII header value")
             url = urllib.parse.urlsplit(self.service)
             _ = url.port  # Validate malformed ports before constructing a credential-bearing request.
             if (
@@ -376,10 +387,6 @@ class TaskClient:
                 raise ValueError("native task service requires HTTPS or an explicit loopback fixture")
             if not isinstance(token, str) or not 0 < len(token) <= 4096 or not all(33 <= ord(c) <= 126 for c in token):
                 raise ValueError("an explicit native queue bearer is required")
-            handlers = [_NoTaskRedirect()]
-            if url.hostname in {"127.0.0.1", "::1", "localhost"}:
-                handlers.insert(0, urllib.request.ProxyHandler({}))
-            self._opener = urllib.request.build_opener(*handlers)
 
     def _require_task(self, task):
         if getattr(task, "binding", None) != self.binding:
@@ -402,10 +409,17 @@ class TaskClient:
             },
         )
         try:
-            open_request = self._opener.open if self._opener is not None else urllib.request.urlopen
-            with open_request(request, timeout=self.timeout) as response:
-                status = response.status
-                payload = response.read(16 * 1024 * 1024 + 1) if self.binding is not None else response.read()
+            if self.binding is not None:
+                status, payload = task_transport.post(
+                    request.full_url, data, dict(request.header_items()), timeout=self.timeout
+                )
+            else:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    status = response.status
+                    payload = response.read()
+        except task_transport.TaskTransportError as error:
+            failure = NativeTaskDeliveryUncertain if error.delivery_uncertain else ServiceError
+            raise failure(f"{path}: {error}") from None
         except urllib.error.HTTPError as error:
             status = error.code
             with error:
@@ -424,12 +438,16 @@ class TaskClient:
                 else:
                     parsed = json.loads(payload)
             except ValueError as error:
+                if self.binding is not None:
+                    raise NativeTaskDeliveryUncertain(f"{path}: response is not JSON; delivery is uncertain") from None
                 if status >= 500:
                     raise ServiceError(f"{path}: HTTP {status}") from error
                 raise ServiceError(f"{path}: response is not JSON") from error
         if status >= 400 and _claim_code(parsed):
             raise ClaimRefused(f"{path}: HTTP {status} {_claim_code(parsed)}: {_error_text(parsed)}".strip())
         if status >= 500:
+            if self.binding is not None:
+                raise NativeTaskDeliveryUncertain(f"{path}: HTTP {status}; delivery is uncertain")
             raise ServiceError(f"{path}: HTTP {status} {_error_text(parsed)}".strip())
         return status, parsed
 
@@ -440,6 +458,10 @@ class TaskClient:
         if status in (401, 403):
             raise ClaimRefused(f"claim refused: HTTP {status} {_error_text(payload)}".strip())
         if status != 200 or not isinstance(payload, dict):
+            if self.binding is not None:
+                raise NativeTaskDeliveryUncertain(
+                    f"claim: unexpected HTTP {status} or native response; delivery is uncertain"
+                )
             raise ServiceError(f"claim: unexpected HTTP {status} {_error_text(payload)}".strip())
         try:
             task = Task.from_json(payload)
@@ -448,7 +470,7 @@ class TaskClient:
         except (TypeError, ValueError, KeyError):
             if self.binding is None:
                 raise
-            raise ServiceError("claim: invalid native task record") from None
+            raise NativeTaskDeliveryUncertain("claim: invalid native task record; delivery is uncertain") from None
         self._require_task(task)
         return task
 
@@ -547,6 +569,8 @@ def with_retries(call, *, attempts: int, delays: tuple[float, ...], what: str):
     for index in range(attempts):
         try:
             return call()
+        except NativeTaskDeliveryUncertain:
+            raise
         except ServiceError as error:
             last = error
             log(f"{what}: {error} (attempt {index + 1}/{attempts})")
@@ -1053,6 +1077,37 @@ def task_findings(task: Task) -> dict:
     return repair.findings_from_diagnostics(task.diagnostics)
 
 
+def known_check_failures(task: Task) -> bool:
+    """An audit/lint repair already has located findings for its frozen candidate.
+
+    Compiler failures still use discovery to collect independent failures. Predictions,
+    generic failed statuses and unlocated check messages are not actionable evidence.
+    This selects when inference starts; it never substitutes for final verification.
+    """
+    if task.kind != "repair":
+        return False
+    findings = task_findings(task)
+    if findings["compiler_errors"]:
+        return False
+
+    def located(value):
+        return isinstance(value, str) and (
+            value.startswith("TauCeti.") or value.startswith("TauCeti/") and value.endswith(".lean")
+        )
+
+    return (
+        any(located(f.get("path")) and f.get("declaration") for f in findings["lint"]["findings"])
+        or any(f.get("declaration") and f.get("modules") for f in findings["duplicate_declarations"])
+        or any(located(f.get("module")) and f.get("declaration") for f in findings["import_collisions"])
+        or any(
+            repair.DIAGNOSTIC_KINDS.get(f.get("kind")) == "audit"
+            and located(f.get("module"))
+            and f.get("message", "").strip()
+            for f in findings.get("other", [])
+        )
+    )
+
+
 def scope_only_repair(task: Task) -> bool:
     """A trusted scope-policy finding is not evidence that Lean needs an edit.
 
@@ -1189,6 +1244,7 @@ def prompt_context(
     artifacts: dict | None = None,
     listings: Path | None = None,
     shell_limit: int = repair.SHELL_LIMIT_SECONDS,
+    worker_verifies: bool = False,
 ) -> PromptContext:
     """``artifacts`` is the ``prepare_artifacts`` record (the prompt says when the build is cold);
     ``listings`` is where the member listings and the check script go (``repair.listings_path``);
@@ -1226,6 +1282,8 @@ def prompt_context(
         ],
         artifacts_cold=cold,
         artifacts_reason=(artifacts or {}).get("unavailable_reason") if cold else None,
+        check_findings_known=known_check_failures(task),
+        worker_verifies=worker_verifies and not cold and task.kind in ("repair", "prepare"),
         listings_path=listings,
         shell_limit=shell_limit,
         pre_rebased=pre_rebased(task) is not None,
@@ -1802,6 +1860,26 @@ def run_task(
     resume_state: TaskState | None = None,
     stop: Stop | None = None,
 ) -> dict:
+    from tauceti_queue.repair_cache import before_task, cache_lease, task_cache
+    from tauceti_queue.repair_cleanup import worktree_lease
+
+    require_task_execution(cfg=cfg, task=task)
+    cache_root = task_cache(cfg.root, task.task_id)
+    cache_cleanup = before_task(cache_root)
+    if cache_cleanup["state"] != "busy":
+        log(f"repair cache retention: {json.dumps(cache_cleanup, sort_keys=True)}")
+    with cache_lease(cache_root), worktree_lease(cfg.root, task.task_id):
+        return _run_task(cfg, task, client, resume_state=resume_state, stop=stop)
+
+
+def _run_task(
+    cfg: RunnerConfig,
+    task: Task,
+    client: TaskClient,
+    *,
+    resume_state: TaskState | None = None,
+    stop: Stop | None = None,
+) -> dict:
     """Run one claimed task to its outcome. The claim is renewed throughout and the result discarded
     if it is lost. Returns the outcome record (also written to the task's state directory).
 
@@ -1825,7 +1903,12 @@ def run_task(
     state.progress_outcome = outcome
     # A ``prepare`` task always streams: the streaming build is how it learns whether there is anything
     # to repair at all (the batch has not been tried, so the task carries no diagnostics).
-    streaming = (task.kind == "prepare" or (cfg.stream_repair and task.kind == "repair")) and not resuming
+    known_checks = known_check_failures(task)
+    streaming = (
+        task.kind == "prepare" or (cfg.stream_repair and task.kind == "repair" and not known_checks)
+    ) and not resuming
+    if known_checks:
+        outcome["pre_repair_discovery"] = "skipped: task already supplies located audit/lint findings"
     stream: repair_stream.StreamingBuild | None = None
     started = time.monotonic()
 
@@ -1845,6 +1928,10 @@ def run_task(
         the record says so and nothing starts."""
         if cfg.publish.when == "before":
             return
+        early = repair_publish.early_record(logdir, revision, cfg.publish)
+        if early:
+            outcome["publish"] = {**early, "early": True}
+            return  # frozen outputs do not need the live worktree kept alive
         record = repair_publish.start_background(
             worktree,
             revision,
@@ -1889,7 +1976,9 @@ def run_task(
         state.write("claimed", worker=cfg.worker, service=cfg.service, resumed=resuming)
         if task.repository != cfg.repository:
             verify_admin(task.repository)
-        env_lake = repair.lake_env(cfg.root)
+        from tauceti_queue.repair_cache import task_cache
+
+        env_lake = repair.lake_env(cfg.root, cache_root=task_cache(cfg.root, task.task_id))
         repair_publish.configure(env_lake, cfg.publish)
         if not resuming:
             try:
@@ -1922,7 +2011,7 @@ def run_task(
                 lake=cfg.lake,
                 preferred=repair_publish.preferred(cfg.publish, task),
                 warm=repair_publish.warm(cfg.publish, task),
-                build=not streaming and task.kind not in repair.REBASE_KINDS,
+                build=not streaming and not known_checks and task.kind not in repair.REBASE_KINDS,
             )
             if artifacts.get("warm_attempts"):
                 warmed = artifacts.get("warmed_from") or []
@@ -1944,6 +2033,8 @@ def run_task(
                 }
             }
             state.write("artifacts_ready" if artifacts["available"] else "artifacts_unavailable", artifacts=artifacts)
+            if known_checks:
+                log(f"task {task.task_id}: using the task's audit/lint findings; verification follows the repair")
             if stopping() and not lease.lost.is_set():
                 return cancelled("the worker stopped while the artifacts were prepared")
             if not artifacts["available"]:
@@ -1980,9 +2071,17 @@ def run_task(
         )
         outcome["repair_context"] = ownership.summary()
         tools_root = cfg.root / repair_audit.TOOLS_DIR
+        repair_publish.write_early_settings(
+            worktree,
+            settings=cfg.publish,
+            logdir=logdir,
+            task_id=task.task_id,
+            repository=task.repository,
+            lake=tuple(cfg.lake),
+        )
         if cfg.worker_audits:
             repair_audit.write_settings(
-                worktree, base=task.validation_base, tools_root=tools_root, lake=tuple(cfg.lake)
+                worktree, base=task.validation_base, tools_root=tools_root, lake=tuple(cfg.lake), logdir=logdir
             )
         if streaming and (outcome.get("artifacts") or {}).get("available"):
             stream = repair_stream.start_build(
@@ -2093,11 +2192,16 @@ def run_task(
                     artifacts=outcome.get("artifacts") or state.record.get("artifacts"),
                     listings=repair.listings_path(worktree),
                     shell_limit=int(cfg.shell_limit),
+                    worker_verifies=cfg.worker_audits,
                 )
                 context.repair_context = ownership
+                if context.worker_verifies:
+                    from tauceti_queue import repair_targeted
+
+                    repair_targeted.write(worktree / repair.LISTINGS_DIR, candidate=task.tip, findings=findings)
                 prompt = repair.compose_prompt(context, findings, chain_before, cfg.clone)
                 if stream is not None:
-                    prompt = stream.annotate(prompt)
+                    prompt = stream.annotate(prompt, worker_verifies=context.worker_verifies)
                 if resume_session:
                     prompt = (
                         "The worker running this task was interrupted and has resumed your session; the worktree is "

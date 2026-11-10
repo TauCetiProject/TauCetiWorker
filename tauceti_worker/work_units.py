@@ -105,7 +105,9 @@ from .survey import (
     Candidate,
     Counters,
     Survey,
+    bump_prs,
     bust_progress_cache,
+    cascade,
     confirm_lost_build,
     fix_disposition,
     owns_author,
@@ -566,6 +568,10 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
             except Die as exc:
                 log(f"  review: {exc}; reviewer affinity disabled for this round")
         ordered, deferred = prioritize_review_candidates(sv.reviewable.actionable, reviewer, now=stamp)
+        # A bump review never waits for its previous reviewer's first-refusal window.
+        bumps = bump_prs(sv)
+        ordered += [c for c in deferred if c.pr in bumps]
+        deferred = [c for c in deferred if c.pr not in bumps]
         if sv.roadmap_backpressure and deferred:
             log("  review: authoring paused; previous-reviewer preference will not leave workers idle")
             ordered.extend(deferred)
@@ -585,47 +591,46 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
     # change what it means.
     focus_prs(sv, opts)
 
-    # The cascade: first actionable stage wins, does one useful unit, returns its rc. A candidate that is
-    # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its
-    # fresh plan re-check finds the cached due verdict stale, so useful lower-priority work still runs.
+    # The cascade: first actionable stage wins, does one useful unit, returns its rc. Work on an
+    # automatic Mathlib bump is offered before every other candidate (survey.cascade). A candidate
+    # that is claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None
+    # when its fresh plan re-check finds the cached due verdict stale, so useful lower-priority work
+    # still runs.
     declined: list[tuple[str, int]] = []
     claim_collision = False
-    for stage in round_stages(opts):
-        if not want(opts.only, stage):
-            continue
-        for c in sv.kind(stage).actionable:
-            from .state_repair import retry_key
+    from .state_repair import retry_key
 
-            if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
-                w.selection_changed = True
-                continue
-            if stage == "review" and not opts.dry_run and _review_claimed_elsewhere(w, c):
-                log(f"Global PR work: review #{c.pr} claimed by a peer — skipping before fresh PR reads")
-                claim_collision = True
-                declined.append((stage, c.pr))
-                continue
-            if (
-                global_pick
-                and not opts.dry_run
-                and stage in FILE_CHANGE_STAGES
-                and c.pr
-                and getattr(w, "claims", None) is not None
-                and _branch_claimed_elsewhere(w, c.pr)
-            ):
-                log(f"Global PR work: {stage} #{c.pr} claimed by a peer — skipping before fresh PR reads")
-                claim_collision = True
-                declined.append((stage, c.pr))
-                continue
-            if global_pick and c.pr:
-                p = next((p for p in sv.open_prs if p.number == c.pr), None)
-                areas = [label[8:] for label in p.labels if label.startswith("roadmap/")] if p else []
-                log(f"Global PR work: trying {stage} #{c.pr} ({', '.join(areas) or 'shared maintenance'})")
-            collisions_before = getattr(getattr(w, "claims", None), "collisions", 0)
-            rc = dispatch(stage, w, sv, c, opts)
-            claim_collision |= getattr(getattr(w, "claims", None), "collisions", 0) > collisions_before
-            if rc is not None:
-                return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
+    for stage, c in cascade(sv, [stage for stage in round_stages(opts) if want(opts.only, stage)]):
+        if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
+            w.selection_changed = True
+            continue
+        if stage == "review" and not opts.dry_run and _review_claimed_elsewhere(w, c):
+            log(f"Global PR work: review #{c.pr} claimed by a peer — skipping before fresh PR reads")
+            claim_collision = True
             declined.append((stage, c.pr))
+            continue
+        if (
+            global_pick
+            and not opts.dry_run
+            and stage in FILE_CHANGE_STAGES
+            and c.pr
+            and getattr(w, "claims", None) is not None
+            and _branch_claimed_elsewhere(w, c.pr)
+        ):
+            log(f"Global PR work: {stage} #{c.pr} claimed by a peer — skipping before fresh PR reads")
+            claim_collision = True
+            declined.append((stage, c.pr))
+            continue
+        if global_pick and c.pr:
+            p = next((p for p in sv.open_prs if p.number == c.pr), None)
+            areas = [label[8:] for label in p.labels if label.startswith("roadmap/")] if p else []
+            log(f"Global PR work: trying {stage} #{c.pr} ({', '.join(areas) or 'shared maintenance'})")
+        collisions_before = getattr(getattr(w, "claims", None), "collisions", 0)
+        rc = dispatch(stage, w, sv, c, opts)
+        claim_collision |= getattr(getattr(w, "claims", None), "collisions", 0) > collisions_before
+        if rc is not None:
+            return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
+        declined.append((stage, c.pr))
     # `roadmap` authors a PR that does not exist yet, so it can never be one of the PRs `--pr` named.
     # A targeted round that finds nothing to do on its targets stops rather than falling through to
     # authoring: the operator asked for those PRs, and unrelated work is not a substitute for them.
@@ -2409,7 +2414,10 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
     recovery = False
 
     def plan_identity(value):
-        return {key: value.get(key) for key in ("roadmap", "from_sha", "to_sha", "prs", "documentation")}
+        return {
+            **{key: value.get(key) for key in ("roadmap", "from_sha", "to_sha", "prs", "documentation")},
+            "history_migration_sha256": publication.history_policy_digest(value),
+        }
 
     for attempt in range(3):
         # Checkout preparation and facts collection can take time. Observe
@@ -2467,6 +2475,7 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                             plan.get(k) for k in ("roadmap", "from_sha", "to_sha", "prs")
                         ):
                             raise ValueError("plan is missing its roadmap/window/PR identity")
+                        publication.history_policy_digest(plan)
                     except (OSError, ValueError) as exc:
                         _progress_mechanical_failed(w, f"progress: invalid plan artifact: {exc}")
                     if invalid_plan == plan_identity(plan):
@@ -2502,8 +2511,9 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                 else:
                     try:
                         publication.facts_bundle(plan_file, verify=True)
+                        publication.history_policy(plan_file, verify=True)
                     except (OSError, ValueError) as exc:
-                        _progress_documentation_wait(w, f"pinned facts bundle unavailable: {exc}", recovery=True)
+                        _progress_documentation_wait(w, f"pinned progress inputs unavailable: {exc}", recovery=True)
                     return plan_file, facts_file
     # This is an infrastructure wait, never a report attempt or a PR repair. The cursor lives only
     # in the roadmap's published PROGRESS.md, which no mechanical stage writes.
@@ -2663,6 +2673,8 @@ def _do_progress_inner(w, opts) -> int | None:
         # Selection explanations can change without changing any writer input.
         for field in ("reason", "skipped", "runner_up"):
             value.pop(field, None)
+        value["history_migration_sha256"] = publication.history_policy_digest(value)
+        value.pop("history_migration_file", None)
         return value, json.loads(f.read_text())
 
     try:
@@ -2676,14 +2688,15 @@ def _do_progress_inner(w, opts) -> int | None:
             previous = new_plan.parent.parent / "previous"
             previous.mkdir()
             artifacts = [plan_file, facts_file, prompt_file, status_body, section_body]
-            try:
-                if bundle := publication.facts_bundle(plan_file):
-                    artifacts.append(bundle)
-            except (OSError, ValueError):
-                pass  # preserve the old core artifacts even if their auxiliary metadata is damaged
+            for locate in (publication.facts_bundle, publication.history_policy):
+                try:
+                    if bundle := locate(plan_file):
+                        artifacts.append(bundle)
+                except (OSError, ValueError):
+                    pass  # preserve the old core artifacts even if their auxiliary metadata is damaged
             for artifact in artifacts:
                 if artifact.exists():
-                    if artifact.name.startswith("plan.json.facts-"):
+                    if artifact.name.startswith(("plan.json.facts-", "plan.json.history-")):
                         publication.retain_facts_bundle(artifact, previous / artifact.name)
                     else:
                         shutil.copyfile(artifact, previous / artifact.name)
@@ -2692,8 +2705,9 @@ def _do_progress_inner(w, opts) -> int | None:
             for body in (status_body, section_body):
                 body.unlink(missing_ok=True)
         # Install immutable bytes before the plan that refers to them.
-        if bundle := publication.facts_bundle(new_plan, verify=True):
-            publication.retain_facts_bundle(bundle, work / bundle.name)
+        for locate in (publication.facts_bundle, publication.history_policy):
+            if bundle := locate(new_plan, verify=True):
+                publication.retain_facts_bundle(bundle, work / bundle.name)
         _install_progress_body(new_plan, plan_file)
         _install_progress_body(new_facts, facts_file)
     except (OSError, ValueError) as exc:

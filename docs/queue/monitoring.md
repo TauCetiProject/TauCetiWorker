@@ -65,7 +65,10 @@ build log; no log text, module names or paths leave the machine. The first sampl
 has unknown progress-change time. Unchanged counts, including a heartbeat or
 other new log output, do not advance that time. Log replacement, truncation,
 counter regression, a new phase or claim resets the comparison. The phase's own
-checkpoint time stays unchanged. A silent log alone is not a stalled build.
+checkpoint time stays unchanged. A silent log alone is not a stalled build. Scripted preparation is sampled from the live
+worktree build log while the checkpoint is `artifacts_ready`; the completed copy under
+the task logs is not required. The final Lake job summary supplies the last numeric
+count, without treating a successful local build as a staging verdict.
 
 Worker liveness is distinct from task progress. Busy workers may not rewrite
 worker.json until a long task finishes. On Linux the sidecar can instead verify
@@ -115,3 +118,13 @@ read R2 only, never this file or the queue's database. Queue publication has a
 fail before network calls. Normal batches do not change queue scheduling to fit
 monitoring limits. Explicit retained-batch scope lets the receiver retire old
 terminal details without guessing that capped absence means a deleted live item.
+
+
+`GET /statistics` on the current queue controller provides a consistent read-only
+ledger projection (`tauceti-queue.statistics/v1`) for 1h, 3h, 24h and 7d windows.
+Distinct PR landing receipts and landed batches are separate from CI attempt
+outcomes. CI run duration percentiles include setup, result reporting and publication;
+they are not build-only durations. No GitHub calls, source fetches or reconciliation
+are triggered. The retired Bors `/repositories/1/statistics` snapshot is historical
+and must not be presented as current queue history. Native source statistics require
+an explicit qualified public scope and are not exposed by this endpoint.

@@ -1,8 +1,8 @@
 """The AI merge queue controller: records, claims, insertion, sealing, head reconciliation, tasks, status.
 
-This is increment 1 of `docs/redesign/specs/ai-merge-queue.md`: one open batch receiving scripted
-insertions and at most one sealed head that is rebased, built, repaired in place by agents claiming
-tasks, and fast-forwarded onto the canonical branch. The controller is one object shared by the
+The queue has unsealed batches receiving scripted insertions and a target of two sealed active
+batches, including at most one head. The head is rebased, built, repaired in place by agents, and
+fast-forwarded onto the canonical branch. The controller is one object shared by the
 reconciliation loop (`tauceti_queue.loop`) and the HTTP server; every public method takes the
 controller lock (`ControllerLock`: the worker endpoints take it ahead of the tick, which lets
 go of it around its GitHub I/O), and every record mutation is a `Store` transaction.
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import dataclasses
 import logging
 import random
 import re
@@ -48,7 +49,7 @@ from .ports import (
 from .source_authority import NativeQueueAuthority, SourceAuthorityUnavailable, principal_key
 from .stale_cache import StaleCache
 from .store import Store, dumps, loads
-from .task_identity import TaskBinding
+from .task_identity import NATIVE_GIT_REFS, TaskBinding, native_retained_ref, native_submission_ref
 
 STATUS_SCHEMA = "tauceti-queue.status/v1"
 BUILD_CONTEXT = "build"
@@ -71,7 +72,13 @@ COMMENT_MARKER = "tauceti-queue"
 DEFAULT_SETTINGS: dict[str, Any] = {
     "insertion_age_window": 16,
     "open_batch_limit": 2,
+    # Freeze oldest unsealed batches at this size until two active batches are sealed in total.
+    # Zero disables successor sealing. Head creation never waits for this threshold.
+    "sealed_successor_min_members": 100,
     "repair_concurrency": 1,
+    # A background task may start only while fewer than this many total worker claims are live.
+    # With repair_concurrency=3 and this limit=2, only head work can start the third worker.
+    "background_start_limit": 2,
     "stall_interval_seconds": 900,
     "publication_enabled": False,
     "claim_ttl_seconds": 900,
@@ -236,7 +243,9 @@ class ControllerLock:
     """
 
     def __init__(self) -> None:
-        self._cond = threading.Condition(threading.Lock())
+        mutex = threading.Lock()
+        self._cond = threading.Condition(mutex)
+        self._priority_cond = threading.Condition(mutex)
         self._owner: int | None = None
         self._depth = 0
         self._priority_waiting = 0
@@ -246,23 +255,31 @@ class ControllerLock:
         acquirer waits), then own it once. False when `deadline` passes first."""
         if priority:
             self._priority_waiting += 1
+        condition = self._priority_cond if priority else self._cond
         try:
             while self._owner is not None or (not priority and self._priority_waiting):
                 if deadline is None:
-                    self._cond.wait()
+                    condition.wait()
                     continue
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
-                self._cond.wait(remaining)
+                condition.wait(remaining)
             self._owner = threading.get_ident()
             self._depth = 1
             return True
         finally:
             if priority:
                 self._priority_waiting -= 1
-                if not self._priority_waiting:
-                    self._cond.notify_all()
+                if self._owner is None:
+                    self._notify_next()
+
+    def _notify_next(self) -> None:
+        """Under the shared mutex: wake one eligible acquirer. Broadcasting to every webhook
+        waiter makes draining a burst quadratic and can starve worker endpoints of CPU.
+        """
+        condition = self._priority_cond if self._priority_waiting else self._cond
+        condition.notify(1)
 
     def acquire(self, blocking: bool = True, timeout: float = -1, *, priority: bool = False) -> bool:
         with self._cond:
@@ -281,7 +298,7 @@ class ControllerLock:
             self._depth -= 1
             if not self._depth:
                 self._owner = None
-                self._cond.notify_all()
+                self._notify_next()
 
     def __enter__(self) -> ControllerLock:
         self.acquire()
@@ -324,7 +341,7 @@ class ControllerLock:
                 depth = 0
             else:
                 depth, self._depth, self._owner = self._depth, 0, None
-                self._cond.notify_all()
+                self._notify_next()
         try:
             yield
         finally:
@@ -365,6 +382,10 @@ class Controller:
         rng: random.Random | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
+        with store.transaction():
+            if store.get_setting("queue:operating-mode") not in {None, "controller"}:
+                raise ValueError("Stage 1 operator ledger cannot be opened by the autonomous controller")
+            store.set_setting("queue:operating-mode", "controller")
         self.store = store
         self.admission = None  # primary policy intake, attached by the service in policy mode
         self.source = github
@@ -380,6 +401,8 @@ class Controller:
         if candidate_ci is None and store.get_setting("source-ci:binding") is not None:
             raise ValueError("source-bound queue ledger requires its qualified CI coordinator")
         if candidate_ci is not None:
+            if candidate_ci.ledger.policy.source.repository.forge.kind != "forgejo":
+                raise ValueError("source CI currently requires the qualified Forgejo task protocol")
             if candidate_ci.ledger.store is not store or candidate_ci.ledger.clone != str(clone):
                 raise ValueError("source CI ledger does not belong to this controller")
             if getattr(github, "repository_identity", None) != candidate_ci.ledger.policy.source:
@@ -393,6 +416,39 @@ class Controller:
         self.github = self.source  # compatibility for source-authentication/service callers
         self.clone = clone
         self.repository = repository
+        source_identity = getattr(self.source, "repository_identity", None)
+        self.native_source = bool(source_identity and source_identity.repository.forge.kind == "forgejo")
+        if self.native_source and candidate_ci is None:
+            raise ValueError("Forgejo source requires qualified source CI; legacy GitHub execution is unavailable")
+        if self.native_source:
+            configure_publishers = getattr(self.source, "configure_publisher_policy", None)
+            if configure_publishers is not None:
+                with store.transaction():
+                    if configure_publishers(store):
+                        # A rotation/restore never re-signs a positive release.
+                        # Retired source history already holds affected heads;
+                        # no historical comments need to be replayed here.
+                        for entry in store.rows("outbox", {"kind": "comment"}, order="id"):
+                            body = loads(entry["payload"], {})
+                            publication = body.get("publication") or {}
+                            if (
+                                publication.get("kind") == "recovery"
+                                and publication.get("clear")
+                                and entry["state"] == "pending"
+                            ):
+                                store.update(
+                                    "outbox",
+                                    {"id": entry["id"]},
+                                    state="done",
+                                    done_at=clock(),
+                                    result="reconciliation-required: clear predates authority rotation",
+                                )
+                        store.journal(
+                            clock(),
+                            "native-publisher-rotation",
+                            generation=self.source.admission_policy.publishers.generation,
+                        )
+        self.provenance_repository = source_identity.repository.key if self.native_source else repository
         self.revision = revision
         self.clock = clock
         self.rng = rng or random.Random()
@@ -1301,9 +1357,10 @@ class Controller:
         two tiers, each by kind priority then age (`TASK_PRIORITY`): first a head task (`repair` or
         `rebase_conflict`); then an open batch's background task (`pre_rebase`, then `prepare`).
         Each batch has at most one live worker claim, including when its task changes. Background
-        claims number at most `repair_concurrency - 1`, so head work never waits behind background
-        work. With two workers one repairs the head while the other prepares or pre-rebases the
-        next batch; a worker waits when no distinct batch needs work.
+        claims number at most `repair_concurrency - 1`. Starting background work also requires
+        fewer than `background_start_limit` total live claims; only head work may increase the
+        active total beyond that limit. Head work never waits behind background work. With two workers
+        one repairs the head while the other prepares or pre-rebases the next batch; a worker waits when no distinct batch needs work.
 
         The admin check (a cached GitHub read) runs before the lock is taken, and the claim takes the
         lock's priority lane, so a claim answers while a tick is running.
@@ -1376,7 +1433,8 @@ class Controller:
         self, claimable: list[tuple[dict[str, Any], dict[str, Any]]], concurrency: int
     ) -> tuple[dict[str, Any], dict[str, Any]] | None:
         """The next task on a batch without a live worker claim: a head task, else background while
-        background claims number fewer than `concurrency - 1` (one slot is always left for head work,
+        total claims number fewer than `background_start_limit` and background claims number fewer
+        than `concurrency - 1` (one slot is always left for head work,
         so with `repair_concurrency` 1 nothing runs in the background). Selection and insertion of
         the claim share the controller lock; concurrent requests cannot select the same batch.
         """
@@ -1387,7 +1445,7 @@ class Controller:
             if pair[0]["kind"] not in BACKGROUND_TASKS:
                 return pair
         background = [claim for claim in active if claim["operation"] in BACKGROUND_OPERATIONS]
-        if len(background) < concurrency - 1:
+        if len(active) < int(self.setting("background_start_limit")) and len(background) < concurrency - 1:
             for task, batch in unheld:
                 if task["kind"] in BACKGROUND_TASKS:
                     return task, batch
@@ -1426,7 +1484,14 @@ class Controller:
             if batch["state"] != wanted:
                 continue
             found.append((task, batch))
-        found.sort(key=lambda pair: (TASK_PRIORITY.get(pair[0]["kind"], 0), pair[0]["created_at"], pair[0]["id"]))
+        found.sort(
+            key=lambda pair: (
+                TASK_PRIORITY.get(pair[0]["kind"], 0),
+                not pair[1]["sealed"],
+                pair[0]["created_at"],
+                pair[0]["id"],
+            )
+        )
         return found
 
     def _active_task_claims(self) -> list[dict[str, Any]]:
@@ -1775,11 +1840,17 @@ class Controller:
             and not chain.landed_commit(landed, m.source_pr)
         ]
 
+    def _worker_submission_ref(self, task_id, claim_id):
+        if self.candidate_ci is not None and getattr(self.source, "task_git_transport", None) == NATIVE_GIT_REFS:
+            return native_submission_ref(self.candidate_ci.ledger.epoch, task_id, claim_id)
+        return self.submission_ref(task_id, claim_id)
+
     def _retain_submission(self, task: dict[str, Any], claim: dict[str, Any], tip_sha: str) -> str | None:
         ref = self.submission_ref(task["id"], claim["id"])
+        remote = self._worker_submission_ref(task["id"], claim["id"])
         if not chain.object_exists(self.clone, tip_sha):
             try:
-                self.source.fetch_refs(self.repository, [f"+{ref}:{ref}"])
+                self.source.fetch_refs(self.repository, [f"+{remote}:{ref}"])
             except Exception as error:  # noqa: BLE001
                 self.log.warning("fetch of %s failed: %s", ref, error)
             if not chain.object_exists(self.clone, tip_sha):
@@ -2127,6 +2198,12 @@ class Controller:
             ahead = self._head()
             if ahead is not None and ahead["tip"] == task["onto"]:
                 refs.insert(1, self.batch_ref(ahead["id"], ahead["version"]))  # where `onto` is fetched from
+        if self.candidate_ci is not None and getattr(self.source, "task_git_transport", None) == NATIVE_GIT_REFS:
+            refs = [native_retained_ref(ref) for ref in refs]
+            members = [
+                dataclasses.replace(member, retained_ref=native_retained_ref(member.retained_ref)) for member in members
+            ]
+            extra["git_transport"] = NATIVE_GIT_REFS
         return Task(
             task_id=task["id"],
             kind=task["kind"],
@@ -2139,7 +2216,7 @@ class Controller:
             members=members,
             diagnostics=loads(task["diagnostics"], []),
             retained_refs=refs,
-            submission_ref=self.submission_ref(task["id"], claim_id),
+            submission_ref=self._worker_submission_ref(task["id"], claim_id),
             claim_token=token,
             expires_at=expires,
             instruction=AGENT_INSTRUCTION,
@@ -2266,8 +2343,12 @@ class Controller:
     # --- records -----------------------------------------------------------------------------------
 
     def _open_batches(self) -> list[dict[str, Any]]:
-        """Open batches oldest first: insertion tries them in this order and sealing takes the first."""
+        """Non-head batches oldest first, including the sealed successor (`state=open, sealed=1`)."""
         return self.store.rows("batches", {"repository": self.repository, "state": BATCH_OPEN}, order="id")
+
+    def _unsealed_batches(self) -> list[dict[str, Any]]:
+        """Batches still accepting insertions; only these count against `open_batch_limit`."""
+        return [batch for batch in self._open_batches() if not batch["sealed"]]
 
     def _open_batch(self) -> dict[str, Any] | None:
         batches = self._open_batches()
@@ -2283,12 +2364,12 @@ class Controller:
         input_row = self.store.row("inputs", {"id": member["input_id"]}) or {}
         coauthors = loads(input_row.get("coauthors"))
         return chain.Member(
-            self.repository,
+            self.provenance_repository,
             member["number"],
             member["accepted_head"],
             title=input_row.get("title", ""),
             description=input_row.get("description", ""),
-            author=input_row.get("author", ""),
+            author="" if self.native_source else input_row.get("author", ""),
             coauthors=None if coauthors is None else tuple(coauthors),
         )
 
@@ -2578,9 +2659,9 @@ class Controller:
                     trees[commit.sha] = commit.tree
                     if empty:
                         continue  # an empty placeholder lands no contribution
-                    if source and source.startswith(f"{self.repository}#"):
+                    if source and source.startswith(f"{self.provenance_repository}#"):
                         landed_prs.add(int(source.rsplit("#", 1)[1]))
-                    elif not source:
+                    elif not source and not self.native_source:
                         # Bors's squash commits carry no Source-PR trailer; the subject names the PR.
                         lines = (commit.message or "").splitlines()
                         match = _BORS_SUBJECT_RE.search(lines[0]) if lines else None
@@ -2889,7 +2970,7 @@ class Controller:
             self._reasons.append("canonical branch not yet observed")
             return None
         batches = []
-        for batch in self._open_batches():
+        for batch in self._unsealed_batches():
             if not self._members(batch["id"]) and batch["base"] != canonical:
                 self._remove_batch(batch, "stale-empty", now)
             else:
@@ -2902,7 +2983,7 @@ class Controller:
         """Remove empty open batches: a later one as soon as the pass leaves it empty (it is created on
         demand for an input that conflicts with the batches before it), the first only when nothing waits
         and its base is stale."""
-        for position, batch in enumerate(self._open_batches()):
+        for position, batch in enumerate(self._unsealed_batches()):
             if self._members(batch["id"]):
                 continue
             if position > 0:
@@ -2937,12 +3018,12 @@ class Controller:
             )
             claim = self._take_claim(batch, "insert", now)
         member = chain.Member(
-            self.repository,
+            self.provenance_repository,
             row["number"],
             row["head_sha"],
             title=row["title"],
             description=row["description"],
-            author=row["author"],
+            author="" if self.native_source else row["author"],
             coauthors=None if loads(row["coauthors"]) is None else tuple(loads(row["coauthors"])),
         )
         chain_id = f"probe-{batch['id']}-{secrets.token_hex(4)}"
@@ -2987,7 +3068,13 @@ class Controller:
         row = fresh
         current = self.store.row("batches", {"id": batch["id"]})
         prepared = any(c["operation"] == f"task:{TASK_PREPARE}" for c in self._active_claims(batch["id"]))
-        if current is None or current["version"] != batch["version"] or current["state"] != BATCH_OPEN or prepared:
+        if (
+            current is None
+            or current["version"] != batch["version"]
+            or current["state"] != BATCH_OPEN
+            or current["sealed"]
+            or prepared
+        ):
             # The batch moved while the probe ran without the lock (an adoption, a removal), or a
             # `prepare` task claimed it: the input waits for the next pass.
             with self.store.transaction():
@@ -3289,6 +3376,7 @@ class Controller:
 
     def _seal(self, now: float) -> None:
         if self._head() is not None:
+            self._seal_successor(now)
             return
         batch = self._open_batch()
         if batch is None or not self._members(batch["id"]):
@@ -3304,6 +3392,7 @@ class Controller:
         if claims:
             # Keep the batch open while its owner prepares or pre-rebases it. Adoption uses the
             # ordinary open-batch validation, and the next head keeps the completed work.
+            self._seal_successor(now)
             self._reasons.append(f"open batch {batch['id']} is claimed; sealing waits for the release")
             return
         with self.store.transaction():
@@ -3315,7 +3404,13 @@ class Controller:
                 self.store.update(
                     "tasks", {"id": stale["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="sealed"
                 )
-            self.store.update("batches", {"id": batch["id"]}, sealed=1, state=BATCH_HEAD, sealed_at=now)
+            self.store.update(
+                "batches",
+                {"id": batch["id"]},
+                sealed=1,
+                state=BATCH_HEAD,
+                sealed_at=batch["sealed_at"] if batch["sealed_at"] is not None else now,
+            )
             self._count("heads_sealed")
             self.store.journal(
                 now,
@@ -3325,8 +3420,47 @@ class Controller:
                 size=len(self._members(batch["id"])),
                 urgent=batch["urgent"],
             )
-            if self._canonical is not None and not self._open_batches():
+            if self._canonical is not None and not self._unsealed_batches():
                 self._create_open_batch(self._canonical, now)
+        self._seal_successor(now)
+
+    def _seal_successor(self, now: float) -> None:
+        """Freeze oldest unsealed batches at the threshold until two active batches are sealed.
+
+        The existing sealed flag fixes membership independently of `state`: a successor remains
+        `open` for the background task protocol until promotion to `head`. An active background
+        owner keeps its task and can adopt normally; insertions may never enter the sealed batch.
+        """
+        minimum = int(self.setting("sealed_successor_min_members"))
+        if minimum == 0 or self._state("inference_hold") or self._external_head_blocks_sealing():
+            return
+        sealed = int(self._head() is not None) + sum(bool(batch["sealed"]) for batch in self._open_batches())
+        # Promotion may be waiting for the oldest preparation owner even after the previous
+        # head landed. That still leaves capacity for a second sealed batch; do not wait for
+        # the first to become head before freezing the next one's membership.
+        while sealed < 2:
+            batches = self._unsealed_batches()
+            if not batches:
+                return
+            batch = batches[0]
+            size = len(self._members(batch["id"]))
+            if size < minimum or any(
+                c["operation"] not in BACKGROUND_OPERATIONS for c in self._active_claims(batch["id"])
+            ):
+                return
+            with self.store.transaction():
+                self.store.update("batches", {"id": batch["id"]}, sealed=1, sealed_at=now)
+                self._count("successors_sealed")
+                self.store.journal(
+                    now,
+                    "successor-sealed",
+                    batch["id"],
+                    version=batch["version"],
+                    size=size,
+                    sealed_before=sealed,
+                    sealed_after=sealed + 1,
+                )
+            sealed += 1
 
     # --- head reconciliation -----------------------------------------------------------------------
 
@@ -3527,7 +3661,7 @@ class Controller:
             return f"prepare task {prepare['id']} is {held}"
         if not self.setting("prepare_open_batches"):
             return None
-        if len(self._members(batch["id"])) < max(1, int(self.setting("prepare_min_members"))):
+        if not batch["sealed"] and len(self._members(batch["id"])) < max(1, int(self.setting("prepare_min_members"))):
             return None
         if batch["prepared_version"] == batch["version"]:
             return None
@@ -3604,7 +3738,7 @@ class Controller:
                 if admission_planning.fingerprint([{"base": task["base"]}, *collisions]) == digest:
                     attempted = True
                     break
-        if not predicted or attempted:
+        if not batch["sealed"] and (not predicted or attempted):
             if len(members) < max(1, int(self.setting("prepare_min_members"))):
                 return False
             if now - max(m["added_at"] for m in members) < int(self.setting("prepare_quiet_seconds")):
@@ -3966,7 +4100,7 @@ class Controller:
         preparation of the same chain that was adopted, released clean or failed is not repeated."""
         if not self.setting("prepare_pre_rebased") or not self.setting("prepare_open_batches"):
             return "prepare_pre_rebased is off"
-        if len(self._members(batch["id"])) < max(1, int(self.setting("prepare_min_members"))):
+        if not batch["sealed"] and len(self._members(batch["id"])) < max(1, int(self.setting("prepare_min_members"))):
             return "below prepare_min_members"
         if batch["pre_rebase_state"] not in PRE_REBASE_USABLE or not batch["pre_rebase_tip"]:
             return "no usable pre-rebase"
@@ -5831,8 +5965,11 @@ class Controller:
         """Whether a non-empty commit on the canonical branch names PR `number` (` (#N)` subject or `Source-PR`)."""
         if self._canonical is None:
             return False
-        repository = self.repository.replace(".", "\\.")
+        # Git uses POSIX ERE, whose literal escaping differs from Python re.escape.
+        repository = "".join("\\" + char if char in ".[](){}*+?^$|\\" else char for char in self.provenance_repository)
         pattern = rf"(\(#{number}\)$|^{chain.SOURCE_PR_TRAILER}: {repository}#{number}$)"
+        if self.native_source:
+            pattern = rf"^{chain.SOURCE_PR_TRAILER}: {repository}#{number}$"
         result = chain._git(
             self.clone, "log", "-n", "5", "--format=%H", "-E", f"--grep={pattern}", self._canonical, "--"
         )
@@ -6083,6 +6220,70 @@ class Controller:
 
     # --- outbox ------------------------------------------------------------------------------------
 
+    def enqueue_source_recovery(self, repo, number, head, explanation, *, key, clear=False):
+        """Trusted controller operation; holds and clears share the existing outbox allocator."""
+        if (
+            not self.native_source
+            or type(number) is not int
+            or number < 1
+            or not isinstance(head, str)
+            or re.fullmatch(r"[0-9a-f]{40}", head) is None
+            or type(clear) is not bool
+            or not isinstance(explanation, str)
+            or not isinstance(key, str)
+            or not key
+        ):
+            raise ValueError("native recovery requires a qualified accepted head and durable intent key")
+        with self._lock, self.store.transaction():
+            self._check_repo(repo)
+            body = (
+                f"Merge-queue recovery for head `{head}`\n\n"
+                + explanation.replace("<!--tauceti-", "&lt;!--tauceti-")
+                + f"\n\n<!--tauceti-rebase:v1 {head}-->"
+            )
+            outbox_key = "native-recovery:" + key
+            payload = {
+                "number": number,
+                "body": body,
+                "marker": outbox_key,
+                "publication": {"kind": "recovery", "head": head, "clear": clear},
+            }
+            existing = self.store.row("outbox", {"key": outbox_key})
+            if existing is not None:
+                previous = loads(existing["payload"], {})
+                previous.pop("native_intent", None)
+                if previous != payload:
+                    raise ValueError("native recovery key was reused for a different decision")
+            self._enqueue("comment", outbox_key, payload)
+            return self.store.row("outbox", {"key": outbox_key})["id"]
+
+    def reconcile_source_recovery(self, number, head, nonce):
+        """Republish only the latest desired owned fact, never an older hold over a newer clear."""
+        if not self.native_source or not head or not nonce:
+            return False
+        with self._lock, self.store.transaction():
+            latest = None
+            for entry in self.store.rows("outbox", {"kind": "comment"}, order="id"):
+                if entry.get("result") == "reconciliation-required: clear predates authority rotation":
+                    continue
+                payload = loads(entry["payload"], {})
+                publication = payload.get("publication") or {}
+                if (
+                    payload.get("number") == number
+                    and publication.get("kind") == "recovery"
+                    and publication.get("head") == head
+                ):
+                    latest = payload
+            if latest is None or (latest.get("native_intent") or {}).get("nonce") != nonce:
+                return False
+            key = "native-republish:" + nonce
+            if self.store.row("outbox", {"key": key}) is not None:
+                return False
+            latest.pop("native_intent", None)
+            self._enqueue("comment", key, latest)
+            self.store.journal(self.clock(), "native-publication-requeued", number=number, nonce=nonce)
+            return True
+
     def _enqueue(self, kind: str, key: str, payload: dict[str, Any]) -> None:
         now = self.clock()
         if self.store.row("outbox", {"key": key}) is not None:
@@ -6141,7 +6342,53 @@ class Controller:
         result = ""
         try:
             with self._lock.unlocked():
-                result = self._perform(current["kind"], loads(current["payload"], {}), now)
+                payload = loads(current["payload"], {})
+                prepare_comment = getattr(self.source, "prepare_outbox_comment", None)
+                if self.native_source and payload.get("publication") and not self.setting("publication_enabled"):
+                    return
+                frozen = payload.get("native_intent")
+                wrong_generation = bool(
+                    frozen
+                    and self.native_source
+                    and frozen.get("generation") != self.source.admission_policy.publishers.generation
+                )
+                if wrong_generation and payload.get("publication", {}).get("clear"):
+                    with self._lock:
+                        self._outbox_done(
+                            current,
+                            loads(current["history"], []),
+                            "reconciliation-required: clear predates authority rotation",
+                            now,
+                        )
+                    return
+                if (
+                    self.native_source
+                    and current["kind"] == "comment"
+                    and ("native_intent" not in payload or wrong_generation)
+                    and prepare_comment is not None
+                ):
+                    if payload.get("publication") and not self.setting("publication_enabled"):
+                        return
+                    intent = prepare_comment(
+                        self.repository,
+                        payload["number"],
+                        payload["body"],
+                        payload["marker"],
+                        sequence=current["id"],
+                        publication=payload.get("publication"),
+                    )
+                    if intent is not None:
+                        # Freeze before the first status/comment POST. A restart
+                        # or uncertain response must retain both nonce and order.
+                        with self._lock, self.store.transaction():
+                            pending = self._pending_entry(current)
+                            if pending is None:
+                                return
+                            payload = loads(pending["payload"], {})
+                            if "native_intent" not in payload or wrong_generation:
+                                payload["native_intent"] = intent
+                                self.store.update("outbox", {"id": current["id"]}, payload=dumps(payload))
+                result = self._perform(current["kind"], payload, now)
         except Exception as caught:  # noqa: BLE001 - every adapter failure is recorded and retried
             error = caught
         with self._lock:
@@ -6149,6 +6396,16 @@ class Controller:
             if current is None:
                 return
             if error is not None:
+                from .forgejo_source import PublisherNotGranted
+
+                if self.native_source and current["kind"] == "comment" and isinstance(error, PublisherNotGranted):
+                    self._outbox_done(
+                        current,
+                        loads(current["history"], []),
+                        "reconciliation-required: source publication grant is unavailable",
+                        now,
+                    )
+                    return
                 self._outbox_failed(current, loads(current["history"], []), error, now)
             else:
                 self._outbox_done(current, loads(current["history"], []), result, now)
@@ -6174,15 +6431,19 @@ class Controller:
 
     def _outbox_done(self, entry: dict[str, Any], history: list[Any], result: str, now: float) -> None:
         history.append({"at": now, "result": result})
-        self.store.update(
-            "outbox",
-            {"id": entry["id"]},
-            state="done",
-            attempts=entry["attempts"] + 1,
-            history=dumps(history[-20:]),
-            done_at=now,
-            result=result,
-        )
+        with self.store.transaction():
+            self.store.update(
+                "outbox",
+                {"id": entry["id"]},
+                state="done",
+                attempts=entry["attempts"] + 1,
+                history=dumps(history[-20:]),
+                done_at=now,
+                result=result,
+            )
+            publication = loads(entry["payload"], {}).get("publication")
+            if self.native_source and self.admission is not None and publication and result.startswith("comment "):
+                self.admission.invalidate(loads(entry["payload"], {})["number"], head="", urgent=True)
 
     def _outbox_failed(self, entry: dict[str, Any], history: list[Any], error: Exception, now: float) -> None:
         attempts = entry["attempts"] + 1
@@ -6215,6 +6476,43 @@ class Controller:
             self.source.update_ref(repo, payload["ref"], payload["sha"])
             return "retained"
         if kind == "comment":
+            if "native_intent" in payload and self.native_source:
+                from .forgejo_source import PublicationDamaged, PublicationSuperseded
+
+                if (
+                    payload.get("publication", {}).get("kind") != "recovery"
+                    or payload["native_intent"].get("kind") != "recovery"
+                ):
+                    return "reconciliation-required: unsupported queued native publication"
+
+                try:
+                    return "comment " + str(self.source.publish(payload["native_intent"]))
+                except PublicationSuperseded as error:
+                    known = bool(error.nonce) and any(
+                        (loads(e["payload"], {}).get("native_intent") or {}).get("nonce") == error.nonce
+                        for e in self.store.rows("outbox", {"kind": "comment"})
+                    )
+                    if not known:
+                        with self._lock:
+                            self.store.journal(
+                                now,
+                                "native-publication-history-mismatch",
+                                number=payload["number"],
+                                remote_sequence=error.sequence,
+                                remote_nonce=error.nonce,
+                            )
+                            self.log.warning(
+                                "native publication for #%s requires restore reconciliation (remote sequence %s)",
+                                payload["number"],
+                                error.sequence,
+                            )
+                        return "reconciliation-required: remote publication is absent from the local outbox; reconcile restore"
+                    return "superseded native publication"
+                except PublicationDamaged:
+                    repaired = self.reconcile_source_recovery(
+                        payload["number"], payload["publication"]["head"], payload["native_intent"]["nonce"]
+                    )
+                    return "native publication requeued" if repaired else "superseded damaged native publication"
             return "comment " + str(
                 self.source.post_comment(repo, payload["number"], payload["body"], payload["marker"])
             )
@@ -6465,6 +6763,9 @@ class Controller:
                 if open_batch is None
                 else self._batch_status(open_batch, now) | {"pre_rebase": self._pre_rebase_status(open_batch)},
                 "open_batches": [self._open_batch_summary(batch, now) for batch in open_batches],
+                "sealed_successor": next(
+                    (self._open_batch_summary(batch, now) for batch in open_batches if batch["sealed"]), None
+                ),
                 "head": head_status,
                 "external_head": self._external_head_status(),
                 "approvals": {
@@ -6538,6 +6839,8 @@ class Controller:
         return {
             "id": batch["id"],
             "version": batch["version"],
+            "sealed": bool(batch["sealed"]),
+            "sealed_at": batch["sealed_at"],
             "base": batch["base"],
             "tip": batch["tip"],
             "size": len(members),
@@ -6637,6 +6940,8 @@ class Controller:
         return {
             "id": batch["id"],
             "version": batch["version"],
+            "sealed": bool(batch["sealed"]),
+            "sealed_at": batch["sealed_at"],
             "base": batch["base"],
             "tip": batch["tip"],
             "size": len(members),

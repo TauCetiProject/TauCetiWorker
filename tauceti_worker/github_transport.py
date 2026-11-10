@@ -1133,10 +1133,11 @@ def _install_proxy(*, bindir=None):
 
 
 def migrated_history(args):
-    """Compatibility bridge for host review engines, with live reads and existing jq formatting.
+    """Compatibility bridge for host review engines, with shared history and existing jq formatting.
 
     Match ONLY the complete-history forms we can preserve. Unrecognized flags use the real CLI.
-    Publishing/claim ownership reads remain live even though survey histories share a cache.
+    Fresh history bypasses the host cache while retaining ordinary shared-service reads.
+    The service applies comment webhooks; fresh must not imply a direct GitHub read.
     """
     if args[:1] != ["api"] or "--paginate" not in args:
         return None

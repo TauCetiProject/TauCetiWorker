@@ -223,8 +223,9 @@ class Execution(unittest.TestCase):
 
     def test_rate_limit_deadlines_are_finite_and_bad_credentials_are_invalidated(self):
         with patch.object(self.adapter, "_post", return_value=(401, {}, b"")):
-            with self.assertRaises(DispatchNotAccepted):
+            with self.assertRaises(DispatchNotAccepted) as caught:
                 self.adapter.dispatch(self.frozen)
+        self.assertTrue(caught.exception.retryable)  # Minted App credentials can refresh.
         self.assertIsNone(self.tokens._current)
         for value, expected in (("NaN", None), ("inf", None), ("-1", None), ("2000", 2000)):
             self.tokens._current = InstallationToken("fixture-only", 10**12)

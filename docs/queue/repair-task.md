@@ -185,7 +185,8 @@ has a time budget holds because the service re-exposes the task.
    --rev=<revision>` into the private pool, then `lake build --iofail` at the tip, which restores every
    unchanged module and builds the batch's own modules and their dependents (for a repair with
    streaming on, the default, that build is the worker's background build described after this list,
-   and the preparation ends with the fetch). The artifacts come from
+   and the preparation ends with the fetch). Known audit/lint-only repairs also end preparation
+   with the fetch, starting inference before any build or audit discovery pass. The artifacts come from
    the newest revision the cache has: the revision the build runs on (`artifact_revisions` puts it
    first: a repair's `base`, a rebase conflict's `onto`), then its first-parent ancestors walking back
    up to `ARTIFACT_ANCESTORS` (50) commits, each asked with its own `lake cache get --rev=` until one
@@ -291,13 +292,17 @@ has a time budget holds because the service re-exposes the task.
    commit it, and `checkout_worktree` leaves it alone; a prompt composed without a worktree (the
    experiment's preview) carries the listings inline. The verification advice follows
    the artifacts outcome: a warm rebase fetches cached outputs without compiling the old chain and
-   asks the agent to finish the replay before building the resulting chain. Other warm tasks describe
-   the incremental whole-library build; when a
+   asks the agent to finish the replay before building the resulting chain. Warm repair/prepare tasks
+   with worker verification enabled instead use `.tauceti-repair/check-findings`: scoped compilation
+   of the reported modules and actual repair delta, then the named linters or ownership-only check.
+   They return for the worker's full verification; their build helper requires module arguments.
+   Other configurations retain the incremental whole-library advice. When a
    rebase conflict runs without them (`cold`) it says so, gives the reason, warns that
    `lake build --iofail` starts from nothing and may take hours, and asks for the touched modules
    (`lake build <Module>`) to be built first. Either way the prompt tells the agent to check a fix
-   with the scoped build first and to run the whole-library `lake build --iofail` only as the final
-   verdict: `.tauceti-repair/build` (written by `repair_tools.write_build_script` beside the check
+   with the scoped build first; when the worker owns full verification it is the worker's next
+   step after the agent returns. Otherwise the agent runs `lake build --iofail` as its final verdict.
+   `.tauceti-repair/build` (written by `repair_tools.write_build_script` beside the check
    script, a Python script of under eighty-five lines) takes module names (`TauCeti.Foo.Bar`) or paths
    (`TauCeti/Foo/Bar.lean`), with `--dependents` every module importing them transitively (from the
    library's `import` lines, read in one pass and cached in `.tauceti-repair/imports.json`, which the
@@ -355,8 +360,8 @@ has a time budget holds because the service re-exposes the task.
    default on, and `--no-worker-audits`). Head 2's first CI round after a green worker build failed in the
    audit phase on a duplicate declaration the agent's text scan had listed and set aside, so the checks are
    the worker's, not the agent's. After every green whole-library `lake build --iofail` it runs (the
-   streaming build, the parallel path's verification build, the verification below and the agent's
-   `.tauceti-repair/build` without module arguments) it runs what CI's `sandbox-build.sh` runs after its
+   streaming build, the parallel path's verification build, the verification below and, in configurations
+   where the worker does not own final verification, the agent's full-library helper) it runs what CI's `sandbox-build.sh` runs after its
    build: the `audit-driver` under `lake env timeout 3000s` (import of every TauCeti module, duplicate
    declarations, axioms) and `lint-env.sh` with the `lint-env-driver` on the TauCeti modules changed between
    the task's base and HEAD (`lint-scope.sh`'s module list for a batch). The sources are the TauCetiTools pin
@@ -375,18 +380,31 @@ has a time budget holds because the service re-exposes the task.
    (`repair_audit.verify`, under the build lock: the whole-library build, then the checks); a failure is not
    submitted: the agent is run again with the findings as the task's diagnostics and the report as feedback,
    up to `verify_retries` (2) times, then the task is released as `agent_failed`. Each verification is in the
-   outcome's `verification` list. The prompt says only that the helper and the worker's verification run CI's
-   audits and lints and that the task cannot be submitted until they pass. CI's module-system check and
+   outcome's `verification` list. For warm repair/prepare tasks the prompt gives the agent focused
+   feedback checks and assigns the complete verification to the worker, avoiding a duplicate agent
+   pass. The task cannot be submitted while the worker's checks report failures. CI's module-system check and
    source style lint are not run on the worker. In CI runs of 2026-11-05 on the full library (24,455 TauCeti
    modules) the audit's import took 5 s warm and 27 s cold, the duplicate check 3 s and the axiom scan of a
    PR's few modules 4 s; the lint of five changed modules took 45 s and the two driver builds about 4 s.
 6. **Submit and publish.** Push, `result`, record the response (checkpoints `pushed`, `submitted`,
    then `adopted` or `not_adopted`), then publish the build outputs (below). The worktree is removed
    afterwards (by the background publisher when one runs) unless `--keep-worktree`;
+   the [lifecycle collector](operations.md#terminal-repair-worktree-cleanup) overrides that retention
+   once the task or batch is terminal, including trees left by errors or process kills;
    the artifact pool is kept, since the next task on the same base reuses it (prune it with the
    experiment CLI's `prune`). Every attempt's tip stays under
    `refs/tauceti-queue/task/<id>/attempt-<n>` in the clone, and `tasks/<id>/outcome.json` holds the
    outcome record.
+
+**Known audit/lint findings.** When a repair task already carries located audit or lint
+findings for its frozen candidate, and no compiler errors, the worker fetches the warm artifacts
+and starts the agent directly. It skips both the sequential preparation build and streaming
+build/audit discovery, even under `--no-stream-repair`. The task's findings and ownership context
+are supplied in the prompt. This avoids waiting for another whole-library lint pass to rediscover
+the failures that created the task. Final build and audit verification still runs before submission;
+remaining failures go back to the agent or prevent submission. Predictions, unlocated messages,
+generic failed statuses, compiler failures, preparations and rebases keep their existing flows.
+The outcome records this choice as `pre_repair_discovery`.
 
 **Repair while the build still streams** (`tauceti_queue/repair_stream.py`; setting
 `TAUCETI_QUEUE_STREAM_REPAIR`, default on, and `--no-stream-repair`). The first production repair spent
@@ -405,12 +423,13 @@ build script of `tauceti_queue/repair_tools.py`, whose lock the streaming build 
 `take_lock` so the two never overlap) waits for the lock and builds only the named modules.
 When the build ends the worker appends a `build finished, exit N, M errors total` line to the error
 list, removes the lock and copies the log to `tasks/<id>/logs/stream-build.log`; the outcome records
-the build under `stream_build`. The agent's final whole-library `lake build --iofail` after its fixes
-is still the only verdict. A build still running when the task ends or is interrupted is stopped and
+the build under `stream_build`. When worker verification is enabled, the agent returns after focused
+checks and the worker runs the final full verification. Other configurations retain the agent's
+whole-library `lake build --iofail` verdict. A build still running when the task ends or is interrupted is stopped and
 its lock removed. Rebase-conflict and pre-rebase tasks fetch caches and go directly to the agent,
 which finishes the replay before building the resulting chain. Resumed tasks continue their agent
-session. `--no-stream-repair` keeps ordinary repairs sequential: the preparation's own incremental
-build, then the agent.
+session. For repairs without known audit/lint findings, `--no-stream-repair` keeps the sequential
+flow: the preparation's own incremental build, then the agent.
 
 **Preparing an open batch** (`kind: "prepare"`; `docs/queue/controller.md`, "Background
 preparation"). While the head waits on CI or is repaired the controller hands out `prepare` tasks for quiet open
@@ -480,7 +499,15 @@ Publication never delays the submission. On 2026-11-05 head 2's repair validated
 the publish step (the `--no-build --rehash` pass over about 26,000 modules, then the upload) ran for
 more than 12 minutes before the chain was submitted, and CI, dispatched only after submission, waited
 with the whole queue. `TAUCETI_REPAIR_PUBLISH` (`after`, the default; `before`; `off`) now chooses
-the order. Under `after` the worker pushes and submits exactly as before (the same checkpoint token,
+the order. With `after`, a green full-library build now first freezes an output map and
+archive hardlinks and starts a background upload while audits and lint run. Stock Lake's
+`cache put-staged --rev=...` uploads for that captured revision without consulting the live
+workspace. Compilation outputs are reusable even if audits subsequently reject the chain;
+checks and submission remain independent. At submission an upload for the exact accepted
+revision is reused without waiting. A changed revision, failure or unavailable snapshot
+retains the late-publication fallback described below.
+
+Under that fallback the worker pushes and submits exactly as before (the same checkpoint token,
 the claim released or adopted by the submission) and then starts `repair_publish.start_background`
 for the submitted tip, after `adopted` or `not_adopted` and after a `prepared_clean` release, and
 goes on to its next claim. The publisher is a process of its own: under systemd a transient unit

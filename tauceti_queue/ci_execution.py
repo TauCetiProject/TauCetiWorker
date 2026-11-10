@@ -20,6 +20,7 @@ from tauceti_tools.forge import GITHUB
 from . import github_app
 from .github_adapter import UrllibTransport
 from .ports import CandidateRun, DispatchNotAccepted
+from .workflow_token import WorkflowTokenSource
 
 
 @dataclass(frozen=True)
@@ -67,9 +68,11 @@ class ExecutionEvidence(GitHubEvidence):
 class GitHubSourceExecution:
     def __init__(self, tokens, *, transport=None, reader_factory=None, clock=time.time, max_pages=10):
         if (
-            not isinstance(tokens, github_app.InstallationTokenSource)
+            not isinstance(tokens, (github_app.InstallationTokenSource, WorkflowTokenSource))
             or tokens.repository_id is None
             or tokens._api != github_app.API
+            # For job tokens this is the explicit trusted bootstrap's permission
+            # contract, not an assertion inferred from repository metadata.
             or tokens.permissions != {"contents": "write", "actions": "write"}
         ):
             raise ValueError("source execution requires a GitHub repository-ID-scoped token source")
@@ -99,7 +102,8 @@ class GitHubSourceExecution:
     def _post(self, frozen, path, payload=None, *, token=None):
         # No generic retrying API client: a lost POST response is not permission
         # to send the same dispatch again. The token is resource-scoped when minted,
-        # so a name reused between observation and POST cannot select another repo.
+        # (or by GitHub's native job-token contract), so a name reused between
+        # observation and POST cannot select another repo.
         return self.transport(
             "POST",
             GITHUB.api_url + "/repos/" + frozen.policy.execution.repository.name + path,
@@ -114,6 +118,12 @@ class GitHubSourceExecution:
 
     def preflight(self, frozen):
         try:
+            if isinstance(self.tokens, WorkflowTokenSource) and (
+                self.tokens.job.repository != frozen.policy.execution
+                or self.tokens.job.revision != frozen.request.workflow_revision
+                or self.tokens.job.branch != frozen.policy.execution_branch
+            ):
+                raise ValueError("workflow controller launch differs from the approved frozen caller")
             token = self.tokens.token()
             reader = self._reader(frozen, token=token)
             repository = reader.repository()
@@ -175,7 +185,7 @@ class GitHubSourceExecution:
             raise DispatchNotAccepted(
                 f"source CI dispatch refused with HTTP {status}",
                 retry_at=retry_at,
-                retryable=status == 401 or limited,
+                retryable=(status == 401 and not isinstance(self.tokens, WorkflowTokenSource)) or limited,
             )
         raise OSError("source CI dispatch outcome is unconfirmed")
 

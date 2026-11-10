@@ -1028,7 +1028,10 @@ class GitHub:
         return ""
 
     def issue_comments(self, pr: int) -> list[dict] | None:
-        """Complete GraphQL history in REST shape. Cache is triage-only; force reads bypass it."""
+        """Complete shared history in REST shape, with direct fallback when unavailable.
+
+        Fresh reads bypass the host cache; only a direct read context bypasses the mirror.
+        """
         from .github_state import read
 
         available, rows = read(self.repo, "issue_comments", number=pr)

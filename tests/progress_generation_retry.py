@@ -205,6 +205,106 @@ class GenerationRetryTests(unittest.TestCase):
         self.assertEqual(self.calls, ["plan", "facts"] * 3)
         self.assert_uncharged()
 
+    @staticmethod
+    def policy_fixture(commit="a"):
+        raw = json.dumps(
+            {"commits": {commit * 40: None}, "mappings": [], "schema": "tauceti-progress.migration/v1"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        digest = hashlib.sha256(raw).hexdigest()
+        return raw, {"history_migration_sha256": digest, "history_migration_file": f"plan.json.history-{digest}.json"}
+
+    def test_policy_is_promoted_before_plan_and_preserved_with_previous_paid_output(self):
+        raw, policy = self.policy_fixture()
+        old_raw, old_policy = self.policy_fixture("b")
+        (self.work / "plan.json").write_text(json.dumps({**PLAN, **old_policy}))
+        (self.work / old_policy["history_migration_file"]).write_bytes(old_raw)
+        (self.work / "status-body.md").write_text("previous paid prose")
+        original_run = self.run_tool
+        original_install = wu._install_progress_body
+
+        def prepared(stage, *args, **kwargs):
+            result = original_run(stage, *args, **kwargs)
+            if stage == "plan":
+                (Path(args[args.index("--out") + 1]).parent / policy["history_migration_file"]).write_bytes(raw)
+            return result
+
+        def install(source, target):
+            if target.name == "plan.json":
+                self.assertEqual((target.parent / policy["history_migration_file"]).read_bytes(), raw)
+            return original_install(source, target)
+
+        self.run_tool = prepared
+        with patch.dict(PLAN, policy), patch.object(wu, "_install_progress_body", side_effect=install):
+            self.assertEqual(self.drive_inner(), 0)
+        saved = list((self.root / "progress/mechanical").glob("attempt-*/previous"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual((saved[0] / old_policy["history_migration_file"]).read_bytes(), old_raw)
+        self.assertEqual((saved[0] / "status-body.md").read_text(), "previous paid prose")
+        self.assertEqual(publication.history_policy(self.work / "plan.json", verify=True).read_bytes(), raw)
+
+    def test_missing_or_corrupt_policy_prevents_paid_writing(self):
+        raw, policy = self.policy_fixture()
+        original_run = self.run_tool
+        for corrupt in (False, True):
+
+            def prepared(stage, *args, corrupt=corrupt, **kwargs):
+                result = original_run(stage, *args, **kwargs)
+                if stage == "plan" and corrupt:
+                    target = Path(args[args.index("--out") + 1]).parent / policy["history_migration_file"]
+                    target.write_bytes(raw + b"changed")
+                return result
+
+            self.run_tool = prepared
+            with patch.dict(PLAN, policy), self.assertRaises(DocumentationUnavailable):
+                self.drive_inner()
+            self.assertNotIn("writer", self.calls)
+            self.assert_uncharged()
+
+    def test_changed_policy_cannot_pay_again_for_parked_window(self):
+        saved = self.root / "progress/retained/parked"
+        saved.mkdir(parents=True)
+        (saved / "publication.json").write_text(json.dumps({"status": "parked"}))
+        (saved / "plan.json").write_text(json.dumps({**PLAN, "history_migration_sha256": "a" * 64}))
+        (saved / "status-body.md").write_text("previous paid prose")
+        with patch.dict(PLAN, history_migration_sha256="b" * 64):
+            self.assertIsNone(wu._prepare_progress(self.worker, self.run_tool, self.roadmap, self.work))
+        self.assertEqual(self.calls, ["plan"])
+        self.assertEqual((saved / "status-body.md").read_text(), "previous paid prose")
+        self.assert_uncharged()
+
+    def test_repaired_policy_is_new_identity_for_free_mechanical_retry(self):
+        old_raw, old_policy = self.policy_fixture("b")
+        raw, policy = self.policy_fixture()
+        original_run = self.run_tool
+        selected = 0
+
+        def prepared(stage, *args, **kwargs):
+            nonlocal selected
+            if stage == "plan":
+                selected += 1
+                current_raw, current = (old_raw, old_policy) if selected == 1 else (raw, policy)
+                with patch.dict(PLAN, current):
+                    result = original_run(stage, *args, **kwargs)
+                (Path(args[args.index("--out") + 1]).parent / current["history_migration_file"]).write_bytes(
+                    current_raw
+                )
+                return result
+            if selected == 1:
+                self.calls.append(stage)
+                return subprocess.CompletedProcess([], 78, "", "saved history migration invalid")
+            return original_run(stage, *args, **kwargs)
+
+        self.run_tool = prepared
+        self.assertEqual(self.drive_inner(), 0)
+        self.assertEqual(self.calls, ["plan", "facts", "plan", "facts", "prompt", "writer"])
+        self.assertEqual(
+            json.loads((self.work / "plan.json").read_text())["history_migration_sha256"],
+            policy["history_migration_sha256"],
+        )
+        self.assertEqual(self.values[PROGRESS_ERROR_KEY], 1)
+
     def test_pages_bundle_is_promoted_and_archived_with_plan(self):
         bundle, pin = self.pages_fixture()
         original_run = self.run_tool

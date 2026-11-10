@@ -227,6 +227,11 @@ with (
     assert len(bundles) == 1 and publication.fingerprints(bundles[0]) == original
     assert intent.exists()
     assert publication.parked_window(cfg, plan) == bundles[0]
+    assert (
+        publication.parked_window(cfg, {**plan, "history_migration_sha256": publication.EMPTY_HISTORY_POLICY})
+        == bundles[0]
+    )
+    assert publication.parked_window(cfg, {**plan, "history_migration_sha256": "e" * 64}) == bundles[0]
     assert publication.parked_window(cfg, {**plan, "to_sha": "c" * 40}) is None
     # Deterministic/stale reports are parked immediately.
     receipt = publication.save(cfg, "author", PROGRESS_REF)
@@ -332,6 +337,79 @@ with (
     else:
         raise AssertionError("bundle symlink accepted")
     (work / name).unlink()
+    (work / "plan.json").write_bytes(plan_bytes)
+    publication.save(cfg, "author", PROGRESS_REF)
+    for malformed in (None, 1, True, []):
+        (work / "plan.json").write_text(json.dumps(malformed))
+        try:
+            publication.history_policy(work / "plan.json")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("malformed saved policy plan accepted")
+    # Empty policies do not need a sibling, including plans with obsolete redundant metadata.
+    (work / "plan.json").write_text(
+        json.dumps(
+            {
+                **plan,
+                "history_migration_sha256": publication.EMPTY_HISTORY_POLICY,
+                "history_migration_file": "missing-empty-policy.json",
+            }
+        )
+    )
+    assert publication.history_policy(work / "plan.json", verify=True) is None
+    # History configuration travels through the same parking path without changing receipts.
+    policy_raw = b'{"commits":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":null},"mappings":[],"schema":"tauceti-progress.migration/v1"}'
+    policy_digest = hashlib.sha256(policy_raw).hexdigest()
+    policy_name = f"plan.json.history-{policy_digest}.json"
+    policy_plan = {**plan, "history_migration_sha256": policy_digest, "history_migration_file": policy_name}
+    (work / "plan.json").write_text(json.dumps(policy_plan))
+    (work / policy_name).write_bytes(policy_raw)
+    assert publication.history_policy(work / "plan.json", verify=True).read_bytes() == policy_raw
+    value = publication.save(cfg, "author", PROGRESS_REF)
+    parked = publication.park(cfg, value, "policy fixture")
+    assert (parked / policy_name).read_bytes() == policy_raw
+    assert publication.parked_window(cfg, policy_plan) is not None
+    assert publication.parked_window(cfg, {**policy_plan, "history_migration_sha256": "f" * 64}) is not None
+    assert git("show-ref", "--verify", "refs/heads/" + branch).returncode == 0
+    assert publication.fingerprints(parked) == value["files"]
+    assert publication.fingerprints(parked) == value["files"]
+    for unsafe in ("../outside.json", "/outside.json", "status-body.md"):
+        (work / "plan.json").write_text(json.dumps({**policy_plan, "history_migration_file": unsafe}))
+        try:
+            publication.history_policy(work / "plan.json")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsafe policy path accepted")
+    (work / "plan.json").write_text(json.dumps(policy_plan))
+    (work / policy_name).unlink()
+    (work / policy_name).symlink_to(state / "outside")
+    try:
+        publication.history_policy(work / "plan.json")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("policy symlink accepted")
+    (work / policy_name).unlink()
+    # Loss of this auxiliary file keeps publication authority and all paid prose for recovery.
+    value = publication.save(cfg, "author", PROGRESS_REF)
+    assert publication.retained(cfg)["files"] == value["files"]
+    before = set((state / "progress/retained").iterdir())
+    assert (
+        wu._apply_prepared_progress(
+            worker,
+            lambda *args, **kwargs: subprocess.CompletedProcess([], 78, "", "saved history migration missing"),
+            roadmap,
+            work,
+            value,
+        )
+        is None
+    )
+    (parked,) = set((state / "progress/retained").iterdir()) - before
+    assert publication.parked_window(cfg, {**policy_plan, "history_migration_sha256": "f" * 64}) is not None
+    assert not (parked / policy_name).exists()
+    assert publication.fingerprints(parked) == value["files"]
     (work / "plan.json").write_bytes(plan_bytes)
     publication.save(cfg, "author", PROGRESS_REF)
     # Receipt corruption or edited bodies preserve everything for recovery.

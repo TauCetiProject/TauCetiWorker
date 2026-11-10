@@ -111,6 +111,8 @@ class ServerConfig:
     # How often the background thread asks GitHub again about cached answers older than
     # `auth_cache_seconds`; 0 disables it.
     identity_revalidate_seconds: float = 300.0
+    native_webhooks: bool = False
+    prebound_socket: object | None = dataclasses.field(default=None, repr=False)
 
 
 def running_revision(package_dir: pathlib.Path | None = None) -> str:
@@ -223,7 +225,14 @@ class QueueHTTPServer(ThreadingHTTPServer):
                 raise ValueError("source-bound HTTP requires matching fresh native authority and repository")
         elif self.source_authority is not None:
             raise ValueError("native HTTP authority requires a source-bound controller")
-        super().__init__(address, handler)
+        bound = config.prebound_socket
+        super().__init__(address, handler, bind_and_activate=bound is None)
+        if bound is not None:
+            self.socket.close()
+            self.socket = bound
+            self.server_address = bound.getsockname()
+            self.server_name, self.server_port = str(self.server_address[0]), self.server_address[1]
+            self.server_activate()
         self.controller = controller
         self.config = config
         self.status_provider = status
@@ -238,6 +247,13 @@ class QueueHTTPServer(ThreadingHTTPServer):
                 review_app_id=config.review_app_id,
             )
         )
+        self.native_receiver = None
+        if self.source_authority is not None and config.native_webhooks:
+            from .forgejo_webhook import ForgejoWebhookReceiver
+
+            self.native_receiver = ForgejoWebhookReceiver(
+                controller, self.source_authority.source, config.webhook_secret
+            )
         store = config.store if config.store is not None else getattr(controller, "store", None)
         self.identity_store = store
         self.auth = (
@@ -469,9 +485,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authenticated_json(self):
         if self.server.source_authority is not None:
-            if NativeBearerAuth.token(self.headers.get("Authorization")) is None:
+            token = NativeBearerAuth.token(self.headers.get("Authorization"))
+            if token is None:
                 self.close_connection = True
                 return self._authenticated(), None  # Syntactic check only, before any body or source I/O.
+            try:
+                self.server.source_authority.require_control_credential(token)
+            except SourceAccessDenied as error:
+                self.close_connection = True
+                self._error(error.status, str(error))
+                return None, None
             # A slow request body must not keep an earlier native ACL grant.
             body = self._read_json()
             if body is not None and urllib.parse.urlsplit(self.path).path == "/tasks/claim":
@@ -513,6 +536,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b"ok\n", "text/plain")
         elif path in ("/status", "/status/"):
             self._call(self._status)
+        elif path == "/statistics":
+            self._call(self._statistics)
         elif path == "/healthz":
             self._call(self._healthz)
         elif path == "/settings":
@@ -534,6 +559,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib naming
         path = urllib.parse.urlsplit(self.path).path
+        if path == "/webhook/forgejo":
+            self._native_webhook()
+            return
         if self.server.source_authority is not None:
             refused = {
                 "/webhook/github": (404, "GitHub webhooks are not a native source authority"),
@@ -583,13 +611,14 @@ class Handler(BaseHTTPRequestHandler):
     def _counters(self) -> dict:
         adapter = self.server.config.adapter
         client = getattr(adapter, "client", None)
+        receiver = self.server.native_receiver or self.server.receiver
         return {
             "github": client.stats() if client is not None and hasattr(client, "stats") else {},
             "identities": self.server.identity_status(),
             "webhooks": {
-                "received": self.server.receiver.received if self.server.receiver else 0,
-                "duplicates": self.server.receiver.duplicates if self.server.receiver else 0,
-                "ignored": self.server.receiver.ignored if self.server.receiver else 0,
+                "received": receiver.received if receiver else 0,
+                "duplicates": receiver.duplicates if receiver else 0,
+                "ignored": receiver.ignored if receiver else 0,
             },
         }
 
@@ -661,6 +690,17 @@ class Handler(BaseHTTPRequestHandler):
             self._error(403, f"{login} is not a repository admin")
         return admin
 
+    def _statistics(self) -> dict:
+        from .statistics import snapshot
+
+        controller = self.server.controller
+        if self.server.source_authority is not None or not hasattr(controller, "store"):
+            raise ValueError("controller ledger statistics are unavailable")
+        repository = getattr(controller, "repository", None)
+        if repository not in self.server.config.repositories.values():
+            raise ValueError("repository statistics are not public")
+        return snapshot(controller.store.path, repository, controller.canonical_branch, now=self.server.config.clock())
+
     def _feed_reply(self, which: str, repo: str, query: dict) -> None:
         if self.server.source_authority is not None:
             self._error(503, "qualified native source feeds are not available")
@@ -716,11 +756,46 @@ class Handler(BaseHTTPRequestHandler):
         )
         try:
             disposition = self.server.receiver.handle(delivery)
-        except Exception:  # noqa: BLE001 - GitHub retries on 5xx; the failure is logged for the operator
+        except Exception:  # noqa: BLE001 - failed deliveries need explicit redelivery or reconciliation
             log.error("webhook %s %s failed:\n%s", delivery.event, delivery.delivery_id, traceback.format_exc())
             self._error(500, "delivery failed")
             return
         self._json(202, {"result": disposition})
+
+    def _native_webhook(self):
+        receiver = self.server.native_receiver
+        if receiver is None:
+            self._error(404, "native source notifications are unavailable")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._error(400, "invalid native notification length")
+            self.close_connection = True
+            return
+        if not 0 <= length <= 1024 * 1024:
+            self._error(413, "native notification exceeds one MiB")
+            self.close_connection = True
+            return
+        body = self._read_body()
+        if body is None:
+            return
+        try:
+            result = receiver.handle(
+                body,
+                event=self.headers.get("X-Forgejo-Event", ""),
+                delivery=self.headers.get("X-Forgejo-Delivery", ""),
+                signature=self.headers.get("X-Forgejo-Signature", ""),
+            )
+        except PermissionError as error:
+            self._error(401, str(error))
+        except ValueError as error:
+            self._error(400, str(error))
+        except Exception:
+            log.exception("native source invalidation failed")
+            self._error(503, "source invalidation was not recorded; redeliver")
+        else:
+            self._json(202, {"result": result})
 
     def _worker_identity(self, body: dict) -> str:
         return str(body.get("worker") or self.headers.get("X-TauCeti-Worker") or "")
