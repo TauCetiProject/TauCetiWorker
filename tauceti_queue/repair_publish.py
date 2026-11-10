@@ -323,6 +323,7 @@ def write_early_settings(
             "task_id": task_id,
             "repository": repository,
             "lake": list(lake),
+            "python": sys.executable,
         },
     )
 
@@ -432,6 +433,7 @@ def start_early(worktree: Path, env: dict) -> dict | None:
             lake=lake,
             remove_worktree=False,
             frozen=frozen,
+            python=config.get("python"),
         )
         if record.get("launched"):
             stage = None  # the independent publisher now owns the immutable snapshot
@@ -628,6 +630,7 @@ def start_background(
     nice: int = NICE,
     systemd: bool | None = None,
     frozen: dict | None = None,
+    python: str | None = None,
 ) -> dict:
     """Publish the worktree's outputs for ``revision`` in a process of its own and return at once.
 
@@ -675,7 +678,9 @@ def start_background(
         spec["frozen"] = frozen
     child_env = dict(env)
     child_env["PYTHONPATH"] = os.pathsep.join(p for p in (str(PROJECT_ROOT), env.get("PYTHONPATH")) if p)
-    argv = [sys.executable, "-m", "tauceti_queue.repair_publish", str(logdir / SPEC)]
+    # Agent helpers may run with the system Python, which lacks worker dependencies.
+    # The worker captures its own installed runtime before handing work to helpers.
+    argv = [python or sys.executable, "-m", "tauceti_queue.repair_publish", str(logdir / SPEC)]
     proc: subprocess.Popen | None = None
     try:
         repair.write_record(logdir / SPEC, spec)
@@ -725,13 +730,28 @@ def start_background(
 
 
 def run_spec(spec_path: Path) -> int:
-    from tauceti_queue.repair_cache import cache_lease
-    from tauceti_queue.repair_cleanup import worktree_lease
-
     spec = json.loads(spec_path.read_text())
-    root = Path(spec["worktree"]).parent.parent
-    with cache_lease(Path(spec.get("cache_root", root))), worktree_lease(root, spec["task_id"]):
-        return _run_spec(spec_path)
+    try:
+        from tauceti_queue.repair_cache import cache_lease
+        from tauceti_queue.repair_cleanup import worktree_lease
+
+        root = Path(spec["worktree"]).parent.parent
+        with cache_lease(Path(spec.get("cache_root", root))), worktree_lease(root, spec["task_id"]):
+            return _run_spec(spec_path)
+    except Exception as error:
+        # Startup/import failures must release the submission-time fallback too.
+        record = dict(
+            spec["record"],
+            state="failed",
+            published=False,
+            error=f"publisher startup: {type(error).__name__}: {error}",
+            finished_at=time.time(),
+        )
+        repair.write_record(Path(record["record"]), record)
+        if spec.get("frozen"):
+            shutil.rmtree(spec["frozen"]["path"], ignore_errors=True)
+        log(record["error"])
+        return 1
 
 
 def _run_spec(spec_path: Path) -> int:
