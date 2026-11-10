@@ -5143,7 +5143,8 @@ class Controller:
         """Reuse the durable outbox and existing intent-only workflow, without a retry limit."""
         if self.candidate_ci is not None:
             return  # native execution receipts use their existing result protocol
-        key = f"status-delivery:{attempt['id']}"
+        run_attempt = run.attempt or 1
+        key = f"status-delivery:{attempt['id']}:{run.run_id}:{run_attempt}"
         existing = self.store.row("outbox", {"key": key})
         if existing is None:
             self._enqueue(
@@ -5152,7 +5153,7 @@ class Controller:
                 {
                     "attempt_id": attempt["id"],
                     "run_id": run.run_id,
-                    "run_attempt": run.attempt or 1,
+                    "run_attempt": run_attempt,
                     "base_ref": attempt["base_ref"],
                 },
             )
@@ -6570,6 +6571,7 @@ class Controller:
                 or attempt["batch_version"] != head["version"]
                 or attempt["outcome"] != OUTCOME_PENDING
                 or attempt["run_id"] != payload["run_id"]
+                or (attempt["run_attempt"] or 1) != payload["run_attempt"]
             ):
                 return "superseded status delivery"
             self.execution.retry_status_delivery(

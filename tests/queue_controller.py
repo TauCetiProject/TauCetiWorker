@@ -273,6 +273,19 @@ class Verdicts(ControllerCase):
         self.assertEqual(self.attempt(head)["outcome"], "pending")
         self.assertEqual(len(self.github.dispatches), 1)
 
+    def test_reporting_uses_the_observed_run_attempt_after_a_rerun(self):
+        self.github.fail_next["retry_status_delivery"] = 1
+        head, attempt = self.observe("build-only")
+        run = self.github.runs[0]
+        run.attempt = 2
+        self.clock.advance(LOG_GRACE_SECONDS + 1)
+        self.controller._observe_attempt(head, attempt, self.clock())
+        before = len(self.github.calls)
+        self.controller.tick()
+        self.assertEqual([args[2] for name, args in self.github.calls[before:] if name == "retry_status_delivery"], [2])
+        self.assertEqual(self.attempt(head)["id"], attempt["id"])
+        self.assertEqual(len(self.github.dispatches), 1)
+
     def test_delayed_build_status_can_land_without_redispatch(self):
         head, attempt = self.observe("no-status")
         self.assertEqual(attempt["outcome"], "pending")
