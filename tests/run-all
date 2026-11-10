@@ -131,6 +131,7 @@ RUN_STDLIB=(
   verification_storage.py
   ledger_blocking.py
   loop_sigterm.py
+  macos_token_route.py
   mirror_creds.py
   mirror_creds_macos.py
   oauth_refresh_loop.py

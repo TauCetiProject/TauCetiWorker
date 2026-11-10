@@ -997,8 +997,11 @@ def mirror_creds(cfg: Config) -> None:
     — so returning early for the whole function left an isolated macOS worker pinned to whatever account
     was seeded, forever: never re-synced after an operator account switch, and still holding the real
     refresh token the once-only seed copied verbatim, which is exactly what this function exists to
-    strip."""
-    if sys.platform != "darwin":
+    strip.
+
+    With a usage login (claude_usage_credentials) the agents' Claude credential is a file on macOS as
+    well, the one isolate_home seeded from, and it is mirrored there as on every other platform."""
+    if sys.platform != "darwin" or claude_usage_credentials() is not None:
         iso_claude = claude_dir(cfg.home)
         src_claude = _read_marker(iso_claude / ".tauceti-creds-source")
         if src_claude:

@@ -53,6 +53,7 @@ from .quota import (
     _safe_exists,
     _write_json_atomic,
     claude_dir,
+    claude_usage_credentials,
     codex_dir,
     mirror_creds,
 )
@@ -2220,6 +2221,9 @@ def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
     host review process. If the Keychain is unavailable, copy an existing configured credential file into
     the private directory as the same fallback the old in-place handoff provided.
 
+    With a usage login (claude_usage_credentials) the configured file is the agents' credential and is
+    staged without a Keychain read.
+
     The caller owns and must remove the returned directory."""
     if sys.platform != "darwin":
         return None  # Linux/Windows: the configured file is the store; Bubble reads it directly
@@ -2230,7 +2234,17 @@ def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
         shutil.rmtree(stale, ignore_errors=True)
 
     source = claude_dir(cfg.home) / ".credentials.json"
-    blob = _claude_keychain_creds_interactive()
+    if claude_usage_credentials() is not None:
+        # The configured file is the agents' credential here; the Keychain item for the default config
+        # directory is at most the operator's own sign-in.
+        blob = _read_json_file(source)
+        if not (blob or {}).get("claudeAiOauth"):
+            raise Die(
+                f"no Claude credentials to seed the bubble: none in {source}, the file agents launch from "
+                "when $TAUCETI_CLAUDE_USAGE_CREDENTIALS names a usage login"
+            )
+    else:
+        blob = _claude_keychain_creds_interactive()
     if not (blob or {}).get("claudeAiOauth"):
         blob = _read_json_file(source)
         if (blob or {}).get("claudeAiOauth"):

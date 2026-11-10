@@ -183,6 +183,14 @@ plain file on every platform: on macOS the Keychain is not consulted for it and
 `--auto-refresh` applies to it. It must not be a copy of a login that another
 `claude` also uses.
 
+On macOS the variable also makes the token file the agents' credential for the
+worker, as it is elsewhere: the file is mirrored into isolated workers, and a
+bubble round is seeded from it, so the worker reads no Claude item from the
+Keychain. Claude Code itself still looks first for a Keychain item belonging to
+the config directory it is given and reads the file when there is none, so the
+token directory, and an isolated worker's copy of it, must be directories nobody
+has signed in to with `claude`.
+
 Workers naming the same usage login share its observations, fetch lock and
 cooldowns under `<usage login directory>/.tauceti-quota/usage/`, exactly as
 workers sharing a credential source do. Model-limit refusals are recorded against
