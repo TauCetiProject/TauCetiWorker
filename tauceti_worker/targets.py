@@ -9,6 +9,7 @@ the worker uses:
     landed_pr(item, gh)                the merged pull request that completed an item, at any age
     render_assignment(targets, item)   the roadmap prompt's bullet assigning one item
     marker_stem(item)                  what the pull request body must contain for that item
+    rewrite_item(text, item, status)   the file's text with one item line changed, for the curate phase
 
 `parse_targets`, `marker_keys`, `landed`, `overlay_live`, `eligible_items` and `eligible_areas`
 are the pure pieces those are built from; none of them reads GitHub or the environment.
@@ -156,6 +157,16 @@ def partial_prs(item: TargetItem) -> set[int]:
     }
 
 
+def inflight_pr(item: TargetItem) -> int | None:
+    """The pull request an item's `in flight: #N` clause names."""
+    for clause in item.meta:
+        key, _, value = clause.partition(":")
+        number = re.search(r"#(\d+)", value)
+        if key.strip().lower() == "in flight" and number:
+            return int(number.group(1))
+    return None
+
+
 def overlay_live(targets: Targets, inflight: set[Key], done: set[Key]) -> Targets:
     """The list with each item at its effective status: done if the file says so or its key is in
     `done`; else in flight if the file says so or its key is in `inflight`; else open."""
@@ -247,6 +258,35 @@ def render_item(targets: Targets, item: TargetItem) -> str:
         needs.append(f"`{slug}` {_BOX[dep.status] if dep else '[?]'}")
     clauses = [*item.meta, "needs: " + (", ".join(needs) or "none")]
     return f"- {_BOX[item.status]} `{item.slug}` — {item.text} ({'; '.join(clauses)})"
+
+
+def rewrite_item(text: str, item: TargetItem, status: str, *, drop: Iterable[str] = (), add: Iterable[str] = ()) -> str:
+    """`text` with `item`'s line set to `status`, its clauses whose key is in `drop` removed and the
+    `add` clauses appended. Every other line is returned as it was, and so is the whole text when
+    it no longer has the item. A clause in `add` holds no `;` and no parentheses."""
+    dropped = {key.strip().lower() for key in drop}
+    lines = text.splitlines(keepends=True)
+    area = None
+    for n, line in enumerate(lines):
+        heading = _HEADING_RE.match(line)
+        if heading:
+            area = heading.group(1) if _AREA_RE.fullmatch(heading.group(1)) else None
+            continue
+        found = _parse_item(line, area) if area == item.area else None
+        if found is None or found.slug != item.slug:
+            continue
+        body = line.rstrip("\r\n")
+        box = _ITEM_RE.match(body)
+        body = body[: box.start(1)] + _BOX[status][1] + body[box.end(1) :]
+        clauses: list[str] = []
+        group = _META_RE.search(body)
+        if group:
+            clauses = [c for c in (c.strip() for c in group.group(1).split(";")) if c]
+            body = body[: group.start()]
+        clauses = [c for c in clauses if c.partition(":")[0].strip().lower() not in dropped] + list(add)
+        lines[n] = body.rstrip() + (f" ({'; '.join(clauses)})" if clauses else "") + line[len(line.rstrip("\r\n")) :]
+        break
+    return "".join(lines)
 
 
 def marker_stem(item: TargetItem) -> str:

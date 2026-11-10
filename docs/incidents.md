@@ -1,12 +1,15 @@
 # Incident records
 
 An incident record is a small JSON file a worker writes when a round concludes
-something about a pull request that GitHub does not show. Two kinds exist:
+something about a pull request that GitHub does not show. Three kinds exist:
 
 - `declined`: a `rebase`, `fix`, or `fix-ci` round finished and left no push,
   closure, or reply. The record keeps the agent's final message.
 - `budget-spent`: a stage has used its attempts on a pull request and will not
   take it again at that head.
+- `target-closed`: a [target list](target-lists.md) shows an item in flight on
+  a pull request that closed unmerged, and nothing on record says what replaced
+  it.
 
 Nothing is written unless `TAUCETI_INCIDENTS_DIR` is set, and records alone
 change no selection.
@@ -42,17 +45,22 @@ Every record has:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `schema` | string | `tauceti-incident/v1` |
-| `kind` | string | `declined` or `budget-spent` |
-| `key` | string | `<stage>-<pr>` for both kinds |
+| `kind` | string | `declined`, `budget-spent` or `target-closed` |
+| `key` | string | `<stage>-<pr>`; `<slug>-<pr>` for `target-closed` |
 | `worker` | string | Id of the worker that wrote the file last |
 | `first_at`, `last_at` | string | UTC times of the first and the latest write, `YYYY-MM-DDTHH:MM:SSZ` |
 | `count` | integer | Number of times the live file has been written |
 | `repository` | string | `owner/name` of the pull request's repository |
-| `stage` | string | `rebase`, `fix`, or `fix-ci` |
 | `pr` | integer | Pull request number |
+
+`declined` and `budget-spent` records add:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `stage` | string | `rebase`, `fix`, or `fix-ci` |
 | `head` | string | Full head commit the record is about |
 
-A `declined` record adds:
+A `declined` record also has:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -62,8 +70,16 @@ A `declined` record adds:
 | `mentions` | integer list | Other pull requests the message refers to as `#N` |
 | `transcript` | string | The round's transcript file on the worker's host; its log directory for a streamed round |
 
-A `budget-spent` record adds `detail`, one line naming the survey's reason and
-the attempts used.
+A `budget-spent` record also has `detail`, one line naming the survey's reason
+and the attempts used.
+
+A `target-closed` record adds:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `list` | string | Path of the target list on the worker's host |
+| `area`, `slug` | string | The item |
+| `detail` | string | One line naming the item, the pull request, and the two ways to settle it |
 
 ```json
 {
@@ -106,6 +122,13 @@ left alone, and a new head writes a new live record. Attempt budgets are kept
 per worker, so the record is the first worker's; another worker may still have
 attempts for that head. `--dry-run` writes nothing.
 
+**`target-closed`.** By the [`curate` phase](target-lists.md#curation), for a
+`[~]` item whose `in flight: #N` pull request closed without merging, unless a
+`declined` record about that pull request names replacements that have all
+merged; the item is then marked done instead. One write per item and pull
+request: a record that exists, live or acknowledged, is left alone. Settle it
+by editing the item to `[ ]` or `[x]` in the list.
+
 ## Holding a declined head
 
 With `TAUCETI_HOLD_DECLINED=1`, a stage takes no further round on a pull request
@@ -122,8 +145,10 @@ pull request the account authored: a held head is left for a person.
 ## Stale records
 
 The worker does not remove a record when its pull request merges, closes, or
-gets a new head. A record is about `head`; compare it with the live pull request
-before acting on it.
+gets a new head, or when a list's item is settled. A `declined` or
+`budget-spent` record is about `head`; compare it with the live pull request
+before acting on it. Compare a `target-closed` record with the item's line in
+the list.
 
 ## Reading and writing from code
 
@@ -135,7 +160,8 @@ before acting on it.
 | `record(kind, key, **fields)` | Write or refresh a live record; returns its path, or `None` when off or the write failed |
 | `find(kind, key)` | The live and the acknowledged record of that name, where they exist |
 | `records(kind="", acked=True)` | Every readable record with its path, live ones first |
-| `record_declined(...)`, `note_budget_spent(...)` | The two kinds above |
+| `record_declined(...)`, `note_budget_spent(...)`, `note_target_closed(...)` | The three kinds above |
 | `declined(stage, pr, head)` | Whether the hold applies |
+| `subsumed_by(pr)` | The pull requests the latest `declined` record about `pr` names on its `Subsumed-by:` line |
 
 A new kind needs only a name and a key that is unique within it.

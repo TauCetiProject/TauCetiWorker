@@ -43,12 +43,15 @@ first `## ` heading is shown to the agent with the items of its area.
 - A trailing parenthesised group holds `key: value` clauses separated by `;`,
   with no parentheses inside. `needs:` is a comma list of slugs from any area,
   or `none`. `partial: #N, #M` names merged pull requests that did not complete
-  the item. Every other clause is passed to the agent as written.
+  the item. `in flight: #N` on a `[~]` item names the pull request it waits on,
+  which is how [curation](#curation) follows it. Every other clause is passed
+  to the agent as written.
 - An item line that does not parse is logged and skipped. A `needs:` slug the
   file never defines is logged and blocks nothing.
 
 The file is read at the start of each roadmap round, so an edit takes effect on
-the next round. The worker never writes to it.
+the next round. A worker writes to it only in the `curate` phase, which is off
+unless a worker's `only` names it (see [Curation](#curation)).
 
 ## Live statuses
 
@@ -65,8 +68,8 @@ The overlay only moves an item forward: `[x]` in the file stays done and `[~]`
 stays in flight until the file changes. The merged side reads the 200 most
 recently updated closed pull requests that carry a target marker. An older
 landing is still found before its item is assigned again (see below), but it
-no longer unlocks the items that need it, so tick an item `[x]` in the file to
-make its landing permanent.
+no longer unlocks the items that need it, so an item's landing is permanent
+only once the file says `[x]`: by hand, or through [curation](#curation).
 
 ## Selection
 
@@ -96,6 +99,72 @@ A roadmap round under a list costs one listing of open pull requests, one
 search for recent landings, and one search and one claim push per candidate
 tried. The searches are shared between workers of one account on a host for two
 minutes.
+
+## Curation
+
+`curate` is a phase that keeps the file true. It is explicit: a round considers
+it only when the worker's `only` names it, for example
+`only = ["roadmap", "curate"]`, and only with a target list set. Such a round
+looks at the list first when a look is due, which is once every
+`TAUCETI_CURATE_GAP` seconds (six hours by default) for all the workers that
+share the file on one host. A look that changes the file is the round's work;
+after one that changes nothing the round goes on to its other phases. A round
+given `--pr` does not curate. One worker per list is enough.
+
+A look makes these edits, each to one item line; every other line stays as it
+was:
+
+| What it finds | The item becomes |
+| --- | --- |
+| A merged pull request completes the item by its marker, under the rules of [Live statuses](#live-statuses) | `[x]`, with `landed: #N` |
+| The pull request a `[~]` item names in `in flight: #N` merged | `[x]`, with `landed: #N` |
+| That pull request merged, but its marker for the item says `"partial":true` | `[ ]`, with `#N` added to `partial:` |
+| That pull request closed unmerged, and a `declined` [incident record](incidents.md) about it names the pull requests that replaced it, all of them merged | `[x]`, with `subsumed by: #M; closed: #N` |
+| That pull request closed unmerged, with no such record | unchanged; a `target-closed` incident record asks the operator to mark it `[ ]` or `[x]` |
+| A model confirms that main already has an eligible item (below) | `[x]`, with `landed elsewhere: <file> <declaration>` |
+
+An `in flight:` clause is removed when its item is settled. The merged side
+reads the 1000 most recently updated closed pull requests that carry a marker.
+
+**Landed elsewhere.** A milestone can land without any pull request naming it.
+For each eligible item, the worker searches a fresh shallow checkout of main
+for declarations of the Lean names the description quotes in backticks (dotted,
+capitalised or with an underscore), and of the slug's words in any case with or
+without underscores between them. An item qualifies when every quoted name is
+declared, or the slug is. Up to `TAUCETI_CURATE_MAX_CANDIDATES` qualifying
+items (12 by default), in file order, go to one host agent with those hits; it
+reads the checkout and answers per item with `landed` and, when true, a file
+and a declaration. The worker ticks the item only if that file of the checkout
+declares that name, and writes the file and name it checked, so the list gains
+nothing else of the model's answer. An item found not landed is not asked about again
+until the declarations found for it change. This is the phase's only model
+call, with the worker's authoring model; a look with no qualifying item starts
+no model.
+
+**Writing.** A look holds `.<file name>.lock` beside the list from start to
+end, so two workers on a host never curate one file at once; the lock file's
+modification time is what shares the gap between them. Each write merges the
+edit three ways with the file as it then is, so a change made by hand while the
+look ran is kept; if both changed the same or adjacent lines nothing is written
+and the next look starts from the new file. The file is replaced by a rename.
+
+When the list is tracked in a git repository, the worker also runs git in that
+clone with the clone's own identity and credentials: before reading and before
+writing it fetches the branch the current branch tracks and rebases onto it,
+then commits the list alone as `Curate <file name>: N item(s)` with one line
+per item, and pushes to that branch, once more after a rebase if the remote
+moved first. That is how workers on several hosts share one list: each keeps a
+clone, and their edits meet through the remote. Give the list a clone of its
+own, since the rebase moves the whole checkout. A clone with uncommitted
+changes to tracked files is not rebased, a rebase that conflicts is aborted
+and logged, and a commit that cannot be pushed goes with the next look. A
+branch that tracks nothing is committed and not pushed. Add the lock file to
+`.gitignore`.
+
+A look costs one search for merged markers, one listing of open pull requests,
+one read per `in flight:` clause and per replacement a record names, and, when
+an item is eligible, a shallow fetch of main and one `git grep` per quoted name
+and per slug.
 
 ## What the agent sees
 

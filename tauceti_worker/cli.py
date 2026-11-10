@@ -1329,6 +1329,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         from .targets import load_targets
 
         load_targets(roadmap_targets())
+    if "curate" in only and roadmap_targets() is None:
+        raise Die("--only curate needs a target list: pass --roadmap-targets FILE")
     # --extra-roadmap-prompt likewise: validated here, at the boundary, then read live by do_roadmap via
     # extra_roadmap_prompt() so loop children see it without a flag of their own.
     if getattr(args, "extra_roadmap_prompt", None) is not None:
@@ -1709,7 +1711,9 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     # engine and never compiles (same reason it's excluded from the fork preflight below). Excluding it
     # keeps a host-default `--only review` worker from being falsely blocked on a machine with no toolchain.
     needs_host_build = any(
-        (not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s) and s not in ("review", "overlap-scan")
+        (not _bubble(s, opts))
+        for s in WORK_TASKS
+        if want(opts.only, s) and s not in ("review", "overlap-scan", "curate")
     )
     if needs_host_build:
         from .agents import lake_cache_max_revs

@@ -67,6 +67,7 @@ from .constants import (
     CONTEST_CLAIM_TTL,
     EX_CLAIM_COLLISION,
     EX_NOPROGRESS,
+    EXPLICIT_TASKS,
     MAX_CI_PR_ATTEMPTS,
     MAX_FIX_ATTEMPTS,
     MAX_INFRA_REFUNDS,
@@ -148,7 +149,7 @@ def want(only: list[str], task: str) -> bool:
             return False
         if task == "security-audit" and not project.feature("security_audit"):
             return False
-    if task == "security-audit":
+    if task in EXPLICIT_TASKS:
         return task in only
     return (not only) or (task in only)
 
@@ -622,6 +623,18 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
     claim_collision = False
     from .state_repair import retry_key
 
+    # `curate` is about the operator's target list, not a pull request, so like `roadmap` it is
+    # dispatched outside the candidate lists and a `--pr` round does not do it. It goes first because
+    # its own gap keeps it to a few rounds a day and what it ticks decides what authoring may take. A
+    # curation that changes nothing declines, and the round goes on.
+    curation = Candidate(0, "", "")
+    if want(opts.only, "curate") and not getattr(opts, "prs", ()):
+        from .curate import due
+
+        curate_due, curation.reason = due(w.counters)
+        if curate_due and (rc := dispatch("curate", w, sv, curation, opts)) is not None:
+            return rc
+
     for stage, c in cascade(sv, [stage for stage in round_stages(opts) if want(opts.only, stage)]):
         if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
             w.selection_changed = True
@@ -699,6 +712,8 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
     for stage in ("overlap-fix", "overlap-scan"):
         if stage in opts.only and sv.kind(stage).suppressed:
             raise NoProgress(f"{stage}: {sv.kind(stage).suppressed[0].reason}")
+    if opts.only == ["curate"] and curation.reason:
+        raise NoProgress(f"curate: {curation.reason}")
     error = ClaimCollision if claim_collision or w.selection_changed else NoProgress
     raise error(f"no eligible work this round under {scope}")
 
@@ -1161,7 +1176,7 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
         "progress": (PROGRESS_ERROR_KEY,),
     }.get(stage, ())
     before = {key: w.counters.read(key) for key in keys}
-    admission_keys = (*keys, "progress-attempt-ts") if stage == "progress" else keys
+    admission_keys = (*keys, f"{stage}-attempt-ts") if stage in ("progress", "curate") else keys
     admission_before = {key: w.counters.read(key) for key in admission_keys}
     foreign_receipt = (
         w.cfg.state / f"rebase-foreign-launch-{pr}.json"
@@ -1342,6 +1357,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         "roadmap": do_roadmap,
         "overlap-scan": do_overlap_scan,
         "overlap-fix": do_overlap_fix,
+        "curate": do_curate,
     }[stage]
     # Announce the round up front so the log says what was chosen, on which PR (as a clickable URL),
     # with which agent and sandbox — the same line for every stage.
@@ -1472,6 +1488,12 @@ def do_overlap_fix(w, sv, c, opts, bubble):
     from .overlaps import do_fix
 
     return do_fix(w, sv, c, opts, bubble)
+
+
+def do_curate(w, sv, c, opts, bubble):
+    from .curate import run
+
+    return run(w, c, _effective_authoring_profile(opts))
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int | None:

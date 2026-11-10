@@ -22,6 +22,7 @@ SCHEMA = "tauceti-incident/v1"
 ACKED = "acked"
 DECLINED = "declined"
 BUDGET_SPENT = "budget-spent"
+TARGET_CLOSED = "target-closed"
 # The stages whose rounds leave these records: the ones that repair an existing pull request head.
 STAGES = ("rebase", "fix", "fix-ci")
 HELD = "an earlier round declined at this head; waiting for a new head"
@@ -161,3 +162,25 @@ def note_budget_spent(stage: str, pr: int, head: str, detail: str) -> None:
     if any(value.get("head") == head for value in find(BUDGET_SPENT, f"{stage}-{pr}")):
         return
     record(BUDGET_SPENT, f"{stage}-{pr}", repository=TAUCETI, stage=stage, pr=pr, head=head, detail=detail)
+
+
+def subsumed_by(pr: int) -> list[int]:
+    """The pull requests that the latest `declined` record about `pr` with a `Subsumed-by:` line
+    names on it, whichever stage wrote the record and whether or not it is acknowledged."""
+    named = [
+        value
+        for _, value in records(DECLINED)
+        if value.get("pr") == pr and isinstance(value.get("subsumed_by"), list) and value["subsumed_by"]
+    ]
+    latest = max(named, key=lambda value: str(value.get("last_at") or ""), default={})
+    return [n for n in latest.get("subsumed_by", []) if type(n) is int]
+
+
+def note_target_closed(path: Path, area: str, slug: str, pr: int) -> None:
+    """Record that the target list at `path` shows `slug` in flight on `pr`, which closed unmerged
+    with nothing on record replacing it. One write per item and pull request, as for a spent budget."""
+    key = f"{slug}-{pr}"
+    if find(TARGET_CLOSED, key):
+        return
+    detail = f"`{slug}` is in flight on #{pr}, which closed without merging; mark it `[ ]` to author it again or `[x]` if it is done"
+    record(TARGET_CLOSED, key, repository=TAUCETI, pr=pr, list=str(path), area=area, slug=slug, detail=detail)
