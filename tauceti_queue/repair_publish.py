@@ -1,44 +1,15 @@
-"""Publish a repair's build outputs to the workers' own Lake cache namespace.
+"""Publish native Lake outputs without another whole-library graph scan.
 
-After a repair's final green ``lake build`` the worktree holds every module's outputs for the chain
-tip. Publishing them under the tip's revision lets the next repair round on the same head, and the
-next head's agent, start warm instead of rebuilding what this repair already built. CI fetches from
-this namespace only the exact staging head (TauCetiTools ``repair-cache-get.sh``) and Lake checks every
-trace, so nothing published here changes a CI verdict.
+The final build writes .lake/outputs.jsonl. Native `lake cache stage` freezes
+its complete artifacts outside the disposable worktree; stock `put-staged`
+uploads them with explicit repository, revision and toolchain and never loads
+workspace configuration. The write key reaches only the native upload process.
+Lake uploads artifacts before the revision map. Failures remain visible in
+existing publication records and never change the compilation/audit verdict.
 
-The namespace is two Lake cache services written into the private pool's ``lake.toml``:
-
-- ``tauceti-repair`` (``TAUCETI_REPAIR_CACHE_URL``), the read side, which ``prepare_artifacts``
-  consults for the task's ``tip``, ``onto`` and ``base`` before the public service; Lake fetches
-  without credentials, so this is a publicly readable endpoint;
-- ``tauceti-repair-upload`` (``TAUCETI_REPAIR_CACHE_UPLOAD_URL``, default the read URL), the S3
-  write side of the same bucket, which ``lake cache put`` signs with the key.
-
-Each base URL holds ``artifacts/`` and ``revisions/``, laid out as the public cache is
-(``revisions/<owner>/<repo>/tc/<toolchain>/<rev>.jsonl``, through ``--repo``). The write key (the
-``access-key-id:secret`` pair ``lake cache put`` takes as ``LAKE_CACHE_KEY``) is read from the file
-named by ``TAUCETI_REPAIR_CACHE_KEY_FILE`` and given only to the ``lake cache put`` process: it is
-never in the worker's environment, so the agent, which inherits that environment, never holds it.
-Use a bucket of its own with a token scoped to it, so the key cannot write the public cache.
-
-``TAUCETI_QUEUE_PUBLISH_CACHE`` turns publication on or off; unset, it is on when the key file and an
-upload URL are configured. Publication never fails a task: every failure is logged and recorded.
-
-``TAUCETI_REPAIR_PUBLISH=after`` (default) starts an immutable background upload after a green
-whole-library build, overlapping audits and lint. At submission the worker reuses that exact
-revision's upload without waiting; a failed/missing upload or changed revision uses the existing
-after-submission publisher. ``before`` retains synchronous publication before push; ``off`` publishes
-nothing. Early publication is compilation reuse, never an audit verdict. The background publisher
-outlives the worker: under systemd it runs in a transient unit of its own (``systemd-run --user``,
-since the worker unit's ``KillMode=mixed`` kills every process left in its cgroup on a stop),
-elsewhere in a new session. Early records are under ``logs/publications/<revision>/``; the frozen
-hardlink snapshot is removed on completion or by terminal task cleanup after a crash. Late records
-remain at ``logs/publish.json`` and the late publisher removes its source worktree. ``background_status`` reports what it did in
-``worker.json``. Both commands run under ``nice`` so a concurrent repair or build on the host keeps
-the CPU. ``lake cache put`` uploads every artifact before the revision mapping and exits without
-writing the mapping when an artifact upload fails, so the fetcher (TauCetiTools
-``repair-cache-get.sh``, for which a missing mapping is the normal case) never sees a mapping for a
-partially uploaded set; a publisher killed mid-upload leaves no mapping either.
+Early publication can overlap checks. An independent transient unit owns its
+immutable staging directory and removes it on completion. The late fallback
+uses the same native path and removes its source worktree when finished.
 """
 
 from __future__ import annotations
@@ -48,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -60,7 +32,7 @@ from tauceti_queue import repair
 SERVICE = "tauceti-repair"
 UPLOAD_SERVICE = "tauceti-repair-upload"
 PUBLISH_TIMEOUT = 1800.0  # seconds for the upload itself
-CHECK_TIMEOUT = 900.0  # seconds for the `--no-build` pass that writes the output map
+CHECK_TIMEOUT = 900.0  # seconds to stage the final build map
 TRUE = ("1", "true", "yes", "on")
 FALSE = ("0", "false", "no", "off")
 WHEN = ("after", "before", "off")  # TAUCETI_REPAIR_PUBLISH: after the submission, before the push, never
@@ -201,21 +173,43 @@ def warm(settings: Settings, task) -> tuple[tuple[str, str], ...]:
     return tuple((settings.service, revision) for revision in ordered if revision)
 
 
-def _artifact_bytes(mapping: Path, artifacts: Path) -> tuple[int, int]:
-    """Count and total size of the artifacts the output map names (rows ``[input, artifact]``)."""
-    count = size = 0
-    for line in mapping.read_text(errors="replace").splitlines():
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(row, list) and len(row) >= 2 and isinstance(row[1], str):
-            count += 1
-            try:
-                size += (artifacts / row[1]).stat().st_size
-            except OSError:
-                pass
-    return count, size
+def validate_native_stage(stage: Path) -> None:
+    """Keep only the native flat file boundary before credentials are available.
+
+    The build and native staging processes have exited under the build lock;
+    Lake owns artifact validity. Do not follow any supplied path or special file.
+    """
+    fd = os.open(stage / "outputs.jsonl", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError("native staging accepts only ordinary files")
+        raw = handle.read(16 * 1024**2 + 1)
+    if len(raw) > 16 * 1024**2:
+        raise ValueError("oversized native output map")
+    header, *lines = raw.decode().splitlines()
+    if json.loads(header) != "2026-03-17" or not lines:
+        raise ValueError("unsupported or empty native output map")
+    names = {"outputs.jsonl"}
+    inputs = set()
+    for line in lines:
+        row = json.loads(line)
+        if (
+            not isinstance(row, list)
+            or len(row) != 2
+            or not isinstance(row[0], str)
+            or not re.fullmatch(r"[0-9a-f]{16}", row[0])
+            or row[0] in inputs
+            or not isinstance(row[1], str)
+            or not re.fullmatch(r"[0-9a-f]{16}\.ltar", row[1])
+        ):
+            raise ValueError("unsafe native output map entry")
+        inputs.add(row[0])
+        names.add(row[1])
+    if {p.name for p in stage.iterdir()} != names:
+        raise ValueError("staged files do not match native output map")
+    for name in names:
+        if not stat.S_ISREG((stage / name).lstat().st_mode):
+            raise ValueError("native staging accepts only ordinary files")
 
 
 def niced(argv: list[str], nice: int, env: dict) -> list[str]:
@@ -236,76 +230,27 @@ def publish_outputs(
     lake: tuple[str, ...] = ("lake",),
     nice: int = NICE,
 ) -> dict:
-    """Publish the worktree's outputs for ``revision`` (its checked-out HEAD) to the repair namespace.
-
-    ``lake build --no-build --rehash -o`` writes the output map and exits nonzero unless every
-    module is built and current, so only a green final build at this revision is published. Then
-    ``lake cache put`` uploads the artifacts and then the map under ``revision`` with a bounded
-    timeout. Both run under ``nice``. Returns the record (``published``, ``skipped`` or ``error``, sizes, seconds); never raises.
-    """
-    record: dict = {"revision": revision, "service": settings.upload_service, "published": False}
+    """Publish the final build's native staged outputs, without another build scan."""
     reason = settings.disabled_reason()
     if reason:
-        record["skipped"] = reason
-        return record
-    started = time.monotonic()
+        return {"revision": revision, "published": False, "skipped": reason}
     try:
-        head = repair.git(worktree, "rev-parse", "HEAD").strip()
-        if head != revision:
-            record["skipped"] = f"worktree HEAD {head[:12]} is not {revision[:12]}"
-            return record
-        if repair.git(worktree, "status", "--porcelain", "--untracked-files=no").strip():
-            record["skipped"] = "worktree has uncommitted changes"
-            return record
-        mapping = logdir / "repair-outputs.jsonl"
-        mapping.unlink(missing_ok=True)
-        check = repair.run_logged(
-            niced([*lake, "build", "--no-build", "--rehash", "-o", str(mapping)], nice, env),
-            worktree,
-            logdir / "publish-outputs.log",
-            env=env,
-            timeout=CHECK_TIMEOUT,
+        frozen = freeze_outputs(worktree, revision, env, logdir, lake)
+        if frozen is None:
+            return {"revision": revision, "published": False, "skipped": "no complete final-build map"}
+        return publish_frozen(
+            {
+                "settings": settings.to_json(),
+                "frozen": frozen,
+                "revision": revision,
+                "repository": repository,
+                "lake": list(lake),
+                "logdir": str(logdir),
+                "nice": nice,
+            }
         )
-        record["outputs_check"] = {k: check[k] for k in ("rc", "seconds", "timed_out")}
-        if check["rc"] != 0 or not mapping.is_file():
-            record["skipped"] = f"outputs not complete at {revision[:12]} (lake build --no-build exited {check['rc']})"
-            return record
-        artifacts = Path(env.get("LAKE_CACHE_DIR") or worktree / ".lake" / "cache") / "artifacts"
-        record["artifacts"], record["bytes"] = _artifact_bytes(mapping, artifacts)
-        put_env = dict(env)
-        put_env["LAKE_CACHE_KEY"] = settings.key() or ""
-        put = repair.run_logged(
-            niced(
-                [*lake, "cache", "put", str(mapping), "--service", settings.upload_service, "--repo", repository],
-                nice,
-                env,
-            ),
-            worktree,
-            logdir / "cache-put.log",
-            env=put_env,
-            timeout=settings.timeout,
-        )
-        record["put"] = {k: put[k] for k in ("rc", "seconds", "timed_out", "log")}
-        if put["rc"] != 0:
-            record["error"] = (
-                f"lake cache put did not finish within {settings.timeout:.0f}s"
-                if put["timed_out"]
-                else f"lake cache put exited {put['rc']}"
-            )
-        else:
-            record["published"] = True
-    except Exception as error:  # publication never fails the task
-        record["error"] = f"{type(error).__name__}: {error}"
-    finally:
-        record["seconds"] = round(time.monotonic() - started, 1)
-        if record["published"]:
-            log(
-                f"published {record['artifacts']} artifacts ({record['bytes'] / 2**20:.1f} MiB) for "
-                f"{revision[:12]} to {settings.upload_service} in {record['seconds']}s"
-            )
-        elif "error" in record or "skipped" in record:
-            log(f"not published for {revision[:12]}: {record.get('error') or record.get('skipped')}")
-    return record
+    except Exception as error:
+        return {"revision": revision, "published": False, "error": f"{type(error).__name__}: {error}"}
 
 
 EARLY_SETTINGS = "publication.json"
@@ -323,6 +268,7 @@ def write_early_settings(
             "task_id": task_id,
             "repository": repository,
             "lake": list(lake),
+            "python": sys.executable,
         },
     )
 
@@ -339,88 +285,90 @@ def early_record(logdir: Path, revision: str, settings: Settings) -> dict | None
     return None
 
 
-def start_early(worktree: Path, env: dict) -> dict | None:
-    """Freeze a successful build under the caller's build lock, then upload during checks.
+def build_flags(worktree: Path) -> list[str]:
+    """Emit a map during the final native build when publication is configured."""
+    config = _read(worktree / repair.LISTINGS_DIR / EARLY_SETTINGS)
+    settings = config.get("settings") or {}
+    flags = ["--iofail"]
+    if (
+        (settings.get("url") or settings.get("upload_url"))
+        and settings.get("key_file")
+        and settings.get("publish") is not False
+        and settings.get("when") != "off"
+    ):
+        flags += ["--rehash", "-o", ".lake/outputs.jsonl"]
+    return flags
 
-    Stock Lake put-staged takes an explicit revision and never reads the live workspace.
-    Snapshots use immutable artifact hardlinks and are named like disposable task worktrees,
-    so the normal lease-aware terminal-task collector removes even crashed publishers' scratch.
-    """
+
+def freeze_outputs(worktree: Path, revision: str, env: dict, logdir: Path, lake: tuple[str, ...]) -> dict | None:
+    """Native staging with no credentials, moved outside candidate-writable paths."""
+    from tauceti_queue import repair_sandbox
+
+    mapping = worktree / ".lake/outputs.jsonl"
+    if not mapping.is_file() or repair.git(worktree, "rev-parse", "HEAD").strip() != revision:
+        return None
+    if repair.git(worktree, "status", "--porcelain", "--untracked-files=no").strip():
+        return None
+    stage = worktree / ".lake/publication-stage"
+    shutil.rmtree(stage, ignore_errors=True)
+    argv = [*lake, "cache", "stage", ".lake/outputs.jsonl", ".lake/publication-stage"]
+    wrapped = repair_sandbox.sandboxed_lake(argv, worktree, env)
+    check = repair.run_logged(wrapped, worktree, logdir / "cache-stage.log", env=env, timeout=CHECK_TIMEOUT)
+    if check["rc"] or not (stage / "outputs.jsonl").is_file():
+        shutil.rmtree(stage, ignore_errors=True)
+        return None
+    if (
+        repair.git(worktree, "rev-parse", "HEAD").strip() != revision
+        or repair.git(worktree, "status", "--porcelain", "--untracked-files=no").strip()
+    ):
+        shutil.rmtree(stage, ignore_errors=True)
+        return None
+    destination = worktree.parent / (worktree.name + "-publish-" + revision)
+    if destination.exists():
+        shutil.rmtree(stage, ignore_errors=True)
+        return None
+    toolchain = (worktree / "lean-toolchain").read_text().strip()
+    if not toolchain or any(c.isspace() for c in toolchain):
+        shutil.rmtree(stage, ignore_errors=True)
+        return None
+    try:
+        validate_native_stage(stage)
+        stage.rename(destination)
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    artifacts = list(destination.glob("*.ltar"))
+    return {
+        "path": str(destination),
+        "toolchain": toolchain,
+        "artifacts": len(artifacts),
+        "bytes": sum(p.stat().st_size for p in artifacts),
+        "outputs_check": {"kind": "native-stage", **{k: check[k] for k in ("rc", "seconds", "timed_out")}},
+    }
+
+
+def start_early(worktree: Path, env: dict) -> dict | None:
+    """Upload the final native build's staged outputs during audits and lint."""
     config = _read(worktree / repair.LISTINGS_DIR / EARLY_SETTINGS)
     if not config:
         return None
     settings = Settings.from_json(config["settings"])
     if settings.when != "after" or settings.disabled_reason():
         return None
-    stage = None
+    frozen = None
     try:
         revision = repair.git(worktree, "rev-parse", "HEAD").strip()
-        if not re.fullmatch(r"[0-9a-f]{40}", revision):
-            return None
-        logroot = Path(config["logdir"])
-        existing = early_record(logroot, revision, settings)
+        existing = early_record(Path(config["logdir"]), revision, settings)
         if existing:
             return existing
-        # This matches the production repair namespace used by platform-independent TauCeti.
-        # Other project layouts retain their existing publication path and scope semantics.
         layout = tomllib.loads((worktree / "lakefile.toml").read_text())
         if layout.get("platformIndependent") is not True or layout.get("fixedToolchain") or layout.get("bootstrap"):
             return None
-        toolchain = (worktree / "lean-toolchain").read_text().strip()
-        if not toolchain or any(c.isspace() for c in toolchain):
-            return None
-        if repair.git(worktree, "status", "--porcelain", "--untracked-files=no").strip():
-            return None
-        logdir = logroot / "publications" / revision
+        logdir = Path(config["logdir"]) / "publications" / revision
         logdir.mkdir(parents=True, exist_ok=True)
-        mapping = logdir / "repair-outputs.jsonl"
-        lake = tuple(config["lake"])
-        check = repair.run_logged(
-            niced([*lake, "build", "--no-build", "--rehash", "-o", str(mapping)], NICE, env),
-            worktree,
-            logdir / "publish-outputs.log",
-            env=env,
-            timeout=CHECK_TIMEOUT,
-        )
-        if check["rc"] or not mapping.is_file():
-            return {"revision": revision, "launched": False, "skipped": "outputs are not complete"}
-        if (
-            repair.git(worktree, "rev-parse", "HEAD").strip() != revision
-            or repair.git(worktree, "status", "--porcelain", "--untracked-files=no").strip()
-        ):
-            return {"revision": revision, "launched": False, "skipped": "workspace changed while freezing outputs"}
-        names = set()
-        for line in mapping.read_text().splitlines()[1:]:
-            row = json.loads(line)
-            if (
-                not isinstance(row, list)
-                or len(row) != 2
-                or not isinstance(row[1], str)
-                or not re.fullmatch(r"[0-9a-f]{16}\.ltar", row[1])
-            ):
-                raise ValueError("unsupported staged artifact description")
-            names.add(row[1])
-        destination = worktree.parent / f"task-{config['task_id']}-publish-{revision}"
-        if destination.exists() or destination.is_symlink():
-            # An old failed attempt may still own this directory. Retry via the usual
-            # final publisher rather than overwrite a snapshot behind a live uploader.
-            return {"revision": revision, "launched": False, "skipped": "snapshot already exists"}
-        destination.mkdir()
-        stage = destination
-        shutil.copyfile(mapping, stage / "outputs.jsonl")
-        artifacts = Path(env["LAKE_CACHE_DIR"]) / "artifacts"
-        for name in names:
-            source = artifacts / name
-            if source.is_symlink() or not source.is_file():
-                raise ValueError(f"missing or unsafe staged artifact: {name}")
-            os.link(source, stage / name)
-        frozen = {
-            "path": str(stage),
-            "toolchain": toolchain,
-            "artifacts": len(names),
-            "bytes": sum((stage / name).stat().st_size for name in names),
-            "outputs_check": {k: check[k] for k in ("rc", "seconds", "timed_out")},
-        }
+        frozen = freeze_outputs(worktree, revision, env, logdir, tuple(config["lake"]))
+        if frozen is None:
+            return {"revision": revision, "launched": False, "skipped": "no complete final-build map"}
         record = start_background(
             worktree,
             revision,
@@ -429,19 +377,20 @@ def start_early(worktree: Path, env: dict) -> dict | None:
             logdir=logdir,
             task_id=config["task_id"],
             repository=config["repository"],
-            lake=lake,
+            lake=tuple(config["lake"]),
             remove_worktree=False,
             frozen=frozen,
+            python=config.get("python"),
         )
         if record.get("launched"):
-            stage = None  # the independent publisher now owns the immutable snapshot
+            frozen = None
         return record
     except Exception as error:
-        log(f"early publication unavailable: {type(error).__name__}: {error}; final publication remains enabled")
+        log(f"early publication unavailable: {type(error).__name__}: {error}")
         return {"launched": False, "error": f"{type(error).__name__}: {error}"}
     finally:
-        if stage is not None:
-            shutil.rmtree(stage, ignore_errors=True)
+        if frozen:
+            shutil.rmtree(frozen["path"], ignore_errors=True)
 
 
 def publish_frozen(spec: dict) -> dict:
@@ -628,6 +577,7 @@ def start_background(
     nice: int = NICE,
     systemd: bool | None = None,
     frozen: dict | None = None,
+    python: str | None = None,
 ) -> dict:
     """Publish the worktree's outputs for ``revision`` in a process of its own and return at once.
 
@@ -675,7 +625,7 @@ def start_background(
         spec["frozen"] = frozen
     child_env = dict(env)
     child_env["PYTHONPATH"] = os.pathsep.join(p for p in (str(PROJECT_ROOT), env.get("PYTHONPATH")) if p)
-    argv = [sys.executable, "-m", "tauceti_queue.repair_publish", str(logdir / SPEC)]
+    argv = [python or sys.executable, "-m", "tauceti_queue.repair_publish", str(logdir / SPEC)]
     proc: subprocess.Popen | None = None
     try:
         repair.write_record(logdir / SPEC, spec)
@@ -725,13 +675,27 @@ def start_background(
 
 
 def run_spec(spec_path: Path) -> int:
-    from tauceti_queue.repair_cache import cache_lease
-    from tauceti_queue.repair_cleanup import worktree_lease
-
     spec = json.loads(spec_path.read_text())
-    root = Path(spec["worktree"]).parent.parent
-    with cache_lease(Path(spec.get("cache_root", root))), worktree_lease(root, spec["task_id"]):
-        return _run_spec(spec_path)
+    try:
+        from tauceti_queue.repair_cache import cache_lease
+        from tauceti_queue.repair_cleanup import worktree_lease
+
+        root = Path(spec["worktree"]).parent.parent
+        with cache_lease(Path(spec.get("cache_root", root))), worktree_lease(root, spec["task_id"]):
+            return _run_spec(spec_path)
+    except Exception as error:
+        record = dict(
+            spec["record"],
+            state="failed",
+            published=False,
+            error=f"publisher startup: {type(error).__name__}: {error}",
+            finished_at=time.time(),
+        )
+        repair.write_record(Path(record["record"]), record)
+        if spec.get("frozen"):
+            shutil.rmtree(spec["frozen"]["path"], ignore_errors=True)
+        log(record["error"])
+        return 1
 
 
 def _run_spec(spec_path: Path) -> int:

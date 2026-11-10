@@ -1634,6 +1634,17 @@ class Controller:
                 raise TaskError("unknown-claim", "no claim with that token on this task")
             if self.candidate_ci is not None:
                 self._source_request_access(source_access, claim=claim)
+            # A lost HTTP response must not cause a second adoption. This is a
+            # receipt for this exact claim/tip, never permission to adopt stale work.
+            receipt = self.store.row(
+                "submissions",
+                {"task_id": task_id, "claim_id": claim["id"], "tip": tip_sha, "accepted": 1},
+                order="id DESC",
+            )
+            if receipt is not None:
+                return Adoption(
+                    True, "already-adopted", task_id, task["batch_id"], None, tip_sha, receipt["retained_ref"], []
+                )
             self._task_binding(task, allow_stale_policy=True)
             batch = self.store.row("batches", {"id": task["batch_id"]})
             assert batch is not None
@@ -3622,6 +3633,16 @@ class Controller:
         if not self.setting("prepare_open_batches") or self._state("inference_hold"):
             return
         for batch in self._open_batches():
+            successor = self._open_batch()
+            if (
+                self.setting("prepare_pre_rebased")
+                and successor
+                and successor["id"] == batch["id"]
+                and self._pre_rebase_blocked(self._head()) is None
+            ):
+                # Prepare this successor on its intended parent. Starting another
+                # own-base pass would serialize two full builds and rewrite repairs.
+                continue
             if not self._prepare_due(batch, now):
                 continue
             pre_rebase = self._open_pre_rebase_task(batch)
@@ -3647,31 +3668,12 @@ class Controller:
             self._note_reason(f"open batch {batch['id']} waits for a worker to prepare it")
 
     def _pre_rebase_waits_for_prepare(self, batch: dict[str, Any]) -> str | None:
-        """Why a `pre_rebase` task may not be created for the batch yet; None once it may.
-
-        A batch that background preparation applies to (`prepare_open_batches` on, at least
-        `prepare_min_members` members) is pre-rebased by an agent only from its prepared chain: a
-        preparation adopted later would rewrite the chain under the pre-rebase and discard the
-        agent's resolutions. So the task waits while a `prepare` task is open and until the batch is
-        prepared at its current version, or its preparation at that version failed.
-        """
+        """A live own-base owner finishes first; future work uses the intended parent."""
         prepare = self._open_own_base_prepare(batch)
         if prepare is not None:
             held = "claimed" if self._active_claims(batch["id"], task_id=prepare["id"]) else "open"
             return f"prepare task {prepare['id']} is {held}"
-        if not self.setting("prepare_open_batches"):
-            return None
-        if not batch["sealed"] and len(self._members(batch["id"])) < max(1, int(self.setting("prepare_min_members"))):
-            return None
-        if batch["prepared_version"] == batch["version"]:
-            return None
-        settled = self.store.row(
-            "tasks",
-            {"batch_id": batch["id"], "batch_version": batch["version"], "kind": TASK_PREPARE, "resolution": "failed"},
-        )
-        if settled is not None:
-            return None
-        return f"not yet prepared at v{batch['version']}"
+        return None
 
     def _prepare_outcome(self, batch: dict[str, Any]) -> dict[str, Any] | None:
         """The `prepare_errors` diagnostic of a batch prepared at its current version: the errors its
@@ -3924,6 +3926,9 @@ class Controller:
             return
         assert head is not None
         onto = head["tip"]
+        own_prepare = self._open_own_base_prepare(batch)
+        if own_prepare and not self._active_claims(batch["id"], task_id=own_prepare["id"]):
+            self._supersede_prepare(batch["id"], "pre-rebase", now, own_base_only=True)
         state = batch["pre_rebase_state"]
         if self._open_pre_rebase_task(batch) is not None:
             self._reasons.append(f"open batch {batch['id']} waits for a worker to resolve its pre-rebase")

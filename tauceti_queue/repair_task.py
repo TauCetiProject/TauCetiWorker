@@ -50,6 +50,7 @@ import argparse
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import json
 import os
 import re
@@ -96,6 +97,7 @@ RELEASE_REASONS = (
     "agent_launch_failed",
     "agent_failed",
     "push_failed",
+    "submission_unavailable",  # preflight failed before inference; retry without settling preparation
     "worker-stopped",  # the worker was stopped (SIGTERM) before the task reached a resumable phase
     "prepared_clean",  # a ``prepare`` task's batch built without an error: nothing to repair
 )
@@ -107,12 +109,15 @@ IN_FLIGHT_STATES = (
     "artifacts_unavailable",
     "agent_running",
     "validated",
+    "delivery_pending",
+    "verifying",
     "pushed",
     "submitted",
     "interrupted",
 )
 # In-flight states a restarted worker continues instead of releasing: the agent's session exists.
-RESUMABLE_STATES = ("agent_running", "interrupted")
+DELIVERY_STATES = ("delivery_pending", "pushed", "submitted")
+RESUMABLE_STATES = ("agent_running", "interrupted", *DELIVERY_STATES)
 # ``run_repair_agent`` statuses that release the task under the same name.
 RELEASED_AGENT_STATUSES = ("inference_unavailable", "artifacts_unavailable", "agent_launch_failed")
 
@@ -890,7 +895,7 @@ class TaskState:
     @property
     def resumable(self) -> bool:
         """A checkpoint a restarted runner continues: mid-agent, or interrupted by a stop."""
-        return self.state in ("agent_running", "interrupted")
+        return self.state in RESUMABLE_STATES
 
     @property
     def agent_started(self) -> bool:
@@ -1283,7 +1288,7 @@ def prompt_context(
         artifacts_cold=cold,
         artifacts_reason=(artifacts or {}).get("unavailable_reason") if cold else None,
         check_findings_known=known_check_failures(task),
-        worker_verifies=worker_verifies and not cold and task.kind in ("repair", "prepare"),
+        worker_verifies=worker_verifies and not cold,
         listings_path=listings,
         shell_limit=shell_limit,
         pre_rebased=pre_rebased(task) is not None,
@@ -1770,6 +1775,41 @@ def _parallel_summary(record: dict) -> dict:
     return {k: v for k, v in record.items() if k not in ("remaining", "report", "attempts")}
 
 
+def delivery_identity(cfg: RunnerConfig, task: Task, tip: str) -> dict:
+    """Only unchanged source and checking policy may reuse completed verification."""
+    return {
+        "tip": tip,
+        "base": task.validation_base,
+        "audits": cfg.worker_audits,
+        "lake": list(cfg.lake),
+        "checker": hashlib.sha256(
+            Path(repair_audit.__file__).read_bytes() + Path(repair_sandbox.__file__).read_bytes()
+        ).hexdigest(),
+    }
+
+
+def check_submission_access(cfg: RunnerConfig, task: Task, logdir: Path) -> dict:
+    """Exercise receive-pack authentication without changing any remote ref."""
+    remote = cfg.push_remote or f"https://github.com/{task.repository}"
+    return repair.run_logged(
+        [
+            "git",
+            "-c",
+            "push.followTags=false",
+            "push",
+            "--dry-run",
+            "--porcelain",
+            "--force",
+            remote,
+            task.tip + ":" + task.submission_ref,
+        ],
+        cfg.clone,
+        logdir / "submission-access.log",
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        timeout=30,
+    )
+
+
 def push_result(cfg: RunnerConfig, task: Task, worktree: Path, tip: str, logdir: Path, expect: str | None) -> dict:
     """Push the proposed tip to the task's ``submission_ref`` through ``git-safe-push``.
 
@@ -1892,14 +1932,16 @@ def _run_task(
     state_dir = cfg.tasks_dir / task.task_id
     logdir = state_dir / "logs"
     state = resume_state or TaskState(state_dir, task)
-    resuming = resume_state is not None and resume_state.agent_started
+    pending_delivery = state.record.get("delivery") if state.state in IN_FLIGHT_STATES else None
+    resuming = resume_state is not None and (resume_state.agent_started or bool(pending_delivery))
     cancel = threading.Event()
     if stop is not None:
         stop.attach(cancel)
     lease = ClaimLease(client, task, cancel, retry_interval=cfg.lease_retry_interval)
     lease.start()
     worktree = cfg.root / "worktrees" / f"task-{task.task_id}"
-    outcome: dict = {"task_id": task.task_id, "status": "running", "worker": cfg.worker}
+    outcome: dict = dict(state.record.get("outcome") or {}) if pending_delivery else {}
+    outcome.update(task_id=task.task_id, status="running", worker=cfg.worker)
     state.progress_outcome = outcome
     # A ``prepare`` task always streams: the streaming build is how it learns whether there is anything
     # to repair at all (the batch has not been tried, so the task carries no diagnostics).
@@ -1971,6 +2013,13 @@ def _run_task(
         return release_task(
             cfg, client, task, state, "worker-stopped", f"worker stopped while {phase}: {detail}", outcome, lease
         )
+
+    def defer_delivery(detail: str) -> dict:
+        lease.submitting.clear()
+        outcome.update(status="delivery_pending", detail=detail)
+        state.write("delivery_pending", detail=detail, outcome=outcome, next_retry_at=time.time() + cfg.poll_seconds)
+        log(f"task {task.task_id}: delivery retained for automatic retry: {detail}")
+        return outcome
 
     try:
         state.write("claimed", worker=cfg.worker, service=cfg.service, resumed=resuming)
@@ -2060,6 +2109,19 @@ def _run_task(
             return release_task(
                 cfg, client, task, state, "agent_failed", "resume: the worktree is gone", outcome, lease
             )
+        if not resuming:
+            access = check_submission_access(cfg, task, logdir)
+            if access["rc"]:
+                return release_task(
+                    cfg,
+                    client,
+                    task,
+                    state,
+                    "submission_unavailable",
+                    "submission authentication/preflight failed; see submission-access.log",
+                    outcome,
+                    lease,
+                )
         chain_before = read_chain(cfg.clone, task.base, task.tip)
         ownership = repair_context.compute(
             cfg.clone,
@@ -2144,16 +2206,17 @@ def _run_task(
                 return released
         findings = task_findings(task)
         feedback: str | None = None
-        pushed: str | None = None
+        pushed: str | None = state.record.get("pushed_tip") if pending_delivery else None
         attempt = 0
         validation_retries = 0
         verify_rounds = 0
         explanation_resubmits = 0
         resubmit = False
-        agent_records: list[dict] = []
+        agent_records: list[dict] = list(outcome.get("agent", []))
+        agent = {"status": "ok"}
         resume_session = state.session() if resuming else None
         resume_provider = state.session_provider() if resuming else None
-        skip_agent = False
+        skip_agent = bool(pending_delivery)
         while True:
             attempt += 1
             if cancel.is_set() or stopping():
@@ -2185,6 +2248,8 @@ def _run_task(
             elif skip_agent:
                 skip_agent = False  # every group folded and the verification build passed; check and submit
             else:
+                pending_delivery = None
+                state.record.pop("delivery", None)
                 context = prompt_context(
                     task,
                     feedback,
@@ -2285,11 +2350,13 @@ def _run_task(
                     log(f"attempt {attempt} not acceptable; retrying once with the report")
                     continue
                 return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
-            verified = (outcome.get("parallel") or {}).get("verified_tip") == tip
+            verified = (outcome.get("parallel") or {}).get(
+                "verified_tip"
+            ) == tip or pending_delivery == delivery_identity(cfg, task, tip)
             artifacts_cold = bool((outcome.get("artifacts") or state.record.get("artifacts") or {}).get("cold"))
-            if cfg.worker_audits and task.kind in ("repair", "prepare") and not artifacts_cold and not verified:
+            if cfg.worker_audits and not artifacts_cold and not verified:
                 # The worker's own verdict before anything is submitted: the whole-library build, then CI's
-                # audits and the changed-module lint. A finding goes back to the agent as a diagnostic.
+                # audits and full-library lint. A finding goes back to the agent as a diagnostic.
                 state.write("verifying", attempt=attempt, tip=tip)
                 verification = repair_audit.verify(
                     worktree,
@@ -2343,14 +2410,15 @@ def _run_task(
                     repository=task.repository,
                     lake=cfg.lake,
                 )
+            state.write(
+                "delivery_pending", delivery=delivery_identity(cfg, task, tip), outcome=outcome, next_retry_at=0
+            )
             push = push_result(cfg, task, worktree, tip, logdir, pushed)
             outcome["push"] = {k: v for k, v in push.items() if "load" not in k}
             if not push["ok"]:
-                return release_task(
-                    cfg, client, task, state, "push_failed", f"git-safe-push exited {push['rc']}", outcome, lease
-                )
+                return defer_delivery(f"git-safe-push exited {push['rc']}")
             pushed = tip
-            state.write("pushed", tip=tip, pushed_ref=push["ref"])
+            state.write("pushed", tip=tip, pushed_tip=tip, pushed_ref=push["ref"], outcome=outcome)
             if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost after the push")
             notes = {
@@ -2379,6 +2447,8 @@ def _run_task(
                 )
             except ClaimRefused as error:
                 return discard(f"result refused: {error}")
+            except ServiceError as error:
+                return defer_delivery(f"result response unavailable: {error}")
             state.write("submitted", attempt=attempt, response=response)
             outcome["response"] = response
             reason = str(response.get("reason") or "")
@@ -2459,7 +2529,11 @@ def _run_task(
         outcome["lease"] = {"renewals": lease.renewals, "errors": lease.errors, "lost": lease.lost.is_set()}
         # An interrupted task keeps its worktree: the next start resumes the agent in it. A background
         # publication owns it from its start and removes it when done.
-        if not cfg.keep_worktree and outcome.get("status") not in ("error", "interrupted") and not background:
+        if (
+            not cfg.keep_worktree
+            and outcome.get("status") not in ("error", "interrupted", "delivery_pending")
+            and not background
+        ):
             with contextlib.suppress(Exception):
                 repair.remove_worktree(cfg.clone, worktree)
         with contextlib.suppress(Exception):
@@ -2614,13 +2688,40 @@ def resume_pending(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None =
         try:
             task.expires_at = client.renew(task)
         except ClaimRefused as error:
+            # Submission may have committed before its response was lost. Ask for
+            # the exact delivery's receipt before treating a released claim as loss.
+            if record.get("delivery") and record.get("pushed_tip"):
+                try:
+                    response = client.submit(task, record["pushed_tip"], task.submission_ref, {})
+                except (ClaimRefused, ServiceError):
+                    continue
+                if response.get("accepted"):
+                    outcome = dict(
+                        record.get("outcome") or {},
+                        status="adopted",
+                        tip=record["pushed_tip"],
+                        response=response,
+                        version=response.get("version"),
+                    )
+                    state.write("adopted", outcome=outcome)
+                    outcomes.append(outcome)
+                    if not cfg.keep_worktree:
+                        with contextlib.suppress(Exception):
+                            repair.remove_worktree(cfg.clone, cfg.root / "worktrees" / f"task-{task.task_id}")
+                    continue
             state.write("claim_lost", detail=f"resume: {error}")
+            if not cfg.keep_worktree:
+                with contextlib.suppress(Exception):
+                    repair.remove_worktree(cfg.clone, cfg.root / "worktrees" / f"task-{task.task_id}")
             log(f"task {task.task_id}: claim no longer ours; not resumed")
             continue
         except ServiceError as error:
             log(f"task {task.task_id}: renew failed during resume ({error}); will retry on the next start")
             continue
-        if record.get("state") not in RESUMABLE_STATES:
+        if record.get("delivery"):
+            if record.get("next_retry_at", 0) > time.time():
+                continue
+        elif record.get("state") not in ("agent_running", "interrupted"):
             # Claimed and stopped before the agent ran (or past the agent, mid-submission): nothing
             # to continue; give the claim back now and claim fresh rather than hold it to expiry.
             log(
@@ -2886,7 +2987,7 @@ def serve(
         """Wait before the next claim when a task was released for want of artifacts; the service
         re-exposes the same task at once, and nothing publishes its cache within seconds."""
         nonlocal artifacts_wait
-        if outcome.get("reason") != "artifacts_unavailable":
+        if outcome.get("reason") not in ("artifacts_unavailable", "submission_unavailable"):
             artifacts_wait = 0.0
             return
         first, cap = cfg.artifacts_backoff
@@ -2910,6 +3011,13 @@ def serve(
     while not stop.is_set():
         outcome = None
         try:
+            deliveries = [r for _, r in in_flight_checkpoints(cfg) if r.get("delivery")]
+            if deliveries:
+                for completed in resume_pending(cfg, client, stop=stop):
+                    record(completed)
+                write_heartbeat(cfg, summary, "delivery")
+                stop.wait(cfg.poll_seconds)
+                continue
             settled = retry_releases(cfg, client, stop=stop)
             if settled:
                 summary["releases_settled"] = summary.get("releases_settled", 0) + len(settled)

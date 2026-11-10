@@ -1594,23 +1594,21 @@ class Preparation(QueueFixture):
         batch, agent = self.scenario(prepare=True)
         result = agent.run(self.controller)
         self.assertEqual(agent.tasks[0].kind, "prepare")
-        self.assertEqual((agent.tasks[0].base, agent.tasks[0].onto), (batch["base"], batch["base"]))
+        self.assertEqual((agent.tasks[0].base, agent.tasks[0].onto), (self.head()["tip"], self.head()["tip"]))
         self.assertTrue(result.accepted, result)
         prepared = self.controller.store.row("batches", {"id": batch["id"]})
-        self.assertEqual((prepared["state"], prepared["prepared_version"]), ("open", prepared["version"]))
+        self.assertEqual((prepared["state"], prepared["pre_rebase_prepared"]), ("open", result.tip))
         self.drive_until_landed(batch, [agent])
         landed = self.controller.store.row("batches", {"id": batch["id"]})
         self.assertEqual(landed["state"], "landed")
         self.assertEqual(self.source_failures(batch), 0, "the head's CI round found nothing left to repair")
-        self.assertEqual(
-            [t.kind for t in agent.tasks], ["prepare", "prepare"], "no repair round for the prepared batch"
-        )
+        self.assertEqual([t.kind for t in agent.tasks], ["prepare"], "one intended-parent preparation, no repair round")
         self.assertEqual(
             ["pre_rebased" in t.extra for t in agent.tasks],
-            [False, True],
-            "prepared on its own base, then its pre-rebased chain on the head's tip",
+            [True],
+            "prepared directly on the head's tip",
         )
-        stacked = agent.results[1]
+        stacked = agent.results[0]
         self.assertTrue(stacked.accepted, stacked)
         attempts = self.controller.store.rows("ci_attempts", {"batch_id": batch["id"]}, order="id")
         self.assertEqual(attempts[0]["head_sha"], stacked.tip, "CI ran on the exact prepared tip")
@@ -1704,6 +1702,7 @@ class SequencedBackgroundTasks(QueueFixture):
 
     def test_the_pre_rebase_follows_the_preparation_and_seals_with_both(self):
         self.controller.set_setting("prepare_min_members", 2, "t")
+        self.controller.set_setting("pre_rebase_enabled", False, "t")
         self.github.ci_policy = lambda head, _base, members: (
             ("fail", [{"kind": "compiler", "module": "TauCeti/P203.lean", "message": "error in PR 203"}])
             if "BROKEN" in (self.repo.file_at(head, "TauCeti/P203.lean") or "")
@@ -1716,7 +1715,7 @@ class SequencedBackgroundTasks(QueueFixture):
         self.approve(203, {"TauCeti/P203.lean": "BROKEN\n"})
         self.tick()
         batch = self.open_batch()
-        self.assertEqual(batch["pre_rebase_state"], "conflict")
+        self.assertEqual(batch["pre_rebase_state"], "")
         self.assertEqual(self.controller.store.count("tasks", {"kind": "pre_rebase"}), 0, "not before preparation")
         self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
         self.tick()
@@ -1732,6 +1731,7 @@ class SequencedBackgroundTasks(QueueFixture):
         )
         self.assertTrue(preparer.run(self.controller).accepted)
         self.assertEqual(preparer.tasks[0].kind, "prepare")
+        self.controller.set_setting("pre_rebase_enabled", True, "t")
         self.tick()
         prepared = self.open_batch()
         pre_rebase = self.controller.store.row("tasks", {"kind": "pre_rebase", "state": "open"})
