@@ -32,7 +32,7 @@ from .constants import (
 from .fleet_capacity import admission_reason as fleet_admission_reason
 from .github import github_budget
 from .github_state import enabled as github_state_enabled
-from .quota import Provider, Quota, _hours, _unavail_reason, quota_line
+from .quota import Provider, Quota, _hours, _unavail_reason, claude_usage_credentials, quota_line
 from .quota_wait import QuotaWait
 from .round import run_round_subprocess
 from .runtime_status import report_runtime, runtime_snapshot
@@ -498,6 +498,12 @@ def _credential_hint(agent: str, prov: Provider | None) -> str:
         return ""
     if agent != "claude":
         return ". Run `codex login` to renew the credential"
+    usage = claude_usage_credentials()
+    if usage is not None:
+        return (
+            f". Sign in again to the usage login at {usage}, or --auto-refresh to let an unattended worker"
+            " rotate it (see docs/quota.md)"
+        )
     if sys.platform == "darwin":
         # The Keychain is the store here and the worker never writes it, so --auto-refresh does nothing
         # and offering it would send the operator after a flag that cannot help.

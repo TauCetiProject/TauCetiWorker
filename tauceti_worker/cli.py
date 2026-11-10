@@ -90,7 +90,15 @@ from .cost_model import format_report as format_cost_report
 from .github import GitHub, pin_github_account, shared_claims_granted
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file, legacy_data_root
-from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, codex_dir, parse_pace_curve
+from .quota import (
+    Quota,
+    _claude_keychain_creds,
+    _safe_exists,
+    claude_dir,
+    claude_usage_credentials,
+    codex_dir,
+    parse_pace_curve,
+)
 from .review_state import ReviewState
 from .round import Claims, RoundContext, cmd_heartbeat
 from .runtime_status import report_failure, report_runtime
@@ -154,6 +162,7 @@ environment (flags win; full reference linked below):
   TAUCETI_AUTHORING_CLAUDE_MODEL / _EFFORT exact Claude authoring profile
   TAUCETI_STREAM=1       same as --stream
   TAUCETI_AUTO_REFRESH=1 same as --auto-refresh (renew an expired Claude token; see --auto-refresh)
+  TAUCETI_CLAUDE_USAGE_CREDENTIALS  a second Claude login read for usage only (agents on a setup-token)
   TAUCETI_ACCOUNT        default for --account (require a specific Codex account)
   TAUCETI_GITHUB_ACCOUNT default for --github-account (select the GitHub login)
   TAUCETI_OVERLAP_BATCH_COMMITS  commits per scan session (default 160)
@@ -1653,6 +1662,9 @@ def cmd_host_doctor(args) -> int:
         rows.append(
             ("claude creds", _claude_keychain_creds() is not None, 'macOS login Keychain ("Claude Code-credentials")')
         )
+    usage_creds = claude_usage_credentials()
+    if usage_creds is not None:
+        rows.append(("claude usage", _safe_exists(usage_creds), f"{usage_creds} (read for usage only)"))
     kiro_db = kiro_data_dir(cfg.home) / "data.sqlite3"
     rows.append(
         (
