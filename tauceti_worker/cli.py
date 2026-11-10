@@ -62,6 +62,7 @@ from .config import (
     is_git_url,
     log,
     roadmap_only,
+    roadmap_targets,
     sanitize_wid,
     security_audit_problem,
     set_log_file,
@@ -147,6 +148,7 @@ environment (flags win; full reference linked below):
   TAUCETI_ROADMAP_ONLY   single roadmap area (unset = a fresh random area each round; "" = all areas)
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
   TAUCETI_EXTRA_ROADMAP_PROMPT   extra guidance for roadmap rounds; default for --extra-roadmap-prompt
+  TAUCETI_ROADMAP_TARGETS        operator target list for roadmap rounds; default for --roadmap-targets
   TAUCETI_PR             comma-separated PR numbers; default for --pr
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_PACE           pacing curve "t:b,..." (default = 60:40); see --pace
@@ -333,6 +335,17 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--roadmap-skip OneParameterSemigroups. Excludes them from the auto-random pick and the "
         "all-areas case; --roadmap-only takes precedence if it names a skipped area. Overrides "
         "$TAUCETI_ROADMAP_SKIP for this run",
+    )
+    p.add_argument(
+        "--roadmap-targets",
+        dest="roadmap_targets",
+        default=None,
+        metavar="FILE",
+        help="for roadmap rounds, an operator target list (docs/target-lists.md): milestones grouped "
+        "by roadmap area, each with the items it needs first. Every round the worker takes one open "
+        "item whose needs have landed, claims it, and hands it to the agent; with nothing eligible it "
+        "authors nothing. --roadmap-only and --roadmap-skip narrow the areas it draws from. The file "
+        "is re-read each round. Empty string = no list. Overrides $TAUCETI_ROADMAP_TARGETS for this run",
     )
     p.add_argument(
         "--extra-roadmap-prompt",
@@ -1307,6 +1320,15 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     # roadmap_skip()).
     if getattr(args, "roadmap_skip", None) is not None:
         os.environ["TAUCETI_ROADMAP_SKIP"] = args.roadmap_skip
+    # --roadmap-targets likewise. The path is made absolute for loop children, and the driver parses
+    # the file once so that a missing or unmarked list stops the worker at startup.
+    if getattr(args, "roadmap_targets", None) is not None:
+        chosen = args.roadmap_targets.strip()
+        os.environ["TAUCETI_ROADMAP_TARGETS"] = str(Path(chosen).expanduser().resolve()) if chosen else ""
+    if not one_round and roadmap_targets() is not None:
+        from .targets import load_targets
+
+        load_targets(roadmap_targets())
     # --extra-roadmap-prompt likewise: validated here, at the boundary, then read live by do_roadmap via
     # extra_roadmap_prompt() so loop children see it without a flag of their own.
     if getattr(args, "extra_roadmap_prompt", None) is not None:

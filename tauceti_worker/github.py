@@ -626,6 +626,17 @@ _OPEN_PRS_QUERY = """query($owner:String!,$repo:String!,$n:Int!,$cursor:String){
 }"""
 
 
+BORS_MERGED_PREFIX = "[Merged by Bors] - "
+
+
+def normalize_merged(d: dict) -> dict:
+    """`d` with a Bors landing reported as any other merge. Bors lands a squash on main and closes
+    the pull request under a `[Merged by Bors] - ` title, which GitHub reports as CLOSED."""
+    if d.get("state") == "CLOSED" and str(d.get("title") or "").startswith(BORS_MERGED_PREFIX):
+        d["state"] = "MERGED"
+    return d
+
+
 def _pr_json_from_graphql(node: dict) -> dict:
     """One GraphQL PR node in `gh pr list --json` shape, so PRInfo.from_json stays the single place
     that decides what a PR's fields MEAN.
@@ -791,6 +802,19 @@ class GitHub:
         if p.returncode != 0:
             raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
         return json.loads(p.stdout or "[]")
+
+    def merged_prs(self, search: str, *, limit: int = 200) -> list[dict]:
+        """Number, title and body of the merged pull requests among the first `limit` closed ones a
+        search returns, Bors landings included (see `normalize_merged`)."""
+        args = ["pr", "list", "--repo", self.repo, "--state", "closed", "--search", search, "--limit", str(limit)]
+
+        def fetch():
+            p = self._gh([*args, "--json", "number,title,body,state"])
+            if p.returncode != 0:
+                raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
+            return [d for d in map(normalize_merged, json.loads(p.stdout or "[]")) if d.get("state") == "MERGED"]
+
+        return transport.shared_read(["merged_prs", self.repo, search, limit], fetch, ttl=120)
 
     def issue_list(
         self, repo: str, *, labels: list[str] | None = None, fields: list[str], state: str = "open", limit: int = 200

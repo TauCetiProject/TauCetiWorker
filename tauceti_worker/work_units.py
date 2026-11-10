@@ -55,6 +55,7 @@ from .config import (
     roadmap_areas,
     roadmap_only,
     roadmap_skip,
+    roadmap_targets,
     warn_red,
 )
 from .constants import (
@@ -114,6 +115,16 @@ from .survey import (
     progress_argv,
     spread_candidates,
     survey,
+)
+from .targets import (
+    TargetItem,
+    Targets,
+    candidates,
+    landed_pr,
+    live_targets,
+    load_targets,
+    marker_stem,
+    render_assignment,
 )
 
 # ============================================================================
@@ -436,7 +447,8 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
         if getattr(opts, "prs", ()):
             scope = "any"  # explicit targets override the ambient roadmap
         else:
-            if use_fleet_focus and scope in (None, "auto"):
+            # A target list names its own areas, so its worker takes no fleet focus.
+            if use_fleet_focus and scope in (None, "auto") and roadmap_targets() is None:
                 from .fleet_capacity import roadmap_focus
 
                 focus = roadmap_focus(w.cfg.wid)
@@ -645,7 +657,7 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
             )
         if global_pick:
             log("No available maintenance or reviews; proceeding to roadmap authoring")
-            if scope in (None, "auto") and not opts.dry_run:
+            if scope in (None, "auto") and not opts.dry_run and roadmap_targets() is None:
                 sv.roadmap_only = random_roadmap_area(w, focus=[])
                 log(f"Authoring roadmap: {sv.roadmap_only} (selected after existing PR work)")
         rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
@@ -2908,11 +2920,56 @@ def random_roadmap_area(w, *, focus=None, fallback=True) -> str | None:
     return random.choice(areas) if areas else "any"
 
 
+MAX_TARGET_TRIES = 8  # per round; each one is a search and a push to the claim repository
+
+
+def assign_target(w, path: Path, only: str, skip: list[str]) -> tuple[Targets, TargetItem]:
+    """Choose and claim this round's item of the operator's target list (docs/target-lists.md).
+    Returns the list under its live statuses and the item; NoProgress when there is none to take."""
+    listed = load_targets(path)
+    claims = getattr(w, "claims", None)
+    try:
+        live = live_targets(listed, w.gh)
+        offered = candidates(live, only, skip)
+        for item in offered[:MAX_TARGET_TRIES]:
+            name = f"{item.area}/{item.slug}"
+            merged = landed_pr(item, w.gh)
+            if merged is not None:
+                log(f"target {name} landed in #{merged}; mark it `[x]` in {path.name} — trying the next")
+                continue
+            rc = claims.begin_target_work(item.area, item.slug) if claims is not None else 2
+            if rc == 1:
+                log(f"target {name} is claimed by another worker — trying the next")
+                continue
+            if rc != 0:
+                log(
+                    f"claim acquire author/{name} errored (rc={rc}) against {claims_repo()} — proceeding "
+                    f"unclaimed. If this repeats, this account cannot push there; set CLAIM_REPO=<a repo your "
+                    f"whole fleet can push to> to pick the namespace yourself."
+                )
+            log(f"→ ROADMAP target: {name} ({len(offered)} eligible in {path.name})")
+            return live, item
+    except GitHubError as e:
+        raise NoProgress(f"roadmap: cannot read pull requests for the target list ({e})") from None
+    raise NoProgress(
+        f"roadmap: none of the {min(len(offered), MAX_TARGET_TRIES)} eligible target(s) of {path.name} tried this "
+        f"round can be taken ({len(offered)} eligible; each is claimed by another worker or has landed)"
+    )
+
+
 def do_roadmap(w, sv, c, opts, bubble) -> int:
     os.environ["TAUCETI_VERIFY_POLICY"] = "ordinary"
     only = c.reason or "any"
     skip = roadmap_skip()
-    if only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
+    assignment = ""
+    targets_path = roadmap_targets()
+    if targets_path is not None:
+        live, item = assign_target(w, targets_path, only, skip)
+        only = item.area
+        assignment = render_assignment(live, item)
+        os.environ["TAUCETI_TARGET_MARKER"] = marker_stem(item)
+        report_runtime(target=f"new PR (target: {only}/{item.slug})", roadmap_target=f"{only}/{item.slug}")
+    elif only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
         only = random_roadmap_area(w, focus=[])
         log(f"→ ROADMAP area: {only} (auto-picked, skipping {len(skip)})")
     elif only not in ("any", "") and only in skip:  # --roadmap-only wins over an overlapping skip
@@ -3004,6 +3061,7 @@ other contributors' claims, or the hard rules of the repo.
                 ),
                 SOURCE_GUIDANCE=source_guidance,
                 EXTRA_ROADMAP_PROMPT=extra_guidance,
+                TARGET_LIST=assignment,
                 LOCAL_VERIFICATION=local_verification("ordinary", bubble),
                 BIN=wrapper_bin(bubble=True),
             ),
@@ -3028,6 +3086,7 @@ other contributors' claims, or the hard rules of the repo.
         RUBRICS=(str(bundle) if bundle is not None else f"{refs / 'review' / 'rubrics'} (read every .md file in it)"),
         SOURCE_GUIDANCE=source_guidance,
         EXTRA_ROADMAP_PROMPT=extra_guidance,
+        TARGET_LIST=assignment,
         LOCAL_VERIFICATION=local_verification("ordinary", bubble),
         BIN=wrapper_bin(),
     )
