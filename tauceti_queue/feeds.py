@@ -785,18 +785,71 @@ class ControllerFeedSource:
             )
         return tuple(events)
 
+    def _promotion_receipt(self, batch: dict, attempt: dict, promotions: list[dict]) -> tuple[EventView, ...]:
+        """Translate recorded main push/recovery results, never CI success, into Bors receipts."""
+        if batch["landed_how"] != "promoted" or batch["tip"] != attempt["head_sha"]:
+            return ()
+        for promotion in promotions:
+            payload = _loads(promotion["payload"], {})
+            if (
+                payload.get("batch_id") != batch["id"]
+                or payload.get("attempt_id") != attempt["id"]
+                or payload.get("tip") != attempt["head_sha"]
+                or payload.get("expected_parent") != attempt["base_sha"]
+                or payload.get("version") != attempt["batch_version"]
+                or promotion["result"] not in ("fast-forwarded", "already-visible")
+            ):
+                continue
+            landing = self.store.row("journal", {"batch_id": batch["id"], "kind": "landed"}, order="id DESC")
+            detail = _loads(landing.get("detail"), {}) if landing else {}
+            if detail.get("tip") != attempt["head_sha"] or detail.get("how") != "promoted":
+                return ()
+            receipt = {"base": self._branch(), "base_sha": attempt["base_sha"], "commit": attempt["head_sha"]}
+            source = (
+                "github.base_push_response" if promotion["result"] == "fast-forwarded" else "github.base_recovery_read"
+            )
+            return (
+                EventView(
+                    int(landing["id"]), "constructed", "queue.controller", _micro(attempt["dispatched_at"]), receipt
+                ),
+                EventView(int(landing["id"]), "promoted", source, _micro(landing["at"]), receipt),
+            )
+        return ()
+
     def candidates(self, repo: str, base: str, batch_id: int | None, *, promoted: bool) -> Sequence[CandidateView]:
         if not self._serves(repo, base):
             return []
         inputs = self._inputs_by_id()
         batches = {b["id"]: b for b in self.controller.batches()}
         where = {"batch_id": batch_id} if batch_id is not None else None
-        rows = self.store.rows("ci_attempts", where, order="id DESC", limit=CANDIDATE_LIMIT)
+        if promoted:
+            clause = " AND b.id=?" if batch_id is not None else ""
+            params = (batch_id, CANDIDATE_LIMIT) if batch_id is not None else (CANDIDATE_LIMIT,)
+            rows = self.store.query(
+                "SELECT a.* FROM ci_attempts a JOIN batches b ON b.id=a.batch_id "
+                "WHERE b.state='landed' AND b.tip=a.head_sha" + clause + " ORDER BY a.id DESC LIMIT ?",
+                params,
+            )
+        else:
+            rows = self.store.rows("ci_attempts", where, order="id DESC", limit=CANDIDATE_LIMIT)
+        promotions = self.store.rows("outbox", {"kind": "promote", "state": "done"}) if promoted else []
         out = []
         for attempt in rows:
             batch = batches.get(attempt["batch_id"])
             if batch is None or (promoted and batch["state"] != "landed"):
                 continue
+            events = (
+                self._promotion_receipt(batch, attempt, promotions)
+                if promoted
+                else self._events(attempt["batch_id"], attempt)
+            )
+            if promoted and not events:
+                continue
+            members = self._members(attempt["batch_id"], inputs)
+            if promoted:
+                landing = self.store.row("journal", {"batch_id": batch["id"], "kind": "landed"}, order="id DESC")
+                accepted = _loads(landing.get("detail"), {}).get("members", [])
+                members = tuple(member for member in members if member.pr in accepted)
             previous = self.store.rows("ci_attempts", {"batch_id": attempt["batch_id"]}, order="id")
             earlier = [a["id"] for a in previous if a["id"] < attempt["id"]]
             out.append(
@@ -806,9 +859,9 @@ class ControllerFeedSource:
                     generation=int(attempt["batch_version"]),
                     base=self._branch(),
                     base_sha=str(attempt["base_sha"]),
-                    members=self._members(attempt["batch_id"], inputs),
+                    members=members,
                     observed_at=_micro(attempt["dispatched_at"]),
-                    events=self._events(attempt["batch_id"], attempt),
+                    events=events,
                     previous_generation_id=earlier[-1] if earlier else None,
                     runner_assigned_at=_micro(attempt["run_created_at"]) if attempt.get("run_created_at") else None,
                     runner_started_at=_micro(attempt["run_started_at"]) if attempt.get("run_started_at") else None,
