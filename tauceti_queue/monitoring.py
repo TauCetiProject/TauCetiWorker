@@ -235,7 +235,18 @@ def workers(roots, *, claims=(), task_states=None, captured=None):
             active = [c for c in claims if worker_alias(c.get("worker")) == alias and c.get("expires_at", 0) > captured]
             phase = next((p for c in active if (p := task_states.get(c.get("task_id"), {}).get("state"))), None)
             state = text(value.get("state"), 40)
-            if alive:
+            live_phase = phase in {
+                "building",
+                "freezing_cache_outputs",
+                "auditing",
+                "audit_import",
+                "audit_duplicates",
+                "audit_axioms",
+                "environment_lint",
+            }
+            if live_phase:
+                state = phase
+            elif alive:
                 checkpoint_age = captured - (numeric(value.get("updated_at")) or 0)
                 if phase:
                     state = text("alive / " + phase, 40)
@@ -247,7 +258,7 @@ def workers(roots, *, claims=(), task_states=None, captured=None):
                 {
                     "id": alias,
                     "state": state,
-                    "observed_at": iso(captured if alive else numeric(value.get("updated_at"))),
+                    "observed_at": iso(captured if alive or live_phase else numeric(value.get("updated_at"))),
                     "started_at": iso(numeric(value.get("started_at"))),
                     "tasks": numeric(value.get("tasks")),
                     "errors": numeric(value.get("errors")),
@@ -421,6 +432,13 @@ class TaskObservations:
                     else None
                 )
                 result[task["id"]] = observation | ({"build": build} if build else {})
+                if task["state"] == "open" and token in live_tokens:
+                    from . import task_activity
+
+                    activity = task_activity.public(directory, token, observed_at)
+                    if activity:
+                        result[task["id"]].pop("build", None)
+                        result[task["id"]].update(activity)
         if len(self.cache) > 1000:
             self.cache = dict(list(self.cache.items())[-500:])
         return result
