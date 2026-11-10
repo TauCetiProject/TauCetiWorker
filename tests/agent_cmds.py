@@ -203,11 +203,18 @@ try:
         parity_dir = Path(td) / "parity"
         tc.run_agent_proc(["claude"], env={}, logdir=parity_dir, label="agent-claude", provider="claude")
         logged_transcript = next(parity_dir.glob("agent-claude-*.log")).read_text()
+        run = tc.agents.take_last_agent_run()
+        check(
+            "the run record keeps the final message and the transcript file",
+            (run["last_message"], run["transcript"]),
+            ("working", str(next(parity_dir.glob("agent-claude-*.log")))),
+        )
         os.environ["TAUCETI_STREAM"] = "1"
         streamed = io.StringIO()
         with redirect_stdout(streamed):
             tc.run_agent_proc(["claude"], env={}, logdir=parity_dir, label="agent-claude", provider="claude")
         os.environ.pop("TAUCETI_STREAM")
+        check("a streamed run names no transcript file", tc.agents.take_last_agent_run().get("transcript"), None)
         check("logfile and --stream transcripts match", streamed.getvalue(), logged_transcript)
         check(
             "Bubble prelude survives normalization", logged_transcript.startswith("bubble bootstrap complete\n"), True
