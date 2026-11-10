@@ -146,6 +146,7 @@ RUN_STDLIB=(
   progress_generation_retry.py
   progress_publication.py
   progress_strategy.py
+  progress_shepherd.py
   process_cleanup.py
   prompt_wrapper_paths.py
   provider_usage.py

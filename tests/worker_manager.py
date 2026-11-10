@@ -128,6 +128,7 @@ try:
         progress_strategy="threshold",
         progress_max_open=1,
         progress_skip=("-Alpha", "Beta"),
+        progress_shepherd=True,
         extra_roadmap_prompt="Work on the material relevant to Higher Topos Theory",
         source="https://example.invalid/source",
         author_model="gpt-5",
@@ -145,11 +146,18 @@ try:
     assert wm.WorkerSpec.from_dict({"id": "plain"}, 0).auto_refresh is False
     assert wm.WorkerSpec.from_dict({"id": "opted", "auto_refresh": True}, 0).as_dict()["auto_refresh"] is True
     assert (parsed.progress_strategy, parsed.progress_max_open, parsed.progress_skip) == ("threshold", 1, "-Alpha,Beta")
+    assert parsed.progress_shepherd is True
     assert not [arg for arg in wm.WorkerSpec(id="plain").work_argv() if arg.startswith("--progress")]
     assert not [key for key in wm.WorkerSpec(id="plain").as_dict() if key.startswith("progress")]
     reporting = {"id": "reports", "progress_strategy": "threshold", "progress_max_open": 3, "progress_skip": ["Beta"]}
+    reporting["progress_shepherd"] = True
     assert wm.WorkerSpec.from_dict(reporting, 0).as_dict() == {**reporting, "enabled": True}
-    for field, bad in (("progress_strategy", "busiest"), ("progress_max_open", 0), ("progress_max_open", "2")):
+    for field, bad in (
+        ("progress_strategy", "busiest"),
+        ("progress_max_open", 0),
+        ("progress_max_open", "2"),
+        ("progress_shepherd", "yes"),
+    ):
         try:
             wm.WorkerSpec.from_dict({"id": "reports", field: bad}, 0)
         except wm.WorkersError as error:
@@ -280,6 +288,7 @@ try:
                         "respect_claims": False,
                         "progress_strategy": "threshold",
                         "progress_skip": ["Algebra"],
+                        "progress_shepherd": True,
                         "extra_roadmap_prompt": "Work on the material relevant to Higher Topos Theory",
                         "source": "https://example.invalid/source",
                         "author_model": "claude-opus-5",
@@ -334,6 +343,7 @@ worker3 — backing off
   reports:  threshold strategy
             at most 2 open
             skip: Algebra
+            asks the gate again
   source:   https://example.invalid/source
   author:   model claude-opus-5 · high effort
   options:  stream output

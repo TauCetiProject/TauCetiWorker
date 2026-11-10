@@ -22,6 +22,7 @@ SCHEMA = "tauceti-incident/v1"
 ACKED = "acked"
 DECLINED = "declined"
 BUDGET_SPENT = "budget-spent"
+PROGRESS_STUCK = "progress-stuck"
 # The stages whose rounds leave these records: the ones that repair an existing pull request head.
 STAGES = ("rebase", "fix", "fix-ci")
 HELD = "an earlier round declined at this head; waiting for a new head"
@@ -161,3 +162,20 @@ def note_budget_spent(stage: str, pr: int, head: str, detail: str) -> None:
     if any(value.get("head") == head for value in find(BUDGET_SPENT, f"{stage}-{pr}")):
         return
     record(BUDGET_SPENT, f"{stage}-{pr}", repository=TAUCETI, stage=stage, pr=pr, head=head, detail=detail)
+
+
+def progress_stuck(pr: int) -> bool:
+    """Whether progress report `pr` has a `progress-stuck` record, live or acknowledged."""
+    return bool(find(PROGRESS_STUCK, f"progress-{pr}"))
+
+
+def note_progress_stuck(repository: str, pr: int, head: str, **fields) -> bool:
+    """Record that the merge gate has left progress report `pr` of `repository` open and the worker
+    has stopped asking it. One write per report: an existing record is left as it is. False when
+    the directory is not configured or the write failed."""
+    if progress_stuck(pr):
+        return True
+    return (
+        record(PROGRESS_STUCK, f"progress-{pr}", repository=repository, stage="progress", pr=pr, head=head, **fields)
+        is not None
+    )

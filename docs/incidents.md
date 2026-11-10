@@ -1,12 +1,15 @@
 # Incident records
 
 An incident record is a small JSON file a worker writes when a round concludes
-something about a pull request that GitHub does not show. Two kinds exist:
+something about a pull request that GitHub does not show. Three kinds exist:
 
 - `declined`: a `rebase`, `fix`, or `fix-ci` round finished and left no push,
   closure, or reply. The record keeps the agent's final message.
 - `budget-spent`: a stage has used its attempts on a pull request and will not
   take it again at that head.
+- `progress-stuck`: the roadmap repository's merge gate has left a progress
+  report open through every ask `progress_shepherd` makes, and the worker has
+  stopped asking.
 
 Nothing is written unless `TAUCETI_INCIDENTS_DIR` is set, and records alone
 change no selection.
@@ -42,13 +45,13 @@ Every record has:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `schema` | string | `tauceti-incident/v1` |
-| `kind` | string | `declined` or `budget-spent` |
-| `key` | string | `<stage>-<pr>` for both kinds |
+| `kind` | string | `declined`, `budget-spent`, or `progress-stuck` |
+| `key` | string | `<stage>-<pr>` for every kind |
 | `worker` | string | Id of the worker that wrote the file last |
 | `first_at`, `last_at` | string | UTC times of the first and the latest write, `YYYY-MM-DDTHH:MM:SSZ` |
 | `count` | integer | Number of times the live file has been written |
 | `repository` | string | `owner/name` of the pull request's repository |
-| `stage` | string | `rebase`, `fix`, or `fix-ci` |
+| `stage` | string | `rebase`, `fix`, or `fix-ci`; `progress` for `progress-stuck` |
 | `pr` | integer | Pull request number |
 | `head` | string | Full head commit the record is about |
 
@@ -64,6 +67,18 @@ A `declined` record adds:
 
 A `budget-spent` record adds `detail`, one line naming the survey's reason and
 the attempts used.
+
+A `progress-stuck` record is about a pull request in the roadmap repository,
+which `repository` names, and adds:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `url` | string | The report's pull request |
+| `area` | string | The roadmap the report is for |
+| `opened_at` | string | UTC time the pull request was opened |
+| `asks` | integer | Dispatches of the gate workflow this worker made for the report |
+| `refusal` | string | The reason in the gate's newest refusal comment on the pull request, or empty when it left none |
+| `detail` | string | One line with the report, its age, the asks or the rejected dispatch, and that reason |
 
 ```json
 {
@@ -106,6 +121,15 @@ left alone, and a new head writes a new live record. Attempt budgets are kept
 per worker, so the record is the first worker's; another worker may still have
 attempts for that head. `--dry-run` writes nothing.
 
+**`progress-stuck`.** By a progress round of a worker with
+[`progress_shepherd`](reference.md#open-progress-reports) set, when a report of
+its account is still open four hours after the last ask, or as soon as GitHub
+rejects the dispatch itself. One write per report: a record that exists, live
+or acknowledged, is left alone, and no worker sharing the directory asks the
+gate about that report again. Closing the pull request, or getting it landed,
+is what frees its place under `progress_max_open`; deleting the record from
+both folders does not restart the asks of the worker that wrote it.
+
 ## Holding a declined head
 
 With `TAUCETI_HOLD_DECLINED=1`, a stage takes no further round on a pull request
@@ -137,5 +161,6 @@ before acting on it.
 | `records(kind="", acked=True)` | Every readable record with its path, live ones first |
 | `record_declined(...)`, `note_budget_spent(...)` | The two kinds above |
 | `declined(stage, pr, head)` | Whether the hold applies |
+| `note_progress_stuck(repository, pr, head, **fields)`, `progress_stuck(pr)` | The third kind, and whether a report has a record |
 
 A new kind needs only a name and a key that is unique within it.

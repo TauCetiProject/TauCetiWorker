@@ -152,7 +152,7 @@ environment (flags win; full reference linked below):
   TAUCETI_WORKER_ID      pins the worker id (else `work` auto-assigns worker1, worker2, ...)
   TAUCETI_ROADMAP_ONLY   single roadmap area (unset = a fresh random area each round; "" = all areas)
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
-  TAUCETI_PROGRESS_STRATEGY / _MAX_OPEN / _SKIP   defaults for the --progress-* flags
+  TAUCETI_PROGRESS_STRATEGY / _MAX_OPEN / _SKIP / _SHEPHERD   defaults for the --progress-* flags
   TAUCETI_EXTRA_ROADMAP_PROMPT   extra guidance for roadmap rounds; default for --extra-roadmap-prompt
   TAUCETI_PR             comma-separated PR numbers; default for --pr
   TAUCETI_QUOTA_CMD      default for --quota-cmd
@@ -370,6 +370,16 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         metavar="AREA[,AREA...]",
         help="for progress rounds, a comma-separated list of roadmap areas never to report on, passed "
         "to `plan` as --skip-area under either strategy. Overrides $TAUCETI_PROGRESS_SKIP for this run",
+    )
+    p.add_argument(
+        "--progress-shepherd",
+        dest="progress_shepherd",
+        action="store_true",
+        default=None,
+        help="in progress rounds, dispatch the roadmap repository's merge-gate workflow again for a "
+        "progress report of this account that the gate has left open, a bounded number of times, then "
+        "record the report for a person. Needs a token that may dispatch workflows there. Sets "
+        "$TAUCETI_PROGRESS_SHEPHERD=true",
     )
     p.add_argument(
         "--extra-roadmap-prompt",
@@ -1351,6 +1361,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     ):
         if getattr(args, flag, None) is not None:
             os.environ[variable] = str(getattr(args, flag))
+    if getattr(args, "progress_shepherd", None):
+        os.environ["TAUCETI_PROGRESS_SHEPHERD"] = "true"
     try:
         if progress_strategy() is not None:
             validate_progress_strategy(progress_strategy())

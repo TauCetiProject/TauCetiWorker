@@ -62,6 +62,7 @@ _WORKER_KEYS = {
     "progress_strategy",
     "progress_max_open",
     "progress_skip",
+    "progress_shepherd",
     "extra_roadmap_prompt",
     "source",
     "author_model",
@@ -290,6 +291,7 @@ class WorkerSpec:
     progress_strategy: str | None = None
     progress_max_open: int = PROGRESS_MAX_OPEN
     progress_skip: tuple[str, ...] = ()
+    progress_shepherd: bool = False
     extra_roadmap_prompt: str | None = None
     source: str | None = None
     author_model: str | None = None
@@ -368,6 +370,7 @@ class WorkerSpec:
             progress_strategy=strategy,
             progress_max_open=reports,
             progress_skip=_strings(raw.get("progress_skip", []), f"workers[{index}].progress_skip"),
+            progress_shepherd=_boolean(raw.get("progress_shepherd", False), f"workers[{index}].progress_shepherd"),
             extra_roadmap_prompt=_extra_roadmap_prompt(
                 raw.get("extra_roadmap_prompt"), f"workers[{index}].extra_roadmap_prompt"
             ),
@@ -439,6 +442,8 @@ class WorkerSpec:
             value["progress_max_open"] = self.progress_max_open
         if self.progress_skip:
             value["progress_skip"] = list(self.progress_skip)
+        if self.progress_shepherd:
+            value["progress_shepherd"] = True
         for name in (
             "github_account",
             "conf",
@@ -506,6 +511,8 @@ class WorkerSpec:
         if self.progress_skip:
             # One argument: an area list is operator text and must not read as a flag.
             argv.append(f"--progress-skip={','.join(self.progress_skip)}")
+        if self.progress_shepherd:
+            argv.append("--progress-shepherd")
         for field, flag in (
             (self.github_account, "--github-account"),
             (self.github_state_url, "--github-state-url"),
@@ -1521,6 +1528,8 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
     skips = spec.get("progress_skip")
     if isinstance(skips, list) and skips:
         reports.append("skip: " + ", ".join(map(str, skips)))
+    if spec.get("progress_shepherd") is True:
+        reports.append("asks the gate again")
     if reports:
         lines.extend(_status_field("reports", reports, width))
 

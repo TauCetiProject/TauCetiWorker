@@ -54,6 +54,7 @@ from .config import (
     log,
     one_line,
     progress_max_open,
+    progress_shepherd,
     progress_skip,
     progress_strategy,
     respect_claims,
@@ -2447,12 +2448,14 @@ def _progress_deadline_wait(w):
     )
 
 
-def _progress_reports_held(w) -> str | None:
+def _progress_reports_held(w, rows=None) -> str | None:
     """Why the threshold strategy may not plan a report now, or None: the account's open reports
-    in the roadmap repository have reached progress_max_open, or could not be counted."""
+    in the roadmap repository have reached progress_max_open, or could not be counted. `rows` is
+    this round's listing of them where the shepherd already made one."""
     limit = progress_max_open()
     try:
-        rows = GitHub(ROADMAP).pr_list(["number", "headRefName"], author=me())
+        if rows is None:
+            rows = GitHub(ROADMAP).pr_list(["number", "headRefName"], author=me())
     except GitHubError as exc:
         reason = f"could not count this account's open reports ({one_line(str(exc), 120)})"
     else:
@@ -2659,8 +2662,10 @@ def _install_progress_body(source, target):
 
 
 def _do_progress_inner(w, opts) -> int | None:
+    from . import progress_landing as shepherd
     from . import progress_publication as publication
 
+    open_reports = shepherd.look(w.cfg) if progress_shepherd() else None
     retained = publication.retained(w.cfg)
     marker = w.cfg.state / "progress/work/publication.json"
     if marker.exists() and not retained:
@@ -2676,7 +2681,7 @@ def _do_progress_inner(w, opts) -> int | None:
             w.counters.write(PROGRESS_ERROR_KEY, 0)
             return None
         retained = publication.defer(w.cfg, retained)
-    elif progress_strategy() == "threshold" and (held := _progress_reports_held(w)):
+    elif progress_strategy() == "threshold" and (held := _progress_reports_held(w, open_reports)):
         log(f"progress: {held}")
         return None
     # Reserve separate mechanical spacing before checkout and every fallible preparation step.

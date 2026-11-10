@@ -103,6 +103,12 @@ def progress_max_open() -> int:
     return positive_integer(os.environ.get("TAUCETI_PROGRESS_MAX_OPEN", PROGRESS_MAX_OPEN))
 
 
+def progress_shepherd() -> bool:
+    """Whether progress rounds ask the merge gate again about this account's reports it has left
+    open; read live from TAUCETI_PROGRESS_SHEPHERD so --progress-shepherd reaches loop children."""
+    return os.environ.get("TAUCETI_PROGRESS_SHEPHERD", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def progress_skip() -> list[str]:
     """Roadmap areas the progress phase never reports on, from TAUCETI_PROGRESS_SKIP; parsed as
     roadmap_skip() parses its list."""

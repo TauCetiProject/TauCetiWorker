@@ -231,6 +231,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `progress_strategy` | string | unset | `"threshold"` plans progress reports per roadmap on the worker's own timer instead of the project-wide cadence. Needs a TauCetiProgress revision that has the strategy; see [progress report strategy](reference.md#progress-report-strategy) |
 | `progress_max_open` | integer | `2` | Under `progress_strategy = "threshold"`, plan no new report while this many progress reports of the worker's account are open in the roadmap repository |
 | `progress_skip` | string list | `[]` | Roadmap areas progress rounds never report on, under either strategy |
+| `progress_shepherd` | bool | `false` | Ask the roadmap repository's merge gate again about a progress report of the worker's account that it has left open, then record the report for a person. Needs a token that may dispatch workflows there; see [open progress reports](reference.md#open-progress-reports) |
 | `source` | string | unset | Supplementary repository directory or URL. Requires `roadmap` in `only` and a non-empty `roadmap_only` |
 | `author_model` | string | unset | Exact authoring model. Requires an `agent` other than `auto` |
 | `author_effort` | string | unset | Authoring reasoning effort for Codex, Claude, or Kiro. Requires an explicit `agent` |

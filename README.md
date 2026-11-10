@@ -157,7 +157,7 @@ A round does exactly one unit of work: the first of these that applies.
 | **Rebase** | Reconcile one of our conflicting PRs or an authenticated current-head integration repair request, including missing sources or renamed APIs after main moves. Integrate one main snapshot and validate source repair before safe push. Genuine conflict retries renew after verified progress; handoffs retain their per-PR cap. Hold labels pause recovery. |
 | **Bump** | Adapt a red `bump-mathlib/` PR (the review bot opens those to move the Mathlib dependency forward) so `TauCeti/` builds against the new Mathlib. The worker never opens a bump itself. |
 | **Lint repair** | Fix `TauCeti/` on a red `lint-repair/` PR. PR builds lint only the modules a change touches, so TauCeti's daily full lint opens one of these when main carries environment-lint violations elsewhere (for example, a new simp lemma that takes an older one out of simp normal form). The worker never opens one itself. |
-| **Progress** | When the global eight-hour cadence is due and a roadmap has at least 25 new PRs, update its generated `STATUS.md` and `PROGRESS.md` through TauCetiProgress. A worker can choose a [per-roadmap strategy](docs/reference.md#progress-report-strategy) instead. |
+| **Progress** | When the global eight-hour cadence is due and a roadmap has at least 25 new PRs, update its generated `STATUS.md` and `PROGRESS.md` through TauCetiProgress. A worker can choose a [per-roadmap strategy](docs/reference.md#progress-report-strategy) instead, and can [ask the merge gate again](docs/reference.md#open-progress-reports) about a report it leaves open. |
 | **Fix CI** | Repair one of our PRs whose `build` check is red. It cannot be reviewed until it builds, so this comes before Fix. |
 | **Fix** | Address current-head review findings on one of our PRs: fix the code, or contest a wrong finding on its thread. Existing findings can be repaired while CI is pending or unavailable; a green build is not required. |
 | **Review** | Review an open PR whose head is green but not yet reviewed, with the `tauceti-review` engine. Maintenance on our own PRs takes priority so author-action work (`ci-failed` or `awaiting-author`) cannot be starved by unrelated reviews. |
@@ -774,7 +774,8 @@ in `workers.toml`. Keep the raw API key out of that file.
 - [Unfinished source recovery](docs/work-recovery.md): records saved before
   checkout preparation resets, and checkouts moved aside while still in use.
 - [Incident records](docs/incidents.md): the opt-in local record of a repair
-  round that left nothing on GitHub, and of a spent attempt budget.
+  round that left nothing on GitHub, of a spent attempt budget, and of a
+  progress report the merge gate keeps open.
 
 The `overlap-scan` and `overlap-fix` phases maintain a shared Mathlib cursor and
 adopt overlapping upstream APIs. See [Mathlib overlap maintenance](docs/mathlib-overlaps.md)
