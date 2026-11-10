@@ -51,6 +51,9 @@ from .config import (
     is_git_url,
     log,
     one_line,
+    progress_max_open,
+    progress_skip,
+    progress_strategy,
     respect_claims,
     roadmap_areas,
     roadmap_only,
@@ -70,6 +73,8 @@ from .constants import (
     PR_TASKS,
     PROGRESS_ATTEMPT_GAP,
     PROGRESS_ERROR_KEY,
+    PROGRESS_FLAGS_KEY,
+    PROGRESS_POLL,
     PROGRESS_REF,
     PROGRESS_TOOL_LINE,
     PROGRESS_TOOL_TAIL,
@@ -84,7 +89,7 @@ from .constants import (
     SANDBOX_DEFAULT,
     TAUCETI,
 )
-from .github import GitHub, GitHubError, can_push, claims_repo, ensure_fork, gh_run, me
+from .github import GitHub, GitHubError, _parse_iso8601, can_push, claims_repo, ensure_fork, gh_run, me
 from .github_state import enabled as github_state_enabled
 from .intentions import avoid_list
 from .paths import CLAIM_SH, HERE
@@ -112,6 +117,8 @@ from .survey import (
     owns_pr,
     prioritize_review_candidates,
     progress_argv,
+    progress_flags_reason,
+    progress_poll_wait,
     spread_candidates,
     survey,
 )
@@ -2401,6 +2408,57 @@ def _progress_deadline_wait(w):
     )
 
 
+def _progress_reports_held(w) -> str | None:
+    """Why the threshold strategy may not plan a report now, or None: the account's open reports
+    in the roadmap repository have reached progress_max_open, or could not be counted."""
+    limit = progress_max_open()
+    try:
+        rows = GitHub(ROADMAP).pr_list(["number", "headRefName"], author=me())
+    except GitHubError as exc:
+        reason = f"could not count this account's open reports ({one_line(str(exc), 120)})"
+    else:
+        held = sorted(r["number"] for r in rows if str(r.get("headRefName") or "").startswith("progress/"))
+        if len(held) < limit:
+            return None
+        reason = (
+            f"{len(held)} report(s) of this account open ({', '.join(f'#{n}' for n in held)}), "
+            f"the limit is {limit}; waiting for one to land or close"
+        )
+    progress_poll_wait(w.cfg, w.counters, PROGRESS_TTL, reason)
+    return reason
+
+
+def _progress_threshold_wait(w, table, proc):
+    """A threshold plan chose nothing: wait until its table says a roadmap qualifies with the pull
+    requests it has now. New merges can bring that forward, hence the PROGRESS_POLL ceiling."""
+    delay = PROGRESS_POLL
+    try:
+        if at := _parse_iso8601(json.loads(table.read_text()).get("next_qualifies_at")):
+            delay = at - time.time()
+    except (OSError, ValueError, AttributeError):
+        pass
+    said = [line.strip() for line in (proc.stderr or proc.stdout or "").splitlines() if line.strip()]
+    w.counters.write("progress-mechanical-retry-at", 0)
+    progress_poll_wait(
+        w.cfg,
+        w.counters,
+        min(PROGRESS_POLL, max(PROGRESS_TTL, delay)),
+        one_line(said[-1].removeprefix("not due: "), 160) if said else "no roadmap qualifies",
+    )
+
+
+def _progress_flags_rejected(w, proc):
+    """A TauCetiProgress pinned before the strategy flags existed stops at its argument parser.
+    Record that against the revision and fail this one round; the survey then holds the phase."""
+    if proc.returncode != 2 or not re.search(r"unrecognized arguments|invalid choice", proc.stderr or ""):
+        return
+    _progress_tool_failed(w, "plan", proc)
+    w.counters.write(PROGRESS_FLAGS_KEY, 1)
+    w.counters.write("progress-mechanical-retry-at", 0)
+    bust_progress_cache(w.cfg)
+    raise Die(f"progress: {progress_flags_reason()}")
+
+
 def _prepare_progress(w, run_tool, roadmap_dir, work):
     """Retry only free mechanical work. Keep the last coherent artifacts until replacement succeeds."""
     from . import progress_publication as publication
@@ -2420,6 +2478,15 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
     reason = ""
     invalid_plan = None
     recovery = False
+    threshold = progress_strategy() == "threshold"
+    table = w.cfg.state / "progress/table.json"
+    if threshold:
+        choice = ["--strategy", "threshold", "--table", str(table)]
+        choice += ["--label-cache", str(w.cfg.state / "progress/labels.json")]
+    else:
+        choice = ["--min-prs", "25"]
+    # One argument each: an area name is operator text and must not read as a flag.
+    choice += [f"--skip-area={area}" for area in progress_skip()]
 
     def plan_identity(value):
         return {
@@ -2436,6 +2503,8 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
         output.mkdir()
         plan_file, facts_file = output / "plan.json", output / "facts.json"
         plan = {}
+        if threshold:
+            table.unlink(missing_ok=True)  # a plan that stops before its choice must not leave the last table
         # Shared within an attempt, isolated from all other attempts and the global disk cache.
         with tempfile.TemporaryDirectory(prefix="docs-", dir=output) as cache:
             for stage, args in (
@@ -2448,8 +2517,7 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                         "origin/main",
                         "--code-dir",
                         str(w.cfg.checkout),
-                        "--min-prs",
-                        "25",
+                        *choice,
                         "--out",
                         str(plan_file),
                     ),
@@ -2461,9 +2529,14 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                     log(f"progress: nothing due after re-checking: {(proc.stderr or proc.stdout or '').strip()}")
                     w.counters.write("progress-docs-waits", 0)
                     w.counters.write("progress-docs-retry-at", 0)
-                    _progress_mechanical_delay(w)
+                    if threshold:
+                        _progress_threshold_wait(w, table, proc)
+                    else:
+                        _progress_mechanical_delay(w)
                     return None
                 if proc.returncode:
+                    if stage == "plan" and (threshold or progress_skip()):
+                        _progress_flags_rejected(w, proc)
                     reason = _progress_tool_failed(w, stage, proc)
                     if proc.returncode == 78:
                         recovery = True
@@ -2564,6 +2637,9 @@ def _do_progress_inner(w, opts) -> int | None:
             w.counters.write(PROGRESS_ERROR_KEY, 0)
             return None
         retained = publication.defer(w.cfg, retained)
+    elif progress_strategy() == "threshold" and (held := _progress_reports_held(w)):
+        log(f"progress: {held}")
+        return None
     # Reserve separate mechanical spacing before checkout and every fallible preparation step.
     # Churn, deadline and not-due paths replace this reservation with their own retry delays.
     if not retained:
@@ -2828,6 +2904,9 @@ def _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt):
         raise Die(reason)
     log(out[:600])  # `apply`'s own output is a handful of one-liners; the PR url is the one that matters
     publication.complete(w.cfg, receipt)
+    if progress_strategy() == "threshold":
+        # A published report is paced by progress_max_open; the attempt gap is left to failed attempts.
+        w.counters.write("progress-attempt-ts", 0)
     if proc.returncode == EX_NOPROGRESS:
         bust_progress_cache(w.cfg)
         raise NoProgress("progress: this window is already in flight or already landed")
