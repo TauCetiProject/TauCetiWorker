@@ -19,15 +19,19 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 
 from . import incidents
-from .config import Die, NoProgress, log
+from .config import Die, NoProgress, log, roadmap_targets
+from .constants import ROADMAP, ROADMAP_DIR
 from .github import GitHubError, normalize_merged
 from .paths import HERE
+from .targets import _AREA_RE, Targets, live_targets, load_targets, parse_targets
 
 GAP_ENV = "TAUCETI_DECIDE_GAP"
 CASES_ENV = "TAUCETI_DECIDE_MAX_CASES"
@@ -269,6 +273,32 @@ class _Round:
         row = self.open_prs.get(value["pr"])
         return row is not None and row.get("headRefOid") == value.get("head")
 
+    @cached_property
+    def listed(self) -> tuple[Path, Targets] | None:
+        """The target list with live statuses, when one is set and readable."""
+        path = roadmap_targets()
+        if path is None:
+            return None
+        try:
+            return path, live_targets(load_targets(path), self.gh)
+        except (Die, GitHubError) as error:
+            log(f"decide: {error}; ruling without the target list")
+            return None
+
+    @cached_property
+    def roadmaps(self) -> Path | None:
+        """The directory of roadmaps, one subdirectory each, in a read-only checkout."""
+        from .agents import fetch_ref
+
+        checkout = self.w.cfg.state / "refs" / "roadmap"
+        return checkout / ROADMAP_DIR if fetch_ref(ROADMAP, checkout) else None
+
+    @cached_property
+    def areas(self) -> set[str]:
+        with contextlib.suppress(OSError):
+            return {path.name for path in self.roadmaps.iterdir() if path.is_dir()} if self.roadmaps else set()
+        return set()
+
 
 def run(w, opts) -> int | None:
     """One round. The agent's exit status when it failed, 0 when the model ruled, None when there
@@ -311,6 +341,13 @@ def _blockers(rd: _Round, ruling: dict) -> tuple[list[str] | None, str]:
         if state != "MERGED":
             return None, ""
         landed.append(f"#{n} merged")
+    for slug in ruling.get("blocked_on_targets") or []:
+        item = rd.listed[1].find(slug) if rd.listed else None
+        if rd.listed is None or (item is not None and item.status != "done"):
+            return None, ""
+        if item is None:
+            return None, f"`{slug}` is no longer on the target list"
+        landed.append(f"`{slug}` landed")
     return landed, ""
 
 
@@ -445,6 +482,8 @@ EFFECTS = {WAIT: _wait, ESCALATE: _escalate}
 def _rule(rd: _Round, opts, cases: list[dict]) -> int:
     packet = {
         "repository": rd.gh.repo,
+        "roadmaps": str(rd.roadmaps or ""),
+        "target_list": str(rd.listed[0]) if rd.listed else "",
         "cases": [_case(rd, incident) for incident in cases],
     }
     log("decide: asking the model about " + ", ".join(f"#{incident['pr']}" for incident in cases))
@@ -466,3 +505,117 @@ def _rule(rd: _Round, opts, cases: list[dict]) -> int:
         _record(incident, ruling, "model", **fields)
         log(f"decide: #{incident['pr']}: {ruling}: {_clip(' '.join(fields['note'].split()), 160)}")
     return 0
+
+
+# ---- prerequisite: add a milestone to the target list -------------------------------------------
+
+PREREQUISITE = "prerequisite"
+_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{2,60}")
+
+
+def _area(v) -> bool:
+    return isinstance(v, str) and bool(_AREA_RE.fullmatch(v))
+
+
+def _slugs(v) -> bool:
+    return isinstance(v, list) and len(v) <= 5 and all(isinstance(s, str) and _SLUG.fullmatch(s) for s in v)
+
+
+_ITEM = {"area": _area, "slug": lambda v: _slugs([v]), "text": _text(20, 300, line=True), "needs": _slugs}
+
+
+def _items(v) -> bool:
+    return (
+        isinstance(v, list)
+        and 1 <= len(v) <= 3
+        and all(
+            isinstance(item, dict) and set(item) == set(_ITEM) and all(_ITEM[k](item[k]) for k in _ITEM) for item in v
+        )
+    )
+
+
+@contextlib.contextmanager
+def _list_lock(path: Path):
+    fd = os.open(path.with_name(f".{path.name}.lock"), os.O_RDONLY | os.O_CREAT, 0o664)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def insert_item(text: str, area: str, line: str) -> str:
+    """`text` with one item line added directly under `## <area>`, where a worker that takes an
+    area's items in file order meets it first; a list without that area gains the section at its end."""
+    rows = (text if text.endswith("\n") else text + "\n").splitlines(keepends=True)
+    for index, row in enumerate(rows):
+        if re.fullmatch(rf"##\s+{re.escape(area)}\s*", row):
+            return "".join([*rows[: index + 1], line + "\n", *rows[index + 1 :]])
+    return "".join(rows).rstrip("\n") + f"\n\n## {area}\n{line}\n"
+
+
+def prerequisite_lines(
+    items: list[dict], pr: int, targets: Targets, areas: set[str]
+) -> tuple[list[tuple[str, str, str]], list[str], str]:
+    """Check a `prerequisite` ruling's items against the list. Returns the (area, slug, line) to add,
+    every slug the pull request then waits on, and "" or the reason the ruling cannot be applied.
+    An item the list already has, not yet done, adds nothing and is waited on."""
+    lines: list[tuple[str, str, str]] = []
+    slugs: list[str] = []
+    for item in items:
+        area, slug = item["area"], item["slug"]
+        existing = targets.find(slug)
+        if slug in slugs or (existing is not None and existing.status == "done"):
+            return [], [], f"`{slug}` is named twice or is already done on the target list"
+        slugs.append(slug)
+        if existing is not None:
+            continue
+        if area not in areas:
+            return [], [], f"there is no roadmap `{area}`"
+        if unknown := [s for s in item["needs"] if targets.find(s) is None and s not in slugs]:
+            return [], [], f"`{slug}` needs `{unknown[0]}`, which the target list does not have"
+        needs = ", ".join(f"`{s}`" for s in item["needs"]) or "none"
+        text = " ".join(item["text"].split())
+        lines.append((area, slug, f"- [ ] `{slug}` — {text} (unblocks: #{pr}; needs: {needs}; added by: decide)"))
+    return lines, slugs, ""
+
+
+def add_prerequisites(path: Path, additions: list[tuple[str, str, str]]) -> list[str] | None:
+    """Add (area, slug, line) items to the target list under its lock, `.<name>.lock` beside it.
+    Returns the slugs added, leaving out any the list gained meanwhile; None when it was not written."""
+    try:
+        path = path.resolve()  # the lock and the rename are beside the file itself, not a link to it
+        with _list_lock(path):
+            text = path.read_text()
+            have = {item.slug for item in parse_targets(text).items()}
+            added = []
+            for area, slug, line in additions:
+                if slug not in have:
+                    text = insert_item(text, area, line)
+                    added.append(slug)
+                    have.add(slug)
+            if added:
+                temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+                temporary.write_text(text)
+                shutil.copymode(path, temporary)
+                os.replace(temporary, path)
+            return added
+    except (OSError, UnicodeDecodeError, Die) as error:
+        log(f"decide: the target list {path} was not written: {getattr(error, 'strerror', None) or error}")
+        return None
+
+
+def _prerequisite(rd: _Round, incident: dict, answer: dict) -> tuple[str, dict]:
+    path, targets = rd.listed
+    lines, slugs, problem = prerequisite_lines(answer["items"], incident["pr"], targets, rd.areas | set(targets.areas))
+    if problem:
+        return problem, {}
+    added = add_prerequisites(path, lines)
+    if added is None:
+        return "the target list could not be written", {}
+    return "", {"blocked_on_targets": slugs, "added": added}
+
+
+SCHEMA[PREREQUISITE] = {"items": _items}
+OFFERED[PREREQUISITE] = lambda rd, incident: rd.listed is not None and rd.roadmaps is not None
+EFFECTS[PREREQUISITE] = _prerequisite

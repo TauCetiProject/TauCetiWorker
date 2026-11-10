@@ -4,7 +4,7 @@
 GitHub is a stub and the model is a function that returns the answer file's contents. Covered: the
 phase's selection and its due check; the answer schema; a round for each ruling, with the incident
 acknowledged and the hold lifted or kept; a refused or malformed ruling becoming an escalation; the
-later look at a ruling that waits; and what the model process is given.
+later look at a ruling that waits; what the model process is given; and each side effect on its own.
 
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
@@ -23,7 +23,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import tauceti_worker as tc
 from tauceti_worker import agents, cli, decide, incidents, work_units
-from tauceti_worker.constants import TAUCETI
+from tauceti_worker.constants import ROADMAP_DIR, TAUCETI
+from tauceti_worker.targets import parse_targets
 
 fails = 0
 clock = [1768469400]
@@ -83,6 +84,9 @@ class Hub:
     def issue_comments(self, n):
         return [{"user": {"login": "reviewer"}, "created_at": "t", "body": "x" * 5000}] * 9
 
+    def merged_prs(self, search, limit=200):
+        return []
+
 
 def declined(*numbers):
     for number in numbers:
@@ -98,10 +102,15 @@ def rounds(tmp, hub, answer=None, *, rc=0, claimed=()):
         seen.update(packet=packet)
         return rc, answer
 
+    def fetch(_repo, checkout):
+        (checkout / ROADMAP_DIR / "Probability").mkdir(parents=True, exist_ok=True)
+        return True
+
     w = SimpleNamespace(gh=hub, cfg=SimpleNamespace(state=tmp / "state", wid="w1"))
     with (
         patch.object(decide, "_ask", side_effect=ask),
         patch.object(work_units, "_branch_claimed_elsewhere", side_effect=lambda _w, n: n in claimed),
+        patch.object(agents, "fetch_ref", side_effect=fetch),
     ):
         seen["rc"] = decide.run(w, SimpleNamespace())
     later()
@@ -411,6 +420,133 @@ def test_model_call(tmp):
     check("older run directories are pruned", len(list((tmp / "state" / "decide").iterdir())), decide.KEPT_RUNS)
 
 
+LIST = """# Law of large numbers
+<!-- tauceti-targets:v1 -->
+
+## MeasureTheory
+- [x] `borel-cantelli` — both lemmas (needs: none)
+
+## Probability
+- [ ] `strong-law` — the strong law (needs: `borel-cantelli`)
+"""
+
+
+def item(slug, area="Probability", needs=(), text="Layer 2 (tail events): they have probability 0 or 1."):
+    return {"area": area, "slug": slug, "text": text, "needs": list(needs)}
+
+
+def test_prerequisite(tmp):
+    need = {"case": "c", "ruling": "prerequisite", "note": "n", "items": [item("zero-one")]}
+    check("the schema takes an item", verdict(need), "ok")
+    check("…checked field by field", "malformed items" in verdict({**need, "items": [item("Zero One")]}), True)
+    check(
+        "…on one line", "malformed items" in verdict({**need, "items": [item("zero-one", text="a\n" + "b" * 30)]}), True
+    )
+
+    path = tmp / "targets.md"
+    path.write_text(LIST)
+    targets, areas = parse_targets(LIST), {"Probability", "MeasureTheory", "Topology"}
+    asked = [item("zero-one", needs=["borel-cantelli"]), item("strong-law"), item("nets", "Topology", ["zero-one"])]
+    lines, slugs, problem = decide.prerequisite_lines(asked, 7, targets, areas)
+    check(
+        "new items become lines",
+        ([(a, s) for a, s, _ in lines], problem),
+        ([("Probability", "zero-one"), ("Topology", "nets")], ""),
+    )
+    check("…and one the list has is only waited on", slugs, ["zero-one", "strong-law", "nets"])
+    check(
+        "a done item is refused", decide.prerequisite_lines([item("borel-cantelli")], 7, targets, areas)[2] != "", True
+    )
+    check(
+        "an unknown roadmap is refused",
+        decide.prerequisite_lines([item("x-y-z", "Nowhere")], 7, targets, areas)[2],
+        "there is no roadmap `Nowhere`",
+    )
+    check(
+        "an unknown need is refused",
+        "does not have" in decide.prerequisite_lines([item("x-y-z", needs=["missing"])], 7, targets, areas)[2],
+        True,
+    )
+
+    check("the list is written", decide.add_prerequisites(path, lines), ["zero-one", "nets"])
+    check("…under its lock", (tmp / ".targets.md.lock").exists(), True)
+    after = parse_targets(path.read_text())
+    added = after.find("zero-one")
+    check(
+        "the item parses as an open target",
+        (added.status, added.needs, added.text),
+        ("open", ("borel-cantelli",), item("zero-one")["text"]),
+    )
+    check("…that names what it unblocks", added.meta, ("unblocks: #7", "added by: decide"))
+    check("it is first in its area", [it.slug for it in after.areas["Probability"]], ["zero-one", "strong-law"])
+    check("a new area gets a section", [it.slug for it in after.areas["Topology"]], ["nets"])
+    kept = [line for line in path.read_text().splitlines() if line and "decide" not in line and "Topology" not in line]
+    check("the rest of the file is untouched", kept, [line for line in LIST.splitlines() if line])
+    check(
+        "an item the list gained meanwhile is not added twice",
+        (decide.add_prerequisites(path, lines), path.read_text().count("`zero-one` —")),
+        ([], 1),
+    )
+    check(
+        "a list that cannot be read is reported, not raised", decide.add_prerequisites(tmp / "absent.md", lines), None
+    )
+
+    root = tmp / "prerequisite"
+    path.write_text(LIST)
+    with settings(root):
+        declined(1)
+        check(
+            "without a list it is not offered",
+            "prerequisite" in rounds(tmp, Hub(p1={}), {"rulings": []})["packet"]["cases"][0]["allowed"],
+            False,
+        )
+    with settings(root, TAUCETI_ROADMAP_TARGETS=str(path)):
+        declined(4, 5)
+        hub = Hub(p4={}, p5={})
+        asked = answer(
+            (4, "prerequisite", {"items": [item("zero-one"), item("strong-law")]}),
+            (5, "prerequisite", {"items": [item("x-y-z", "Nowhere")]}),
+        )
+        seen = rounds(tmp, hub, asked)
+        check("with a list it is offered", "prerequisite" in seen["packet"]["cases"][0]["allowed"], True)
+        check(
+            "the packet names the list and the roadmaps",
+            (seen["packet"]["target_list"], seen["packet"]["roadmaps"]),
+            (str(path), str(tmp / "state" / "refs" / "roadmap" / ROADMAP_DIR)),
+        )
+        value = ruling(root, "declined-fix-4")
+        check(
+            "prerequisite: the pull request waits on both items",
+            (value["ruling"], value["blocked_on_targets"]),
+            ("prerequisite", ["zero-one", "strong-law"]),
+        )
+        check(
+            "…and the list gains the new one",
+            (value["added"], parse_targets(path.read_text()).find("zero-one").meta[0]),
+            (["zero-one"], "unblocks: #4"),
+        )
+        refused = ruling(root, "declined-fix-5")
+        check(
+            "an item that cannot be added escalates",
+            (refused["ruling"], refused["recommend"], "Nowhere" in refused["note"]),
+            ("escalate", "prerequisite", True),
+        )
+        path.write_text(path.read_text().replace("- [ ] `zero-one`", "- [x] `zero-one`"))
+        check(
+            "one item landed: still waiting",
+            (rounds(tmp, hub), ruling(root, "declined-fix-4")["ruling"]),
+            ({"rc": None}, "prerequisite"),
+        )
+        path.write_text(path.read_text().replace("- [ ] `strong-law`", "- [x] `strong-law`"))
+        rounds(tmp, hub)
+        value = ruling(root, "declined-fix-4")
+        check(
+            "both landed: a retry by recheck",
+            (value["ruling"], value["by"], "`strong-law` landed" in value["note"]),
+            ("retry", "recheck", True),
+        )
+
+
 def main():
     def gmtime(seconds=None):
         return real_gmtime(clock[0] if seconds is None else seconds)
@@ -421,6 +557,7 @@ def main():
         test_schema()
         test_rounds(tmp)
         test_model_call(tmp / "model")
+        test_prerequisite(tmp)
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
     return 1 if fails else 0
 

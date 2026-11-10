@@ -48,7 +48,9 @@ first `## ` heading is shown to the agent with the items of its area.
   file never defines is logged and blocks nothing.
 
 The file is read at the start of each roadmap round, so an edit takes effect on
-the next round. The worker never writes to it.
+the next round. The worker never writes to it, except that a
+[`prerequisite` ruling](decide.md#what-prerequisite-writes) of the opt-in
+decide phase adds an item.
 
 ## Live statuses
 

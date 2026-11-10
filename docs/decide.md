@@ -35,6 +35,7 @@ one finds the directory's lock held and stands aside.
 | `TAUCETI_INCIDENTS_DIR` | _(unset)_ | Required. The directory whose records are ruled on. |
 | `TAUCETI_DECIDE_GAP` | `600` | Seconds between rounds on one directory. |
 | `TAUCETI_DECIDE_MAX_CASES` | `6` | Incidents put to the model in one round. |
+| `TAUCETI_ROADMAP_TARGETS` | _(unset)_ | With a [target list](target-lists.md) set, `prerequisite` is offered and may add items to it. |
 
 The phase is written for workers that also set `TAUCETI_HOLD_DECLINED=1`: a
 declined head then waits for its ruling, and `retry` is what releases it.
@@ -64,6 +65,7 @@ directory holds a live incident or a live ruling. It then:
 | `retry` | The round stopped for a reason that is not about the pull request, or there is evidence it did not have. | Lifts the hold at that head, and adds the ruling's note to the stage's next prompt for it. Once per head, and for `declined` incidents only. |
 | `wait` | Other open pull requests are doing the missing work. | Records them. When all have merged the ruling becomes a `retry`; when one closes unmerged the incident is put to the model again. |
 | `escalate` | Anything else. | Nothing: the record carries the analysis and a recommendation for a person. |
+| `prerequisite` | A roadmap milestone nobody is building blocks it. | Adds the milestone to the target list and waits for it as `wait` does. Offered only with a target list and a readable roadmap checkout. |
 
 A ruling that cannot be applied is recorded as `escalate` with the reason and
 `recommend` set to the ruling that was asked for. So is a case the answer leaves
@@ -91,6 +93,7 @@ as `ruling-<incident kind>-<stage>-<pr>.json`. Beside the
 | `retried` | string list | Heads at which this pull request has had a `retry` |
 | `blocked_on` | integer list | `wait`: the pull requests waited on |
 | `recommend` | string | `escalate`: what the model would do, or the ruling that was refused |
+| `blocked_on_targets`, `added` | string lists | `prerequisite`: the target slugs waited on, and those this ruling added to the list |
 
 ```json
 {
@@ -135,6 +138,8 @@ kind of the incident, the agent's final message, the state of each pull request
 that message names (at most six), the six latest comments, the earlier ruling
 if there was one, and the rulings it may choose from. Every text is cut to a
 fixed length.
+The file also names a read-only checkout of the roadmaps and the target list
+file, when those are available.
 
 The answer is `{"rulings": [...]}` with one object per case: `case`, `ruling`,
 `note`, and exactly the fields of that ruling.
@@ -144,7 +149,25 @@ The answer is `{"rulings": [...]}` with one object per case: `case`, `ruling`,
 | `retry` | none |
 | `wait` | `blocked_on`: 1 to 5 pull request numbers |
 | `escalate` | `recommend`: one line, may be empty |
+| `prerequisite` | `items`: 1 to 3 of `{area, slug, text, needs}` |
 
 The model runs on the host, as `progress` and `overlap-scan` do, with
 `GH_TOKEN` and `GITHUB_TOKEN` removed from its environment. Every write is made
 by the worker, after the checks on this page.
+
+## What `prerequisite` writes
+
+Each new item is added as the first item of its `## <Area>` section, so the
+list's authors reach it before the area's other open items; an area the list
+does not have gets a section at the end of the file:
+
+```markdown
+- [ ] `kolmogorov-zero-one` — Layer 2: tail events have probability 0 or 1 (unblocks: #412; needs: `borel-cantelli`; added by: decide)
+```
+
+The area must be a roadmap directory or a section of the list, every `needs`
+slug must be on the list, and a slug the list already has open or in flight is
+waited on without being added. The file is rewritten by rename while holding an
+exclusive `flock` on `.<file name>.lock` beside it; anything else that writes
+the list should take the same lock. The phase does not commit the file, and
+does not remove an item once the pull request it unblocks has gone.
