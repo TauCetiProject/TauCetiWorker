@@ -227,6 +227,8 @@ other top-level key is an error, as is any unrecognized field inside a
 | `roadmap_only` | string | unset | The single roadmap area for roadmap rounds. `""` means all areas; unset means a fresh random area each round |
 | `roadmap_skip` | string list | `[]` | Roadmap areas to exclude. `roadmap_only` wins on overlap |
 | `roadmap_targets` | string | unset | Absolute path of an operator [target list](target-lists.md). Roadmap rounds author only its open items whose prerequisites have landed, one claimed item per round. Several workers may name the same file |
+| `targets_fallback_max_open` | positive integer | unset | Lets a roadmap round the target list offers nothing [author outside it](target-lists.md#authoring-outside-the-list) while fewer than this many of the account's open pull requests serve no item of the list. Requires `roadmap_targets`. Unset, such a round authors nothing |
+| `targets_fallback_cap_file` | string | unset | Absolute path of a file holding one non-negative integer, read each such round in place of `targets_fallback_max_open`. Requires that key |
 | `roadmap_extra_identities` | string list | `[]` | Extra GitHub logins whose claimed intentions count as this worker's own |
 | `extra_roadmap_prompt` | string | unset | Operator guidance rendered into the roadmap prompt, steering target choice within the designated roadmap. Not blank, at most 4096 characters; other phases ignore it |
 | `respect_claims` | bool | `true` | Whether to avoid intentions others have claimed |
@@ -430,7 +432,8 @@ entry with `enabled = true`.
 | `--stream` | `stream` |
 | `--isolate-home` | `isolate_home`; useful when the id is `default` |
 
-`add` cannot set `roadmap_extra_identities`, `respect_claims`, or `restart`, and
+`add` cannot set `roadmap_extra_identities`, `respect_claims`,
+`targets_fallback_max_open`, `targets_fallback_cap_file`, or `restart`, and
 always writes `enabled = true`. Use `workers edit` for those.
 
 ## Actions

@@ -86,6 +86,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
         target=None,
         roadmap_focus=None,
         roadmap_target=None,
+        roadmap_work=None,
         next_action_at=None,
     )
     streak = 0
@@ -147,6 +148,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 target=None,
                 roadmap_focus=None,
                 roadmap_target=None,
+                roadmap_work=None,
                 failure_reason=None,
                 failure_code=None,
                 failure_log=None,
@@ -394,6 +396,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     target=None,
                     roadmap_focus=None,
                     roadmap_target=None,
+                    roadmap_work=None,
                     next_action_at=time.time() + INTERROUND,
                 )
                 time.sleep(INTERROUND)

@@ -237,6 +237,7 @@ RUN_STDLIB=(
   spread_candidates.py
   ssl_cert_file.py
   staging_journal_report.py
+  targets_fallback.py
   status_labels.py
   target_list.py
   tend_bot_permissions.py

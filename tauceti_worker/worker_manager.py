@@ -58,6 +58,8 @@ _WORKER_KEYS = {
     "roadmap_only",
     "roadmap_skip",
     "roadmap_targets",
+    "targets_fallback_max_open",
+    "targets_fallback_cap_file",
     "roadmap_extra_identities",
     "respect_claims",
     "extra_roadmap_prompt",
@@ -199,6 +201,14 @@ def _roadmap_targets(value, where: str) -> str | None:
     return path
 
 
+def _targets_fallback_max_open(value, where: str) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise WorkersError(f"{where} must be a positive integer")
+    return value
+
+
 def _extra_roadmap_prompt(value, where: str) -> str | None:
     """Operator guidance for roadmap rounds, checked at the configuration boundary like `pace`: a blank
     or oversized value is a bad line in workers.toml, not a worker that dies on launch."""
@@ -291,6 +301,8 @@ class WorkerSpec:
     roadmap_only: str | None = None
     roadmap_skip: tuple[str, ...] = ()
     roadmap_targets: str | None = None
+    targets_fallback_max_open: int | None = None
+    targets_fallback_cap_file: str | None = None
     roadmap_extra_identities: tuple[str, ...] = ()
     respect_claims: bool = True
     extra_roadmap_prompt: str | None = None
@@ -359,6 +371,12 @@ class WorkerSpec:
             roadmap_only=_string(raw.get("roadmap_only"), f"workers[{index}].roadmap_only", optional=True),
             roadmap_skip=_strings(raw.get("roadmap_skip", []), f"workers[{index}].roadmap_skip"),
             roadmap_targets=_roadmap_targets(raw.get("roadmap_targets"), f"workers[{index}].roadmap_targets"),
+            targets_fallback_max_open=_targets_fallback_max_open(
+                raw.get("targets_fallback_max_open"), f"workers[{index}].targets_fallback_max_open"
+            ),
+            targets_fallback_cap_file=_roadmap_targets(
+                raw.get("targets_fallback_cap_file"), f"workers[{index}].targets_fallback_cap_file"
+            ),
             roadmap_extra_identities=_strings(
                 raw.get("roadmap_extra_identities", []), f"workers[{index}].roadmap_extra_identities"
             ),
@@ -382,6 +400,10 @@ class WorkerSpec:
                 raise WorkersError(f"workers[{index}].github_account: {e}") from None
         if spec.source is not None and ("roadmap" not in spec.only or not spec.roadmap_only):
             raise WorkersError(f"workers[{index}].source requires only to include roadmap and a non-empty roadmap_only")
+        if spec.targets_fallback_max_open is not None and spec.roadmap_targets is None:
+            raise WorkersError(f"workers[{index}].targets_fallback_max_open requires roadmap_targets")
+        if spec.targets_fallback_cap_file is not None and spec.targets_fallback_max_open is None:
+            raise WorkersError(f"workers[{index}].targets_fallback_cap_file requires targets_fallback_max_open")
         if (spec.author_model or spec.author_effort) and spec.agent == "auto":
             raise WorkersError(f"workers[{index}] author_model/author_effort require an explicit agent")
         if spec.claude_billing not in ("subscription", "api"):
@@ -438,6 +460,8 @@ class WorkerSpec:
             "extra_roadmap_prompt",
             "source",
             "roadmap_targets",
+            "targets_fallback_max_open",
+            "targets_fallback_cap_file",
             "author_model",
             "author_effort",
             "pace",
@@ -495,6 +519,8 @@ class WorkerSpec:
             (self.github_state_url, "--github-state-url"),
             (self.github_state_token_file, "--github-state-token-file"),
             (self.roadmap_targets, "--roadmap-targets"),
+            (self.targets_fallback_max_open and str(self.targets_fallback_max_open), "--targets-fallback-max-open"),
+            (self.targets_fallback_cap_file, "--targets-fallback-cap-file"),
             (self.source, "--source"),
             (self.author_model, "--author-model"),
             (self.author_effort, "--author-effort"),
@@ -1489,6 +1515,12 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
             roadmap_values.append("skip: " + ", ".join(map(str, skips)))
         if spec.get("roadmap_targets"):
             roadmap_values.append("targets: " + str(spec["roadmap_targets"]))
+        if spec.get("targets_fallback_max_open"):
+            cap_file = spec.get("targets_fallback_cap_file")
+            roadmap_values.append(
+                f"outside the list: below {spec['targets_fallback_max_open']} open"
+                + (f", or the number in {cap_file}" if cap_file else "")
+            )
         identities = spec.get("roadmap_extra_identities")
         if isinstance(identities, list) and identities:
             roadmap_values.append("also treat as self: " + ", ".join(map(str, identities)))

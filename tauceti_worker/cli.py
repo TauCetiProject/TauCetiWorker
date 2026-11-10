@@ -66,6 +66,7 @@ from .config import (
     sanitize_wid,
     security_audit_problem,
     set_log_file,
+    targets_fallback_max_open,
     validate_extra_roadmap_prompt,
     warn_red,
 )
@@ -149,6 +150,8 @@ environment (flags win; full reference linked below):
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
   TAUCETI_EXTRA_ROADMAP_PROMPT   extra guidance for roadmap rounds; default for --extra-roadmap-prompt
   TAUCETI_ROADMAP_TARGETS        operator target list for roadmap rounds; default for --roadmap-targets
+  TAUCETI_TARGETS_FALLBACK_MAX_OPEN   default for --targets-fallback-max-open (unset = never author outside the list)
+  TAUCETI_TARGETS_FALLBACK_CAP_FILE   default for --targets-fallback-cap-file
   TAUCETI_PR             comma-separated PR numbers; default for --pr
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_PACE           pacing curve "t:b,..." (default = 60:40); see --pace
@@ -346,6 +349,26 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "item whose needs have landed, claims it, and hands it to the agent; with nothing eligible it "
         "authors nothing. --roadmap-only and --roadmap-skip narrow the areas it draws from. The file "
         "is re-read each round. Empty string = no list. Overrides $TAUCETI_ROADMAP_TARGETS for this run",
+    )
+    p.add_argument(
+        "--targets-fallback-max-open",
+        dest="targets_fallback_max_open",
+        default=None,
+        metavar="N",
+        help="with --roadmap-targets: a roadmap round the list offers nothing authors outside it, in "
+        "the area an ordinary round would take, while fewer than N of your open PRs serve no item of "
+        "the list (rounds on this host already authoring one count too). Without it such a round "
+        "authors nothing. Overrides $TAUCETI_TARGETS_FALLBACK_MAX_OPEN for this run",
+    )
+    p.add_argument(
+        "--targets-fallback-cap-file",
+        dest="targets_fallback_cap_file",
+        default=None,
+        metavar="FILE",
+        help="a file holding one non-negative integer that replaces N of --targets-fallback-max-open "
+        "for each round that reads it, so the cutoff can move while workers run (0 = no authoring "
+        "outside the list). A missing or malformed file leaves N in force. Overrides "
+        "$TAUCETI_TARGETS_FALLBACK_CAP_FILE for this run",
     )
     p.add_argument(
         "--extra-roadmap-prompt",
@@ -1329,6 +1352,15 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         from .targets import load_targets
 
         load_targets(roadmap_targets())
+    if getattr(args, "targets_fallback_max_open", None) is not None:
+        os.environ["TAUCETI_TARGETS_FALLBACK_MAX_OPEN"] = args.targets_fallback_max_open
+    try:
+        targets_fallback_max_open()
+    except ValueError as e:
+        raise Die(f"--targets-fallback-max-open / $TAUCETI_TARGETS_FALLBACK_MAX_OPEN {e}") from None
+    if getattr(args, "targets_fallback_cap_file", None) is not None:
+        chosen = args.targets_fallback_cap_file.strip()
+        os.environ["TAUCETI_TARGETS_FALLBACK_CAP_FILE"] = str(Path(chosen).expanduser().resolve()) if chosen else ""
     # --extra-roadmap-prompt likewise: validated here, at the boundary, then read live by do_roadmap via
     # extra_roadmap_prompt() so loop children see it without a flag of their own.
     if getattr(args, "extra_roadmap_prompt", None) is not None:

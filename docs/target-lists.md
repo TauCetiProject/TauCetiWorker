@@ -89,13 +89,48 @@ covers the rest.
 When the list offers nothing (every open item waits on its needs or is in
 flight, or eight candidates in a row were passed over) the round ends with that
 reason, no model is started, and the loop backs off as after any round without
-progress. The same happens when pull requests cannot be read. Maintenance and
-review are unaffected by the list.
+progress, unless the worker may
+[author outside the list](#authoring-outside-the-list). The same happens when
+pull requests cannot be read. Maintenance and review are unaffected by the list.
 
 A roadmap round under a list costs one listing of open pull requests, one
 search for recent landings, and one search and one claim push per candidate
 tried. The searches are shared between workers of one account on a host for two
 minutes.
+
+## Authoring outside the list
+
+`--targets-fallback-max-open N` (`TAUCETI_TARGETS_FALLBACK_MAX_OPEN`, or
+`targets_fallback_max_open` in `workers.toml`) gives a round the list offers
+nothing something else to do: it authors as a worker without a list does. The
+round draws a random area outside `--roadmap-skip`, or keeps the area of
+`--roadmap-only`, the agent gets the ordinary roadmap prompt and chooses its
+own target, and the pull request serves no item of the list. Fleet roadmap
+focus does not apply to it. Without the setting no round authors outside the
+list.
+
+Such a round runs only while these two together number fewer than N:
+
+- the account's open, non-draft pull requests whose body carries no target
+  marker naming an item of the list, whoever opened them, plus
+- the rounds on this host that are authoring outside the list now. Each holds a
+  slot, a locked file under `targets-fallback/<login>/` in
+  `TAUCETI_GITHUB_SHARED_DIR`, from this check until it ends, so workers that
+  reach the check together do not all pass it. A worker on another host is
+  counted once its pull request is open.
+
+`--targets-fallback-cap-file FILE` (`TAUCETI_TARGETS_FALLBACK_CAP_FILE`,
+`targets_fallback_cap_file`) names a file holding one non-negative integer. A
+round that gets this far reads it and uses that number in place of N, so a
+controller can move the cutoff while workers run; `0` stops authoring outside
+the list. While the file is missing or holds anything else, N applies and the
+round logs why. The file does nothing without `--targets-fallback-max-open`.
+
+When there is no room, or the open pull requests cannot be counted, the round
+ends without progress, giving the list's reason and this one. The check costs
+one more read of the open pull request listing, which workers share, and takes
+no claim. `--max-open-prs` still stops every roadmap round, list or not, before
+any of this.
 
 ## What the agent sees
 
@@ -110,5 +145,6 @@ marker.
 ## Runtime status
 
 While an authoring round runs, the worker's runtime status file carries
-`roadmap_target`, the item as `<Area>/<slug>`. The loop clears it between
-rounds.
+`roadmap_target`, the item as `<Area>/<slug>`, and `roadmap_work`: `list` for a
+round on an item, `outside-list` for a round authoring outside the list. The
+loop clears both between rounds, and a worker without a list sets neither.

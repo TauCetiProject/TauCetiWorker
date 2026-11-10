@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from . import targets_fallback
 from .agents import (
     AuthoringProfile,
     BuildCacheUnavailable,
@@ -2950,7 +2951,7 @@ def assign_target(w, path: Path, only: str, skip: list[str]) -> tuple[Targets, T
             log(f"→ ROADMAP target: {name} ({len(offered)} eligible in {path.name})")
             return live, item
     except GitHubError as e:
-        raise NoProgress(f"roadmap: cannot read pull requests for the target list ({e})") from None
+        raise NoProgress(f"roadmap: cannot read pull requests for the target list ({e})") from e
     raise NoProgress(
         f"roadmap: none of the {min(len(offered), MAX_TARGET_TRIES)} eligible target(s) of {path.name} tried this "
         f"round can be taken ({len(offered)} eligible; each is claimed by another worker or has landed)"
@@ -2963,12 +2964,23 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     skip = roadmap_skip()
     assignment = ""
     targets_path = roadmap_targets()
+    item = None
     if targets_path is not None:
-        live, item = assign_target(w, targets_path, only, skip)
+        try:
+            live, item = assign_target(w, targets_path, only, skip)
+        except NoProgress as nothing:
+            # A typed pause, or a reason raised from a GitHubError, leaves the list's offer unknown.
+            if type(nothing) is not NoProgress or isinstance(nothing.__cause__, GitHubError):
+                raise
+            targets_fallback.admit(w, sv, targets_path, nothing)
+            report_runtime(roadmap_work="outside-list")
+    if item is not None:
         only = item.area
         assignment = render_assignment(live, item)
         os.environ["TAUCETI_TARGET_MARKER"] = marker_stem(item)
-        report_runtime(target=f"new PR (target: {only}/{item.slug})", roadmap_target=f"{only}/{item.slug}")
+        report_runtime(
+            target=f"new PR (target: {only}/{item.slug})", roadmap_target=f"{only}/{item.slug}", roadmap_work="list"
+        )
     elif only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
         only = random_roadmap_area(w, focus=[])
         log(f"→ ROADMAP area: {only} (auto-picked, skipping {len(skip)})")

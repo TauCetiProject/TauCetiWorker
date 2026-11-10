@@ -128,6 +128,23 @@ def roadmap_extra_identities() -> list[str]:
     return sorted({tok.lower() for tok in (t.strip() for t in raw.split(",")) if tok})
 
 
+def targets_fallback_max_open() -> int | None:
+    """The cutoff for authoring outside the operator's target list when it offers nothing (see
+    docs/target-lists.md): such a round authors only while fewer than this many of the account's open
+    pull requests serve no list item. Read live from TAUCETI_TARGETS_FALLBACK_MAX_OPEN so
+    --targets-fallback-max-open is inherited by loop children. None when unset or blank: such a round
+    authors nothing. ValueError unless it is a positive integer."""
+    raw = os.environ.get("TAUCETI_TARGETS_FALLBACK_MAX_OPEN", "").strip()
+    return positive_integer(raw) if raw else None
+
+
+def targets_fallback_cap_file() -> Path | None:
+    """A file holding one integer that replaces `targets_fallback_max_open()` for the round that
+    reads it, from TAUCETI_TARGETS_FALLBACK_CAP_FILE. None when unset or blank."""
+    raw = os.environ.get("TAUCETI_TARGETS_FALLBACK_CAP_FILE", "").strip()
+    return Path(raw) if raw else None
+
+
 def respect_claims() -> bool:
     """Whether roadmap workers avoid targets claimed by other contributors on the intentions
     board. On by default; read live from TAUCETI_RESPECT_CLAIMS so --ignore-claims (which sets it
