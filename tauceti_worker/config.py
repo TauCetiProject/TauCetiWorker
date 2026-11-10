@@ -421,6 +421,14 @@ class Die(Exception):
     """Fatal error → exit 1."""
 
 
+class Halted(Die):
+    """GitHub identity no retry can fix → exit EX_HALTED (84) from `work`; the loop and manager stay stopped."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+
+
 class NoProgress(Exception):
     """Round did no productive work → exit EX_NOPROGRESS (75)."""
 

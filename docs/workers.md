@@ -212,7 +212,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `id` | string | required | `[a-z0-9-]+`, at most 40 characters; namespaces the worker's state, checkout, review store, and logs |
 | `enabled` | bool | `true` | Desired running state. `false` stops the worker without forgetting it |
 | `agent` | string | `"auto"` | `auto`, `codex`, `claude`, `kiro`, `deepseek`, or `minimax` |
-| `github_account` | string | unset | GitHub login to select and verify for this worker. Independent of the agent account; changing it restarts the worker. Requires that account's stored gh credential or a matching environment token |
+| `github_account` | string | unset | GitHub login to select and verify for this worker. Independent of the agent account; changing it restarts the worker. Requires that account's stored gh credential or a matching environment token. A wrong login, a rejected credential, or a suspended account is an [identity halt](#identity-halt) |
 | `max_open_prs` | positive integer | `32` | Open-PR cutoff for roadmap authoring. CLI `--max-open-prs` and `TAUCETI_MAX_OPEN_PRS` also configure it. Science-account workers use `128`. |
 | `github_state_url` | string | public Tau Ceti mirror | Shared GitHub state service. Clients use its newest available data, with direct fallback on unavailable coverage or transport. See [service operations](../services/github-state/README.md). |
 | `github_state_token_file` | string | unset | Private client-token file for the service; installation credentials stay on the server. |
@@ -240,6 +240,40 @@ other top-level key is an error, as is any unrecognized field inside a
 The manager fingerprints each definition. It stops a worker when `enabled`
 becomes false and restarts an enabled worker when any other field changes,
 without disturbing unchanged workers.
+
+### Identity halt
+
+A worker with `github_account` asks GitHub which account its credential belongs
+to before its loop starts and once at the start of every round, one `GET /user`
+each time. Three answers stop the worker until a person intervenes:
+
+| Reason | GitHub's answer |
+| --- | --- |
+| `identity-mismatch` | A login other than `github_account` |
+| `invalid-credentials` | HTTP 401 |
+| `account-halt` | HTTP 403 stating that the account is suspended or locked |
+
+The worker writes the reason, a description, and the time to
+`state/<worker-id>/halt.json` and exits with status 84. Its loop ends without
+backoff or another round, and the manager leaves it stopped under every
+`restart` policy. The status record carries `state = "halted"`, `halt_reason`,
+and `failure_reason`; `workers status` shows the worker as `halted` with that
+reason. While the file exists, `tauceti work` for that worker id exits 84 again
+before it reads a credential or contacts GitHub. Once the account is in order,
+read and remove the record, then start the worker:
+
+```bash
+tauceti work --worker-id reviewer --clear-halt
+tauceti workers restart reviewer
+```
+
+Rate limits, other 403 responses such as a missing scope or SSO enforcement,
+server errors, and network failures are not halts. Before the loop they are
+retried or waited out, and one that persists is an ordinary failure; at the
+start of a round the round proceeds on the loop's earlier verification. A halt
+belongs to a worker id, so a start that fails before `work` has auto-assigned
+one exits 84 without writing a file. A worker without `github_account` is never
+checked or halted.
 
 `env` exists for running one worker differently from its peers when the
 difference has no flag: an A/B of a build setting, for instance. It is part of

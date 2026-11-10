@@ -31,7 +31,7 @@ from typing import NoReturn
 
 from . import worker_scopes
 from .config import positive_integer, security_audit_problem, validate_extra_roadmap_prompt
-from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS
+from .constants import AGENTS, ALLOWED_TASKS, EX_HALTED, EXPLICIT_TASKS, MAX_OPEN_PRS
 from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
 from .quota import parse_pace_curve
@@ -849,6 +849,7 @@ def cmd_managed_runner(args) -> int:
                 restart_count=restart_count,
                 exit_code=None,
                 stopped_at=None,
+                halt_reason=None,
                 **isolation,
             )
             test_command = os.environ.get("TAUCETI_MANAGER_TEST_COMMAND")
@@ -903,7 +904,7 @@ def cmd_managed_runner(args) -> int:
                     signal_group(child.pid, signal.SIGKILL)
                     child.wait()
             rc = child.wait()
-            final = "stopped" if stopping else ("exited" if rc == 0 else "failed")
+            final = "stopped" if stopping else "exited" if rc == 0 else "halted" if rc == EX_HALTED else "failed"
             publisher.update(
                 timeout=1,
                 state=final,
@@ -1191,6 +1192,14 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     if not forced and outcome and outcome[0] == spec.fingerprint():
                         if spec.restart == "never" or spec.restart == "on-failure" and outcome[1] == 0:
                             continue  # Parent-observed exits remain authoritative if reporting fails.
+                    # A halted worker waits for a person under every restart policy. Only an explicit
+                    # restart, a re-enable or a changed definition launches it again.
+                    if not forced and (
+                        outcome[1] == EX_HALTED
+                        if outcome and outcome[0] == spec.fingerprint()
+                        else prior.get("spec_hash") == spec.fingerprint() and prior.get("exit_code") == EX_HALTED
+                    ):
+                        continue
                     if (
                         not forced
                         and not (outcome and outcome[0] == spec.fingerprint())
@@ -1545,7 +1554,7 @@ def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, w
         age = _format_age(item.get("activity_at"))
         lines.extend(_status_field("activity", [f"{age} ago" if age != "—" else age], width))
         detail = item.get("detail")
-        if state == "backoff":
+        if state in ("backoff", "halted"):
             lines.extend(_status_field("reason", [_backoff_reason(item)], width))
         elif detail:
             # Quota summaries use three spaces between providers. Keeping each provider on its own
@@ -1576,6 +1585,9 @@ def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, w
             )
         if state == "backoff":
             lines.extend(_status_field("logs", [f"tauceti workers logs {item['id']}"], width))
+        if state == "halted":
+            resume = f"tauceti work --worker-id {item['id']} --clear-halt, then tauceti workers restart {item['id']}"
+            lines.extend(_status_field("resume", [resume], width))
     return lines
 
 

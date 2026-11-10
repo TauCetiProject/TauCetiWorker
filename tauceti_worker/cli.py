@@ -54,6 +54,7 @@ from .config import (
     Config,
     Die,
     GitHubUnavailable,
+    Halted,
     NoProgress,
     ProgressPreparationUnavailable,
     acquire_slot,
@@ -76,6 +77,7 @@ from .constants import (
     EX_CLAIM_COLLISION,
     EX_DOCUMENTATION_WAIT,
     EX_GITHUB_WAIT,
+    EX_HALTED,
     EX_NOPROGRESS,
     EX_RECOVERY_IDLE,
     EXPLICIT_TASKS,
@@ -88,6 +90,7 @@ from .cost_model import analyze as analyze_costs
 from .cost_model import analyze_review_archive, infrastructure_model, loc_cost_model, measured_ai_model
 from .cost_model import format_report as format_cost_report
 from .github import GitHub, pin_github_account, shared_claims_granted
+from .identity import clear_halt, halt_file, refuse_if_halted, write_halt
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file, legacy_data_root
 from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, codex_dir, parse_pace_curve
@@ -435,6 +438,14 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--dry-run", dest="dry_run", action="store_true", help="survey + print the picker's decision; act on nothing"
+    )
+    p.add_argument(
+        "--clear-halt",
+        dest="clear_halt",
+        action="store_true",
+        help="print and remove this worker's halt.json, then exit. With --github-account, a wrong login, "
+        "a rejected credential or a suspended account writes that file, and the worker does not "
+        "start while it exists (needs --worker-id)",
     )
 
 
@@ -975,6 +986,10 @@ def main(argv: list[str] | None = None) -> int:
 
         if getattr(args, "worker_id", None):
             os.environ["TAUCETI_WORKER_ID"] = sanitize_wid(args.worker_id)
+        if getattr(args, "clear_halt", False):
+            if halt_file() is None:
+                raise Die("--clear-halt needs --worker-id (or $TAUCETI_WORKER_ID)")
+            return clear_halt(halt_file())
         install_proxy()
         if cmd in ("work", "_round"):
             report_runtime(max_open_prs=max_open_prs())
@@ -982,9 +997,18 @@ def main(argv: list[str] | None = None) -> int:
             report_runtime(github_transport_loop_rev=os.environ.get("TAUCETI_GITHUB_TRANSPORT_REV"))
         account = getattr(args, "github_account", os.environ.get("TAUCETI_GITHUB_ACCOUNT"))
         if account is not None:
-            args.github_account = pin_github_account(
-                account, wait_for_reset=cmd == "work" and getattr(args, "loop", False)
-            )
+            halts = cmd in ("work", "_round")
+            if halts:
+                refuse_if_halted(halt_file())
+            try:
+                args.github_account = pin_github_account(
+                    account, wait_for_reset=cmd == "work" and getattr(args, "loop", False), recheck=halts
+                )
+            except Halted as halt:
+                if not halts:
+                    raise Die(str(halt)) from None
+                write_halt(halt_file(), halt)
+                raise
             report_runtime(github_account=args.github_account)
 
     if cmd == "overlap":
@@ -1395,6 +1419,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         wid = auto_assign_wid()
         os.environ["TAUCETI_WORKER_ID"] = wid
         log(f"auto-assigned worker slot {wid} (override with --worker-id)")
+        if getattr(args, "github_account", None):
+            refuse_if_halted(halt_file())
     # A distinct worker id implies its own credential directories (so several workers' refreshes don't
     # race); --isolate-home forces it even for the 'default' id. This must run BEFORE Config.resolve so
     # cfg.home and the credential paths derived from it point at the per-worker copy. Off macOS that
@@ -1821,6 +1847,11 @@ def cli_main() -> int:
         return main() or 0
     except GitHubUnavailable as e:
         return github_pause(e, e.retry_at)
+    except Halted as e:
+        log(f"halted ({e.reason}): {e}")
+        report_failure(str(e), code=EX_HALTED)
+        report_runtime("halted", detail=str(e), halt_reason=e.reason, next_action_at=None)
+        return EX_HALTED
     except Die as e:
         event = blocking_event_since(started)
         if event:

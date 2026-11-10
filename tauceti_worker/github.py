@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 
 from . import github_transport as transport
-from .config import Die, log, one_line
+from .config import Die, Halted, log, one_line
 from .constants import (
     _GH_PRIMARY_RE,
     _GH_SECONDARY_RE,
@@ -33,6 +33,7 @@ from .constants import (
     OPEN_PR_PAGE,
     TAUCETI,
 )
+from .identity import ACCOUNT_HALT, IDENTITY_MISMATCH, INVALID_CREDENTIALS
 from .review_diagnostics import public_diagnostic_quality
 
 
@@ -74,12 +75,34 @@ def unselected_github_env(env: dict[str, str] | None = None) -> dict[str, str]:
     return result
 
 
-def pin_github_account(account: str, *, wait_for_reset: bool = False) -> str:
+# GitHub answers a suspended account with 403 "Sorry. Your account was suspended." Rate limits, missing
+# scopes, SSO enforcement and blocked repositories are also 403s, and none of them names an account state.
+_ACCOUNT_STATE_RE = re.compile(r"\baccount\b[^\n]{0,40}\b(?:suspended|locked)\b", re.I)
+
+
+def _identity_halt(result) -> str | None:
+    """Why a failed `/user` read cannot succeed on retry, or None when it still might."""
+    text = (result.stderr or "") + "\n" + (result.stdout or "")
+    if _gh_rate_kind(text):
+        return None
+    statuses = {record.get("status") for record in getattr(result, "github_records", ())}
+    if 401 in statuses or "HTTP 401" in text:
+        return INVALID_CREDENTIALS
+    if (403 in statuses or "HTTP 403" in text) and _ACCOUNT_STATE_RE.search(text):
+        return ACCOUNT_HALT
+    return None
+
+
+def pin_github_account(account: str, *, wait_for_reset: bool = False, recheck: bool = False) -> str:
     """Select an account without changing gh's active login, before HOME isolation.
 
     Children reuse the parent's credential and verify its identity. A fresh worker prefers the
     named stored credential; a token-only/headless launch may supply GH_TOKEN/GITHUB_TOKEN instead.
     No credential is persisted, included in argv, or copied into worker configuration.
+
+    `recheck` asks GitHub once more instead of reusing a verification from the last hour. A wrong
+    login, a rejected credential and a suspended account raise `Halted`; an unanswered recheck of
+    the credential this process tree already verified returns that login.
     """
     try:
         validate_github_account(account)
@@ -88,6 +111,13 @@ def pin_github_account(account: str, *, wait_for_reset: bool = False) -> str:
     inherited = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     pinned = os.environ.get("_TAUCETI_PINNED_GITHUB_ACCOUNT", "").lower() == account.lower()
     token = inherited if pinned else None
+    # Only the credential this process tree already verified may outlive an unanswered recheck.
+    carried = recheck and pinned and os.environ.get("_TAUCETI_PINNED_GITHUB_SCOPE") == transport.scope()
+
+    def unanswered() -> str:
+        log(f"GitHub account {account}: identity recheck unanswered; continuing on this loop's verification")
+        return os.environ["_TAUCETI_PINNED_GITHUB_ACCOUNT"]
+
     lookup_env = dict(os.environ)
     for name in ("GH_TOKEN", "GITHUB_TOKEN"):
         lookup_env.pop(name, None)
@@ -136,14 +166,14 @@ def pin_github_account(account: str, *, wait_for_reset: bool = False) -> str:
             verified = transport.shared_read(
                 ["identity", "github.com"],
                 verify,
-                ttl=3600 if pinned else 0,
+                ttl=3600 if pinned and not recheck else 0,
                 identity=transport.scope(env),
                 immutable=True,
             )
             identity = attempts[-1] if attempts else subprocess.CompletedProcess([], 0, verified or "", "")
             if verified is None and transport.observed_budget(env).get("core", (1,))[0] == 0:
                 identity.stderr = "API rate limit exceeded"
-            if identity.returncode == 0:
+            if identity.returncode == 0 or carried:
                 break
             error = (identity.stderr or "") + "\n" + (identity.stdout or "")
             kind = _gh_rate_kind(error)
@@ -177,11 +207,22 @@ def pin_github_account(account: str, *, wait_for_reset: bool = False) -> str:
             waited += nap
             attempt += 1
     except (OSError, subprocess.TimeoutExpired):
+        if carried:
+            return unanswered()
         raise Die(
             f"could not authenticate GitHub account {account}; check gh installation, login, and connectivity"
         ) from None
     if identity.returncode != 0:
         # gh's stderr can contain credential material when debugging is enabled. Do not log it.
+        reason = _identity_halt(identity)
+        if reason == INVALID_CREDENTIALS:
+            raise Halted(reason, f"GitHub rejected the credential for account {account} (HTTP 401); log in again")
+        if reason == ACCOUNT_HALT:
+            raise Halted(
+                reason, f"GitHub reports the account behind {account}'s credential as suspended or locked (HTTP 403)"
+            )
+        if carried:
+            return unanswered()
         if _gh_rate_kind((identity.stderr or "") + "\n" + (identity.stdout or "")) == "primary":
             raise Die(f"GitHub API rate limit exceeded while verifying account {account}; waiting for the hourly reset")
         raise Die(f"could not verify GitHub account {account}; check its credential and GitHub connectivity")
@@ -194,7 +235,10 @@ def pin_github_account(account: str, *, wait_for_reset: bool = False) -> str:
     except (ValueError, TypeError, KeyError):
         raise Die(f"could not read the authenticated GitHub identity for {account}") from None
     if login.lower() != account.lower():
-        raise Die(f"requested GitHub account {account}, but the credential belongs to {login}; log in as {account}")
+        raise Halted(
+            IDENTITY_MISMATCH,
+            f"requested GitHub account {account}, but the credential belongs to {login}; log in as {account}",
+        )
     if _SELECTION_BASE not in os.environ:
         os.environ[_SELECTION_BASE] = json.dumps(
             {key: value for key, value in os.environ.items() if key in _SELECTION_KEYS or key.startswith("GIT_CONFIG_")}

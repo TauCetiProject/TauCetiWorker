@@ -33,6 +33,7 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--worker-id ID` | Run an independent worker under this name; any id but `default` also isolates its credential directories (`$HOME` on Linux; provider-specific Claude, Codex, and Kiro directories on macOS). |
 | `--isolate-home` | Force that per-worker isolation even for the `default` id (a distinct id already implies it). |
 | `--dry-run` | Survey and print the picker's decision; act on nothing. |
+| `--clear-halt` | Print and remove this worker's `halt.json`, then exit. Needs `--worker-id` or `TAUCETI_WORKER_ID`. See [identity halt](workers.md#identity-halt). |
 
 ## Roadmap backpressure
 
@@ -159,6 +160,10 @@ removed, then verifies the resulting credential against GitHub's `/user` API.
 When no named credential is stored, an inherited `GH_TOKEN` or `GITHUB_TOKEN`
 may be used, with the same identity check. Missing, rejected, or mismatched
 credentials stop the command; TauCeti never switches to another account.
+`work` repeats the check at the start of every round, and a mismatched login,
+an HTTP 401, or a suspended account stops the worker until
+`tauceti work --worker-id ID --clear-halt`; see
+[identity halt](workers.md#identity-halt).
 
 The selected token lives in the worker's environment and is inherited by loop
 rounds, review tools, host agents, and Git's `gh auth git-credential` helper.
