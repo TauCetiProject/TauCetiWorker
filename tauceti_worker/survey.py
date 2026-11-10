@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .config import Config, log, roadmap_only, roadmap_skip
+from .config import Config, log, own_branches, roadmap_only, roadmap_skip
 from .config import max_open_prs as configured_max_open_prs
 from .constants import (
     AUTO_STAGES,
@@ -828,14 +828,21 @@ def survey(
         sv.errors.append(str(e))
         return sv
     prs = [PRInfo.from_json(d) for d in raw]
+    own = own_branches()
+
+    def own_branch(p):
+        return own is None or own.search(p.head_ref) is not None
+
     if count_all_roadmaps:
-        counts = getattr(compact, "author_counts", None)
+        # The compact survey's per-author totals carry no branch names, so a branch scope counts
+        # from the open-PR listing.
+        counts = None if own else getattr(compact, "author_counts", None)
         all_prs = prs if not available else ([] if counts is not None else [PRInfo.from_json(d) for d in gh.open_prs()])
         sv._automatic_open_count = (
             counts.get(me(), 0)
             if counts is not None
             else roadmap_open_count(
-                [p for p in all_prs if not p.is_draft and p.author == me()], "auto", sv.roadmap_skip
+                [p for p in all_prs if not p.is_draft and p.author == me() and own_branch(p)], "auto", sv.roadmap_skip
             )
         )
     if deep:
@@ -865,16 +872,17 @@ def survey(
     ]
     me_login = me()
     sv.me_login = me_login
-    mine = [p for p in nondraft if p.author == me_login]
+    maintained = [p for p in nondraft if own_branch(p)]
+    mine = [p for p in maintained if p.author == me_login]
     # Tend our own PRs, plus bot PRs hosted on canonical when this identity can push there. Only query
     # that permission while such a bot PR is open; an unknown result skips optional bot work this round.
     bot_on_canonical = bool(enabled & {"rebase", "fix", "fix-ci", "bump", "lint-repair"}) and any(
-        p.author_is_bot and p.head_owner == TAUCETI_OWNER for p in nondraft
+        p.author_is_bot and p.head_owner == TAUCETI_OWNER for p in maintained
     )
     tend_bot = bot_on_canonical and can_push(TAUCETI) is True
     tended = [
         p
-        for p in nondraft
+        for p in maintained
         if (p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER))
         and not {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
     ]

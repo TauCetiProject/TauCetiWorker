@@ -127,6 +127,14 @@ def respect_claims() -> bool:
     return os.environ.get("TAUCETI_RESPECT_CLAIMS", "true").strip().lower() not in ("0", "false", "no", "off")
 
 
+def own_branches() -> re.Pattern[str] | None:
+    """The head branches whose pull requests this worker maintains and counts as open work, as a
+    regular expression searched in the branch name. Read live from TAUCETI_OWN_BRANCHES so
+    --own-branches is inherited by loop children. None when unset or blank: every branch."""
+    raw = os.environ.get("TAUCETI_OWN_BRANCHES", "")
+    return re.compile(raw) if raw else None
+
+
 def _only_label(sv=None) -> str:
     """Friendly render of the roadmap-only area for the status bar. Prefers the survey's sanitized
     value ("auto"/"any"/area); falls back to the raw env tri-state before the first survey lands."""
