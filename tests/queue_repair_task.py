@@ -30,6 +30,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import stat
 import subprocess
@@ -105,7 +106,7 @@ if args == ["build", "--iofail"] and os.environ.get("STUB_LAKE_BUILD_SCRIPT") an
     sys.exit(0)
 if args[:1] == ["env"]:
     os.execvp(args[1], args[1:])
-if args[:2] == ["cache", "put"]:
+if args[:2] in (["cache", "put"], ["cache", "put-staged"]):
     import json, shutil, subprocess
     (stub / "lake-put-key").write_text(os.environ.get("LAKE_CACHE_KEY", ""))
     if os.environ.get("STUB_LAKE_PUT_FAIL") == "1":
@@ -113,17 +114,26 @@ if args[:2] == ["cache", "put"]:
     remote = stub / "remote"
     (remote / "artifacts").mkdir(parents=True, exist_ok=True)
     uploads = (remote / "uploads.log").open("a")
-    for line in Path(args[2]).read_text().splitlines():
+    staged = args[1] == "put-staged"
+    mapping = Path(args[2]) / "outputs.jsonl" if staged else Path(args[2])
+    artifact_root = Path(args[2]) if staged else Path(os.environ["LAKE_CACHE_DIR"]) / "artifacts"
+    if staged:
+        (stub / "staged-upload-started").touch()
+        gate = stub / "staged-upload-gate"
+        while gate.exists():
+            time.sleep(0.05)
+    for line in mapping.read_text().splitlines():
         row = json.loads(line)
         if isinstance(row, list):
-            shutil.copy(Path(os.environ["LAKE_CACHE_DIR"]) / "artifacts" / row[1], remote / "artifacts" / row[1])
+            shutil.copy(artifact_root / row[1], remote / "artifacts" / row[1])
             uploads.write(f"artifact {row[1]}\n")
             uploads.flush()
     if os.environ.get("STUB_LAKE_PUT_FAIL") == "partial":
         sys.exit(1)
-    rev = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    rev = (next(a.split("=", 1)[1] for a in args if a.startswith("--rev=")) if staged else
+           subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip())
     (remote / "revisions").mkdir(exist_ok=True)
-    shutil.copy(args[2], remote / "revisions" / f"{rev}.jsonl")
+    shutil.copy(mapping, remote / "revisions" / f"{rev}.jsonl")
     uploads.write(f"mapping {rev}\n")
     sys.exit(0)
 if args[:2] == ["cache", "get"] and "tauceti-repair" in args:
@@ -5419,6 +5429,127 @@ class RepairContextTests(unittest.TestCase):
         )
         self.assertIn({"file": "TauCeti/Uses.lean", "main": True, "lines": [20]}, ripple["references"])
         self.assertTrue(all(r.get("pr") in (39, 99) for r in ripple["references"] if not r.get("main")))
+
+
+class EarlyPublication(Fixture):
+    BASE_FILES = {
+        "lakefile.toml": 'name = "TauCeti"\nplatformIndependent = true\n',
+        "lean-toolchain": "leanprover/lean4:v4.36.0-rc2\n",
+        "tauceti.toml": f'[tools.tools]\nrepo = "TauCetiProject/TauCetiTools"\nref = "{TOOLS_REF}"\n',
+        "scripts/lint-baseline.txt": "",
+        ".gitignore": ".lake/\n",
+    }
+
+    def setUp(self):
+        super().setUp()
+        os.environ[repair_audit.URL_VARIABLE] = str(TOOLS_REPOSITORY)
+        self.addCleanup(os.environ.pop, repair_audit.URL_VARIABLE, None)
+        key = self.root / "cache-key"
+        key.write_text("test-id:test-secret")
+        self.settings = repair_publish.Settings(url="https://repair-cache.example", key_file=key)
+
+    def test_upload_overlaps_audits_and_is_reused_without_waiting_for_completion(self):
+        gate = self.stub_dir / "staged-upload-gate"
+        gate.touch()
+        self.addCleanup(lambda: gate.unlink(missing_ok=True))
+        audit = repair_audit._sandboxed
+        seen = []
+
+        def checking(argv, *args, **kwargs):
+            if any(str(a).endswith("/audit-driver") for a in argv):
+                deadline = time.monotonic() + 10
+                while not (self.stub_dir / "staged-upload-started").exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue((self.stub_dir / "staged-upload-started").exists())
+                self.assertEqual(self.service.results, [], "checks still block submission")
+                seen.append(True)
+            return audit(argv, *args, **kwargs)
+
+        cfg = self.config(publish=self.settings)
+        try:
+            with patch.object(repair_audit, "_sandboxed", side_effect=checking):
+                outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+            self.assertEqual(outcome["status"], "adopted", outcome)
+            self.assertTrue(seen)
+            self.assertTrue(outcome["publish"]["early"])
+            self.assertFalse((self.stub_dir / "remote/revisions").exists(), "submission does not wait for upload")
+            self.assertEqual(len(repair_publish.BACKGROUND.running), 1, "no duplicate late publisher")
+            self.assertFalse((cfg.root / "worktrees/task-1").exists(), "frozen uploader does not retain source")
+        finally:
+            gate.unlink(missing_ok=True)
+        records = repair_publish.BACKGROUND.wait(20)
+        self.assertTrue(records[0]["published"], records)
+        self.assertTrue((self.stub_dir / "remote/revisions" / (outcome["tip"] + ".jsonl")).is_file())
+        self.assertEqual(list((cfg.root / "worktrees").glob("task-1-publish-*")), [])
+        self.assertNotIn("cache put ", "\n".join(self.lake_calls()))
+        self.assertIsNone(self.agent_calls()[0]["env"]["LAKE_CACHE_KEY"])
+
+    def test_full_check_failures_still_block_submission_despite_early_upload(self):
+        (self.stub_dir / "audit-findings-always").write_text(DUPLICATE_LINE + "\n")
+        cfg = self.config(publish=self.settings, verify_retries=0)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "released")
+        self.assertEqual(self.service.results, [])
+        records = repair_publish.BACKGROUND.wait(20)
+        self.assertTrue(records and records[0]["published"], records)
+        self.assertFalse(outcome["verification"][0]["ok"])
+
+    def test_frozen_upload_uses_captured_revision_after_source_worktree_is_removed(self):
+        worktree = self.root / "state/worktrees/task-7"
+        worktree.mkdir(parents=True)
+        (worktree / "lakefile.toml").write_text('name = "TauCeti"\nplatformIndependent = true\n')
+        (worktree / "lean-toolchain").write_text("leanprover/lean4:v4.36.0-rc2\n")
+        subprocess.run(["git", "init", "-q", str(worktree)], check=True)
+        sh(worktree, "add", "-A")
+        sh(worktree, "-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-qm", "base")
+        revision = sh(worktree, "rev-parse", "HEAD")
+        logdir = self.root / "state/tasks/7/logs"
+        repair_publish.write_early_settings(
+            worktree, settings=self.settings, logdir=logdir, task_id="7", repository=PROJECT, lake=("lake",)
+        )
+        with patch.object(repair_publish, "_spawn") as spawn:
+            record = repair_publish.start_early(worktree, repair.lake_env(self.root / "state"))
+            spec_path = Path(spawn.call_args.args[0][-1])
+        self.assertTrue(record["launched"], record)
+        shutil.rmtree(worktree)
+        spec = json.loads(spec_path.read_text())
+        spec["settings"]["key_file"] = str(self.settings.key_file)
+        # The child receives Lake config/cache settings from systemd or the subprocess env.
+        with patch.dict(os.environ, repair.lake_env(self.root / "state")):
+            self.assertEqual(repair_publish.run_spec(spec_path), 0)
+        result = json.loads(Path(record["record"]).read_text())
+        self.assertTrue(result["published"], result)
+        self.assertEqual(result["revision"], revision)
+        self.assertFalse(Path(spec["frozen"]["path"]).exists())
+
+    def test_later_commit_revision_does_not_reuse_an_older_upload(self):
+        logdir = self.root / "publication-lookup"
+        old_revision = "a" * 40
+        path = logdir / "publications" / old_revision / "publish.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"revision": old_revision, "published": True, "state": "published"}))
+        self.assertIsNotNone(repair_publish.early_record(logdir, old_revision, self.settings))
+        self.assertIsNone(repair_publish.early_record(logdir, "b" * 40, self.settings))
+        path.write_text(json.dumps({"revision": old_revision, "published": False, "state": "failed"}))
+        self.assertIsNone(repair_publish.early_record(logdir, old_revision, self.settings))
+
+    def test_failed_early_start_falls_back_to_final_publication(self):
+        spawn = repair_publish._spawn
+        calls = []
+
+        def launching(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 1:
+                raise OSError("temporary spawn failure")
+            return spawn(*args, **kwargs)
+
+        cfg = self.config(publish=self.settings)
+        with patch.object(repair_publish, "_spawn", side_effect=launching):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(repair_publish.BACKGROUND.wait(20)[0]["published"])
+        self.assertEqual(list((cfg.root / "worktrees").glob("task-1-publish-*")), [])
 
 
 if __name__ == "__main__":

@@ -289,6 +289,11 @@ def check(
     lists the findings in the controller's shape) or ``unavailable`` (``reason``)."""
     started = time.monotonic()
     record: dict = {"status": "passed", "diagnostics": []}
+    from tauceti_queue import repair_publish
+
+    publication = repair_publish.start_early(worktree, env)
+    if publication is not None:
+        record["publication"] = publication
     work = worktree / WORK_DIR
     setup_started = time.monotonic()
     try:

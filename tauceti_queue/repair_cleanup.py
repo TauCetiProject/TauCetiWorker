@@ -124,11 +124,11 @@ def _collect_one(store, clone, root, tree, task_id, result, *, apply):
     ).fetchone():
         result["state"] = "claimed"
         return
-    publication = root / "tasks" / str(task_id) / "logs" / "publish.json"
-    if publication.exists():
+    publications = (root / "tasks" / str(task_id) / "logs").glob("**/publish.json")
+    for publication in publications:
         pub = _record(publication)
-        # Close the worker -> systemd publisher startup gap. Once started, the publisher holds
-        # the same lease. A crashed publisher's old 'running' record cannot retain a tree forever.
+        # Cover both late publishers and immutable early snapshots during unit startup.
+        # Once started the publisher holds this task's shared lease.
         if pub.get("state") == "running" and now - float(pub.get("started_at", now)) < HANDOFF_SECONDS:
             result["state"] = "publisher-starting"
             return

@@ -165,8 +165,8 @@ def _busy(store, root: Path, now: float, *, cache_root: Path | None = None) -> b
     )
     if any((tasks / task_id).exists() and _uses_cache(root, task_id, cache_root) for task_id in claimed):
         return True
-    for publication in _files(tasks, "*/logs/publish.json"):
-        if not _uses_cache(root, publication.parent.parent.name, cache_root):
+    for publication in _files(tasks, "*/logs/**/publish.json"):
+        if not _uses_cache(root, publication.relative_to(tasks).parts[0], cache_root):
             continue
         record = _record(publication)
         if record.get("state") == "running" and now - float(record.get("started_at", now)) < 120:
@@ -186,7 +186,7 @@ def _collect(root: Path, *, apply: bool, now: float, max_bytes: int, max_age: fl
     candidates = [(p.stat().st_mtime, p.parent.name, p, False) for p in mappings]
     # Previous successful publishers did not save their new maps under revisions/. Treat
     # their manifests as snapshots too, so deploying retention cannot discard new outputs.
-    publications = [p for source in participants(root) for p in _files(source / "tasks", "*/logs/publish.json")]
+    publications = [p for source in participants(root) for p in _files(source / "tasks", "*/logs/**/publish.json")]
     for publication in publications:
         record = _record(publication)
         mapping = publication.with_name("repair-outputs.jsonl")

@@ -499,7 +499,15 @@ Publication never delays the submission. On 2026-11-05 head 2's repair validated
 the publish step (the `--no-build --rehash` pass over about 26,000 modules, then the upload) ran for
 more than 12 minutes before the chain was submitted, and CI, dispatched only after submission, waited
 with the whole queue. `TAUCETI_REPAIR_PUBLISH` (`after`, the default; `before`; `off`) now chooses
-the order. Under `after` the worker pushes and submits exactly as before (the same checkpoint token,
+the order. With `after`, a green full-library build now first freezes an output map and
+archive hardlinks and starts a background upload while audits and lint run. Stock Lake's
+`cache put-staged --rev=...` uploads for that captured revision without consulting the live
+workspace. Compilation outputs are reusable even if audits subsequently reject the chain;
+checks and submission remain independent. At submission an upload for the exact accepted
+revision is reused without waiting. A changed revision, failure or unavailable snapshot
+retains the late-publication fallback described below.
+
+Under that fallback the worker pushes and submits exactly as before (the same checkpoint token,
 the claim released or adopted by the submission) and then starts `repair_publish.start_background`
 for the submitted tip, after `adopted` or `not_adopted` and after a `prepared_clean` release, and
 goes on to its next claim. The publisher is a process of its own: under systemd a transient unit
