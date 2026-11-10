@@ -305,6 +305,109 @@ class Round(unittest.TestCase):
         self.assertEqual(seen, [("roadmap", "auto"), ("roadmap", "Topology")])
 
 
+class MaintenanceOrder(unittest.TestCase):
+    BASE = "rebase 9, rebase 1, progress 0, fix-ci 2, fix 3, fix 4, review 50, review 1, review 60, review 4, review 2"
+    LISTED = (
+        "rebase 9, fix-ci 2, progress 0, fix 4, rebase 1, fix 3, review 50, review 4, review 60, review 2, review 1"
+    )
+
+    def survey(self):
+        """The account `science` has #1-#4 open, `bob` #50 and #60, and #9 is an automatic bump."""
+
+        def pr(number, author="science", ref="feature", bot=False):
+            return tc.PRInfo(
+                number, "a" * 40, ref, "TauCetiProject", "TauCeti", False, "MERGEABLE", author, True, False, bot
+            )
+
+        def work_on(*numbers):
+            return [tc.Candidate(n, "a" * 40 if n else "") for n in numbers]
+
+        sv = tc.Survey(worker_id="worker3", me_login="science")
+        sv.open_prs = [pr(1), pr(2), pr(3), pr(4), pr(50, "bob"), pr(60, "bob"), pr(9, "bot", "bump-mathlib/x", True)]
+        sv.rebaseable.actionable = work_on(1, 9)
+        sv.progress.actionable = work_on(0)
+        sv.red_ci.actionable = work_on(2)
+        sv.needs_fix.actionable = work_on(3, 4)
+        sv.reviewable.actionable = work_on(50, 1, 60, 4, 2)
+        return sv
+
+    def order(self, pairs):
+        return ", ".join(f"{stage} {c.pr}" for stage, c in pairs)
+
+    def test_marked_pull_requests(self):
+        bodies = [
+            marker("Probability", "strong-law"),
+            "Part one.\n" + marker("MeasureTheory", "kolmogorov-zero-one", partial=True),
+            marker("Probability", "not-in-the-list"),
+            marker("Topology", "strong-law"),
+            None,
+        ]
+        prs = [{"number": n, "body": body} for n, body in enumerate(bodies, 1)]
+        self.assertEqual(t.marked_prs(t.parse_targets(EXAMPLE), prs), {1, 2})
+
+    def test_listed_work_takes_the_first_of_the_accounts_own_positions(self):
+        sv = self.survey()
+        self.assertEqual(self.order(tc.cascade(sv, tc.AUTO_STAGES)), self.BASE)
+        self.assertEqual(self.order(tc.cascade(sv, tc.AUTO_STAGES, {2, 4, 60})), self.LISTED)
+        self.assertEqual(self.order(tc.cascade(sv, tc.AUTO_STAGES, {60, 9})), self.BASE)
+        self.assertEqual(
+            self.order(tc.cascade(sv, ["fix", "review"], {4})),
+            "fix 4, fix 3, review 50, review 4, review 60, review 1, review 2",
+        )
+
+    def offered(self, gh, sv=None):
+        """The order in which one round offers its candidates, every one of them declined."""
+        seen = []
+        opts = work.RoundOpts(
+            only=["rebase", "progress", "fix-ci", "fix", "review"],
+            agent="claude",
+            work_model="claude",
+            sandbox_host=True,
+            dry_run=True,
+        )
+        w = SimpleNamespace(cfg=SimpleNamespace(wid="worker3"), gh=gh, rs=None, counters=None)
+        with (
+            patch.object(work, "roadmap_only", return_value="any"),
+            patch.object(work, "survey", return_value=sv or self.survey()),
+            patch.object(work, "spread_candidates", side_effect=list),
+            patch.object(work, "prioritize_review_candidates", side_effect=lambda queue, *a, **k: (list(queue), [])),
+            patch.object(work, "dispatch", side_effect=lambda stage, _w, _sv, c, _o: seen.append((stage, c))),
+            patch.object(work, "log") as log,
+            self.assertRaisesRegex(tc.NoProgress, "no eligible work"),
+        ):
+            work.run_round(w, opts)
+        return self.order(seen), [call.args[0] for call in log.call_args_list if call.args[0].startswith("target list")]
+
+    def test_a_round_reads_the_list_and_the_markers(self):
+        bodies = {2: marker("Probability", "strong-law"), 4: marker("MeasureTheory", "borel-cantelli", partial=True)}
+        bodies[60] = marker("Probability", "truncation-bounds")
+        gh = SimpleNamespace(
+            open_prs=Mock(return_value=[{"number": n, "body": bodies.get(n, "")} for n in range(1, 61)])
+        )
+        with tempfile.TemporaryDirectory(prefix="target-list-") as tmp, patch.dict(os.environ):
+            os.environ["TAUCETI_ROADMAP_TARGETS"] = str(Path(tmp, "targets.md"))
+            Path(tmp, "targets.md").write_text(EXAMPLE)
+            self.assertEqual(
+                self.offered(gh), (self.LISTED, ["target list: #2, #4 before this account's other pull requests"])
+            )
+            gh.open_prs.side_effect = tc.GitHubError("HTTP 504")
+            order, logged = self.offered(gh)
+            self.assertEqual(order, self.BASE)
+            self.assertIn("usual order this round (HTTP 504)", logged[0])
+            Path(tmp, "targets.md").unlink()
+            order, logged = self.offered(gh)
+            self.assertEqual(order, self.BASE)
+            self.assertIn("usual order this round (roadmap targets: ", logged[0])
+            gh.open_prs.reset_mock()
+            alone = self.survey()
+            alone.red_ci.actionable, alone.needs_fix.actionable = [], []
+            alone.reviewable.actionable = alone.reviewable.actionable[:2]
+            self.assertEqual(self.offered(gh, alone), ("rebase 9, rebase 1, progress 0, review 50, review 1", []))
+            os.environ["TAUCETI_ROADMAP_TARGETS"] = ""
+            self.assertEqual(self.offered(gh), (self.BASE, []))
+            gh.open_prs.assert_not_called()
+
+
 class Wiring(unittest.TestCase):
     def test_setting_and_flag(self):
         with patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS": " "}):

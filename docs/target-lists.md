@@ -89,13 +89,37 @@ covers the rest.
 When the list offers nothing (every open item waits on its needs or is in
 flight, or eight candidates in a row were passed over) the round ends with that
 reason, no model is started, and the loop backs off as after any round without
-progress. The same happens when pull requests cannot be read. Maintenance and
-review are unaffected by the list.
+progress. The same happens when pull requests cannot be read. The list never
+changes which pull requests maintenance and review take up, only the order
+[below](#maintenance-order).
 
 A roadmap round under a list costs one listing of open pull requests, one
 search for recent landings, and one search and one claim push per candidate
 tried. The searches are shared between workers of one account on a host for two
 minutes.
+
+## Maintenance order
+
+A worker with a list also puts the list first when it tends the account's own
+pull requests. A pull request serves the list when its body carries a target
+marker, complete or partial, for one of the list's items.
+
+- Across `rebase`, `fix-ci` and `fix`, work on the account's pull requests that
+  serve the list is offered before work on its others, so a round repairs a
+  red build on a list item before it rebases an unrelated pull request.
+- In `review`, among the account's own pull requests, those that serve the
+  list are offered first.
+
+Each group keeps the order it would have had, and every other candidate keeps
+its position: Mathlib bump work stays in front, `lint-repair`, `progress` and
+other accounts' pull requests are offered exactly when they would have been,
+and `--pr` and `--only` narrow the round as before. The "Next auto round would"
+line of `tauceti status` and the TUI does not take the list into account.
+
+The order costs one more read of the file and one listing of open pull
+requests, in rounds where at least two of the account's pull requests have
+work to offer. When either cannot be read, the round logs it and keeps the
+usual order.
 
 ## What the agent sees
 

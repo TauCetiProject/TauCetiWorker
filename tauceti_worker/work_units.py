@@ -123,6 +123,7 @@ from .targets import (
     landed_pr,
     live_targets,
     load_targets,
+    marked_prs,
     marker_stem,
     render_assignment,
 )
@@ -401,6 +402,25 @@ def focus_prs(sv: Survey, opts) -> None:
             log(f"  --pr #{pr}: {pr_focus_reason(sv, opts, pr)}")
 
 
+def target_list_prs(w, sv, stages) -> set[int]:
+    """The account's actionable pull requests that carry a target marker for an item of the
+    operator's target list, which `cascade` offers before the account's others. Empty without a
+    list, and when the list or the open pull requests cannot be read."""
+    path = roadmap_targets()
+    own = {p.number for p in sv.open_prs if sv.owns(p)}
+    actionable = {c.pr for stage in stages for c in sv.kind(stage).actionable} & own
+    if path is None or len(actionable) < 2:
+        return set()
+    try:
+        listed = marked_prs(load_targets(path), w.gh.open_prs()) & actionable
+    except (Die, GitHubError) as e:
+        log(f"target list: maintenance keeps its usual order this round ({e})")
+        return set()
+    if listed and listed != actionable:
+        log(f"target list: {', '.join(f'#{n}' for n in sorted(listed))} before this account's other pull requests")
+    return listed
+
+
 def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
     if "security-audit" in opts.only:
         from .activity import select
@@ -610,7 +630,8 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
     claim_collision = False
     from .state_repair import retry_key
 
-    for stage, c in cascade(sv, [stage for stage in round_stages(opts) if want(opts.only, stage)]):
+    stages = [stage for stage in round_stages(opts) if want(opts.only, stage)]
+    for stage, c in cascade(sv, stages, target_list_prs(w, sv, stages)):
         if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
             w.selection_changed = True
             continue

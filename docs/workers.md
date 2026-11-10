@@ -226,7 +226,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `auto_refresh` | bool | `false` | Renew this worker's Claude access token when it expires, instead of parking until a human runs `claude`. Only safe when nothing else uses the same credential file — the refresh token is single-use. See [quota and pacing](quota.md) |
 | `roadmap_only` | string | unset | The single roadmap area for roadmap rounds. `""` means all areas; unset means a fresh random area each round |
 | `roadmap_skip` | string list | `[]` | Roadmap areas to exclude. `roadmap_only` wins on overlap |
-| `roadmap_targets` | string | unset | Absolute path of an operator [target list](target-lists.md). Roadmap rounds author only its open items whose prerequisites have landed, one claimed item per round. Several workers may name the same file |
+| `roadmap_targets` | string | unset | Absolute path of an operator [target list](target-lists.md). Roadmap rounds author only its open items whose prerequisites have landed, one claimed item per round. Maintenance and review take the account's own pull requests that serve the list [first](target-lists.md#maintenance-order). Several workers may name the same file |
 | `roadmap_extra_identities` | string list | `[]` | Extra GitHub logins whose claimed intentions count as this worker's own |
 | `extra_roadmap_prompt` | string | unset | Operator guidance rendered into the roadmap prompt, steering target choice within the designated roadmap. Not blank, at most 4096 characters; other phases ignore it |
 | `respect_claims` | bool | `true` | Whether to avoid intentions others have claimed |

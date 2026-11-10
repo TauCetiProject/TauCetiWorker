@@ -7,6 +7,7 @@ the worker uses:
     live_targets(targets, gh)          statuses overlaid from open and merged pull request markers
     candidates(targets, only, skip)    the eligible items, in the order a worker tries to claim them
     landed_pr(item, gh)                the merged pull request that completed an item, at any age
+    marked_prs(targets, prs)           the pull requests among `prs` whose marker names an item
     render_assignment(targets, item)   the roadmap prompt's bullet assigning one item
     marker_stem(item)                  what the pull request body must contain for that item
 
@@ -200,6 +201,13 @@ def landed_pr(item: TargetItem, gh) -> int | None:
     among the closed pull requests that carry a marker. Raises GitHubError when it fails."""
     ident = '\\"id\\":\\"' + item.slug.replace('"', "") + '\\"'
     return landed([item], gh.merged_prs(f'"{ident}" {MERGED_SEARCH}', limit=30)).get((item.area, item.slug))
+
+
+def marked_prs(targets: Targets, prs: Iterable[dict]) -> set[int]:
+    """The numbers of the pull requests among `prs` whose body carries a target marker, complete or
+    partial, for an item of the list."""
+    listed = {(it.area, it.slug) for it in targets.items()}
+    return {d["number"] for d in prs if marker_keys(d.get("body"))[0] & listed}
 
 
 def eligible_items(targets: Targets, area: str) -> list[TargetItem]:
