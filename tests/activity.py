@@ -780,7 +780,7 @@ class ActivityTests(unittest.TestCase):
         s = a.cached()["summary"]
         self.assertEqual(sum(r["finished"] for r in s["rounds"]["total"].values()), 1)
 
-    def test_migration_keeps_native_activity_and_cannot_restore_old_data(self):
+    def test_history_cutoff_keeps_native_rounds_and_preserves_older_pr_identities(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute(
                 "INSERT INTO rounds(id,worker,scope,kind,finished,outcome) VALUES ('resource:old','worker','machine','unknown',?,'unknown')",
@@ -799,7 +799,7 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(s["history_since"], self.now - 60)
         self.assertEqual(s["rounds"]["total"], {"review": dict(finished=1, failed=0, unknown=0)})
         self.assertEqual(s["pr_windows"]["total"]["authored"], 1)
-        # Even a still-running older collector cannot reinsert imported rounds/PRs.
+        # Imported resource rounds remain excluded; older PR identities survive.
         with contextlib.closing(a._connect()) as db, db:
             db.execute("INSERT INTO rounds(id,kind) VALUES ('resource:replayed','unknown')")
             db.execute("INSERT INTO prs(repo,number,created) VALUES ('org/repo',9,?)", (self.now - 100,))
@@ -816,8 +816,39 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(s["pr_windows"]["total"]["authored"], 1)
         with contextlib.closing(a._connect()) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM rounds").fetchone()[0], 1)
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM prs").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM prs").fetchone()[0], 5)
             self.assertEqual(db.execute("SELECT value FROM meta WHERE key='history_cutoff'").fetchone()[0], cutoff)
+
+    def test_landing_window_migration_replays_discarded_prs_without_double_counting(self):
+        receipt = dict(
+            version=1,
+            id="old-pr",
+            kind="pr_created",
+            repository="org/repo",
+            pr=7,
+            at=self.now - 100,
+            worker="worker",
+            group="machine",
+        )
+        journal = Path(os.environ["TAUCETI_FLEET_EVENTS"])
+        journal.write_text(json.dumps(receipt) + "\n")
+        self.finish(60)
+        a.prepare(now=self.now)
+        with contextlib.closing(a._connect()) as db, db:
+            # Simulate a collector that consumed this receipt, then discarded
+            # its PR because it was opened before local round recording began.
+            db.execute("DELETE FROM prs")
+            db.execute("DELETE FROM meta WHERE key='landing_window_schema'")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE id='old-pr'").fetchone()[0], 1)
+        for _ in range(2):
+            a.prepare(now=self.now + 1)
+        with contextlib.closing(a._connect()) as db, db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM prs").fetchone()[0], 1)
+            db.execute("UPDATE prs SET landed=?,head='h',state='CLOSED'", (self.now,))
+            db.execute("INSERT INTO pr_loc VALUES ('org/repo',7,'h',77,0,?)", (self.now,))
+            s = a._summary(db, self.now + 1)
+        self.assertEqual(s["pr_windows"]["total"]["authored"], 0)
+        self.assertEqual(s["costs"]["windows"]["24h"]["landed_loc_added"], 77)
 
     def test_observation_client_has_no_redirect_or_direct_api_fallback(self):
         import threading

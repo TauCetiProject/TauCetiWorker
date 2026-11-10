@@ -82,6 +82,10 @@ def install(db):
             "INSERT OR IGNORE INTO report_pr_refresh SELECT repo,number,worker,0 FROM pr_contributions GROUP BY repo,number HAVING rowid=MAX(rowid)"
         )
 
+    if db.execute("INSERT OR IGNORE INTO report_sources VALUES('pr-landing-windows-v1')").rowcount:
+        # Recompute only PR deltas when upgrading from creation-cohort LOC.
+        db.execute("INSERT OR IGNORE INTO report_dirty SELECT 'pr:prs',json_array(repo,number) FROM prs")
+
 
 def invalidate(db, source, key):
     db.execute("INSERT OR IGNORE INTO report_dirty VALUES(?,?)", (source, key))
@@ -168,22 +172,12 @@ def pr_events(db, key, now):
     p = dict(row)
     loc = db.execute("SELECT head,added FROM pr_loc WHERE repo=? AND number=?", (repo, number)).fetchone()
     measured = bool(loc and loc[0] == p["head"])
-    landed = p["landed"] is not None and p["landed"] <= now
     opened = p["state"] == "OPEN" and p["landed"] is None
     if p["landed"] is not None and p["landed"] > now:
         db.execute("INSERT OR REPLACE INTO report_due VALUES('pr:prs',?,?)", (key, p["landed"]))
-    cohort = dict(
-        authored=1,
-        landed_loc_added=loc[1] if landed and measured else 0,
-        open_loc_added=loc[1] if opened and measured else 0,
-        landed_prs=int(landed),
-        open_prs=int(opened),
-        missing_loc_prs=int(((landed or opened) and not measured) or (p["state"] is None and p["landed"] is None)),
-        known_loc_prs=int((landed or opened) and measured),
-        measured_pr_weight=(1 if landed else 0.5 if opened else 0) if measured else 0,
-    )
+    cutoff = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
     values = [
-        r.point(p["created"], cohort),
+        r.point(p["created"], {"authored": 1} if not cutoff or p["created"] >= cutoff[0] else {}),
         r.point(
             0,
             dict(
@@ -194,7 +188,18 @@ def pr_events(db, key, now):
         ),
     ]
     if p["landed"] is not None:
-        values.append(r.point(p["landed"], {"landed": 1}))
+        values.append(
+            r.point(
+                p["landed"],
+                dict(
+                    landed=1,
+                    landed_loc_added=loc[1] if measured else 0,
+                    landed_prs=1,
+                    missing_loc_prs=int(not measured),
+                    known_loc_prs=int(measured),
+                ),
+            )
+        )
     return r.events(r.subjects(p["worker"], p["scope"]), values)
 
 

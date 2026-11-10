@@ -202,12 +202,8 @@ def _connect():
       CREATE TRIGGER IF NOT EXISTS activity_round_history_cutoff BEFORE INSERT ON rounds
         WHEN NEW.id LIKE 'resource:%' AND EXISTS(SELECT 1 FROM meta WHERE key='history_cutoff')
         BEGIN SELECT RAISE(IGNORE); END;
-      CREATE TRIGGER IF NOT EXISTS activity_pr_history_cutoff BEFORE INSERT ON prs
-        WHEN NEW.created < (SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff')
-        BEGIN SELECT RAISE(IGNORE); END;
-      CREATE TRIGGER IF NOT EXISTS activity_pr_history_cutoff_update AFTER UPDATE OF created ON prs
-        WHEN NEW.created < (SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff')
-        BEGIN DELETE FROM prs WHERE repo=NEW.repo AND number=NEW.number; END;
+      DROP TRIGGER IF EXISTS activity_pr_history_cutoff;
+      DROP TRIGGER IF EXISTS activity_pr_history_cutoff_update;
     """)
     activity_costs.install(db)
     db.executescript("""
@@ -233,6 +229,10 @@ def _connect():
         # Older preparers advanced these journals while filtering review starts out.
         # Replay once; stable event IDs keep already-counted activity idempotent.
         db.execute("DELETE FROM cursors WHERE path NOT LIKE '%/resources.jsonl'")
+    if db.execute("INSERT OR IGNORE INTO meta VALUES ('landing_window_schema','1')").rowcount:
+        # Replay retained creation journals to recover identities discarded by
+        # the former creation cutoff, without losing registered journal paths.
+        db.execute("UPDATE cursors SET offset=0 WHERE path NOT LIKE '%/resources.jsonl'")
     from .activity_rollup_sources import install as install_rollups
 
     install_rollups(db)
@@ -245,9 +245,16 @@ def _ingest(db, e):
     if e.get("round_id", "").startswith("resource:"):
         return
     cutoff = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
-    if cutoff and e["at"] < cutoff[0]:
+    if cutoff and e["at"] < cutoff[0] and e.get("kind") != "pr_created":
         return
     kind, worker, scope = e["kind"], e.get("worker", "unknown"), e.get("group", e.get("machine_id", "local"))
+    if kind == "pr_created":
+        # Replays must restore PRs removed by older collectors even when the
+        # event's deduplication tombstone already exists.
+        db.execute(
+            "INSERT OR IGNORE INTO prs(repo,number,worker,scope,created) VALUES (?,?,?,?,?)",
+            (e["repository"], e["pr"], worker, scope, e["at"]),
+        )
     if kind == "pr_activity":
         db.execute(
             "INSERT OR IGNORE INTO pr_contributions VALUES (?,?,?,?,?,?,?)",
@@ -281,12 +288,6 @@ def _ingest(db, e):
             )
         elif kind == "round_waited":
             db.execute("UPDATE rounds SET outcome='waiting' WHERE id=?", (rid,))
-    elif kind == "pr_created":
-        db.execute(
-            "INSERT OR IGNORE INTO prs(repo,number,worker,scope,created) VALUES (?,?,?,?,?)",
-            (e["repository"], e["pr"], worker, scope, e["at"]),
-        )
-
     elif kind == "ci_result":
         db.execute(
             "INSERT OR IGNORE INTO ci_activity VALUES (?,?,?,?,?,?)",
@@ -368,7 +369,8 @@ def _clean_history(db):
     cutoff = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
     if cutoff:
         db.execute("DELETE FROM rounds WHERE COALESCE(started,finished) < ?", (cutoff[0],))
-        db.execute("DELETE FROM prs WHERE created < ?", (cutoff[0],))
+        # Older PRs may still land inside a reporting window. Keep their identity
+        # and refresh observations; only authorship counts use the history cutoff.
         db.execute("DELETE FROM pr_contributions WHERE at < ?", (cutoff[0],))
         db.execute("DELETE FROM ci_activity WHERE at < ?", (cutoff[0],))
     db.execute("DELETE FROM cursors WHERE path LIKE '%/resources.jsonl'")
@@ -632,7 +634,12 @@ def _summary(db, now, column=None, identity=None):
         return db.execute(f"SELECT {field} FROM {table} {predicate} ORDER BY {field} LIMIT 1", args).fetchone()
 
     first_round = minimum("rounds", "COALESCE(started,finished)")
-    first_pr = minimum("prs", "created")
+    cutoff_row = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
+    first_pr = minimum(
+        "prs",
+        "created",
+        "created >= (SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff')" if cutoff_row else "",
+    )
     since = min((row[0] for row in (first_round, first_pr) if row is not None), default=None)
     native_since = minimum("rounds", "started")
     pr_windows = {
@@ -645,27 +652,23 @@ def _summary(db, now, column=None, identity=None):
         "AND started IS NOT NULL ORDER BY started DESC,id DESC LIMIT 1",
         args,
     ).fetchone()
-    cutoff_row = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
     cutoff = cutoff_row[0] if cutoff_row else since
     costs = activity_costs.summarize(db, now, cutoff, column, identity)
-    _, cohorts = rollup.snapshot(db, now, WINDOWS, cutoff, column, identity)
     for window in activity_costs.COST_WINDOWS:
-        values = cohorts[window]
+        values = totals[window]
         row = costs["windows"][window]
         row.update(
             {
                 key: int(values.get(key, 0))
                 for key in (
                     "landed_loc_added",
-                    "open_loc_added",
                     "landed_prs",
-                    "open_prs",
                     "missing_loc_prs",
                     "known_loc_prs",
                 )
             }
         )
-        row["measured_pr_weight"] = float(values.get("measured_pr_weight", 0))
+        row["loc_basis"] = "landed_at"
         row.update(activity_summary.loc_estimate(row))
     raw_observed = minimum("prs", "observed")
     raw_checked = minimum("prs", "checked")
@@ -807,6 +810,8 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                 for column, key in (("worker", "workers"), ("scope", "groups")):
                     ids = [(identity,) for kind, identity in subjects if kind == column]
                     for row in ids:
+                        if row[0] is None:
+                            continue
                         value[key][row[0]] = _summary(db, now, column, row[0])
                         value[key][row[0]]["shared_mathlib"] = shared_mathlib.summary(
                             **{"scope" if key == "groups" else "worker": row[0]}

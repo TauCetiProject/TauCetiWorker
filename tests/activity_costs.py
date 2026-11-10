@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pooled costs, initiated-PR cohorts, half-credit open output and cached readers."""
+"""Pooled costs, landing windows, measured output and cached readers."""
 
 import contextlib
 import io
@@ -189,29 +189,29 @@ class CostTests(unittest.TestCase):
         self.assertIn("Accounting: 1 stopped conversation with unresolved usage.", output.getvalue())
         self.assertNotIn("settled estimates", output.getvalue())
 
-    def test_all_fleet_costs_include_reviews_but_only_initiated_output_counts(self):
+    def test_all_fleet_costs_include_reviews_and_all_prs_landed_in_window(self):
         s = self.summary()
         rows = s["costs"]["windows"]
         self.assertEqual(set(rows), {"24h", "7d", "total"})
         self.assertEqual(Decimal(rows["total"]["spent_usd"]), Decimal(60))
         self.assertEqual(Decimal(rows["total"]["active_accrued_usd"]), 0)
         self.assertEqual(Decimal(rows["total"]["unresolved_stopped_usd"]), Decimal(40))
-        self.assertEqual(Decimal(rows["total"]["weighted_loc"]), Decimal(650))
-        self.assertEqual(Decimal(rows["total"]["usd_per_loc"]), Decimal(100) / 650)
-        # An old PR landing yesterday does not enter the seven-day initiation cohort.
+        self.assertEqual(Decimal(rows["total"]["landed_loc"]), Decimal(300))
+        self.assertEqual(Decimal(rows["total"]["usd_per_loc"]), Decimal(100) / 300)
+        # An older PR landing today enters both the seven-day and 24-hour windows.
         self.assertEqual(Decimal(rows["7d"]["estimated_usd"]), Decimal(90))
-        self.assertEqual(Decimal(rows["7d"]["weighted_loc"]), Decimal(350))
-        self.assertEqual(Decimal(rows["7d"]["usd_per_loc"]), Decimal(90) / 350)
+        self.assertEqual(Decimal(rows["7d"]["landed_loc"]), Decimal(300))
+        self.assertEqual(Decimal(rows["7d"]["usd_per_loc"]), Decimal(90) / 300)
         self.assertEqual(s["pr_windows"]["total"]["reviews"], 1)
         self.assertEqual(s["pr_windows"]["total"]["assisted"], 1)
         with contextlib.redirect_stdout(io.StringIO()) as output:
             a.display(dict(available=True, summary=s))
         self.assertIn("All time", output.getvalue())
         self.assertIn("7 days", output.getvalue())
-        self.assertIn("$0.1538", output.getvalue())
-        self.assertIn("$0.2571", output.getvalue())
+        self.assertIn("$0.3333", output.getvalue())
+        self.assertIn("$0.3000", output.getvalue())
 
-    def test_24h_costs_use_all_conversations_but_only_prs_opened_in_window(self):
+    def test_24h_costs_use_all_conversations_and_prs_landed_in_window(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute(
                 "INSERT INTO prs VALUES ('org/repo',6,'author','machine',?,'OPEN',NULL,?,?,'head',NULL)",
@@ -221,10 +221,35 @@ class CostTests(unittest.TestCase):
         summary = self.summary()
         row = summary["costs"]["windows"]["24h"]
         self.assertEqual(Decimal(row["estimated_usd"]), 90)  # Includes the review of another author's PR.
-        self.assertEqual(row["open_prs"], 1)
-        self.assertEqual(row["landed_prs"], 0)  # Older PRs landing today do not enter this cohort.
-        self.assertEqual(Decimal(row["weighted_loc"]), 40)
-        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal("2.25"))
+        self.assertNotIn("open_prs", row)
+        self.assertEqual(row["landed_prs"], 2)  # Both older PRs landed today.
+        self.assertEqual(Decimal(row["landed_loc"]), 300)
+        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal("0.3"))
+
+    def test_landing_windows_ignore_creation_time_and_exclude_future_landings(self):
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("UPDATE prs SET created=? WHERE number=1", (self.now - 30 * DAY,))
+            db.execute("UPDATE prs SET landed=? WHERE number=1", (self.now - 3600,))
+            db.execute("UPDATE meta SET value=? WHERE key='history_cutoff'", (str(self.now - 60),))
+            db.execute("UPDATE prs SET landed=? WHERE number=2", (self.now - 8 * DAY,))
+            db.execute("UPDATE prs SET landed=? WHERE number=5", (self.now + DAY,))
+        s = self.summary()
+        for window in ("24h", "7d"):
+            row = s["costs"]["windows"][window]
+            self.assertEqual(row["landed_prs"], 1)
+            self.assertEqual(row["landed_loc_added"], 100)
+        self.assertEqual(s["costs"]["windows"]["total"]["landed_loc_added"], 300)
+        self.assertEqual(s["costs"]["windows"]["total"]["known_loc_prs"], 2)
+
+    def test_landed_output_preserves_worker_and_machine_attribution(self):
+        self.summary()
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute("UPDATE prs SET worker='other',scope='other-machine' WHERE number=1")
+            author = a._summary(db, self.now + 1, "worker", "author")
+            machine = a._summary(db, self.now + 1, "scope", "machine")
+        for s in (author, machine):
+            self.assertEqual(s["costs"]["windows"]["24h"]["landed_loc_added"], 200)
+            self.assertEqual(s["costs"]["windows"]["total"]["landed_prs"], 1)
 
     def test_cost_breakdown_is_additive_and_total_is_last(self):
         summary = self.summary()
@@ -281,15 +306,15 @@ class CostTests(unittest.TestCase):
         for line in output.getvalue().splitlines():
             if line.startswith("Finished rounds"):
                 self.assertNotIn("1h", line)
-            if line.startswith("Costs / initiated PR output"):
+            if line.startswith("Costs / landed PR output"):
                 self.assertNotIn("24h", line)
 
-    def test_odd_open_LOC_gets_exactly_half_credit(self):
+    def test_open_LOC_does_not_contribute_to_landed_output(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute("UPDATE pr_loc SET added=301 WHERE number=3")
         row = self.summary()["costs"]["windows"]["7d"]
-        self.assertEqual(Decimal(row["weighted_loc"]), Decimal("350.5"))
-        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal(90) / Decimal("350.5"))
+        self.assertEqual(Decimal(row["landed_loc"]), Decimal(300))
+        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal(90) / Decimal(300))
 
     def test_unchanged_usage_is_cached_and_new_checkpoint_invalidates_it(self):
         self.summary()
@@ -678,21 +703,21 @@ class CostTests(unittest.TestCase):
         self.assertEqual(Decimal(spending["7d"]["spent_usd"]), 90)
         self.assertEqual(Decimal(spending["total"]["spent_usd"]), 105)
 
-    def test_missing_or_changed_head_LOC_is_extrapolated_with_half_weight_open_prs(self):
+    def test_missing_or_changed_landed_head_LOC_is_extrapolated(self):
         with contextlib.closing(a._connect()) as db, db:
-            db.execute("UPDATE prs SET head='new-head' WHERE number=3")
+            db.execute("UPDATE prs SET head='new-head' WHERE number=2")
         rows = self.summary()["costs"]["windows"]
-        self.assertEqual(Decimal(rows["total"]["measured_weighted_loc"]), 500)
-        self.assertEqual(Decimal(rows["total"]["weighted_loc"]), 600)
-        self.assertEqual(Decimal(rows["total"]["usd_per_loc"]), Decimal(100) / 600)
-        self.assertEqual(Decimal(rows["7d"]["weighted_loc"]), 300)
-        self.assertEqual(Decimal(rows["7d"]["usd_per_loc"]), Decimal("0.3"))
+        self.assertEqual(Decimal(rows["total"]["landed_loc_added"]), 100)
+        self.assertEqual(Decimal(rows["total"]["landed_loc"]), 200)
+        self.assertEqual(Decimal(rows["total"]["usd_per_loc"]), Decimal(100) / 200)
+        self.assertEqual(Decimal(rows["7d"]["landed_loc"]), 200)
+        self.assertEqual(Decimal(rows["7d"]["usd_per_loc"]), Decimal("0.45"))
         self.assertEqual(rows["7d"]["missing_loc_prs"], 1)
         self.assertTrue(rows["7d"]["loc_estimated"])
         with contextlib.redirect_stdout(io.StringIO()) as output:
             a.display(dict(available=True, summary=self.summary()))
-        self.assertIn("~$0.1667", output.getvalue())
-        self.assertIn("~$0.3000", output.getvalue())
+        self.assertIn("~$0.5000", output.getvalue())
+        self.assertIn("~$0.4500", output.getvalue())
         self.assertIn("~ Missing LOC estimated", output.getvalue())
 
     def test_missing_all_LOC_keeps_rate_visible_without_inventing_output(self):
@@ -700,24 +725,24 @@ class CostTests(unittest.TestCase):
             db.execute("DELETE FROM pr_loc")
         s = self.summary()
         for row in s["costs"]["windows"].values():
-            self.assertEqual(Decimal(row["weighted_loc"]), 0)
+            self.assertEqual(Decimal(row["landed_loc"]), 0)
             self.assertEqual(row["usd_per_loc"], "Infinity")
         with contextlib.redirect_stdout(io.StringIO()) as output:
             a.display(dict(available=True, summary=s))
-        rate = next(line for line in output.getvalue().splitlines() if line.startswith("Estimated $ / weighted LOC"))
-        self.assertEqual(rate.count("~$∞"), 2)
+        rate = next(line for line in output.getvalue().splitlines() if line.startswith("Estimated $ / landed LOC"))
+        self.assertEqual(rate.count("~$∞"), 3)
 
     def test_unknown_pr_state_contributes_zero_without_hiding_rate(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute("UPDATE prs SET state=NULL WHERE number=3")
         row = self.summary()["costs"]["windows"]["7d"]
-        self.assertTrue(row["loc_estimated"])
-        self.assertEqual(Decimal(row["weighted_loc"]), 200)
-        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal("0.45"))
+        self.assertFalse(row["loc_estimated"])
+        self.assertEqual(Decimal(row["landed_loc"]), 300)
+        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal("0.3"))
 
     def test_partial_fleet_estimate_pools_measurements_before_dividing(self):
         with contextlib.closing(a._connect()) as db, db:
-            db.execute("UPDATE prs SET head='new-head' WHERE number=3")
+            db.execute("UPDATE prs SET head='new-head' WHERE number=2")
         s = self.summary()
         other = json.loads(json.dumps(s))
         for row in other["costs"]["windows"].values():
@@ -733,31 +758,34 @@ class CostTests(unittest.TestCase):
             )
         combined = activity_summary.combine([dict(available=True, summary=s), dict(available=True, summary=other)])
         row = combined["summary"]["costs"]["windows"]["total"]
-        self.assertEqual(Decimal(row["weighted_loc"]), 800)  # 700 measured LOC * 4 / 3.5
-        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal("0.15"))
+        self.assertEqual(Decimal(row["landed_loc"]), 450)  # 300 measured LOC * 3 / 2
+        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal(120) / 450)
         self.assertTrue(row["loc_estimated"])
 
-    def test_old_prepared_summary_gets_numeric_fallback_without_refresh(self):
+    def test_old_prepared_summary_cannot_be_relabelled_as_landed_output(self):
         s = self.summary()
         for row in s["costs"]["windows"].values():
-            for key in ("loc_estimated", "measured_pr_weight"):
-                row.pop(key)
-            row.update(usd_per_loc=None, missing_loc_prs=1, known_loc_prs=3)
+            row.pop("loc_basis")
         with (
             patch.object(a, "_connect", side_effect=AssertionError("SQL in status")),
             patch.object(a, "observe", side_effect=AssertionError("network in status")),
             contextlib.redirect_stdout(io.StringIO()) as output,
         ):
             a.display(dict(available=True, summary=s))
-        rate = next(line for line in output.getvalue().splitlines() if line.startswith("Estimated $ / weighted LOC"))
-        self.assertEqual(rate.count("~$"), 3)
-        self.assertNotIn("—", rate)
+        rate = next(line for line in output.getvalue().splitlines() if line.startswith("Estimated $ / landed LOC"))
+        self.assertEqual(rate.count("—"), 3)
+        self.assertIn("older summaries", output.getvalue())
+        modern = self.summary()
+        combined = activity_summary.combine([dict(available=True, summary=modern), dict(available=True, summary=s)])
+        self.assertTrue(all(r["usd_per_loc"] is None for r in combined["summary"]["costs"]["windows"].values()))
 
     def test_zero_output_and_failed_ledger_are_not_zero_dollars_per_LOC(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute("UPDATE prs SET state='CLOSED',landed=NULL")
         self.assertEqual(self.summary()["costs"]["windows"]["total"]["usd_per_loc"], "Infinity")
-        self.assertEqual(activity_summary.loc_estimate(dict(estimated_usd="0"))["usd_per_loc"], "0")
+        self.assertEqual(
+            activity_summary.loc_estimate(dict(estimated_usd="0", loc_basis="landed_at"))["usd_per_loc"], "0"
+        )
         p = self.root / "budget/events.jsonl"
         p.write_text(p.read_text() + '{"invalid":true}\n')
         s = self.summary()
@@ -799,8 +827,8 @@ class CostTests(unittest.TestCase):
         ):
             s = self.summary()
         self.assertEqual(s["unknown_landings"], 0)
-        self.assertEqual(s["costs"]["windows"]["7d"]["landed_loc_added"], 10200)
-        self.assertEqual(Decimal(s["costs"]["windows"]["7d"]["weighted_loc"]), 10350)
+        self.assertEqual(s["costs"]["windows"]["7d"]["landed_loc_added"], 10300)
+        self.assertEqual(Decimal(s["costs"]["windows"]["7d"]["landed_loc"]), 10300)
 
     def test_native_and_compatibility_review_receipts_are_not_double_counted(self):
         # Clear the direct fixture receipt so just the dual-written review remains.
@@ -821,7 +849,7 @@ class CostTests(unittest.TestCase):
             row.update(spent_usd="0", pending_usd="0", estimated_usd="0", landed_loc_added=1000, open_loc_added=0)
         v = activity_summary.combine([dict(available=True, summary=s), dict(available=True, summary=other)])
         row = v["summary"]["costs"]["windows"]["total"]
-        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal(100) / 1650)
+        self.assertEqual(Decimal(row["usd_per_loc"]), Decimal(100) / 1300)
 
     def test_CI_history_is_local_incremental_and_accepts_late_receipts(self):
         p = self.root / "ci.sqlite"

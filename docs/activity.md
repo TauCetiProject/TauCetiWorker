@@ -41,7 +41,7 @@ approved PR head and constructed batch commit. Titles, reviews, CI success and
 staging pushes are not landing evidence. Ordinary closed PRs do not produce a
 missing-landing warning.
 
-## Costs and initiated PR output
+## Costs and landed PR output
 
 Average API spending has **1h**, **3h**, **24h**, **7d** and **All time** columns in
 $/hour. It uses accrued conversation costs, including running and interrupted work
@@ -78,12 +78,17 @@ but are omitted from the display to avoid suggesting they should be added again.
 Healthy accounting adds no diagnostic lines. Unresolved stopped conversations
 and stale live estimates still produce warnings.
 
-The 24-hour and seven-day denominators contain only PRs initiated within their respective windows;
-all-time contains all retained initiated PRs. Each verified landed PR contributes
-its Lean lines added, each currently open PR contributes half its Lean lines
-added, and a closed unmerged PR contributes nothing. Reviews and other assists
-never add another author's LOC to this denominator. Fleet totals pool costs and
-weighted LOC before dividing; they do not average machine ratios.
+The 24-hour and seven-day denominators contain every fleet-created PR that
+**landed in that window**, regardless of when it was opened. All time includes
+all retained fleet-created PRs with verified landing evidence. Older creation
+receipts remain eligible, including PRs opened before local activity recording
+began; an upgrade replays retained PR journals to restore identities previously
+removed by the history cutoff. PRs opened outside the fleet are excluded.
+Open, closed unmerged, and unknown-state PRs without landing evidence contribute
+nothing. Reviews and other assists never add another author's LOC to this
+denominator. Fleet totals pool costs and landed LOC before dividing; they do not
+average machine ratios. The display shows landed Lean lines added, estimated
+API dollars per landed line, and measured-PR coverage when incomplete.
 
 PR state, landing evidence and exact head/base identities come from the shared
 GitHub state server. LOC uses its cached measurement when available. Otherwise,
@@ -97,13 +102,15 @@ leaves the count unknown and normal refresh retries. No Git work runs in `status
 File-derived measurements require complete cached file lists and immutable URL
 and total validation; Git-derived measurements bind the exact head/base pair.
 The observation route never schedules collection or falls back to GitHub.
-Missing or stale LOC is extrapolated from measured PRs in the same window: measured weighted LOC
-per measured PR weight, multiplied by total eligible PR weight (landed = 1,
-open = ½). Unknown PR states contribute zero. These estimates carry `~` and show
-measured-PR coverage. With no measured LOC, missing LOC contributes zero; positive
-spending divided by zero LOC displays `$∞` (zero spending displays `$0.0000`).
-Missing financial data remains explicitly unavailable. Fleet totals pool the
-measurement counts and costs before estimating and dividing.
+Missing or stale LOC is extrapolated from measured landed PRs in the same window:
+measured LOC per measured PR, multiplied by the number of landed PRs. These
+estimates carry `~` and show measured-PR coverage. With no measured LOC, missing
+LOC contributes zero; positive spending divided by zero LOC displays `$∞` (zero
+spending displays `$0.0000`). Missing financial data remains explicitly unavailable.
+Fleet totals pool measurement counts and costs before estimating and dividing.
+Older prepared creation-cohort summaries cannot supply landing-window totals;
+they show unavailable LOC until refreshed, including fleets with mixed collector
+versions. Status never relabels the old figures or fetches replacement data.
 Cost preparation runs in the existing background collector;
 `activity` and `workers status` still only read small JSON summaries.
 
@@ -224,10 +231,10 @@ long session from appearing entirely in the window in which it happens to finish
 Unknown usage remains incomplete and reserved; it is not invented as spending.
 
 The cost/LOC numerator is the same accrued spending, including reviews and other
-fleet conversations. The denominator still uses only initiated PRs: landed LOC
-plus half of open LOC. Seven-day output includes only PRs opened in those seven
-days. Missing LOC uses the existing extrapolation/zero fallback and never hides
-the rate. Costs remain seven days and all time; hourly rates retain four windows.
+fleet conversations. Its denominator is Lean LOC from every fleet-created PR
+that landed in the window, regardless of opening date. Missing landed LOC uses
+the extrapolation/zero fallback described above. Costs have 24h, seven-day and
+all-time windows; hourly rates retain all five activity windows.
 
 Preparation is local and runs in the existing background collector. Reading
 `status` performs no transcript scans, SQL queries or additional GitHub requests.
