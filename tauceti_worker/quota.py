@@ -95,7 +95,12 @@ CLAUDE_QUOTA_DIRNAME = ".tauceti-quota"
 # point, so a window that would otherwise burn out early keeps a reserve for the work that arrives late
 # in the window, while still permitting the whole quota before the window rolls.
 # The older default, the identity line used% < elapsed%, is still one spec away: `--pace 0:0,100:100`.
+#
+# $TAUCETI_PACE_CLAUDE / $TAUCETI_PACE_CODEX (--pace-claude / --pace-codex) give one provider's windows
+# a curve of their own; a provider without one paces on $TAUCETI_PACE.
 _DEFAULT_PACE = [(0.0, 0.0), (60.0, 40.0), (100.0, 100.0)]
+
+PACE_PROVIDERS = ("claude", "codex")
 
 _PACE_CACHE: dict[str, list[tuple[float, float]]] = {}
 
@@ -137,17 +142,24 @@ def parse_pace_curve(spec: str | None) -> list[tuple[float, float]]:
     return sorted(pts.items())
 
 
-def pace_curve() -> list[tuple[float, float]]:
-    """The active pacing curve from $TAUCETI_PACE (read live so --pace / the TUI and loop children all
-    see it; parse cached per raw spec).
+def pace_env(provider: str) -> str:
+    """The variable holding `provider`'s own curve."""
+    return f"TAUCETI_PACE_{provider.upper()}"
 
-    A malformed spec cannot reach here through a sanctioned path: the CLI rejects $TAUCETI_PACE for every
-    subcommand and --pace in cmd_work, and a worker's `pace` from workers.toml arrives as --pace. This
-    fallback is the last-resort guard for a path that outlives or bypasses that validation, and it
+
+def pace_curve(provider: str | None = None) -> list[tuple[float, float]]:
+    """The active pacing curve from $TAUCETI_PACE (read live so --pace / the TUI and loop children all
+    see it; parse cached per raw spec). With `provider`, that provider's own variable (see pace_env) is
+    the spec when it is set and not blank.
+
+    A malformed spec cannot reach here through a sanctioned path: the CLI rejects each variable for every
+    subcommand and each flag in resolve_pace, and a worker's curves from workers.toml arrive as flags.
+    This fallback is the last-resort guard for a path that outlives or bypasses that validation, and it
     substitutes the DEFAULT curve — stricter than the identity line the pacer used to fall back on, but
     not provably stricter than whatever the operator was reaching for. That is the trade: pace on a known
     curve rather than crash the pacer, and let validation stay the thing that catches typos."""
-    raw = os.environ.get("TAUCETI_PACE", "") or ""
+    own = (os.environ.get(pace_env(provider)) or "").strip() if provider in PACE_PROVIDERS else ""
+    raw = own or os.environ.get("TAUCETI_PACE", "") or ""
     if raw not in _PACE_CACHE:
         try:
             _PACE_CACHE[raw] = parse_pace_curve(raw)
@@ -354,7 +366,12 @@ def _finite_num(x: object) -> bool:
 
 
 def _classify_window(
-    name: str, used: float | None, elapsed: float | None, resets_at: float | None, limit_reached: bool
+    name: str,
+    used: float | None,
+    elapsed: float | None,
+    resets_at: float | None,
+    limit_reached: bool,
+    provider: str | None = None,
 ) -> Window:
     # Fail CLOSED on missing OR garbage data. These endpoints are reverse-engineered: a schema drift that
     # drops `used`/the reset clock, or hands us a non-number / NaN / inf, must read as 'unknown' (⇒
@@ -366,7 +383,7 @@ def _classify_window(
     if not _finite_num(used) or e is None:
         return Window(name, used, e, resets_at, "unknown")
     u = max(0.0, min(100.0, used))
-    thr = pace_budget(pace_curve(), e)  # max allowed used% at this elapsed%, per the operator's curve
+    thr = pace_budget(pace_curve(provider), e)  # max allowed used% at this elapsed%, per the operator's curve
     # Strictly under the budget = headroom for another request. Exactly AT it is not: the next request
     # costs something, so starting one would put us over. (Equality is not an edge case — the default
     # curve's budget is 0 at elapsed 0, so a fresh window sits exactly on its budget.)
@@ -381,7 +398,7 @@ def _classify_window(
     return Window(name, used, e, resets_at, st, thr)
 
 
-def _pace_free_at(window: Window, now: float) -> float | None:
+def _pace_free_at(window: Window, now: float, provider: str | None = None) -> float | None:
     """When a window held by the PACE line should have budget again, as an epoch — or None when nothing
     but the reset will free it (a flat or falling curve, or a window we cannot measure).
 
@@ -392,7 +409,7 @@ def _pace_free_at(window: Window, now: float) -> float | None:
     left, remaining = window.resets_at - now, 100.0 - window.elapsed
     if left <= 0 or remaining <= 0:  # rolling over right now; the reset is the answer
         return None
-    free = pace_recovery(pace_curve(), window.used, window.elapsed)
+    free = pace_recovery(pace_curve(provider), window.used, window.elapsed)
     if free is None:
         return None
     start, end = free
@@ -658,9 +675,9 @@ def _window_from_reading(r: Reading, now: float | None = None) -> Window:
     if r.state == STATE_ACTIVE:
         window_s = _WINDOW_S[r.window]
         elapsed = (window_s - (r.resets_at - (time.time() if now is None else now))) / window_s * 100
-        return _classify_window(r.window, r.used, elapsed, r.resets_at, False)
+        return _classify_window(r.window, r.used, elapsed, r.resets_at, False, "claude")
     if r.state == STATE_IDLE:
-        blocked = _idle_spend_block()
+        blocked = _idle_spend_block(pace_curve("claude"))
         return Window(
             r.window,
             None,
@@ -1978,11 +1995,11 @@ class Quota:
             # carries the ~5h vs the ~7d window, and a positional label would call a weekly window 'session'.
             raw_lim = w.get("limit_window_seconds")
             name = "session" if _finite_num(raw_lim) and raw_lim <= 24 * 3600 else "weekly"
-            wins.append(_classify_window(name, w.get("used_percent"), elapsed, resets, limit_reached))
+            wins.append(_classify_window(name, w.get("used_percent"), elapsed, resets, limit_reached, "codex"))
         # No usable window at all ⇒ fail-closed (unavailable), never fail-OPEN on an empty all(...) that
         # is vacuously True.
         avail = bool(wins) and all(x.status == "under-pace" for x in wins) and not limit_reached
-        nxt = self._next_eligible(wins, now)
+        nxt = self._next_eligible(wins, now, "codex")
         return Provider("codex", avail, "gpt-5" if avail else None, wins, None, nxt)
 
     # --- Claude ------------------------------------------------------------
@@ -2278,7 +2295,7 @@ class Quota:
         if wins and all(w.status == STATE_ABSENT for w in wins):
             err = "claude usage response schema unsupported (no session or weekly record)"
         avail = bool(wins) and all(w.status in (STATUS_UNDER_PACE, STATE_IDLE) for w in wins)
-        return Provider("claude", avail, "opus" if avail else None, wins, err, self._next_eligible(wins, now))
+        return Provider("claude", avail, "opus" if avail else None, wins, err, self._next_eligible(wins, now, "claude"))
 
     def _claude_from_payload(self, payload: dict) -> Provider:
         """Provider straight from a payload, without side effects — the pure parse.
@@ -2315,7 +2332,7 @@ class Quota:
         return f"creds:{self._claude_creds_source()}"
 
     @staticmethod
-    def _next_eligible(windows: list[Window], now: float | None = None) -> float | None:
+    def _next_eligible(windows: list[Window], now: float | None = None, provider: str | None = None) -> float | None:
         # Earliest moment a wait actually fixes something, over the windows currently blocking on TIME.
         # An exhausted window needs its reset. A window held by the PACE line does not: its usage is
         # fixed while we wait and the budget climbs, so it frees itself partway through the window (see
@@ -2328,7 +2345,7 @@ class Quota:
         now = time.time() if now is None else now
         for w in windows:
             if w.status in (STATUS_AT_BUDGET, STATUS_OVER_PACE):
-                paced = _pace_free_at(w, now)
+                paced = _pace_free_at(w, now, provider)
                 soon.append(w.resets_at if paced is None else paced)
             elif w.status == STATUS_EXHAUSTED:
                 soon.append(w.resets_at)

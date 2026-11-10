@@ -1392,14 +1392,14 @@ def subscription_status(cfg: RunnerConfig, provider: str) -> tuple[bool, str]:
     windows against the pacing curve), under ``cfg.rate`` when the operator set one. The read never
     spends a request and never rotates a token. An unreadable or missing credential, a telemetry failure
     and a malformed usage response are all "not eligible", with the pacer's reason."""
-    from tauceti_worker.quota import Quota, _unavail_reason
+    from tauceti_worker.quota import PACE_PROVIDERS, Quota, _unavail_reason, pace_env
     from tauceti_worker.repair_recovery import environment
 
     home = Path(os.environ.get("HOME", os.path.expanduser("~")))
     cache = cfg.root / "quota-cache"
     try:
         cache.mkdir(parents=True, exist_ok=True)
-        with environment(TAUCETI_PACE=cfg.rate):
+        with environment(TAUCETI_PACE=cfg.rate, **{pace_env(name): None for name in PACE_PROVIDERS}):
             quota = Quota(_QuotaHome(home, cache))
             verdict = quota.codex() if provider == "codex" else quota.claude()
     except Exception as error:  # the pacer must never take the task down with it

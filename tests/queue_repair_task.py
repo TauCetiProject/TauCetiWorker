@@ -2126,6 +2126,7 @@ class Providers(Fixture):
 
         def claude(self_, *, refresh=False, renew=False):
             seen["pace"] = os.environ.get("TAUCETI_PACE")
+            seen["own"] = os.environ.get("TAUCETI_PACE_CLAUDE")
             seen["renew"] = renew
             window = quota.Window("session", 61.0, 70.0, time.time() + 3600, quota.STATUS_OVER_PACE, 55.0)
             return quota.Provider("claude", False, None, [window])
@@ -2137,16 +2138,23 @@ class Providers(Fixture):
 
         cfg = self.config(rate="0:10,50:70")
         with patch.object(repair_task, "subscription_status", self._real_subscription_status):
-            with patch.object(quota.Quota, "claude", claude), patch.object(quota.Quota, "codex", codex):
+            with (
+                patch.object(quota.Quota, "claude", claude),
+                patch.object(quota.Quota, "codex", codex),
+                patch.dict(os.environ, {"TAUCETI_PACE_CLAUDE": "0:100"}),
+            ):
                 self.assertEqual(
                     repair_task.subscription_status(cfg, "claude"),
                     (False, "session ahead of pace (70% elapsed: used 61% > 55% pace budget), 39% left"),
                 )
+                self.assertEqual(os.environ.get("TAUCETI_PACE_CLAUDE"), "0:100")
                 self.assertEqual(
                     repair_task.subscription_status(cfg, "codex"), (True, "under pace (weekly 10% used of 30% budget)")
                 )
             self.assertEqual(
-                seen, {"pace": "0:10,50:70", "renew": False}, "the task's rate is the pacer's curve; no token rotation"
+                seen,
+                {"pace": "0:10,50:70", "own": None, "renew": False},
+                "the task's rate is the pacer's only curve; no token rotation",
             )
             self.assertIsNone(os.environ.get("TAUCETI_PACE"))
             # No credential at all: unmeasurable, not eligible, and the reason names the file.
