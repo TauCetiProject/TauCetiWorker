@@ -104,7 +104,9 @@ from .survey import (
     Candidate,
     Counters,
     Survey,
+    bump_prs,
     bust_progress_cache,
+    cascade,
     fix_disposition,
     owns_author,
     owns_pr,
@@ -564,6 +566,10 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
             except Die as exc:
                 log(f"  review: {exc}; reviewer affinity disabled for this round")
         ordered, deferred = prioritize_review_candidates(sv.reviewable.actionable, reviewer, now=stamp)
+        # A bump review never waits for its previous reviewer's first-refusal window.
+        bumps = bump_prs(sv)
+        ordered += [c for c in deferred if c.pr in bumps]
+        deferred = [c for c in deferred if c.pr not in bumps]
         if sv.roadmap_backpressure and deferred:
             log("  review: authoring paused; previous-reviewer preference will not leave workers idle")
             ordered.extend(deferred)
@@ -583,47 +589,46 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
     # change what it means.
     focus_prs(sv, opts)
 
-    # The cascade: first actionable stage wins, does one useful unit, returns its rc. A candidate that is
-    # claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None when its
-    # fresh plan re-check finds the cached due verdict stale, so useful lower-priority work still runs.
+    # The cascade: first actionable stage wins, does one useful unit, returns its rc. Work on an
+    # automatic Mathlib bump is offered before every other candidate (survey.cascade). A candidate
+    # that is claimed elsewhere is skipped to the next one (COOP dedup); progress also returns None
+    # when its fresh plan re-check finds the cached due verdict stale, so useful lower-priority work
+    # still runs.
     declined: list[tuple[str, int]] = []
     claim_collision = False
-    for stage in round_stages(opts):
-        if not want(opts.only, stage):
-            continue
-        for c in sv.kind(stage).actionable:
-            from .state_repair import retry_key
+    from .state_repair import retry_key
 
-            if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
-                w.selection_changed = True
-                continue
-            if stage == "review" and not opts.dry_run and _review_claimed_elsewhere(w, c):
-                log(f"Global PR work: review #{c.pr} claimed by a peer — skipping before fresh PR reads")
-                claim_collision = True
-                declined.append((stage, c.pr))
-                continue
-            if (
-                global_pick
-                and not opts.dry_run
-                and stage in FILE_CHANGE_STAGES
-                and c.pr
-                and getattr(w, "claims", None) is not None
-                and _branch_claimed_elsewhere(w, c.pr)
-            ):
-                log(f"Global PR work: {stage} #{c.pr} claimed by a peer — skipping before fresh PR reads")
-                claim_collision = True
-                declined.append((stage, c.pr))
-                continue
-            if global_pick and c.pr:
-                p = next((p for p in sv.open_prs if p.number == c.pr), None)
-                areas = [label[8:] for label in p.labels if label.startswith("roadmap/")] if p else []
-                log(f"Global PR work: trying {stage} #{c.pr} ({', '.join(areas) or 'shared maintenance'})")
-            collisions_before = getattr(getattr(w, "claims", None), "collisions", 0)
-            rc = dispatch(stage, w, sv, c, opts)
-            claim_collision |= getattr(getattr(w, "claims", None), "collisions", 0) > collisions_before
-            if rc is not None:
-                return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
+    for stage, c in cascade(sv, [stage for stage in round_stages(opts) if want(opts.only, stage)]):
+        if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
+            w.selection_changed = True
+            continue
+        if stage == "review" and not opts.dry_run and _review_claimed_elsewhere(w, c):
+            log(f"Global PR work: review #{c.pr} claimed by a peer — skipping before fresh PR reads")
+            claim_collision = True
             declined.append((stage, c.pr))
+            continue
+        if (
+            global_pick
+            and not opts.dry_run
+            and stage in FILE_CHANGE_STAGES
+            and c.pr
+            and getattr(w, "claims", None) is not None
+            and _branch_claimed_elsewhere(w, c.pr)
+        ):
+            log(f"Global PR work: {stage} #{c.pr} claimed by a peer — skipping before fresh PR reads")
+            claim_collision = True
+            declined.append((stage, c.pr))
+            continue
+        if global_pick and c.pr:
+            p = next((p for p in sv.open_prs if p.number == c.pr), None)
+            areas = [label[8:] for label in p.labels if label.startswith("roadmap/")] if p else []
+            log(f"Global PR work: trying {stage} #{c.pr} ({', '.join(areas) or 'shared maintenance'})")
+        collisions_before = getattr(getattr(w, "claims", None), "collisions", 0)
+        rc = dispatch(stage, w, sv, c, opts)
+        claim_collision |= getattr(getattr(w, "claims", None), "collisions", 0) > collisions_before
+        if rc is not None:
+            return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
+        declined.append((stage, c.pr))
     # `roadmap` authors a PR that does not exist yet, so it can never be one of the PRs `--pr` named.
     # A targeted round that finds nothing to do on its targets stops rather than falling through to
     # authoring: the operator asked for those PRs, and unrelated work is not a substitute for them.

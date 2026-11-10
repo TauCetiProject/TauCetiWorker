@@ -1258,12 +1258,29 @@ def survey(
     return sv
 
 
+def bump_prs(sv: Survey) -> set[int]:
+    """Open automatic Mathlib bump PRs in this survey."""
+    return {p.number for p in sv.open_prs if p.automatic_bump}
+
+
+def cascade(sv: Survey, stages) -> list[tuple[str, Candidate]]:
+    """Actionable (stage, candidate) pairs in the order a round offers them.
+
+    Every stage's work on an automatic Mathlib bump comes first, in stage order: its conflicts,
+    red build, review findings and pending reviews. Main moves faster than an ordinary queue
+    position allows a bump round to start, so a bump that waits behind unrelated work goes stale
+    again before it can be admitted. Everything else follows in the usual stage order.
+    """
+    bumps = bump_prs(sv)
+    pairs = [(stage, c) for stage in stages for c in sv.kind(stage).actionable]
+    return [pair for pair in pairs if pair[1].pr in bumps] + [pair for pair in pairs if pair[1].pr not in bumps]
+
+
 def _next_auto_stage(sv: Survey) -> str | None:
     if hasattr(sv, "source_repository"):
         return None  # Source inventory supplies no scheduling or publication authority.
-    for stage in AUTO_STAGES:
-        if sv.kind(stage).actionable:
-            return stage
+    for stage, _ in cascade(sv, AUTO_STAGES):
+        return stage
     if not sv.roadmap_backpressure:
         return "roadmap"
     return None

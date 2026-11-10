@@ -70,6 +70,15 @@ capped. Existing loop backoff, quota pacing, branch claims,
 and explicit holds still apply. Workers checkpoint coherent partial source repairs
 before their round deadline; full CI, audits, and current-head reviews authorize merging.
 
+Bump work comes before all other work in every round. Each enabled stage's
+candidates on a bump PR (conflicts, a red build, review findings and pending
+reviews) are offered first, in stage order, ahead of progress reports and
+every other PR, and a bump review does not wait for its previous reviewer's
+first-refusal window. Main lands large batches every half hour or so, so a bump
+that waits its turn goes stale before it can be admitted. No worker is reserved
+for bumps: one branch claim serializes edits anyway, and every worker whose
+`only` list includes the stage picks the bump first.
+
 After a host round pushes a new bump head, the worker runs the full local
 verifier (`tauceti verify`, bump policy) on that exact commit with the same
 build-cache view the agent used. If it succeeds and GitHub still reports that
