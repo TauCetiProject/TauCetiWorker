@@ -128,3 +128,12 @@ they are not build-only durations. No GitHub calls, source fetches or reconcilia
 are triggered. The retired Bors `/repositories/1/statistics` snapshot is historical
 and must not be presented as current queue history. Native source statistics require
 an explicit qualified public scope and are not exposed by this endpoint.
+
+Live repair activity can be sampled independently of worker checkpoints with
+`python -m tauceti_queue.task_activity --root ROOT --follow` (the provided user
+unit observes all three standard roots). The observer reads only known local
+compiler/driver processes and bounded build/audit markers; it records sanitized
+phase/counter observations in each task's private `activity.json`. It does not
+restart workers or change verdicts. The publisher accepts only observations bound
+to the current claim and sampled within 45 seconds, allowing the transition's
+15-second metadata mirror. Stale observations fall back to the checkpoint.

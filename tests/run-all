@@ -181,6 +181,7 @@ RUN_STDLIB=(
   queue_operator_token.py
   queue_forgejo_webhook.py
   queue_monitoring.py
+  queue_task_activity.py
   queue_task_progress.py
   queue_monitoring_protocol.py
   queue_monitoring_history.py
