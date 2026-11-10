@@ -314,6 +314,7 @@ CREATE TABLE IF NOT EXISTS journal (
     batch_id INTEGER,
     detail TEXT NOT NULL DEFAULT '{}'
 );
+CREATE INDEX IF NOT EXISTS journal_batch_kind ON journal (batch_id, kind, id);
 """
 
 
