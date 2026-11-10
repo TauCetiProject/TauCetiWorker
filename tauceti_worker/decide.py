@@ -30,6 +30,7 @@ from . import incidents
 from .config import Die, NoProgress, log, roadmap_targets
 from .constants import ROADMAP, ROADMAP_DIR
 from .github import GitHubError, normalize_merged
+from .github_transport import read_context
 from .paths import HERE
 from .targets import _AREA_RE, Targets, live_targets, load_targets, parse_targets
 
@@ -67,6 +68,7 @@ def check_settings() -> None:
         raise Die(f"--only decide rules on incident records and needs {incidents.ENV}")
     gap()
     max_cases()
+    max_closes()
 
 
 # ---- records ------------------------------------------------------------------------------------
@@ -298,6 +300,16 @@ class _Round:
         with contextlib.suppress(OSError):
             return {path.name for path in self.roadmaps.iterdir() if path.is_dir()} if self.roadmaps else set()
         return set()
+
+    @cached_property
+    def login(self) -> str:
+        from .github import me
+
+        try:
+            return me() if close_enabled() else ""
+        except Die as error:
+            log(f"decide: {error}; closing is unavailable this round")
+            return ""
 
 
 def run(w, opts) -> int | None:
@@ -660,3 +672,106 @@ def _roadmap(rd: _Round, incident: dict, answer: dict) -> tuple[str, dict]:
 SCHEMA[ROADMAP_CHANGE] = {"area": _area, "title": _text(5, 120, line=True), "proposal": _text(80, 12000)}
 OFFERED[ROADMAP_CHANGE] = lambda rd, incident: rd.roadmaps is not None
 EFFECTS[ROADMAP_CHANGE] = _roadmap
+
+
+# ---- close: close the account's own subsumed pull request ---------------------------------------
+
+CLOSE = "close"
+CLOSE_ENV = "TAUCETI_DECIDE_CLOSE"
+CLOSES_ENV = "TAUCETI_DECIDE_MAX_CLOSES_PER_DAY"
+_DECLARATION = re.compile(
+    r"\+\s*(?:@\[[^\]]*\]\s*)*((?:(?:private|protected|noncomputable|unsafe|partial|nonrec|scoped|local)\s+)*)"
+    r"(?:theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom)\s+([^\s:({\[⦃]+)"
+)
+
+
+def close_enabled() -> bool:
+    return os.environ.get(CLOSE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def max_closes() -> int:
+    return _setting(CLOSES_ENV, 3)
+
+
+def added_declarations(diff: str, *, private: bool = False) -> set[str]:
+    """The names, as written, of the declarations a unified diff adds to `.lean` files. `private`
+    ones are left out unless asked for."""
+    names: set[str] = set()
+    lean = False
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            lean = line.rstrip().endswith(".lean")
+        elif lean and (found := _DECLARATION.match(line)) and (private or "private" not in found.group(1)):
+            names.add(found.group(2))
+    return names
+
+
+def closes_today() -> int:
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    return sum(
+        value.get("ruling") == CLOSE and str(value.get("last_at") or "").startswith(today)
+        for _path, value in incidents.records(incidents.RULING)
+    )
+
+
+def close_subsumed(gh, pr: int, head: str, subsumed_by: list[int], comment: str, *, login: str) -> tuple[bool, str]:
+    """Close `pr`, one of `login`'s own, as subsumed by the merged pull requests `subsumed_by`.
+
+    (True, the evidence posted with the closure) or (False, the check that refused). Nothing is
+    closed unless closing is switched on, today's limit is not used up, the pull request is open at
+    `head`, not a draft, authored by `login` and under no hold label, every subsuming pull request
+    has merged, and between them their diffs add every non-private declaration this one's adds."""
+    if not close_enabled():
+        return False, f"{CLOSE_ENV} is not on"
+    if closes_today() >= max_closes():
+        return False, f"today's limit of {max_closes()} closure(s) is used"
+    named = ", ".join(f"#{n}" for n in subsumed_by)
+    with read_context(fresh=True, direct=True):
+        live = gh.pr_view(pr, ["state", "headRefOid", "author", "labels", "isDraft"])
+        if not live or live.get("state") != "OPEN" or live.get("headRefOid") != head:
+            return False, "it is no longer open at the head the ruling is about"
+        if live.get("isDraft") is not False:
+            return False, "it is a draft"
+        author = str((live.get("author") or {}).get("login") or "")
+        if not login or author.casefold() != login.casefold():
+            return False, f"its author is {author or 'unknown'}, not this account"
+        if held := sorted(_labels(live) & HOLD_LABELS):
+            return False, f"it carries the label {held[0]}"
+        for n in subsumed_by:
+            if n == pr or _state(gh, n) != "MERGED":
+                return False, f"#{n} has not merged"
+    diffs = [gh.pr_diff(n) for n in (pr, *subsumed_by)]
+    if None in diffs:
+        return False, "a diff could not be read"
+    own = added_declarations(diffs[0])
+    if not own:
+        return False, "its diff adds no named declaration to compare"
+    theirs = set().union(*(added_declarations(diff, private=True) for diff in diffs[1:]))
+    if missing := sorted(own - theirs):
+        return False, f"{named} do not add {', '.join(f'`{name}`' for name in missing[:5])}"
+    evidence = f"{named} merged and add all {len(own)} declaration(s) this pull request adds"
+    body = (
+        f"{comment.strip()}\n\nChecked before closing: {evidence}.\n\n"
+        f"Closed by an automated worker's decide phase, ruling on this pull request at `{head[:12]}`. "
+        "Reopen it if this is wrong."
+    )
+    if not gh.close_pr(pr, body):
+        return False, "the closure could not be confirmed"
+    return True, evidence
+
+
+def _own(rd: _Round, incident: dict) -> bool:
+    author = str((rd.open_prs[incident["pr"]].get("author") or {}).get("login") or "")
+    return bool(rd.login) and author.casefold() == rd.login.casefold()
+
+
+def _close(rd: _Round, incident: dict, answer: dict) -> tuple[str, dict]:
+    closed, detail = close_subsumed(
+        rd.gh, incident["pr"], incident["head"], answer["subsumed_by"], answer["comment"], login=rd.login
+    )
+    return ("", {"subsumed_by": answer["subsumed_by"], "evidence": detail}) if closed else (detail, {})
+
+
+SCHEMA[CLOSE] = {"subsumed_by": _numbers(3), "comment": _text(40, 1500)}
+OFFERED[CLOSE] = lambda rd, incident: close_enabled() and _own(rd, incident)
+EFFECTS[CLOSE] = _close

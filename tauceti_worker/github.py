@@ -855,6 +855,18 @@ class GitHub:
             return None
         return json.loads(p.stdout or "{}")
 
+    def pr_diff(self, pr: int) -> str | None:
+        """The pull request's unified diff, open or closed; None when unreadable."""
+        p = self._gh(["pr", "diff", str(pr), "--repo", self.repo])
+        return p.stdout if p.returncode == 0 else None
+
+    def close_pr(self, pr: int, comment: str) -> bool:
+        """Close the pull request with a comment; True once a fresh read shows it closed."""
+        self._gh(["pr", "close", str(pr), "--repo", self.repo, "--comment", comment])
+        with transport.read_context(fresh=True, direct=True):
+            after = self.pr_view(pr, ["state"])
+        return bool(after) and after.get("state") in ("CLOSED", "MERGED")
+
     def live_pull(self, pr: int) -> dict | None:
         """The PR as GitHub reports it now, bypassing shared and cached state; None when unreadable."""
         with transport.read_context(fresh=True):

@@ -36,6 +36,8 @@ one finds the directory's lock held and stands aside.
 | `TAUCETI_DECIDE_GAP` | `600` | Seconds between rounds on one directory. |
 | `TAUCETI_DECIDE_MAX_CASES` | `6` | Incidents put to the model in one round. |
 | `TAUCETI_ROADMAP_TARGETS` | _(unset)_ | With a [target list](target-lists.md) set, `prerequisite` is offered and may add items to it. |
+| `TAUCETI_DECIDE_CLOSE` | _(unset)_ | `1` lets a `close` ruling close a pull request. |
+| `TAUCETI_DECIDE_MAX_CLOSES_PER_DAY` | `3` | Closures per UTC day across the directory. |
 
 The phase is written for workers that also set `TAUCETI_HOLD_DECLINED=1`: a
 declined head then waits for its ruling, and `retry` is what releases it.
@@ -67,6 +69,7 @@ directory holds a live incident or a live ruling. It then:
 | `escalate` | Anything else. | Nothing: the record carries the analysis and a recommendation for a person. |
 | `prerequisite` | A roadmap milestone nobody is building blocks it. | Adds the milestone to the target list and waits for it as `wait` does. Offered only with a target list and a readable roadmap checkout. |
 | `roadmap` | Only a change to a roadmap resolves it. | Writes the proposed change to a local file. Nothing is opened. Offered only with a readable roadmap checkout. |
+| `close` | Merged pull requests already contain everything it adds. | Closes it after the checks below. Offered only with `TAUCETI_DECIDE_CLOSE=1`, on the account's own pull requests. |
 
 A ruling that cannot be applied is recorded as `escalate` with the reason and
 `recommend` set to the ruling that was asked for. So is a case the answer leaves
@@ -96,6 +99,7 @@ as `ruling-<incident kind>-<stage>-<pr>.json`. Beside the
 | `recommend` | string | `escalate`: what the model would do, or the ruling that was refused |
 | `blocked_on_targets`, `added` | string lists | `prerequisite`: the target slugs waited on, and those this ruling added to the list |
 | `area`, `draft` | strings | `roadmap`: the roadmap, and the path of the drafted change |
+| `subsumed_by`, `evidence` | integer list, string | `close`: the merged pull requests, and what was checked |
 
 ```json
 {
@@ -153,6 +157,7 @@ The answer is `{"rulings": [...]}` with one object per case: `case`, `ruling`,
 | `escalate` | `recommend`: one line, may be empty |
 | `prerequisite` | `items`: 1 to 3 of `{area, slug, text, needs}` |
 | `roadmap` | `area`; `title`: one line; `proposal`: 80 to 12000 characters |
+| `close` | `subsumed_by`: 1 to 3 pull request numbers; `comment`: 40 to 1500 characters |
 
 The model runs on the host, as `progress` and `overlap-scan` do, with
 `GH_TOKEN` and `GITHUB_TOKEN` removed from its environment. Every write is made
@@ -181,3 +186,28 @@ A `roadmap` ruling writes `drafts/roadmap-<pr>.md` under the incident
 directory: the title, the roadmap, the pull request it would unblock, and the
 proposed change in the model's words. The worker opens nothing in the roadmap
 repository; a person reads the draft and files the change, or does not.
+
+## What `close` checks
+
+`close` is the phase's only write to a pull request, and it is made only when
+all of these hold at the moment of closing:
+
+- `TAUCETI_DECIDE_CLOSE` is on, and fewer than
+  `TAUCETI_DECIDE_MAX_CLOSES_PER_DAY` `close` rulings were recorded in the
+  directory today (UTC).
+- A fresh read shows the pull request open, not a draft, at the head the
+  incident names, authored by the worker's own account, and under none of the
+  hold labels listed above.
+- Every pull request the ruling names as subsuming it has merged; a Bors
+  landing counts.
+- Every non-private declaration the pull request's diff adds to a `.lean` file
+  (`theorem`, `lemma`, `def`, `abbrev`, `instance`, `structure`, `class`,
+  `inductive`, `opaque`, `axiom`, compared by name as written) is also added by
+  the diff of one of those merged pull requests. A pull request that adds no
+  named declaration cannot be closed this way.
+
+The closing comment is the model's `comment` followed by the evidence checked
+and a line saying the closure was automatic and can be reopened. The comparison
+is by name: a subsuming pull request that states the same result under another
+name fails it and is escalated, and one that reuses a name for something else
+passes it.

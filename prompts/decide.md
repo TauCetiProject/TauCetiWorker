@@ -45,6 +45,13 @@ For each case choose one ruling from that case's `allowed` list:
   replace, and a paragraph on why. It is saved as a draft for a person to
   review and file; nothing is opened. When the roadmap already states the
   missing milestone, the ruling is `prerequisite` or `wait`, not this.
+- `close`: main already has everything this pull request adds, through merged
+  pull requests. `subsumed_by` lists those, at most three, and `comment` is the
+  two or three sentences posted on the pull request when it is closed, saying
+  where its content now lives. The worker closes it only after confirming that
+  each one merged and that together they add every declaration this pull
+  request adds; partial overlap is not subsumption, and any other reason to
+  close is an `escalate`.
 - `escalate`: anything else. `note` is your analysis and `recommend` one line
   saying what you would do, or an empty string. If the ruling you would have
   chosen is not in `allowed`, escalate and name it in `recommend`.
@@ -64,6 +71,7 @@ with `case`, `ruling`, `note` and the fields of its ruling and no others:
    "items": [{"area": "Probability", "slug": "kolmogorov-zero-one", "text": "...", "needs": []}]},
   {"case": "declined-fix-105", "ruling": "roadmap", "note": "...", "area": "Probability",
    "title": "...", "proposal": "..."},
+  {"case": "declined-fix-104", "ruling": "close", "note": "...", "subsumed_by": [98], "comment": "..."},
   {"case": "budget-spent-fix-ci-106", "ruling": "escalate", "note": "...", "recommend": ""}
 ]}
 

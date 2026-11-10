@@ -29,6 +29,7 @@ from tauceti_worker.targets import parse_targets
 fails = 0
 clock = [1768469400]
 real_gmtime = time.gmtime
+LEAN = "+++ b/TauCeti/A.lean\n+theorem strong_law : True := trivial\n+private lemma aux : True := trivial\n"
 
 
 def check(name, got, want=True):
@@ -61,6 +62,7 @@ class Hub:
 
     def __init__(self, **prs):
         self.prs = {int(k[1:]): v for k, v in prs.items()}
+        self.closed = []
 
     def _row(self, n):
         v = self.prs[n]
@@ -87,6 +89,14 @@ class Hub:
     def merged_prs(self, search, limit=200):
         return []
 
+    def pr_diff(self, n):
+        return self.prs[n].get("diff", LEAN)
+
+    def close_pr(self, n, comment):
+        self.closed.append((n, comment))
+        self.prs[n]["state"] = "CLOSED"
+        return True
+
 
 def declined(*numbers):
     for number in numbers:
@@ -111,6 +121,7 @@ def rounds(tmp, hub, answer=None, *, rc=0, claimed=()):
         patch.object(decide, "_ask", side_effect=ask),
         patch.object(work_units, "_branch_claimed_elsewhere", side_effect=lambda _w, n: n in claimed),
         patch.object(agents, "fetch_ref", side_effect=fetch),
+        patch("tauceti_worker.github.me", return_value="me"),
     ):
         seen["rc"] = decide.run(w, SimpleNamespace())
     later()
@@ -580,6 +591,95 @@ def test_roadmap(tmp):
         )
 
 
+def test_close(tmp):
+    more = "+++ b/README.md\n+theorem prose : x\n+++ b/B.lean\n+@[simp] noncomputable def Foo.bar := 1\n+instance : Inhabited Nat := ⟨0⟩\n"
+    check(
+        "added declarations: named ones, in Lean files",
+        decide.added_declarations(LEAN + more),
+        {"strong_law", "Foo.bar"},
+    )
+    check("…private ones on request", decide.added_declarations(LEAN, private=True), {"strong_law", "aux"})
+
+    root = tmp / "close"
+    comment = "Everything here landed through #41, in the same file and under the same names."
+
+    def attempt(hub=None, by=(41,), **env):
+        hub = hub or Hub(p1={}, p41={"state": "MERGED"})
+        with settings(root, **{"TAUCETI_DECIDE_CLOSE": "1", **env}):
+            done, why = decide.close_subsumed(hub, 1, "head-1", list(by), comment, login="me")
+        return done, why, [n for n, _ in hub.closed]
+
+    def merged(**p1):
+        return Hub(p1=p1, p41={"state": "MERGED"})
+
+    check("off by default", attempt(TAUCETI_DECIDE_CLOSE=""), (False, "TAUCETI_DECIDE_CLOSE is not on", []))
+    check("a moved head", attempt(merged(head="new"))[::2], (False, []))
+    check("already closed", attempt(merged(state="CLOSED"))[::2], (False, []))
+    check("a draft", attempt(merged(draft=True)), (False, "it is a draft", []))
+    check("someone else's", attempt(merged(author="them")), (False, "its author is them, not this account", []))
+    check(
+        "under a hold label", attempt(merged(labels=["Do-Not-Close"])), (False, "it carries the label do-not-close", [])
+    )
+    check("the subsuming one is open", attempt(Hub(p1={}, p41={})), (False, "#41 has not merged", []))
+    check("…or closed unmerged", attempt(Hub(p1={}, p41={"state": "CLOSED"})), (False, "#41 has not merged", []))
+    check("…or itself", attempt(by=(1,)), (False, "#1 has not merged", []))
+    other = Hub(p1={}, p41={"state": "MERGED", "diff": "+++ b/A.lean\n+theorem other : True\n"})
+    check("it does not add every declaration", attempt(other), (False, "#41 do not add `strong_law`", []))
+    check("nothing to compare", attempt(merged(diff="+++ b/README.md\n+words\n"))[::2], (False, []))
+    check("an unreadable diff", attempt(merged(diff=None)), (False, "a diff could not be read", []))
+    bors = {"state": "CLOSED", "title": "[Merged by Bors] - the strong law"}
+    hub = Hub(p1={}, p41=bors, p42={"state": "MERGED", "diff": ""})
+    done, why, closed = attempt(hub, by=(41, 42))
+    check(
+        "every check passes: closed; a Bors landing counts; private helpers are not required",
+        (done, closed),
+        (True, [1]),
+    )
+    check("…the evidence", why, "#41, #42 merged and add all 1 declaration(s) this pull request adds")
+    check("…posted with the comment", (comment in hub.closed[0][1], why in hub.closed[0][1]), (True, True))
+    with settings(root):
+        for n in (7, 8):
+            incidents.record(incidents.RULING, f"declined-fix-{n}", ruling="close")
+    check(
+        "the daily limit counts the directory's close rulings",
+        attempt(TAUCETI_DECIDE_MAX_CLOSES_PER_DAY="2"),
+        (False, "today's limit of 2 closure(s) is used", []),
+    )
+    clock[0] += 86400
+    check("…and starts again the next day", attempt(TAUCETI_DECIDE_MAX_CLOSES_PER_DAY="2")[0], True)
+
+    root = tmp / "close-round"
+    asked = answer(
+        (1, "close", {"subsumed_by": [41], "comment": comment}), (2, "close", {"subsumed_by": [42], "comment": comment})
+    )
+    hub = Hub(p1={}, p2={}, p3={"author": "them"}, p41={"state": "MERGED"}, p42={})
+    with settings(root):
+        declined(1)
+        seen = rounds(tmp, hub, asked)
+        check("without the switch it is not offered", "close" in seen["packet"]["cases"][0]["allowed"], False)
+        check("…and a close answer closes nothing", (hub.closed, ruling(root)["ruling"]), ([], "escalate"))
+    with settings(root, TAUCETI_DECIDE_CLOSE="1"):
+        declined(1, 2, 3)
+        seen = rounds(tmp, hub, asked)
+        allowed = {case["pr"]: "close" in case["allowed"] for case in seen["packet"]["cases"]}
+        check("with it, on the account's own pull requests only", allowed, {1: True, 2: True, 3: False})
+        value = ruling(root)
+        check(
+            "close: closed once the checks pass",
+            ([n for n, _ in hub.closed], value["ruling"], value["subsumed_by"]),
+            ([1], "close", [41]),
+        )
+        check("…with what was checked", "#41 merged" in value["evidence"], True)
+        refused = ruling(root, "declined-fix-2")
+        check(
+            "a refused close escalates with the reason",
+            (refused["ruling"], refused["recommend"], "#42 has not merged" in refused["note"]),
+            ("escalate", "close", True),
+        )
+        rounds(tmp, hub)
+        check("the closed pull request's ruling is retired", where(root, "ruling-declined-fix-1.json"), ["acked"])
+
+
 def main():
     def gmtime(seconds=None):
         return real_gmtime(clock[0] if seconds is None else seconds)
@@ -592,6 +692,7 @@ def main():
         test_model_call(tmp / "model")
         test_prerequisite(tmp)
         test_roadmap(tmp)
+        test_close(tmp)
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
     return 1 if fails else 0
 
