@@ -956,8 +956,21 @@ def _launch_runner(spec: WorkerSpec, state_dir: Path, runtime_dir: Path) -> subp
     )
 
 
-def _defer_read_policy_reload(spec: WorkerSpec, live: dict) -> bool:
-    """These read-policy edits can wait for a round boundary instead of killing paid work."""
+# What an operator edits to retune a running fleet: the read policy, and the agent, phases and
+# authoring model of a slot.
+_DEFERRED_FIELDS = (
+    "max_open_prs",
+    "github_state_url",
+    "github_state_token_file",
+    "agent",
+    "only",
+    "author_model",
+    "author_effort",
+)
+
+
+def _defer_reload(spec: WorkerSpec, live: dict) -> bool:
+    """An edit confined to _DEFERRED_FIELDS can wait for a round boundary instead of killing paid work."""
     applied = live.get("applied_spec")
     if not isinstance(applied, dict):
         # Older runners persisted only a hash. Recognize the default read policy by its
@@ -972,7 +985,7 @@ def _defer_read_policy_reload(spec: WorkerSpec, live: dict) -> bool:
             applied = previous.as_dict()
     old = dict(applied)
     desired = spec.as_dict()
-    for field in ("max_open_prs", "github_state_url", "github_state_token_file"):
+    for field in _DEFERRED_FIELDS:
         old.pop(field, None)
         desired.pop(field, None)
     if old != desired:
@@ -1142,7 +1155,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     if is_live or not should_run:
                         enable_ids.discard(wid)
                     changed = bool(is_live and spec and live.get("spec_hash") != spec.fingerprint())
-                    if changed and should_run and wid not in restart_ids and _defer_read_policy_reload(spec, live):
+                    if changed and should_run and wid not in restart_ids and _defer_reload(spec, live):
                         StatusPublisher(status_path(wid, state_dir)).update(pending_read_policy=spec.fingerprint())
                         continue
                     if (

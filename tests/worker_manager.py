@@ -198,6 +198,25 @@ try:
     mixed = ["bump", "progress", "security-audit", "overlap-scan", "overlap-fix", "review"]
     assert wm.WorkerSpec.from_dict({"id": "audit", "agent": "codex", "only": mixed}, 0).only == tuple(mixed)
 
+    # --- edits that wait for the round boundary ------------------------------------------------
+    slot = wm.WorkerSpec(id="slot", agent="codex", only=("review",), author_model="gpt-5")
+    in_round = {"applied_spec": slot.as_dict(), "state": "running"}
+    parked = {"applied_spec": slot.as_dict(), "state": "waiting-quota", "next_action_at": time.time() + 3600}
+    for retune in (
+        {"agent": "claude", "author_model": None},
+        {"only": ("review", "fix")},
+        {"only": ()},
+        {"author_model": "gpt-5-codex"},
+        {"author_effort": "high"},
+        {"agent": "claude", "only": ("roadmap",), "author_model": None, "max_open_prs": 64},
+    ):
+        retuned = dataclasses.replace(slot, **retune)
+        assert wm._defer_reload(retuned, in_round), retune
+        assert not wm._defer_reload(retuned, parked), retune
+    # Any other field in the same edit keeps the immediate restart.
+    for other in ({"sandbox": "bubble"}, {"roadmap_only": "Algebra"}, {"env": (("A", "b"),)}, {"pace": "0:10"}):
+        assert not wm._defer_reload(dataclasses.replace(slot, agent="claude", author_model=None, **other), in_round)
+
     # Desired fields win over a stale actual status generation in CLI/TUI snapshots.
     wm.update_status(
         wm.status_path("snapshot"),
@@ -405,12 +424,36 @@ worker3 — backing off
 
     # A changed definition restarts only the changed worker.
     current = wm.load_worker_specs(config)
-    wm.save_worker_specs(
-        config,
-        [dataclasses.replace(spec, agent="claude") if spec.id == "worker1" else spec for spec in current],
-    )
+    streamed = dataclasses.replace(current[0], stream=True)
+    wm.save_worker_specs(config, [streamed, *current[1:]])
     assert wm.manager_request("apply")
     wait_for(lambda: wm.runner_status("worker1").get("wrapper_pid") not in (None, pids["worker1"]))
+
+    # An edit to the agent and phases alone leaves the round in flight and lands at its boundary.
+    wait_for(lambda: wm.runner_status("worker1").get("spec_hash") == streamed.fingerprint())
+    in_round_pid = wm.runner_status("worker1")["wrapper_pid"]
+    retuned = dataclasses.replace(streamed, agent="claude", only=("review",))
+    wm.save_worker_specs(config, [retuned, *current[1:]])
+    assert wm.manager_request("apply")
+    wait_for(lambda: wm.runner_status("worker1").get("pending_read_policy") == retuned.fingerprint())
+    time.sleep(0.3)
+    held = wm.runner_status("worker1")
+    assert held["wrapper_pid"] == in_round_pid and held["applied_spec"] == streamed.as_dict()
+    # On Linux the manager lands a held edit only where it can read the child's process tree.
+    if sys.platform != "linux" or Path(f"/proc/{os.getpid()}/task/{os.getpid()}/children").exists():
+        wm.update_status(wm.status_path("worker1"), state="idle", next_action_at=time.time() + 3600)
+        wait_for(lambda: wm.runner_status("worker1").get("spec_hash") == retuned.fingerprint())
+        landed = wm.runner_status("worker1")
+        assert landed["wrapper_pid"] != in_round_pid and landed["pending_read_policy"] is None
+        in_round_pid = landed["wrapper_pid"]
+
+    # An explicit restart does not wait for the boundary.
+    refocused = dataclasses.replace(retuned, only=("fix",))
+    wm.save_worker_specs(config, [refocused, *current[1:]])
+    assert wm.manager_request("apply")
+    wait_for(lambda: wm.runner_status("worker1").get("pending_read_policy") == refocused.fingerprint())
+    assert wm.manager_request("restart", id="worker1")
+    wait_for(lambda: wm.runner_status("worker1").get("wrapper_pid") not in (None, in_round_pid))
 
     # A malformed generation is rejected wholesale; the last good fleet remains alive.
     worker1_pid = wm.runner_status("worker1").get("wrapper_pid")
