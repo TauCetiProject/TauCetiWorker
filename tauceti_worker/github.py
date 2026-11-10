@@ -870,6 +870,35 @@ class GitHub:
                 return None
         return runs
 
+    def live_pull(self, pr: int) -> dict | None:
+        """The PR as GitHub reports it now, bypassing shared and cached state; None when unreadable."""
+        with transport.read_context(fresh=True):
+            result = self._gh(["api", f"repos/{self.repo}/pulls/{int(pr)}"])
+        if result.returncode:
+            return None
+        try:
+            return json.loads(result.stdout)
+        except ValueError:
+            return None
+
+    def commit_status(self, sha: str, context: str) -> str:
+        """The newest state of one commit-status context on `sha`, fresh; "" when absent or unreadable."""
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return ""
+        with transport.read_context(fresh=True):
+            result = self._gh(["api", f"repos/{self.repo}/commits/{sha}/status?per_page=100"])
+        if result.returncode:
+            return ""
+        try:
+            rows = [s for s in json.loads(result.stdout).get("statuses", []) if s.get("context") == context]
+        except (ValueError, AttributeError):
+            return ""
+        return str(max(rows, key=lambda s: s.get("id") or 0).get("state", "")) if rows else ""
+
+    def add_label(self, pr: int, name: str) -> bool:
+        result = self._gh(["api", "-X", "POST", f"repos/{self.repo}/issues/{int(pr)}/labels", "-f", f"labels[]={name}"])
+        return result.returncode == 0
+
     def bump_repair_requested(self, pr: int, head: str) -> int | None:
         """Fresh proof of a stopped singleton, never a pending retry or speculative label."""
         if self.repo != TAUCETI or not re.fullmatch(r"[0-9a-f]{40}", head):
