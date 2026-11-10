@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from . import incidents
 from .agents import (
     AuthoringProfile,
     BuildCacheUnavailable,
@@ -37,6 +38,7 @@ from .agents import (
     run_to_logfile,
     scope_policy,
     take_last_agent_infra_failure,
+    take_last_agent_run,
     validate_kiro_model_access,
     wrapper_bin,
 )
@@ -64,6 +66,7 @@ from .constants import (
     CONTEST_CLAIM_TTL,
     EX_CLAIM_COLLISION,
     EX_NOPROGRESS,
+    MAX_CI_PR_ATTEMPTS,
     MAX_FIX_ATTEMPTS,
     MAX_INFRA_REFUNDS,
     OPENROUTER_MODELS,
@@ -527,6 +530,15 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
         reason = f"its review has errored {n_err} times without completing a review"
         w.gh.ensure_stuck_issue(pr, reason, diagnostic)
 
+    if incidents.directory() is not None and not opts.dry_run:
+        for stage in incidents.STAGES:
+            for c in sv.kind(stage).suppressed:
+                if in_scope(c.pr) and not incidents.declined(stage, c.pr, c.head):
+                    detail = f"{c.reason}; {c.attempts}/{c.budget} attempts used"
+                    if stage == "fix-ci":
+                        detail += f" at this head, {w.counters.read(f'ci-pr-{c.pr}')}/{MAX_CI_PR_ATTEMPTS} on the PR"
+                    incidents.note_budget_spent(stage, c.pr, c.head, detail)
+
     if global_pick:
         counts = ", ".join(
             f"{stage}={len(sv.kind(stage).actionable)}" for stage in round_stages(opts) if want(opts.only, stage)
@@ -764,6 +776,26 @@ def log_round_file_changes(cfg: Config, pre_head: str | None) -> None:
             log(f"    {ln.strip()}")
         if len(dirty) > _MAX_CHANGED_FILES:
             log(f"    … {len(dirty) - _MAX_CHANGED_FILES} more")
+
+
+def _record_declined(stage: str, w: Worker, sv: Survey, c: Candidate) -> Path | None:
+    # An automatic bump is retried without an attempt budget, so no round on it is its last word.
+    if (
+        stage not in incidents.STAGES
+        or not c.pr
+        or incidents.directory() is None
+        or any(p.number == c.pr and getattr(p, "automatic_bump", False) for p in sv.open_prs)
+    ):
+        return None
+    run = take_last_agent_run() or {}
+    return incidents.record_declined(
+        stage,
+        c.pr,
+        c.head,
+        reason=c.reason,
+        message=run.get("last_message") or "\n".join(run.get("tail") or ()),
+        transcript=run.get("transcript") or str(w.cfg.logdir),
+    )
 
 
 def _open_pr_numbers(w: Worker) -> set[int] | None:
@@ -1223,6 +1255,9 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         if retained_repair(getattr(w, "cfg", None), getattr(getattr(w, "gh", None), "repo", TAUCETI), c.pr):
             log(f"  #{c.pr}: retained source recovery has priority; selecting unrelated work")
             return None
+    if c.pr and stage in incidents.STAGES and incidents.declined(stage, c.pr, c.head):
+        log(f"  {stage} #{c.pr}: {incidents.HELD}; selecting unrelated work")
+        return None
     os.environ["TAUCETI_GITHUB_PR"] = str(c.pr or "")
     _check_stage_read_quota(stage)
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
@@ -1375,6 +1410,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             f"{stage}{tgt}: the agent finished but nothing landed on GitHub (no push, new PR, or "
             f"comment or closure). No durable PR outcome was confirmed. Transcript: {w.cfg.logdir}"
         )
+        if recorded := _record_declined(stage, w, sv, c):
+            reason += f"; the agent's final message is recorded at {recorded}"
         if not bubble and _candidate_checkout_unchanged(w.cfg, c):
             log(reason + "; checkout unchanged — selecting another candidate")
             report_runtime(
@@ -1873,6 +1910,8 @@ def _do_fixlike(
             else "You may NOT close this PR: it is not your authored PR or has a special repair scope."
         ),
     )
+    if label in incidents.STAGES and incidents.directory() is not None and not getattr(p, "automatic_bump", False):
+        prompt += incidents.PROMPT
     if getattr(c, "final_resolution", False) and may_close:
         prompt += (
             "\nThis is the last permitted per-head repair attempt. "

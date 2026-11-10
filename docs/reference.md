@@ -417,6 +417,8 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_GITHUB_SHARED_DIR` | `state/github-shared` | Stable cross-worker cache, quota state, host gh wrapper and HTTP accounting directory. |
 | `TAUCETI_GITHUB_CACHE_BYPASS` | _(unset)_ | Set to `1` to bypass shared cached reads for diagnosis. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
+| `TAUCETI_INCIDENTS_DIR` | _(unset)_ | Directory, shared by a fleet's workers, for [incident records](incidents.md): a `rebase`, `fix`, or `fix-ci` round that left nothing on GitHub writes the agent's final message there, and a spent attempt budget is noted once per head. Unset writes nothing. |
+| `TAUCETI_HOLD_DECLINED` | _(unset)_ | `1` keeps a stage off a pull request head that such a `declined` record names, until the head moves or the record is deleted. Needs `TAUCETI_INCIDENTS_DIR`. |
 | `CLAIM_REPO` | automatic | The repository holding this worker's cooperative claim leases. Without an override it is the shared namespace `TauCetiProject/tauceti-claims` once your account can push there, and your own fork until then. See [the claim namespace](#the-claim-namespace). |
 | `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `1500` / `300` | Branch-claim lease TTL and heartbeat interval (seconds). |
 
