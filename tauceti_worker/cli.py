@@ -1008,6 +1008,7 @@ def main(argv: list[str] | None = None) -> int:
                     "activity": 1,
                     "roadmap_focus": 1,
                     "roadmap_targets": 1,
+                    "targets_fallback": 1,
                 }
             )
         )
