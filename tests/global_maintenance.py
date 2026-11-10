@@ -4,6 +4,7 @@ import importlib
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker.config import ClaimCollision, NoProgress
+from tauceti_worker.github import GitHubError
 from tauceti_worker.github_state import SurveyRows
 from tauceti_worker.review_state import ReviewState
 from tauceti_worker.survey import PRInfo
@@ -97,7 +99,7 @@ class GlobalMaintenance(unittest.TestCase):
             item.start()
             self.addCleanup(item.stop)
 
-    def run_round(self, rows, dispatch=None, *, author_count=3):
+    def run_round(self, rows, dispatch=None, *, author_count=3, cached=False):
         self.calls = []
 
         def perform(stage, _w, sv, candidate, _opts):
@@ -107,7 +109,7 @@ class GlobalMaintenance(unittest.TestCase):
         with (
             patch(
                 "tauceti_worker.github_state.read_survey",
-                return_value=(True, SurveyRows(rows, {"science": author_count})),
+                return_value=(True, SurveyRows(rows, {"science": author_count}, cached=cached)),
             ) as query,
             patch.object(work, "dispatch", side_effect=perform),
             patch.object(work, "roadmap_areas", return_value=["NewArea"]) as areas,
@@ -481,6 +483,49 @@ class GlobalMaintenance(unittest.TestCase):
         ):
             self.run_round([row(10, "Other")])
             self.assertEqual(reported(runtime), [None])
+
+    def test_survey_backlog_is_reported_for_fleet_status(self):
+        def reported(runtime):
+            return [c.kwargs for c in runtime.call_args_list if "mine_open" in c.kwargs]
+
+        def labelled(number, area, *labels, **kwargs):
+            pr = row(number, area, **kwargs)
+            pr["pr"]["labels"] += [{"name": label} for label in labels]
+            return pr
+
+        rows = [
+            labelled(10, "Other", "awaiting-author"),
+            labelled(20, "NewArea", "awaiting-author", "ci-failed"),
+            labelled(30, "Other", "ci-failed", blocking=False),
+            labelled(40, "Other", "awaiting-review", blocking=False),
+            labelled(50, "Other", "awaiting-author", author="peer"),
+        ]
+        with patch.object(work, "report_runtime") as runtime:
+            began = time.time()
+            self.run_round(rows)
+            (backlog,) = reported(runtime)
+            self.assertGreaterEqual(backlog.pop("survey_at"), began)
+            self.assertEqual(backlog, {"mine_open": 3, "mine_awaiting_author": 2, "mine_needs_fix": 3})
+            # A retained snapshot is older than the round, named PRs are a subset of the scope,
+            # and a failed survey holds no inventory.
+            runtime.reset_mock()
+            self.run_round(rows, cached=True)
+            self.opts.prs = (10,)
+            self.run_round(rows)
+            self.opts.prs = ()
+            with (
+                patch("tauceti_worker.github_state.read_survey", side_effect=GitHubError("gh pr list failed")),
+                self.assertRaisesRegex(NoProgress, "gh pr list failed"),
+            ):
+                run_round(self.w, self.opts)
+            self.assertEqual(reported(runtime), [])
+        with (
+            patch("tauceti_worker.fleet_capacity.roadmap_focus", return_value=["NewArea"]),
+            patch.object(work, "report_runtime") as runtime,
+        ):
+            self.run_round(rows)
+            self.assertEqual(self.calls[0][:2], ("fix", 20))
+            self.assertEqual(reported(runtime), [])
 
     def test_missing_or_skipped_focus_keeps_global_maintenance(self):
         for focused, skip in ((["RemovedArea"], ""), (["NewArea"], "NewArea")):

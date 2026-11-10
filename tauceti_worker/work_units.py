@@ -464,6 +464,13 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
             # silently fall back to thousands of direct comment requests.
             cached_only=global_pick and github_state_enabled(),
         )
+        # The published backlog describes this worker's configured roadmap scope from a current
+        # inventory. Named PRs and a Fleet focus area are narrower and a retained snapshot is older,
+        # so those rounds leave it as the last such survey reported it.
+        narrowed = focused_round or getattr(opts, "prs", ())
+        stale = sv.dependency_wait or sv.github_failed or getattr(sv, "_retained_snapshot", False)
+        if not (narrowed or stale):
+            report_runtime(**sv.backlog_counts(), survey_at=time.time())
     if sv.dependency_wait:
         # Unknown global coverage is neither an empty backlog nor a failed round. Nothing is selected,
         # so no PR repair allowance is charged; the loop resumes at the circuit's retry time.

@@ -6,7 +6,9 @@ The line replaced a bare non-draft / build-green count with totals bucketed by T
   - every STATUS_LABELS bucket is present and in that fixed order (a zero bucket is still listed);
   - a bucket's total counts open NON-DRAFT PRs carrying that label; drafts never count;
   - `mine` counts only the subset authored by the passed-in identity;
-  - the formatted line spells out 'mine' on the first entry and pairs (total, mine) for every entry.
+  - the formatted line spells out 'mine' on the first entry and pairs (total, mine) for every entry;
+  - the backlog counts a worker publishes to its runtime status count a PR carrying both
+    author-action labels once.
 
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
@@ -93,6 +95,19 @@ def main():
     peer_counts = {label: (total, mine) for label, total, mine in sl_peer}
     check(peer_counts["awaiting-author"] == (2, 1), "peer view: awaiting-author 2 total, 1 mine (PR #2)")
     check(peer_counts["awaiting-CI"] == (1, 0), "peer view: awaiting-CI 1 total, 0 mine")
+
+    backlog = Survey(worker_id=ME)
+    backlog.n_mine_open = 7
+    backlog._mine_open_prs = [
+        prinfo(1, ME, ["awaiting-author", "roadmap/PDE"]),
+        prinfo(2, ME, ["ci-failed"]),
+        prinfo(3, ME, ["ci-failed", "awaiting-author"]),
+        prinfo(4, ME, ["awaiting-review"]),
+    ]
+    check(
+        backlog.backlog_counts() == {"mine_open": 7, "mine_awaiting_author": 2, "mine_needs_fix": 3},
+        "backlog: authoring count passed through; awaiting-author plus ci-failed is one PR to fix",
+    )
 
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} assertion failure(s)")
     return 1 if fails else 0

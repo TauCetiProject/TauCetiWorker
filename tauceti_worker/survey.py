@@ -407,6 +407,17 @@ class Survey:
         self.roadmap_backpressure = self.n_mine_open >= self.max_open_prs
         self.next_auto_stage = _next_auto_stage(self)
 
+    def backlog_counts(self) -> dict[str, int]:
+        """This identity's backlog as the runtime status publishes it: the open-PR count the authoring
+        limit is compared with, how many of its surveyed non-draft PRs carry `awaiting-author`, and how
+        many carry that or `ci-failed` (a PR with both counts once)."""
+        waiting = [{"awaiting-author", "ci-failed"} & set(p.labels) for p in self._mine_open_prs]
+        return {
+            "mine_open": self.n_mine_open,
+            "mine_awaiting_author": sum("awaiting-author" in labels for labels in waiting),
+            "mine_needs_fix": sum(map(bool, waiting)),
+        }
+
     def status_label_line(self) -> str:
         """One-line breakdown of open non-draft PRs by status label: 'N label (M mine), N label (M),
         ...'. Each entry pairs the total carrying that label with the subset the worker itself authored;
@@ -806,6 +817,7 @@ def survey(
                 f"({describe_dependency_wait(failure)})"
             )
         elif getattr(compact, "cached", False):
+            sv._retained_snapshot = True
             log("Shared-state refresh unavailable; selecting maintenance from the last complete local snapshot")
         raw = [row["pr"] for row in compact] if available else gh.open_prs()
         if available and seed:

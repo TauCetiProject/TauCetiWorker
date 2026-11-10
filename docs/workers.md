@@ -602,6 +602,21 @@ Each managed worker publishes a structured state such as `waiting-quota`,
 the path to its logfile. That is what `tauceti workers status` and the
 dashboard's workers view read.
 
+After each survey of its configured roadmap scope, a worker also records its
+GitHub account's backlog in that file, where `workers status --json` shows it:
+
+| Field | Value |
+| --- | --- |
+| `mine_open` | The open-PR count the survey compares with `max_open_prs` |
+| `mine_awaiting_author` | The account's non-draft PRs in that scope labelled `awaiting-author` |
+| `mine_needs_fix` | Those labelled `awaiting-author` or `ci-failed`, each PR counted once |
+| `survey_at` | When that survey ran, in seconds since the epoch |
+
+The counts come from the inventory the survey already holds and cost no GitHub
+request. A round that surveys named PRs or a Fleet focus area, or that reads a
+retained snapshot while shared GitHub state is unavailable, leaves all four
+fields as they were, so `survey_at` gives their age.
+
 Work rounds read kernel resource counters at start and finish, with live refreshes once a
 minute. Telemetry never scans the host process table. Live statistics appear under
 `resources` in `workers status --json`; completed rounds append structured records to
