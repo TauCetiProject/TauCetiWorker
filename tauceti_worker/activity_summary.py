@@ -556,7 +556,7 @@ def combine(values):
                 if compatible_costs and all(r.get(key) is not None for r in rows) and len(known) == len(values)
                 else None
             )
-        if len(known) == len(values) and all(r.get("loc_basis") == "landed_at" for r in rows):
+        if all(r.get("loc_basis") == "landed_at" for r in rows):
             row["loc_basis"] = "landed_at"
         if accounting_versions == {2, 3} and row.get("active_accrued_usd") is not None:
             row["active_accrued_usd"] = str(
