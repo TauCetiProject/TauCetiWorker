@@ -432,7 +432,7 @@ service. This design trusts admins, including credentials used by other agents;
 admin credentials should be kept out of ordinary authoring/review workers.
 
 With no `--only`, a round walks the whole cascade and does the first job that
-applies. `--only <task>[,<task>...]` pins it to particular kinds, and `--skip`
+applies. Any job on an automatic Mathlib bump PR comes first, whatever its kind. `--only <task>[,<task>...]` pins it to particular kinds, and `--skip`
 drops kinds from the cascade (the two combine by subtraction):
 
 ```bash

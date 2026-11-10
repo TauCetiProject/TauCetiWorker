@@ -6,6 +6,7 @@ Bare `tauceti` opens a dashboard + launcher; `tauceti work [--loop]` does the wo
 The worker acts on TauCetiProject/TauCeti as the authenticated `gh` account, and
 treats that account's own PRs as the ones it tends. Each round does exactly ONE unit
 of work, chosen in priority order: rebase → bump → lint-repair → progress → fix-ci → fix → review → overlap-fix → overlap-scan → roadmap.
+Work of any of those kinds on an automatic Mathlib bump PR comes before all other work.
 The `bump` step adapts a red bump-mathlib PR (the review bot opens those; the worker
 never authors a bump). Merging, abandoning, and de-duplicating PRs is the repo's CI,
 not the worker.
