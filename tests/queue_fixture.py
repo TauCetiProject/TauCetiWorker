@@ -497,6 +497,30 @@ class Repair(QueueFixture):
 
 
 class EmptyContributions(QueueFixture):
+    def assert_unrelated_history_still_rejects(self, message, *, empty=False):
+        self.repaired_empty()
+        self.repo.advance_main({} if empty else {"Other.lean": "other\n"}, message=message)
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "empty-commit")
+        self.assertEqual(self.controller.status()["counters"].get("prs_rejected", 0), 1)
+        self.assertNotIn("successfully merged", self.github.comments_for(101)[0]["body"])
+
+    def test_a_pr_reference_in_a_commit_body_is_not_landing_evidence(self):
+        self.assert_unrelated_history_still_rejects("Other change\n\nFollow-up to cleanup (#101)")
+
+    def test_a_foreign_trailer_takes_precedence_over_the_subject(self):
+        self.assert_unrelated_history_still_rejects("Other change (#101)\n\nSource-PR: other/repo#101")
+
+    def test_a_native_trailer_does_not_land_a_github_pr_with_the_same_number(self):
+        self.assert_unrelated_history_still_rejects(
+            "Other change (#101)\n\nSource-PR: forgejo:example.test/library#101"
+        )
+
+    def test_an_earlier_empty_placeholder_is_not_landing_evidence(self):
+        self.assert_unrelated_history_still_rejects("Change 101 (#101)", empty=True)
+
     def test_external_merge_is_recognized_without_a_staging_landing_note(self):
         self.github.ci_policy = verdicts("fail")
         self.approve(101, {"A.lean": "a\n"})
@@ -531,9 +555,7 @@ class EmptyContributions(QueueFixture):
     def test_external_merge_lookup_failure_defers_landing_instead_of_rejecting(self):
         head = self.repaired_empty()
         self.github.update_ref(PROJECT, "refs/heads/main", head["tip"])
-        with patch.object(
-            self.controller, "_landed_on", side_effect=chain.ChainError("history temporarily unavailable")
-        ):
+        with patch.object(chain, "landed_prs", side_effect=chain.ChainError("history temporarily unavailable")):
             with self.assertRaises(chain.ChainError):
                 self.tick()
         self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
