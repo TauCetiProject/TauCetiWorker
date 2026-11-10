@@ -779,6 +779,15 @@ class CostTests(unittest.TestCase):
         combined = activity_summary.combine([dict(available=True, summary=modern), dict(available=True, summary=s)])
         self.assertTrue(all(r["usd_per_loc"] is None for r in combined["summary"]["costs"]["windows"].values()))
 
+    def test_missing_host_preserves_known_landed_loc_without_inventing_costs(self):
+        s = self.summary()
+        combined = activity_summary.combine([dict(available=True, summary=s), dict(available=False)])
+        for row in combined["summary"]["costs"]["windows"].values():
+            self.assertEqual(row["loc_basis"], "landed_at")
+            self.assertEqual(Decimal(row["landed_loc"]), 300)
+            self.assertIsNone(row["usd_per_loc"])
+        self.assertIn("Some hosts have no prepared activity", combined["errors"])
+
     def test_zero_output_and_failed_ledger_are_not_zero_dollars_per_LOC(self):
         with contextlib.closing(a._connect()) as db, db:
             db.execute("UPDATE prs SET state='CLOSED',landed=NULL")
