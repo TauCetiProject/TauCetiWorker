@@ -131,16 +131,25 @@ someone intervenes.
 `tauceti work --loop --auto-refresh` (or `$TAUCETI_AUTO_REFRESH=1`) lets the
 worker renew the token itself once it is within 90 minutes of expiry.
 
+The same flag covers Codex. The Codex CLI renews its login only while it runs,
+and the pacer reads usage before launching it, so an expired access token parks
+the worker at `codex token expired; refresh left to the operator`. With the flag
+on, the worker renews the operator's `~/.codex/auth.json` once the access token,
+which lasts about ten days, is within two days of expiry, or when the usage
+endpoint answers 401. It leaves the file alone when `cli_auth_credentials_store`
+in Codex's configuration is anything other than `file`.
+
 **Only turn it on when nothing else uses that credential file.** Claude and Codex
 issue single-use refresh tokens: exchanging one retires it and returns a
 replacement. TauCeti serializes its own processes on the host, but it cannot
-serialize an interactive `claude` sharing `~/.claude/.credentials.json`, a second
-refresher, or a copy of the credential on another machine — a rotation here logs
-any of those out. The shape this is meant for is a worker running as its own
-user, with its own Claude account nobody signs into interactively;
-`$CLAUDE_CONFIG_DIR` gives the same separation on a shared login. On macOS the
-flag does nothing: the Keychain is the store, and the section below applies
-instead.
+serialize an interactive `claude` sharing `~/.claude/.credentials.json` (or
+`codex` sharing `~/.codex/auth.json`), a second refresher, or a copy of the
+credential on another machine — a rotation here logs any of those out. The shape
+this is meant for is a worker running as its own user, with its own Claude and
+Codex accounts nobody signs into interactively; `$CLAUDE_CONFIG_DIR` and
+`$CODEX_HOME` give the same separation on a shared login. On macOS the Claude
+half of the flag does nothing: the Keychain is the store, and the section below
+applies instead. Codex keeps a file on macOS, so its half works there.
 
 When it is on: it renews the file the operator owns, never a worker's stripped
 mirror, and it never touches a credential carrying no refresh token, so the

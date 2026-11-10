@@ -77,6 +77,12 @@ CLAUDE_RESET_SKEW_S = 60
 CLAUDE_REFRESH_SKEW_S = 5400
 CLAUDE_REFRESH_RETRY_S = 600
 
+# The same two bounds for the operator's Codex credential. An isolated worker's codex holds a
+# placeholder refresh token and cannot renew mid-round, so the skew has to outlast any
+# $TAUCETI_ROUND_TIMEOUT; two days of a ten-day access token leaves that margin.
+CODEX_REFRESH_SKEW_S = 48 * 3600
+CODEX_REFRESH_RETRY_S = 600
+
 # Shared TauCeti usage observations live beside the credential source.
 CLAUDE_QUOTA_DIRNAME = ".tauceti-quota"
 
@@ -1834,12 +1840,17 @@ class Quota:
         tok = auth.get("tokens") or {}
         return self._fingerprint(self._codex_account_id(auth) or tok.get("access_token"))
 
-    def codex(self, *, refresh: bool = False) -> Provider:
-        result = self._codex_pass(refresh=refresh)
+    def codex(self, *, refresh: bool = False, renew: bool = False) -> Provider:
+        """Read the Codex usage endpoint and report whether codex may run. `renew` is the same per-caller
+        opt-in as Quota.claude's: only a caller about to act on the verdict may rotate the token."""
+        result = self._codex_pass(refresh=refresh, renew=renew)
         return self._with_model_refusal("codex", result)
 
-    def _codex_pass(self, *, refresh: bool = False) -> Provider:
+    def _codex_pass(self, *, refresh: bool = False, renew: bool = False) -> Provider:
         if not getattr(self, "_cache_only", False):
+            # Renew before mirroring, so a rotation reaches an isolated worker's copy in the same call.
+            if renew:
+                self._refresh_codex_credential()
             mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
         # The pacer reads auth.json for the token it measures usage with, so it inherits the same
         # assumption --account does: that auth.json is the credential codex uses. Under a non-file
@@ -1895,10 +1906,12 @@ class Quota:
             if isinstance(e, UsageTransportError):
                 return self._telemetry_failure("codex", fp, str(e), retry_after=self._cooldown("codex", fp)[0])
             return Provider("codex", False, None, error=str(e))
-        # The worker never refreshes (the operator owns the single-use refresh token). On expiry the
-        # access token simply reads as unavailable until the operator's external refresher rotates it
-        # and mirror_creds picks it up next cycle.
+        # Without --auto-refresh the worker never refreshes (the operator owns the single-use refresh
+        # token). On expiry the access token simply reads as unavailable until the operator's external
+        # refresher rotates it and mirror_creds picks it up next cycle.
         if code != 200 or not payload:
+            if code == 401 and renew and self._refresh_codex_credential(force=True):
+                return self._codex_pass(refresh=True)
             self._start_cooldown("codex", fp, code, retry_after)
             retry_after = retry_after or self._cooldown("codex", fp)[0] or None
             if code == 401:
@@ -1984,6 +1997,38 @@ class Quota:
         avail = bool(wins) and all(x.status == "under-pace" for x in wins) and not limit_reached
         nxt = self._next_eligible(wins, now)
         return Provider("codex", avail, "gpt-5" if avail else None, wins, None, nxt)
+
+    def _refresh_codex_credential(self, *, force: bool = False) -> bool:
+        """Codex's counterpart of _refresh_claude_credential, under the same --auto-refresh opt-in:
+        rotate the operator's source auth.json when its access token has expired or is about to, and
+        report whether the file changed. Unlike Claude's it runs on macOS, where Codex also keeps a file.
+
+        It stands down when codex's credential store is not verifiably that file: a keyring login can
+        share the refresh token a leftover auth.json still carries, and spending it here would log that
+        login out."""
+        if os.environ.get("TAUCETI_AUTO_REFRESH") != "1" or self._codex_credentials_store() is not None:
+            return False
+        prov = credential_refresh.provider("codex", credentials=self._codex_creds_source() / "auth.json")
+        if not credential_refresh.renewable(prov):
+            return False
+        if not force:
+            expiry = credential_refresh.expires_at(prov)
+            if expiry is None or expiry > time.time() + CODEX_REFRESH_SKEW_S:
+                return False
+        try:
+            result = credential_refresh.refresh_if_due(
+                prov,
+                CODEX_REFRESH_SKEW_S,
+                force=force,
+                attempt_interval_seconds=CODEX_REFRESH_RETRY_S,
+            )
+        except (OSError, RuntimeError, ValueError) as e:
+            log(f"codex credential: refresh failed ({e}) — codex stays unavailable until it is renewed")
+            return False
+        if result == "refreshed":
+            log(f"codex credential: access token renewed ({prov.credentials})")
+            return True
+        return False
 
     # --- Claude ------------------------------------------------------------
     def _claude_creds(self) -> tuple[dict | None, bool]:
@@ -2352,8 +2397,8 @@ class Quota:
         forced in {codex, claude}: only that provider counts. None/'auto': codex preferred, opus
         fallback. Kiro and OpenRouter agents bypass this entirely (handled by the caller).
 
-        `renew` is passed through to Quota.claude: a caller that is about to act on the answer may
-        renew an expiring access token, an inspection command may not.
+        `renew` is passed through to Quota.codex and Quota.claude: a caller that is about to act on the
+        answer may renew an expiring access token, an inspection command may not.
 
         The loop's wait episode can inspect only changed/due providers, permit
         HTTP only for `fetch`, and force refresh only for `refresh_providers`.
@@ -2383,10 +2428,11 @@ class Quota:
                 elif hasattr(self, "_wait_cache_directory"):
                     self._claude_usage_directory = self._wait_cache_directory
             try:
+                renewing = renew and not self._cache_only
                 snap[provider] = (
-                    self.codex(refresh=force)
+                    self.codex(refresh=force, renew=renewing)
                     if provider == "codex"
-                    else self.claude(refresh=force, renew=renew and not self._cache_only)
+                    else self.claude(refresh=force, renew=renewing)
                 )
             except LocalUsageUnavailable:
                 snap[provider] = Provider(

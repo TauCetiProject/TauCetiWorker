@@ -149,6 +149,7 @@ RUN_STDLIB=(
   provider_usage.py
   quota_auto_refresh.py
   quota_cache_fp.py
+  quota_codex_auto_refresh.py
   quota_loop_refresh.py
   quota_wakeups.py
   quota_shared_usage.py
