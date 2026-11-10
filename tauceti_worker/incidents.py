@@ -22,6 +22,7 @@ SCHEMA = "tauceti-incident/v1"
 ACKED = "acked"
 DECLINED = "declined"
 BUDGET_SPENT = "budget-spent"
+RULING = "ruling"  # written by decide.py; a `retry` one lifts the hold below
 # The stages whose rounds leave these records: the ones that repair an existing pull request head.
 STAGES = ("rebase", "fix", "fix-ci")
 HELD = "an earlier round declined at this head; waiting for a new head"
@@ -119,6 +120,24 @@ def record(kind: str, key: str, **fields) -> Path | None:
     return path
 
 
+def acknowledge(kind: str, key: str) -> bool:
+    """Move the live record `<kind>-<key>` into `acked/`, over an older acknowledged one of that
+    name. False when there is no live record or the move failed."""
+    root = directory()
+    if root is None:
+        return False
+    name = _name(kind, key)
+    try:
+        (root / ACKED).mkdir(mode=0o700, exist_ok=True)
+        os.replace(root / name, root / ACKED / name)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        log(f"incident {name} could not be acknowledged under {root}: {error}")
+        return False
+    return True
+
+
 def named_prs(message: str, pr: int) -> tuple[list[int], list[int]]:
     """(subsumed_by, mentions): the pull requests the last `Subsumed-by:` line of `message` names,
     and the other ones the message refers to as `#N`; `pr` itself is in neither."""
@@ -150,9 +169,17 @@ def record_declined(stage: str, pr: int, head: str, *, reason: str = "", message
 
 
 def declined(stage: str, pr: int, head: str) -> bool:
-    """Whether `stage` is held off `pr` at `head`: TAUCETI_HOLD_DECLINED is on and a `declined`
-    record, live or acknowledged, names this head."""
-    return hold_declined() and any(value.get("head") == head for value in find(DECLINED, f"{stage}-{pr}"))
+    """Whether `stage` is held off `pr` at `head`: TAUCETI_HOLD_DECLINED is on, a `declined`
+    record, live or acknowledged, names this head, and no `retry` ruling has been made on the
+    latest of them."""
+    if not hold_declined():
+        return False
+    key = f"{stage}-{pr}"
+    written = [str(value.get("last_at") or "") for value in find(DECLINED, key) if value.get("head") == head]
+    return bool(written) and not any(
+        value.get("ruling") == "retry" and value.get("head") == head and value.get("incident_at") == max(written)
+        for value in find(RULING, f"{DECLINED}-{key}")
+    )
 
 
 def note_budget_spent(stage: str, pr: int, head: str, detail: str) -> None:

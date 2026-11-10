@@ -51,6 +51,7 @@ CALL_SITES = {
         CLOSE_AUTHORITY="Closure authority is pinned by the worker.",
     ),
     "overlap-scan.md": dict(BATCH="/tmp/batch.json", RESULT="/tmp/result.json"),
+    "decide.md": dict(CASES="/tmp/cases.json", RESULT="/tmp/rulings.json"),
     "overlap-fix.md": dict(ISSUE=123, BODY="Evidence", FORK="alice/TauCeti", FORK_OWNER="alice", BIN="/bin", **VERIFY),
     "fix.md": FIXLIKE,
     "fix-ci.md": FIXLIKE,
@@ -75,7 +76,7 @@ CALL_SITES = {
         **VERIFY,
     ),
 }
-NO_WRAPPER = {"overlap-scan.md", "pr-outcome.md", "local-verification.md"}
+NO_WRAPPER = {"overlap-scan.md", "decide.md", "pr-outcome.md", "local-verification.md"}
 
 fails = 0
 

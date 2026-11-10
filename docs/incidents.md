@@ -11,6 +11,9 @@ something about a pull request that GitHub does not show. Two kinds exist:
 Nothing is written unless `TAUCETI_INCIDENTS_DIR` is set, and records alone
 change no selection.
 
+The opt-in [decide phase](decide.md) reads these two kinds and writes a third,
+`ruling`, into the same directory.
+
 ## Settings
 
 | Variable | Default | Effect |
@@ -25,11 +28,13 @@ A [managed worker](workers.md) gets both through its `env` table.
 ```
 <dir>/<kind>-<key>.json          live
 <dir>/acked/<kind>-<key>.json    acknowledged
+<dir>/.decide.lock               the decide phase's lock and last-round time
 ```
 
 The worker writes live files only, each by a rename from a temporary file in
 the same directory (`.<name>.<pid>.tmp`), so a reader never sees a partial
-record. It never moves or deletes a file.
+record. It never deletes a file, and it moves one only in the decide phase,
+which acknowledges the records it has settled.
 
 Whoever reads the records acknowledges one by moving it into `acked/` under the
 same name, and discards one by deleting it. A hyphen can occur in both `<kind>`
@@ -114,8 +119,9 @@ current head. The survey lists the pull request as suppressed with the reason
 `an earlier round declined at this head; waiting for a new head`, and dispatch
 checks again before spending, for a record written after the survey.
 
-The hold ends when the head moves, or when the record is deleted from both
-folders. It covers every action of the stage at that head, including the final
+The hold ends when the head moves, when the record is deleted from both
+folders, or when the decide phase rules `retry` on the latest record for that
+head. It covers every action of the stage at that head, including the final
 resolution attempt and the closure after spent attempts that `fix` makes on a
 pull request the account authored: a held head is left for a person.
 
@@ -127,7 +133,8 @@ before acting on it.
 
 ## Reading and writing from code
 
-`tauceti_worker/incidents.py` is the only module that touches the directory:
+`tauceti_worker/incidents.py` is the only module that reads and writes the
+records:
 
 | Function | Use |
 | --- | --- |
@@ -135,6 +142,7 @@ before acting on it.
 | `record(kind, key, **fields)` | Write or refresh a live record; returns its path, or `None` when off or the write failed |
 | `find(kind, key)` | The live and the acknowledged record of that name, where they exist |
 | `records(kind="", acked=True)` | Every readable record with its path, live ones first |
+| `acknowledge(kind, key)` | Move a live record into `acked/` |
 | `record_declined(...)`, `note_budget_spent(...)` | The two kinds above |
 | `declined(stage, pr, head)` | Whether the hold applies |
 

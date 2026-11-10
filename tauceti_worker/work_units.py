@@ -67,6 +67,7 @@ from .constants import (
     CONTEST_CLAIM_TTL,
     EX_CLAIM_COLLISION,
     EX_NOPROGRESS,
+    EXPLICIT_TASKS,
     MAX_CI_PR_ATTEMPTS,
     MAX_FIX_ATTEMPTS,
     MAX_INFRA_REFUNDS,
@@ -148,7 +149,7 @@ def want(only: list[str], task: str) -> bool:
             return False
         if task == "security-audit" and not project.feature("security_audit"):
             return False
-    if task == "security-audit":
+    if task in EXPLICIT_TASKS:
         return task in only
     return (not only) or (task in only)
 
@@ -437,6 +438,20 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True) -> int:
         from .review_diagnostics import refund_stale_head_errors
 
         refund_stale_head_errors(w.cfg.state, w.counters)
+    if "decide" in opts.only:
+        # Ahead of the survey, so a hold that a `retry` ruling lifts is already gone from it.
+        from . import decide
+
+        ready, why = (False, "it takes no --pr") if getattr(opts, "prs", ()) else decide.due()
+        if ready:
+            rc = dispatch("decide", w, Survey(worker_id=w.cfg.wid), Candidate(0, "", why), opts)
+            if rc is not None:
+                return rc
+            why = "nothing to put to the model this round"
+        other_tasks = [task for task in opts.only if task != "decide"]
+        if not other_tasks:
+            raise NoProgress(f"decide: {why}")
+        opts = replace(opts, only=other_tasks)
     w.selection_changed = False
     global_pick = False
     focused_round = False
@@ -1342,6 +1357,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         "roadmap": do_roadmap,
         "overlap-scan": do_overlap_scan,
         "overlap-fix": do_overlap_fix,
+        "decide": do_decide,
     }[stage]
     # Announce the round up front so the log says what was chosen, on which PR (as a clickable URL),
     # with which agent and sandbox — the same line for every stage.
@@ -1472,6 +1488,12 @@ def do_overlap_fix(w, sv, c, opts, bubble):
     from .overlaps import do_fix
 
     return do_fix(w, sv, c, opts, bubble)
+
+
+def do_decide(w, sv, c, opts, bubble):
+    from .decide import run
+
+    return run(w, opts)
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int | None:
@@ -1924,6 +1946,9 @@ def _do_fixlike(
     )
     if label in incidents.STAGES and incidents.directory() is not None and not getattr(p, "automatic_bump", False):
         prompt += incidents.PROMPT
+        from .decide import retry_note
+
+        prompt += retry_note(label, pr, head)
     if getattr(c, "final_resolution", False) and may_close:
         prompt += (
             "\nThis is the last permitted per-head repair attempt. "

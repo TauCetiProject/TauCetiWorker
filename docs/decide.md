@@ -1,0 +1,150 @@
+# The decide phase
+
+`decide` rules on [incident records](incidents.md): the `declined` and
+`budget-spent` records that repair rounds leave when a pull request cannot be
+moved forward. For each one it asks a model to choose a ruling, checks the
+answer, carries it out, and writes the ruling back as a record of its own, so
+that the records still waiting for a person are the ones a person has to
+decide.
+
+It is outside the cascade: a worker runs it only when its `only` list names
+`decide`. A round costs one listing of open pull requests; when there is
+something to rule on it adds one model conversation for up to six pull
+requests, and for each of those one read of its comments and one read per pull
+request the incident names.
+
+## Turning it on
+
+```toml
+[[workers]]
+id = "decider"
+only = ["decide"]
+
+[workers.env]
+TAUCETI_INCIDENTS_DIR = "/srv/tauceti/incidents"
+```
+
+`tauceti work --only decide` is the same thing by hand. `decide` may share a
+worker with other phases (`only = ["decide", "fix", "rebase"]`): it then goes
+first on the rounds where it is due, and the round moves on to the other phases
+when it starts no model. One worker per incident directory is enough; a second
+one finds the directory's lock held and stands aside.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `TAUCETI_INCIDENTS_DIR` | _(unset)_ | Required. The directory whose records are ruled on. |
+| `TAUCETI_DECIDE_GAP` | `600` | Seconds between rounds on one directory. |
+| `TAUCETI_DECIDE_MAX_CASES` | `6` | Incidents put to the model in one round. |
+
+The phase is written for workers that also set `TAUCETI_HOLD_DECLINED=1`: a
+declined head then waits for its ruling, and `retry` is what releases it.
+Without the hold the rulings are still recorded, and the stage keeps taking the
+pull request on its own.
+
+## A round
+
+A round is due when `TAUCETI_DECIDE_GAP` has passed since the last one and the
+directory holds a live incident or a live ruling. It then:
+
+1. Lists the open pull requests and acknowledges every live incident and ruling
+   whose pull request has closed, merged, or moved to another head. No model is
+   involved.
+2. Looks again at each live ruling that waits on something (see below).
+3. Takes the live incidents, oldest first, up to the limit. One whose pull
+   request carries `keep`, `hold`, `wip`, `human`, `on-hold` or `do-not-close`
+   is left for a person, and one whose branch another worker has claimed is
+   left for a later round.
+4. Writes those cases to a file, runs the model on it, and checks the answer.
+5. Applies each ruling, writes its record, and acknowledges the incident.
+
+## The rulings
+
+| Ruling | Meaning | What the worker does |
+| --- | --- | --- |
+| `retry` | The round stopped for a reason that is not about the pull request, or there is evidence it did not have. | Lifts the hold at that head, and adds the ruling's note to the stage's next prompt for it. Once per head, and for `declined` incidents only. |
+| `wait` | Other open pull requests are doing the missing work. | Records them. When all have merged the ruling becomes a `retry`; when one closes unmerged the incident is put to the model again. |
+| `escalate` | Anything else. | Nothing: the record carries the analysis and a recommendation for a person. |
+
+A ruling that cannot be applied is recorded as `escalate` with the reason and
+`recommend` set to the ruling that was asked for. So is a case the answer leaves
+out or fills in against the schema. If the model run itself fails, nothing is
+recorded and the incidents wait for the next round.
+
+A `budget-spent` incident is never offered `retry`: attempt counts live in each
+worker's own state, where a ruling cannot restore them. When what such a pull
+request waited on has landed, the ruling becomes `escalate`.
+
+## Ruling records
+
+A ruling is an incident record of kind `ruling`, written to the same directory
+as `ruling-<incident kind>-<stage>-<pr>.json`. Beside the
+[common fields](incidents.md#fields) it has:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `repository`, `stage`, `pr`, `head` | | Copied from the incident |
+| `incident` | string | `declined` or `budget-spent` |
+| `incident_at` | string | The incident's `last_at` when it was ruled on |
+| `ruling` | string | The ruling's name |
+| `by` | string | `model`, or `recheck` for the follow-up to a ruling that waited |
+| `note` | string | The reasoning, for whoever acts next; at most 1500 characters |
+| `retried` | string list | Heads at which this pull request has had a `retry` |
+| `blocked_on` | integer list | `wait`: the pull requests waited on |
+| `recommend` | string | `escalate`: what the model would do, or the ruling that was refused |
+
+```json
+{
+ "blocked_on": [431],
+ "by": "model",
+ "count": 1,
+ "first_at": "2026-01-15T09:42:00Z",
+ "head": "5f2c9d0e8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d",
+ "incident": "declined",
+ "incident_at": "2026-01-15T09:30:00Z",
+ "key": "declined-rebase-412",
+ "kind": "ruling",
+ "last_at": "2026-01-15T09:42:00Z",
+ "note": "The conflict is with #431, which rewrites the same file and is green.",
+ "pr": 412,
+ "repository": "TauCetiProject/TauCeti",
+ "retried": [],
+ "ruling": "wait",
+ "schema": "tauceti-incident/v1",
+ "stage": "rebase",
+ "worker": "decider"
+}
+```
+
+Live and acknowledged mean the following for the two kinds together:
+
+- A live `declined` or `budget-spent` record has not been ruled on.
+- A live `ruling` is in force.
+  A live `escalate` ruling is waiting for a person.
+- The phase acknowledges an incident when it rules on it, and a ruling when its
+  pull request closes or leaves that head. A person acknowledges a ruling that
+  waited for them once they have dealt with it.
+
+To have a pull request ruled on again, delete its ruling record and move the
+incident from `acked/` back into the directory.
+
+## The model's part
+
+The model receives one file and writes one file. The first holds, per case:
+the pull request's number, head, title, labels and description, the stage and
+kind of the incident, the agent's final message, the state of each pull request
+that message names (at most six), the six latest comments, the earlier ruling
+if there was one, and the rulings it may choose from. Every text is cut to a
+fixed length.
+
+The answer is `{"rulings": [...]}` with one object per case: `case`, `ruling`,
+`note`, and exactly the fields of that ruling.
+
+| Ruling | Fields |
+| --- | --- |
+| `retry` | none |
+| `wait` | `blocked_on`: 1 to 5 pull request numbers |
+| `escalate` | `recommend`: one line, may be empty |
+
+The model runs on the host, as `progress` and `overlap-scan` do, with
+`GH_TOKEN` and `GITHUB_TOKEN` removed from its environment. Every write is made
+by the worker, after the checks on this page.

@@ -118,6 +118,10 @@ the cascade (priority order; a round does the first that applies):
   overlap-scan  investigate consecutive Mathlib commits up to Tau Ceti's pin
   roadmap   open a new PR for a roadmap item
 
+outside the cascade, run only when --only names them:
+  security-audit  inspect main's new commits (admin only)
+  decide    rule on the incident records of repair rounds (needs TAUCETI_INCIDENTS_DIR)
+
   With no --only a round walks the whole cascade; --only pins it to a subset,
   --skip drops a subset (and the two combine by subtraction). --pr narrows the
   same round to named pull requests: it filters what the round would already
@@ -1267,6 +1271,10 @@ def cmd_status(args) -> int:
 
 
 def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[int, ...] = ()) -> int:
+    if "decide" in only:
+        from .decide import check_settings
+
+        check_settings()
     if "security-audit" in only:
         from .security_audit import require_admin
 
@@ -1709,7 +1717,9 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     # engine and never compiles (same reason it's excluded from the fork preflight below). Excluding it
     # keeps a host-default `--only review` worker from being falsely blocked on a machine with no toolchain.
     needs_host_build = any(
-        (not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s) and s not in ("review", "overlap-scan")
+        (not _bubble(s, opts))
+        for s in WORK_TASKS
+        if want(opts.only, s) and s not in ("review", "overlap-scan", "decide")
     )
     if needs_host_build:
         from .agents import lake_cache_max_revs

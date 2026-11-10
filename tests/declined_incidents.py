@@ -301,6 +301,12 @@ def test_prompt(root):
         check("unset: the repair prompt is unchanged", "Subsumed-by" in prompt(), False)
     with settings(root):
         check("set: the agent is told its final message is recorded", incidents.PROMPT in prompt(), True)
+        incidents.record(
+            incidents.RULING, "declined-rebase-20", ruling="retry", head="head-20", note="main moved since"
+        )
+        check("a retry ruling at this head reaches the next session", "> main moved since" in prompt(), True)
+        incidents.record(incidents.RULING, "declined-rebase-20", ruling="retry", head="other", note="main moved since")
+        check("…and one at another head does not", "main moved since" in prompt(), False)
 
 
 def main():

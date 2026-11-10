@@ -421,6 +421,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
 | `TAUCETI_INCIDENTS_DIR` | _(unset)_ | Directory, shared by a fleet's workers, for [incident records](incidents.md): a `rebase`, `fix`, or `fix-ci` round that left nothing on GitHub writes the agent's final message there, and a spent attempt budget is noted once per head. Unset writes nothing. |
 | `TAUCETI_HOLD_DECLINED` | _(unset)_ | `1` keeps a stage off a pull request head that such a `declined` record names, until the head moves or the record is deleted. Needs `TAUCETI_INCIDENTS_DIR`. |
+| `TAUCETI_DECIDE_GAP` / `TAUCETI_DECIDE_MAX_CASES` | `600` / `6` | For a worker whose `--only` names [`decide`](decide.md): seconds between its rounds on one incident directory, and incidents put to the model in one round. |
 | `CLAIM_REPO` | automatic | The repository holding this worker's cooperative claim leases. Without an override it is the shared namespace `TauCetiProject/tauceti-claims` once your account can push there, and your own fork until then. See [the claim namespace](#the-claim-namespace). |
 | `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `1500` / `300` | Branch-claim lease TTL and heartbeat interval (seconds). |
 
