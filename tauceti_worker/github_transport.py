@@ -788,7 +788,7 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
         else "core"
     )
     started = time.monotonic()
-    ceiling = min(900, max(0, int(effective.get("TAUCETI_GH_PROXY_WAIT", "900"))))
+    ceiling = min(3600, max(0, int(effective.get("TAUCETI_GH_PROXY_WAIT", "3600"))))
     sent_intent = False
     observed_resource = endpoint is not None
     while True:
@@ -822,8 +822,13 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
             delay = mutation_slot(effective)
             if delay:
                 if time.monotonic() - started + delay > ceiling:
+                    from tauceti_worker.constants import EX_GITHUB_WAIT
+
+                    # A pacing wait must reach the worker's infrastructure-wait
+                    # path, without spending its review-error budget.
+                    record_block("publication", time.time() + delay, scope(effective))
                     blocked = subprocess.CompletedProcess(
-                        argv, 1, "", f"gh: publication pacing; Retry-After: {int(delay) + 1}\n"
+                        argv, EX_GITHUB_WAIT, "", f"gh: publication pacing; Retry-After: {int(delay) + 1}\n"
                     )
                     blocked.github_before_request = True
                     return blocked

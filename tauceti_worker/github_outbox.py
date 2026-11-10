@@ -114,6 +114,14 @@ def supersede_comment_patches(payload, env):
     bases = {directory(env).parent, tr.root() / "outbox" / (tr.scope(env) or "unselected")}
     for base in bases:
         for path in base.glob("*/*.json"):
+            # Recovery holds an intent lock while sending it. An unrelated PR
+            # must not wait for that request (or its publication backoff).
+            try:
+                old = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if comment_patch(old) != endpoint:
+                continue
             with tr.locked(path.with_suffix(".lock")):
                 try:
                     old = json.loads(path.read_text())
@@ -220,8 +228,13 @@ def prepare(argv, env, cwd=None, input=None):
         "input": input,
         "context": context,
     }
-    # Serialize competing edits of comments; no network request is made under this lock.
-    guard = tr.locked(directory(env).parent / "patches.lock") if comment_patch(payload) else contextlib.nullcontext()
+    # Only edits to the same comment compete. No network request is made here.
+    endpoint = comment_patch(payload)
+    guard = (
+        tr.locked(directory(env).parent / "patches" / (hashlib.sha256(endpoint.encode()).hexdigest() + ".lock"))
+        if endpoint
+        else contextlib.nullcontext()
+    )
     with guard:
         key = semantic_key(payload)
         for previous_path in intent_paths(env):
