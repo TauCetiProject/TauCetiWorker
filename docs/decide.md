@@ -66,6 +66,7 @@ directory holds a live incident or a live ruling. It then:
 | `wait` | Other open pull requests are doing the missing work. | Records them. When all have merged the ruling becomes a `retry`; when one closes unmerged the incident is put to the model again. |
 | `escalate` | Anything else. | Nothing: the record carries the analysis and a recommendation for a person. |
 | `prerequisite` | A roadmap milestone nobody is building blocks it. | Adds the milestone to the target list and waits for it as `wait` does. Offered only with a target list and a readable roadmap checkout. |
+| `roadmap` | Only a change to a roadmap resolves it. | Writes the proposed change to a local file. Nothing is opened. Offered only with a readable roadmap checkout. |
 
 A ruling that cannot be applied is recorded as `escalate` with the reason and
 `recommend` set to the ruling that was asked for. So is a case the answer leaves
@@ -94,6 +95,7 @@ as `ruling-<incident kind>-<stage>-<pr>.json`. Beside the
 | `blocked_on` | integer list | `wait`: the pull requests waited on |
 | `recommend` | string | `escalate`: what the model would do, or the ruling that was refused |
 | `blocked_on_targets`, `added` | string lists | `prerequisite`: the target slugs waited on, and those this ruling added to the list |
+| `area`, `draft` | strings | `roadmap`: the roadmap, and the path of the drafted change |
 
 ```json
 {
@@ -122,7 +124,7 @@ Live and acknowledged mean the following for the two kinds together:
 
 - A live `declined` or `budget-spent` record has not been ruled on.
 - A live `ruling` is in force.
-  A live `escalate` ruling is waiting for a person.
+  A live `roadmap` or `escalate` ruling is waiting for a person.
 - The phase acknowledges an incident when it rules on it, and a ruling when its
   pull request closes or leaves that head. A person acknowledges a ruling that
   waited for them once they have dealt with it.
@@ -150,6 +152,7 @@ The answer is `{"rulings": [...]}` with one object per case: `case`, `ruling`,
 | `wait` | `blocked_on`: 1 to 5 pull request numbers |
 | `escalate` | `recommend`: one line, may be empty |
 | `prerequisite` | `items`: 1 to 3 of `{area, slug, text, needs}` |
+| `roadmap` | `area`; `title`: one line; `proposal`: 80 to 12000 characters |
 
 The model runs on the host, as `progress` and `overlap-scan` do, with
 `GH_TOKEN` and `GITHUB_TOKEN` removed from its environment. Every write is made
@@ -171,3 +174,10 @@ waited on without being added. The file is rewritten by rename while holding an
 exclusive `flock` on `.<file name>.lock` beside it; anything else that writes
 the list should take the same lock. The phase does not commit the file, and
 does not remove an item once the pull request it unblocks has gone.
+
+## Roadmap drafts
+
+A `roadmap` ruling writes `drafts/roadmap-<pr>.md` under the incident
+directory: the title, the roadmap, the pull request it would unblock, and the
+proposed change in the model's words. The worker opens nothing in the roadmap
+repository; a person reads the draft and files the change, or does not.

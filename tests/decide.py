@@ -547,6 +547,39 @@ def test_prerequisite(tmp):
         )
 
 
+def test_roadmap(tmp):
+    incident = {"pr": 7, "head": "a" * 40, "repository": TAUCETI}
+    check(
+        "a draft that cannot be written is reported, not raised",
+        decide.write_draft(tmp / "absent", incident, "Probability", "T", "P"),
+        None,
+    )
+    root = tmp / "roadmap"
+    proposal = "In Layer 2 of the README, add the zero-one law before the strong law, which uses it. "
+    with settings(root):
+        declined(5, 6)
+        change = {"area": "Probability", "title": "Add the zero-one law", "proposal": proposal}
+        seen = rounds(
+            tmp, Hub(p5={}, p6={}), answer((5, "roadmap", change), (6, "roadmap", {**change, "area": "Nowhere"}))
+        )
+        check("it is offered with a roadmap checkout", "roadmap" in seen["packet"]["cases"][0]["allowed"], True)
+        value = ruling(root, "declined-fix-5")
+        check(
+            "roadmap: a draft file, named in the ruling",
+            (value["ruling"], value["area"], value["draft"]),
+            ("roadmap", "Probability", str(root / "drafts" / "roadmap-5.md")),
+        )
+        text = Path(value["draft"]).read_text()
+        parts = ("# Add the zero-one law", "`Probability`", "/pull/5", "Nothing has been opened", proposal.strip())
+        check("…saying what it is for and that nothing was opened", [part in text for part in parts], [True] * 5)
+        refused = ruling(root, "declined-fix-6")
+        check(
+            "an unknown roadmap escalates and drafts nothing",
+            (refused["ruling"], refused["recommend"], (root / "drafts" / "roadmap-6.md").exists()),
+            ("escalate", "roadmap", False),
+        )
+
+
 def main():
     def gmtime(seconds=None):
         return real_gmtime(clock[0] if seconds is None else seconds)
@@ -558,6 +591,7 @@ def main():
         test_rounds(tmp)
         test_model_call(tmp / "model")
         test_prerequisite(tmp)
+        test_roadmap(tmp)
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
     return 1 if fails else 0
 

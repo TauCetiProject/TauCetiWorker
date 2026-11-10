@@ -29,6 +29,7 @@ A [managed worker](workers.md) gets both through its `env` table.
 <dir>/<kind>-<key>.json          live
 <dir>/acked/<kind>-<key>.json    acknowledged
 <dir>/.decide.lock               the decide phase's lock and last-round time
+<dir>/drafts/roadmap-<pr>.md     roadmap changes the decide phase drafted
 ```
 
 The worker writes live files only, each by a rename from a temporary file in

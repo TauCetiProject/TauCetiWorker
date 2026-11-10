@@ -619,3 +619,44 @@ def _prerequisite(rd: _Round, incident: dict, answer: dict) -> tuple[str, dict]:
 SCHEMA[PREREQUISITE] = {"items": _items}
 OFFERED[PREREQUISITE] = lambda rd, incident: rd.listed is not None and rd.roadmaps is not None
 EFFECTS[PREREQUISITE] = _prerequisite
+
+
+# ---- roadmap: draft a change for a person to file -----------------------------------------------
+
+ROADMAP_CHANGE = "roadmap"
+DRAFTS = "drafts"
+
+
+def write_draft(root: Path, incident: dict, area: str, title: str, proposal: str) -> Path | None:
+    """Write a proposed roadmap change as `drafts/roadmap-<pr>.md` under `root`, for a person to
+    review and file. Nothing is opened anywhere. None when the file could not be written."""
+    path = root / DRAFTS / f"roadmap-{incident['pr']}.md"
+    text = (
+        f"# {title.strip()}\n\n"
+        f"- Roadmap: `{area}` in {ROADMAP}\n"
+        f"- Unblocks: https://github.com/{incident['repository']}/pull/{incident['pr']} at `{incident['head'][:12]}`\n"
+        "- Status: a draft written by the decide phase. Nothing has been opened; a person reviews it "
+        "and files the change.\n\n"
+        f"{proposal.strip()}\n"
+    )
+    try:
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        path.write_text(text)
+    except OSError as error:
+        log(f"decide: the draft {path} was not written: {error}")
+        return None
+    return path
+
+
+def _roadmap(rd: _Round, incident: dict, answer: dict) -> tuple[str, dict]:
+    if answer["area"] not in rd.areas:
+        return f"there is no roadmap `{answer['area']}`", {}
+    path = write_draft(incidents.directory(), incident, answer["area"], answer["title"], answer["proposal"])
+    if path is None:
+        return "the draft could not be written", {}
+    return "", {"area": answer["area"], "draft": str(path)}
+
+
+SCHEMA[ROADMAP_CHANGE] = {"area": _area, "title": _text(5, 120, line=True), "proposal": _text(80, 12000)}
+OFFERED[ROADMAP_CHANGE] = lambda rd, incident: rd.roadmaps is not None
+EFFECTS[ROADMAP_CHANGE] = _roadmap

@@ -38,6 +38,13 @@ For each case choose one ruling from that case's `allowed` list:
   README, with its section) and `needs` (slugs of list items it depends on).
   New items are added to the target list and the pull request waits for them.
   Name the smallest set that clears the blocker.
+- `roadmap`: only a change to a roadmap resolves it, because the pull request
+  does work the roadmap does not list or lists in an order that cannot be met.
+  `area` is the roadmap, `title` a one-line title for the change, and
+  `proposal` the change itself: the README section, the wording to add or
+  replace, and a paragraph on why. It is saved as a draft for a person to
+  review and file; nothing is opened. When the roadmap already states the
+  missing milestone, the ruling is `prerequisite` or `wait`, not this.
 - `escalate`: anything else. `note` is your analysis and `recommend` one line
   saying what you would do, or an empty string. If the ruling you would have
   chosen is not in `allowed`, escalate and name it in `recommend`.
@@ -55,6 +62,8 @@ with `case`, `ruling`, `note` and the fields of its ruling and no others:
   {"case": "declined-rebase-102", "ruling": "wait", "note": "...", "blocked_on": [120]},
   {"case": "budget-spent-fix-103", "ruling": "prerequisite", "note": "...",
    "items": [{"area": "Probability", "slug": "kolmogorov-zero-one", "text": "...", "needs": []}]},
+  {"case": "declined-fix-105", "ruling": "roadmap", "note": "...", "area": "Probability",
+   "title": "...", "proposal": "..."},
   {"case": "budget-spent-fix-ci-106", "ruling": "escalate", "note": "...", "recommend": ""}
 ]}
 
