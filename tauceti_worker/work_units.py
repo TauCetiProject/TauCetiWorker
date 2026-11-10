@@ -1263,7 +1263,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         if retained_repair(getattr(w, "cfg", None), getattr(getattr(w, "gh", None), "repo", TAUCETI), c.pr):
             log(f"  #{c.pr}: retained source recovery has priority; selecting unrelated work")
             return None
-    if c.pr and stage in incidents.STAGES and incidents.declined(stage, c.pr, c.head):
+    if c.pr and stage in incidents.STAGES and incidents.hold_declined() and incidents.declined(stage, c.pr, c.head):
         log(f"  {stage} #{c.pr}: {incidents.HELD}; selecting unrelated work")
         return None
     os.environ["TAUCETI_GITHUB_PR"] = str(c.pr or "")
