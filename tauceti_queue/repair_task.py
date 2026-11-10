@@ -2703,6 +2703,18 @@ def resume_pending(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None =
                         response=response,
                         version=response.get("version"),
                     )
+                    # A lost reply must not skip publication's submission-time
+                    # fallback. Freeze any surviving outputs before terminal cleanup.
+                    from tauceti_queue.repair_cache import cache_lease, task_cache
+                    from tauceti_queue.repair_cleanup import worktree_lease
+
+                    worktree = cfg.root / "worktrees" / f"task-{task.task_id}"
+                    with cache_lease(task_cache(cfg.root, task.task_id)), worktree_lease(cfg.root, task.task_id):
+                        if worktree.is_dir():
+                            env = repair.lake_env(cfg.root, cache_root=task_cache(cfg.root, task.task_id))
+                            publication = repair_publish.start_early(worktree, env)
+                            if publication is not None:
+                                outcome["publish"] = publication
                     state.write("adopted", outcome=outcome)
                     outcomes.append(outcome)
                     if not cfg.keep_worktree:
