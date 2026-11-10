@@ -258,4 +258,89 @@ checks.append(check("red CI beats review findings", tc._next_auto_stage(sv), "fi
 sv.rebaseable.actionable.append(candidate)
 checks.append(check("conflict remains first", tc._next_auto_stage(sv), "rebase"))
 
+
+# Work on an automatic Mathlib bump comes before every other candidate, whatever its stage, and
+# keeps stage order among bump candidates. Main moves faster than a bump can wait its turn.
+def pr_info(number, *, bump):
+    return tc.PRInfo(
+        number=number,
+        head_oid="b" * 40,
+        head_ref=("bump-mathlib/" + "c" * 40) if bump else "feature",
+        head_owner="TauCetiProject",
+        head_repo="TauCeti",
+        is_draft=False,
+        mergeable="MERGEABLE",
+        author="tauceti-review-bot[bot]" if bump else "someone",
+        build_success=True,
+        build_failed=False,
+        author_is_bot=bump,
+    )
+
+
+mixed = tc.Survey(worker_id="test")
+mixed.open_prs = [pr_info(7, bump=False), pr_info(9, bump=True)]
+other, bump_fix, bump_review = (
+    tc.Candidate(7, "b" * 40, "conflicting"),
+    tc.Candidate(9, "b" * 40, "blocking review at head"),
+    tc.Candidate(9, "b" * 40, "ready for review"),
+)
+mixed.rebaseable.actionable.append(other)
+mixed.progress.actionable.append(tc.Candidate(0, "", "due"))
+mixed.needs_fix.actionable.append(bump_fix)
+mixed.reviewable.actionable.append(bump_review)
+checks.append(check("bump candidates precede every other stage", tc._next_auto_stage(mixed), "fix"))
+checks.append(
+    check(
+        "cascade order: bump work in stage order, then the rest",
+        [(stage, c.pr) for stage, c in tc.cascade(mixed, tc.AUTO_STAGES)],
+        [("fix", 9), ("review", 9), ("rebase", 7), ("progress", 0)],
+    )
+)
+checks.append(check("non-bump PRs are not promoted", tc.bump_prs(mixed), {9}))
+
+seen = []
+tc.work_units.survey = lambda *_a, **_k: mixed
+tc.work_units.dispatch = lambda stage, _w, _sv, c, _o: seen.append((stage, c.pr)) or (None if stage == "fix" else 0)
+try:
+    tc.work_units.run_round(worker, SimpleNamespace(only=[], dry_run=True))
+finally:
+    tc.work_units.survey = saved_survey
+    tc.work_units.dispatch = saved_dispatch
+checks.append(check("runtime offers bump work first and falls through in order", seen, [("fix", 9), ("review", 9)]))
+
+seen = []
+tc.work_units.survey = lambda *_a, **_k: mixed
+tc.work_units.dispatch = lambda stage, _w, _sv, c, _o: seen.append((stage, c.pr)) or 0
+try:
+    tc.work_units.run_round(worker, SimpleNamespace(only=["rebase", "review"], dry_run=True))
+finally:
+    tc.work_units.survey = saved_survey
+    tc.work_units.dispatch = saved_dispatch
+checks.append(check("--only still restricts the stages bump work can use", seen, [("review", 9)]))
+
+# A peer's first-refusal window defers ordinary reviews, never a bump review.
+import time as _time
+
+affine = tc.Survey(worker_id="test")
+affine.open_prs = [pr_info(7, bump=False), pr_info(9, bump=True)]
+for number in (7, 9):
+    affine.reviewable.actionable.append(
+        tc.Candidate(number, "b" * 40, "ready for review", preferred_reviewer="peer", ready_at=_time.time())
+    )
+seen = []
+saved_me = tc.work_units.me
+tc.work_units.survey = lambda *_a, **_k: affine
+tc.work_units.dispatch = lambda stage, _w, _sv, c, _o: seen.append((stage, c.pr)) or None
+tc.work_units.me = lambda: "me"
+try:
+    try:
+        tc.work_units.run_round(worker, SimpleNamespace(only=["review"], dry_run=True))
+    except Exception:
+        pass  # nothing performed: the round reports no progress
+finally:
+    tc.work_units.survey = saved_survey
+    tc.work_units.dispatch = saved_dispatch
+    tc.work_units.me = saved_me
+checks.append(check("bump review skips the peer affinity window", seen, [("review", 9)]))
+
 sys.exit(0 if all(checks) else 1)

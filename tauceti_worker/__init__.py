@@ -6,6 +6,7 @@ the driver loop); `tauceti status` prints the read-only survey.
 The worker acts on TauCetiProject/TauCeti as the authenticated `gh` account, and treats that
 account's own PRs as the ones it tends. Each round does exactly ONE unit of work, chosen in
 priority order: rebase -> bump -> lint-repair -> progress -> fix-ci -> fix -> review -> roadmap.
+Work of any of those kinds on an automatic Mathlib bump PR comes before all other work.
 
 This package was split from a single-file script for navigability. The split is behaviour-
 preserving. For both the test harness (which reaches `tauceti_worker.<NAME>`) and the historical
