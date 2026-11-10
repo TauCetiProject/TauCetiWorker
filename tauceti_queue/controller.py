@@ -7079,7 +7079,12 @@ class Controller:
                     alerts.append(f"head {head['id']}: {attempt['outcome_detail']} (request {attempt['request_id']})")
             if attempt["dispatch_state"] == "rejected" and not attempt["dispatch_retryable"]:
                 alerts.append(
-                    f"head {head['id']} dispatch rejected; check CI permissions and configuration, then use retry_ci after repair if retries are exhausted"
+                    f"head {head['id']} dispatch rejected; automatic retries continue; check CI permissions and configuration"
+                )
+            if attempt["outcome"] == OUTCOME_INFRASTRUCTURE and attempt["infrastructure_retry"] >= 3:
+                alerts.append(
+                    f"head {head['id']} CI repeatedly failed on infrastructure: {attempt['outcome_detail']}; "
+                    "automatic retries continue"
                 )
             if attempt["outcome"] == OUTCOME_PENDING and attempt["dispatch_state"] in {"sending", "uncertain"}:
                 alerts.append(
@@ -7106,9 +7111,17 @@ class Controller:
                         "phase": (ci["phases"][-1]["name"] if ci["phases"] else None),
                     }
                     if silence >= 2 * interval:
-                        alerts.append(
-                            f"head {head['id']} build stalled for {silence:.0f}s on {attempt['runner_name'] or 'unknown runner'} ({attempt['host'] or 'unknown host'})"
-                        )
+                        if attempt["run_status"] == "completed" and (
+                            ci["verdicts"].get(BUILD_CONTEXT, {}).get("state") == "success"
+                        ):
+                            alerts.append(
+                                f"head {head['id']} verified run {attempt['run_id']} still awaits required status delivery; "
+                                "automatic reporting retries continue"
+                            )
+                        else:
+                            alerts.append(
+                                f"head {head['id']} build stalled for {silence:.0f}s on {attempt['runner_name'] or 'unknown runner'} ({attempt['host'] or 'unknown host'})"
+                            )
         if task is not None and not info["task"]["active_claims"]:
             unclaimed_at = task["created_at"]
             for claim in self.store.rows("claims", {"task_id": task["id"]}):
