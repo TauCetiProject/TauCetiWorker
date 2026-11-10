@@ -35,7 +35,7 @@ One exception (operator decision, 2026-11-10): workers label automatic Mathlib b
 
 Accept it for PRs whose **author belongs to a designated GitHub team**, the **TauCetiProject/self-tested** team, initially **kim-em, roed314, roed-math, CBirkbeck and tauceti-ai-for-science**. A nonmember author's PR remains ineligible even when a team member labels it.
 
-The route applies to ordinary mathematics changes entirely under `TauCeti/`, with unchanged pins and lakefile. Infrastructure changes and explicit full-lint/lint-repair requests retain their existing CI route.
+The route applies to ordinary mathematics changes entirely under `TauCeti/`, with unchanged pins and lakefile, and to automatic Mathlib bumps as described above (pin files allowed, lakefile unchanged, real `bump-guard`). Infrastructure changes and explicit full-lint/lint-repair requests retain their existing CI route.
 
 Change the existing path as follows:
 
