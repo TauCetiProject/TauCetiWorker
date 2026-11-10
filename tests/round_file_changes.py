@@ -219,6 +219,24 @@ def main():
                     tc.work_units._progressed_direct(types.SimpleNamespace(gh=gh), candidate, pre) == expected,
                 )
 
+        # A finding that only the PR description can answer (a quality-pass report) leaves no source
+        # change to push. Replacing the description and replying on its thread completes even the
+        # final attempt; a reply alone, or nothing, still does not.
+        gh = types.SimpleNamespace(pr_progress_state=lambda _: {"head": head, "ncomments": 1, "state": "OPEN"})
+        pre = {"head": head, "ncomments": 0, "state": "OPEN", "require_push": True}
+        for mutated, expected in (("description-reply", True), ("reply", False), (None, False)):
+            with patch.object(tc.work_units, "_round_mutated", return_value=mutated):
+                check(
+                    "final resolution accepts a description repair with its reply: " + str(mutated),
+                    tc.work_units._progressed_direct(types.SimpleNamespace(gh=gh), candidate, pre) == expected,
+                )
+        final = tc.work_units.FINAL_ATTEMPT_INSTRUCTION
+        check(
+            "the final-attempt instruction keeps its rule and names the exception",
+            "A comment alone does not complete this attempt" in final
+            and "update the description and reply on the finding's thread" in final,
+        )
+
         from tauceti_worker import github_transport as transport
 
         gh = types.SimpleNamespace(
@@ -297,6 +315,53 @@ def main():
                         types.SimpleNamespace(stdout=""),
                     )
                 check(method + " is not a new reply", tc.work_units._round_mutated(candidate, baseline) is None)
+
+            def record(created, argv, round_id="this-round"):
+                with patch.dict(os.environ, TAUCETI_ACTIVITY_ROUND_ID=round_id):
+                    fleet_events.mutation(command | {"created": created, "argv": argv}, types.SimpleNamespace(stdout=""))
+
+            edit = ["pr", "edit", "1", "--repo", "TauCetiProject/TauCeti", "--body-file", "/tmp/body.md"]
+            reply = ["api", "-X", "POST", "repos/TauCetiProject/TauCeti/pulls/1/comments/42/replies"]
+            final = baseline | {"require_push": True}
+            baseline["mutation_cursor"] = final["mutation_cursor"] = tc.work_units._mutation_cursor()
+            record("label", ["pr", "edit", "1", "--repo", "TauCetiProject/TauCeti", "--add-label", "x"])
+            record("peer-edit", edit, round_id="other-round")
+            record("reply-1", reply)
+            check(
+                "a reply without this round's description edit stays a reply",
+                tc.work_units._round_mutated(candidate, final) == "reply",
+            )
+            check(
+                "a reply alone does not complete a final attempt",
+                tc.work_units._progressed(types.SimpleNamespace(gh=gh), candidate, final) is False,
+            )
+            baseline["mutation_cursor"] = final["mutation_cursor"] = tc.work_units._mutation_cursor()
+            record("edit", edit)
+            check(
+                "a description edit alone is not a publication",
+                tc.work_units._round_mutated(candidate, final) is None,
+            )
+            record("reply-2", reply)
+            check(
+                "a description edit with its reply is attributed",
+                tc.work_units._round_mutated(candidate, final) == "description-reply",
+            )
+            check(
+                "a description repair with its reply completes a final attempt",
+                tc.work_units._progressed(types.SimpleNamespace(gh=gh), candidate, final) is True,
+            )
+            check(
+                "and an ordinary one",
+                tc.work_units._progressed(types.SimpleNamespace(gh=gh), candidate, baseline) is True,
+            )
+            baseline["mutation_cursor"] = final["mutation_cursor"] = tc.work_units._mutation_cursor()
+            record("rest-edit", ["api", "-X", "PATCH", "repos/TauCetiProject/TauCeti/pulls/1", "-f", "body=new text"])
+            record("reply-3", reply)
+            check(
+                "the REST form of a description edit counts the same",
+                tc.work_units._round_mutated(candidate, final) == "description-reply",
+            )
+            baseline["mutation_cursor"] = tc.work_units._mutation_cursor()
             journal.unlink()
             check(
                 "missing journal leaves observation unknown", tc.work_units._round_mutated(candidate, baseline) is None
