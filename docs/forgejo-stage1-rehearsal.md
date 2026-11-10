@@ -8,8 +8,8 @@ Fixture native IDs and credentials are separate from the intended real destinati
 `https://git.taucetiproject.org/TauCetiProject/TauCeti`.
 
 **Stage 1 readiness is not yet declared.** Actual destination backup/recovery
-access is still unavailable, and verification of the returned GitHub-mode controls
-is running. The intended destination paths are chosen; operational ownership by
+access is still unavailable. The isolated rehearsal, including verification of
+the returned GitHub-mode controls, is complete. The intended destination paths are chosen; operational ownership by
 `kim-em` and real Forgejo site-administrator access are confirmed. No production import,
 authority switch, mirror activation, fleet drain, or shared-state shutdown occurred.
 
@@ -21,8 +21,8 @@ authority switch, mirror activation, fleet drain, or shared-state shutdown occur
 | Work preservation | Captured Git, queue, claims, spending, prepared publications, and Review stores were retained and recovery checked. A per-head transfer manifest names `kim-em` for decisions. Refresh and apply individual dispositions at the separately authorized cutoff; captured approvals never become native authority. |
 | Contribution path | A failed real candidate was refused, a corrected candidate passed, stale head/base evidence was refused, and the final scoped dispatcher produced one verified owning child. Native review and the familiar contributor `gh` path were exercised. |
 | Merge and outputs | The exact current candidate landed, only `main` mirrored through the App, main build/audits passed, the exact public cache remained usable, and actual API docs and Pages published the new native module. |
-| Recovery | Durable handoff export, publication-only retry, real App mirror refusal/repair, scheduled catch-up, user-manager re-exec, isolated restores, and authority rollback preserving landed native work passed. Returned GitHub-mode build/publication verification is still running. |
-| Handover | Executable [cutover](forgejo-stage1-cutover.md), [operator](forgejo-stage1-operator.md), [automation disposition](forgejo-stage1-automations.md), and opt-in [mirror units](../services/queue/stage1-mirror/README.md) are available. Complete the actual destination recovery record and final returned-mode verification before readiness sign-off. |
+| Recovery | Durable handoff export, publication-only retry, real App mirror refusal/repair, scheduled catch-up, user-manager re-exec, isolated restores, and authority rollback preserving landed native work passed. Returned GitHub-mode build, cache, API docs, public Pages, and `docgen` advancement passed. |
+| Handover | Executable [cutover](forgejo-stage1-cutover.md), [operator](forgejo-stage1-operator.md), [automation disposition](forgejo-stage1-automations.md), and opt-in [mirror units](../services/queue/stage1-mirror/README.md) are available. Complete the actual destination recovery record before readiness sign-off. |
 
 ## Tested installed revisions
 
@@ -99,8 +99,8 @@ and API builds were not repeated for that retry.
 
 Anonymous HTTP checks verified the landed `SOURCE_SHA`, the new
 `TauCeti.StageOneMigration` page, an existing module, index pages, and stylesheet.
-The complete Pages run remained red because the empty-history execution fixture
-could not regenerate two historical PR charts. Its deployment succeeded; the
+The complete Pages run remained red with two historical PR-chart diagnostics
+in the execution fixture. Its deployment succeeded; the
 chart report finished before a proposed retirement cancellation, so no cancellation
 was sent. Live publication URLs can advance after these captured checks.
 
@@ -144,7 +144,20 @@ The returned controls triggered
 [main CI](https://github.com/TauCetiProject/forgejo-stage1-rehearsal-20261109/actions/runs/42750580933),
 [API docs](https://github.com/TauCetiProject/forgejo-stage1-rehearsal-20261109/actions/runs/42750580656),
 and [Pages](https://github.com/TauCetiProject/forgejo-stage1-rehearsal-20261109/actions/runs/42750580720).
-Their final verification is pending in this record.
+Main build and audits passed, and its cache publisher published a 28,275-entry map
+for the returned revision. Its module/archive pairs matched the native candidate;
+anonymous reads reverified the new module archive. API docs passed and saved fresh
+HTML and analysis caches. Pages data, site, deployment, and `docgen` advancement
+passed on the original attempt. The public `SOURCE_SHA` and `docgen` ref both
+matched the returned revision. Anonymous reads also checked the new native module,
+an existing module, index pages, and stylesheet. The full Pages run remained red
+with the same two historical chart diagnostics; deployment success is not a claim
+that every Pages job passed.
+
+After those checks, the owned fixture's API and Pages schedules were disabled to
+avoid further automatic test builds. The mirror timer and protected native dispatch
+parent remain disabled, and the native source remains archived. Historical runs,
+refs, caches, snapshots, and evidence are retained. Production scheduling was unchanged.
 
 ## Private evidence index
 
@@ -162,6 +175,8 @@ request to publish private worker or credential stores.
 | Failed handoff retirement and retained requests | `failing-child-terminal-observation.json`, `failing-promotion-refusal.json`, `retired-failed-handoff-closure.json`, `operator-rollback-final-ledger-proof.json` |
 | Git, queue, claims, spending, and prepared work | `active-git-backup-proof.json`, `queue-git-backup-proof.json`, `git-claim-inventory-proof.json`, `worker-accounting-proof.json`, `prepared-publication-proof.json`, `retained-source-proof.json`, `review-store-proof.json`, `worker-review-store-proof.json`, `active-work-transfer-manifest.json` |
 | Historical chart diagnostics and published output | `post-native-pages-final-jobs.json`, `post-native-pages-final-chart-report.log`, `post-native-public-pages-proof.json`, `post-native-pages-recovery-proof.json` |
+| Returned GitHub-mode build and public outputs | `returned-github-main-final-jobs.json`, `returned-github-main-output-proof.json`, `returned-github-api-final-jobs.json`, `returned-github-api-proof.json`, `returned-github-pages-final-jobs.json`, `returned-github-public-pages-proof.json`, `returned-github-docgen-ref.json` |
+| Owned fixture schedule cleanup | `returned-api-fixture-schedule-cleanup-response.json`, `returned-pages-fixture-schedule-cleanup-response.json` |
 | Baseline artifact size and existing production comparison | `pages-primary-artifact-inspection.json`, `pages-existing-production-comparison-proof.json` |
 
 ## Remaining readiness decisions
