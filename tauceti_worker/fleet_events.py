@@ -52,8 +52,7 @@ def _replaces_description(args, method):
     """`gh pr edit` with a body, or the REST call that does the same: the description was replaced."""
     if args[:2] == ["pr", "edit"]:
         return any(
-            arg in ("--body", "-b", "--body-file", "-F") or arg.startswith(("--body=", "--body-file="))
-            for arg in args
+            arg in ("--body", "-b", "--body-file", "-F") or arg.startswith(("--body=", "--body-file=")) for arg in args
         )
     return (
         method == "PATCH"

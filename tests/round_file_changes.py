@@ -318,7 +318,9 @@ def main():
 
             def record(created, argv, round_id="this-round"):
                 with patch.dict(os.environ, TAUCETI_ACTIVITY_ROUND_ID=round_id):
-                    fleet_events.mutation(command | {"created": created, "argv": argv}, types.SimpleNamespace(stdout=""))
+                    fleet_events.mutation(
+                        command | {"created": created, "argv": argv}, types.SimpleNamespace(stdout="")
+                    )
 
             edit = ["pr", "edit", "1", "--repo", "TauCetiProject/TauCeti", "--body-file", "/tmp/body.md"]
             reply = ["api", "-X", "POST", "repos/TauCetiProject/TauCeti/pulls/1/comments/42/replies"]
