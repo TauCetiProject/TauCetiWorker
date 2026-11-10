@@ -201,6 +201,7 @@ RUN_STDLIB=(
   rebase_handoff.py
   scoped_repair_route.py
   rebase_budget.py
+  shared_attempts.py
   review_sync_failure.py
   quota_claude_bootstrap.py
   quota_claude_windows.py

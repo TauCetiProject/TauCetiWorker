@@ -3,6 +3,8 @@ picker, `status`, and the TUI all consume."""
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import math
@@ -61,13 +63,52 @@ class RebaseBudgetUnavailable(ValueError):
     """Existing retry evidence could not be read safely."""
 
 
+# The attempt budgets of the branch-writing stages, the provider-outage refunds charged against them,
+# and the rebase checkpoint that rebase budget keys derive from.
+SHARED_ATTEMPT_RE = re.compile(
+    r"(?:fix|ci|bump|lint-repair)-\d+-\w+|(?:ci|bump|lint-repair)-pr-\d+|rebase-pr-\d+(?:-\w+)?"
+    r"|infra-(?:fix|fix-ci|rebase|bump|lint-repair)-\d+|rebase-progress-\d+\.json"
+)
+
+
 class Counters:
+    """Integer files in the worker's state directory.
+
+    With TAUCETI_SHARED_ATTEMPTS_DIR set, the names matching SHARED_ATTEMPT_RE live in that directory,
+    which every worker naming it reads and charges. There `write` applies the caller's change, the
+    difference from this process's last `read`, under the directory's lock, and lowers a counter by no
+    more than this process has added to it: a refund hands back the caller's own charge and leaves
+    what peers charged meanwhile.
+    """
+
     def __init__(self, cfg: Config):
         self.state = cfg.state
+        shared = os.environ.get("TAUCETI_SHARED_ATTEMPTS_DIR", "").strip()
+        self.shared = Path(shared) if shared else None
+        self._seen: dict[str, int] = {}
+        self._added: dict[str, int] = {}
+
+    def _store(self, name: str) -> Path:
+        return self.shared if self.shared is not None and SHARED_ATTEMPT_RE.fullmatch(name) else self.state
+
+    @contextlib.contextmanager
+    def _locked(self):
+        self.shared.mkdir(parents=True, exist_ok=True)
+        # The lock is on the directory itself: every user who can list it can take it.
+        lock = os.open(self.shared, os.O_RDONLY)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(lock)
 
     def read(self, name: str) -> int:
+        value = self._seen[name] = self._read(name)
+        return value
+
+    def _read(self, name: str) -> int:
         try:
-            txt = (self.state / name).read_text().strip()
+            txt = (self._store(name) / name).read_text().strip()
         except FileNotFoundError:
             return 0
         except (OSError, UnicodeError):
@@ -79,19 +120,38 @@ class Counters:
         return int(txt) if txt.isdigit() else 0
 
     def write(self, name: str, value: int) -> None:
-        self._atomic_write(name, str(value))
+        self._write(name, value)
+
+    def _write(self, name: str, value: int) -> int:
+        if self._store(name) is self.state:
+            self._atomic_write(name, str(value))
+            return value
+        with self._locked():
+            stored = self._read(name)
+            change = value - self._seen.get(name, stored)
+            if change < 0:
+                change = -min(-change, stored, self._added.get(name, 0))
+            self._added[name] = self._added.get(name, 0) + change
+            stored += change
+            self._atomic_write(name, str(stored))
+        self._seen[name] = value
+        return stored
 
     def _atomic_write(self, name: str, text: str) -> None:
-        self.state.mkdir(parents=True, exist_ok=True)
+        store = self._store(name)
+        store.mkdir(parents=True, exist_ok=True)
         temporary = None
         try:
-            with tempfile.NamedTemporaryFile(mode="w", dir=self.state, prefix=f".{name}-", delete=False) as target:
+            with tempfile.NamedTemporaryFile(mode="w", dir=store, prefix=f".{name}-", delete=False) as target:
                 temporary = Path(target.name)
                 target.write(text)
                 target.flush()
                 os.fsync(target.fileno())
-            os.replace(temporary, self.state / name)
-            directory = os.open(self.state, os.O_RDONLY)
+            if store is self.shared:
+                # Peers of another user must read the file; the directory's mode says who they are.
+                os.chmod(temporary, store.stat().st_mode & 0o666)
+            os.replace(temporary, store / name)
+            directory = os.open(store, os.O_RDONLY)
             try:
                 os.fsync(directory)
             finally:
@@ -104,9 +164,7 @@ class Counters:
                     pass
 
     def incr(self, name: str) -> int:
-        v = self.read(name) + 1
-        self.write(name, v)
-        return v
+        return self._write(name, self.read(name) + 1)
 
     def foreign_repair_launched(self, pr: int) -> bool:
         # An unreadable/malformed receipt still consumes the optional canary.
@@ -119,8 +177,9 @@ class Counters:
         )
 
     def _rebase_progress(self, pr: int) -> dict | None:
+        name = f"rebase-progress-{pr}.json"
         try:
-            value = json.loads((self.state / f"rebase-progress-{pr}.json").read_text())
+            value = json.loads((self._store(name) / name).read_text())
         except FileNotFoundError:
             return None
         except (OSError, ValueError) as error:

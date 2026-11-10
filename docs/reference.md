@@ -329,6 +329,31 @@ picker in shadow mode before changing selection; track missed candidates, time t
 oldest uninspected PR and requests per productive round. This bounds discovery delays without
 turning a missing/deleted comment or a stale cache into permission to spend.
 
+## Shared attempt budgets
+
+Each worker counts its repair attempts in its own state directory.
+`TAUCETI_SHARED_ATTEMPTS_DIR` names a directory that holds those counts for every worker
+started with the same value: the per-head and per-PR budgets of `fix`, `fix-ci`, `bump` and
+`lint-repair`, the rebase budget with the progress checkpoint that renews it, and the
+allowance of provider-outage refunds. A head no agent can change is then retired after one
+budget of attempts, whichever workers made them. Review counters, retry deadlines and
+progress-report state stay with the worker.
+
+Set it in the environment the workers start from, or in each worker's `env` table. A charge
+or refund takes an exclusive `flock` on the directory, which must be on a local filesystem,
+and one synced write. A refund hands back only what the refunding process charged, so it
+leaves a peer's concurrent attempt counted.
+Counter files take the directory's read and write bits. Workers running as different users
+share a budget through a directory their common group can write, with the setgid bit so new
+files carry that group and without the sticky bit so one user can replace another's file:
+
+```
+install -d -m 2770 -g <group> /srv/tauceti/attempts
+```
+
+Counts a worker already holds in its own state are not carried over: the shared directory
+starts empty, so a head retired before the change gets one fresh budget.
+
 ## Codex accounts
 
 `--account EMAIL_OR_ID` (or `TAUCETI_ACCOUNT`) requires the Codex credential to
@@ -415,6 +440,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_GH_INROUND_WAIT` | `900` | Cap on how long a single `gh` call waits in place for a secondary rate limit to clear (seconds). Primary limits return immediately so the loop can wait for them before another round. |
 | `TAUCETI_GH_PROXY_WAIT` | `900` | Maximum host child `gh` quota wait, capped at 900 seconds to preserve the round deadline. |
 | `TAUCETI_GITHUB_SHARED_DIR` | `state/github-shared` | Stable cross-worker cache, quota state, host gh wrapper and HTTP accounting directory. |
+| `TAUCETI_SHARED_ATTEMPTS_DIR` | _(unset)_ | Directory holding the repair attempt budgets for every worker that names it, in place of each worker's own state. See [shared attempt budgets](#shared-attempt-budgets). |
 | `TAUCETI_GITHUB_CACHE_BYPASS` | _(unset)_ | Set to `1` to bypass shared cached reads for diagnosis. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
 | `CLAIM_REPO` | automatic | The repository holding this worker's cooperative claim leases. Without an override it is the shared namespace `TauCetiProject/tauceti-claims` once your account can push there, and your own fork until then. See [the claim namespace](#the-claim-namespace). |

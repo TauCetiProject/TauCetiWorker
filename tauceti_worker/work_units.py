@@ -1686,7 +1686,7 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     lifetime or progress-scoped (`ci-pr-`, `bump-pr-`, rebase budgets), so a head-keyed allowance would reset on every
     push while still handing those back, and a persistent false positive could evade the lifetime
     backstop indefinitely by moving the head. The counters live in the worker's own state, so this is
-    per worker rather than fleet-wide; a fleet-wide bound would need shared state it does not have.
+    per worker rather than fleet-wide, unless TAUCETI_SHARED_ATTEMPTS_DIR gives the workers one store.
     """
     from .claude_api import blocked_failure
     from .config import AdmissionUnavailable
