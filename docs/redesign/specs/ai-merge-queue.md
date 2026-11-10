@@ -295,7 +295,7 @@ These items warrant targeted follow-up; this specification cleanup does not impl
 
 Hold-and-retry remains the inference policy. Splitting, when resumed, must stay within this engine and specify partitioning, attribution, ordering and recovery without returning control to legacy Bors.
 
-The controller, tunnel, repair workers, monitoring and backups now run through systemd user units on chungus2. Repair execution moved on November 7 and the controller moved on November 8, retaining the running revision and queue state. Crash/OOM recovery while the user manager is running is implemented, but automatic startup after reboot or user-manager loss is not guaranteed (`Linger=no`). The [runbook](../../queue/operations.md#current-deployment) records the deployment and its limitation. Guaranteed reboot recovery remains unscheduled.
+The controller, tunnel, monitoring and backups moved to tauchonki2 on November 10, retaining queue state and active run identities. Repair workers transfer individually when idle; active source claims finish on chungus2. Future staging builds use tauchonki2's reserved staging runner with CPU precedence and no compiler memory-admission sleeps. Existing staging builds stay on their original hosts. Enabled systemd user units and `Linger=yes` provide startup with the destination user manager after reboot. The [runbook](../../queue/operations.md#current-deployment) records the live transition and its receipts.
 
 ## Later increments
 
