@@ -121,6 +121,7 @@ if args[:1] == ["env"]:
 if args[:2] in (["cache", "put"], ["cache", "put-staged"]):
     import json, shutil, subprocess
     (stub / "lake-put-key").write_text(os.environ.get("LAKE_CACHE_KEY", ""))
+    (stub / "lake-put-toolchain").write_text(os.environ.get("ELAN_TOOLCHAIN", ""))
     if os.environ.get("STUB_LAKE_PUT_FAIL") == "1":
         sys.exit(1)
     remote = stub / "remote"
@@ -2879,6 +2880,7 @@ class PublishOutputs(Fixture):
         put = next(c for c in calls if c.startswith("cache put-staged "))
         self.assertIn(f"--service tauceti-repair-upload --repo {PROJECT}", put)
         self.assertEqual((self.stub_dir / "lake-put-key").read_text(), self.KEY)
+        self.assertEqual((self.stub_dir / "lake-put-toolchain").read_text(), "leanprover/lean4:v4.36.0-rc2")
         self.assertIsNone(self.agent_calls()[0]["env"]["LAKE_CACHE_KEY"], "and never the agent")
         logs = self.root / "state" / "tasks" / "1" / "logs"
         self.assertTrue((logs / repair_publish.BACKGROUND_LOG).is_file())
