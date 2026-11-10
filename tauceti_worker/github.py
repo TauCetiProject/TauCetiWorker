@@ -18,13 +18,14 @@ import urllib.request
 from pathlib import Path
 
 from . import github_transport as transport
-from .config import Die, log, one_line
+from .config import Die, log, one_line, reactions_enabled, stuck_issues_enabled
 from .constants import (
     _GH_PRIMARY_RE,
     _GH_SECONDARY_RE,
     _GH_TRANSIENT_RE,
     CLAIMS,
     CONTEST_CLAIM_EMOJI,
+    CONTEST_CLAIM_TTL,
     GH_INROUND_WAIT,
     GH_SECONDARY_BASE,
     GH_TRANSIENT_BASE,
@@ -944,6 +945,9 @@ class GitHub:
         record so a human notices). An existing issue is updated when a later worker has a better
         diagnostic. Deduped by an exact title: one open issue per stuck PR across the whole fleet.
         Best-effort — a GitHub failure is non-fatal (the per-round warning still fires); never raises."""
+        if not stuck_issues_enabled():
+            log(f"  #{pr}: stuck-review issues are off (TAUCETI_STUCK_ISSUES=0); no tracking issue opened")
+            return
         title = f"Review stuck: PR #{pr}"
         try:
             p = self._gh(
@@ -1291,13 +1295,12 @@ class GitHub:
     def fresh_claim_age(self, comment_id: int, emoji: str = CONTEST_CLAIM_EMOJI) -> int | None:
         """Seconds since the newest `emoji` reaction on this comment, or None if there is none (or the
         fetch failed — fail OPEN: a transient API error must not let a stale claim block work forever,
-        and the worst case of a missed claim is a rare double-review, which we've accepted)."""
+        and the worst case of a missed claim is a rare double-review, which we've accepted). A claim
+        a worker on this host recorded locally (TAUCETI_REACTIONS=0) counts like a reaction."""
         with transport.read_context(fresh=True, direct=True):
             rs = self.reactions(comment_id)
-        if not rs:
-            return None
-        newest = 0
-        for r in rs:
+        newest = _local_claim(comment_id, emoji)[0]
+        for r in rs or ():
             if r.get("content") != emoji:
                 continue
             ts = _parse_iso8601(r.get("created_at"))
@@ -1309,7 +1312,11 @@ class GitHub:
 
     def add_reaction(self, comment_id: int, emoji: str = CONTEST_CLAIM_EMOJI) -> bool:
         """Add `emoji` to a review comment (idempotent per (login, content)). False on failure — a
-        claim we couldn't post just means a peer may double up, which is acceptable."""
+        claim we couldn't post just means a peer may double up, which is acceptable. With
+        TAUCETI_REACTIONS=0 the claim is a file under the shared GitHub state directory instead: the
+        workers sharing that directory honour it, workers elsewhere cannot see it."""
+        if not reactions_enabled():
+            return _record_local_claim(comment_id, emoji)
         p = self._gh(
             ["api", "-X", "POST", f"/repos/{self.repo}/pulls/comments/{comment_id}/reactions", "-f", f"content={emoji}"]
         )
@@ -1326,6 +1333,10 @@ class GitHub:
     def remove_reaction(self, comment_id: int, emoji: str = CONTEST_CLAIM_EMOJI) -> bool:
         """Remove our own `emoji` reaction from a review comment (releases the claim). Looks up the
         reaction id for THIS login, then deletes it; a no-op (True) if we hold none."""
+        if not reactions_enabled():
+            if _local_claim(comment_id, emoji)[1] == _claimant():
+                _local_claim_path(comment_id, emoji).unlink(missing_ok=True)
+            return True
         ids = getattr(self, "_claim_reaction_ids", {})
         rid = ids.get((comment_id, emoji))
         if rid is None:
@@ -1343,6 +1354,39 @@ class GitHub:
         if p.returncode == 0:
             ids.pop((comment_id, emoji), None)
         return p.returncode == 0
+
+
+def _local_claim_path(comment_id: int, emoji: str) -> Path:
+    return transport.root() / "contest-claims" / f"{int(comment_id)}-{emoji}.json"
+
+
+def _claimant() -> str:
+    return f"{os.environ.get('TAUCETI_WORKER_ID', '')}:{os.getpid()}"
+
+
+def _local_claim(comment_id: int, emoji: str) -> tuple[int, str | None]:
+    """(epoch, holder) of the claim recorded on this host for a review comment; (0, None) without one."""
+    try:
+        record = json.loads(_local_claim_path(comment_id, emoji).read_text())
+        return int(record["at"]), str(record["holder"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0, None
+
+
+def _record_local_claim(comment_id: int, emoji: str) -> bool:
+    path = _local_claim_path(comment_id, emoji)
+    try:
+        transport.atomic(path, {"at": int(time.time()), "holder": _claimant()})
+    except OSError:
+        return False
+    # A worker that died mid-review never released its record; nothing else would remove it.
+    for other in path.parent.glob("*.json"):
+        try:
+            if time.time() - other.stat().st_mtime >= CONTEST_CLAIM_TTL:
+                other.unlink()
+        except OSError:
+            pass
+    return True
 
 
 def _parse_retry_after(raw: str | None) -> float | None:

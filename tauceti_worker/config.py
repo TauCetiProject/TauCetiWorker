@@ -127,6 +127,24 @@ def respect_claims() -> bool:
     return os.environ.get("TAUCETI_RESPECT_CLAIMS", "true").strip().lower() not in ("0", "false", "no", "off")
 
 
+def _switch(name: str) -> bool:
+    return os.environ.get(name, "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def reactions_enabled() -> bool:
+    """Whether a contest claim is posted as a reaction on GitHub; off keeps it in a file under the
+    shared GitHub state directory. On by default; read live from TAUCETI_REACTIONS so --no-reactions
+    (which sets it to 0) is inherited by loop children."""
+    return _switch("TAUCETI_REACTIONS")
+
+
+def stuck_issues_enabled() -> bool:
+    """Whether the worker files a "Review stuck" tracking issue for a PR it cannot review. On by
+    default; read live from TAUCETI_STUCK_ISSUES so --no-stuck-issues (which sets it to 0) is
+    inherited by loop children."""
+    return _switch("TAUCETI_STUCK_ISSUES")
+
+
 def _only_label(sv=None) -> str:
     """Friendly render of the roadmap-only area for the status bar. Prefers the survey's sanitized
     value ("auto"/"any"/area); falls back to the raw env tri-state before the first survey lands."""

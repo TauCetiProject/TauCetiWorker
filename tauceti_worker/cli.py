@@ -364,6 +364,23 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "intentions board (claim-respect is on by default). Sets $TAUCETI_RESPECT_CLAIMS=false",
     )
     p.add_argument(
+        "--no-reactions",
+        dest="reactions",
+        action="store_false",
+        default=None,
+        help="keep this worker's claim on an author contest off GitHub: instead of a 👀 on the "
+        "contesting reply, the claim is a file that workers sharing this host's GitHub state "
+        "directory honour. Sets $TAUCETI_REACTIONS=0",
+    )
+    p.add_argument(
+        "--no-stuck-issues",
+        dest="stuck_issues",
+        action="store_false",
+        default=None,
+        help='do not open or update "Review stuck" tracking issues; the per-round warning still '
+        "prints. Sets $TAUCETI_STUCK_ISSUES=0",
+    )
+    p.add_argument(
         "--auto-refresh",
         dest="auto_refresh",
         action="store_true",
@@ -1333,6 +1350,10 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         os.environ["TAUCETI_ROADMAP_EXTRA_IDENTITIES"] = args.roadmap_extra_identities
     if getattr(args, "respect_claims", None) is False:
         os.environ["TAUCETI_RESPECT_CLAIMS"] = "false"
+    if getattr(args, "reactions", None) is False:
+        os.environ["TAUCETI_REACTIONS"] = "0"
+    if getattr(args, "stuck_issues", None) is False:
+        os.environ["TAUCETI_STUCK_ISSUES"] = "0"
     # --auto-refresh likewise, so a loop child renews on the same authority the driver was given.
     if getattr(args, "auto_refresh", None):
         os.environ["TAUCETI_AUTO_REFRESH"] = "1"

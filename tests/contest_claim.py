@@ -8,12 +8,19 @@ crashed worker's claim frees itself. This harness pins the pure decision — giv
 is the contest claimed? — without touching the live API (the reaction round-trip is exercised live in
 the GitHub class; here we stub `reactions()` and assert the survey-time skip/fire decision).
 
+With TAUCETI_REACTIONS=0 the claim is a file under the shared GitHub state directory instead. The second
+half runs the real add/age/remove against a temporary directory and a `_gh` that records its calls.
+
 Exit 0 = all cases agree; 1 = a mismatch.
 """
 
+import json
+import os
 import sys
+import tempfile
 from datetime import UTC
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -36,9 +43,14 @@ class FakeGitHub(tc.GitHub):
     def __init__(self, reactions):
         super().__init__("owner/repo")
         self._reactions = reactions
+        self.calls = []
 
     def reactions(self, comment_id):
         return self._reactions
+
+    def _gh(self, args):
+        self.calls.append(args)
+        return tc.subprocess.CompletedProcess(args, 0, '{"id": 9}', "")
 
 
 # (name, reactions-fixture, want_claimed) — claimed => a peer holds it => this worker SKIPS.
@@ -59,8 +71,63 @@ CASES = [
 
 def claimed(reactions) -> bool:
     """Mirror the survey-time decision: a 👀 newer than the TTL means a peer is mid-review → skip."""
-    age = FakeGitHub(reactions).fresh_claim_age(123)
+    with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": tmp}):
+        return claimed_by(FakeGitHub(reactions))
+
+
+def claimed_by(gh) -> bool:
+    age = gh.fresh_claim_age(123)
     return age is not None and age < tc.CONTEST_CLAIM_TTL
+
+
+def local_claims() -> list[tuple[str, object, object]]:
+    """(name, got, want) for the claim kept on the host when reactions are off."""
+    out = []
+    with tempfile.TemporaryDirectory() as tmp:
+        shared = {"TAUCETI_GITHUB_SHARED_DIR": tmp}
+        off = {**shared, "TAUCETI_REACTIONS": "0", "TAUCETI_WORKER_ID": "a"}
+        mine, peer = FakeGitHub([]), FakeGitHub([])
+
+        def files():
+            return sorted(p.name for p in Path(tmp).rglob("*.json"))
+
+        with patch.dict(os.environ, shared):
+            os.environ.pop("TAUCETI_REACTIONS", None)
+            out.append(
+                ("default: the claim is posted", mine.add_reaction(123) and mine.calls[-1][:3], ["api", "-X", "POST"])
+            )
+            out.append(("default: nothing is written locally", files(), []))
+            out.append(
+                (
+                    "default: the release is a DELETE",
+                    mine.remove_reaction(123) and mine.calls[-1][:3],
+                    ["api", "-X", "DELETE"],
+                )
+            )
+        mine.calls.clear()
+
+        with patch.dict(os.environ, off):
+            out.append(("off: the claim succeeds", mine.add_reaction(123), True))
+            out.append(("off: it is one local record", files(), ["123-eyes.json"]))
+            out.append(("off: a peer with reactions off skips", claimed_by(peer), True))
+            with patch.dict(os.environ, {"TAUCETI_WORKER_ID": "b"}):
+                out.append(
+                    ("off: a peer's release leaves it", peer.remove_reaction(123) and files(), ["123-eyes.json"])
+                )
+        with patch.dict(os.environ, shared):
+            os.environ.pop("TAUCETI_REACTIONS", None)
+            out.append(("off: a peer with reactions on skips too", claimed_by(peer), True))
+        with patch.dict(os.environ, off):
+            record = Path(tmp) / "contest-claims" / "123-eyes.json"
+            stale = json.loads(record.read_text()) | {"at": NOW - tc.CONTEST_CLAIM_TTL - 30}
+            record.write_text(json.dumps(stale))
+            out.append(("off: a record past the TTL frees the contest", claimed_by(peer), False))
+            os.utime(record, (stale["at"], stale["at"]))
+            out.append(("off: the next claim removes it", mine.add_reaction(456) and files(), ["456-eyes.json"]))
+            out.append(("off: a 👀 from elsewhere still counts", claimed_by(FakeGitHub(CASES[3][1])), True))
+            out.append(("off: the holder's release removes it", mine.remove_reaction(456) and files(), []))
+            out.append(("off: no write reached GitHub", mine.calls + peer.calls, []))
+    return out
 
 
 def main() -> int:
@@ -71,6 +138,10 @@ def main() -> int:
         fails += not ok
         verb = "SKIP" if got else "fire"
         print(f"[{'OK ' if ok else 'BAD'}] {name:<26} -> {verb} (want {'SKIP' if want else 'fire'})")
+    for name, got, want in local_claims():
+        ok = got == want
+        fails += not ok
+        print(f"[{'OK ' if ok else 'BAD'}] {name}" + ("" if ok else f": got {got!r}, want {want!r}"))
     # _parse_iso8601 round-trips GitHub's whole-second Z timestamps.
     assert tc._parse_iso8601("2026-06-19T08:03:48Z") == int(
         __import__("datetime").datetime(2026, 6, 19, 8, 3, 48, tzinfo=__import__("datetime").timezone.utc).timestamp()
