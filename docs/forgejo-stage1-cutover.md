@@ -22,6 +22,7 @@ an unproven essential rehearsal result means migration readiness is incomplete.
 | Recovery | Named Forgejo administrator and backup/recovery owner; access to Git, database, configuration, keys, and tested restoration |
 | Credentials | Human source-token files, dedicated mirror-reader account/profile, read-only CI observer, narrowly scoped GitHub workflow dispatcher, execution App directory, installation/repository selection, and main push permissions |
 | Administrative access | Separate named GitHub administrator profile for protection/secret/workflow changes; never use its token as the runtime dispatcher or observer |
+| GitHub main update rule | Created repository ruleset ID, full effective policy and sole mirror-App bypass; exact ownership transfer or removal command for rollback |
 | App key holders | Mirror App ID/installation ID, every automated holder of its private keys or source-writing credentials, owning repository/host, and the exact retirement command and read-back for each |
 | Controls | Reviewed configuration/policy bytes, immutable Worker/Tools revisions, protected caller/control commit, and expected old tips |
 | Existing work | Timestamped PR/branch/tag inventory, claim namespaces, queue records, spending history, prepared outputs, and a disposition/owner for unsettled work |
@@ -296,9 +297,13 @@ promote and complete the relevant Stage 2 prerequisites before this operation.
 
    Install the mirror App exception before removing the temporary GitHub bootstrap
    writer. Require admin enforcement and a nonempty App-only push allowlist: no
-   human users or teams, and exactly the approved mirror App. An empty actor list
-   is not a verified deny-all policy: the isolated negative test allowed the
-   administrator to push even with `enforce_admins` enabled. Read effective settings
+   human users or teams, and exactly the approved mirror App. Classic push
+   restrictions still permit repository administrators to push, even with
+   `enforce_admins` enabled and a nonempty App-only list. Neither that list nor an
+   empty list proves that the former bootstrap administrator has lost push access.
+   Add an active branch ruleset restricting updates to `refs/heads/main`, with
+   exactly the mirror App as its bypass actor. Do not include an administrator,
+   organization-owner, team, user, or deploy-key bypass. Read effective settings
    with the separate administrator profile, rather than the dispatcher/observer.
    Record classic protection and applicable rulesets, including inherited ruleset
    details and bypass actors; this first endpoint alone is not the effective
@@ -308,7 +313,14 @@ promote and complete the relevant Stage 2 prerequisites before this operation.
    GH_TOKEN="$(cat "$administrator_token_file")" \
      "$administrator_gh" api --hostname github.com \
      "repos/$execution_owner/$execution_name/branches/main/protection" \
-     --jq '. as $p | (.restrictions // error("no push restrictions")) as $r | {enforce_admins:$p.enforce_admins.enabled,users:[$r.users[].login],teams:[$r.teams[].slug],apps:[$r.apps[]|{id,slug}],allow_force_pushes:$p.allow_force_pushes.enabled,allow_deletions:$p.allow_deletions.enabled}'
+     > "$deployment_record/github-main-protection.json"
+   jq -e --argjson app_id "$mirror_app_id" '
+     . as $p | (.restrictions // error("no push restrictions")) as $r |
+     if $p.enforce_admins.enabled == true and
+        $p.allow_force_pushes.enabled == false and $p.allow_deletions.enabled == false and
+        $r.users == [] and $r.teams == [] and ($r.apps | map(.id)) == [$app_id]
+     then . else error("main protection differs from approved mirror policy") end
+   ' "$deployment_record/github-main-protection.json"
    GH_TOKEN="$(cat "$administrator_token_file")" \
      "$administrator_gh" api --hostname github.com \
      "repos/$execution_owner/$execution_name/rules/branches/main" \
@@ -332,13 +344,59 @@ promote and complete the relevant Stage 2 prerequisites before this operation.
    Listing rule summaries does not replace these details. Unreadable or unknown
    inherited policy leaves the protection gate incomplete.
 
+   Create the update rule once, after checking the recorded rulesets for an
+   existing equivalent rule. Use the verified App ID from the classic protection
+   read-back, not its installation ID. These commands belong to the separately
+   authorized cutover administrator; during preparation, use only the owned
+   rehearsal repository:
+
+   ```sh
+   jq -n --argjson app_id "$mirror_app_id" '{
+     name:"Mirror owns main updates",target:"branch",enforcement:"active",
+     bypass_actors:[{actor_id:$app_id,actor_type:"Integration",bypass_mode:"always"}],
+     conditions:{ref_name:{include:["refs/heads/main"],exclude:[]}},
+     rules:[{type:"update",parameters:{update_allows_fetch_and_merge:false}}]
+   }' > "$deployment_record/github-main-update-rule-input.json"
+   GH_TOKEN="$(cat "$administrator_token_file")" \
+     "$administrator_gh" api --hostname github.com --method POST \
+     "repos/$execution_owner/$execution_name/rulesets" \
+     --input "$deployment_record/github-main-update-rule-input.json" \
+     > "$deployment_record/github-main-update-rule-response.json"
+   mirror_ruleset_id=$(jq -er '.id | select(type == "number")' \
+     "$deployment_record/github-main-update-rule-response.json")
+   GH_TOKEN="$(cat "$administrator_token_file")" \
+     "$administrator_gh" api --hostname github.com \
+     "repos/$execution_owner/$execution_name/rulesets/$mirror_ruleset_id" \
+     > "$deployment_record/github-main-update-rule.json"
+   jq -e --argjson app_id "$mirror_app_id" '
+     .enforcement == "active" and .target == "branch" and
+     .conditions.ref_name == {include:["refs/heads/main"],exclude:[]} and
+     (.rules | map(.type)) == ["update"] and
+     .bypass_actors == [{actor_id:$app_id,actor_type:"Integration",bypass_mode:"always"}]
+   ' "$deployment_record/github-main-update-rule.json"
+   ```
+
+   Read back the created rule by ID and the active rules for main. Require active
+   enforcement, the exact main condition, only an `update` rule, and the sole
+   `Integration` bypass with the approved App ID and mode `always`. Preserve the
+   separate classic fast-forward and deletion protections: the App bypass on this
+   update rule must not waive them. Repository administrators retain the ability
+   to edit repository policy; this rule prevents their ordinary code pushes under
+   the recorded policy. See GitHub's [protected branch semantics](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches)
+   and [restrict updates rule](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets#restrict-updates).
+
    In the isolated rehearsal, verify actual main push refusal for the dispatcher
-   and observer, unchanged main tips, and the protection/ruleset read-back taken
+   and observer **and the former bootstrap administrator**, unchanged main tips,
+   and the protection/ruleset read-back taken
    immediately before each probe. Also verify the narrowed dispatcher cannot
    write repository contents regardless of the main branch rule. A settings read,
    an empty allowlist, or a Git dry run is insufficient. Keep this gate incomplete
    until the final roles and App-only policy pass; do not call the temporary
    administrator bootstrap configuration ready.
+   Also require a successful real main push by the mirror App under that same
+   effective policy, with read-backs immediately before the push. The bootstrap
+   `mirror` command below confirms equal tips without pushing and cannot satisfy
+   this positive check; the isolated tested-candidate promotion and mirror must.
    A raw mirror push must also be permitted by any remaining PR, merge-queue or
    status-check rules. Remove obsolete GitHub source-admission requirements from
    the execution mirror, or record an approved mirror-App bypass limited to those
@@ -473,9 +531,24 @@ If returning development authority to GitHub:
    expected common case keeps the current mirrored tip. Do not reset to the
    pre-cutover backup and discard the new contributions. If recovery uses an older
    backup, restore the retained post-cutover Git objects and reconcile them first.
-4. Deploy the reviewed GitHub-mode controls on that retained history using expected
-   old tips. Transfer protection/credential ownership back to the approved GitHub
-   writer only after the native writer and mirror have been fenced. Verify the
+4. After the native writer and mirror are fenced, transfer the recorded main update
+   ruleset to the approved returning GitHub writer before deploying GitHub-mode
+   controls. If the returning writer is the same App, retain the rule and verify
+   its exact bypass. Otherwise use the reviewed replacement policy, or remove only
+   this repository rule by its recorded ID after verifying its identity:
+
+   ```sh
+   GH_TOKEN="$(cat "$administrator_token_file")" \
+     "$administrator_gh" api --hostname github.com --method DELETE \
+     "repos/$execution_owner/$execution_name/rulesets/$mirror_ruleset_id"
+   ```
+
+   Read back active main rules and all applicable ruleset details, including
+   inherited ones. Never delete unrelated or inherited rules wholesale. Update
+   classic push exceptions to the approved returning writer, retain no-force and
+   no-delete protections, and verify that writer's effective access. Deploy the
+   reviewed GitHub-mode controls on the retained history using expected old tips.
+   Transfer credentials only after those fences and protections are confirmed. Verify the
    GitHub provenance readers still reject qualified native `Source-PR` citations
    as GitHub-number authority before re-enabling source automation.
 5. Move unsettled native contributions by explicit head/URL correspondence and
