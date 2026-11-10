@@ -497,6 +497,72 @@ class Repair(QueueFixture):
 
 
 class EmptyContributions(QueueFixture):
+    def assert_unrelated_history_still_rejects(self, message, *, empty=False):
+        self.repaired_empty()
+        self.repo.advance_main({} if empty else {"Other.lean": "other\n"}, message=message)
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "empty-commit")
+        self.assertEqual(self.controller.status()["counters"].get("prs_rejected", 0), 1)
+        self.assertNotIn("successfully merged", self.github.comments_for(101)[0]["body"])
+
+    def test_a_pr_reference_in_a_commit_body_is_not_landing_evidence(self):
+        self.assert_unrelated_history_still_rejects("Other change\n\nFollow-up to cleanup (#101)")
+
+    def test_a_foreign_trailer_takes_precedence_over_the_subject(self):
+        self.assert_unrelated_history_still_rejects("Other change (#101)\n\nSource-PR: other/repo#101")
+
+    def test_a_native_trailer_does_not_land_a_github_pr_with_the_same_number(self):
+        self.assert_unrelated_history_still_rejects(
+            "Other change (#101)\n\nSource-PR: forgejo:example.test/library#101"
+        )
+
+    def test_an_earlier_empty_placeholder_is_not_landing_evidence(self):
+        self.assert_unrelated_history_still_rejects("Change 101 (#101)", empty=True)
+
+    def test_external_merge_is_recognized_without_a_staging_landing_note(self):
+        self.github.ci_policy = verdicts("fail")
+        self.approve(101, {"A.lean": "a\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        agent = self.agent(
+            script=lambda task: {f"{PROJECT}#101": Resolution(empty=True, explanation="Dropped A during repair.")}
+        )
+        self.assertTrue(agent.run(self.controller).accepted)
+        # An independent merge is already in the batch base when its repaired empty commit lands.
+        landing = self.repo.advance_main({"A.lean": "a\n"}, message="Change 101 (#101)")
+        self.github.ci_policy = verdicts()
+        with patch.object(chain, "landed_message", side_effect=lambda message, sha: message):
+            self.tick()
+        head = self.head()
+        self.assertEqual(head["base"], landing)
+        commit = next(c for c in self.chain_commits(head) if c.source_pr == f"{PROJECT}#101")
+        self.assertFalse(chain.carries_landed_note(commit.message))
+        self.assertTrue(self.controller._commit_empty(commit.sha))
+        self.run_ci()
+        self.tick(2)
+        row = self.controller.input_for(PROJECT, 101)
+        self.assertEqual(row["state"], "landed")
+        self.assertEqual(self.controller.status()["counters"]["prs_landed"], 2)
+        self.assertEqual(self.controller.status()["counters"].get("prs_rejected", 0), 0)
+        self.assertIn("successfully merged", self.github.comments_for(101)[0]["body"])
+        self.assertNotIn("repaired-in-queue", self.github.labels[101])
+        self.assertFalse(self.controller.store.rows("outbox", {"key": f"rejected-close:{head['id']}:101"}))
+
+    def test_external_merge_lookup_failure_defers_landing_instead_of_rejecting(self):
+        head = self.repaired_empty()
+        self.github.update_ref(PROJECT, "refs/heads/main", head["tip"])
+        with patch.object(chain, "landed_prs", side_effect=chain.ChainError("history temporarily unavailable")):
+            with self.assertRaises(chain.ChainError):
+                self.tick()
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
+        self.assertFalse(self.controller.store.rows("outbox", {"key": f"rejected-close:{head['id']}:101"}))
+        self.tick(2)
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "empty-commit")
+
     def repaired_empty(self, count=1):
         self.github.ci_policy = verdicts("fail")
         for number in range(101, 101 + count):

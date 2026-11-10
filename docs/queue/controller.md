@@ -365,7 +365,11 @@ Landing side effects replicate bors-ng's squash landing exactly (`lib/worker/bat
 landed commit is the landing evidence; GitHub does not show the PR as merged.
 
 At landing, a final commit whose tree equals its parent's is rejected instead of merged, unless
-it is the existing placeholder for a PR merged externally or an opt-out withdrawal. Its input is
+it is a PR merged externally or an opt-out withdrawal. For an empty commit without a landing note,
+the controller also checks the history from the accepted head's merge base to the batch base for
+a nonempty commit naming the PR. This uses `chain.landed_prs` and `chain.landed_commit`, with the
+same qualified-trailer precedence and GitHub subject rules as chain construction. Git read failures defer landing rather than
+classifying unknown history as rejection. A rejected input is
 `cancelled` with reason `empty-commit`, with no landing time or SHA. The `landed` journal entry
 lists these PRs under `rejected`; `prs_rejected` counts them, merged counters exclude them, and
 their per-PR feed outcome is `canceled`. The rejection comment quotes the explanations already
