@@ -245,8 +245,8 @@ all of these hold at the moment of closing:
   `inductive`, `opaque`, `axiom`, compared by name as written) is also added by
   the diff of one of those merged pull requests. A pull request that adds no
   named declaration cannot be closed this way. On Forgejo, whose API returns no
-  patch text, each diff runs from the merge base to the head, both fetched into
-  a scratch repository.
+  patch text, each diff runs from the merge base Forgejo recorded for the pull
+  request to its head, both fetched into a scratch repository.
 
 The closing comment is the model's `comment` followed by the evidence checked
 and a line saying the closure was automatic and can be reopened. The comparison

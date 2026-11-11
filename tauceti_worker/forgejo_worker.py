@@ -127,14 +127,18 @@ class ForgejoWorkerSource(ForgejoReadSource):
     def pr_diff(self, pr):
         """`GitHub.pr_diff` on this source: the unified diff of the pull request, open or merged, from
         its merge base to its head, made from both commits fetched into a scratch repository (the
-        API returns no patch text). None when unreadable."""
+        API returns no patch text). The merge base is the one Forgejo recorded for the pull request,
+        since after a merge `base.sha` is the target branch's tip, which already holds the head; it
+        is computed from `base.sha` only where none is recorded. None when unreadable."""
         import subprocess
         import tempfile
 
         row = self.live_pull(pr)
         if row is None:
             return None
-        base, head = row["base"]["sha"], row["head"]["sha"]
+        recorded = row.get("merge_base") or ""
+        base = recorded if re.fullmatch(r"[0-9a-f]{40}", recorded) else row["base"]["sha"]
+        head = row["head"]["sha"]
         if not all(re.fullmatch(r"[0-9a-f]{40}", value or "") for value in (base, head)):
             return None
         with tempfile.TemporaryDirectory(prefix="tauceti-diff-") as work:
@@ -153,7 +157,7 @@ class ForgejoWorkerSource(ForgejoReadSource):
                 git("fetch", "--quiet", "--no-tags", self.repository.clone_url, f"refs/pull/{pr}/head")
                 if git("rev-parse", "FETCH_HEAD").decode().strip() != head:
                     return None
-                merge_base = git("merge-base", base, head).decode().strip()
+                merge_base = base if base == recorded else git("merge-base", base, head).decode().strip()
                 return git("diff", "--no-ext-diff", "--no-textconv", merge_base, head).decode(errors="replace")
             except (OSError, subprocess.SubprocessError):
                 return None

@@ -1201,6 +1201,13 @@ def test_forgejo_adapters(tmp):
             "pr_diff: the merge-base diff from fetched commits", decide.added_declarations(diff or ""), {"strong_law"}
         )
         check("…None for a pull request it cannot read", ForgejoWorkerSource.pr_diff(fake, 6), None)
+        git("update-ref", "refs/heads/main", head)
+        pulls[5] = {"state": "closed", "merged": True, "base": {"sha": head}, "head": {"sha": head}, "merge_base": base}
+        check(
+            "…and for a merged one, from the merge base Forgejo recorded, not the target branch's tip",
+            decide.added_declarations(ForgejoWorkerSource.pr_diff(fake, 5) or ""),
+            {"strong_law"},
+        )
 
     calls = []
 
