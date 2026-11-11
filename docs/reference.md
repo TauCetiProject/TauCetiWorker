@@ -339,6 +339,12 @@ allowance of provider-outage refunds. A head no agent can change is then retired
 budget of attempts, whichever workers made them. Review counters, retry deadlines and
 progress-report state stay with the worker.
 
+GitHub pull requests keep their counters at the top of the directory. A Forgejo source keeps
+them in `sources/<digest>/`, where `<digest>` is the name of that source's state directory: it
+is derived from the repository and its native ID, so every worker of every host working that
+repository shares it, and pull request N on Forgejo never shares a budget with pull request N
+on GitHub. Subdirectories take the top directory's mode.
+
 Set it in the environment the workers start from, or in each worker's `env` table. A charge
 or refund takes an exclusive `flock` on the directory, which must be on a local filesystem,
 and one synced write. A stage checks its budgets and charges its attempt under one lock, so a

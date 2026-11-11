@@ -11,6 +11,7 @@ import math
 import os
 import random
 import re
+import stat
 import subprocess
 import tempfile
 import time
@@ -131,7 +132,12 @@ class Counters:
     def __init__(self, cfg: Config):
         self.state = cfg.state
         shared = os.environ.get("TAUCETI_SHARED_ATTEMPTS_DIR", "").strip()
-        self.shared = Path(shared) if shared else None
+        self._shared_root = Path(shared) if shared else None
+        self.shared = self._shared_root
+        if self._shared_root is not None and self.state.parent.name == "sources":
+            # A forge source's state is `sources/<repository digest>` (worker_sources.source_config), and
+            # the digest names the same repository on every host.
+            self.shared = self._shared_root / "sources" / self.state.name
         self._seen: dict[str, int] = {}
         self._added: dict[str, int] = {}
 
@@ -141,7 +147,7 @@ class Counters:
 
     @contextlib.contextmanager
     def _locked(self):
-        self.shared.mkdir(parents=True, exist_ok=True)
+        self._make_shared()
         # The lock is on the directory itself: every user who can list it can take it.
         lock = os.open(self.shared, os.O_RDONLY)
         try:
@@ -216,9 +222,25 @@ class Counters:
         """In the shared directory, the attempts whose stage has settled; otherwise the counter itself."""
         return self.read(name) if self._store(name) is self.state else self._read(COMPLETED_PREFIX + name)
 
+    def _make_shared(self) -> None:
+        self._shared_root.mkdir(parents=True, exist_ok=True)
+        mode = stat.S_IMODE(self._shared_root.stat().st_mode)
+        directory = self._shared_root
+        for part in self.shared.relative_to(self._shared_root).parts:
+            directory = directory / part
+            try:
+                directory.mkdir()
+            except FileExistsError:
+                continue
+            # Workers of other users write here too: give it the shared directory's mode, not the umask's.
+            directory.chmod(mode)
+
     def _atomic_write(self, name: str, text: str) -> None:
         store = self._store(name)
-        store.mkdir(parents=True, exist_ok=True)
+        if store is self.shared:
+            self._make_shared()
+        else:
+            store.mkdir(parents=True, exist_ok=True)
         temporary = None
         try:
             with tempfile.NamedTemporaryFile(mode="w", dir=store, prefix=f".{name}-", delete=False) as target:

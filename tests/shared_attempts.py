@@ -82,6 +82,43 @@ class SharedAttemptsTests(unittest.TestCase):
         self.assertEqual(second.rebase_budget_key(7), "rebase-pr-7")
         self.assertFalse(self.shared.exists())
 
+    def test_each_forge_source_has_its_own_budgets_on_every_host(self):
+        from tauceti_tools.forge import GITHUB, Forge, RepositoryRef
+
+        from tauceti_worker.config import Config
+        from tauceti_worker.worker_sources import source_config
+
+        def host(name):
+            base = self.root / name
+            paths = (base / "state", base / "checkout", base / "store", base / "sb", base / "logs", base / "quota")
+            return Config("worker", base, base, *paths)
+
+        forgejo = RepositoryRef(Forge("forgejo", "https://forge.example"), "Project/Repo")
+        source = SimpleNamespace(repository=forgejo, identity=SimpleNamespace(native_id=1))
+        other = SimpleNamespace(repository=RepositoryRef(GITHUB, "Project/Repo"), identity=SimpleNamespace(native_id=1))
+        self.shared.mkdir()
+        self.shared.chmod(0o2770)
+        with patch.dict(os.environ, {"TAUCETI_SHARED_ATTEMPTS_DIR": str(self.shared)}):
+            github = survey_mod.Counters(host("one"))
+            native = [survey_mod.Counters(source_config(host(name), source)) for name in ("one", "two")]
+            elsewhere = survey_mod.Counters(source_config(host("one"), other))
+        github.incr(FIX)
+        self.assertEqual(native[0].read(FIX), 0)
+        native[0].incr(FIX)
+        self.assertEqual(native[1].incr(FIX), 2)
+        self.assertEqual((github.read(FIX), elsewhere.read(FIX)), (1, 0))
+        digest = source_config(host("one"), source).state.name
+        self.assertEqual((self.shared / FIX).read_text(), "1")
+        self.assertEqual((self.shared / "sources" / digest / FIX).read_text(), "2")
+        for directory in (self.shared / "sources", self.shared / "sources" / digest):
+            self.assertEqual(directory.stat().st_mode, self.shared.stat().st_mode)
+
+        with patch.dict(os.environ, {"TAUCETI_SHARED_ATTEMPTS_DIR": ""}):
+            private = survey_mod.Counters(source_config(host("one"), source))
+        private.incr(FIX)
+        self.assertTrue((source_config(host("one"), source).state / FIX).is_file())
+        self.assertEqual(native[0].read(FIX), 2)
+
     def test_workers_charge_one_budget(self):
         first, second = self.counters("first"), self.counters("second")
         for name in SHARED_NAMES:
