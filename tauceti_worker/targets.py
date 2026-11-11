@@ -5,6 +5,7 @@ the worker uses:
 
     load_targets(path)                 read and parse the file; Die when it is not a target list
     live_targets(targets, gh)          statuses overlaid from open and merged pull request markers
+    inventory_keys(rows)               the items a multi-source round's open-PR inventory names
     candidates(targets, only, skip)    the eligible items, in the order a worker tries to claim them
     landed_pr(item, gh)                the merged pull request that completed an item, at any age
     render_assignment(targets, item)   the roadmap prompt's bullet assigning one item
@@ -146,6 +147,21 @@ def marker_keys(body: str) -> tuple[set[Key], set[Key]]:
             if data.get("partial") is True:
                 partial.add((focus, ident))
     return keys, partial
+
+
+def inventory_keys(rows: Iterable[dict]) -> set[Key]:
+    """The (focus, id) pairs of a multi-source round's open-PR target inventory
+    (`cross_source_targets`), whose `targets` are `work_target_keys` strings."""
+    keys: set[Key] = set()
+    for row in rows:
+        for target in row.get("targets") or ():
+            try:
+                focus, ident = json.loads(target)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(focus, str) and isinstance(ident, str):
+                keys.add((focus, ident))
+    return keys
 
 
 def partial_prs(item: TargetItem) -> set[int]:

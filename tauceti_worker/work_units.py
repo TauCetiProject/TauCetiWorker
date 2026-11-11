@@ -125,9 +125,11 @@ from .targets import (
     TargetItem,
     Targets,
     candidates,
+    inventory_keys,
     landed_pr,
     live_targets,
     load_targets,
+    overlay_live,
     render_assignment,
     target_markers,
 )
@@ -3069,6 +3071,8 @@ def assign_target(w, path: Path, only: str, skip: list[str]) -> tuple[Targets, T
     claims = getattr(w, "claims", None)
     try:
         live = live_targets(listed, w.gh)
+        # A multi-source round's inventory also names the other forge's open pull requests.
+        live = overlay_live(live, inventory_keys(getattr(w, "cross_source_targets", None) or ()), set())
         offered = candidates(live, only, skip)
         for item in offered[:MAX_TARGET_TRIES]:
             name = f"{item.area}/{item.slug}"
