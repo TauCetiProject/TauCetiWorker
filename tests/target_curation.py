@@ -250,9 +250,18 @@ class Evidence(Tmp):
         self.assertEqual(list(curate.evidence(checkout, named)), ["TailSigma.measure"])
         absent = t.TargetItem("Probability", "strong-law", "open", "`TailSigma.measure` and `strongLaw_integrable`")
         self.assertEqual(curate.evidence(checkout, absent), {})
-        moved = {k: [h.replace(":3:", ":30:") for h in v] for k, v in hits.items()}
-        self.assertEqual(curate._fingerprint(hits), curate._fingerprint(moved))
-        self.assertNotEqual(curate._fingerprint(hits), curate._fingerprint(curate.evidence(checkout, named)))
+        before = curate._fingerprint(checkout, item, hits)
+        self.assertEqual(before, curate._fingerprint(checkout, item, curate.evidence(checkout, item)))
+        self.assertNotEqual(before, curate._fingerprint(checkout, named, curate.evidence(checkout, named)))
+        restated = t.TargetItem(item.area, item.slug, "open", "tail events of an iid sequence have probability 0 or 1")
+        self.assertNotEqual(before, curate._fingerprint(checkout, restated, hits))
+        tail = checkout / "TauCeti" / "Probability" / "Tail.lean"
+        tail.write_text("theorem kolmogorov_zero_one\n    (s : Set Ω) : True := trivial\n")
+        hits = curate.evidence(checkout, item)
+        before = curate._fingerprint(checkout, item, hits)
+        tail.write_text("theorem kolmogorov_zero_one\n    (s : Set Ω) (h : Tail s) : True := trivial\n")
+        self.assertEqual(curate.evidence(checkout, item), hits)
+        self.assertNotEqual(before, curate._fingerprint(checkout, item, hits))
 
     def test_a_verdict_counts_only_for_a_declaration_the_file_has(self):
         checkout = self.lean_checkout()

@@ -216,10 +216,16 @@ def evidence(checkout: Path, item: TargetItem) -> dict[str, list[str]]:
     return {**found, f"slug {item.slug}": by_slug} if by_slug else found
 
 
-def _fingerprint(hits: dict[str, list[str]]) -> str:
-    """Identifies a set of hits by file and declaration text, not by line number."""
-    lines = sorted(f"{name}\n{re.sub(r':[0-9]+:', ':', hit, count=1)}" for name, found in hits.items() for hit in found)
-    return hashlib.sha256("\n".join(lines).encode()).hexdigest()
+def _fingerprint(checkout: Path, item: TargetItem, hits: dict[str, list[str]]) -> str:
+    """Identifies what a verdict on `item` was given on: its description, the names looked up, and
+    the whole of every checkout file a hit is in, since a declaration's statement runs on past the
+    line that names it."""
+    digest = hashlib.sha256(json.dumps([item.text, sorted(hits)]).encode())
+    for file in sorted({hit.split(":", 1)[0] for found in hits.values() for hit in found}):
+        digest.update(b"\0" + file.encode() + b"\0")
+        with contextlib.suppress(OSError):
+            digest.update(hashlib.sha256((checkout / file).read_bytes()).digest())
+    return digest.hexdigest()
 
 
 def confirmed(checkout: Path, verdict) -> str | None:
@@ -381,7 +387,8 @@ def _main_checkout(w) -> Path | None:
 def _landed_elsewhere(w, profile, live: Targets) -> list[Change]:
     """The eligible items of `live` that a model verdict, checked against a fresh checkout of main,
     shows landed. At most MAX_CANDIDATES items with evidence are put to the model, in file order;
-    one it found not landed is not asked about again until its evidence changes."""
+    one it found not landed is not asked about again until its description or a file declaring
+    what it names changes."""
     eligible = [it for area in live.areas for it in eligible_items(live, area)]
     checkout = _main_checkout(w) if eligible else None
     if checkout is None:
@@ -397,7 +404,7 @@ def _landed_elsewhere(w, profile, live: Targets) -> list[Change]:
     candidates = []
     for it in eligible:
         hits = evidence(checkout, it)
-        if hits and memo.get(it.slug) != _fingerprint(hits):
+        if hits and memo.get(it.slug) != _fingerprint(checkout, it, hits):
             candidates.append((it, hits))
         if len(candidates) >= MAX_CANDIDATES:
             break
@@ -412,7 +419,7 @@ def _landed_elsewhere(w, profile, live: Targets) -> list[Change]:
                 clause = f"landed elsewhere: {where}"
                 changes.append(Change(it, "done", f"landed elsewhere, {where}", ("in flight",), (clause,)))
             elif isinstance(verdict, dict) and verdict.get("landed") is False:
-                memo[it.slug] = _fingerprint(hits)
+                memo[it.slug] = _fingerprint(checkout, it, hits)
                 log(f"curate: `{it.slug}` has not landed: {one_line(str(verdict.get('missing') or ''))[:160]}")
             else:
                 log(f"curate: `{it.slug}`: no usable verdict; it stays open")
