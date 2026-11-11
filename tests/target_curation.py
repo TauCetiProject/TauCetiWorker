@@ -607,9 +607,10 @@ class ForgejoLists(Tmp):
         self.repo = RepositoryRef(Forge("forgejo", "https://git.example.org"), "TauCetiProject/TauCeti")
         api = Mock(forge=self.repo.forge, _token="fixture-token", max_bytes=1024 * 1024, max_pages=100)
         self.forgejo = ForgejoWorkerSource(RepositoryIdentity(self.repo, 7), api, token_file=None)
-        api.pulls.return_value = [
+        self.merged_rows = [
             {"number": 3, "body": marker("MeasureTheory", "kolmogorov-zero-one"), "state": "closed", "merged": True}
         ]
+        api.pages.side_effect = lambda path: iter([self.merged_rows])
         self.forgejo.open_prs = Mock(return_value=[])
         self.states = {}
         self.forgejo.pr_view = Mock(side_effect=lambda number, fields: dict(self.states.get(number, {"state": "OPEN"})))
@@ -657,7 +658,7 @@ class ForgejoLists(Tmp):
         self.forgejo.pr_view.assert_called_once_with(12, ["state", "title", "body", "headRefOid"])
 
     def test_a_forgejo_only_worker_settles_github_items_from_one_github_read(self):
-        self.forgejo.api.pulls.return_value = []
+        self.merged_rows = []
         listed = EXAMPLE.replace("in flight: #1234", "in flight: #40").replace(
             "- [ ] `kolmogorov-zero-one` — tail events have probability 0 or 1 (serves: G2;",
             "- [~] `kolmogorov-zero-one` — tail events have probability 0 or 1 (serves: G2; in flight: #41;",
@@ -677,7 +678,7 @@ class ForgejoLists(Tmp):
         self.forgejo.pr_view.assert_not_called()
 
     def test_a_closed_github_pull_request_is_matched_to_its_record_by_head(self):
-        self.forgejo.api.pulls.return_value = []
+        self.merged_rows = []
         listed = EXAMPLE.replace("in flight: #1234", "in flight: #41")
         self.path.write_text(listed)
         self.github_rows = [
@@ -698,7 +699,7 @@ class ForgejoLists(Tmp):
         self.assertIn("(needs: none; subsumed by: #398; closed: #41)", self.path.read_text())
 
     def test_a_github_reference_outside_the_github_read_is_left_alone(self):
-        self.forgejo.api.pulls.return_value = []
+        self.merged_rows = []
         listed = EXAMPLE.replace("in flight: #1234", "in flight: #40")
         self.path.write_text(listed)
         self.assertEqual(self.curate(self.forgejo), (None, "the target list is current"))
@@ -722,7 +723,7 @@ class ForgejoLists(Tmp):
         self.forgejo.pr_view.assert_not_called()
 
     def test_the_same_number_on_the_other_forge_is_not_taken_for_it(self):
-        self.forgejo.api.pulls.return_value = []
+        self.merged_rows = []
         self.path.write_text(EXAMPLE.replace("in flight: #1234", "in flight: #12"))
         self.states = {12: {"state": "MERGED", "body": ""}, 398: {"state": "MERGED", "body": ""}}
         incidents.record_declined("fix", 12, "a" * 40, message="Subsumed-by: #398", repository=self.repo)

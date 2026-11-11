@@ -52,6 +52,7 @@ from .targets import (
     overlay_live,
     parse_targets,
     partial_prs,
+    ref_key,
     render_item,
     rewrite_item,
 )
@@ -97,7 +98,7 @@ class Source:
 
     def number(self, ref: str) -> int | None:
         found = re.fullmatch(r"https?://\S*?(\d+)" if self.native else r"#(\d+)", ref)
-        if found is None or (self.native and _ref_key(self.repository.pull_url(int(found.group(1)))) != _ref_key(ref)):
+        if found is None or (self.native and ref_key(self.repository.pull_url(int(found.group(1)))) != ref_key(ref)):
             return None
         return int(found.group(1))
 
@@ -180,15 +181,9 @@ def due(counters) -> tuple[bool, str]:
     return True, "the target list is due a look"
 
 
-def _ref_key(ref: str) -> str:
-    """What identifies a reference: a URL in any case, since a forge's repository names are not
-    case-sensitive and the list may spell one differently from the source's configuration."""
-    return ref if ref.startswith("#") else ref.lower()
-
-
 def _refs(refs: Iterable[str]) -> str:
     """GitHub `#N` references in number order, then URLs; one spelling of each, the first given."""
-    unique = list({_ref_key(ref): ref for ref in reversed(list(refs))}.values())
+    unique = list({ref_key(ref): ref for ref in reversed(list(refs))}.values())
     return ", ".join(
         sorted(unique, key=lambda ref: (0, int(ref[1:]), "") if ref.startswith("#") else (1, 0, ref.lower()))
     )
@@ -209,12 +204,12 @@ def settle(targets: Targets, seen: Seen) -> tuple[list[Change], list[tuple[Targe
     the item and joins its `partial:` clause; one that was partial and closed reopens it with its
     replacements in that clause instead."""
     pending = [it for it in targets.items() if it.status != "done"]
-    excused = {(it.area, it.slug): {_ref_key(ref) for ref in _partial_refs(it)} for it in pending}
+    excused = {(it.area, it.slug): {ref_key(ref) for ref in _partial_refs(it)} for it in pending}
     by_marker: dict[Key, str] = {}
     for row in seen.merged:
         for key, number in landed(pending, [row]).items():
             ref = row.get("url") or f"#{number}"
-            if _ref_key(ref) not in excused[key]:
+            if ref_key(ref) not in excused[key]:
                 by_marker.setdefault(key, ref)
     changes: list[Change] = []
     stranded: list[tuple[TargetItem, str]] = []
@@ -222,7 +217,7 @@ def settle(targets: Targets, seen: Seen) -> tuple[list[Change], list[tuple[Targe
         key = (it.area, it.slug)
         named = inflight_ref(it) if it.status == "inflight" else None
         pull = seen.pulls.get(named) or {}
-        partial = key in marker_keys(pull.get("body"))[1] or (named is not None and _ref_key(named) in excused[key])
+        partial = key in marker_keys(pull.get("body"))[1] or (named is not None and ref_key(named) in excused[key])
         if key in by_marker:
             ref = by_marker[key]
             changes.append(Change(it, "done", f"{ref} merged", ("in flight",), (f"landed: {ref}",)))
