@@ -859,6 +859,21 @@ class GitHub:
 
         return transport.shared_read(["merged_prs", self.repo, search, limit], fetch, ttl=120)
 
+    def target_marker_prs(self, *, limit: int = 200) -> list[dict]:
+        """Number, title, body and state (OPEN, CLOSED or MERGED, Bors landings included) of the
+        `limit` most recently updated pull requests in any state whose body carries a target
+        marker: one search request, shared for two minutes."""
+        search = '"tauceti-target:v1" in:body sort:updated-desc'
+        args = ["pr", "list", "--repo", self.repo, "--state", "all", "--search", search, "--limit", str(limit)]
+
+        def fetch():
+            p = self._gh([*args, "--json", "number,title,body,state"])
+            if p.returncode != 0:
+                raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
+            return [normalize_merged(d) for d in json.loads(p.stdout or "[]")]
+
+        return transport.shared_read(["target_marker_prs", self.repo, limit], fetch, ttl=120)
+
     def issue_list(
         self, repo: str, *, labels: list[str] | None = None, fields: list[str], state: str = "open", limit: int = 200
     ) -> list[dict]:
