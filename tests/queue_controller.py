@@ -1309,6 +1309,71 @@ class PreRebase(ControllerCase):
         self.assertEqual(self.controller.claim_task("w", "admin-worker").kind, "pre_rebase")
         self.assertIsNone(batch["prepared_version"])
 
+    def test_verified_pre_rebase_needs_no_second_preparation(self):
+        ref = "a" * 40
+        pin = f'[tools.tools]\nrepo = "org/Tools"\nref = "{ref}"\n'
+        self.repo.advance_main({"tauceti.toml": pin})
+        self.controller.set_setting("prepare_min_members", 1, "kim")
+        self.controller.set_setting("prepare_quiet_seconds", 0, "kim")
+        self.conflicting_batch()
+        agent = ScriptedAgent(
+            "w",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {
+                f"{PROJECT}#102": Resolution({"Shared.lean": "combined\n"}, explanation="Resolved both changes.")
+            },
+        )
+        task = agent.claim(self.controller)
+        tip = agent.produce(task)
+        evidence = {"tip": tip, "base": task.onto, "tools": f"org/Tools@{ref}"}
+        row = self.controller.store.row("tasks", {"id": task.task_id})
+        for stale in ({"tip": task.tip}, {"base": task.base}, {"tools": "org/Tools@" + "b" * 40}):
+            notes = json.dumps({"pre_rebase_verification": dict(evidence, **stale)})
+            self.assertFalse(self.controller._verified_pre_rebase(row, tip, notes))
+        result = self.controller.submit_task(
+            task.task_id, task.claim_token, tip, json.dumps({"pre_rebase_verification": evidence})
+        )
+        self.assertTrue(result.accepted, result)
+        self.controller.tick()
+        self.assertEqual(self.open_batch()["pre_rebase_prepared"], tip)
+        self.assertEqual(self.open_tasks(self.open_batch()), [])
+
+    def test_compiling_repair_is_retained_for_the_next_claim_without_adoption(self):
+        self.conflicting_batch()
+        agent = ScriptedAgent(
+            "w",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {
+                f"{PROJECT}#102": Resolution({"Shared.lean": "combined\n"}, explanation="Resolved both changes.")
+            },
+        )
+        task = agent.claim(self.controller)
+        tip = agent.produce(task)
+        findings = [{"kind": "lint", "module": "Shared", "message": "unused argument"}]
+        notes = json.dumps({"repair_checkpoint": findings})
+        before = self.open_batch()
+        result = self.controller.submit_task(task.task_id, task.claim_token, tip, notes, checkpoint=True)
+        self.assertFalse(result.accepted, result)
+        self.assertEqual(result.reason, "repair-checkpoint")
+        self.assertEqual(self.open_batch(), before)
+        self.assertEqual(
+            self.controller.submit_task(task.task_id, task.claim_token, tip, notes, checkpoint=True).reason,
+            "repair-checkpoint",
+        )
+        self.assertEqual(self.controller.store.count("submissions", {"task_id": task.task_id}), 1)
+        next_task = self.controller.claim_task("next", "admin-worker")
+        self.assertEqual(next_task.extra["repair_checkpoint"], {"tip": tip, "diagnostics": findings})
+        self.assertEqual(next_task.warm_revs[0], tip)
+        self.assertIn(result.retained_ref, next_task.retained_refs)
+        self.assertEqual(next_task.tip, task.tip, "the original membership and validation baseline survive")
+        adoption = self.controller.submit_task(task.task_id, next_task.claim_token, tip)
+        self.assertTrue(adoption.accepted, adoption)
+        self.assertEqual(self.open_batch()["pre_rebase_tip"], tip)
+
     def test_claimed_own_base_preparation_finishes_before_rebase(self):
         self.controller.set_setting("prepare_min_members", 1, "kim")
         self.controller.set_setting("prepare_quiet_seconds", 0, "kim")
