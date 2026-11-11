@@ -115,6 +115,36 @@ class GlobalMaintenance(unittest.TestCase):
             result = run_round(self.w, self.opts)
         return result, query, areas
 
+    def test_prepared_source_survey_keeps_global_peer_claim_checks(self):
+        from tauceti_worker.survey import Candidate, Survey
+
+        prepared = Survey(worker_id="test", roadmap_only="auto")
+        prepared._round_scope = (True, False)
+        prepared.needs_fix.actionable = [Candidate(10, HEAD)]
+        self.opts.only = ["fix"]
+        with (
+            patch.object(work, "_branch_claimed_elsewhere", return_value=True) as hint,
+            patch.object(work, "dispatch") as dispatch,
+        ):
+            with self.assertRaises(ClaimCollision):
+                run_round(self.w, self.opts, prepared_survey=prepared)
+        hint.assert_called_once_with(self.w, 10)
+        dispatch.assert_not_called()
+
+    def test_prepared_fleet_focus_falls_back_to_both_sources(self):
+        from tauceti_worker.survey import Survey
+
+        prepared = Survey(worker_id="test", roadmap_only="Algebra")
+        prepared._round_scope = (False, True)
+        prepared.roadmap_backpressure = True
+        self.opts.only = ["roadmap"]
+        with (
+            patch.dict(os.environ, {"TAUCETI_WORKER_FORGES": "both", "TAUCETI_NEW_PR_FORGE": "github"}),
+            patch("tauceti_worker.multi_source.run_round", return_value=0) as global_round,
+        ):
+            self.assertEqual(run_round(self.w, self.opts, prepared_survey=prepared), 0)
+        self.assertFalse(global_round.call_args.kwargs["use_fleet_focus"])
+
     def test_held_prs_do_not_consume_automatic_maintenance_or_reviews(self):
         for label in ("on-hold", "human", "hold", "keep", "do-not-close"):
             held = row(10, "Other", mergeable="CONFLICTING")
@@ -699,6 +729,24 @@ class GlobalMaintenance(unittest.TestCase):
         self.assertEqual(result.discovery_gaps, 1)
         self.assertEqual(result.discovery_gap_prs, [10])
         self.assertEqual(result.next_auto_stage, "review")
+
+    def test_recent_unchanged_engine_result_suppresses_partial_history_review(self):
+        survey = importlib.import_module("tauceti_worker.survey")
+        for recorded, offered in ((HEAD, False), ("b" * 40, True)):
+            self.w.counters.unchanged_review_recent = lambda pr, head, recorded=recorded: head == recorded
+            with patch(
+                "tauceti_worker.github_state.read_survey", return_value=(True, [row(10, "Other", complete=False)])
+            ):
+                result = survey.survey(
+                    self.w.cfg,
+                    self.w.gh,
+                    self.w.rs,
+                    self.w.counters,
+                    stages=["review"],
+                    selected_roadmap="auto",
+                    cached_only=True,
+                )
+            self.assertEqual([c.pr for c in result.reviewable.actionable] == [10], offered)
 
     def test_disabled_maintenance_remains_disabled(self):
         self.opts.only = ["roadmap"]

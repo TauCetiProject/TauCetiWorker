@@ -373,11 +373,10 @@ class Dispatches(unittest.TestCase):
         self.backend.start_runs()
         self.backend.complete_runs()
         self.clock.advance(600)
-        self.controller.set_setting("infrastructure_retry_limit", 0, "operator")
         self.controller.tick()
         self.assertEqual(len(self.backend.runs), 1)
         self.assertEqual(self.controller._current_attempt(head)["outcome"], "infrastructure")
-        self.assertTrue(any("exhausted" in r for r in self.controller._reasons))
+        self.assertFalse(any("exhausted" in r for r in self.controller._reasons))
 
     def test_late_live_run_is_readopted_after_permanent_rejections_exhaust_budget(self):
         self.approve()
@@ -405,7 +404,6 @@ class Dispatches(unittest.TestCase):
 
     def test_late_live_run_is_readopted_after_ci_run_budget_exhaustion(self):
         self.approve()
-        self.controller.set_setting("infrastructure_retry_limit", 0, "operator")
         self.controller.tick()
         find = self.backend.find_candidate_run
         self.backend.find_candidate_run = lambda *_args, **_kwargs: None
@@ -571,7 +569,7 @@ class Dispatches(unittest.TestCase):
         self.assertEqual(self.attempt()["dispatch_state"], "rejected")
         self.assertFalse(self.backend.runs)
 
-    def test_permanent_rejections_have_a_separate_finite_budget_and_alert(self):
+    def test_dispatch_rejections_keep_retrying_with_an_alert(self):
         self.approve()
         calls = []
 
@@ -583,11 +581,11 @@ class Dispatches(unittest.TestCase):
         for _ in range(8):
             self.controller.tick()
             self.clock.advance(3600)
-        self.assertEqual(len(calls), 1 + self.controller.setting("infrastructure_retry_limit"))
+        self.assertEqual(len(calls), 8)
         self.assertTrue(any("dispatch rejected" in alert for alert in self.controller.status()["alerts"]))
         self.controller.retry_ci(PROJECT, "operator")
         self.controller.tick()
-        self.assertEqual(len(calls), 2 + self.controller.setting("infrastructure_retry_limit"))
+        self.assertEqual(len(calls), 9)
 
     def test_rate_limit_deadline_survives_restart_without_consuming_run_budget(self):
         self.approve()

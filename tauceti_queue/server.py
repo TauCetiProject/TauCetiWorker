@@ -63,7 +63,7 @@ log = logging.getLogger("tauceti_queue.server")
 MAX_BODY = 25 * 1024 * 1024
 SOURCE_BODY_DEADLINE_SECONDS = 10.0
 REPOSITORY_ROUTE = re.compile(r"^/repositories/(\d+)/(active-batches|candidates)$")
-TASK_ROUTE = re.compile(r"^/tasks/([A-Za-z0-9_.:-]+)/(renew|result|release)$")
+TASK_ROUTE = re.compile(r"^/tasks/([A-Za-z0-9_.:-]+)/(renew|result|release|checkpoint)$")
 # `ControllerError.code` (tauceti_queue/controller.py) to HTTP status.
 ERROR_STATUS = {
     "unknown-task": 404,
@@ -825,7 +825,9 @@ class Handler(BaseHTTPRequestHandler):
         controller = self.server.controller
         if action == "renew":
             self._call(
-                lambda: _renewal(tid, controller.renew_task(tid, token, **self._source_task_kwargs(refresh=True)))
+                lambda: _renewal(
+                    tid, controller.renew_task(tid, token, **self._source_task_kwargs(refresh=True)), controller
+                )
             )
         elif action == "release":
             self._call(
@@ -844,7 +846,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._call(
                 lambda: controller.submit_task(
-                    tid, token, tip, str(body.get("worker_notes") or ""), **self._source_task_kwargs(refresh=True)
+                    tid,
+                    token,
+                    tip,
+                    str(body.get("worker_notes") or ""),
+                    **({"checkpoint": True} if action == "checkpoint" else {}),
+                    **self._source_task_kwargs(refresh=True),
                 )
             )
 
@@ -1013,10 +1020,12 @@ class Handler(BaseHTTPRequestHandler):
         self._call(revoke)
 
 
-def _renewal(task_id, result) -> dict:  # noqa: E302
-    if isinstance(result, dict):
-        return result
-    return {"task_id": task_id, "expires_at": result}
+def _renewal(task_id, result, controller=None) -> dict:  # noqa: E302
+    result = dict(result) if isinstance(result, dict) else {"task_id": task_id, "expires_at": result}
+    policy = getattr(controller, "task_check_policy", None)
+    if callable(policy):
+        result.update(policy(task_id))
+    return result
 
 
 def server_config(config, *, adapter=None, app=None, controller=None) -> ServerConfig:
