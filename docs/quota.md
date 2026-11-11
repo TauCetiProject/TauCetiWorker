@@ -166,9 +166,7 @@ dashboard read Claude usage with that login, and `tauceti doctor` shows it as
 `$CLAUDE_CONFIG_DIR`, whose `.credentials.json` holds the setup-token as
 `claudeAiOauth.accessToken` (with its `expiresAt` and `scopes`, and no
 `refreshToken`), and off macOS that file is mirrored into isolated workers as
-before. Off macOS it is also checked locally before Claude work starts: a missing
-file, or a token past its `expiresAt` with no refresh token, makes Claude
-unavailable whatever the usage login reports. On macOS the variable changes only which login usage is read with: the
+before. On macOS the variable changes only which login usage is read with: the
 agents' credential is handled as [below](#macos-and-the-login-keychain), so a
 `--bubble` round is seeded from the login Keychain when it holds a Claude
 sign-in, and an isolated worker's copy of the token file is not re-mirrored.
@@ -193,6 +191,11 @@ Workers naming the same usage login share its observations, fetch lock and
 cooldowns under `<usage login directory>/.tauceti-quota/usage/`, exactly as
 workers sharing a credential source do. Model-limit refusals are recorded against
 the usage login too, so the two credentials must belong to one account.
+
+The usage login says nothing about the agents' own token, so off macOS the
+worker also reads that file before Claude work starts, without a request: a
+missing file, or a token past its `expiresAt` with no refresh token, makes Claude
+unavailable whatever the usage login reports.
 
 ## macOS and the login Keychain
 
