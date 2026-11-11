@@ -67,8 +67,11 @@ directory holds a live incident or a live ruling. It then:
 With a Forgejo source enabled as well, the phase runs on the GitHub source after
 both sources are surveyed and ahead of either source's work, so a hold it lifts
 is gone from the next round's survey rather than this one's. Incident records
-are about GitHub pull requests; a round in which GitHub could not be surveyed
-does not rule.
+are ruled on only for the worker's GitHub repository; a round in which GitHub
+could not be surveyed does not rule. A record of another source, whose key
+carries that source's digest (see [incidents](incidents.md)), is never put to the
+model, acknowledged or settled by the phase; rulings are keyed the same way, so
+a GitHub ruling neither lifts that record's hold nor adds a note to its prompt.
 
 ## The rulings
 

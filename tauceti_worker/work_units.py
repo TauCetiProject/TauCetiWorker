@@ -2054,7 +2054,7 @@ def _do_fixlike(
         prompt += incidents.PROMPT
         from .decide import retry_note
 
-        prompt += retry_note(label, pr, head)
+        prompt += retry_note(label, pr, head, _incident_source(w, c)[0])
     if getattr(c, "final_resolution", False) and may_close:
         prompt += (
             "\nThis is the last permitted per-head repair attempt. "

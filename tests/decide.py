@@ -23,6 +23,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tauceti_tools.forge import Forge, RepositoryRef
+
 import tauceti_worker as tc
 from tauceti_worker import agents, cli, decide, github, incidents, work_units
 from tauceti_worker.constants import ROADMAP_DIR, TAUCETI
@@ -511,6 +513,34 @@ def test_rounds(tmp):
             "…out of the hold's sight",
             [load(root / incidents.ACKED / name)["head"] for name in kept] + [len(incidents.find("declined", "fix-9"))],
             ["h3", "h1", "h2", 1],
+        )
+
+    root = tmp / "sources"
+    forgejo = RepositoryRef(Forge("forgejo", "https://forge.example"), TAUCETI)
+    with settings(root):
+        declined(1)
+        incidents.record_declined("fix", 1, "head-1", message="declined on Forgejo", repository=forgejo)
+        foreign = incidents.find(incidents.DECLINED, incidents.subject("fix", 1, forgejo))[0]
+        seen = rounds(tmp, Hub(p1={}), answer((1, "retry", {})))
+        check("a Forgejo record of the same stage and number is not put to the model", len(seen["packet"]["cases"]), 1)
+        check(
+            "…a retry on the GitHub one lifts only the GitHub hold",
+            (incidents.declined("fix", 1, "head-1"), incidents.declined("fix", 1, "head-1", forgejo)),
+            (False, True),
+        )
+        check(
+            "…and adds no note to the Forgejo pull request's prompt", decide.retry_note("fix", 1, "head-1", forgejo), ""
+        )
+        rounds(tmp, Hub(p1={"state": "CLOSED"}))
+        check(
+            "…which is never acknowledged, even once GitHub's #1 has closed",
+            incidents.find(incidents.DECLINED, incidents.subject("fix", 1, forgejo)),
+            [foreign],
+        )
+        check(
+            "…and is kept apart from every acknowledged GitHub record",
+            sorted(path.name for path in (root / incidents.ACKED).iterdir()),
+            ["declined-fix-1.json", "ruling-declined-fix-1.json"],
         )
 
     root = tmp / "cap"

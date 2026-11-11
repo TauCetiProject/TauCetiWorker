@@ -79,14 +79,17 @@ def case_id(incident: dict) -> str:
     return f"{incident['kind']}-{incident['key']}"
 
 
-def _usable(value: dict) -> bool:
+def _usable(value: dict, repository: str) -> bool:
+    """Whether `value` is an incident about a pull request of the GitHub repository `repository`. A
+    record of another source has a key of its own (`incidents.subject`) and is never ruled on here."""
     return (
         value.get("kind") in KINDS
         and value.get("stage") in incidents.STAGES
         and type(value.get("pr")) is int
         and value["pr"] > 0
-        and value.get("key") == f"{value['stage']}-{value['pr']}"
-        and all(isinstance(value.get(name), str) and value[name] for name in ("head", "last_at", "repository"))
+        and value.get("repository") == repository
+        and value.get("key") == incidents.subject(value["stage"], value["pr"], repository)
+        and all(isinstance(value.get(name), str) and value[name] for name in ("head", "last_at"))
     )
 
 
@@ -102,10 +105,10 @@ def ruling_on(incident: dict) -> dict | None:
     )
 
 
-def _incident_of(ruling: dict) -> dict | None:
-    key = f"{ruling.get('stage')}-{ruling.get('pr')}"
-    found = incidents.find(str(ruling.get("incident")), key)
-    return next((value for value in found if _usable(value) and ruling_on(value) is not None), None)
+def _incident_of(ruling: dict, repository: str) -> dict | None:
+    kind = str(ruling.get("incident"))
+    found = incidents.find(kind, str(ruling.get("key"))[len(kind) + 1 :])
+    return next((value for value in found if _usable(value, repository) and ruling_on(value) is not None), None)
 
 
 def _retried(case: str) -> list[str]:
@@ -151,9 +154,10 @@ def _clip(text, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 2].rstrip() + " …"
 
 
-def retry_note(stage: str, pr: int, head: str) -> str:
-    """The paragraph a repair prompt gains while a `retry` ruling names this stage, PR and head."""
-    for value in incidents.find(incidents.RULING, f"{incidents.DECLINED}-{stage}-{pr}"):
+def retry_note(stage: str, pr: int, head: str, repository=None) -> str:
+    """The paragraph a repair prompt gains while a `retry` ruling names this stage, PR of
+    `repository` (as `incidents.subject` takes it) and head."""
+    for value in incidents.find(incidents.RULING, f"{incidents.DECLINED}-{incidents.subject(stage, pr, repository)}"):
         if value.get("ruling") == RETRY and value.get("head") == head and value.get("note"):
             return (
                 f"\nAn earlier {stage} session on this PR ended at this head with no outcome on GitHub. "
@@ -342,7 +346,11 @@ def _settle(rd: _Round) -> None:
     confirmed: dict[int, dict | None] = {}
     for path, value in incidents.records(acked=False):
         ruling = value.get("kind") == incidents.RULING and type(value.get("pr")) is int
-        if value.get("repository") != rd.gh.repo or not (ruling or _usable(value)) or rd.at_head(value):
+        if ruling:
+            ruling = value.get("repository") == rd.gh.repo and value.get("key") == (
+                f"{value.get('incident')}-{incidents.subject(str(value.get('stage')), value['pr'], rd.gh.repo)}"
+            )
+        if not (ruling or _usable(value, rd.gh.repo)) or rd.at_head(value):
             continue
         pr = value["pr"]
         if pr not in confirmed:
@@ -390,7 +398,7 @@ def _recheck(rd: _Round) -> list[dict]:
     again = []
     for _path, ruling in incidents.records(incidents.RULING, acked=False):
         landed, lost = _blockers(rd, ruling) if ruling.get("repository") == rd.gh.repo else (None, "")
-        incident = _incident_of(ruling) if landed or lost else None
+        incident = _incident_of(ruling, rd.gh.repo) if landed or lost else None
         if incident is None or not rd.at_head(incident):
             continue
         if lost:
@@ -412,7 +420,7 @@ def _unruled(rd: _Round) -> list[dict]:
     live = [
         value
         for _path, value in incidents.records(acked=False)
-        if _usable(value) and value["repository"] == rd.gh.repo and rd.at_head(value) and ruling_on(value) is None
+        if _usable(value, rd.gh.repo) and rd.at_head(value) and ruling_on(value) is None
     ]
     found = []
     for value in sorted(live, key=lambda value: value["last_at"]):
