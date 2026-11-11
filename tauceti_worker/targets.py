@@ -4,7 +4,8 @@ The file format and the selection rules are documented in docs/target-lists.md. 
 the worker uses:
 
     load_targets(path)                 read and parse the file; Die when it is not a target list
-    live_targets(targets, gh)          statuses overlaid from open and merged pull request markers
+    live_targets(targets, gh, others)  statuses overlaid from the open and merged pull request markers
+                                       of `gh` and of the other sources a round sees
     inventory_keys(rows)               the items a multi-source round's open-PR inventory names
     candidates(targets, only, skip)    the eligible items, in the order a worker tries to claim them
     landed_pr(item, gh)                the merged pull request that completed an item, at any age
@@ -25,11 +26,12 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .config import Die, NoProgress, log
+from .config import Die, NoProgress, SourceUnavailable, log
 from .survey import TARGET_MARKER_RE
 
 MARKER_RE = re.compile(r"<!--\s*tauceti-targets:v1\s*-->")
-MERGED_SEARCH = '"tauceti-target:v1" in:body'
+MARKER_TAG = "tauceti-target:v1"
+MERGED_SEARCH = f'"{MARKER_TAG}" in:body'
 MERGED_LIMIT = 200
 _AREA_RE = re.compile(r"[A-Za-z0-9_-]+")
 _HEADING_RE = re.compile(r"^##\s+(.*?)\s*$")
@@ -165,12 +167,11 @@ def inventory_keys(rows: Iterable[dict]) -> set[Key]:
 
 def partial_prs(item: TargetItem) -> set[int]:
     """The pull requests an item's `partial:` clause names; a merge of one never completes the item."""
-    return {
-        int(n)
-        for clause in item.meta
-        if clause.partition(":")[0].strip().lower() == "partial"
-        for n in re.findall(r"#(\d+)", clause)
-    }
+    return {int(n) for clause in item.meta if _is_partial(clause) for n in re.findall(r"#(\d+)", clause)}
+
+
+def _is_partial(clause: str) -> bool:
+    return clause.partition(":")[0].strip().lower() == "partial"
 
 
 def overlay_live(targets: Targets, inflight: set[Key], done: set[Key]) -> Targets:
@@ -189,27 +190,40 @@ def overlay_live(targets: Targets, inflight: set[Key], done: set[Key]) -> Target
 
 def landed(items: Iterable[TargetItem], merged: Iterable[dict]) -> dict[Key, int]:
     """The items a merged pull request among `merged` completes, each with that pull request: its
-    marker names the item and is not partial, and the item's `partial:` clause does not name it."""
+    marker names the item and is not partial, and the item's `partial:` clause does not name it.
+    A row with a `url` (a Forgejo pull request) is named by that URL, any other by `#N`."""
+    items = list(items)
     excused = {(it.area, it.slug): partial_prs(it) for it in items}
+    urls = {
+        (it.area, it.slug): set(re.findall(r"https?://[^\s,;]+", " ".join(c for c in it.meta if _is_partial(c))))
+        for it in items
+    }
     done: dict[Key, int] = {}
     for d in merged:
         keys, partial = marker_keys(d.get("body"))
         for key in keys - partial:
-            if key in excused and d.get("number") not in excused[key]:
+            named = d["url"] in urls.get(key, ()) if d.get("url") else d.get("number") in excused.get(key, ())
+            if key in excused and not named:
                 done.setdefault(key, d.get("number"))
     return done
 
 
-def live_targets(targets: Targets, gh) -> Targets:
-    """`overlay_live` from GitHub: an open pull request whose marker names an item puts it in flight,
-    a merged one that completes it (`landed`) makes it done. The merged side sees the MERGED_LIMIT
-    most recently updated closed pull requests that carry a marker. Raises GitHubError when either
-    listing fails."""
+def live_targets(targets: Targets, gh, others: Iterable = ()) -> Targets:
+    """`overlay_live` from the pull requests of `gh` and of each source in `others` (GitHub or
+    Forgejo): an open one whose marker names an item puts it in flight, a merged one that completes
+    it (`landed`) makes it done. The merged side sees each source's MERGED_LIMIT most recent closed
+    pull requests that carry a marker. Raises GitHubError or SourceUnavailable when a listing fails."""
     inflight: set[Key] = set()
-    for d in gh.open_prs():
-        inflight |= marker_keys(d.get("body"))[0]
-    recent = gh.merged_prs(f"{MERGED_SEARCH} sort:updated-desc", limit=MERGED_LIMIT)
-    return overlay_live(targets, inflight, set(landed(targets.items(), recent)))
+    done: set[Key] = set()
+    for source in (gh, *others):
+        rows = source.open_prs()
+        if rows is None:
+            raise SourceUnavailable("open pull requests are unavailable for the target list")
+        for d in rows:
+            inflight |= marker_keys(d.get("body"))[0]
+        recent = source.merged_prs(f"{MERGED_SEARCH} sort:updated-desc", limit=MERGED_LIMIT)
+        done |= set(landed(targets.items(), recent))
+    return overlay_live(targets, inflight, done)
 
 
 def landed_pr(item: TargetItem, gh) -> int | None:
