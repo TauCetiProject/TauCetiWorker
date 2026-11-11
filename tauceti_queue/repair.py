@@ -1034,6 +1034,7 @@ class PromptContext:
     artifacts_cold: bool = False  # no warm artifacts: the agent's first build starts from nothing
     artifacts_reason: str | None = None  # ``prepare_artifacts``'s ``unavailable_reason`` when cold
     worker_verifies: bool = False  # worker owns the final full suite; agent checks are scoped
+    staging_checks: bool = False  # staging owns full audits and lint
     check_findings_known: bool = False  # cached artifacts fetched; CI already supplied the failures
     listings_path: Path | None = None  # where the member listings and the check script are written
     shell_limit: int = SHELL_LIMIT_SECONDS  # what the prompt says about the foreground shell limit
@@ -1437,10 +1438,15 @@ def _verification_section(
             "finish all conflicts before checking their combined downstream closure. The worker performs "
             "that closure check in its final whole-library verification.",
             "",
-            "After the focused checks and the chain check, return your summary. The worker runs the "
-            "whole-library build, full audits and environment lint before submission and sends any "
-            "remaining failures back as diagnostics. If a targeted checker is unavailable, report that "
-            "and return after scoped compilation; do not replace it with the full suite.",
+            "After the focused checks and the chain check, return your summary. "
+            + (
+                "The worker compiles the final chain and submits it; staging runs full audits and environment lint. "
+                if context.staging_checks
+                else "The worker runs the whole-library build, full audits and environment lint before submission "
+                "and sends remaining failures back as diagnostics. "
+            )
+            + "If a targeted checker is unavailable, report that and return after scoped compilation; "
+            "do not replace it with the full suite.",
             "",
             CACHE_SENTENCE,
             f"Run scoped checks in the foreground: shell commands have a {_hours_text(context.shell_limit)} limit. "

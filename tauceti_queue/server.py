@@ -63,7 +63,7 @@ log = logging.getLogger("tauceti_queue.server")
 MAX_BODY = 25 * 1024 * 1024
 SOURCE_BODY_DEADLINE_SECONDS = 10.0
 REPOSITORY_ROUTE = re.compile(r"^/repositories/(\d+)/(active-batches|candidates)$")
-TASK_ROUTE = re.compile(r"^/tasks/([A-Za-z0-9_.:-]+)/(renew|result|release)$")
+TASK_ROUTE = re.compile(r"^/tasks/([A-Za-z0-9_.:-]+)/(renew|result|release|checkpoint)$")
 # `ControllerError.code` (tauceti_queue/controller.py) to HTTP status.
 ERROR_STATUS = {
     "unknown-task": 404,
@@ -844,7 +844,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._call(
                 lambda: controller.submit_task(
-                    tid, token, tip, str(body.get("worker_notes") or ""), **self._source_task_kwargs(refresh=True)
+                    tid,
+                    token,
+                    tip,
+                    str(body.get("worker_notes") or ""),
+                    **({"checkpoint": True} if action == "checkpoint" else {}),
+                    **self._source_task_kwargs(refresh=True),
                 )
             )
 

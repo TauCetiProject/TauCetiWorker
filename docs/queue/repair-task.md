@@ -760,6 +760,16 @@ verification. A changed checking policy requires verification again. The control
 accepted receipt only for the exact claim and tip, so a lost response cannot adopt twice or authorize
 stale work. Terminal worktrees are removed as before.
 
-Staging status intents persist for the existing retry workflow; optional status delivery does not
-hold the reserved compiler during quota waits. The finalizer still requires the build and exact
-public map. Legacy missing-run grace is unchanged pending duplicate-safe dispatch evidence.
+Staging status intents persist for the existing retry workflow. A green build waits for required
+status delivery on its original run. The finalizer still requires the build and exact public map.
+Legacy missing-run grace is unchanged pending duplicate-safe dispatch evidence.
+
+For a repair or rebase that compiles and still fails audit or lint after local retries, the worker
+can send a checkpoint using the current claim and its submission ref. The controller validates the
+chain and records it as a retained submission without adopting it. A new claim on the same task
+starts from that tip and receives the outstanding findings. It runs full verification before final
+submission. The old worktree is removed once the checkpoint receipt is confirmed.
+
+When a pre-rebase passes full verification, the worker reports the verified tip, parent and tools
+pin with its submission. A matching result counts as preparation for that tip. A changed chain
+gets its own preparation and staging still makes the landing decision.
