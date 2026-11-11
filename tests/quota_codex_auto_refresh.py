@@ -322,7 +322,14 @@ for name, locked in (("root", "Managed Preferences"), ("per-user directory", "Ma
         (tmp / "Managed Preferences/someone").mkdir(parents=True)
         (tmp / "Managed Preferences/someone/com.openai.codex.plist").write_text("")
         (tmp / locked).chmod(0)
-        with rotates_to(jwt(10 * DAY)) as post, usage_seen()[1]:
+
+        def denied(path, locked=tmp / locked, real_scandir=os.scandir):
+            # Mode 0 does not stop root from listing, so deny it explicitly as well.
+            if Path(path) == locked:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_scandir(path)
+
+        with rotates_to(jwt(10 * DAY)) as post, usage_seen()[1], patch.object(os, "scandir", denied):
             quota.codex(renew=True)
         check(f"an unreadable managed-preference {name} blocks renewal", post.call_count, 0)
     finally:
