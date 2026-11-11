@@ -474,7 +474,7 @@ def _write(path: Path, text: str) -> bool:
     return True
 
 
-def publish(path: Path, base: str, ours: str, notes: list[str]) -> str | None:
+def publish(path: Path, base: str, ours: str, notes: list[str], *, still=None) -> str | None:
     """Put `ours`, the list as this curation edited it from `base`, into the file and return what
     the file then holds, or None when it could not be merged or written. Call with the lock held.
 
@@ -482,11 +482,15 @@ def publish(path: Path, base: str, ours: str, notes: list[str]) -> str | None:
     with the file as it is now, so an edit made meanwhile by hand or on another host is kept; when
     both touch the same lines nothing is written and a later curation starts from the new file. A
     tracked list is committed, that path only, and pushed; when the commit fails this curation's
-    edit is taken back out of the file, so a later curation makes it again."""
+    edit is taken back out of the file, so a later curation makes it again. With `still`, nothing
+    is written unless `still(the file as it now is)` holds."""
     tracked = _tracked(path)
     if tracked:
         _sync(path)
     theirs = path.read_text()
+    if still is not None and not still(theirs):
+        log(f"curate: {path.name} changed what this curation's verdicts were given; nothing written")
+        return None
     merged = ours if theirs == base else merge3(base, ours, theirs)
     if merged is None:
         log(f"curate: {path.name} changed on the same lines during this curation; nothing written")
@@ -571,6 +575,25 @@ def _parsed(path: Path, text: str) -> Targets:
         raise Die(f"roadmap targets: {path}: {error}") from None
 
 
+def _unchanged(path: Path, targets: Targets, items: list[TargetItem]):
+    """Whether a later text of the list keeps `targets`' preamble and each of `items` as it was."""
+
+    def basis(listed: Targets, item: TargetItem):
+        found = listed.find(item.slug)
+        return listed.preamble, found and (found.area, found.status, found.text, tuple(found.meta))
+
+    before = [basis(targets, item) for item in items]
+
+    def still(text: str) -> bool:
+        try:
+            listed = _parsed(path, text)
+        except Die:
+            return False
+        return [basis(listed, item) for item in items] == before
+
+    return still
+
+
 def _curate(w, c, path: Path, profile) -> int | None:
     if _tracked(path):
         _sync(path)
@@ -598,7 +621,9 @@ def _curate(w, c, path: Path, profile) -> int | None:
         if not changes:
             continue
         notes = [f"`{change.item.slug}`: {change.note}" for change in changes]
-        published = publish(path, text, apply(text, changes), notes)
+        # A model verdict holds for the goal and item line it was given, not for a later edit of them.
+        still = _unchanged(path, targets, [change.item for change in changes]) if tier == 2 else None
+        published = publish(path, text, apply(text, changes), notes, still=still)
         if published is None:
             c.reason = f"{len(changes)} edit(s) to the target list could not be written"
             return 0 if written else None

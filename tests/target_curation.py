@@ -468,6 +468,7 @@ class Round(Tmp):
         env = {"TAUCETI_ROADMAP_TARGETS": str(self.path), "TAUCETI_INCIDENTS_DIR": str(self.tmp / "incidents")}
         self.asked = []
         self.verdicts = {}
+        self.during = None
         for item in (
             patch.dict(os.environ, env),
             patch.object(curate, "_main_checkout", side_effect=lambda w: self.checkout),
@@ -490,6 +491,8 @@ class Round(Tmp):
         listing = json.loads((cwd / "candidates.json").read_text())
         self.asked.append((prompt, listing))
         (cwd / "verdicts.json").write_text(json.dumps(self.verdicts))
+        if self.during:
+            self.during()
         return 0
 
     def curate(self, *, after_gap=True):
@@ -533,6 +536,23 @@ class Round(Tmp):
         self.assertEqual(self.curate(), (None, "the target list is current"))
         self.assertEqual(len(self.asked), 1)
         self.assertLessEqual(time.time() - self.w.counters.read(curate.ATTEMPT_KEY), 5)
+
+    def test_a_verdict_is_not_written_once_its_goal_or_line_changed_during_the_look(self):
+        file = "TauCeti/Probability/Tail.lean"
+        self.verdicts = {"kolmogorov-zero-one": {"landed": True, "file": file, "declaration": "kolmogorov_zero_one"}}
+        broadened = EXAMPLE.replace("i.i.d. integrable", "i.i.d. measurable")
+        self.during = lambda: self.path.write_text(broadened)
+        self.assertEqual(self.curate()[0], None)
+        self.assertEqual(self.path.read_text(), broadened)
+        restated = broadened.replace("probability 0 or 1 (serves", "probability 0 or 1 for any sequence (serves")
+        self.during = lambda: self.path.write_text(restated)
+        self.assertEqual(self.curate()[0], None)
+        self.assertEqual(self.path.read_text(), restated)
+        unrelated = restated.replace("nothing under this heading is a target", "nothing here is a target")
+        self.during = lambda: self.path.write_text(unrelated)
+        self.assertEqual(self.curate()[0], 0)
+        self.assertIn("- [x] `kolmogorov-zero-one`", self.path.read_text())
+        self.assertIn("nothing here is a target", self.path.read_text())
 
     def test_a_not_landed_verdict_is_not_asked_for_again_until_the_evidence_changes(self):
         self.verdicts = {"kolmogorov-zero-one": {"landed": False, "missing": "only the auxiliary lemma"}}
