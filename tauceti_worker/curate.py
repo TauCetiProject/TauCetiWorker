@@ -40,10 +40,12 @@ from .github import GitHubError, normalize_merged
 from .paths import HERE
 from .targets import (
     MERGED_SEARCH,
+    GitHubMarkerReads,
     Key,
     TargetItem,
     Targets,
     eligible_items,
+    github_history_enabled,
     inflight_ref,
     landed,
     marker_keys,
@@ -121,8 +123,19 @@ class Source:
         return row if self.native else normalize_merged(row)
 
 
+class _GitHubHistory(GitHubMarkerReads):
+    """`GitHubMarkerReads` with the view of one pull request that curation needs, from the same
+    listing. A pull request outside it reads as unknown, and its item is left as it is."""
+
+    def pr_view(self, number: int, fields: list[str]) -> dict | None:
+        row = next((d for d in self._listing() if d.get("number") == number), None)
+        return {f: row[f] for f in fields if f in row} if row else None
+
+
 def sources(w) -> list[Source]:
-    """The worker's own source and the others a multi-source round hands it (`target_sources`)."""
+    """The worker's own source and the others a multi-source round hands it (`target_sources`). A
+    round with no GitHub source adds the GitHub repository's marked pull requests (`_GitHubHistory`)
+    unless TAUCETI_ROADMAP_TARGETS_GITHUB is 0, so a list carried over from GitHub keeps its `#N`."""
     from .worker_sources import current
 
     found = []
@@ -131,6 +144,8 @@ def sources(w) -> list[Source]:
             found.append(Source(gh, gh.repository, native=True))
         else:
             found.append(Source(gh, RepositoryRef(GITHUB, getattr(gh, "repo", TAUCETI)), shared=current() is not None))
+    if all(source.native for source in found) and github_history_enabled():
+        found.append(Source(_GitHubHistory(), RepositoryRef(GITHUB, TAUCETI)))
     return found
 
 

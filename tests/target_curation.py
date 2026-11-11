@@ -3,6 +3,7 @@
 and verdict checks, the locked three-way write with real git repositories, and the round wiring.
 No GitHub or model access. The fixture is the example in docs/target-lists.md."""
 
+import contextlib
 import fcntl
 import importlib
 import json
@@ -592,7 +593,14 @@ class ForgejoLists(Tmp):
         self.forgejo.pr_view = Mock(side_effect=lambda number, fields: dict(self.states.get(number, {"state": "OPEN"})))
         self.path = self.tmp / "targets.md"
         env = {"TAUCETI_ROADMAP_TARGETS": str(self.path), "TAUCETI_INCIDENTS_DIR": str(self.tmp / "incidents")}
-        for item in (patch.dict(os.environ, env), patch.object(curate, "_main_checkout", return_value=None)):
+        self.github_rows = []
+        self.github_reads = Mock(side_effect=lambda limit: self.github_rows)
+        for item in (
+            patch.dict(os.environ, env),
+            patch.object(curate, "_main_checkout", return_value=None),
+            patch("tauceti_worker.worker_sources.shared_github_environment", contextlib.nullcontext),
+            patch("tauceti_worker.github.GitHub.target_marker_prs", lambda _gh, *, limit: self.github_reads(limit)),
+        ):
             item.start()
             self.addCleanup(item.stop)
         cfg = SimpleNamespace(state=self.tmp / "state", logdir=self.tmp / "logs", wid="worker3")
@@ -625,6 +633,41 @@ class ForgejoLists(Tmp):
         self.assertIn(f"(needs: none; landed: {url})", text)
         self.assertIn(f"needs: `borel-cantelli`; landed: {self.repo.pull_url(3)})", text)
         self.forgejo.pr_view.assert_called_once_with(12, ["state", "title", "body", "headRefOid"])
+
+    def test_a_forgejo_only_worker_settles_github_items_from_one_github_read(self):
+        self.forgejo.api.pulls.return_value = []
+        listed = EXAMPLE.replace("in flight: #1234", "in flight: #40").replace(
+            "- [ ] `kolmogorov-zero-one` — tail events have probability 0 or 1 (serves: G2;",
+            "- [~] `kolmogorov-zero-one` — tail events have probability 0 or 1 (serves: G2; in flight: #41;",
+        )
+        self.path.write_text(listed)
+        self.github_rows = [
+            {"number": 40, "title": "t", "body": "", "state": "MERGED"},
+            {"number": 41, "title": "t", "body": marker("MeasureTheory", "kolmogorov-zero-one"), "state": "CLOSED"},
+        ]
+        self.assertEqual(self.curate(self.forgejo), (0, ""))
+        text = self.path.read_text()
+        self.assertIn("(needs: none; landed: #40)", text)
+        self.assertIn("- [~] `kolmogorov-zero-one`", text)
+        ((file, _),) = incidents.records(incidents.TARGET_CLOSED)
+        self.assertEqual(file.name, "target-closed-kolmogorov-zero-one-41.json")
+        self.github_reads.assert_called_once_with(200)
+        self.forgejo.pr_view.assert_not_called()
+
+    def test_a_github_reference_outside_the_github_read_is_left_alone(self):
+        self.forgejo.api.pulls.return_value = []
+        listed = EXAMPLE.replace("in flight: #1234", "in flight: #40")
+        self.path.write_text(listed)
+        self.assertEqual(self.curate(self.forgejo), (None, "the target list is current"))
+        self.github_rows = [{"number": 40, "title": "t", "body": "", "state": "MERGED"}]
+        self.github_reads.side_effect = tc.GitHubError("rate limited")
+        with patch.object(t, "log") as said:
+            self.assertEqual(self.curate(self.forgejo), (None, "the target list is current"))
+        self.assertIn("GitHub pull requests unreadable (rate limited)", said.call_args_list[0].args[0])
+        self.github_reads.side_effect = lambda limit: self.github_rows
+        with patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS_GITHUB": "0"}):
+            self.assertEqual(self.curate(self.forgejo), (None, "the target list is current"))
+        self.assertEqual((self.github_reads.call_count, self.path.read_text()), (2, listed))
 
     def test_a_mixed_worker_settles_items_from_both_forges(self):
         self.path.write_text(EXAMPLE)

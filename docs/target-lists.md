@@ -126,8 +126,15 @@ after one that changes nothing the round goes on to its other phases. A round
 given `--pr` does not curate. One worker per list is enough. In a round over
 several sources the look runs once, ahead of either source's work, and reads
 every source surveyed that round: in GitHub's round when GitHub was surveyed,
-otherwise in the round of the forge new pull requests go to. A clause that
-names a pull request of a source the round did not read is left as it is.
+otherwise in the round of the forge new pull requests go to. A round with no
+GitHub source reads GitHub's marked pull requests as the roadmap round does
+(above): the same single listing of 200, the same fallback when GitHub cannot
+be read, and the same `TAUCETI_ROADMAP_TARGETS_GITHUB=0` to stop it. A `#N`
+clause there is settled only from that listing, so one naming a pull request
+outside it (older, or without a marker) is left as it is; so is a clause naming
+a pull request of a source the round did not read. A closed GitHub pull request
+seen this way has no head in the listing, so a `declined` record cannot replace
+it and it is left to the operator.
 
 A look makes these edits, each to one item line; every other line stays as it
 was:
