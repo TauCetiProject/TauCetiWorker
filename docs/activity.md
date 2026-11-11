@@ -155,8 +155,12 @@ of its reviews, the fallback is our measured average per paid review pass over t
 seven days, falling back to retained history. The production rate likewise uses local
 authoring plus fixes on measured, locally authored landed PRs from the last seven days,
 with a retained-history fallback. Other contributors' review costs and production costs
-are estimates based on these local measurements, not their actual bills. Cached counters require a comment-history verification at or after landing. Archive
-fallback observations may lag until an existing review sync runs; hosts that do not
+are estimates based on these local measurements, not their actual bills. Complete cached counters for the observed PR head are estimates of total participation.
+Their verification can predate landing: reviews normally finish before staging lands a
+PR, and reporting does not request a new collection of closed PR comments. Late reviews
+missing from that snapshot can make our share look too high. The oldest counter/archive
+observation time is available as `review_counts_observed_at` in per-host cost-window JSON.
+The collector reads the cache once after landing before parking the PR. Archive fallback observations may lag until an existing review sync runs; hosts that do not
 push archives may never refresh that fallback. Neither source schedules collection.
 Missing or stale evidence remains explicitly incomplete. Settled measurements are
 parked; new local reviews reopen their PR's measurement.

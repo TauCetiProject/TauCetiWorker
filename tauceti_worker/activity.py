@@ -464,7 +464,7 @@ def _refresh_prs(db, config, now, errors):
             and counts[0] == p["head"]
             and counts[1] is not None
             and counts[3] is not None
-            and counts[3] >= p["landed"]
+            and counts[2] >= p["landed"]
         )
         expired = bool(landed_loc and counts and counts[2] >= p["landed"] and now > p["landed"] + 7 * 86400)
         db.execute(
@@ -616,7 +616,7 @@ def _refresh_prs(db, config, now, errors):
                     and counts[0] == p["head"]
                     and counts[1] is not None
                     and counts[3] is not None
-                    and counts[3] >= p["landed"]
+                    and counts[2] >= p["landed"]
                 )
                 db.execute(
                     "UPDATE report_pr_refresh SET next_at=? WHERE repo=? AND number=?",

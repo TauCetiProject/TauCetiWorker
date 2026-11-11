@@ -302,7 +302,7 @@ def prepare_reviews(db, now, priority=()):
             and observed[0] == counts[0]
             and observed[1] is not None
             and counts[2] is not None
-            and counts[2] >= observed[1]
+            and counts[2] >= 0
         ):
             db.execute("UPDATE review_archive_checks SET checked=1e99 WHERE repo=? AND number=?", (repo, number))
             continue
@@ -463,6 +463,9 @@ def calculate(records, now, windows, reference=None):
                 attribution_authored_prs=sum(r["owned"] for r in selected),
                 production_usd_per_loc=str(production_rate) if production_rate is not None else None,
                 review_usd_per_pass=str(review_rate) if review_rate is not None else None,
+                review_counts_observed_at=min(
+                    (r["review_observed_at"] for r in selected if r.get("review_observed_at") is not None), default=None
+                ),
             ),
         )
 

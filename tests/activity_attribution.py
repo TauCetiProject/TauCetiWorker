@@ -580,7 +580,7 @@ class AttributionTests(unittest.TestCase):
         self.assertEqual(row["attribution_known_prs"], 0)
         self.assertEqual(row["attribution_missing_prs"], 2)
 
-    def test_stale_counter_uses_fresh_archive_instead_of_parking_it(self):
+    def test_cached_head_counter_does_not_require_post_landing_collection(self):
         self.example()
         self.db.execute(
             "INSERT INTO pr_review_counts VALUES (?,?,?,?,?,?,?)",
@@ -588,7 +588,8 @@ class AttributionTests(unittest.TestCase):
         )
         row = self.prepare()["costs"]["windows"]["total"]
         self.assertEqual(row["attribution_known_prs"], 2)
-        self.assertEqual(self.archive_count(1), 3)
+        self.assertEqual(self.archive_count(1), 0)
+        self.assertEqual(row["review_counts_observed_at"], self.now - 500)
 
     def test_large_reports_are_throttled_and_show_pending_evidence(self):
         self.example()

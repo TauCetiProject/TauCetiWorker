@@ -235,7 +235,7 @@ def fact(db, key, now):
         and counter[0] == p.get("head")
         and p.get("landed") is not None
         and counter[2] is not None
-        and counter[2] >= p["landed"]
+        and counter[2] >= 0
     )
     value = dict(
         version=2,
@@ -248,6 +248,7 @@ def fact(db, key, now):
         review_known=cached_counts or bool(checked and checked[0] and passes and fresh),
         archived_rounds=archived_rounds,
         counter_basis=cached_counts,
+        review_observed_at=counter[2] if cached_counts else fetched or None,
     )
     payload = json.dumps(value)
     previous = db.execute("SELECT payload FROM attribution_prs WHERE repo=? AND number=?", key).fetchone()
@@ -313,6 +314,7 @@ def reports(db, now):
                 review_known=p["review_known"]
                 and (p.get("counter_basis") or p["total_runs"] >= len(passes))
                 and not any(w["unpriced"] for w in work),
+                review_observed_at=p.get("review_observed_at"),
                 samples=[(json.dumps([p["key"], rid]), sample["cost"], sample["at"]) for rid, sample in passes.items()],
             )
             profiles[profile].append(row)
