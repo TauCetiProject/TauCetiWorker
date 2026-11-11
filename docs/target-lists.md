@@ -126,6 +126,11 @@ requests, in rounds where at least two of the account's pull requests have
 work to offer. When either cannot be read, the round logs it and keeps the
 usual order.
 
+A Forgejo source orders its own pull requests the same way, reading the
+markers from its own open-PR listing. With more than one source enabled each
+round works one stage of one source, so the list orders the account's pull
+requests within that stage.
+
 ## What the agent sees
 
 The roadmap prompt gains one bullet at the top of "Choose a target": the
