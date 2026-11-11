@@ -2904,12 +2904,13 @@ def _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt):
         raise Die(reason)
     log(out[:600])  # `apply`'s own output is a handful of one-liners; the PR url is the one that matters
     publication.complete(w.cfg, receipt)
-    if progress_strategy() == "threshold":
-        # A published report is paced by progress_max_open; the attempt gap is left to failed attempts.
-        w.counters.write("progress-attempt-ts", 0)
     if proc.returncode == EX_NOPROGRESS:
         bust_progress_cache(w.cfg)
         raise NoProgress("progress: this window is already in flight or already landed")
+    if progress_strategy() == "threshold":
+        # A published report is paced by progress_max_open. The gap stays for 75: that includes a
+        # window closed unmerged, which the threshold planner can choose again on every poll.
+        w.counters.write("progress-attempt-ts", 0)
 
     # A report landed (as a PR). Clear the error streak, and drop the cached "due" verdict immediately:
     # otherwise this same worker would still read `due` from cache on its next round, minutes from now,

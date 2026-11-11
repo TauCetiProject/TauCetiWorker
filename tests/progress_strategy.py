@@ -270,6 +270,16 @@ class ProgressStrategyTests(unittest.TestCase):
                 self.assertEqual(wu._apply_prepared_progress(self.worker, tool, self.roadmap, self.work, {}), 0)
             self.assertEqual(self.values["progress-attempt-ts"], expected, strategy)
 
+    def test_threshold_refused_window_keeps_the_attempt_gap(self):
+        def tool(*_args, **_kwargs):
+            return subprocess.CompletedProcess([], EX_NOPROGRESS, "", "this window was already proposed and closed")
+
+        os.environ["TAUCETI_PROGRESS_STRATEGY"] = "threshold"
+        self.values["progress-attempt-ts"] = 123
+        with patch.object(publication, "complete"), self.assertRaises(wu.NoProgress):
+            wu._apply_prepared_progress(self.worker, tool, self.roadmap, self.work, {})
+        self.assertEqual(self.values["progress-attempt-ts"], 123)
+
     # ------------------------------------------------------------------ threshold: the open-report limit
 
     def test_threshold_holds_at_the_open_report_limit(self):
