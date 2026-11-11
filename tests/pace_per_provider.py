@@ -15,6 +15,7 @@ from types import SimpleNamespace
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 import tauceti_worker as tc
+from tauceti_worker.claude_api import BudgetError, configure_api
 from tauceti_worker.cli import build_parser
 
 fails = 0
@@ -168,6 +169,14 @@ try:
     check("an API-billed worker takes no provider curve", False)
 except tc.WorkersError:
     check("an API-billed worker takes no provider curve", True)
+
+for flag in ("--pace-claude", "--pace-codex"):
+    args = build_parser().parse_args(["work", "--agent", "claude", "--claude-billing", "api", flag, "0:100"])
+    try:
+        configure_api(args, "claude")
+        check(f"an API-billed run rejects {flag}", False)
+    except BudgetError as e:
+        check(f"an API-billed run rejects {flag}", "subscription pacing" in str(e))
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} failure(s)")
 sys.exit(1 if fails else 0)
