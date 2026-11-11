@@ -205,6 +205,50 @@ class GenerationRetryTests(unittest.TestCase):
         self.assertEqual(self.calls, ["plan", "facts"] * 3)
         self.assert_uncharged()
 
+    SOURCE = {"schema": "tauceti-progress.source/v1", "content": "forgejo:https://forge.invalid/team/Math"}
+
+    def test_source_binding_must_agree_before_paid_writing(self):
+        other = {**self.SOURCE, "content": "forgejo:https://forge.invalid/team/Other"}
+        for plan_source, facts_source in (
+            ({"source": self.SOURCE}, {"source": other}),
+            ({"source": self.SOURCE}, {}),
+            ({}, {"source": self.SOURCE}),
+            ({"source": None}, {}),
+        ):
+            with self.subTest(plan=plan_source, facts=facts_source):
+                self.calls.clear()
+                (self.work / "status-body.md").write_text("prior prose")
+                with patch.dict(PLAN, plan_source), patch.dict(FACTS, facts_source):
+                    with self.assertRaises(DocumentationUnavailable):
+                        self.drive_inner()
+                self.assertEqual(self.calls, ["plan", "facts"] * 3)
+                self.assertEqual((self.work / "status-body.md").read_text(), "prior prose")
+                self.assert_uncharged()
+        for binding in ({"source": self.SOURCE}, {}):
+            with self.subTest(both=binding):
+                self.calls.clear()
+                with patch.dict(PLAN, binding), patch.dict(FACTS, binding):
+                    self.assertIsNotNone(wu._prepare_progress(self.worker, self.run_tool, self.roadmap, self.work))
+                self.assertEqual(self.calls, ["plan", "facts"])
+
+    def test_changed_source_binding_is_new_identity_for_free_mechanical_retry(self):
+        original_run = self.run_tool
+        selected = 0
+
+        def prepared(stage, *args, **kwargs):
+            nonlocal selected
+            if stage == "plan":
+                selected += 1
+            binding = {"source": self.SOURCE} if selected > 1 else {}
+            with patch.dict(PLAN, binding), patch.dict(FACTS, binding):
+                if stage == "facts" and selected == 1:
+                    self.calls.append(stage)
+                    return subprocess.CompletedProcess([], 78, "", "invalid saved source repository binding; replan")
+                return original_run(stage, *args, **kwargs)
+
+        self.assertIsNotNone(wu._prepare_progress(self.worker, prepared, self.roadmap, self.work))
+        self.assertEqual(self.calls, ["plan", "facts", "plan", "facts"])
+
     @staticmethod
     def policy_fixture(commit="a"):
         raw = json.dumps(

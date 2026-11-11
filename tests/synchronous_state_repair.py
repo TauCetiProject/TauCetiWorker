@@ -13,6 +13,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from fixtures.review_runtime_stub import install_runtime_stub
+
+install_runtime_stub()
+
 from tauceti_worker import github_state as state
 from tauceti_worker import github_transport as transport
 from tauceti_worker import review_diagnostics as diagnostics
@@ -35,7 +39,7 @@ class StateRepair(unittest.TestCase):
         self.w = SimpleNamespace(
             cfg=self.cfg,
             counters=self.counters,
-            gh=SimpleNamespace(),
+            gh=SimpleNamespace(repo=TAUCETI),
             claims=None,
             rs=SimpleNamespace(bust=Mock(), review_rounds=lambda *_: 1),
         )
@@ -120,6 +124,8 @@ class StateRepair(unittest.TestCase):
             return dict(headRefOid=NEW, state="OPEN", isDraft=False)
 
         self.w.gh = SimpleNamespace(pr_view=read)
+        self.w.rs.gh_meta = lambda *_, **__: SimpleNamespace(provenance="missing")
+        self.w.rs.ledger_clean_head = lambda *_: ""
         with patch.object(state, "refresh_pr", return_value=dict(status="ok")) as refresh:
             self.assertFalse(work._still_actionable("review", self.w, None, Candidate(7, HEAD)))
         refresh.assert_called_once_with(TAUCETI, 7, HEAD, NEW)
