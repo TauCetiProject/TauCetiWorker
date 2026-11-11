@@ -536,6 +536,55 @@ class ForgejoIdentity(unittest.TestCase):
         self.assertIsNone(claims.lease)
 
 
+class ClaimsBeforeAuthoring(unittest.TestCase):
+    """A round whose repair claimed a branch and then fell through to list authoring."""
+
+    def test_a_held_github_branch_claim_is_released_first(self):
+        cleanups = []
+        claims = tc.Claims(SimpleNamespace(wid="w1"), SimpleNamespace(add_cleanup=cleanups.append))
+        claims.held = ("branch/5", "org/claims")
+        with (
+            patch("tauceti_worker.round.claims_repo", return_value="org/claims"),
+            patch("tauceti_worker.round.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run,
+            patch.object(tc.Claims, "start_heartbeat"),
+            patch.object(tc.Claims, "stop_heartbeat"),
+        ):
+            self.assertEqual(claims.begin_target_work("Algebra", "a"), 0)
+            for cleanup in cleanups:
+                cleanup()
+        self.assertEqual(
+            [c.args[0][1:3] for c in run.call_args_list],
+            [["release", "branch/5"], ["acquire", "author/Algebra/a"], ["release", "author/Algebra/a"]],
+        )
+
+    def test_a_held_native_branch_lease_is_released_first(self):
+        from tauceti_worker.source_claims import SourceClaims
+
+        fixture = Forgejo()
+        fixture.setUp()
+        cleanups = []
+        claims = SourceClaims(SimpleNamespace(wid="w1"), SimpleNamespace(add_cleanup=cleanups.append), fixture.source)
+        acquired = Mock()
+        claims.lease, claims.held = acquired, ("branch/5", "forgejo-key")
+        with (
+            patch("tauceti_worker.worker_sources.shared_github_environment", contextlib.nullcontext),
+            patch("tauceti_worker.round.claims_repo", return_value="org/claims"),
+            patch("tauceti_worker.round.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run,
+            patch.object(SourceClaims, "start_heartbeat"),
+            patch.object(SourceClaims, "stop_heartbeat"),
+        ):
+            self.assertEqual(claims.begin_target_work("Algebra", "a"), 0)
+            for cleanup in cleanups:
+                cleanup()
+        acquired.release.assert_called_once_with()
+        self.assertEqual(
+            [c.args[0][1:3] for c in run.call_args_list],
+            [["acquire", "author/Algebra/a"], ["release", "author/Algebra/a"]],
+        )
+        self.assertIsNone(claims.lease)
+        self.assertIsNone(claims.held)
+
+
 class GitHubHistoryLookup(unittest.TestCase):
     NEWER = [{"number": 500 + i, "body": marker("Algebra", f"x{i}"), "state": "MERGED"} for i in range(200)]
 
