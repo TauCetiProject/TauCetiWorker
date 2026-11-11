@@ -858,6 +858,7 @@ def _dashboard_app(cfg, loader=None):
                         roadmap_skip=skip,
                         github_account=os.environ.get("TAUCETI_GITHUB_ACCOUNT"),
                         extra_roadmap_prompt=guidance,
+                        own_branches=os.environ.get("TAUCETI_OWN_BRANCHES"),
                     )
                     self.notify(
                         f"saved {spec.id} in {self.workers_config}\nmanager will keep it running",

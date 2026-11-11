@@ -161,6 +161,29 @@ def forgejo(pattern):
     }
 
 
+def dashboard_worker(pattern):
+    """The dashboard's `l` saves a persistent worker; the manager that launches it has no scope."""
+    from tauceti_worker import tui
+    from tauceti_worker import worker_manager as wm
+
+    with tempfile.TemporaryDirectory() as root:
+        config = Path(root) / "workers.toml"
+        app = tui._dashboard_app(SimpleNamespace(wid="test", state=Path(root)), loader=lambda: None)
+        dashboard = SimpleNamespace(
+            sel=0,
+            model_dial="auto",
+            bubble=False,
+            workers_config=config,
+            notify=lambda *_a, **_k: None,
+            _refresh_workers=lambda: None,
+        )
+        with scope(pattern), patch.object(wm, "ensure_manager", lambda _config: None):
+            type(app)._launch(dashboard, loop=True, only_selected=False)
+        (spec,) = wm.load_worker_specs(config)
+    with scope(None):
+        return [a for a in spec.work_argv() if a.startswith("--own-branches")]
+
+
 def main():
     def no_query(_repo):
         raise AssertionError("unexpected permission query")
@@ -203,6 +226,9 @@ def main():
             listing_outage("-alpha$", None),
             {"rebase": [3], "open": survey_mod.configured_max_open_prs(), "max": survey_mod.configured_max_open_prs()},
         ),
+        ("dashboard worker, unset: no flag", dashboard_worker(None), []),
+        ("dashboard worker, set: the dashboard's pattern", dashboard_worker("-alpha$"), ["--own-branches=-alpha$"]),
+        ("dashboard worker, set empty: explicitly every branch", dashboard_worker(""), ["--own-branches="]),
         ("Forgejo, unset: every PR of the account", forgejo(None), {"rebase": [1, 2], "review": [3], "open": 2}),
         (
             "Forgejo, set: matching branches of the account only; #2 falls through to review as any PR does",
