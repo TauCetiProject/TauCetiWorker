@@ -91,6 +91,22 @@ CODEX_REFRESH_RETRY_S = 600
 CODEX_SYSTEM_CONFIG = Path("/etc/codex/config.toml")
 CODEX_REQUIREMENT_FILES = (Path("/etc/codex/requirements.toml"), Path("/etc/codex/managed_config.toml"))
 CODEX_MANAGED_PREFERENCES = Path("/Library/Managed Preferences")
+# The ChatGPT plans for which Codex 0.160.0 fetches no cloud policy (`cloud_config_eligible_auth` in
+# codex-rs/cloud-config/src/service.rs). That policy can require a non-file store over every local
+# layer and is fetched on demand, so a credential whose plan is not listed here is never renewed.
+CODEX_NO_CLOUD_POLICY_PLANS = frozenset(
+    {
+        "free",
+        "go",
+        "plus",
+        "pro",
+        "prolite",
+        "promax",
+        "team",
+        "self_serve_business_prolite",
+        "self_serve_business_usage_based",
+    }
+)
 
 # Shared TauCeti usage observations live beside the credential source.
 CLAUDE_QUOTA_DIRNAME = ".tauceti-quota"
@@ -2082,11 +2098,16 @@ class Quota:
         It stands down when codex's credential store is not verifiably that file: a keyring login can
         share the refresh token a leftover auth.json still carries, and spending it here would log that
         login out. An isolated worker spends the source's token, so the source directory's own config
-        must pass as well as the worker's, each resolved with Codex's administrator layers."""
+        must pass as well as the worker's, each resolved with Codex's administrator layers, and the
+        credential's plan must be one Codex fetches no cloud policy for."""
         if os.environ.get("TAUCETI_AUTO_REFRESH") != "1":
             return False
         source = self._codex_creds_source()
         if self._codex_effective_store() is not None or self._codex_effective_store(source) is not None:
+            return False
+        tokens = _as_dict(_as_dict(_read_json_file(source / "auth.json")).get("tokens"))
+        plans = {_TokenIdentity.of(_jwt_claims(tokens.get(key))).plan for key in ("access_token", "id_token")} - {None}
+        if not plans or not plans <= CODEX_NO_CLOUD_POLICY_PLANS:
             return False
         prov = credential_refresh.provider("codex", credentials=source / "auth.json")
         if not credential_refresh.renewable(prov):

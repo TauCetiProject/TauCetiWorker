@@ -331,6 +331,20 @@ for name, locked in (("root", "Managed Preferences"), ("per-user directory", "Ma
                 (tmp / d).chmod(0o755)
         shutil.rmtree(tmp, ignore_errors=True)
 
+# 6f) Codex fetches a cloud policy, which can require a non-file store over any local setting, for
+#     business, education and enterprise workspaces. Renewal runs only for a plan outside that set.
+for plan, want in (("plus", 1), ("team", 1), ("business", 0), ("hc", 0), ("edu_plus", 0), ("someday", 0), (None, 0)):
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        quota, src, mirror, stale = setup(tmp, plan=plan)
+        for d in (src.parent, mirror.parent):
+            (d / "config.toml").write_text('cli_auth_credentials_store = "file"\n')
+        with rotates_to(jwt(10 * DAY)) as post, usage_seen()[1]:
+            quota.codex(renew=True)
+        check(f"plan {plan!r} under explicit file stores: exchanges", post.call_count, want)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
 
 # 6d) A stop signal that lands while the endpoint answers must not unwind before the answer is
 #     written: the endpoint has already retired the old refresh token. The stop is honoured after.
