@@ -9,10 +9,9 @@ whose prerequisites have landed, claims it, and hands the agent that item.
 Turn it on with `--roadmap-targets FILE`, `TAUCETI_ROADMAP_TARGETS`, or the
 `roadmap_targets` key in `workers.toml`. Several workers, on one host or many,
 may be given copies of the same list. Without the setting nothing changes.
-A list authors on GitHub: its live view reads GitHub pull requests, so a worker
-whose new pull requests go to Forgejo (`--new-pr-forge forgejo`) refuses to
-start with one; `--forgejo` alone, which also maintains Forgejo pull requests
-while authoring on GitHub, keeps it.
+A list authors on GitHub, so a worker whose new pull requests go to Forgejo
+(`--new-pr-forge forgejo`) refuses to start with one; `--forgejo` alone, which
+also maintains Forgejo pull requests while authoring on GitHub, keeps it.
 
 ## The file
 
@@ -60,17 +59,18 @@ The marks in the file go stale between edits, so each round overlays them:
 
 - An open pull request whose body carries
   `<!--tauceti-target:v1 {"focus":"<Area>","id":"<slug>"}-->` puts that item in
-  flight.
+  flight. When the worker also maintains Forgejo pull requests, an open one
+  there with that marker does too.
 - A merged one marks it done, unless its marker also says `"partial":true` or
   the item's `partial:` clause names the pull request. A pull request Bors
   landed, closed under a `[Merged by Bors] - ` title, counts as merged.
 
 The overlay only moves an item forward: `[x]` in the file stays done and `[~]`
 stays in flight until the file changes. The merged side reads the 200 most
-recently updated closed pull requests that carry a target marker. An older
-landing is still found before its item is assigned again (see below), but it
-no longer unlocks the items that need it, so tick an item `[x]` in the file to
-make its landing permanent.
+recently updated closed GitHub pull requests that carry a target marker; a
+landing on Forgejo is not read. An older landing is still found before its item
+is assigned again (see below), but it no longer unlocks the items that need it,
+so tick an item `[x]` in the file to make its landing permanent.
 
 ## Selection
 
