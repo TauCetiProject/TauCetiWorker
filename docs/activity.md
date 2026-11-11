@@ -177,7 +177,12 @@ time window, so daily rates still fluctuate with landing delays.
 cost links or calibration samples supply no attributed output. With no covered PRs the
 attributed rate is unavailable; partial output is shown with its coverage rather than
 silently assuming there was no outside work. Rates using incomplete output are labelled
-`partial`; an all-missing rate is unavailable. Unpriced completed local review passes
+`partial`; an all-missing rate is unavailable. During historical backfill, adjusted
+LOC and cost rates are unavailable: full spending divided by partly reconstructed
+credit is not a fleet estimate. The underlying provisional sums remain in JSON for
+diagnostics, with `attribution_backfilling=true`. This is separate from an ordinary
+pending live refresh, which retains the last prepared estimate. Finishing backfill
+forces a final report refresh before the backfilling flag clears. Unpriced completed local review passes
 also make coverage incomplete. Older hosts cannot supply attribution until their
 collectors are updated. Fleet reporting pools dollars and locally estimated credit
 before dividing. Worker and group summaries share host-wide measured rates and per-PR

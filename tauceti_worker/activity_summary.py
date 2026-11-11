@@ -87,7 +87,14 @@ def loc_estimate(row):
     )
 
 
+def attribution_backfilling(row):
+    # Older collectors exposed one flag for historical backfill and live refresh.
+    return bool(row.get("attribution_backfilling", row.get("attribution_preparing", False)))
+
+
 def attributed_rate(row):
+    if attribution_backfilling(row):
+        return None
     if row.get("attribution_known_prs") == 0 and (
         row.get("attribution_missing_prs") or row.get("attribution_preparing")
     ):
@@ -273,7 +280,7 @@ def display(value, default_kinds=()):
                         "Attributed landed Lean LOC",
                         [
                             "—"
-                            if windows[w].get("attributed_loc") is None
+                            if attribution_backfilling(windows[w]) or windows[w].get("attributed_loc") is None
                             else "~" + number(f"{Decimal(windows[w]['attributed_loc']):.1f}")
                             for w in cost_windows
                         ],
@@ -358,8 +365,12 @@ def display(value, default_kinds=()):
             print(
                 "~ Attribution uses observed review counts and measured local costs; all spending, including failures and overhead, is charged."
             )
-            if any(windows[w].get("attribution_preparing") for w in cost_windows):
-                print("Attribution backfill is in progress; coverage includes only prepared PRs.")
+            if any(attribution_backfilling(windows[w]) for w in cost_windows):
+                print(
+                    "Attribution history is being prepared; adjusted LOC and cost rates are unavailable until backfill finishes."
+                )
+            elif any(windows[w].get("attribution_preparing") for w in cost_windows):
+                print("Attribution refresh is pending; showing the last prepared estimate.")
             if any(windows[w].get("attribution_missing_prs") for w in cost_windows):
                 print(
                     "Attribution coverage is incomplete; PRs missing cost links, review records or LOC contribute no attributed output."
@@ -637,6 +648,7 @@ def combine(values):
             compatible = len(known) == len(values) and all(r.get("attribution_version") == 1 for r in rows)
             row["attribution_version"] = 1
             row["attribution_preparing"] = any(r.get("attribution_preparing") for r in rows)
+            row["attribution_backfilling"] = any(attribution_backfilling(r) for r in rows)
             for field in ("attribution_known_prs", "attribution_missing_prs"):
                 row[field] = sum(r[field] for r in rows) if compatible else None
             row["attributed_loc"] = (

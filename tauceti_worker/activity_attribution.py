@@ -471,6 +471,8 @@ def calculate(records, now, windows, reference=None):
 
 
 def summarize(db, now, windows, column=None, identity=None):
+    from .activity_attribution_prepare import history_pending
+
     subject = json.dumps([column, identity])
     cached = db.execute("SELECT payload FROM attribution_reports WHERE subject=?", (subject,)).fetchone()
     values = json.loads(cached[0]) if cached else {}
@@ -478,11 +480,14 @@ def summarize(db, now, windows, column=None, identity=None):
         db.execute("SELECT 1 FROM attribution_dirty LIMIT 1").fetchone() is not None
         or db.execute("SELECT 1 FROM meta WHERE key='attribution-report-dirty'").fetchone() is not None
     )
+    prior = db.execute("SELECT value FROM meta WHERE key='attribution-report-backfilling'").fetchone()
+    no_reports = not cached and db.execute("SELECT 1 FROM attribution_reports LIMIT 1").fetchone() is None
+    backfilling = history_pending(db) or bool(prior and prior[0] == "1") or no_reports
     for key in windows:
         row = values.get(
             key, dict(attribution_version=1, attributed_loc=None, attribution_known_prs=0, attribution_missing_prs=0)
         )
-        yield key, {**row, "attribution_preparing": preparing}
+        yield key, {**row, "attribution_preparing": preparing, "attribution_backfilling": backfilling}
 
 
 def prepare(db, now):

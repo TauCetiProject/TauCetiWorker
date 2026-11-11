@@ -535,6 +535,9 @@ class AttributionTests(unittest.TestCase):
         self.assertIn(("legacy_cost", '["old-1"]'), keys)
         self.assertNotIn(("cost", '["old-1"]'), keys)
         self.assertIn(("cost", '["active"]'), keys)
+        row = a._summary(self.db, self.now)["costs"]["windows"]["total"]
+        self.assertTrue(row["attribution_backfilling"])
+        self.assertIsNone(activity_summary.attributed_rate(row))
 
     def test_live_work_is_processed_before_legacy_backfill(self):
         self.example()
@@ -655,6 +658,57 @@ class AttributionTests(unittest.TestCase):
             self.assertEqual(observe.call_count, 1)
         self.assertEqual(self.db.execute("SELECT added FROM pr_loc WHERE number=1").fetchone()[0], 15000)
         self.assertIsNone(self.db.execute("SELECT next_at FROM report_pr_refresh WHERE number=1").fetchone()[0])
+
+    def test_history_backfill_does_not_quote_full_spend_over_provisional_credit(self):
+        self.example()
+        self.prepare()
+        adapter.queue(self.db, "legacy_cost", ["author"])
+        row = a._summary(self.db, self.now)["costs"]["windows"]["total"]
+        self.assertTrue(row["attribution_backfilling"])
+        self.assertEqual(Decimal(row["estimated_usd"]), 37)
+        self.assertIsNone(activity_summary.attributed_rate(row))
+        self.assertEqual(activity_summary.attributed_rate_display(row), "—")
+
+    def test_final_backfill_refresh_bypasses_large_report_throttle(self):
+        self.example()
+        self.prepare()
+        raw = self.db.execute("SELECT payload FROM attribution_prs LIMIT 1").fetchone()[0]
+        for number in range(100, 240):
+            self.db.execute("INSERT INTO attribution_prs VALUES (?,?,?)", (REPO, number, raw))
+        for identity in ("author", "review-own"):
+            adapter.queue(self.db, "legacy_cost", [identity])
+        with (
+            patch.object(adapter, "MAX_SESSIONS", 1),
+            patch.object(adapter, "reports", wraps=adapter.reports) as report,
+        ):
+            attr.prepare(self.db, self.now + 1)
+            self.assertEqual(report.call_count, 0)
+            row = a._summary(self.db, self.now + 1)["costs"]["windows"]["total"]
+            self.assertTrue(row["attribution_backfilling"])
+            attr.prepare(self.db, self.now + 2)
+            self.assertEqual(report.call_count, 1)
+        row = a._summary(self.db, self.now + 2)["costs"]["windows"]["total"]
+        self.assertFalse(row["attribution_backfilling"])
+        self.assertIsNotNone(activity_summary.attributed_rate(row))
+
+    def test_normal_live_refresh_is_distinct_from_history_backfill(self):
+        self.example()
+        self.prepare()
+        adapter.queue(self.db, "cost", ["new-live-session"])
+        row = a._summary(self.db, self.now)["costs"]["windows"]["total"]
+        self.assertTrue(row["attribution_preparing"])
+        self.assertFalse(row["attribution_backfilling"])
+        self.assertIsNotNone(activity_summary.attributed_rate(row))
+
+    def test_empty_scope_does_not_keep_whole_fleet_backfilling(self):
+        self.example()
+        host = self.prepare()
+        empty = a._summary(self.db, self.now, "scope", "queue-only")
+        self.assertFalse(empty["costs"]["windows"]["total"]["attribution_backfilling"])
+        combined = activity_summary.combine([dict(available=True, summary=host), dict(available=True, summary=empty)])
+        row = combined["summary"]["costs"]["windows"]["total"]
+        self.assertFalse(row["attribution_backfilling"])
+        self.assertIsNotNone(activity_summary.attributed_rate(row))
 
     def test_existing_observation_batch_imports_counters_once_after_landing(self):
         self.pr(1, 15000)

@@ -89,6 +89,15 @@ def rebuild_cost_queue(db, active):
         queue(db, "cost", [identity])
 
 
+def history_pending(db):
+    return (
+        db.execute(
+            "SELECT 1 FROM attribution_dirty WHERE source IN ('legacy_cost','legacy_pr','legacy_receipt') LIMIT 1"
+        ).fetchone()
+        is not None
+    )
+
+
 def round_sessions(db, rid, now, source="cost"):
     for row in db.execute("SELECT id FROM invocation_work WHERE round_id=?", (rid,)):
         if (
@@ -349,6 +358,8 @@ def reports(db, now):
 
 def prepare(db, now):
     deadline = time.monotonic() + SECONDS
+    if history_pending(db):
+        db.execute("INSERT OR REPLACE INTO meta VALUES ('attribution-report-backfilling','1')")
     changed = False
     for source in ("round", "receipt", "cost", "pr", "legacy_cost", "legacy_pr", "legacy_receipt"):
         if source == "pr":
@@ -386,7 +397,18 @@ def prepare(db, now):
     small = len(db.execute("SELECT 1 FROM attribution_prs LIMIT 129").fetchall()) <= 128
     pending = db.execute("SELECT 1 FROM meta WHERE key='attribution-report-dirty'").fetchone()
     cached = db.execute("SELECT next_at FROM attribution_reports LIMIT 1").fetchone()
-    if not cached or cached[0] <= now or (pending and (small or not last or float(last[0]) <= now - 300)):
+    backfilling = history_pending(db)
+    previous = db.execute("SELECT value FROM meta WHERE key='attribution-report-backfilling'").fetchone()
+    finished_backfill = not backfilling and previous and previous[0] == "1"
+    if (
+        finished_backfill
+        or not cached
+        or cached[0] <= now
+        or (pending and (small or not last or float(last[0]) <= now - 300))
+    ):
         reports(db, now)
+        db.execute(
+            "INSERT OR REPLACE INTO meta VALUES ('attribution-report-backfilling',?)", ("1" if backfilling else "0",)
+        )
         db.execute("DELETE FROM meta WHERE key='attribution-report-dirty'")
         db.execute("INSERT OR REPLACE INTO meta VALUES ('attribution-report-last',?)", (str(now),))
