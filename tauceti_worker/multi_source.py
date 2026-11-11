@@ -72,9 +72,51 @@ def collect(w, opts, *, use_fleet_focus=True):
         unavailable = Survey(worker_id=w.cfg.wid, github_failed=True)
         unavailable.errors.append(f"Forgejo discovery unavailable ({type(error).__name__})")
         result.append(("forgejo", None, unavailable))
-    for _, _, observation in result:
+    for name, worker, observation in result:
+        if name == "github" and not observation.github_failed and github_state_enabled():
+            enrich_targets(worker, observation)
         observation._round_scope = (global_pick, focused_round)
     return result
+
+
+def enrich_targets(worker, observation):
+    """Compact survey rows omit bodies; reuse the existing cached inventory."""
+    if not observation.open_prs:
+        return
+    from .github_state import read
+    from .github_transport import read_context
+    from .survey import origin_pr_url, work_target_keys
+
+    try:
+        with read_context(retry=False):
+            available, rows = read(worker.gh.repo, "open_prs", _optional=True)
+    except (Die, ForgeError, OSError):
+        available, rows = False, None
+    bodies = {
+        (row["number"], row["headRefOid"]): row["body"]
+        for row in rows or []
+        if isinstance(row, dict)
+        and isinstance(row.get("body"), str)
+        and type(row.get("number")) is int
+        and isinstance(row.get("headRefOid"), str)
+    }
+    observation.target_inventory_available = available and all(
+        (pr.number, pr.head_oid) in bodies for pr in observation.open_prs
+    )
+    if not observation.target_inventory_available:
+        observation.errors.append(
+            "GitHub target-marker inventory unavailable; new authoring waits for complete target coverage"
+        )
+    observation.open_prs = [
+        dataclasses.replace(
+            pr,
+            work_targets=work_target_keys(bodies[(pr.number, pr.head_oid)]),
+            origin_pr=origin_pr_url(bodies[(pr.number, pr.head_oid)]),
+        )
+        if (pr.number, pr.head_oid) in bodies
+        else pr
+        for pr in observation.open_prs
+    ]
 
 
 def deduplicate(observations):
@@ -166,7 +208,10 @@ def run_round(w, opts, *, use_fleet_focus=True):
             if candidates:
                 priority = 0 if any(candidate.pr in bumps for candidate in candidates) else 1
                 choices.append((priority, index, name, worker, result, stage))
-    complete = all(not value.github_failed and not value.dependency_wait for _, _, value in observations)
+    complete = all(
+        not value.github_failed and not value.dependency_wait and getattr(value, "target_inventory_available", True)
+        for _, _, value in observations
+    )
     execution_failed = set()
     collisions = False
     for _, _, name, worker, result, stage in sorted(choices, key=lambda item: item[:2]):

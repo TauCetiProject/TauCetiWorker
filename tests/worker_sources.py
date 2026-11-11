@@ -768,6 +768,46 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_toke
                 any("https://github.com/TauCetiProject/TauCetiRoadmap.git" in call.args for call in git.call_args_list)
             )
 
+    def test_compact_github_survey_recovers_exact_head_target_markers_from_cached_inventory(self):
+        from tauceti_worker.multi_source import enrich_targets
+
+        github = PRInfo.from_json({"number": 1, "headRefOid": "a" * 40})
+        body = '<!--tauceti-target:v1 {"focus":"Algebra","id":"one-target"}-->\nOrigin-PR: https://git.example.org/one/project/pulls/2'
+        observations = self.observations(
+            [github], [PRInfo.from_json({"number": 2, "headRefOid": "b" * 40, "body": body})]
+        )
+        with patch(
+            "tauceti_worker.github_state.read",
+            return_value=(True, [{"number": 1, "headRefOid": "a" * 40, "body": body}]),
+        ) as read:
+            enrich_targets(observations[0][1], observations[0][2])
+        self.assertTrue(observations[0][2].target_inventory_available)
+        self.assertEqual(observations[0][2].open_prs[0].origin_pr, "https://git.example.org/one/project/pulls/2")
+        deduplicate(observations)
+        self.assertEqual([len(item[2].reviewable.actionable) for item in observations], [0, 1])
+        read.assert_called_once_with("one/project", "open_prs", _optional=True)
+
+    def test_marker_inventory_cannot_apply_a_body_from_another_head(self):
+        from tauceti_worker.multi_source import enrich_targets
+
+        observations = self.observations([PRInfo.from_json({"number": 1, "headRefOid": "a" * 40})], [])
+        with patch(
+            "tauceti_worker.github_state.read",
+            return_value=(
+                True,
+                [
+                    {
+                        "number": 1,
+                        "headRefOid": "b" * 40,
+                        "body": "Origin-PR: https://git.example.org/one/project/pulls/2",
+                    }
+                ],
+            ),
+        ):
+            enrich_targets(observations[0][1], observations[0][2])
+        self.assertFalse(observations[0][2].target_inventory_available)
+        self.assertFalse(observations[0][2].open_prs[0].origin_pr)
+
 
 if __name__ == "__main__":
     unittest.main()
