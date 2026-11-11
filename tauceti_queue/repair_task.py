@@ -871,7 +871,12 @@ class TaskState:
         if recorded_task and recorded_task.get("claim_token") != task.claim_token:
             # A new claim can continue the retained chain, but the previous
             # worker's in-flight delivery and agent session belong to its lease.
-            self.record = {}
+            self.record = {
+                "schema": SCHEMA,
+                "task": task.to_json(),
+                "history": self.record.get("history", []),
+                "pending_release": None,
+            }
             self.session_path.unlink(missing_ok=True)
         if not self.record:
             self.record = {"schema": SCHEMA, "task": task.to_json(), "history": []}
