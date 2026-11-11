@@ -81,6 +81,7 @@ RUN_STDLIB=(
   bump_attestation.py
   authoring_profiles.py
   bubble_cache.py
+  bubble_mounts.py
   bubble_version.py
   branch_claim_repo.py
   build_status_rollup.py

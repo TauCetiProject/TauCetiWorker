@@ -2256,6 +2256,18 @@ def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
     return seed_dir
 
 
+def resolved_mount(spec: str) -> str:
+    """A Bubble `--mount SRC:DST[:MODE]` spec with the symlinks in SRC resolved.
+
+    A restricted Incus project opens a disk source beneath its allowed path and refuses one that
+    crosses an absolute symlink, wherever the link points. `shared_repositories.attach` publishes
+    the roadmap and review-engine checkouts as such links."""
+    src, sep, rest = spec.partition(":/")
+    if not sep or not src.startswith("/"):
+        return spec
+    return f"{Path(src).resolve()}:/{rest}"
+
+
 def run_in_bubble(
     w: Worker,
     target: str,
@@ -2415,6 +2427,7 @@ def run_in_bubble(
     snapshot = os.environ.get("TAUCETI_CONF_SNAPSHOT")
     if snapshot:
         mount_flags += ["--mount", f"{snapshot}:/opt/project.toml:ro"]
+    mount_flags = [arg if arg == "--mount" else resolved_mount(arg) for arg in mount_flags]
 
     # Fork-PR write support (kim-em/bubble#320): grant the in-container agent git fetch/push to the
     # contributor's own fork on top of the base-scoped GitHub access, so it can push an authored branch

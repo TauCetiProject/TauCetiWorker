@@ -87,6 +87,28 @@ reports whether the Bubble and Incus executables are present; the round prefligh
 checks the Bubble version and capabilities. `TAUCETI_BUBBLE` overrides the
 executable, and `TAUCETI_BUBBLE_HOME` overrides the private Bubble home.
 
+### Restricted Incus projects
+
+A user in the `incus` group is served by `incus-user` and gets a restricted
+project of their own, without the root-equivalent access `incus-admin` grants.
+Such a project accepts a disk device only when its source lies under the
+project's allowed paths (the user's home directory, for a project `incus-user`
+creates) and is reached without crossing an absolute symlink. The worker hands
+Bubble every mount by its resolved path, so the roadmap and review-engine
+checkouts, which are links into the shared repository store, arrive as the
+snapshots they point to.
+
+What the worker mounts must itself sit under an allowed path: its state and
+data directories, the Python environment it is installed in,
+`TAUCETI_GITHUB_SHARED_DIR`, and a `TAUCETI_REVIEW_ENGINE_DIR` checkout. With
+`TAUCETI_VERIFY_HELPER=1`, set `TAUCETI_VERIFY_CACHE_DIR` as well, because its
+default is under `/tmp`.
+
+The worker changes no ownership or permissions for the container. Connecting
+the container to the project's bridge and mapping the host user onto the
+container's `user`, so that private files mounted from the host stay readable
+inside, are Bubble's part.
+
 ## OpenRouter agents
 
 `--agent deepseek|minimax` runs in the bubble too. The image ships
