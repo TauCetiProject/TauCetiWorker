@@ -22,7 +22,9 @@ SCHEMA = "tauceti-incident/v1"
 ACKED = "acked"
 DECLINED = "declined"
 BUDGET_SPENT = "budget-spent"
-# The stages whose rounds leave these records: the ones that repair an existing pull request head.
+SANDBOX_FAILED = "sandbox-failed"
+# The stages whose rounds leave `declined` and `budget-spent` records: the ones that repair an
+# existing pull request head.
 STAGES = ("rebase", "fix", "fix-ci")
 HELD = "an earlier round declined at this head; waiting for a new head"
 MAX_SUMMARY = 2000
@@ -161,3 +163,21 @@ def note_budget_spent(stage: str, pr: int, head: str, detail: str) -> None:
     if any(value.get("head") == head for value in find(BUDGET_SPENT, f"{stage}-{pr}")):
         return
     record(BUDGET_SPENT, f"{stage}-{pr}", repository=TAUCETI, stage=stage, pr=pr, head=head, detail=detail)
+
+
+def note_sandbox_failed(stage: str, pr: int, head: str, *, failures: int, tail=(), transcript: str = "") -> Path | None:
+    """Record that `failures` rounds of `stage` on `pr` at `head` ended before their agent started,
+    with the last lines the sandbox printed. One write per head, as for a spent budget."""
+    if any(value.get("head") == head for value in find(SANDBOX_FAILED, f"{stage}-{pr}")):
+        return None
+    return record(
+        SANDBOX_FAILED,
+        f"{stage}-{pr}",
+        repository=TAUCETI,
+        stage=stage,
+        pr=pr,
+        head=head,
+        failures=failures,
+        tail=list(tail),
+        transcript=transcript,
+    )

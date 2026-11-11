@@ -76,6 +76,25 @@ revision and content-addressed GET routes are shared across rounds; containers
 cannot select another origin or upload, and their writable Lake views are
 discarded when the container is popped.
 
+## A round that ends before the agent starts
+
+The bootstrap of a code-writing round prints one fixed line immediately before
+it starts the agent; the worker keeps that line out of the transcript. A round
+that exits non-zero without having printed it, and without one structured agent
+event, ended in the sandbox itself: the container could not be created, a mount
+was missing, the connection to it dropped during the bootstrap, or the Mathlib
+cache fetch failed. For `rebase`, `fix`, `fix-ci`, `bump` and `lint-repair`
+such a round gives back the attempt it charged and the loop backs off, as after
+a provider outage.
+
+A pull request's own checkout can be what breaks the bootstrap, so this is
+bounded: three rounds per head and stage, each also counted in the pull
+request's provider-refund allowance. Later ones at that head are charged, and
+with `TAUCETI_INCIDENTS_DIR` set the third leaves a `sandbox-failed`
+[incident record](incidents.md) holding the sandbox's last lines. A new head
+starts a new count. A Bubble process that could not be created at all is not
+charged and not counted, as on the host.
+
 ## Requirements
 
 Bubble needs a working [Incus](https://linuxcontainers.org/incus/) runtime.

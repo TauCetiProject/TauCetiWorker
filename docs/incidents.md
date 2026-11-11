@@ -1,12 +1,14 @@
 # Incident records
 
 An incident record is a small JSON file a worker writes when a round concludes
-something about a pull request that GitHub does not show. Two kinds exist:
+something about a pull request that GitHub does not show. Three kinds exist:
 
 - `declined`: a `rebase`, `fix`, or `fix-ci` round finished and left no push,
   closure, or reply. The record keeps the agent's final message.
 - `budget-spent`: a stage has used its attempts on a pull request and will not
   take it again at that head.
+- `sandbox-failed`: three Bubble rounds of a stage at one head ended before the
+  agent started, and the next such round will be charged to the pull request.
 
 Nothing is written unless `TAUCETI_INCIDENTS_DIR` is set, and records alone
 change no selection.
@@ -42,13 +44,13 @@ Every record has:
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `schema` | string | `tauceti-incident/v1` |
-| `kind` | string | `declined` or `budget-spent` |
-| `key` | string | `<stage>-<pr>` for both kinds |
+| `kind` | string | `declined`, `budget-spent`, or `sandbox-failed` |
+| `key` | string | `<stage>-<pr>` for every kind |
 | `worker` | string | Id of the worker that wrote the file last |
 | `first_at`, `last_at` | string | UTC times of the first and the latest write, `YYYY-MM-DDTHH:MM:SSZ` |
 | `count` | integer | Number of times the live file has been written |
 | `repository` | string | `owner/name` of the pull request's repository |
-| `stage` | string | `rebase`, `fix`, or `fix-ci` |
+| `stage` | string | `rebase`, `fix`, or `fix-ci`; a `sandbox-failed` record may also name `bump` or `lint-repair` |
 | `pr` | integer | Pull request number |
 | `head` | string | Full head commit the record is about |
 
@@ -64,6 +66,14 @@ A `declined` record adds:
 
 A `budget-spent` record adds `detail`, one line naming the survey's reason and
 the attempts used.
+
+A `sandbox-failed` record adds:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `failures` | integer | Rounds at this head that ended before the agent started and were not charged |
+| `tail` | string list | The last lines the sandbox printed in the latest of them |
+| `transcript` | string | That round's log file on the worker's host; its log directory for a streamed round |
 
 ```json
 {
@@ -106,6 +116,15 @@ left alone, and a new head writes a new live record. Attempt budgets are kept
 per worker, so the record is the first worker's; another worker may still have
 attempts for that head. `--dry-run` writes nothing.
 
+**`sandbox-failed`.** A Bubble round of a branch-writing stage that fails
+without reaching its agent (see [Inside the sandbox](sandbox.md#a-round-that-ends-before-the-agent-starts))
+gives its attempt back, three times per head. The third such round writes the
+record; from the fourth on, the attempt is charged, and a head that keeps
+failing ends as `budget-spent`. One write per head, as for `budget-spent`. The
+count is the worker's own, like the attempt budgets. The refund does not depend
+on the directory: with `TAUCETI_INCIDENTS_DIR` unset the same three rounds are
+handed back and the worker's log carries the notice instead.
+
 ## Holding a declined head
 
 With `TAUCETI_HOLD_DECLINED=1`, a stage takes no further round on a pull request
@@ -135,7 +154,7 @@ before acting on it.
 | `record(kind, key, **fields)` | Write or refresh a live record; returns its path, or `None` when off or the write failed |
 | `find(kind, key)` | The live and the acknowledged record of that name, where they exist |
 | `records(kind="", acked=True)` | Every readable record with its path, live ones first |
-| `record_declined(...)`, `note_budget_spent(...)` | The two kinds above |
+| `record_declined(...)`, `note_budget_spent(...)`, `note_sandbox_failed(...)` | The three kinds above |
 | `declined(stage, pr, head)` | Whether the hold applies |
 
 A new kind needs only a name and a key that is unique within it.

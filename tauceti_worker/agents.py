@@ -1088,6 +1088,12 @@ def classify_agent_failure(text: str) -> str | None:
     return None
 
 
+# bubble_work_cmd prints AGENT_STARTING as its last act before it execs the agent. A failed Bubble work
+# round without that line, and without one structured agent event, ended in the sandbox's own setup:
+# the container, a mount, the connection to it, or the Mathlib cache fetch.
+AGENT_STARTING = "tauceti-worker: sandbox ready, starting the agent"
+AGENT_NOT_STARTED = "the sandbox ended before the agent started"
+
 # The classification of the most recent agent subprocess this round, or None. A round runs exactly one
 # work agent (run_round dispatches a single work unit), so a module-level record is unambiguous here,
 # and it keeps run_agent_proc's `-> int` contract intact for its several callers. Written on every
@@ -1143,6 +1149,7 @@ def run_agent_proc(
     session_path=None,
     quota_cfg=None,
     stdin_text: str | None = None,
+    start_marker: str | None = None,
 ) -> int:
     """Run an agent subprocess through its readable transcript renderer.
 
@@ -1151,10 +1158,13 @@ def run_agent_proc(
     failures aren't silent. ``stdin_text`` (a prompt too long for argv, see ``host_agent_launch``) is
     written to the process's stdin from a separate thread, so a prompt larger than the pipe buffer
     cannot deadlock against the transcript being read here, and stdin is closed once it is delivered.
+    ``start_marker`` is a line the launcher prints once its own setup is done: it is kept out of the
+    transcript, and a failed run that never printed it is classified as ``AGENT_NOT_STARTED``.
     """
     global _LAST_AGENT_FAILURE, _LAST_AGENT_RUN
     _LAST_AGENT_FAILURE = None
     _LAST_AGENT_RUN = None
+    marker_seen = False
     telemetry_stamp = time.strftime("%Y%m%d-%H%M%S")
     cwds = str(cwd) if cwd is not None else None
     # A prompt arrives in argv unless it is too long for one argv string, in which case it is the whole
@@ -1188,6 +1198,7 @@ def run_agent_proc(
         tail.extend(rendered.splitlines())
 
     def run_rendered(destination) -> int:
+        nonlocal marker_seen
         if cancel_event is not None and cancel_event.is_set():
             raise NoProgress("shared lease lost before agent launch")
         from .fleet_capacity import check_launch_admission
@@ -1239,6 +1250,10 @@ def run_agent_proc(
                 thread.start()
                 monitor = thread
             for line in proc.stdout:
+                if start_marker and start_marker in line:
+                    marker_seen = True
+                    if line.strip() == start_marker:
+                        continue
                 if session_path:
                     try:
                         event = json.loads(line)
@@ -1305,6 +1320,9 @@ def run_agent_proc(
         # than Bubble prelude lines. A retry event alone is deliberately not terminal evidence.
         if provider in {"codex", "claude"} and renderer.saw_work:
             return None
+        cancelled = cancel_event is not None and cancel_event.is_set()
+        if start_marker and not marker_seen and not renderer.active and not cancelled:
+            return AGENT_NOT_STARTED
         classification_text = "\n".join(tail)
         if renderer.terminal_failure_final and renderer.terminal_failure_text:
             classification_text = renderer.terminal_failure_text
@@ -2177,8 +2195,9 @@ def bubble_work_cmd(inner: str, *, verify_helper=False) -> str:
         if verify_helper
         else "timeout 1800 lake build"
     )
+    started = f"echo '{AGENT_STARTING}'"
     if not TAUCETI_CACHE_SERVICE:
-        return f"set -e; lake exe cache get || lake exe cache get; {preliminary} || true; exec {inner}"
+        return f"set -e; lake exe cache get || lake exe cache get; {preliminary} || true; {started}; exec {inner}"
     fetch = f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI}"
     return (
         "set -e; "
@@ -2204,7 +2223,7 @@ def bubble_work_cmd(inner: str, *, verify_helper=False) -> str:
         f"if ! {preliminary}; then "
         "echo 'warning: pre-agent lake build failed or timed out; the agent starts from a red tree' >&2; "
         "fi; "
-        f"exec {inner}"
+        f"{started}; exec {inner}"
     )
 
 
@@ -2601,6 +2620,7 @@ def run_in_bubble(
                 quota_cfg=cfg,
                 provider=profile.provider,
                 cancel_event=cancel_event,
+                start_marker=AGENT_STARTING,
             )
         else:  # review engine / probe — leave its output inline
             from .fleet_capacity import check_launch_admission

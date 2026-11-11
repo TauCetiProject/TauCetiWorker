@@ -19,6 +19,7 @@ from pathlib import Path
 
 from . import incidents
 from .agents import (
+    AGENT_NOT_STARTED,
     AuthoringProfile,
     BuildCacheUnavailable,
     _claude_review_model,
@@ -69,6 +70,7 @@ from .constants import (
     MAX_CI_PR_ATTEMPTS,
     MAX_FIX_ATTEMPTS,
     MAX_INFRA_REFUNDS,
+    MAX_SANDBOX_REFUNDS,
     OPENROUTER_MODELS,
     PR_TASKS,
     PROGRESS_ATTEMPT_GAP,
@@ -1724,6 +1726,11 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     push while still handing those back, and a persistent false positive could evade the lifetime
     backstop indefinitely by moving the head. The counters live in the worker's own state, so this is
     per worker rather than fleet-wide; a fleet-wide bound would need shared state it does not have.
+
+    A Bubble round that ended before its agent started (agents.AGENT_NOT_STARTED) is refunded the same
+    way and counts against that per-PR bound, under a second allowance of MAX_SANDBOX_REFUNDS that IS
+    keyed on the head: the cause can be the PR's own checkout, which a new head replaces. The round
+    that uses the allowance up leaves a `sandbox-failed` incident; later ones at that head are charged.
     """
     from .claude_api import blocked_failure
     from .config import AdmissionUnavailable
@@ -1738,6 +1745,13 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     if not reason:
         return
     account_limit = reason in {"provider subscription limit reached", "provider credit balance exhausted"}
+    head_key = f"infra-{label}-{c.pr}-{c.head[:12]}" if reason == AGENT_NOT_STARTED else None
+    if head_key and w.counters.read(head_key) >= MAX_SANDBOX_REFUNDS:
+        warn_red(
+            f"  {label} #{c.pr}: {reason}, and {MAX_SANDBOX_REFUNDS} such rounds at this head have "
+            f"already been handed back — charging the attempt"
+        )
+        return
     refunds = w.counters.read(f"infra-{label}-{c.pr}") if account_limit else w.counters.incr(f"infra-{label}-{c.pr}")
     if refunds > MAX_INFRA_REFUNDS and not account_limit:
         warn_red(
@@ -1749,6 +1763,23 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     for key in charged:
         w.counters.write(key, max(0, w.counters.read(key) - 1))
     detail = "provider-limit refusal" if account_limit else f"refund {refunds}/{MAX_INFRA_REFUNDS}"
+    if head_key:
+        at_head = w.counters.incr(head_key)
+        detail += f", {at_head}/{MAX_SANDBOX_REFUNDS} at this head"
+        if at_head >= MAX_SANDBOX_REFUNDS:
+            run = take_last_agent_run() or {}
+            recorded = incidents.note_sandbox_failed(
+                label,
+                c.pr,
+                c.head,
+                failures=at_head,
+                tail=run.get("tail") or (),
+                transcript=run.get("transcript") or str(w.cfg.logdir),
+            )
+            warn_red(
+                f"  {label} #{c.pr}: {at_head} rounds at this head ended before the agent started; "
+                f"further ones are charged" + (f". Recorded at {recorded}" if recorded else "")
+            )
     log(
         f"  {label} #{c.pr}: {reason} — the agent never ran, so this attempt is not charged "
         f"({detail}); backing off and retrying later"
@@ -1958,9 +1989,14 @@ def _do_fixlike(
     if bubble:
         # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
         # auto-derives this from a PR target, so it's explicit/testable belt-and-suspenders (kim-em/bubble#320).
-        rc = run_in_bubble(
-            w, f"{TAUCETI}/pull/{pr}", prompt, opts, allow_push=f"{p.head_owner}/{p.head_repo}"
-        )  # bubble checks out the PR inside
+        try:
+            rc = run_in_bubble(
+                w, f"{TAUCETI}/pull/{pr}", prompt, opts, allow_push=f"{p.head_owner}/{p.head_repo}"
+            )  # bubble checks out the PR inside
+        except BuildCacheUnavailable:
+            for key in charged:
+                w.counters.write(key, max(0, w.counters.read(key) - 1))
+            raise
     else:
         if not prepare_checkout(w.cfg, work=label, pr=pr):
             from .work_recovery import LAST_REFUSAL
