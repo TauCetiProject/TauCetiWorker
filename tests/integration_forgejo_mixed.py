@@ -68,7 +68,7 @@ class MixedNativeIntegration(unittest.TestCase):
                 frozenset({reviewer_id}),
                 queue_id,
                 token_file,
-                {"fixture": "trusted native publishers"},
+                {"fixture": "trusted native publishers", "authority_generation": "1" * 32},
             )
             native = MixedNativeSource(profile, cfg, repo.clone, client=queue, token=tokens["queue"], clock=clock)
             native.configure_publisher_policy(initial.store)

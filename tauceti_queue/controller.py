@@ -1580,7 +1580,6 @@ class Controller:
         try:
             with self._lock.priority():
                 claim = self._claim_for(task_id, claim_token, arrived)
-                self._task_binding(self.store.row("tasks", {"id": task_id}))
                 if self.candidate_ci is not None:
                     self._check_source_claim_owner(entry_actor, claim)
                     try:
@@ -2272,8 +2271,21 @@ class Controller:
             if row != current and not (allow_stale_policy and same_scope):
                 raise TaskError("not-authorized", "mixed task policy changed")
             return None  # Worker control and retained refs keep the existing GitHub authority.
-        if any(isinstance(member["number"], SourceNumber) for member in self._task_members(task)):
-            raise TaskError("not-authorized", "mixed task has no frozen source binding")
+        if any(isinstance(member["number"], SourceNumber) for member in self._members(task["batch_id"])):
+            # A previously claimed GitHub task keeps its original immutable tip,
+            # even if a native member was appended to its batch meanwhile.
+            cache = getattr(self, "_task_source_cache", {})
+            key = (task["base"], task["tip"])
+            if key not in cache:
+                cache[key] = any(
+                    commit.source_pr and commit.source_pr.startswith("forgejo:") and "@" in commit.source_pr
+                    for commit in chain.chain_commits(self.clone, *key)
+                )
+                if len(cache) > 512:
+                    cache.pop(next(iter(cache)))
+                self._task_source_cache = cache
+            if cache[key]:
+                raise TaskError("not-authorized", "mixed task has no frozen source binding")
         if self.candidate_ci is None:
             if not isinstance(row, dict) or row != {}:
                 raise TaskError("not-authorized", "native task requires its qualified controller")
@@ -2366,7 +2378,7 @@ class Controller:
             "claim_id": claim_id,
             "checks_owner": self._task_checks_owner(task),
         }
-        if any(isinstance(member.number, SourceNumber) for member in members):
+        if loads(task.get("task_binding"), {}).get("schema") == "tauceti-queue.mixed-task/v1":
             if self.mixed is None:
                 raise TaskError("source-disabled", "mixed task requires its enrolled sources")
             self._task_binding(task)
@@ -2468,8 +2480,8 @@ class Controller:
             task_binding = TaskBinding.from_policy(
                 self.candidate_ci.ledger.policy, queue_epoch=self.candidate_ci.ledger.epoch
             ).record()
-        elif any(isinstance(member["number"], SourceNumber) for member in self._members(head["id"])):
-            if self.mixed is None or self.mixed_ci is None or self.mixed.mode != "admit":
+        elif self.mixed is not None and self.mixed.mode == "admit":
+            if self.mixed_ci is None:
                 raise TaskError("source-disabled", "mixed task requires active enrolled sources")
             from .mixed_tasks import binding
 
@@ -2557,9 +2569,21 @@ class Controller:
 
     # --- records -----------------------------------------------------------------------------------
 
-    def _open_batches(self) -> list[dict[str, Any]]:
-        """Non-head batches oldest first, including the sealed successor (`state=open, sealed=1`)."""
-        return self.store.rows("batches", {"repository": self.repository, "state": BATCH_OPEN}, order="id")
+    def _inert_barrier(self):
+        if self.mixed is not None and self.mixed.mode == "admit":
+            return None
+        batches = self.store.rows(
+            "batches", {"repository": self.repository, "state": [BATCH_OPEN, BATCH_HEAD]}, order="id"
+        )
+        return next(
+            (batch["id"] for batch in batches if self._mixed_inert_batch(batch) or self._inert_ci_batch(batch)), None
+        )
+
+    def _open_batches(self, *, include_inert=False) -> list[dict[str, Any]]:
+        """Keep staging order, holding an unavailable source and its successors."""
+        batches = self.store.rows("batches", {"repository": self.repository, "state": BATCH_OPEN}, order="id")
+        barrier = None if include_inert else self._inert_barrier()
+        return [batch for batch in batches if barrier is None or batch["id"] < barrier]
 
     def _unsealed_batches(self) -> list[dict[str, Any]]:
         """Batches still accepting insertions; only these count against `open_batch_limit`."""
@@ -2597,9 +2621,29 @@ class Controller:
             and (self.mixed is None or self.mixed.mode != "admit")
         )
 
+    def _inert_ci_batch(self, batch):
+        if batch is None or self.mixed_ci is not None or self.candidate_ci is not None:
+            return False
+        attempt = self._current_attempt(batch)
+        return bool(attempt and self.store.row("ci_requests", {"attempt_id": attempt["id"]}))
+
     def _candidate_coordinator(self, *, batch_id=None, attempt_id=None, run_id=None):
-        if self.candidate_ci is not None or self.mixed_ci is None:
+        if self.candidate_ci is not None:
             return self.candidate_ci
+        if self.mixed_ci is None:
+            owned = False
+            if attempt_id is not None:
+                owned = self.store.row("ci_requests", {"attempt_id": attempt_id}) is not None
+            elif run_id is not None:
+                owned = bool(self.store.query("SELECT 1 FROM ci_request_runs WHERE run_id=? LIMIT 1", (run_id,)))
+            else:
+                batch = self.store.row("batches", {"id": batch_id}) if batch_id is not None else self._head()
+                owned = self._inert_ci_batch(batch)
+            if owned:
+                raise ControllerError(
+                    "forgejo-inert", "qualified CI ownership is retained until its coordinator is enabled"
+                )
+            return None
         if run_id is not None:
             rows = self.store.query(
                 "SELECT r.attempt_id FROM ci_requests r JOIN ci_request_runs o ON o.request_digest=r.request_digest WHERE o.run_id=?",
@@ -2785,20 +2829,37 @@ class Controller:
             self.mixed.check_writer()
             # An uncertain leased write must be read back in its original direction.
             self._drain_outbox(self.clock())
-            uncertain = [
-                entry
-                for entry in self.store.rows("outbox", {"state": "pending", "kind": "promote"})
-                if entry["attempts"]
-            ]
-            if uncertain:
-                raise ControllerError("landing-uncertain", "reconcile pending landing replies before changing primary")
             from .mixed_landing import tips
 
-            current = tips(self.mixed)
+            with self._lock.unlocked():
+                current = tips(self.mixed)
+                self.mixed.check_github()
+                check_actor = getattr(self.mixed.native_main, "check_actor", None)
+                if check_actor is not None:
+                    check_actor()
+                if target == "forgejo":
+                    self.mixed.mirror.preflight(
+                        self.mixed.native, current[target], current[target], self.mixed.approved_caller
+                    )
             if current["github"] != current["forgejo"]:
                 raise ControllerError(
                     "main-tips-differ", "synchronize both protected main tips before changing primary"
                 )
+            for entry in self.store.rows("outbox", {"kind": "promote"}):
+                intent = loads(entry["payload"], {})
+                phase = intent.get("promotion_send", {}).get("state")
+                unknown = phase == "sending" or phase is None and entry["attempts"] and entry["state"] == "pending"
+                if not unknown:
+                    continue
+                original = intent.get("primary", "github")
+                if chain.is_ancestor(self.clone, intent["tip"], current[original]):
+                    intent["promotion_send"] = {"state": "settled"}
+                    self.store.update("outbox", {"id": entry["id"]}, payload=dumps(intent))
+                else:
+                    raise ControllerError(
+                        "landing-uncertain",
+                        "reconcile a sent landing in its original direction before changing primary",
+                    )
             if target == self.mixed.primary:
                 return {
                     "changed": False,
@@ -2810,6 +2871,7 @@ class Controller:
             with self.store.transaction():
                 self.store.set_setting("mixed:primary", target, actor, self.clock())
                 self.store.set_setting("mixed:primary_generation", generation, actor, self.clock())
+                self._set_state("canonical_sha", current[target])
                 self.store.journal(
                     self.clock(),
                     "primary-changed",
@@ -2859,7 +2921,7 @@ class Controller:
             self._reasons.append(f"canonical branch unavailable: {error}")
             return list(self._reasons)
         self._observe_canonical(canonical, now)
-        if any(self._mixed_inert_batch(batch) for batch in [self._head(), *self._open_batches()]):
+        if self._mixed_inert_batch(self._head()) or self._inert_ci_batch(self._head()):
             self._reasons.append("Forgejo admission is disabled; mixed work is retained pending explicit enablement")
             return list(self._reasons)
         self._follow_anticipated(now)
@@ -2969,7 +3031,9 @@ class Controller:
                             landed_prs.add(qualified)
                     elif source and source.startswith(f"{self.provenance_repository}#"):
                         landed_prs.add(int(source.rsplit("#", 1)[1]))
-                    elif not source and not self.native_source:
+                    elif (
+                        not source and not self.native_source and (self.mixed is None or self.mixed.primary == "github")
+                    ):
                         # Bors's squash commits carry no Source-PR trailer; the subject names the PR.
                         lines = (commit.message or "").splitlines()
                         match = _BORS_SUBJECT_RE.search(lines[0]) if lines else None
@@ -3203,6 +3267,9 @@ class Controller:
         inputs wait for the next tick, which the loop is woken to run at once. `probed` is per tick and
         the draw's age bound carries over in `passes_waited`, so a paused tick starves nobody.
         """
+        if self._inert_barrier() is not None:
+            self._reasons.append("insertion waits behind retained work from a disabled source")
+            return
         probed: set[tuple[int, int]] = set()  # (input, batch) pairs probed in this tick
         started = time.monotonic()
         budget = float(self.setting("insertion_probe_budget_seconds"))
@@ -5119,6 +5186,12 @@ class Controller:
         adopted = self.store.row("ci_attempts", {"id": by}) if by is not None else None
         protected_run = adopted["run_id"] if adopted is not None else None
         for attempt in self.store.rows("ci_attempts", {"batch_id": batch_id}, order="id"):
+            if (
+                self.candidate_ci is None
+                and self.mixed_ci is None
+                and self.store.row("ci_requests", {"attempt_id": attempt["id"]}) is not None
+            ):
+                continue
             candidate_ci = self._candidate_coordinator(attempt_id=attempt["id"])
             if candidate_ci is None and self.store.row("ci_requests", {"attempt_id": attempt["id"]}) is not None:
                 continue  # Disabled source: retain ownership for the enrolled coordinator.
@@ -5966,9 +6039,13 @@ class Controller:
             return
         key = f"promote:{head['id']}:{head['version']}:{head['tip']}"
         primary_binding = {}
-        if self.mixed is not None and self.mixed.mode == "admit":
-            key += f":primary:{self.mixed.generation}"
-            primary_binding = {"primary": self.mixed.primary, "primary_generation": self.mixed.generation}
+        generation = self.store.get_setting("mixed:primary_generation", 0)
+        if generation or self.mixed is not None and self.mixed.mode == "admit":
+            key += f":primary:{generation}"
+            primary_binding = {
+                "primary": self.store.get_setting("mixed:primary", "github"),
+                "primary_generation": generation,
+            }
         if candidate_ci is not None:
             generation = self.store.get_setting(f"source-ci:promotion-generation:{attempt['id']}", 0)
             key += f":source:{attempt['id']}:{generation}"
@@ -5985,6 +6062,7 @@ class Controller:
                         "tip": head["tip"],
                         "attempt_id": attempt["id"],
                         **primary_binding,
+                        **({"promotion_send": {"state": "not-sent"}} if primary_binding else {}),
                     },
                 )
                 self.store.journal(now, "promotion-queued", head["id"], version=head["version"], tip=head["tip"])
@@ -5992,7 +6070,7 @@ class Controller:
             self._reasons.append(f"head {head['id']} promotion pending in the outbox")
 
     def _landed(self, batch: dict[str, Any], how: str, now: float) -> None:
-        candidate_ci = self._candidate_coordinator(batch_id=batch["id"])
+        candidate_ci = None if self._inert_ci_batch(batch) else self._candidate_coordinator(batch_id=batch["id"])
         batch = self.store.row("batches", {"id": batch["id"]}) or batch
         if batch["state"] == BATCH_LANDED:
             return
@@ -6437,7 +6515,12 @@ class Controller:
             {"repository": self.repository, "state": INPUT_CANCELLED, "reason": PROBLEM_ANTICIPATED},
             order="id",
         )
-        return [row for row in rows if loads(row["anticipated"], {}).get("stage") == ANTICIPATED_PENDING]
+        return [
+            row
+            for row in rows
+            if loads(row["anticipated"], {}).get("stage") == ANTICIPATED_PENDING
+            and (not isinstance(row["number"], SourceNumber) or self.mixed is not None and self.mixed.mode == "admit")
+        ]
 
     def _needs_rebase(self, row: dict[str, Any], record: dict[str, Any], now: float, *, comment: bool = True) -> None:
         """The interacting PR is on `main`: the problem is reproducible on the author's branch. Comment
@@ -6673,9 +6756,13 @@ class Controller:
             current = self._pending_entry(entry)
             if current is None:
                 return
-            if current["kind"] in {"promote", "mixed-sync"}:
+            if current["kind"] in {"promote", "mixed-sync"} and not self.setting("publication_enabled"):
+                return
+            if current["kind"] == "promote":
                 try:
-                    result = self._perform(current["kind"], loads(current["payload"], {}), now)
+                    payload = loads(current["payload"], {})
+                    payload["_outbox_id"] = current["id"]
+                    result = self._perform(current["kind"], payload, now)
                 except Exception as error:  # noqa: BLE001 - every adapter failure is recorded and retried
                     self._outbox_failed(current, loads(current["history"], []), error, now)
                 else:
@@ -6815,8 +6902,10 @@ class Controller:
             self._labels_ensured.add(label_key)
 
     def _perform(self, kind: str, payload: dict[str, Any], now: float) -> str:
-        candidate_ci = self._candidate_coordinator(
-            attempt_id=payload.get("attempt_id"), batch_id=payload.get("batch_id")
+        candidate_ci = (
+            self._candidate_coordinator(attempt_id=payload.get("attempt_id"), batch_id=payload.get("batch_id"))
+            if kind == "cancel_run"
+            else None
         )
         repo = self.repository
         from .mixed_identity import SourceNumber
@@ -6824,6 +6913,8 @@ class Controller:
         if isinstance(payload.get("number"), SourceNumber):
             repo = payload["number"].source.repository.key
             self._check_repo(repo)
+            if not self.setting("publication_enabled"):
+                raise ControllerError("publication-disabled", "native publication remains pending")
         if kind == "retain_ref":
             self.source.update_ref(repo, payload["ref"], payload["sha"])
             return "retained"
@@ -6910,6 +7001,8 @@ class Controller:
         if kind == "mixed-sync":
             if self.mixed is None or self.mixed.mode != "admit":
                 raise ControllerError("forgejo-inert", "main synchronization awaits source enablement")
+            if not self.setting("publication_enabled"):
+                raise ControllerError("publication-disabled", "main synchronization remains pending")
             from .mixed_landing import synchronize
 
             return dumps(synchronize(self.mixed))
@@ -6946,6 +7039,16 @@ class Controller:
                 return f"gave-up: {str(error)[:200]}"
         raise ControllerError("unknown-outbox-kind", kind)
 
+    def _promotion_send_state(self, payload, state):
+        entry_id = payload.get("_outbox_id")
+        if entry_id is None:
+            return
+        with self.store.transaction():
+            entry = self.store.row("outbox", {"id": entry_id})
+            intent = loads(entry["payload"], {})
+            intent["promotion_send"] = {"state": state}
+            self.store.update("outbox", {"id": entry_id}, payload=dumps(intent))
+
     def _perform_promotion(self, payload: dict[str, Any], now: float) -> str:
         candidate_ci = self._candidate_coordinator(
             attempt_id=payload.get("attempt_id"), batch_id=payload.get("batch_id")
@@ -6969,6 +7072,7 @@ class Controller:
         if canonical == payload["tip"] or chain.is_ancestor(self.clone, payload["tip"], canonical):
             self._canonical = canonical
             self._set_state("canonical_sha", canonical)
+            self._promotion_send_state(payload, "settled")
             self._landed(batch, "promoted", now)
             return "already-visible"
         if candidate_ci is not None:
@@ -7041,12 +7145,31 @@ class Controller:
         if self.mixed is not None and self.mixed.mode == "admit":
             from .mixed_landing import preflight
 
-            preflight(self.mixed, payload["expected_parent"], payload["tip"])
+            before = (
+                self.store.row("batches", {"id": batch["id"]}),
+                self._members(batch["id"]),
+                self.store.row("ci_attempts", {"id": payload["attempt_id"]}),
+            )
+            with self._lock.unlocked():
+                preflight(self.mixed, payload["expected_parent"], payload["tip"])
+            after = (
+                self.store.row("batches", {"id": batch["id"]}),
+                self._members(batch["id"]),
+                self.store.row("ci_attempts", {"id": payload["attempt_id"]}),
+            )
+            if before != after or self._active_claims(batch["id"]):
+                raise ControllerError(
+                    "promotion-changed", "work changed during primary preflight; retained for reconciliation"
+                )
             if primary_generation != self.store.get_setting("mixed:primary_generation", 0):
                 return "stale-primary-generation"
+        if not self.setting("publication_enabled"):
+            raise ControllerError("publication-disabled", "landing remains pending while publication is disabled")
+        self._promotion_send_state(payload, "sending")
         result = self.source.fast_forward(
             self.repository, self.canonical_branch, payload["expected_parent"], payload["tip"]
         )
+        self._promotion_send_state(payload, "settled")
         if result.ok:
             self._canonical = payload["tip"]
             self._set_state("canonical_sha", payload["tip"])
@@ -7116,7 +7239,7 @@ class Controller:
             now = self.clock()
             settings = self.effective_settings()
             waiting = self._waiting()
-            open_batches = self._open_batches()
+            open_batches = self._open_batches(include_inert=True)
             open_batch = open_batches[0] if open_batches else None
             head = self._head()
             hold = self._state("inference_hold")
@@ -7402,8 +7525,10 @@ class Controller:
     def _head_status(
         self, head: dict[str, Any], now: float, settings: dict[str, Any], alerts: list[str]
     ) -> dict[str, Any]:
-        candidate_ci = self._candidate_coordinator(batch_id=head["id"])
+        candidate_ci = None if self._inert_ci_batch(head) else self._candidate_coordinator(batch_id=head["id"])
         info = self._batch_status(head, now)
+        if self._inert_ci_batch(head):
+            info["source_disabled"] = True
         info["sealed_at"] = head["sealed_at"]
         info["expected_parent"] = head["expected_parent"]
         info["first_dispatch_at"] = head["first_dispatch_at"]

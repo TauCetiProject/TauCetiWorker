@@ -6,12 +6,11 @@ writer credentials have independent roles; no ambient gh token enrolls Forgejo.
 
 from __future__ import annotations
 
-import hashlib
-import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from tauceti_tools.ci_candidate import RepositoryIdentity, read_json
+from tauceti_tools.ci_candidate import RepositoryIdentity, digest, read_json
 from tauceti_tools.forge import GITHUB, Forgejo, PrincipalRef
 from tauceti_tools.system import ensure_ssl_cert_file
 
@@ -46,10 +45,25 @@ class MixedProfile:
     def load(cls, path, config):
         try:
             raw = private_json(path)
-            required = {"schema", "github", "forgejo", "reviewer_ids", "publisher_id", "source_token_file"}
+            required = {
+                "schema",
+                "github",
+                "forgejo",
+                "reviewer_ids",
+                "publisher_id",
+                "source_token_file",
+                "authority_generation",
+            }
             optional = {"execution", "mirror"}
             if not isinstance(raw, dict) or set(raw) - optional != required or raw["schema"] != SCHEMA:
                 raise ValueError
+            generation = raw["authority_generation"]
+            if (
+                not isinstance(generation, str)
+                or not re.fullmatch(r"[0-9a-f]{32}", generation)
+                or int(generation, 16) == 0
+            ):
+                raise ValueError("native review authority requires an explicit fresh generation")
             github = RepositoryIdentity.parse(raw["github"])
             native = RepositoryIdentity.parse(raw["forgejo"])
             if (
@@ -80,7 +94,14 @@ class MixedProfile:
 
     @property
     def digest(self):
-        return hashlib.sha256(json.dumps(self.raw, sort_keys=True).encode()).hexdigest()
+        return digest(
+            {
+                "source": self.forgejo.record(),
+                "reviewer_ids": sorted(self.reviewers),
+                "publisher_id": self.publisher,
+                "authority_generation": self.raw["authority_generation"],
+            }
+        )
 
     def publishers(self):
         forge = self.forgejo.repository.forge

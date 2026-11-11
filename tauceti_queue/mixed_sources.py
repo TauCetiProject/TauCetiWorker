@@ -7,7 +7,7 @@ import time
 
 from . import chain
 from .admission_state import AdmissionState
-from .controller import INPUT_RESERVED, INPUT_WAITING, ControllerError
+from .controller import ControllerError
 from .mixed_identity import SourceNumber
 from .store import dumps, loads
 
@@ -107,7 +107,7 @@ class AdmissionInputs:
 
 
 class NativePoller:
-    """Direct native policy evaluation; observation mode never reserves an input."""
+    """Direct native discovery with the existing due/dirty intake ledger."""
 
     def __init__(self, registry, controller):
         self.registry, self.controller = registry, controller
@@ -116,27 +116,41 @@ class NativePoller:
         self._serial = 0
         self._lock = threading.Lock()
         self.stopping = threading.Event()
+        self._discovery_at = 0
+        self.wake = lambda: None
+        configure = getattr(registry.native, "configure_admission_polling", None)
+        if configure is not None:
+            configure(clock=controller.clock, refresh_seconds=controller.setting("approval_poll_interval_seconds"))
 
     def interval(self):
-        return self.registry.poll_seconds
+        due = self.state.summary()["next_attempt_at"]
+        next_at = self._discovery_at if due is None else min(self._discovery_at, due)
+        return max(0, next_at - self.controller.clock())
 
     def request_discovery(self):
         self._serial += 1
+        self._discovery_at = 0
+        self.wake()
 
     def is_current(self, number, head):
-        work = self.state.get(number)
+        work = self.state.get(int(number))
+        decision = loads(work["decision"], {}) if work else {}
         return bool(
             work
             and work["head_sha"] == head
             and work["generation"] == work["evaluated_generation"]
-            and loads(work["decision"], {}).get("review_safe")
+            and decision.get("review_safe")
+            and not decision.get("recovery_authority_hold")
+            and head not in decision.get("recovery_heads", ())
         )
 
     def invalidate(self, number, **kwargs):
-        self.state.dirty(number, **kwargs)
+        self.state.dirty(int(number), **kwargs)
+        self.wake()
 
     def withdraw(self, number, head):
-        self.state.dirty(number, head=head, urgent=True)
+        number = int(number)
+        self.state.dirty(number, head=head or "", urgent=True)
         row = self.state.get(number)
         self.controller.store.update(
             "admission_work",
@@ -145,16 +159,18 @@ class NativePoller:
             cancelled_at=self.controller.clock(),
             cancelled_authorization=row["authorization_key"],
         )
+        self.wake()
 
     def accept_manual(self, number, head):
-        self.state.dirty(number, head=head, urgent=True)
+        self.state.dirty(int(number), head=head, urgent=True)
         self.controller.store.update(
             "admission_work",
-            {"repository": self.state.repository, "number": number},
+            {"repository": self.state.repository, "number": int(number)},
             cancelled_head_sha="",
             cancelled_at=0,
             cancelled_authorization="",
         )
+        self.wake()
 
     def run_once(self, *, reason="interval"):
         with self._lock:
@@ -171,90 +187,155 @@ class NativePoller:
             "approved": 0,
             "errors": [],
         }
-        try:
-            pulls = registry.native.list_open_pull_requests(registry.profile.forgejo.repository.name)
-            summary["listed"] = len(pulls)
-        except Exception as error:
-            summary["errors"].append(type(error).__name__)
-            return self._finish(summary)
-        seen = set()
-        for pull in pulls:
-            if self.stopping.is_set():
-                break
-            seen.add(pull.number)
+        if controller.clock() >= self._discovery_at:
+            serial = self._serial
             try:
-                snapshot = registry.native.admission_snapshot(registry.profile.forgejo.repository.name, pull.number)
-                result, authorization, evidence, comment, meta = registry.native.admission_policy.evaluate(snapshot)
-                number = registry.number(pull.number)
-                version = registry.native._discovery_version(snapshot.pull) + ":" + dumps(result)
-                with controller._lock, controller.store.transaction():
-                    self.state.observe(pull.number, snapshot.pull.head_sha, version)
-                    work = self.state.get(pull.number)
-                    disposition = "observe"
-                    if registry.mode == "admit":
-                        current = controller._input_for(number)
-                        if (
-                            snapshot.pull.state != "open"
-                            or snapshot.pull.draft
-                            or current
-                            and current["head_sha"] != snapshot.pull.head_sha
-                        ):
-                            controller._pull_request_event(
-                                {
-                                    "number": number,
-                                    "action": "closed"
-                                    if snapshot.pull.state != "open"
-                                    else "converted_to_draft"
-                                    if snapshot.pull.draft
-                                    else "synchronize",
-                                    "pull_request": {"head": {"sha": snapshot.pull.head_sha}},
-                                },
-                                controller.clock(),
-                            )
-                        if not result["review_safe"]:
-                            controller._withdraw(
-                                registry.profile.forgejo.repository.key, number, "review-unsafe", "native queue policy"
-                            )
-                            disposition = "review-unsafe"
-                        elif result["merge"] and not self._cancelled(work, snapshot, authorization, comment, meta):
-                            accepted = controller.approve(
-                                registry.profile.forgejo.repository.key,
-                                number,
-                                snapshot.pull.head_sha,
-                                "native published review",
-                                evidence=evidence,
-                                pull=snapshot.pull,
-                            )
-                            disposition = accepted["reason"]
-                            summary["approved"] += int(accepted["accepted"] and disposition == "approved")
-                    summary["would_admit"] += int(result["merge"])
-                    controller.store.update(
-                        "admission_work", {"id": work["id"]}, decision=dumps({**result, "evidence": evidence})
+                pulls = registry.native.list_open_pull_requests(registry.profile.forgejo.repository.name)
+                summary["listed"] = len(pulls)
+                seen = set()
+                for pull in pulls:
+                    seen.add(pull.number)
+                    details = pull.admission or {}
+                    version = dumps(
+                        {
+                            "discovery": details.get("discovery_version")
+                            or {
+                                "head": pull.head_sha,
+                                "base": pull.base_ref,
+                                "draft": pull.draft,
+                                "refresh": int(
+                                    controller.clock() // controller.setting("approval_poll_interval_seconds")
+                                ),
+                            },
+                            "policy": registry.native.admission_policy.revision,
+                            "mode": registry.mode,
+                        }
                     )
-                    self.state.complete(work, version, authorization, disposition)
-                    summary["evaluated"] += 1
+                    self.state.observe(pull.number, pull.head_sha, version)
+                for row in controller.store.rows("admission_work", {"repository": self.state.repository}):
+                    if row["number"] not in seen and row["disposition"] != "closed":
+                        self.state.observe(row["number"], row["head_sha"], "absent:" + registry.mode, urgent=True)
+                next_at = controller.clock() + registry.poll_seconds
             except Exception as error:
-                summary["errors"].append(f"#{pull.number}: {type(error).__name__}")
-        if registry.mode == "admit" and not self.stopping.is_set():
-            for row in controller.store.rows(
-                "inputs", {"repository": controller.repository, "state": [INPUT_WAITING, INPUT_RESERVED]}
-            ):
-                number = row["number"]
+                summary["errors"].append(type(error).__name__)
+                next_at = controller.clock() + controller.setting("outbox_retry_seconds")
+            self._discovery_at = next_at if serial == self._serial else 0
+        started = time.monotonic()
+        while not self.stopping.is_set():
+            work = self.state.next_due()
+            if work is None:
+                break
+            self.state.attempted(work)
+            try:
+                self._evaluate(work, summary)
+            except Exception as error:
+                summary["errors"].append(f"#{work['number']}: {type(error).__name__}")
+                retry = getattr(error, "retry_at", None) or controller.clock() + controller.setting(
+                    "outbox_retry_seconds"
+                )
+                self.state.defer(work, retry, type(error).__name__)
+            if time.monotonic() - started >= registry.poll_seconds:
+                break
+        self.last_summary = summary
+        controller.store.set_setting("state:forgejo_observation", summary, "native queue policy", controller.clock())
+        if summary["evaluated"]:
+            controller._wake.set()
+        return summary
+
+    def _evaluate(self, work, summary):
+        registry, controller = self.registry, self.controller
+        number = registry.number(work["number"])
+        if work["observed_version"].startswith("absent:"):
+            pull = registry.native.fetch_pr_or_none(registry.profile.forgejo.repository.name, int(number))
+            if pull is None:
+                with controller._lock, controller.store.transaction():
+                    if self.state.get(int(number))["generation"] != work["generation"]:
+                        return
+                    if registry.mode == "admit":
+                        controller._withdraw(
+                            registry.profile.forgejo.repository.key, number, "closed", "native queue policy"
+                        )
+                    self.state.complete(work, work["observed_version"], "", "closed")
+                    summary["evaluated"] += 1
+                return
+        snapshot = registry.native.admission_snapshot(registry.profile.forgejo.repository.name, int(number))
+        result, authorization, evidence, comment, meta = registry.native.admission_policy.evaluate(snapshot)
+        with controller._lock, controller.store.transaction():
+            fresh = self.state.get(int(number))
+            if fresh["generation"] != work["generation"]:
+                return
+            disposition = "observe"
+            current = controller._input_for(number)
+            if registry.mode == "admit":
                 if (
-                    isinstance(number, SourceNumber)
-                    and number.source == registry.profile.forgejo
-                    and int(number) not in seen
+                    snapshot.pull.state != "open"
+                    or snapshot.pull.draft
+                    or current
+                    and current["head_sha"] != snapshot.pull.head_sha
                 ):
-                    try:
-                        live = registry.native.fetch_pr_or_none(registry.profile.forgejo.repository.name, int(number))
-                        if live is None or live.state == "closed":
-                            with controller._lock:
-                                controller._withdraw(
-                                    registry.profile.forgejo.repository.key, number, "closed", "native queue policy"
-                                )
-                    except Exception as error:
-                        summary["errors"].append(type(error).__name__)
-        return self._finish(summary)
+                    controller._pull_request_event(
+                        {
+                            "number": number,
+                            "action": "closed"
+                            if snapshot.pull.state != "open"
+                            else "converted_to_draft"
+                            if snapshot.pull.draft
+                            else "synchronize",
+                            "pull_request": {
+                                "head": {"sha": snapshot.pull.head_sha},
+                                "merged": getattr(snapshot.pull, "merged", False),
+                                "title": snapshot.pull.title,
+                            },
+                        },
+                        controller.clock(),
+                    )
+                if snapshot.pull.state != "open" or snapshot.pull.draft:
+                    disposition = "closed" if snapshot.pull.state != "open" else "draft"
+                elif (
+                    not result["review_safe"]
+                    or result.get("recovery_authority_hold")
+                    or snapshot.pull.head_sha in result.get("recovery_heads", ())
+                    or snapshot.pull.base_ref != controller.canonical_branch
+                ):
+                    controller._withdraw(
+                        registry.profile.forgejo.repository.key, number, "review-unsafe", "native queue policy"
+                    )
+                    disposition = "review-unsafe"
+                elif result["merge"]:
+                    if (
+                        current
+                        and current["head_sha"] == snapshot.pull.head_sha
+                        and current["state"] in {"waiting", "reserved", "inserted", "landed"}
+                    ):
+                        disposition = current["state"]
+                    elif self._cancelled(work, snapshot, authorization, comment, meta):
+                        disposition = "withdrawn"
+                    else:
+                        accepted = controller.approve(
+                            registry.profile.forgejo.repository.key,
+                            number,
+                            snapshot.pull.head_sha,
+                            "native published review",
+                            evidence=evidence,
+                            pull=snapshot.pull,
+                        )
+                        disposition = accepted["reason"]
+                        if (
+                            not accepted["accepted"]
+                            and disposition != "member"
+                            and not disposition.startswith("blocked-label:")
+                        ):
+                            raise RuntimeError("native admission could not retain its exact head")
+                        summary["approved"] += int(accepted["accepted"] and disposition == "approved")
+            summary["would_admit"] += int(result["merge"])
+            controller.store.update(
+                "admission_work",
+                {"id": work["id"]},
+                head_sha=snapshot.pull.head_sha,
+                decision=dumps({**result, "evidence": evidence}),
+            )
+            self.state.complete(work, fresh["observed_version"], authorization, disposition)
+            summary["evaluated"] += 1
 
     def _cancelled(self, work, snapshot, authorization, comment, meta):
         from .admission import EXPLICIT_WITHDRAWALS, timestamp
@@ -277,21 +358,12 @@ class NativePoller:
             return True
         if work["cancelled_head_sha"] not in ("*", snapshot.pull.head_sha):
             return False
-        old = loads(work["cancelled_authorization"], {})
-        fresh = loads(authorization, {})
+        old, fresh = loads(work["cancelled_authorization"], {}), loads(authorization, {})
         changed = authorization != work["cancelled_authorization"]
         newer = timestamp(comment.get("created_at")) > work["cancelled_at"] or bool(
             old and meta.get("round") != old.get("round") and timestamp(meta.get("ts")) > work["cancelled_at"]
         )
         return not (fresh and changed and newer)
-
-    def _finish(self, summary):
-        self.last_summary = summary
-        self.controller.store.set_setting(
-            "state:forgejo_observation", summary, "native queue policy", self.controller.clock()
-        )
-        self.controller._wake.set()
-        return summary
 
 
 class MixedSources:

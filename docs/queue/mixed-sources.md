@@ -38,6 +38,7 @@ private regular files as required by the existing control-policy loader.
   "schema": "tauceti-queue.mixed-sources/v1",
   "github": {"forge": {"kind": "github", "url": "https://github.com"}, "name": "team/Math", "id": 101},
   "forgejo": {"forge": {"kind": "forgejo", "url": "https://git.example.org"}, "name": "team/Math", "id": 41},
+  "authority_generation": "11111111111111111111111111111111",
   "reviewer_ids": [3],
   "publisher_id": 4,
   "source_token_file": "/home/operator/.config/tauceti-queue/native-source-token",
@@ -75,8 +76,11 @@ publish native approval using the existing `ForgejoSourceAdapter.prepare_publica
 and `publish` operations with this profile's publisher policy and a durable
 sequence. Stage 1B Worker comments remain useful discussion; completing automatic
 trusted Review publication is Stage 2 work. Never bypass this gate to make a
-canary enter the queue. Profile changes rotate publisher authority and can
-require a new trusted publication.
+canary enter the queue. The explicit `authority_generation` is a fresh nonzero 128-bit value; rotate it
+when changing native review authority and never reuse a retired generation.
+Credential-path, caller and mirror changes preserve reviews and paid repair
+claims. A trust change can require fresh publication of the retained review;
+it does not require paying for the review again.
 
 The execution policy must enroll both exact repository identities in its
 `member_sources` array. Its `source` is the Forgejo **retention** repository;

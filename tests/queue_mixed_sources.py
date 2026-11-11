@@ -29,7 +29,7 @@ class Decision:
     def evaluate(self, snapshot):
         ok = snapshot.pull.state == "open" and not snapshot.pull.draft and "hold" not in snapshot.pull.labels
         result = {"merge": ok, "review_safe": ok, "reason": "fixture policy", "recovery_heads": []}
-        return result, "fixed approval", {"kind": "admission_policy"}, {}, {}
+        return result, dumps({"kind": "fixed approval"}), {"kind": "admission_policy"}, {}, {}
 
 
 class NativeFake(FakeGitHub):
@@ -55,7 +55,14 @@ class MixedFixture:
         )
         self.github_id = cc.RepositoryIdentity(RepositoryRef(GITHUB, self.controller.repository), 42)
         self.github.repository_identity = self.github_id
-        self.profile = MixedProfile(self.github_id, self.native_id, frozenset({3}), 4, self.root / "unused-token", {})
+        self.profile = MixedProfile(
+            self.github_id,
+            self.native_id,
+            frozenset({3}),
+            4,
+            self.root / "unused-token",
+            {"authority_generation": "1" * 32},
+        )
         self.native = NativeFake(self.repo, self.clock, self.native_id.repository.name)
         self.native.repository_identity = self.native_id
         self.native.admission_policy = Decision()
@@ -170,6 +177,7 @@ class Mixed(MixedFixture, unittest.TestCase):
 
     def test_publication_is_routed_to_the_original_source_after_recovery(self):
         registry = self.registry()
+        self.controller.set_setting("publication_enabled", True, "fixture")
         self.github.create_pr(1, {"Github.lean": "github\n"})
         self.native.create_pr(1, {"Native.lean": "native\n"})
         number = registry.number(1)
@@ -198,6 +206,74 @@ class Mixed(MixedFixture, unittest.TestCase):
         self.controller.cancel(self.native_id.repository.key, 1)
         self.assertEqual(self.controller.input_for(self.native_id.repository.key, 1)["state"], "cancelled")
         self.assertEqual(self.controller.input_for(self.controller.repository, 1)["state"], "waiting")
+
+    def test_github_landings_work_after_primary_reversal_and_native_disable(self):
+        self.controller.store.set_setting("mixed:primary_generation", 2)
+        self.controller.set_setting("publication_enabled", True, "fixture")
+        head = self.github.create_pr(1, {"Github.lean": "github\n"})
+        self.controller.approve(self.controller.repository, 1, head, "fixture")
+        self.controller.tick()
+        self.github.start_runs()
+        self.github.complete_runs()
+        self.clock.advance(60)
+        self.controller.tick()
+        self.assertEqual(self.controller.store.rows("batches")[0]["state"], "landed", self.controller._reasons)
+        promotion = self.controller.store.rows("outbox", {"kind": "promote"})[0]
+        self.assertEqual(loads(promotion["payload"])["primary_generation"], 2)
+
+    def test_native_discovery_skips_unchanged_snapshots_and_withdraws_recovery_holds(self):
+        registry = self.registry()
+        head = self.native.create_pr(1, {"Native.lean": "native\n"})
+        poller = NativePoller(registry, self.controller)
+        self.controller.admission = __import__(
+            "tauceti_queue.mixed_sources", fromlist=["AdmissionInputs"]
+        ).AdmissionInputs(None, poller)
+        self.assertEqual(poller.run_once()["approved"], 1)
+        count = sum(name == "admission_snapshot" for name, _ in self.native.calls)
+        self.clock.advance(registry.poll_seconds)
+        self.assertEqual(poller.run_once()["evaluated"], 0)
+        self.assertEqual(sum(name == "admission_snapshot" for name, _ in self.native.calls), count)
+        original = self.native.admission_policy.evaluate
+
+        def revoked(snapshot):
+            result, *rest = original(snapshot)
+            return ({**result, "merge": False, "recovery_authority_hold": True}, *rest)
+
+        self.native.admission_policy.evaluate = revoked
+        poller.invalidate(1, head=head, urgent=True)
+        poller.run_once()
+        self.assertEqual(self.controller.input_for(self.native_id.repository.key, 1)["state"], "cancelled")
+        self.assertFalse(poller.is_current(1, head))
+        poller.withdraw(99, None)
+        self.assertEqual(poller.state.get(99)["cancelled_head_sha"], "*")
+
+    def test_native_landed_head_is_not_readmitted_and_missing_head_is_retried(self):
+        registry = self.registry()
+        self.native.create_pr(1, {"Native.lean": "native\n"})
+        poller = NativePoller(registry, self.controller)
+        with patch.object(self.controller, "_fetch_head", return_value=False):
+            self.assertTrue(poller.run_once()["errors"])
+        self.assertEqual(self.controller.store.count("inputs"), 0)
+        self.clock.advance(self.controller.setting("outbox_retry_seconds"))
+        self.assertEqual(poller.run_once()["approved"], 1)
+        row = self.controller.input_for(self.native_id.repository.key, 1)
+        self.controller.store.update("inputs", {"id": row["id"]}, state="landed")
+        poller.invalidate(1, urgent=True)
+        self.assertEqual(poller.run_once()["approved"], 0)
+        self.assertEqual(self.controller.store.count("inputs"), 1)
+
+    def test_operational_profile_edits_preserve_review_generation(self):
+        original = self.profile.publishers().generation
+        self.profile.raw.update(
+            execution={"workflow_revision": "a" * 40},
+            mirror={"approved_caller": "b" * 40},
+            source_token_file="/another/credential",
+        )
+        self.assertEqual(self.profile.publishers().generation, original)
+        self.profile.raw.pop("execution")
+        self.profile.raw.pop("mirror")
+        self.profile.raw.pop("source_token_file")
+        self.assertEqual(self.profile.publishers().generation, original)
 
 
 class MixedExecution(MixedFixture, unittest.TestCase):
@@ -388,6 +464,8 @@ class MixedExecution(MixedFixture, unittest.TestCase):
                 WorkerTask.from_json(damaged)
         original_binding = loads(self.controller.store.row("tasks", {"id": task_id})["task_binding"])
         self.ledger.policy = dataclasses.replace(self.ledger.policy, harness_revision="e" * 40)
+        self.assertGreater(self.controller.renew_task(task_id, task.claim_token), self.clock())
+        self.profile.raw["authority_generation"] = "2" * 32
         with self.assertRaises(TaskError):
             self.controller.renew_task(task_id, task.claim_token)
         self.assertEqual(loads(self.controller.store.row("tasks", {"id": task_id})["task_binding"]), original_binding)
@@ -421,6 +499,17 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "execution control files changed"):
             self.ci.prepare({}, [], "2" * 32)
 
+    def test_publication_disable_preserves_pending_landing_and_mirror_intents(self):
+        self.start_mixed()
+        self.controller._enqueue("mixed-sync", "paused-sync", {})
+        self.controller.set_setting("publication_enabled", False, "fixture")
+        self.native.calls.clear()
+        self.controller._drain_outbox(self.clock())
+        entry = self.controller.store.row("outbox", {"key": "paused-sync"})
+        self.assertEqual(entry["state"], "pending")
+        self.assertEqual(entry["attempts"], 0)
+        self.assertEqual(self.native.calls, [])
+
     def test_ambiguous_landing_blocks_primary_change_until_readback_reconciles(self):
         from tauceti_queue.controller import ControllerError
 
@@ -440,6 +529,78 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         self.assertEqual(self.native_repo.main_sha(), frozen.request.head)
         self.assertTrue(self.controller.change_primary("forgejo", "fixture")["changed"])
         self.assertEqual(len(self.execution.dispatches), 1)
+
+    def test_disabled_mixed_ci_ownership_is_held_even_for_github_only_members(self):
+        self.registry_value.primary = "forgejo"
+        head = self.github.create_pr(17, {"Github.lean": "github\n"})
+        self.controller.approve(self.controller.repository, 17, head, "fixture")
+        self.controller.tick()
+        self.assertEqual(len(self.execution.dispatches), 1)
+        self.controller.mixed = self.controller.mixed_ci = None
+        self.controller.source = self.github
+        self.github.calls.clear()
+        self.controller.tick()
+        self.assertTrue(self.controller.status()["head"]["source_disabled"])
+        self.assertFalse(
+            any(
+                name in {"find_candidate_run", "read_run", "dispatch_candidate", "fast_forward"}
+                for name, _ in self.github.calls
+            )
+        )
+
+    def test_failed_preflight_without_a_sent_write_does_not_block_primary_change(self):
+        frozen = self.start_mixed()
+        self.controller._enqueue(
+            "promote",
+            "failed-before-send",
+            {
+                "batch_id": 1,
+                "version": 2,
+                "tip": frozen.request.head,
+                "attempt_id": frozen.attempt_id,
+                "primary": "github",
+                "primary_generation": 0,
+                "promotion_send": {"state": "not-sent"},
+            },
+        )
+        entry = self.controller.store.row("outbox", {"key": "failed-before-send"})
+        self.controller.store.update("outbox", {"id": entry["id"]}, attempts=1, next_attempt_at=self.clock() + 3600)
+        self.assertTrue(self.controller.change_primary("forgejo", "fixture")["changed"])
+
+    def test_mixed_scope_rechecks_the_full_repaired_candidate(self):
+        from tauceti_queue.ports import PromotionRefused
+
+        frozen = self.start_mixed()
+        self.execution.add(frozen, classification="passed")
+        self.native.admission_policy.prefix = "OnlyAllowed/"
+        self.native.admission_policy.allow_files = ()
+        with self.assertRaisesRegex(PromotionRefused, "native path policy"):
+            self.ci.verify_promotion(frozen.attempt_id, self.controller._members(1), self.controller.source)
+
+    def test_sync_network_wait_does_not_block_paid_claim_renewal(self):
+        import threading
+
+        self.start_mixed()
+        batch = self.controller._head()
+        self.controller._create_task(batch, "repair", batch["base"], [], self.clock())
+        self.github.admins.add("reviewer")
+        task = self.controller.claim_task("repair-worker", "reviewer")
+        completed = threading.Event()
+
+        def remote_wait(registry):
+            worker = threading.Thread(
+                target=lambda: (self.controller.renew_task(task.task_id, task.claim_token), completed.set())
+            )
+            worker.start()
+            self.assertTrue(completed.wait(2), "mirror I/O held the worker request lock")
+            worker.join()
+            return {}
+
+        self.controller._enqueue("mixed-sync", "slow-sync", {})
+        entry = self.controller.store.row("outbox", {"key": "slow-sync"})
+        with patch("tauceti_queue.mixed_landing.synchronize", side_effect=remote_wait):
+            self.controller._drain_entry(entry, self.clock())
+        self.assertEqual(self.controller.store.row("outbox", {"id": entry["id"]})["state"], "done")
 
 
 if __name__ == "__main__":

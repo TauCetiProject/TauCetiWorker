@@ -20,10 +20,13 @@ class MainWriter(ForgejoGitSource):
         super().__init__(identity, Forgejo(identity.repository.forge, token=token), clone, token=token)
         self.actor_id = actor_id
 
-    def fast_forward(self, *args):
+    def check_actor(self):
         actor = self.client.current_user()
         if type(actor.get("id")) is not int or actor["id"] != self.actor_id:
             raise ValueError("Forgejo main writer differs from its configured native actor ID")
+
+    def fast_forward(self, *args):
+        self.check_actor()
         return super().fast_forward(*args)
 
 
