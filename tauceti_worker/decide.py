@@ -557,7 +557,7 @@ def _ask(w, opts, packet: dict) -> tuple[int, object]:
     profile = _effective_authoring_profile(opts)
     argv, env = host_agent_argv(prompt, profile)
     # The answer is a file and every write to a forge is this module's, so the agent gets no token:
-    # not the pre-selection environment `--github-account` keeps, nor the Git credential header and
+    # not the pre-selection environment `--github-account` keeps, nor the Git credential settings and
     # token file a Forgejo source's `activate` puts in the environment.
     for name in [*CREDENTIAL_ENV, *(name for name in env if name.startswith("GIT_CONFIG_"))]:
         env.pop(name, None)

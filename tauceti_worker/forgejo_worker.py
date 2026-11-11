@@ -146,58 +146,15 @@ class ForgejoWorkerSource(ForgejoReadSource):
         return rows
 
     def pr_diff(self, pr):
-        """`GitHub.pr_diff` on this source: the unified diff of the pull request, open or merged, from
-        its merge base to its head, made from both commits fetched into a scratch repository (the
-        API returns no patch text). The merge base is the one Forgejo recorded for the pull request,
-        since after a merge `base.sha` is the target branch's tip, which already holds the head; it
-        is computed from `base.sha` only where none is recorded. None when unreadable."""
-        import subprocess
-        import tempfile
-
-        row = self.live_pull(pr)
-        if row is None:
-            return None
-        recorded = row.get("merge_base") or ""
-        base = recorded if re.fullmatch(r"[0-9a-f]{40}", recorded) else row["base"]["sha"]
-        head = row["head"]["sha"]
-        if not all(re.fullmatch(r"[0-9a-f]{40}", value or "") for value in (base, head)):
-            return None
-        with tempfile.TemporaryDirectory(prefix="tauceti-diff-") as work:
-
-            def git(*arguments):
-                return subprocess.run(
-                    ["git", "--no-replace-objects", "-C", work, "-c", "core.hooksPath=/dev/null", *arguments],
-                    capture_output=True,
-                    check=True,
-                    timeout=600,
-                ).stdout
-
-            try:
-                git("init", "--quiet")
-                git("fetch", "--quiet", "--no-tags", self.repository.clone_url, base)
-                git("fetch", "--quiet", "--no-tags", self.repository.clone_url, f"refs/pull/{pr}/head")
-                if git("rev-parse", "FETCH_HEAD").decode().strip() != head:
-                    return None
-                merge_base = base if base == recorded else git("merge-base", base, head).decode().strip()
-                return git("diff", "--no-ext-diff", "--no-textconv", merge_base, head).decode(errors="replace")
-            except (OSError, subprocess.SubprocessError):
-                return None
+        """`GitHub.pr_diff` on this source, through the same `gh pr diff` command; None when unreadable."""
+        result = self._gh(["pr", "diff", str(pr)])
+        return result.stdout if result.returncode == 0 else None
 
     def close_pr(self, pr, comment):
-        """`GitHub.close_pr` on this source: close with a comment; True once a fresh read shows it closed."""
-        from tauceti_tools.forge_write import ForgejoWriter
-
-        actor = self.authenticated_actor()
-        if actor is None:
-            return False
-        try:
-            self.validate_binding()
-            writer = ForgejoWriter(self.api, expected_user_id=actor.principal.native_id)
-            writer.lifecycle(self.repository, pr, pull=True, state="closed", comment=comment)
-        except ForgeError:
-            pass
-        finally:
-            self.invalidate(pr)
+        """`GitHub.close_pr` on this source, through the same `gh pr close` command; True once a fresh
+        read shows it closed."""
+        self._gh(["pr", "close", str(pr), "--comment", comment])
+        self.invalidate(pr)
         row = self.live_pull(pr)
         return row is not None and row.get("state") == "closed"
 

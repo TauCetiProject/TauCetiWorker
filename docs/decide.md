@@ -246,9 +246,9 @@ all of these hold at the moment of closing:
   (`theorem`, `lemma`, `def`, `abbrev`, `instance`, `structure`, `class`,
   `inductive`, `opaque`, `axiom`, compared by name as written) is also added by
   the diff of one of those merged pull requests. A pull request that adds no
-  named declaration cannot be closed this way. On Forgejo, whose API returns no
-  patch text, each diff runs from the merge base Forgejo recorded for the pull
-  request to its head, both fetched into a scratch repository.
+  named declaration cannot be closed this way. Each diff is read with `gh pr
+  diff`, on Forgejo through the source's command layer, which returns the pull
+  request's own diff from its recorded merge base, merged or not.
 
 The closing comment is the model's `comment` followed by the evidence checked
 and a line saying the closure was automatic and can be reopened. The comparison

@@ -1208,80 +1208,26 @@ def test_forgejo(tmp):
 
 
 def test_forgejo_adapters(tmp):
-    """`pr_diff` and `close_pr` on the Forgejo worker source."""
-    from tauceti_worker import forgejo_worker
+    """`pr_diff` and `close_pr` on the Forgejo worker source are the familiar `gh pr` commands."""
     from tauceti_worker.forgejo_worker import ForgejoWorkerSource
 
-    remote = tmp / "remote.git"
+    ran, state = [], {"state": "open"}
 
-    def git(*arguments, cwd=remote):
-        return subprocess.run(["git", "-C", str(cwd), *arguments], capture_output=True, check=True, text=True).stdout
+    def gh(args):
+        ran.append(args)
+        if args[:2] == ["pr", "close"]:
+            state["state"] = "closed"
+        out = LEAN if args == ["pr", "diff", "5"] else ""
+        return subprocess.CompletedProcess(args, 0 if args[2] in ("5", "8") else 1, out, "")
 
-    env = {
-        "GIT_AUTHOR_NAME": "t",
-        "GIT_AUTHOR_EMAIL": "t@example.org",
-        "GIT_COMMITTER_NAME": "t",
-        "GIT_COMMITTER_EMAIL": "t@example.org",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_CONFIG_NOSYSTEM": "1",
-    }
-    with patch.dict(os.environ, env):
-        work = tmp / "work"
-        work.mkdir()
-        git("init", "--quiet", "-b", "main", cwd=work)
-        (work / "A.lean").write_text("theorem base_fact : True := trivial\n")
-        git("add", ".", cwd=work)
-        git("commit", "--quiet", "-m", "base", cwd=work)
-        base = git("rev-parse", "HEAD", cwd=work).strip()
-        (work / "A.lean").write_text("theorem base_fact : True := trivial\ntheorem strong_law : True := trivial\n")
-        git("commit", "--quiet", "-am", "pr", cwd=work)
-        head = git("rev-parse", "HEAD", cwd=work).strip()
-        git("clone", "--quiet", "--bare", str(work), str(remote), cwd=tmp)
-        git("update-ref", "refs/pull/5/head", head)
-        pulls = {5: {"state": "open", "base": {"sha": base}, "head": {"sha": head}}}
-        fake = SimpleNamespace(
-            repository=SimpleNamespace(clone_url=str(remote)),
-            live_pull=lambda n: pulls.get(n),
-        )
-        diff = ForgejoWorkerSource.pr_diff(fake, 5)
-        check(
-            "pr_diff: the merge-base diff from fetched commits", decide.added_declarations(diff or ""), {"strong_law"}
-        )
-        check("…None for a pull request it cannot read", ForgejoWorkerSource.pr_diff(fake, 6), None)
-        git("update-ref", "refs/heads/main", head)
-        pulls[5] = {"state": "closed", "merged": True, "base": {"sha": head}, "head": {"sha": head}, "merge_base": base}
-        check(
-            "…and for a merged one, from the merge base Forgejo recorded, not the target branch's tip",
-            decide.added_declarations(ForgejoWorkerSource.pr_diff(fake, 5) or ""),
-            {"strong_law"},
-        )
-
-    calls = []
-
-    class Writer:
-        def __init__(self, api, expected_user_id=None):
-            calls.append(("writer", expected_user_id))
-
-        def lifecycle(self, repository, number, *, pull, state, comment=None):
-            calls.append((number, pull, state, comment))
-            pulls[number]["state"] = state
-
-    fake = SimpleNamespace(
-        api=None,
-        repository=FORGEJO,
-        authenticated_actor=ForgejoHub().authenticated_actor,
-        validate_binding=lambda: None,
-        invalidate=lambda n: calls.append(("invalidate", n)),
-        live_pull=lambda n: pulls.get(n),
-    )
-    with patch("tauceti_tools.forge_write.ForgejoWriter", Writer):
-        closed = ForgejoWorkerSource.close_pr(fake, 5, "subsumed")
+    fake = SimpleNamespace(_gh=gh, invalidate=lambda n: ran.append(("invalidate", n)), live_pull=lambda n: dict(state))
+    check("pr_diff: `gh pr diff` through the source", ForgejoWorkerSource.pr_diff(fake, 5), LEAN)
+    check("…None when the command fails", ForgejoWorkerSource.pr_diff(fake, 6), None)
     check(
-        "close_pr: a lifecycle close with the comment, as the source's own actor, confirmed by a fresh read",
-        (closed, calls),
-        (True, [("writer", "3"), (5, True, "closed", "subsumed"), ("invalidate", 5)]),
+        "close_pr: `gh pr close` with the comment, confirmed by a fresh read",
+        (ForgejoWorkerSource.close_pr(fake, 8, "subsumed"), ran[-2:]),
+        (True, [["pr", "close", "8", "--comment", "subsumed"], ("invalidate", 8)]),
     )
-    del forgejo_worker
 
 
 def main():
