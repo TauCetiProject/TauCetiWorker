@@ -124,6 +124,58 @@ class ForgejoWorkerSource(ForgejoReadSource):
             raise SourceUnavailable("Forgejo merged pull request listing is unavailable")
         return rows
 
+    def pr_diff(self, pr):
+        """`GitHub.pr_diff` on this source: the unified diff of the pull request, open or merged, from
+        its merge base to its head, made from both commits fetched into a scratch repository (the
+        API returns no patch text). None when unreadable."""
+        import subprocess
+        import tempfile
+
+        row = self.live_pull(pr)
+        if row is None:
+            return None
+        base, head = row["base"]["sha"], row["head"]["sha"]
+        if not all(re.fullmatch(r"[0-9a-f]{40}", value or "") for value in (base, head)):
+            return None
+        with tempfile.TemporaryDirectory(prefix="tauceti-diff-") as work:
+
+            def git(*arguments):
+                return subprocess.run(
+                    ["git", "--no-replace-objects", "-C", work, "-c", "core.hooksPath=/dev/null", *arguments],
+                    capture_output=True,
+                    check=True,
+                    timeout=600,
+                ).stdout
+
+            try:
+                git("init", "--quiet")
+                git("fetch", "--quiet", "--no-tags", self.repository.clone_url, base)
+                git("fetch", "--quiet", "--no-tags", self.repository.clone_url, f"refs/pull/{pr}/head")
+                if git("rev-parse", "FETCH_HEAD").decode().strip() != head:
+                    return None
+                merge_base = git("merge-base", base, head).decode().strip()
+                return git("diff", "--no-ext-diff", "--no-textconv", merge_base, head).decode(errors="replace")
+            except (OSError, subprocess.SubprocessError):
+                return None
+
+    def close_pr(self, pr, comment):
+        """`GitHub.close_pr` on this source: close with a comment; True once a fresh read shows it closed."""
+        from tauceti_tools.forge_write import ForgejoWriter
+
+        actor = self.authenticated_actor()
+        if actor is None:
+            return False
+        try:
+            self.validate_binding()
+            writer = ForgejoWriter(self.api, expected_user_id=actor.principal.native_id)
+            writer.lifecycle(self.repository, pr, pull=True, state="closed", comment=comment)
+        except ForgeError:
+            pass
+        finally:
+            self.invalidate(pr)
+        row = self.live_pull(pr)
+        return row is not None and row.get("state") == "closed"
+
     def issue_list(self, repository, **options):
         from .github import GitHub
 

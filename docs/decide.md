@@ -64,14 +64,17 @@ directory holds a live incident or a live ruling. It then:
    incident whose record a repair round rewrote while the model was out stays
    live, and is put to the model in its own right on a later round.
 
-With a Forgejo source enabled as well, the phase runs on the GitHub source after
-both sources are surveyed and ahead of either source's work, so a hold it lifts
-is gone from the next round's survey rather than this one's. Incident records
-are ruled on only for the worker's GitHub repository; a round in which GitHub
-could not be surveyed does not rule. A record of another source, whose key
-carries that source's digest (see [incidents](incidents.md)), is never put to the
-model, acknowledged or settled by the phase; rulings are keyed the same way, so
-a GitHub ruling neither lifts that record's hold nor adds a note to its prompt.
+With a Forgejo source enabled, a round looks at each source that answered its
+survey, GitHub first, ahead of either source's work; the first source whose
+round puts cases to the model ends it, and a hold a ruling lifts is gone from
+the next round's survey rather than this one's. A source's round reads only that
+source's records, which [incidents](incidents.md) keys apart, and reads every
+pull request state, diff and author from that source: pull request numbers in a
+case, in `blocked_on` and in `subsumed_by` are that source's. Rulings are keyed
+the same way, so a ruling on one source neither lifts another source's hold nor
+adds a note to its prompt. Each source has its own round lock and gap
+(`.decide.lock` for the GitHub repository TAUCETI, `.decide.<digest>.lock` for
+any other), so the sources' rounds neither wait on nor delay each other.
 
 ## The rulings
 
@@ -96,12 +99,13 @@ request waited on has landed, the ruling becomes `escalate`.
 ## Ruling records
 
 A ruling is an incident record of kind `ruling`, written to the same directory
-as `ruling-<incident kind>-<stage>-<pr>.json`. Beside the
+as `ruling-<incident kind>-<incident key>.json`, which for the GitHub repository
+TAUCETI is `ruling-<incident kind>-<stage>-<pr>.json`. Beside the
 [common fields](incidents.md#fields) it has:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `repository`, `stage`, `pr`, `head` | | Copied from the incident |
+| `repository`, `forge`, `repository_id`, `stage`, `pr`, `head` | | Copied from the incident, where it has them |
 | `incident` | string | `declined` or `budget-spent` |
 | `incident_at` | string | The incident's `last_at` when it was ruled on |
 | `incident_version` | string | `incidents.version()` of the incident record it rules on: two writes of a record never share it, even within one second. A `retry` lifts the hold only while the latest `declined` record at its head has this version. |
@@ -176,7 +180,9 @@ The answer is `{"rulings": [...]}` with one object per case: `case`, `ruling`,
 
 The model runs on the host, as `progress` and `overlap-scan` do, with
 `GH_TOKEN` and `GITHUB_TOKEN` removed from its environment, and with them the
-copy of the environment from before `--github-account` selected an account.
+copy of the environment from before `--github-account` selected an account, the
+`GIT_CONFIG_*` settings that carry a Forgejo source's Git credential, and the
+variables naming its token file.
 Every write is made by the worker, after the checks on this page.
 
 ## What `prerequisite` writes
@@ -188,6 +194,9 @@ does not have gets a section at the end of the file:
 ```markdown
 - [ ] `kolmogorov-zero-one` — Layer 2: tail events have probability 0 or 1 (unblocks: #412; needs: `borel-cantelli`; added by: decide)
 ```
+
+A pull request on GitHub is named `#N`; one on a Forgejo source by its URL, as
+the [target list](target-lists.md) names pull requests of that forge.
 
 The area must be a roadmap directory or a section of the list, every `needs`
 slug must be on the list or an earlier item of the same ruling, never the item
@@ -202,7 +211,8 @@ and does not remove an item once the pull request it unblocks has gone.
 ## Roadmap drafts
 
 A `roadmap` ruling writes `drafts/roadmap-<pr>.md` under the incident
-directory: the title, the roadmap, the pull request it would unblock, and the
+directory (`roadmap-<pr>.<digest>.md` for a repository other than the GitHub
+one TAUCETI): the title, the roadmap, the pull request it would unblock, and the
 proposed change in the model's words. The worker opens nothing in the roadmap
 repository; a person reads the draft and files the change, or does not.
 
@@ -214,12 +224,15 @@ all of these hold at the moment of closing:
 - `TAUCETI_DECIDE_CLOSE` is on, and fewer than
   `TAUCETI_DECIDE_MAX_CLOSES_PER_DAY` closures were attempted today (UTC),
   counted from `closures.log` in the incident directory. Each attempt appends
-  one line (time, pull request, head) before the pull request is closed; a log
+  one line (time, pull request as `#N` on GitHub or its URL elsewhere, head)
+  before the pull request is closed, on every forge; a log
   that cannot be read or written refuses the closure.
-- The worker holds the pull request's branch claim. Where the claim cannot be
-  registered at all, a repair round goes on unclaimed; a closure does not.
+- The worker holds the pull request's branch claim: the GitHub claim on GitHub,
+  the source's Git lease on Forgejo. Where the claim cannot be registered at
+  all, a repair round on GitHub goes on unclaimed; a closure does not.
 - A fresh read shows the pull request open, not a draft, at the head the
-  incident names, authored by the worker's own account, and under none of the
+  incident names, authored by the worker's own account on that source (the
+  GitHub login, or the Forgejo source's authenticated actor), and under none of the
   hold labels listed above. It is made twice: before the diffs below are read,
   and again after, immediately before closing.
 - Every pull request the ruling names as subsuming it has merged; a Bors
@@ -228,7 +241,9 @@ all of these hold at the moment of closing:
   (`theorem`, `lemma`, `def`, `abbrev`, `instance`, `structure`, `class`,
   `inductive`, `opaque`, `axiom`, compared by name as written) is also added by
   the diff of one of those merged pull requests. A pull request that adds no
-  named declaration cannot be closed this way.
+  named declaration cannot be closed this way. On Forgejo, whose API returns no
+  patch text, each diff runs from the merge base to the head, both fetched into
+  a scratch repository.
 
 The closing comment is the model's `comment` followed by the evidence checked
 and a line saying the closure was automatic and can be reopened. The comparison

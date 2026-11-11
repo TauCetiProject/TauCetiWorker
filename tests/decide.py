@@ -14,6 +14,7 @@ import fcntl
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -88,6 +89,9 @@ class Hub:
             "isDraft": v.get("draft", False),
             "author": {"login": v.get("author", "me")},
             "labels": [{"name": name} for name in v.get("labels", [])],
+            "headRefName": f"branch-{n}",
+            "headRepositoryOwner": {"login": TAUCETI.split("/")[0]},
+            "headRepository": {"name": TAUCETI.split("/")[1]},
         }
 
     def open_prs(self):
@@ -115,6 +119,29 @@ class Hub:
         self.closed.append((n, comment))
         self.prs[n]["state"] = "CLOSED"
         return True
+
+
+FORGEJO = RepositoryRef(Forge("forgejo", "https://forge.example"), TAUCETI)
+
+
+class ForgejoHub(Hub):
+    """The same pull requests as `Hub`, served by a Forgejo source of the same repository name."""
+
+    repository = FORGEJO
+    direct_source = True
+
+    def authenticated_actor(self):
+        from tauceti_worker.source_identity import SourceActor
+
+        return SourceActor.from_native(FORGEJO.forge, {"id": 3, "login": "me"})
+
+    def live_pull(self, n):
+        row = self._row(n)
+        return {
+            "state": row["state"].lower(),
+            "head": {"sha": row["headRefOid"], "repo": {"full_name": TAUCETI}},
+            "user": {"id": 3},
+        }
 
 
 def declined(*numbers):
@@ -219,7 +246,7 @@ def test_selection(root, tmp):
             patch("tauceti_worker.review_diagnostics.refund_stale_head_errors"),
             patch.object(work_units, "_host_agent_binary", return_value="python3"),
             patch.object(work_units, "do_decide", side_effect=lambda *a: ran.append("decide") or 0),
-            patch.object(decide, "due", side_effect=lambda: asked.append(1) or real_due()),
+            patch.object(decide, "due", side_effect=lambda **k: asked.append(1) or real_due(**k)),
             patch("tauceti_worker.github_transport.observed_budget", return_value={}),
             patch("tauceti_worker.claude_api.api_mode", return_value=False),
         ):
@@ -251,45 +278,66 @@ def test_selection(root, tmp):
 
 
 def test_several_sources(root, go, decided):
-    """With a Forgejo source enabled, the phase runs on the GitHub source ahead of either source's work."""
+    """With a Forgejo source enabled, the phase runs on each source, GitHub first, ahead of either
+    source's work; the first that starts the model ends the round."""
     from tauceti_worker import multi_source, worker_sources
 
-    github = SimpleNamespace(cfg=SimpleNamespace(wid="w1", state=root.parent / "state"))
+    github = SimpleNamespace(cfg=SimpleNamespace(wid="w1", state=root.parent / "state"), gh="github-client")
+    forgejo = SimpleNamespace(cfg=SimpleNamespace(wid="w1", state=root.parent / "forgejo"), gh="forgejo-client")
 
     def observed(*names):
-        return [(name, github if name == "github" else SimpleNamespace(), tc.Survey("w1")) for name in names]
+        return [(name, github if name == "github" else forgejo, tc.Survey("w1")) for name in names]
 
     def ran(only, observations, outcomes):
         opts = tc.RoundOpts(only=only, agent="auto", work_model="auto", sandbox_host=True, dry_run=True)
+        activated = []
         with (
             settings(root, TAUCETI_NEW_PR_FORGE="github"),
             patch.object(multi_source, "log"),
             patch.object(multi_source, "collect", return_value=observations),
             patch.object(multi_source, "deduplicate"),
-            patch.object(multi_source, "activate", return_value=contextlib.nullcontext()),
+            patch.object(
+                multi_source,
+                "activate",
+                side_effect=lambda gh, cfg: activated.append(gh) or contextlib.nullcontext(),
+            ),
             patch.object(work_units, "run_round", side_effect=outcomes) as execute,
         ):
             try:
                 result = multi_source.run_round(None, opts)
             except tc.NoProgress as error:
                 result = str(error)
-        calls = [(c.args[0], c.args[1].only, c.kwargs["prepared_survey"]) for c in execute.call_args_list]
-        return result, calls
+        calls = [(c.args[0], c.args[1].only) for c in execute.call_args_list]
+        return result, calls, activated
 
-    both = observed("github", "forgejo")
-    check("decide alone: one GitHub round for it", ran(["decide"], both, [0]), (0, [(github, ["decide"], both[0][2])]))
+    both = observed("forgejo", "github")
+    check("decide alone: GitHub first", ran(["decide"], both, [0]), (0, [(github, ["decide"])], []))
     nothing = tc.NoProgress("decide: no live incident or ruling")
-    result, calls = ran(["decide", "fix"], both, [nothing, 0])
     check(
-        "…with other work, that work follows when it ruled nothing",
-        (result, [c[1] for c in calls]),
-        ("no eligible PR work on the selected forges", [["decide"]]),
+        "…then Forgejo, under its own activation, when GitHub had nothing",
+        ran(["decide"], both, [nothing, 0]),
+        (0, [(github, ["decide"]), (forgejo, ["decide"])], ["forgejo-client"]),
     )
-    check("…and a decide-only round says why", ran(["decide"], both, [nothing]), (str(nothing), calls[:1]))
     check(
-        "without a GitHub survey it does not run",
-        ran(["decide"], observed("forgejo"), []),
-        ("decide: GitHub was not surveyed this round, and incident records are about it", []),
+        "…each with the other source's client for the target list",
+        (github.target_sources, forgejo.target_sources),
+        (["forgejo-client"], ["github-client"]),
+    )
+    result, calls, _ = ran(["decide", "fix"], both, [nothing, nothing, 0])
+    check(
+        "…with other work, that work follows when neither ruled",
+        (result, [c[1] for c in calls]),
+        ("no eligible PR work on the selected forges", [["decide"], ["decide"]]),
+    )
+    check(
+        "…and a decide-only round says why for each",
+        ran(["decide"], both, [nothing, nothing])[0],
+        f"github: {nothing}; forgejo: {nothing}",
+    )
+    check(
+        "a Forgejo-only round rules on Forgejo",
+        ran(["decide"], observed("forgejo"), [0])[:2],
+        (0, [(forgejo, ["decide"])]),
     )
     with (
         settings(root, TAUCETI_DECIDE_GAP="0"),
@@ -515,34 +563,6 @@ def test_rounds(tmp):
             ["h3", "h1", "h2", 1],
         )
 
-    root = tmp / "sources"
-    forgejo = RepositoryRef(Forge("forgejo", "https://forge.example"), TAUCETI)
-    with settings(root):
-        declined(1)
-        incidents.record_declined("fix", 1, "head-1", message="declined on Forgejo", repository=forgejo)
-        foreign = incidents.find(incidents.DECLINED, incidents.subject("fix", 1, forgejo))[0]
-        seen = rounds(tmp, Hub(p1={}), answer((1, "retry", {})))
-        check("a Forgejo record of the same stage and number is not put to the model", len(seen["packet"]["cases"]), 1)
-        check(
-            "…a retry on the GitHub one lifts only the GitHub hold",
-            (incidents.declined("fix", 1, "head-1"), incidents.declined("fix", 1, "head-1", forgejo)),
-            (False, True),
-        )
-        check(
-            "…and adds no note to the Forgejo pull request's prompt", decide.retry_note("fix", 1, "head-1", forgejo), ""
-        )
-        rounds(tmp, Hub(p1={"state": "CLOSED"}))
-        check(
-            "…which is never acknowledged, even once GitHub's #1 has closed",
-            incidents.find(incidents.DECLINED, incidents.subject("fix", 1, forgejo)),
-            [foreign],
-        )
-        check(
-            "…and is kept apart from every acknowledged GitHub record",
-            sorted(path.name for path in (root / incidents.ACKED).iterdir()),
-            ["declined-fix-1.json", "ruling-declined-fix-1.json"],
-        )
-
     root = tmp / "cap"
     with settings(root, TAUCETI_DECIDE_MAX_CASES="2"):
         for n in (1, 2, 3):
@@ -748,6 +768,13 @@ def test_prerequisite(tmp):
         )[2],
         True,
     )
+    native = decide.prerequisite_lines([item("x-y-z")], decide.pull_ref(FORGEJO, 7), targets, areas)[0][0][2]
+    check(
+        "a Forgejo pull request is named by its URL, as the list's other references are",
+        f"(unblocks: {FORGEJO.pull_url(7)};" in native,
+        True,
+    )
+    check("…and a GitHub one by number", decide.pull_ref(None, 7), "#7")
     check("the list is written", decide.add_prerequisites(path, lines), (["zero-one", "nets"], ""))
     check("…under its lock", (tmp / ".targets.md.lock").exists(), True)
     after = parse_targets(path.read_text())
@@ -1001,6 +1028,165 @@ def test_close(tmp):
         )
 
 
+def forgejo_answer(*rows):
+    return {
+        "rulings": [
+            {"case": f"declined-{incidents.subject('fix', n, FORGEJO)}", "ruling": r, "note": f"because of {r}", **f}
+            for n, r, f in rows
+        ]
+    }
+
+
+def test_forgejo(tmp):
+    """A Forgejo source's incidents are ruled on in a round on that source, apart from GitHub's."""
+    root = tmp / "forgejo"
+    forgejo_name = f"declined-{incidents.subject('fix', 1, FORGEJO)}.json"
+    with settings(root):
+        declined(1)
+        incidents.record_declined("fix", 1, "head-1", message="#1 declined on Forgejo", repository=FORGEJO)
+        seen = rounds(tmp, ForgejoHub(p1={}), forgejo_answer((1, "retry", {})))
+        case = seen["packet"]["cases"]
+        check(
+            "a Forgejo round puts only the Forgejo record to the model, named by its source",
+            ([c["case"] for c in case], case[0]["url"], seen["packet"]["repository"]),
+            ([forgejo_name[: -len(".json")]], FORGEJO.pull_url(1), FORGEJO.url),
+        )
+        value = load(root / f"ruling-{forgejo_name}")
+        check(
+            "…its ruling carries the source and the incident is acknowledged under its own name",
+            (value["ruling"], value["forge"]["kind"], where(root, forgejo_name), where(root, "declined-fix-1.json")),
+            ("retry", "forgejo", ["acked"], ["live"]),
+        )
+        check(
+            "a retry lifts only that source's hold",
+            (incidents.declined("fix", 1, "head-1", FORGEJO), incidents.declined("fix", 1, "head-1")),
+            (False, True),
+        )
+        check(
+            "…and notes only that source's prompt",
+            (
+                "because of retry" in decide.retry_note("fix", 1, "head-1", FORGEJO),
+                decide.retry_note("fix", 1, "head-1"),
+            ),
+            (True, ""),
+        )
+        check(
+            "the GitHub round is not delayed by the Forgejo one",
+            (decide.due(source=FORGEJO)[0], decide.due()[0]),
+            (False, True),
+        )
+        seen = rounds(tmp, Hub(p1={"state": "CLOSED"}))
+        check(
+            "a GitHub round settles only GitHub's records",
+            (where(root, "declined-fix-1.json"), where(root, f"ruling-{forgejo_name}")),
+            (["acked"], ["live"]),
+        )
+
+    root = tmp / "forgejo-close"
+    comment = "Everything here landed through #41, in the same file and under the same names."
+    with settings(root, TAUCETI_DECIDE_CLOSE="1"):
+        hub = ForgejoHub(p8={}, p41={"state": "MERGED"})
+        incidents.record_declined("fix", 8, "head-8", message="subsumed", repository=FORGEJO)
+        lease = SimpleNamespace(acquire=lambda: 0, released=[])
+        lease.release = lambda: lease.released.append(True)
+        from tauceti_worker import source_claims
+
+        ctx = SimpleNamespace(add_cleanup=lambda f: None)
+        cfg = SimpleNamespace(state=tmp / "forgejo-state", wid="w1")
+        with (
+            patch.object(source_claims, "lease", return_value=lease) as taken,
+            patch.object(source_claims.SourceClaims, "start_heartbeat"),
+            patch.dict(os.environ, {}),
+        ):
+            claims = source_claims.SourceClaims(cfg, ctx, hub)
+            seen = rounds(
+                tmp, hub, forgejo_answer((8, "close", {"subsumed_by": [41], "comment": comment})), claims=claims
+            )
+        check(
+            "a subsumed Forgejo pull request is offered close", "close" in seen["packet"]["cases"][0]["allowed"], True
+        )
+        check(
+            "…and closed under its own source's branch lease, released after",
+            ([n for n, _ in hub.closed], taken.call_args.args[2], lease.released, claims.held),
+            ([8], "branch/8", [True], None),
+        )
+        check(
+            "…the closure log names it by its URL",
+            (root / decide.CLOSURES).read_text().split()[1:],
+            [FORGEJO.pull_url(8), "head-8"],
+        )
+
+
+def test_forgejo_adapters(tmp):
+    """`pr_diff` and `close_pr` on the Forgejo worker source."""
+    from tauceti_worker import forgejo_worker
+    from tauceti_worker.forgejo_worker import ForgejoWorkerSource
+
+    remote = tmp / "remote.git"
+
+    def git(*arguments, cwd=remote):
+        return subprocess.run(["git", "-C", str(cwd), *arguments], capture_output=True, check=True, text=True).stdout
+
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.org",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.org",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    with patch.dict(os.environ, env):
+        work = tmp / "work"
+        work.mkdir()
+        git("init", "--quiet", "-b", "main", cwd=work)
+        (work / "A.lean").write_text("theorem base_fact : True := trivial\n")
+        git("add", ".", cwd=work)
+        git("commit", "--quiet", "-m", "base", cwd=work)
+        base = git("rev-parse", "HEAD", cwd=work).strip()
+        (work / "A.lean").write_text("theorem base_fact : True := trivial\ntheorem strong_law : True := trivial\n")
+        git("commit", "--quiet", "-am", "pr", cwd=work)
+        head = git("rev-parse", "HEAD", cwd=work).strip()
+        git("clone", "--quiet", "--bare", str(work), str(remote), cwd=tmp)
+        git("update-ref", "refs/pull/5/head", head)
+        pulls = {5: {"state": "open", "base": {"sha": base}, "head": {"sha": head}}}
+        fake = SimpleNamespace(
+            repository=SimpleNamespace(clone_url=str(remote)),
+            live_pull=lambda n: pulls.get(n),
+        )
+        diff = ForgejoWorkerSource.pr_diff(fake, 5)
+        check(
+            "pr_diff: the merge-base diff from fetched commits", decide.added_declarations(diff or ""), {"strong_law"}
+        )
+        check("…None for a pull request it cannot read", ForgejoWorkerSource.pr_diff(fake, 6), None)
+
+    calls = []
+
+    class Writer:
+        def __init__(self, api, expected_user_id=None):
+            calls.append(("writer", expected_user_id))
+
+        def lifecycle(self, repository, number, *, pull, state, comment=None):
+            calls.append((number, pull, state, comment))
+            pulls[number]["state"] = state
+
+    fake = SimpleNamespace(
+        api=None,
+        repository=FORGEJO,
+        authenticated_actor=ForgejoHub().authenticated_actor,
+        validate_binding=lambda: None,
+        invalidate=lambda n: calls.append(("invalidate", n)),
+        live_pull=lambda n: pulls.get(n),
+    )
+    with patch("tauceti_tools.forge_write.ForgejoWriter", Writer):
+        closed = ForgejoWorkerSource.close_pr(fake, 5, "subsumed")
+    check(
+        "close_pr: a lifecycle close with the comment, as the source's own actor, confirmed by a fresh read",
+        (closed, calls),
+        (True, [("writer", "3"), (5, True, "closed", "subsumed"), ("invalidate", 5)]),
+    )
+    del forgejo_worker
+
+
 def main():
     def gmtime(seconds=None):
         return real_gmtime(clock[0] if seconds is None else seconds)
@@ -1014,6 +1200,8 @@ def main():
         test_prerequisite(tmp)
         test_roadmap(tmp)
         test_close(tmp)
+        test_forgejo(tmp)
+        test_forgejo_adapters(tmp)
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
     return 1 if fails else 0
 

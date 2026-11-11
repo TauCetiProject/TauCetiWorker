@@ -30,8 +30,10 @@ A [managed worker](workers.md) gets both through its `env` table.
 <dir>/acked/<kind>-<key>.json    acknowledged
 <dir>/acked/<kind>-<key>.json.<n> earlier acknowledged records of that name
 <dir>/.decide.lock               the decide phase's lock and last-round time
+<dir>/.decide.<digest>.lock      the same for another source's records
 <dir>/.records.lock              held while a live record is written or acknowledged
-<dir>/drafts/roadmap-<pr>.md     roadmap changes the decide phase drafted
+<dir>/drafts/roadmap-<pr>.md     roadmap changes the decide phase drafted (with
+                                 the key's digest for another source)
 <dir>/closures.log               one line per closure the decide phase attempted
 ```
 

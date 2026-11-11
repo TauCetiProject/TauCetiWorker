@@ -485,7 +485,9 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         # Ahead of the survey, so a hold that a `retry` ruling lifts is already gone from it.
         from . import decide
 
-        ready, why = (False, "it takes no --pr") if getattr(opts, "prs", ()) else decide.due()
+        ready, why = (
+            (False, "it takes no --pr") if getattr(opts, "prs", ()) else decide.due(source=incidents.source_of(w.gh))
+        )
         if ready:
             rc = dispatch("decide", w, Survey(worker_id=w.cfg.wid), Candidate(0, "", why), opts)
             if rc is not None:
