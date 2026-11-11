@@ -228,8 +228,8 @@ other top-level key is an error, as is any unrecognized field inside a
 | `roadmap_extra_identities` | string list | `[]` | Extra GitHub logins whose claimed intentions count as this worker's own |
 | `extra_roadmap_prompt` | string | unset | Operator guidance rendered into the roadmap prompt, steering target choice within the designated roadmap. Not blank, at most 4096 characters; other phases ignore it |
 | `respect_claims` | bool | `true` | Whether to avoid intentions others have claimed |
-| `reactions` | bool | `true` | Whether a contest re-review is claimed with a 👀 on GitHub; `false` keeps the claim in the shared GitHub state directory (`--no-reactions`) |
-| `stuck_issues` | bool | `true` | Whether to open "Review stuck" tracking issues for pull requests the worker cannot review (`--no-stuck-issues`) |
+| `reactions` | bool | `true` | Whether a contest re-review is claimed with a 👀 on GitHub; `false` keeps the claim in the shared GitHub state directory (`--no-reactions`); no effect on a Forgejo source, which coordinates with Git leases |
+| `stuck_issues` | bool | `true` | Whether to open "Review stuck" tracking issues for pull requests the worker cannot review, or on a Forgejo source post its stuck comment on the pull request (`--no-stuck-issues`) |
 | `source` | string | unset | Supplementary repository directory or URL. Requires `roadmap` in `only` and a non-empty `roadmap_only` |
 | `author_model` | string | unset | Exact authoring model. Requires an `agent` other than `auto` |
 | `author_effort` | string | unset | Authoring reasoning effort for Codex, Claude, or Kiro. Requires an explicit `agent` |

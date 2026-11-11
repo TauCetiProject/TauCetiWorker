@@ -402,8 +402,8 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         dest="stuck_issues",
         action="store_false",
         default=None,
-        help='do not open or update "Review stuck" tracking issues; the per-round warning still '
-        "prints. Sets $TAUCETI_STUCK_ISSUES=0",
+        help='do not open or update "Review stuck" tracking issues, or post the stuck comment on a '
+        "Forgejo pull request; the per-round warning still prints. Sets $TAUCETI_STUCK_ISSUES=0",
     )
     p.add_argument(
         "--auto-refresh",

@@ -206,6 +206,10 @@ class ForgejoWorkerSource(ForgejoReadSource):
         # route a diagnostic to the same-numbered GitHub PR.
         from tauceti_tools.forge_write import ForgejoWriter
 
+        from .config import stuck_issues_enabled
+
+        if not stuck_issues_enabled():
+            return
         marker = "<!--tauceti-worker-stuck-->"
         comments = self.issue_comments(pr, fresh=True)
         if comments is None or any(marker in row.get("body", "") for row in comments):
