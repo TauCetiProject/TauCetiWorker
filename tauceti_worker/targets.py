@@ -29,6 +29,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .config import Die, NoProgress, SourceUnavailable, log
 from .survey import TARGET_MARKER_RE
@@ -37,6 +38,7 @@ MARKER_RE = re.compile(r"<!--\s*tauceti-targets:v1\s*-->")
 MARKER_TAG = "tauceti-target:v1"
 MERGED_SEARCH = f'"{MARKER_TAG}" in:body'
 MERGED_LIMIT = 200
+_ID_PHRASE = re.compile(r'"id":"(.*)"')
 _AREA_RE = re.compile(r"[A-Za-z0-9_-]+")
 _HEADING_RE = re.compile(r"^##\s+(.*?)\s*$")
 _ITEM_RE = re.compile(r"^\s*-\s*\[([ xX~])\]\s*(.*?)\s*$")
@@ -178,6 +180,15 @@ def _is_partial(clause: str) -> bool:
     return clause.partition(":")[0].strip().lower() == "partial"
 
 
+def ref_key(ref: str) -> str:
+    """What identifies a pull request reference: `#N` as written, a URL in any case and without a
+    trailing slash, since a forge's owner and repository names are not case-sensitive."""
+    if ref.startswith("#"):
+        return ref
+    parts = urlsplit(ref)
+    return f"{parts.scheme.lower()}://{parts.netloc.lower()}{parts.path.rstrip('/').casefold()}"
+
+
 def overlay_live(targets: Targets, inflight: set[Key], done: set[Key]) -> Targets:
     """The list with each item at its effective status: done if the file says so or its key is in
     `done`; else in flight if the file says so or its key is in `inflight`; else open."""
@@ -199,14 +210,19 @@ def landed(items: Iterable[TargetItem], merged: Iterable[dict]) -> dict[Key, int
     items = list(items)
     excused = {(it.area, it.slug): partial_prs(it) for it in items}
     urls = {
-        (it.area, it.slug): set(re.findall(r"https?://[^\s,;]+", " ".join(c for c in it.meta if _is_partial(c))))
+        (it.area, it.slug): {
+            ref_key(u) for u in re.findall(r"https?://[^\s,;]+", " ".join(c for c in it.meta if _is_partial(c)))
+        }
         for it in items
     }
     done: dict[Key, int] = {}
     for d in merged:
         keys, partial = marker_keys(d.get("body"))
         for key in keys - partial:
-            named = d["url"] in urls.get(key, ()) if d.get("url") else d.get("number") in excused.get(key, ())
+            if d.get("url"):
+                named = ref_key(d["url"]) in urls.get(key, ())
+            else:
+                named = d.get("number") in excused.get(key, ())
             if key in excused and not named:
                 done.setdefault(key, d.get("number"))
     return done
@@ -235,6 +251,20 @@ def search_phrases(search: str) -> list[str]:
     return [p.replace('\\"', '"') for p in re.findall(r'"((?:[^"\\]|\\.)*)"', search)]
 
 
+def search_id(phrases: list[str]) -> str | None:
+    """The slug of an `"id":"<slug>"` phrase, as `landed_pr` searches for one item."""
+    return next((m[1] for p in phrases if (m := _ID_PHRASE.fullmatch(p))), None)
+
+
+def body_matches(body: str, phrases: list[str]) -> bool:
+    """Whether a body satisfies a search's phrases: an `"id":"<slug>"` phrase by a parsed marker
+    with that id, whatever its JSON spacing, any other phrase as a substring."""
+    ident = search_id(phrases)
+    if ident is not None and ident not in {i for _, i in marker_keys(body)[0]}:
+        return False
+    return all(p in body for p in phrases if not _ID_PHRASE.fullmatch(p))
+
+
 def github_history_enabled() -> bool:
     """TAUCETI_ROADMAP_TARGETS_GITHUB: whether a round with no GitHub source still reads the GitHub
     content repository's marked pull requests (`GitHubMarkerReads`). On unless set to 0."""
@@ -245,8 +275,8 @@ class GitHubMarkerReads:
     """A source for `live_targets` and `landed_pr` made of the GitHub content repository's
     marker-bearing pull requests, for a round whose sources do not include GitHub (a list carried
     over from GitHub). One listing (`GitHub.target_marker_prs`) serves the open side, the merged
-    side and every item's landing search. A failed read is logged once and counts as no pull
-    requests, which leaves the list's own marks."""
+    side and every item's landing search it can answer. A failed read is logged and counts as no
+    pull requests, which leaves the list's own marks."""
 
     def __init__(self, gh=None):
         from .github import GitHub
@@ -254,27 +284,36 @@ class GitHubMarkerReads:
         self.gh = gh if gh is not None else GitHub()
         self._rows: list[dict] | None = None
 
+    def _read(self, fetch) -> list[dict]:
+        from .config import GitHubUnavailable
+        from .github import GitHubError
+        from .worker_sources import shared_github_environment
+
+        try:
+            with shared_github_environment():
+                return fetch()
+        except (GitHubError, GitHubUnavailable, SourceUnavailable, OSError, ValueError) as e:
+            log(f"target list: GitHub pull requests unreadable ({e}); using the list's own marks for them")
+            return []
+
     def _listing(self) -> list[dict]:
         if self._rows is None:
-            from .config import GitHubUnavailable
-            from .github import GitHubError
-            from .worker_sources import shared_github_environment
-
-            try:
-                with shared_github_environment():
-                    self._rows = self.gh.target_marker_prs(limit=MERGED_LIMIT)
-            except (GitHubError, GitHubUnavailable, SourceUnavailable, OSError, ValueError) as e:
-                log(f"target list: GitHub pull requests unreadable ({e}); using the list's own marks for them")
-                self._rows = []
+            self._rows = self._read(lambda: self.gh.target_marker_prs(limit=MERGED_LIMIT))
         return self._rows
 
     def open_prs(self) -> list[dict]:
         return [d for d in self._listing() if d.get("state") == "OPEN"]
 
     def merged_prs(self, search: str, *, limit: int = MERGED_LIMIT) -> list[dict]:
+        """The listing's merged rows matching `search`. One item's search (`landed_pr`) that the
+        listing cannot answer, because it holds MERGED_LIMIT rows and so may not reach back far
+        enough, goes to GitHub as `GitHub.merged_prs`."""
         phrases = search_phrases(search)
-        rows = [d for d in self._listing() if d.get("state") == "MERGED"]
-        return [d for d in rows if all(p in (d.get("body") or "") for p in phrases)][:limit]
+        listing = self._listing()
+        rows = [d for d in listing if d.get("state") == "MERGED" and body_matches(d.get("body") or "", phrases)]
+        if rows or search_id(phrases) is None or len(listing) < MERGED_LIMIT:
+            return rows[:limit]
+        return self._read(lambda: self.gh.merged_prs(search, limit=limit))
 
 
 def landed_pr(item: TargetItem, gh) -> int | None:

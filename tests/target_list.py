@@ -557,8 +557,9 @@ class Forgejo(unittest.TestCase):
         self.repo = RepositoryRef(Forge("forgejo", "https://git.example.org"), "one/project")
         self.api = Mock(forge=self.repo.forge, _token="fixture-token", max_bytes=1024 * 1024, max_pages=100)
         self.source = ForgejoWorkerSource(RepositoryIdentity(self.repo, 7), self.api, token_file=None)
-        self.api.pulls.return_value = []
-        self.api.pages.return_value = iter([])
+        self.closed = []  # the closed-pull listing's pages; `found` is the keyword search's
+        self.found = []
+        self.api.pages.side_effect = lambda path: iter(self.closed if "/pulls?" in path else self.found)
         self.source.open_prs = Mock(return_value=[])
 
     @staticmethod
@@ -566,21 +567,25 @@ class Forgejo(unittest.TestCase):
         return {"number": number, "title": "t", "body": body, "state": "closed", "merged": merged}
 
     def test_merged_listing_and_keyword_search(self):
-        self.api.pulls.return_value = [self.pull(3, marker("Algebra", "a")), self.pull(4, "none")]
-        recent = self.source.merged_prs(f"{t.MERGED_SEARCH} sort:updated-desc", limit=200)
-        self.assertEqual([(d["number"], d["url"]) for d in recent], [(3, self.repo.pull_url(3))])
-        self.api.pulls.assert_called_once_with(self.repo, state="merged", limit=200)
+        self.closed = [
+            [self.pull(1, "none"), self.pull(2, "none"), self.pull(3, marker("Algebra", "a"), merged=False)],
+            [self.pull(4, marker("Algebra", "a")), self.pull(5, marker("Algebra", "b"))],
+        ]
+        recent = self.source.merged_prs(f"{t.MERGED_SEARCH} sort:updated-desc", limit=1)
+        self.assertEqual([(d["number"], d["url"]) for d in recent], [(4, self.repo.pull_url(4))])
+        self.assertEqual(self.api.pages.call_args.args[0], "repos/one/project/pulls?state=closed")
+        self.api.max_pages = 1
+        self.assertEqual(self.source.merged_prs(f"{t.MERGED_SEARCH} sort:created", limit=200), [])
+        self.api.max_pages = 100
         item = t.TargetItem("Algebra", "a", "open", "x")
         landed = t.target_markers(item)[0]
-        self.api.pages.return_value = iter(
+        self.found = [
             [
-                [
-                    {"number": 8, "body": landed, "pull_request": {"merged": True}},
-                    {"number": 9, "body": landed, "pull_request": {"merged": False}},
-                    {"number": 10, "body": marker("Algebra", "ab"), "pull_request": {"merged": True}},
-                ]
+                {"number": 8, "body": landed, "pull_request": {"merged": True}},
+                {"number": 9, "body": landed, "pull_request": {"merged": False}},
+                {"number": 10, "body": marker("Algebra", "ab"), "pull_request": {"merged": True}},
             ]
-        )
+        ]
         self.assertEqual(t.landed_pr(item, self.source), 8)
         path = self.api.pages.call_args.args[0]
         self.assertTrue(path.startswith("repos/one/project/issues?type=pulls&state=closed&q="), path)
@@ -588,9 +593,9 @@ class Forgejo(unittest.TestCase):
 
         from tauceti_worker.config import SourceUnavailable
 
-        self.api.pulls.side_effect = ForgeError("down")
+        self.api.pages.side_effect = ForgeError("down")
         with self.assertRaises(SourceUnavailable):
-            self.source.merged_prs(f"{t.MERGED_SEARCH} sort:created", limit=200)
+            self.source.merged_prs(f"{t.MERGED_SEARCH} sort:updated", limit=200)
 
     def test_partial_clause_names_a_forgejo_pull_request_by_url(self):
         url = self.repo.pull_url(5)
@@ -631,6 +636,93 @@ class Forgejo(unittest.TestCase):
         self.assertIsNone(claims.held)
 
 
+class ForgejoIdentity(unittest.TestCase):
+    """Fork resolution beside author claims, partial-URL identity, spaced marker JSON, and claim
+    cleanup after a branch collision, on the `Forgejo` fixture."""
+
+    setUp = Forgejo.setUp
+    pull = staticmethod(Forgejo.pull)
+
+    def test_the_github_claim_fork_does_not_become_the_native_fork(self):
+        github = importlib.import_module("tauceti_worker.github")
+        sources = importlib.import_module("tauceti_worker.worker_sources")
+        self.source.writable_repository = Mock(return_value=SimpleNamespace(name="native-user/project"))
+        github.ensure_fork.cache_clear()
+        self.addCleanup(github.ensure_fork.cache_clear)
+        with (
+            patch.object(github, "_resolve_fork", return_value="github-user/TauCeti"),
+            patch.object(github, "can_push", return_value=True),
+        ):
+            self.assertEqual(github.ensure_fork(), "github-user/TauCeti")
+            token = sources._selected.set(self.source)
+            try:
+                self.assertEqual(github.ensure_fork(), "native-user/project")
+                self.assertEqual(github.ensure_fork(), "native-user/project")
+            finally:
+                sources._selected.reset(token)
+            self.assertEqual(github.ensure_fork(), "github-user/TauCeti")
+        self.source.writable_repository.assert_called_once_with()
+
+    def test_a_partial_url_matches_whatever_its_case(self):
+        listed = t.parse_targets(
+            "<!-- tauceti-targets:v1 -->\n## Algebra\n"
+            "- [ ] `a` — x (partial: https://git.example.org/One/Project/pulls/5)\n- [ ] `b` — y (needs: a)\n"
+        )
+        self.closed = [[self.pull(5, marker("Algebra", "a"))]]
+        live = t.live_targets(listed, self.source)
+        self.assertEqual(status(live), {"a": "open", "b": "open"})
+        self.assertEqual([it.slug for it in t.eligible_items(live, "Algebra")], ["a"])
+
+    def test_spaced_marker_json_still_counts_as_a_landing(self):
+        spaced = '<!--tauceti-target:v1 {"focus": "Algebra", "id": "old"}-->'
+        self.found = [[{"number": 8, "body": spaced, "pull_request": {"merged": True}}]]
+        self.assertEqual(t.landed_pr(t.TargetItem("Algebra", "old", "open", "x"), self.source), 8)
+        self.assertIn("q=old", self.api.pages.call_args.args[0])
+
+    def test_an_author_claim_is_released_after_a_branch_collision(self):
+        from tauceti_worker.source_claims import SourceClaims
+
+        cleanups = []
+        claims = SourceClaims(SimpleNamespace(wid="w1"), SimpleNamespace(add_cleanup=cleanups.append), self.source)
+        stale = Mock()
+        claims.lease = stale  # what begin_branch_work leaves behind when another worker holds the branch
+        with (
+            patch("tauceti_worker.worker_sources.shared_github_environment", contextlib.nullcontext),
+            patch("tauceti_worker.round.claims_repo", return_value="org/claims"),
+            patch("tauceti_worker.round.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run,
+            patch.object(SourceClaims, "start_heartbeat"),
+            patch.object(SourceClaims, "stop_heartbeat"),
+        ):
+            self.assertEqual(claims.begin_target_work("Algebra", "next"), 0)
+            for cleanup in cleanups:
+                cleanup()
+        self.assertEqual(
+            [c.args[0][1:3] for c in run.call_args_list],
+            [["acquire", "author/Algebra/next"], ["release", "author/Algebra/next"]],
+        )
+        stale.release.assert_not_called()
+        self.assertIsNone(claims.lease)
+
+
+class GitHubHistoryLookup(unittest.TestCase):
+    def test_a_full_snapshot_falls_back_to_the_per_item_search(self):
+        newer = [{"number": 500 + i, "body": marker("Algebra", f"x{i}"), "state": "MERGED"} for i in range(200)]
+        gh = SimpleNamespace(
+            target_marker_prs=Mock(return_value=newer),
+            merged_prs=Mock(return_value=[{"number": 1, "body": marker("Algebra", "old")}]),
+        )
+        with patch("tauceti_worker.worker_sources.shared_github_environment", contextlib.nullcontext):
+            reads = t.GitHubMarkerReads(gh)
+            self.assertEqual(t.landed_pr(t.TargetItem("Algebra", "old", "open", "x"), reads), 1)
+            self.assertEqual(t.landed_pr(t.TargetItem("Algebra", "x3", "open", "x"), reads), 503)
+        gh.merged_prs.assert_called_once()
+        gh.target_marker_prs.assert_called_once()
+        short = SimpleNamespace(target_marker_prs=Mock(return_value=newer[:5]), merged_prs=Mock())
+        with patch("tauceti_worker.worker_sources.shared_github_environment", contextlib.nullcontext):
+            self.assertIsNone(t.landed_pr(t.TargetItem("Algebra", "old", "open", "x"), t.GitHubMarkerReads(short)))
+        short.merged_prs.assert_not_called()
+
+
 class ForgejoRound(unittest.TestCase):
     """A roadmap round whose new pull requests go to Forgejo, alone and beside GitHub."""
 
@@ -638,7 +730,7 @@ class ForgejoRound(unittest.TestCase):
 
     def setUp(self):
         Round.setUp(self)
-        fixture = Forgejo()
+        self.fixture = fixture = Forgejo()
         fixture.setUp()
         self.forgejo, self.api = fixture.source, fixture.api
         self.w.gh = self.forgejo
@@ -657,7 +749,7 @@ class ForgejoRound(unittest.TestCase):
             self.addCleanup(item.stop)
 
     def test_a_forgejo_landing_unlocks_its_dependents(self):
-        self.api.pulls.return_value = [Forgejo.pull(12, marker("Algebra", "first"))]
+        self.fixture.closed = [[Forgejo.pull(12, marker("Algebra", "first"))]]
         prompt = self.author()
         self.assertIn("Your target is assigned: `second` in `Algebra`", prompt)
         self.assertIn("  - [x] `first` — a", prompt)
@@ -676,7 +768,6 @@ class ForgejoRound(unittest.TestCase):
             self.author()
         self.w.target_sources = [github(open_bodies=[marker("Algebra", "third")])]
         self.forgejo.open_prs.return_value = []
-        self.api.pages.return_value = iter([])
         self.assertIn("Your target is assigned: `first` in `Algebra`", self.author())
 
     def test_a_forgejo_only_round_reads_the_lists_github_history_in_one_request(self):
