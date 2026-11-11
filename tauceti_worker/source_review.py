@@ -99,6 +99,9 @@ def engine_command(source, number, head, comparison, work, store, reviewer):
         raise RuntimeError("native finding history unavailable")
     by_id = {row["id"]: row for row in roots}
     for row in roots:
+        body = row.get("body", "") or ""
+        if "tauceti-reply:" in body or "tauceti-rubric:" in body:
+            continue  # Match the engine's GitHub filter: never contest our own answer.
         root = by_id.get(row.get("in_reply_to_id"))
         rubric = re.search(r"<!--tauceti-rubric:([a-z][a-z-]*)-->", root["body"]) if root else None
         if rubric:

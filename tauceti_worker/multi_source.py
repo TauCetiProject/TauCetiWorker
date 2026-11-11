@@ -146,6 +146,13 @@ def run_round(w, opts, *, use_fleet_focus=True):
         )
         if actionable:
             raise Die("; ".join(actionable.errors) + " — source configuration requires operator action")
+        waiting = next((value for _, _, value in observations if value.dependency_wait), None)
+        if waiting:
+            from .config import SharedStateUnavailable
+
+            raise SharedStateUnavailable(
+                "; ".join(waiting.errors) or "selected sources unavailable", waiting.dependency_wait
+            )
         raise NoProgress("all selected source surveys are unavailable")
     executable = [(name, worker, result) for name, worker, result in healthy if name == "github" or opts.sandbox_host]
     if len(executable) != len(healthy):
@@ -163,7 +170,12 @@ def run_round(w, opts, *, use_fleet_focus=True):
             if candidates:
                 priority = 0 if any(candidate.pr in bumps for candidate in candidates) else 1
                 choices.append((priority, index, name, worker, result, stage))
+    complete = all(not value.github_failed and not value.dependency_wait for _, _, value in observations)
+    execution_failed = set()
+    collisions = False
     for _, _, name, worker, result, stage in sorted(choices, key=lambda item: item[:2]):
+        if name in execution_failed:
+            continue
         selected = dataclasses.replace(opts, only=[stage])
         try:
             if name == "github":
@@ -171,14 +183,14 @@ def run_round(w, opts, *, use_fleet_focus=True):
             with activate(worker.gh, worker.cfg):
                 return ordinary_round(worker, selected, prepared_survey=result)
         except (ClaimCollision, GitHubUnavailable, SourceUnavailable, NoEligibleWork, ForgeError) as error:
+            collisions |= isinstance(error, ClaimCollision)
             if not isinstance(error, (ClaimCollision, NoEligibleWork)):
-                result.dependency_wait = {"dependency": name, "reason": "unavailable"}
+                execution_failed.add(name)
             log(f"{name}: selected work deferred ({type(error).__name__}); checking the other source")
             continue
     destination = os.environ.get("TAUCETI_NEW_PR_FORGE", "github")
     # Partial discovery cannot prove that a roadmap target is unclaimed on the
     # other source. Existing PR review/repair above remains available.
-    complete = all(not value.github_failed and not value.dependency_wait for _, _, value in observations)
     inventory = [
         {"source": name, "pr": pr.number, "head": pr.head_oid, "targets": pr.work_targets}
         for name, _, result in healthy
@@ -189,17 +201,27 @@ def run_round(w, opts, *, use_fleet_focus=True):
     for name, worker, result in executable:
         if (
             name == destination
+            and name not in execution_failed
             and complete
             and authored < result.max_open_prs
             and want(opts.only, "roadmap")
             and not opts.prs
         ):
             worker.cross_source_targets = inventory
+            selected = dataclasses.replace(opts, only=["roadmap"])
             if name == "github":
-                return ordinary_round(worker, opts, prepared_survey=result)
+                return ordinary_round(worker, selected, prepared_survey=result)
             with activate(worker.gh, worker.cfg):
-                return ordinary_round(worker, opts, prepared_survey=result)
-    raise NoProgress("no eligible PR work on the selected forges")
+                return ordinary_round(worker, selected, prepared_survey=result)
+    if (
+        use_fleet_focus
+        and want(opts.only, "roadmap")
+        and any(getattr(result, "_round_scope", (False, False))[1] for _, _, result in healthy)
+    ):
+        log("Fleet roadmap focus: no available focused work; selecting global maintenance")
+        return run_round(w, opts, use_fleet_focus=False)
+    error = ClaimCollision if collisions else NoEligibleWork
+    raise error("no eligible PR work on the selected forges")
 
 
 def display_survey(cfg, gh):

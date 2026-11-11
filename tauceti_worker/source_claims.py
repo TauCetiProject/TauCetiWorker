@@ -6,7 +6,7 @@ import os
 
 from tauceti_tools.claims import ForgejoGitClaim
 
-from .config import NoProgress
+from .config import SourceUnavailable
 from .constants import CLAIM_TTL_S
 from .round import Claims
 
@@ -49,7 +49,7 @@ class SourceClaims(Claims):
             self.collisions += 1
             return False
         if result != 0:
-            raise NoProgress("Forgejo branch claim unavailable before starting repair")
+            raise SourceUnavailable("Forgejo branch claim unavailable before starting repair")
         self.held = (f"branch/{pr}", self.source.repository.key)
         self.start_heartbeat(f"branch/{pr}", self.source.repo)
         self.ctx.add_cleanup(self.release)

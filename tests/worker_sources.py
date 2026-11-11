@@ -266,6 +266,53 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_toke
         self.assertTrue(archive)
         self.assertEqual(json.loads(archive[0].read_text())["repo"], self.repo.key)
 
+        # Publish using native handoff, then ask the real installed engine to
+        # repeat the same head. No provider may run a second time.
+        from tauceti_worker.source_publication import publish, retain_plan
+
+        native_comments = []
+        self.source.live_pull.return_value = {"state": "open", "head": {"sha": "a" * 40}}
+        self.source.issue_comments.side_effect = lambda *args, **kwargs: list(native_comments)
+
+        def write(method, endpoint, body):
+            native_comments[:] = [
+                {
+                    "id": 17,
+                    "body": body["body"],
+                    "user": {"id": 3, "login": "worker"},
+                    "created_at": "2026-11-11T00:00:00Z",
+                }
+            ]
+
+        self.source.api.request.side_effect = write
+        store = self.root / "review-store"
+        publication = retain_plan(
+            self.source, SimpleNamespace(store=store / "ledger.json"), 1, "a" * 40, work / "plan.json", actor_id=3
+        )
+        self.assertTrue(publish(self.source, publication))
+        ledger = json.loads((store / "ledger.json").read_text())["prs"]["1"]
+        self.assertEqual(ledger["published_head_sha"], "a" * 40)
+        self.assertNotIn("pending_publication_head_sha", ledger)
+        (work / "code").mkdir()
+        # An earlier engine answer has a native parent but is never a new contest.
+        self.source.review_comments.return_value = [
+            {"id": 10, "body": "<!--tauceti-rubric:style-->", "user": {"login": "worker"}},
+            {
+                "id": 11,
+                "in_reply_to_id": 10,
+                "body": "<!--tauceti-reply:style--> Reviewer answer",
+                "user": {"login": "worker"},
+            },
+        ]
+        with patch("tauceti_worker.source_review.git", side_effect=prepare_rubrics):
+            command = engine_command(self.source, 1, "a" * 40, ("b" * 40, "b" * 40), work, store, "codex")
+        self.assertEqual(json.loads((work / "replies.json").read_text()), {})
+        command.extend(["--rubrics", "style"])
+        codex.write_text("#!" + sys.executable + "\nraise RuntimeError('second model call')\n")
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout[-1200:])
+        self.assertIs(json.loads((work / "plan.json").read_text())["review_changed"], False)
+
     def test_numeric_target_with_inherited_both_still_defaults_to_github(self):
         with patch.dict(os.environ, {"TAUCETI_WORKER_FORGES": "both"}, clear=True):
             configure(SimpleNamespace(pr=["1"]))
@@ -368,6 +415,81 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_toke
             self.source.anonymous_discovery = False
             self.assertTrue(recover_native(self.cfg, None, SimpleNamespace()))
             pending.assert_called_once()
+
+    def test_native_execution_failure_does_not_invalidate_github_authoring_inventory(self):
+        import contextlib
+
+        from tauceti_worker.config import SourceUnavailable
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import RoundOpts
+
+        observations = self.observations([], [])
+        observations[1][2].reviewable.actionable = [Candidate(2, "b" * 40)]
+        for _, worker, _ in observations:
+            worker.cfg = self.cfg
+        options = RoundOpts(
+            only=["review", "roadmap"], agent="auto", work_model="codex", sandbox_host=True, dry_run=True
+        )
+        with (
+            patch.dict(os.environ, {"TAUCETI_NEW_PR_FORGE": "github"}),
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.multi_source.activate", return_value=contextlib.nullcontext()),
+            patch(
+                "tauceti_worker.work_units.run_round", side_effect=[SourceUnavailable("claim unavailable"), 0]
+            ) as execute,
+        ):
+            self.assertEqual(run_round(None, options), 0)
+        self.assertEqual(execute.call_args.args[1].only, ["roadmap"])
+        self.assertIsNone(observations[1][2].dependency_wait)
+
+    def test_multi_source_fleet_backpressure_falls_back_to_global_maintenance(self):
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import RoundOpts
+
+        scoped, global_work = self.observations([], []), self.observations([], [])
+        for _, _, result in scoped:
+            result._round_scope = (False, True)
+            result.n_mine_open = result.max_open_prs
+        global_work[0][2].reviewable.actionable = [Candidate(1, "a" * 40)]
+        options = RoundOpts(
+            only=["review", "roadmap"], agent="auto", work_model="codex", sandbox_host=True, dry_run=True
+        )
+        with (
+            patch("tauceti_worker.multi_source.collect", side_effect=[scoped, global_work]) as collect,
+            patch("tauceti_worker.work_units.run_round", return_value=0),
+        ):
+            self.assertEqual(run_round(None, options), 0)
+        self.assertFalse(collect.call_args.kwargs["use_fleet_focus"])
+
+    def test_native_branch_claim_outage_refunds_unlaunched_repair(self):
+        from tauceti_worker.config import SourceUnavailable
+        from tauceti_worker.work_units import _do_fixlike
+
+        pr = PRInfo.from_json(
+            {
+                "number": 1,
+                "headRefOid": "a" * 40,
+                "headRefName": "proposal",
+                "headRepositoryOwner": {"login": "worker"},
+                "headRepository": {"name": "project"},
+            }
+        )
+        counters = Counters(self.cfg)
+        counters.write("fix-1", 1)
+        worker = SimpleNamespace(claims=Mock(), counters=counters)
+        worker.claims.begin_branch_work.side_effect = SourceUnavailable("claim unavailable")
+        with self.assertRaises(SourceUnavailable):
+            _do_fixlike(
+                worker,
+                SimpleNamespace(open_prs=[pr]),
+                Candidate(1, "a" * 40),
+                None,
+                False,
+                prompt_file="fix.md",
+                label="fix",
+                charged=("fix-1",),
+            )
+        self.assertEqual(counters.read("fix-1"), 0)
 
 
 if __name__ == "__main__":

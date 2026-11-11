@@ -138,7 +138,18 @@ class NativeWorker(unittest.TestCase):
                 self.assertEqual(peer_claim.acquire(), 1)
                 self.assertEqual(first_claim.release(), 0)
                 cfg.store_dir.mkdir(parents=True)
-                cfg.store.write_text(json.dumps({"prs": {str(pr): {"state": {"style": {}}}}}))
+                cfg.store.write_text(
+                    json.dumps(
+                        {
+                            "prs": {
+                                str(pr): {
+                                    "pending_publication_head_sha": head,
+                                    "state": {"style": {"pending_thread_run_id": "fixture-run"}},
+                                }
+                            }
+                        }
+                    )
+                )
                 meta = {"head_sha": head, "mode": "commit", "states": {"style": "blocking_request"}}
                 (work / "scoreboard.md").write_text(
                     "<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 " + json.dumps(meta) + "-->\nChanges requested."
@@ -186,6 +197,10 @@ class NativeWorker(unittest.TestCase):
                     publication = retain_plan(source, cfg, pr, head, work / "plan.json", actor_id=actor_id)
                 self.assertFalse((work / "code").exists())
                 self.assertTrue(publish(source, publication))
+                published_state = json.loads(cfg.store.read_text())["prs"][str(pr)]
+                self.assertEqual(published_state["published_head_sha"], head)
+                self.assertNotIn("pending_publication_head_sha", published_state)
+                self.assertNotIn("pending_thread_run_id", published_state["state"]["style"])
                 roots = source.review_comments(pr)
                 self.assertEqual(len(roots), 1)
                 root = roots[0]

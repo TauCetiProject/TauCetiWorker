@@ -1817,7 +1817,15 @@ def _do_fixlike(
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
             log(f"  {label} #{pr}: explicit fork repair scope is no longer valid — skipping")
             return None
-    if not w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo):
+    from .config import SourceUnavailable
+
+    try:
+        acquired = w.claims.begin_branch_work(pr, head, p.head_ref, p.head_owner, p.head_repo)
+    except SourceUnavailable:
+        for key in charged:
+            w.counters.write(key, max(0, w.counters.read(key) - 1))
+        raise
+    if not acquired:
         # Losing a claim never launched an attempt. Concurrent workers can
         # still pick the same candidate after independently shuffling.
         for key in charged:

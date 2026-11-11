@@ -9,7 +9,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from tauceti_tools.forge import AmbiguousWrite, Incomplete
+from tauceti_tools.forge import AmbiguousWrite, ForgeError, Incomplete
 
 from .runtime_status import atomic_json
 
@@ -254,10 +254,19 @@ def publish(source, publication_path):
     ledger = json.loads(ledger_path.read_text())
     state = ledger["prs"][str(number)]
     state["scoreboard_comment_id"] = exact["id"]
+    state["published_head_sha"] = head
+    if state.get("pending_publication_head_sha") == head:
+        state.pop("pending_publication_head_sha", None)
+    runs = {
+        action["rubric"]: action.get("run_id")
+        for action in value["threads"]
+        if action.get("required", action.get("action") == "upsert")
+    }
     for rubric, identifier in confirmed.items():
         case = state.setdefault("state", {}).setdefault(rubric, {})
         case["thread"] = {"comment_id": identifier, "head_sha": head}
-        case.pop("pending_thread_run_id", None)
+        if not runs[rubric] or case.get("pending_thread_run_id") == runs[rubric]:
+            case.pop("pending_thread_run_id", None)
     atomic_json(ledger_path, ledger)
     # The engine defines close notes and direct contest answers as best-effort
     # UI actions. They never substitute for required findings or the scoreboard.
@@ -346,5 +355,13 @@ def pending(source, cfg, *, numbers=()):
                 continue
             if value.get("state") == "prepared":
                 cleanup_inputs(work)
-                return publish(source, path)
+                try:
+                    if publish(source, path):
+                        return True
+                except ForgeError as error:
+                    from .config import log
+
+                    log(
+                        f"native retained review #{value['pr']} awaits publication ({type(error).__name__}); checking other retained work"
+                    )
     return False

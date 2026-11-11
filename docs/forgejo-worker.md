@@ -97,3 +97,11 @@ retry recovery, repair selection, replies, and stale-head refusal.
 python tests/worker_sources.py
 FORGEJO_BINARY=/path/to/forgejo python tests/integration_forgejo_worker.py
 ```
+
+Finding roots retain their reviewed head; a new head receives new roots. Native
+UI reply recognition uses the containing review and line location. Replies
+started as a separate review, or unmarked replies to a conversation finding,
+need the source-bound reply command to identify their parent reliably. The
+shared native claim repository must have Actions disabled. Matching target
+markers identify the same work target; contributors pursuing independent work
+must give their proposals distinct target IDs.
