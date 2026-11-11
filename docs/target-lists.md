@@ -132,9 +132,7 @@ GitHub source reads GitHub's marked pull requests as the roadmap round does
 be read, and the same `TAUCETI_ROADMAP_TARGETS_GITHUB=0` to stop it. A `#N`
 clause there is settled only from that listing, so one naming a pull request
 outside it (older, or without a marker) is left as it is; so is a clause naming
-a pull request of a source the round did not read. A closed GitHub pull request
-seen this way has no head in the listing, so a `declined` record cannot replace
-it and it is left to the operator.
+a pull request of a source the round did not read.
 
 A look makes these edits, each to one item line; every other line stays as it
 was:

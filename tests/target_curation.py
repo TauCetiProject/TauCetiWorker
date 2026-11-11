@@ -654,6 +654,27 @@ class ForgejoLists(Tmp):
         self.github_reads.assert_called_once_with(200)
         self.forgejo.pr_view.assert_not_called()
 
+    def test_a_closed_github_pull_request_is_matched_to_its_record_by_head(self):
+        self.forgejo.api.pulls.return_value = []
+        listed = EXAMPLE.replace("in flight: #1234", "in flight: #41")
+        self.path.write_text(listed)
+        self.github_rows = [
+            {"number": 41, "title": "t", "body": "", "state": "CLOSED", "headRefOid": "b" * 40},
+            {
+                "number": 398,
+                "title": "t",
+                "body": marker("Probability", "other"),
+                "state": "MERGED",
+                "headRefOid": "c" * 40,
+            },
+        ]
+        incidents.record_declined("fix", 41, "a" * 40, message="Subsumed-by: #398")
+        self.assertEqual(self.curate(self.forgejo)[0], None)
+        self.assertEqual(self.path.read_text(), listed)
+        incidents.record_declined("rebase", 41, "b" * 40, message="Subsumed-by: #398")
+        self.assertEqual(self.curate(self.forgejo), (0, ""))
+        self.assertIn("(needs: none; subsumed by: #398; closed: #41)", self.path.read_text())
+
     def test_a_github_reference_outside_the_github_read_is_left_alone(self):
         self.forgejo.api.pulls.return_value = []
         listed = EXAMPLE.replace("in flight: #1234", "in flight: #40")
