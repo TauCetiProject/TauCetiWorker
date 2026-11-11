@@ -2159,9 +2159,14 @@ class Quota:
     def _claude_launch_credential_unusable(self) -> str | None:
         """Why the agents cannot launch, when a usage login answers for them and their own credential
         is known to be unusable: the file in $CLAUDE_CONFIG_DIR is missing, or it holds a token past
-        its expiry with no refresh token. None otherwise, and always off this route or on macOS, where
-        agents read the Keychain first."""
-        if claude_usage_credentials() is None or sys.platform == "darwin":
+        its expiry with no refresh token. None otherwise, and always off this route, on macOS, where
+        agents read the Keychain first, and with $CLAUDE_CODE_OAUTH_TOKEN set, which a native agent
+        inherits and authenticates with ahead of the file."""
+        if (
+            claude_usage_credentials() is None
+            or sys.platform == "darwin"
+            or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+        ):
             return None
         path = claude_dir(self.cfg.home) / ".credentials.json"
         oauth = _as_dict(_as_dict(_read_json_file(path)).get("claudeAiOauth"))

@@ -195,7 +195,9 @@ the usage login too, so the two credentials must belong to one account.
 The usage login says nothing about the agents' own token, so off macOS the
 worker also reads that file before Claude work starts, without a request: a
 missing file, or a token past its `expiresAt` with no refresh token, makes Claude
-unavailable whatever the usage login reports.
+unavailable whatever the usage login reports. With `CLAUDE_CODE_OAUTH_TOKEN` set
+the file is not checked: host agents inherit that variable and authenticate with
+it instead.
 
 ## macOS and the login Keychain
 
