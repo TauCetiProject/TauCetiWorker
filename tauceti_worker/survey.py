@@ -75,6 +75,8 @@ SHARED_ATTEMPT_RE = re.compile(
 # how late a contest reply on such a PR is noticed while its history is still being filled in.
 UNCHANGED_REVIEW_TTL = 6 * 3600
 
+COMPLETED_PREFIX = "done-"
+
 
 def checkpoint_counters(counters, names) -> dict[str, tuple[int, int]]:
     take = getattr(counters, "checkpoint", None)
@@ -89,6 +91,18 @@ def restore_counters(counters, saved: dict[str, tuple[int, int]]) -> None:
         return
     for name, (value, _added) in saved.items():
         counters.write(name, min(value, counters.read(name)))
+
+
+def settle_counters(counters, saved: dict[str, tuple[int, int]]) -> None:
+    settle = getattr(counters, "settle", None)
+    if settle:
+        settle(saved)
+
+
+def completed_attempts(counters, name: str) -> int:
+    """Attempts on `name` whose stage has finished: a peer's attempt still in progress may yet be refunded."""
+    completed = getattr(counters, "completed", None)
+    return completed(name) if completed else counters.read(name)
 
 
 def charge_attempts(counters, limits: dict[str, int | None]) -> bool:
@@ -120,7 +134,8 @@ class Counters:
         self._added: dict[str, int] = {}
 
     def _store(self, name: str) -> Path:
-        return self.shared if self.shared is not None and SHARED_ATTEMPT_RE.fullmatch(name) else self.state
+        shared = self.shared is not None and SHARED_ATTEMPT_RE.fullmatch(name.removeprefix(COMPLETED_PREFIX))
+        return self.shared if shared else self.state
 
     @contextlib.contextmanager
     def _locked(self):
@@ -186,6 +201,18 @@ class Counters:
             with self._locked():
                 stored = self._apply(name, self._read(name), min(0, added - self._added.get(name, 0)))
             self._seen[name] = stored
+
+    def settle(self, saved: dict[str, tuple[int, int]]) -> None:
+        """Record what this process still has charged since `checkpoint` as completed attempts."""
+        for name, (_value, added) in saved.items():
+            if self._store(name) is self.state or (finished := self._added.get(name, 0) - added) <= 0:
+                continue
+            with self._locked():
+                self._atomic_write(COMPLETED_PREFIX + name, str(self._read(COMPLETED_PREFIX + name) + finished))
+
+    def completed(self, name: str) -> int:
+        """In the shared directory, the attempts whose stage has settled; otherwise the counter itself."""
+        return self.read(name) if self._store(name) is self.state else self._read(COMPLETED_PREFIX + name)
 
     def _atomic_write(self, name: str, text: str) -> None:
         store = self._store(name)

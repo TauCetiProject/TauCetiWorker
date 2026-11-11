@@ -116,12 +116,14 @@ from .survey import (
     cascade,
     charge_attempts,
     checkpoint_counters,
+    completed_attempts,
     fix_disposition,
     owns_author,
     owns_pr,
     prioritize_review_candidates,
     progress_argv,
     restore_counters,
+    settle_counters,
     spread_candidates,
     survey,
 )
@@ -1161,36 +1163,40 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
         )
 
     try:
-        rc = fn(w, sv, c, opts, bubble)
-        check_result(rc)
-    except AdmissionUnavailable:
-        refund_admission()
-        raise
-    except GitHubUnavailable as error:
-        restore_counters(w.counters, before)
-        raise error
-    except NoProgress as error:
-        # Preserve verification, lease/cache, and other independently typed pauses.
-        if type(error) is NoProgress and blocked_since(started):
-            pause()
-        raise
-    except Exception:
-        # Only pre-inference parsing failures can stand in for a refused result.
-        from .claude_api import CURRENT_CONTEXT
-
-        if (
-            CURRENT_CONTEXT is not None
-            and not CURRENT_CONTEXT.launched
-            and isinstance(failure := blocked_failure(), AdmissionUnavailable)
-        ):
+        try:
+            rc = fn(w, sv, c, opts, bubble)
+            check_result(rc)
+        except AdmissionUnavailable:
             refund_admission()
-            raise failure from None
-        if blocked_since(started):
+            raise
+        except GitHubUnavailable as error:
+            restore_counters(w.counters, before)
+            raise error
+        except NoProgress as error:
+            # Preserve verification, lease/cache, and other independently typed pauses.
+            if type(error) is NoProgress and blocked_since(started):
+                pause()
+            raise
+        except Exception:
+            # Only pre-inference parsing failures can stand in for a refused result.
+            from .claude_api import CURRENT_CONTEXT
+
+            if (
+                CURRENT_CONTEXT is not None
+                and not CURRENT_CONTEXT.launched
+                and isinstance(failure := blocked_failure(), AdmissionUnavailable)
+            ):
+                refund_admission()
+                raise failure from None
+            if blocked_since(started):
+                pause()
+            raise
+        if rc != 0 and blocked_since(started):
             pause()
-        raise
-    if rc != 0 and blocked_since(started):
-        pause()
-    return rc
+        return rc
+    finally:
+        # A peer may close a PR on its completed attempts, so an attempt counts there once its stage ends.
+        settle_counters(w.counters, before)
 
 
 def _check_stage_read_quota(stage):
@@ -1233,7 +1239,11 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     os.environ["TAUCETI_GITHUB_PR"] = str(c.pr or "")
     _check_stage_read_quota(stage)
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
-    if stage == "fix" and c.final_resolution and w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS:
+    if (
+        stage == "fix"
+        and c.final_resolution
+        and completed_attempts(w.counters, f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS
+    ):
         return _close_spent_pr(w, sv, c)
     profile = _effective_authoring_profile(opts) if stage != "review" else None
     kiro_probe_profile = profile
@@ -2122,7 +2132,7 @@ def _close_spent_pr(w, sv, c) -> int | None:
         or not owns_pr(sv, p)
         or p.automatic_bump
         or c.foreign_repair_base
-        or w.counters.read(f"fix-{c.pr}-{c.head[:12]}") < MAX_FIX_ATTEMPTS
+        or completed_attempts(w.counters, f"fix-{c.pr}-{c.head[:12]}") < MAX_FIX_ATTEMPTS
     ):
         return None
     if not w.claims.begin_branch_work(c.pr, c.head, p.head_ref, p.head_owner, p.head_repo):

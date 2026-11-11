@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -224,6 +224,47 @@ class SharedAttemptsTests(unittest.TestCase):
         survey_mod.restore_counters(counters, saved)
         self.assertEqual(counters.read(FIX), 0)
 
+    def test_a_peer_closes_a_pr_only_on_completed_attempts(self):
+        first, second = self.counters("first"), self.counters("second")
+        candidate = SimpleNamespace(pr=7, head=HEAD, foreign_repair_base="")
+        pr = SimpleNamespace(number=7, automatic_bump=False, head_ref="feature", head_owner="me", head_repo="TauCeti")
+        sv = SimpleNamespace(open_prs=[pr], owns=lambda _pr: True)
+        claims = SimpleNamespace(begin_branch_work=Mock(return_value=False))
+        closer = SimpleNamespace(counters=second, claims=claims)
+        closures = []
+
+        def attempt(*, refunded=False):
+            def stage(*_args):
+                self.assertTrue(first.charge({FIX: survey_mod.MAX_FIX_ATTEMPTS}))
+                closures.append(work_units._close_spent_pr(closer, sv, candidate))
+                if refunded:
+                    first.write(FIX, max(0, first.read(FIX) - 1))
+                    return None
+                return 0
+
+            work_units._run_github_stage(
+                "fix", stage, SimpleNamespace(counters=first, cfg=None), None, candidate, None, False
+            )
+
+        with patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": str(self.root / "github")}):
+            for _ in range(survey_mod.MAX_FIX_ATTEMPTS - 1):
+                attempt()
+            # The last attempt is reserved, then refunded when its worker loses the branch claim.
+            attempt(refunded=True)
+            self.assertEqual(second.read(FIX), survey_mod.MAX_FIX_ATTEMPTS - 1)
+            claims.begin_branch_work.assert_not_called()
+            attempt()
+            self.assertEqual(survey_mod.completed_attempts(second, FIX), survey_mod.MAX_FIX_ATTEMPTS)
+            self.assertIsNone(work_units._close_spent_pr(closer, sv, candidate))
+            claims.begin_branch_work.assert_called_once()
+        self.assertEqual(closures, [None] * (survey_mod.MAX_FIX_ATTEMPTS + 1))
+
+        private = self.counters("private", shared=False)
+        private.write(FIX, 2)
+        self.assertEqual(survey_mod.completed_attempts(private, FIX), 2)
+        survey_mod.settle_counters(private, survey_mod.checkpoint_counters(private, (FIX,)))
+        self.assertEqual(sorted(path.name for path in (self.root / "private").iterdir()), [FIX])
+
     def test_the_helpers_need_only_read_and_write(self):
         values = {}
         counters = SimpleNamespace(read=lambda key: values.get(key, 0), write=values.__setitem__)
@@ -232,6 +273,8 @@ class SharedAttemptsTests(unittest.TestCase):
         self.assertEqual(values, {FIX: 1, "ci-pr-7": 1})
         survey_mod.restore_counters(counters, saved)
         self.assertEqual(values[FIX], 0)
+        survey_mod.settle_counters(counters, saved)
+        self.assertEqual(survey_mod.completed_attempts(counters, "ci-pr-7"), 1)
 
     def test_a_candidate_surveyed_before_a_peer_spent_the_budget_is_declined(self):
         first, second = self.counters("first"), self.counters("second")
