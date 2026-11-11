@@ -155,6 +155,27 @@ try:
             not any(p.name.startswith(".") for p in (pool / "toolchains").iterdir()),
         )
 
+        # `elan toolchain link custom DIR` in a worker's own ELAN_HOME, and a name the pool already links.
+        external = tmp / "lean-build"
+        (external / "bin").mkdir(parents=True)
+        (external / "bin" / "lean").write_text("#!/bin/sh\n")
+        (private / "custom").symlink_to(external, target_is_directory=True)
+        (private / "taken").symlink_to(external, target_is_directory=True)
+        (pool / "toolchains" / "taken").symlink_to(pool / "toolchains" / complete[0], target_is_directory=True)
+        migrate()
+        check(
+            "a linked toolchain is pooled as the same link",
+            (pool / "toolchains" / "custom").is_symlink()
+            and os.readlink(pool / "toolchains" / "custom") == str(external),
+        )
+        check(
+            "a name the pool already links is kept",
+            os.readlink(pool / "toolchains" / "taken") == str(pool / "toolchains" / complete[0]),
+        )
+        check("neither link is mounted", not any("/toolchains/custom" in s or "/taken" in s for s in mounts()[1]))
+        (pool / "toolchains" / "custom").unlink()
+        (pool / "toolchains" / "taken").unlink()
+
         os.environ["ELAN_HOME"] = str(tmp / "missing")
         check("a missing pool mounts none", not any("/.elan/" in spec for spec in mounts()[1]))
 finally:

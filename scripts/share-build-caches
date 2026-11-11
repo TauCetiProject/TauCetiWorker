@@ -81,13 +81,25 @@ def publish_toolchains(src: Path, dst: Path, skip=None) -> tuple[int, int]:
 
     A Bubble round mounts any pool toolchain with `bin/lean` over the image's own copy, so a partly
     linked one must never appear under its release name. A toolchain the pool already has is left
-    alone, as elan would leave an installed one."""
+    alone, as elan would leave an installed one. One registered with `elan toolchain link` is a
+    symlink and is recreated as one, which elan needs to read its name as custom."""
     linked = present = 0
     if not src.is_dir() or not same_device(src, dst):
         return (0, 0)
     dst.mkdir(parents=True, exist_ok=True)
-    for tc in sorted(p for p in src.iterdir() if p.is_dir() and not p.is_symlink()):
+    for tc in sorted(src.iterdir()):
         final = dst / tc.name
+        if tc.is_symlink():
+            try:
+                os.symlink(os.readlink(tc), final)
+                linked += 1
+            except FileExistsError:
+                present += 1
+            except OSError as e:
+                print(f"    ! {tc.name}: not pooled ({e})", file=sys.stderr)
+            continue
+        if not tc.is_dir():
+            continue
         if final.exists() or final.is_symlink():
             present += 1
             continue
