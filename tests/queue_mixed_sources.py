@@ -262,6 +262,61 @@ class Mixed(MixedFixture, unittest.TestCase):
         self.assertEqual(poller.run_once()["approved"], 0)
         self.assertEqual(self.controller.store.count("inputs"), 1)
 
+    def test_disabled_native_successor_does_not_stop_an_earlier_github_head(self):
+        registry = self.registry()
+        registry.native_main = self.native
+        self.controller.set_setting("publication_enabled", True, "fixture")
+        github = self.github.create_pr(1, {"Github.lean": "github\n"})
+        self.controller.approve(self.controller.repository, 1, github, "fixture")
+        self.controller.tick()
+        github_batch = self.controller._head()["id"]
+        native = self.native.create_pr(2, {"Native.lean": "native\n"})
+        self.controller.approve(self.native_id.repository.key, 2, native, "fixture")
+        self.controller.tick()
+        self.assertTrue(any(self.controller._members(batch["id"]) for batch in self.controller._open_batches()))
+        self.controller.mixed = None
+        self.controller.source = self.github
+        self.native.calls.clear()
+        self.github.start_runs()
+        self.github.complete_runs()
+        self.clock.advance(60)
+        self.controller.tick()
+        self.assertEqual(self.controller.store.row("batches", {"id": github_batch})["state"], "landed")
+        self.assertEqual(self.native.calls, [])
+        self.assertTrue(any(row["source_identity"] for row in self.controller.store.rows("members")))
+
+    def test_operational_profile_revert_does_not_reuse_retired_review_authority(self):
+        from types import SimpleNamespace
+
+        from tauceti_queue.mixed_native import MixedNativeSource
+
+        cfg = Config(repository=self.controller.repository, canonical_branch="main", forgejo_mode="observe")
+
+        def configured(profile):
+            source = MixedNativeSource(
+                profile,
+                cfg,
+                self.repo.clone,
+                client=SimpleNamespace(forge=self.native_id.repository.forge),
+                token="fixture",
+                clock=self.clock,
+            )
+            source.configure_publisher_policy(self.controller.store)
+
+        configured(self.profile)
+        old = dict(self.profile.raw)
+        self.profile.raw["execution"] = {"workflow_revision": "a" * 40}
+        configured(self.profile)
+        self.profile.raw.clear()
+        self.profile.raw.update(old)
+        configured(self.profile)
+        self.profile.raw["authority_generation"] = "2" * 32
+        configured(self.profile)
+        self.profile.raw.clear()
+        self.profile.raw.update(old)
+        with self.assertRaisesRegex(ValueError, "generation"):
+            configured(self.profile)
+
     def test_operational_profile_edits_preserve_review_generation(self):
         original = self.profile.publishers().generation
         self.profile.raw.update(
@@ -434,7 +489,8 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         batch = self.controller._head()
         task_id = self.controller._create_task(batch, "repair", batch["base"], [], self.clock())
         self.github.admins.add("reviewer")
-        task = self.controller.claim_task("repair-worker", "reviewer")
+        self.assertIsNone(self.controller.claim_task("old-worker", "reviewer"))
+        task = self.controller.claim_task("repair-worker", "reviewer", mixed_capable=True)
         self.assertEqual(task.task_id, task_id)
         row = task.to_dict()
         restored = WorkerTask.from_json(json.loads(json.dumps(row)))
@@ -584,7 +640,7 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         batch = self.controller._head()
         self.controller._create_task(batch, "repair", batch["base"], [], self.clock())
         self.github.admins.add("reviewer")
-        task = self.controller.claim_task("repair-worker", "reviewer")
+        task = self.controller.claim_task("repair-worker", "reviewer", mixed_capable=True)
         completed = threading.Event()
 
         def remote_wait(registry):

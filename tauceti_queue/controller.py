@@ -1408,7 +1408,7 @@ class Controller:
         )
 
     def claim_task(
-        self, worker_identity: str, github_login: str, *, source_access=None, expected_binding=None
+        self, worker_identity: str, github_login: str, *, source_access=None, expected_binding=None, mixed_capable=False
     ) -> Task | None:
         """Hand an open task to an authorized worker under a renewable claim, within `repair_concurrency`.
 
@@ -1445,6 +1445,12 @@ class Controller:
                 return None
             concurrency = int(self.setting("repair_concurrency"))
             claimable = self._claimable_tasks()
+            if not mixed_capable:
+                claimable = [
+                    pair
+                    for pair in claimable
+                    if loads(pair[0]["task_binding"], {}).get("schema") != "tauceti-queue.mixed-task/v1"
+                ]
             if len(self._active_task_claims()) >= concurrency:
                 if claimable and claimable[0][0]["kind"] not in BACKGROUND_TASKS:
                     self._count("claim_collisions")
@@ -7058,6 +7064,10 @@ class Controller:
             return "no-batch"
         if self._mixed_inert_batch(batch):
             raise ControllerError("forgejo-inert", "mixed promotion awaits source enablement")
+        if candidate_ci is None and any(
+            isinstance(member["number"], SourceNumber) for member in self._members(batch["id"])
+        ):
+            raise ControllerError("forgejo-inert", "native members require their qualified candidate CI coordinator")
         primary_generation = self.store.get_setting("mixed:primary_generation", 0)
         if payload.get("primary_generation", 0) != primary_generation:
             return "stale-primary-generation"

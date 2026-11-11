@@ -811,6 +811,19 @@ class Handler(BaseHTTPRequestHandler):
         kwargs = self._source_task_kwargs()
         if self.server.source_authority is not None:
             kwargs["expected_binding"] = self._expected_task_binding
+        elif "task_schemas" in body:
+            schemas = body["task_schemas"]
+            if (
+                not isinstance(schemas, list)
+                or len(schemas) > 8
+                or any(not isinstance(schema, str) for schema in schemas)
+            ):
+                self._error(400, "task_schemas must be a bounded list of schema names")
+                return
+            from .mixed_tasks import SCHEMA
+
+            if SCHEMA in schemas:
+                kwargs["mixed_capable"] = True
         self._call(lambda: self.server.controller.claim_task(self._worker_identity(body), login, **kwargs))
 
     def _task(self, task_id: str, action: str) -> None:

@@ -100,7 +100,9 @@ ID, for example `forgejo:https://git.example.org/team/Math@41#7`. Repair refs an
 repair-worker authentication continue using the GitHub queue repository. The
 mixed task schema preserves member identities through worker checkpoints and
 refuses missing or stale authority bindings. No native source credential is sent
-to the repair worker. CI validates exact retained bytes, full mixed lint and the
+to the repair worker. New runners advertise the mixed task schema when claiming;
+older runners receive legacy work only and cannot park a mixed claim until expiry.
+Deploy the matching repair runner before enabling mixed admission. CI validates exact retained bytes, full mixed lint and the
 existing per-member scope/dependency gates; landing rechecks original heads,
 targets, holds and current review authority.
 

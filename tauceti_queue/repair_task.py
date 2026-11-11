@@ -502,7 +502,12 @@ class TaskClient:
         return status, parsed
 
     def claim(self) -> Task | None:
-        status, payload = self._post("/tasks/claim", {"worker": self.worker})
+        body = {"worker": self.worker}
+        if self.binding is None:
+            from .mixed_tasks import SCHEMA
+
+            body["task_schemas"] = [SCHEMA]
+        status, payload = self._post("/tasks/claim", body)
         if status == 204 or (self.binding is None and status == 200 and not payload):
             return None
         if status in (401, 403):
