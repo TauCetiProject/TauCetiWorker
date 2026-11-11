@@ -91,7 +91,7 @@ class Sources(unittest.TestCase):
     def test_default_sources_and_new_pr_destination(self):
         with patch.dict(os.environ, {}, clear=True):
             configure(SimpleNamespace())
-            self.assertEqual(os.environ["TAUCETI_WORKER_FORGES"], "both")
+            self.assertEqual(os.environ["TAUCETI_WORKER_FORGES"], "github")
             self.assertEqual(os.environ["TAUCETI_NEW_PR_FORGE"], "github")
 
     def test_explicit_numeric_target_preserves_github_default(self):
@@ -99,11 +99,11 @@ class Sources(unittest.TestCase):
             configure(SimpleNamespace(pr=["12"]))
             self.assertEqual(os.environ["TAUCETI_WORKER_FORGES"], "github")
             with self.assertRaises(Die):
-                configure(SimpleNamespace(pr=["12"], forges="both"))
+                configure(SimpleNamespace(pr=["12"], forgejo=True))
 
     def test_native_destination_is_independent(self):
         with patch.dict(os.environ, {}, clear=True):
-            configure(SimpleNamespace(forges="both", new_pr_forge="forgejo"))
+            configure(SimpleNamespace(forgejo=True, new_pr_forge="forgejo"))
             self.assertEqual(os.environ["TAUCETI_WORKER_FORGES"], "both")
             self.assertEqual(os.environ["TAUCETI_NEW_PR_FORGE"], "forgejo")
 
@@ -490,6 +490,78 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_toke
                 charged=("fix-1",),
             )
         self.assertEqual(counters.read("fix-1"), 0)
+
+    def test_source_switch_combinations_and_loop_child_handoff(self):
+        from tauceti_worker.cli import build_parser
+        from tauceti_worker.worker_sources import selection_arguments
+
+        for flags, expected in (
+            ([], "github"),
+            (["--github"], "github"),
+            (["--forgejo"], "both"),
+            (["--github", "--forgejo"], "both"),
+            (["--no-github", "--forgejo"], "forgejo"),
+            (["--forgejo", "--no-forgejo"], "github"),
+        ):
+            with (
+                self.subTest(flags=flags),
+                patch.dict(
+                    os.environ, {"TAUCETI_WORKER_FORGES": "both", "TAUCETI_NEW_PR_FORGE": "forgejo"}, clear=True
+                ),
+            ):
+                configure(build_parser().parse_args(["work", *flags]))
+                self.assertEqual(os.environ["TAUCETI_WORKER_FORGES"], expected)
+                self.assertEqual(os.environ["TAUCETI_NEW_PR_FORGE"], "github")
+                child = build_parser().parse_args(["_round", *selection_arguments()])
+                configure(child)
+                self.assertEqual(os.environ["TAUCETI_WORKER_FORGES"], expected)
+
+    def test_source_switches_work_before_or_after_subcommand(self):
+        from tauceti_worker.cli import build_parser
+
+        for argv in (["--forgejo", "work"], ["work", "--forgejo"], ["--forgejo", "status"], ["--forgejo"]):
+            with self.subTest(argv=argv), patch.dict(os.environ, {}, clear=True):
+                configure(build_parser().parse_args(argv))
+                self.assertEqual(os.environ["TAUCETI_WORKER_FORGES"], "both")
+
+    def test_empty_source_selection_and_ambiguous_target_are_explicit_errors(self):
+        from tauceti_worker.cli import build_parser
+
+        for argv in (["--no-github"], ["--no-github", "--no-forgejo"], ["--forgejo", "--pr", "2"]):
+            with self.subTest(argv=argv), patch.dict(os.environ, {}, clear=True), self.assertRaises(Die):
+                configure(build_parser().parse_args(["work", *argv]))
+
+    def test_explicit_native_destination_survives_loop_handoff(self):
+        from tauceti_worker.cli import build_parser
+        from tauceti_worker.worker_sources import selection_arguments
+
+        with patch.dict(os.environ, {}, clear=True):
+            configure(build_parser().parse_args(["work", "--forgejo", "--new-pr-forge", "forgejo"]))
+            child = build_parser().parse_args(["_round", *selection_arguments()])
+            configure(child)
+            self.assertEqual(os.environ["TAUCETI_WORKER_FORGES"], "both")
+            self.assertEqual(os.environ["TAUCETI_NEW_PR_FORGE"], "forgejo")
+
+    def test_driver_forwards_source_flags_into_the_actual_round_command(self):
+        from tauceti_worker.cli import build_parser
+        from tauceti_worker.loop import cmd_loop
+
+        for flags, expected in (([], "github"), (["--forgejo"], "both"), (["--no-github", "--forgejo"], "forgejo")):
+            with self.subTest(flags=flags), patch.dict(os.environ, {}, clear=True):
+                args = build_parser().parse_args(["work", "--loop", *flags])
+                configure(args)
+                with (
+                    patch("tauceti_worker.loop.run_round_subprocess", side_effect=KeyboardInterrupt) as launch,
+                    patch("tauceti_worker.loop.github_budget", return_value={}),
+                    patch("tauceti_worker.loop.fleet_admission_reason", return_value=None),
+                    patch("tauceti_worker.verification_jobs.resume_pending"),
+                    patch("tauceti_worker.verification_jobs.reap_continuations"),
+                    patch("tauceti_worker.repair_recovery.due", return_value=False),
+                ):
+                    cmd_loop(args, self.cfg, only=["review"], agent="deepseek")
+                child = build_parser().parse_args(["_round", *launch.call_args.args[0]])
+                configure(child)
+                self.assertEqual(os.environ["TAUCETI_WORKER_FORGES"], expected)
 
 
 if __name__ == "__main__":

@@ -47,23 +47,30 @@ def pull_url(number):
 
 
 def configure(args):
-    requested = getattr(args, "forges", None) or os.environ.get("TAUCETI_WORKER_FORGES")
-    if requested is None:
-        requested = "both" if TAUCETI.lower() == "taucetiproject/tauceti" else "github"
-    if requested not in ("both", "github", "forgejo"):
-        raise Die("worker forges must be github, forgejo or both")
-    destination = getattr(args, "new_pr_forge", None) or os.environ.get("TAUCETI_NEW_PR_FORGE", "github")
+    github = getattr(args, "github", None)
+    forgejo = getattr(args, "forgejo", None)
+    legacy = getattr(args, "forges", None)
+    if legacy is not None and (github is not None or forgejo is not None):
+        raise Die("choose --github/--forgejo switches or the legacy --forges selector")
+    if legacy is not None:
+        if legacy not in ("github", "forgejo", "both"):
+            raise Die("worker forges must be github, forgejo or both")
+        github, forgejo = legacy in ("github", "both"), legacy in ("forgejo", "both")
+    else:
+        # Public invocations opt in with flags. Inherited runtime state or a
+        # project configuration must never turn an ordinary worker into a trial.
+        github = True if github is None else github
+        forgejo = False if forgejo is None else forgejo
+    if not github and not forgejo:
+        raise Die("enable at least one source with --github or --forgejo")
+    requested = "both" if github and forgejo else "github" if github else "forgejo"
+    destination = getattr(args, "new_pr_forge", None) or "github"
     if destination not in ("github", "forgejo"):
         raise Die("new PR forge must be github or forgejo")
-    if requested != "both" and destination != requested:
-        # A source-only repair worker may retain the ordinary authoring default.
-        if getattr(args, "new_pr_forge", None) is not None:
-            raise Die("the new PR forge must be among the selected forges")
-    if getattr(args, "pr", None):
-        if getattr(args, "forges", None) == "both":
-            raise Die("qualify numeric --pr targets with --forges github or --forges forgejo")
-        if not getattr(args, "forges", None) and requested == "both":
-            requested = "github"
+    if requested != "both" and destination != requested and getattr(args, "new_pr_forge", None) is not None:
+        raise Die("the new PR forge must be among the selected forges")
+    if (getattr(args, "pr", None) or os.environ.get("TAUCETI_PR", "").strip()) and requested == "both":
+        raise Die("numeric --pr targets need one source: use --no-github --forgejo or --no-forgejo")
     if (
         "TAUCETI_FORGEJO_TOKEN_FILE" not in os.environ
         and TAUCETI.lower() == "taucetiproject/tauceti"
@@ -73,6 +80,19 @@ def configure(args):
         os.environ["TAUCETI_FORGEJO_TOKEN_FILE"] = str(Path.home() / ".config/tauceti-forgejo/worker-token")
     os.environ["TAUCETI_WORKER_FORGES"] = requested
     os.environ["TAUCETI_NEW_PR_FORGE"] = destination
+
+
+def selection_arguments():
+    """Carry the parent's explicit selection into isolated loop children."""
+    selected = os.environ.get("TAUCETI_WORKER_FORGES", "github")
+    arguments = [
+        "--github" if selected in ("github", "both") else "--no-github",
+        "--forgejo" if selected in ("forgejo", "both") else "--no-forgejo",
+    ]
+    destination = os.environ.get("TAUCETI_NEW_PR_FORGE", "github")
+    if selected == "both" or selected == destination:
+        arguments += ["--new-pr-forge", destination]
+    return arguments
 
 
 def enabled():

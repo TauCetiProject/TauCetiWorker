@@ -190,10 +190,25 @@ def add_github_account_flag(p: argparse.ArgumentParser) -> None:
 
 def add_source_flags(parser):
     parser.add_argument(
-        "--forges", choices=("both", "github", "forgejo"), help="PR sources to discover (TauCeti defaults to both)"
+        "--github",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help="discover GitHub PRs (default: enabled)",
     )
     parser.add_argument(
-        "--new-pr-forge", choices=("github", "forgejo"), help="destination for new PRs (initial default github)"
+        "--forgejo",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help="discover Forgejo PRs (default: disabled; opt in for supervised trials)",
+    )
+    parser.add_argument(
+        "--forges", choices=("both", "github", "forgejo"), default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--new-pr-forge",
+        choices=("github", "forgejo"),
+        default=argparse.SUPPRESS,
+        help="destination for new PRs (default: github)",
     )
 
 
@@ -606,6 +621,7 @@ def build_parser() -> argparse.ArgumentParser:
         "  https://github.com/TauCetiProject/TauCetiWorker",
     )
     add_github_account_flag(p)
+    add_source_flags(p)
     sub = p.add_subparsers(dest="cmd")
     from .verification import add_parser as add_verification_parser
 

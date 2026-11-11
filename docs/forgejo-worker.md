@@ -1,28 +1,37 @@
 # Worker operation across GitHub and Forgejo
 
-TauCeti workers discover PR work on GitHub and Forgejo by default. New authored
-PRs initially go to GitHub. Review and repair follow each existing PR's original
-forge. Native user IDs determine ownership on Forgejo.
+TauCeti workers look only at GitHub unless Forgejo is explicitly enabled with a
+flag. The defaults are `--github --no-forgejo`. This keeps existing workers on
+GitHub while an operator supervises individual Forgejo trials. Review and repair
+follow each selected PR's original forge. Native user IDs determine ownership
+on Forgejo. New authored PRs default to GitHub independently of discovery.
 
 ```sh
-tauceti status --json
-tauceti work --dry-run
-tauceti work --only review,fix
-tauceti work --forges github
-tauceti work --forges both --new-pr-forge forgejo
-tauceti work --forges forgejo --pr 2 --only review
+tauceti work --dry-run                       # GitHub only
+tauceti work --forgejo --dry-run             # GitHub and Forgejo
+tauceti work --forgejo --loop --worker-id supervised-forgejo
+tauceti work --no-github --forgejo --pr 2 --only review
+tauceti work --forgejo --new-pr-forge forgejo # Both inputs; new PRs on Forgejo
+tauceti status --forgejo --json
 ```
 
-`TAUCETI_WORKER_FORGES` accepts `github`, `forgejo`, or `both`.
-`TAUCETI_NEW_PR_FORGE` accepts `github` or `forgejo`. Managed workers can set
-these through their existing environment table. CLI flags override those values.
-A numeric `--pr` uses GitHub by default. Choose `--forges forgejo` to target a
-Forgejo PR. An explicit `--forges both --pr NUMBER` requires a single forge
-selection to disambiguate the number.
+`--github`, `--no-github`, `--forgejo`, and `--no-forgejo` independently enable
+or disable discovery on each source. Each switch takes effect for the current
+invocation and its loop children. Repeating opposite switches uses the last
+one. Disabling both sources is an error. The switches also work before a
+subcommand, or with the bare dashboard.
 
-Other projects with an existing GitHub configuration continue using GitHub.
-Native Forgejo content configurations are supported with shared roadmap, rubric,
-tool, and archive repositories on GitHub.
+`--new-pr-forge github|forgejo` independently chooses the destination for new
+PRs. Numeric `--pr` targets require a single selected source, so a native target
+uses `--no-github --forgejo`. With no source flags, numeric targets use GitHub.
+The old `--forges` selector remains an undocumented compatibility alias and
+cannot be combined with the new source switches. Inherited runtime source
+variables do not enable Forgejo in a new invocation; loop children receive
+explicit flags from their parent.
+
+Native Forgejo content configurations remain available with shared roadmap,
+rubric, tool, and archive repositories on GitHub, and require explicit source
+flags as above.
 
 ## Forgejo access
 

@@ -42,11 +42,6 @@ def _bootstrap_worker_project():
     os.environ.update(environment)
     os.environ.setdefault("TAUCETI_FORGEJO_ORIGIN", reference.forge.url)
     os.environ.setdefault("TAUCETI_FORGEJO_REPO", reference.name)
-    canonical = (
-        reference.forge.url == "https://git.taucetiproject.org" and reference.name.lower() == "taucetiproject/tauceti"
-    )
-    os.environ.setdefault("TAUCETI_WORKER_FORGES", "both" if canonical else "forgejo")
-    os.environ.setdefault("TAUCETI_NEW_PR_FORGE", "github" if canonical else "forgejo")
 
 
 try:
