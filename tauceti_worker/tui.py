@@ -206,6 +206,8 @@ def launch_cmd(
         cmd += ["--roadmap-skip", roadmap_skip]
     if extra_roadmap_prompt is not None:
         cmd.append(f"--extra-roadmap-prompt={extra_roadmap_prompt}")  # one argument: the text may start with `-`
+    if (branches := os.environ.get("TAUCETI_OWN_BRANCHES")) is not None:
+        cmd.append(f"--own-branches={branches}")
     return cmd
 
 

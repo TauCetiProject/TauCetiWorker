@@ -184,6 +184,37 @@ def dashboard_worker(pattern):
         return [a for a in spec.work_argv() if a.startswith("--own-branches")]
 
 
+def copied_commands(pattern, receiving):
+    """The branch scope in effect when the dashboard's copied one-round and loop commands run elsewhere."""
+    import shlex
+
+    from tauceti_worker import tui
+    from tauceti_worker.cli import build_parser
+
+    shown = []
+    dashboard = SimpleNamespace(
+        view="tasks",
+        model_dial="auto",
+        bubble=False,
+        copy_to_clipboard=lambda _text: None,
+        push_screen=lambda screen: shown.append(screen),
+    )
+    app = tui._dashboard_app(WORKER, loader=lambda: None)
+    with scope(pattern):
+        type(app).action_copy_cmd(dashboard)
+    (screen,) = shown
+    commands = screen._one, screen._loop
+    effective = []
+    with scope(receiving):
+        for command in commands:
+            argv = shlex.split(command)
+            args = build_parser().parse_args(argv[argv.index("work") :])
+            effective.append(
+                args.own_branches if args.own_branches is not None else os.environ.get("TAUCETI_OWN_BRANCHES")
+            )
+    return effective
+
+
 def main():
     def no_query(_repo):
         raise AssertionError("unexpected permission query")
@@ -229,6 +260,9 @@ def main():
         ("dashboard worker, unset: no flag", dashboard_worker(None), []),
         ("dashboard worker, set: the dashboard's pattern", dashboard_worker("-alpha$"), ["--own-branches=-alpha$"]),
         ("dashboard worker, set empty: explicitly every branch", dashboard_worker(""), ["--own-branches="]),
+        ("copied commands, unset: the receiving shell decides", copied_commands(None, "-beta$"), ["-beta$"] * 2),
+        ("copied commands, set: the dashboard's pattern", copied_commands("-alpha$", None), ["-alpha$"] * 2),
+        ("copied commands, set empty: explicitly every branch", copied_commands("", "-beta$"), [""] * 2),
         ("Forgejo, unset: every PR of the account", forgejo(None), {"rebase": [1, 2], "review": [1, 2, 3], "open": 2}),
         (
             "Forgejo, set: matching branches of the account only; reviews unchanged",
