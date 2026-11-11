@@ -1816,6 +1816,10 @@ def _do_fixlike(
             w.counters.write(key, max(0, w.counters.read(key) - 1))
         return None
 
+    # A peer may have recorded its decline between dispatch's check and this claim.
+    if label in incidents.STAGES and incidents.hold_declined() and incidents.declined(label, pr, head):
+        log(f"  {label} #{pr}: {incidents.HELD}; selecting unrelated work")
+        return decline_repair()
     if label == "fix" or bubble:
         c.progress = _progress_snapshot(w, c)
         live = None
@@ -2154,6 +2158,9 @@ def _close_spent_pr(w, sv, c) -> int | None:
     if not w.claims.begin_branch_work(c.pr, c.head, p.head_ref, p.head_owner, p.head_repo):
         return None
     try:
+        if incidents.hold_declined() and incidents.declined("fix", c.pr, c.head):
+            log(f"  fix #{c.pr}: {incidents.HELD}; leaving it open")
+            return None
         with read_context(fresh=True, direct=True):
             if not _still_actionable("fix", w, sv, replace(c, partial_history=False)):
                 return None

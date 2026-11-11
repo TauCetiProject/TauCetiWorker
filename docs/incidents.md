@@ -112,7 +112,8 @@ With `TAUCETI_HOLD_DECLINED=1`, a stage takes no further round on a pull request
 while a `declined` record for that stage, live or acknowledged, names its
 current head. The survey lists the pull request as suppressed with the reason
 `an earlier round declined at this head; waiting for a new head`, and dispatch
-checks again before spending, for a record written after the survey.
+checks again before spending and once more after taking the branch claim, for a
+record written after the survey or by a peer that just released the claim.
 
 The hold ends when the head moves, or when the record is deleted from both
 folders. It covers every action of the stage at that head, including the final
