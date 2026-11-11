@@ -19,6 +19,8 @@ from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+from tauceti_tools.forge import Forge, RepositoryRef
+
 import tauceti_worker as tc
 from tauceti_worker import curate, incidents
 from tauceti_worker import targets as t
@@ -194,6 +196,9 @@ class Records(Tmp):
         self.assertEqual(incidents.subsumed_by(1234, "a" * 40), [398, 401])
         self.assertEqual(incidents.subsumed_by(1234, "b" * 40), [])
         self.assertEqual(incidents.subsumed_by(1235, "a" * 40), [])
+        forgejo = RepositoryRef(Forge("forgejo", "https://forge.example"), "TauCetiProject/TauCeti")
+        incidents.record_declined("fix", 1235, "a" * 40, message="Subsumed-by: #7", repository=forgejo)
+        self.assertEqual(incidents.subsumed_by(1235, "a" * 40), [])
         states = {
             1234: {"state": "CLOSED", "title": "Truncation bounds", "headRefOid": "a" * 40},
             398: {"state": "MERGED", "title": "x"},
@@ -219,6 +224,7 @@ class Records(Tmp):
         ((file, value),) = incidents.records(incidents.TARGET_CLOSED)
         self.assertEqual(file.name, "target-closed-truncation-bounds-1234.json")
         expected = {"area": "Probability", "slug": "truncation-bounds", "pr": 1234, "list": str(path), "count": 1}
+        self.assertEqual(value["forge"]["kind"], "github")
         self.assertEqual({key: value[key] for key in expected}, expected)
         self.assertIn("closed without merging", value["detail"])
         incidents.note_target_closed(path, "Probability", "truncation-bounds", 1234)

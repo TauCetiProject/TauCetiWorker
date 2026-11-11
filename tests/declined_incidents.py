@@ -12,6 +12,7 @@ Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
 import contextlib
+import hashlib
 import importlib
 import json
 import os
@@ -22,6 +23,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tauceti_tools.forge import Forge, RepositoryRef
+
 import tauceti_worker as tc
 from tauceti_worker import agents, incidents, work_units
 from tauceti_worker.review_state import Meta
@@ -382,6 +385,111 @@ def test_claim_race(root):
         )
 
 
+FORGEJO = RepositoryRef(Forge("forgejo", "https://forge.example"), "TauCetiProject/TauCeti")
+
+
+def test_sources(root):
+    """Records of one PR number on two sources are separate files; GitHub names are unchanged."""
+    digest = hashlib.sha256(FORGEJO.key.encode()).hexdigest()[:12]
+    with settings(root, hold=True):
+        github = incidents.record_declined("fix", 7, "h-github", message="github")
+        native = incidents.record_declined("fix", 7, "h-native", message="forgejo", repository=FORGEJO, repository_id=1)
+        check(
+            "the GitHub record keeps its name and a native one is qualified by its repository",
+            (github.name, native.name),
+            ("declined-fix-7.json", f"declined-fix-7.{digest}.json"),
+        )
+        check(
+            "each names its forge and repository",
+            (load(github)["forge"], load(native)["forge"], load(native)["repository"], load(native)["repository_id"]),
+            (
+                {"kind": "github", "url": "https://github.com"},
+                {"kind": "forgejo", "url": "https://forge.example"},
+                "TauCetiProject/TauCeti",
+                1,
+            ),
+        )
+        check(
+            "the holds are independent",
+            (
+                incidents.declined("fix", 7, "h-github"),
+                incidents.declined("fix", 7, "h-github", tc.TAUCETI),
+                incidents.declined("fix", 7, "h-github", FORGEJO),
+                incidents.declined("fix", 7, "h-native", FORGEJO),
+                incidents.declined("fix", 7, "h-native"),
+            ),
+            (True, True, False, True, False),
+        )
+        (root / incidents.ACKED).mkdir()
+        native.rename(root / incidents.ACKED / native.name)
+        check("an acknowledged native record still holds", incidents.declined("fix", 7, "h-native", FORGEJO), True)
+        check(
+            "another GitHub repository is qualified too",
+            incidents.subject("fix", 7, "Other/Repo"),
+            f"fix-7.{hashlib.sha256(b'github:https://github.com/other/repo').hexdigest()[:12]}",
+        )
+        check(
+            "the source of a native client is its repository, of a GitHub client its name",
+            (incidents.source_of(SimpleNamespace(repository=FORGEJO, repo=tc.TAUCETI)), incidents.source_of(None)),
+            (FORGEJO, None),
+        )
+
+
+def test_multi_source_budgets(root):
+    """A source whose only repair candidates have spent budgets still leaves its records."""
+    from tauceti_worker import multi_source
+
+    def round_over(**options):
+        sv = tc.Survey(worker_id="test")
+        sv.rebaseable.suppressed = [
+            tc.Candidate(7, "head-7", "conflicting", attempts=3, budget=3, source_repository=FORGEJO)
+        ]
+        worker = SimpleNamespace(gh=SimpleNamespace(repository=FORGEJO, repo=tc.TAUCETI))
+        options = {"dry_run": False, **options}
+        opts = tc.RoundOpts(only=["rebase"], agent="claude", work_model="claude", sandbox_host=True, **options)
+        with (
+            patch.object(multi_source, "collect", return_value=[("forgejo", worker, sv)]),
+            patch.object(multi_source, "deduplicate"),
+        ):
+            try:
+                multi_source.run_round(worker, opts, use_fleet_focus=False)
+            except work_units.NoEligibleWork:
+                return "no work"
+        return "ran"
+
+    name = root / incidents._name(incidents.BUDGET_SPENT, incidents.subject("rebase", 7, FORGEJO))
+    with settings(root):
+        check("a dry run writes nothing", (round_over(dry_run=True), name.exists()), ("no work", False))
+        check("nor does a round scoped to another PR", (round_over(prs=[8]), name.exists()), ("no work", False))
+        check("an unscoped round records the spent budget", (round_over(), load(name)["head"]), ("no work", "head-7"))
+
+
+def test_recovery_hold(root):
+    """Retained-source recovery waits on a declined head before it reconciles nothing new or pays."""
+    from tauceti_worker import repair_recovery
+
+    backend = repair_recovery.WorkerBackend(SimpleNamespace(gh=SimpleNamespace(repo=tc.TAUCETI)), SimpleNamespace())
+    m = {"pr": 11, "work": "fix"}
+
+    def policy(head):
+        facts = {"state": "OPEN", "draft": False, "labels": [], "head": head, "base": None}
+        try:
+            backend.policy(m, facts)
+        except repair_recovery.Wait as error:
+            return error.code
+        return None
+
+    with settings(root, hold=True):
+        incidents.record_declined("fix", 11, "head-11", message="declined")
+        check(
+            "held at the declined head; past the hold at a new one",
+            (policy("head-11"), policy("head-12")),
+            ("declined-hold", "base-policy"),
+        )
+    with settings(root):
+        check("without the hold, recovery is unchanged", policy("head-11"), "base-policy")
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -390,6 +498,9 @@ def main():
         test_round(tmp / "round", tmp)
         test_prompt(tmp / "prompt")
         test_claim_race(tmp / "race")
+        test_sources(tmp / "sources")
+        test_multi_source_budgets(tmp / "multi")
+        test_recovery_hold(tmp / "recovery")
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
     return 1 if fails else 0
 
