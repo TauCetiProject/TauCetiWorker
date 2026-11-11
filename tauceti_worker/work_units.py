@@ -2564,7 +2564,11 @@ def progress_reports(fields: list[str], account: str) -> list[dict]:
     """The account's open pull requests in the roadmap repository whose head branch starts with
     `progress/`, by number, as rows with `fields`. Raises GitHubError when they could not be listed
     in full."""
-    rows = GitHub(ROADMAP).pr_list(fields, author=account, limit=PROGRESS_REPORT_SCAN)
+    from .github_transport import read_context
+
+    # A state mirror or cached listing can predate a report this account opened moments ago.
+    with read_context(fresh=True, direct=True, retry=False):
+        rows = GitHub(ROADMAP).pr_list(fields, author=account, limit=PROGRESS_REPORT_SCAN)
     if len(rows) >= PROGRESS_REPORT_SCAN:
         raise GitHubError(f"more than {PROGRESS_REPORT_SCAN} open pull requests in the roadmap repository")
     return sorted(

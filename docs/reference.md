@@ -541,7 +541,7 @@ acting as one account make its own asks: set the key on one of them.
 
 The pass costs one listing per progress round, which a `threshold` round then also uses for its
 `--progress-max-open` count: up to 1000 of the account's open pull requests in the roadmap
-repository, a page of 100 per request. A listing cut off at 1000, like one that fails, asks about no
+repository, read from GitHub itself rather than a state mirror or cache, a page of 100 per request. A listing cut off at 1000, like one that fails, asks about no
 report and leaves the ledger as it is. On top of the listing comes one read of the workflow's runs for each report that has come
 due. It runs only with a progress round, so the times above are the earliest: under
 `--progress-strategy threshold` a round normally starts at least every `TAUCETI_PROGRESS_POLL`
