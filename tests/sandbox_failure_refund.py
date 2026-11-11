@@ -11,6 +11,7 @@ incident when TAUCETI_INCIDENTS_DIR is set; unset, the refunds are the same and 
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import hashlib
 import importlib
 import json
 import os
@@ -22,6 +23,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tauceti_tools.forge import Forge, RepositoryRef
+
 import tauceti_worker as tc
 from tauceti_worker import agents, incidents, work_units
 
@@ -121,13 +124,14 @@ def worker(state, logdir="/logs/w1"):
     return SimpleNamespace(cfg=cfg, counters=work_units.Counters(cfg))
 
 
-def sandbox_round(w, head=HEAD, *, reason=None, key=KEY, label="fix"):
+def sandbox_round(w, head=HEAD, *, reason=None, key=KEY, label="fix", source=None, source_id=None):
     """One failed round at `head`: charge, fail, ask for the refund. True when it was handed back."""
     w.counters.incr(key)
     agents._LAST_AGENT_FAILURE = reason or agents.AGENT_NOT_STARTED
     agents._LAST_AGENT_RUN = {"tail": ["Error: instance failed to start"], "transcript": "/logs/w1/agent.log"}
+    c = SimpleNamespace(pr=412, head=head, source_repository=source, source_repository_id=source_id)
     try:
-        work_units._refund_infra_failure(w, SimpleNamespace(pr=412, head=head), label, (key,))
+        work_units._refund_infra_failure(w, c, label, (key,))
     except NoProgress:
         return True
     return False
@@ -210,6 +214,36 @@ def test_refund(tmp):
     agents._LAST_AGENT_FAILURE = agents._LAST_AGENT_RUN = None
 
 
+FORGEJO = RepositoryRef(Forge("forgejo", "https://forge.example"), "TauCetiProject/TauCeti")
+
+
+def test_other_source(tmp):
+    """A pull request of another source is recorded under that source's key, beside a GitHub record
+    of the same number and head."""
+    root = tmp / "sources"
+    with settings(root):
+        for name in ("github", "forgejo"):
+            w = worker(tmp / f"source-{name}")
+            for _ in range(LIMIT):
+                sandbox_round(
+                    w, source=FORGEJO if name == "forgejo" else None, source_id=9 if name == "forgejo" else None
+                )
+        digest = hashlib.sha256(FORGEJO.key.encode()).hexdigest()[:12]
+        github = json.loads((root / "sandbox-failed-fix-412.json").read_text())
+        native = json.loads((root / f"sandbox-failed-fix-412.{digest}.json").read_text())
+        check(
+            "a GitHub record keeps its name and names TAUCETI on GitHub",
+            (github["key"], github["repository"], github["forge"]["kind"], "repository_id" in github),
+            ("fix-412", tc.TAUCETI, "github", False),
+        )
+        check(
+            "a Forgejo record is keyed by its source and names it",
+            (native["key"], native["repository"], native["forge"], native["repository_id"], native["count"]),
+            (f"fix-412.{digest}", FORGEJO.name, {"kind": "forgejo", "url": "https://forge.example"}, 9, 1),
+        )
+    agents._LAST_AGENT_FAILURE = agents._LAST_AGENT_RUN = None
+
+
 def test_repair_round(tmp):
     """_do_fixlike under Bubble: the refund is reached, and a Bubble that cannot be spawned is not charged."""
     from tauceti_worker.github import GitHub
@@ -278,6 +312,7 @@ def main():
         tmp = Path(tmp)
         test_classification(tmp)
         test_refund(tmp)
+        test_other_source(tmp)
         test_repair_round(tmp)
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
     return 1 if fails else 0

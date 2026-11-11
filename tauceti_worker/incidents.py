@@ -7,12 +7,15 @@ format, the directory layout and what a reader may do to a record are in docs/in
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
 import tempfile
 import time
 from pathlib import Path
+
+from tauceti_tools.forge import GITHUB, RepositoryRef
 
 from .config import log
 from .constants import TAUCETI
@@ -48,6 +51,38 @@ def directory() -> Path | None:
 
 def hold_declined() -> bool:
     return directory() is not None and os.environ.get(HOLD_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def repository_ref(repository: RepositoryRef | str | None = None) -> RepositoryRef:
+    """A source repository as given, a bare name as a GitHub repository, and None as TAUCETI."""
+    if isinstance(repository, RepositoryRef):
+        return repository
+    return RepositoryRef(GITHUB, repository or TAUCETI)
+
+
+def source_of(gh) -> RepositoryRef | str | None:
+    """The repository a worker's forge client serves: a native source's `repository`, else the
+    GitHub client's `repo`."""
+    repository = getattr(gh, "repository", None)
+    return repository if isinstance(repository, RepositoryRef) else getattr(gh, "repo", None)
+
+
+def subject(stage: str, pr: int, repository: RepositoryRef | str | None = None) -> str:
+    """The key of `stage`'s records for `pr`: `<stage>-<pr>` on the GitHub repository TAUCETI, and
+    `<stage>-<pr>.<digest>` on any other, where the digest is the first 12 hex digits of the SHA-256
+    of the repository's `RepositoryRef.key`."""
+    ref = repository_ref(repository)
+    if ref.key == repository_ref().key:
+        return f"{stage}-{pr}"
+    return f"{stage}-{pr}.{hashlib.sha256(ref.key.encode()).hexdigest()[:12]}"
+
+
+def _identity(repository, repository_id) -> dict:
+    ref = repository_ref(repository)
+    fields = {"repository": ref.name, "forge": {"kind": ref.forge.kind, "url": ref.forge.url}}
+    if repository_id is not None:
+        fields["repository_id"] = repository_id
+    return fields
 
 
 def _name(kind: str, key: str) -> str:
@@ -136,15 +171,25 @@ def named_prs(message: str, pr: int) -> tuple[list[int], list[int]]:
     return declared, [n for n in mentioned if n != pr and n not in declared]
 
 
-def record_declined(stage: str, pr: int, head: str, *, reason: str = "", message: str = "", transcript: str = ""):
-    """Record that a `stage` round on `pr` at `head` ended with nothing on GitHub, in the agent's words."""
+def record_declined(
+    stage: str,
+    pr: int,
+    head: str,
+    *,
+    reason: str = "",
+    message: str = "",
+    transcript: str = "",
+    repository: RepositoryRef | str | None = None,
+    repository_id: int | None = None,
+):
+    """Record that a `stage` round on `pr` at `head` ended with nothing on its forge, in the agent's words."""
     message = message.strip()
     subsumed_by, mentions = named_prs(message, pr)
     summary = message if len(message) <= MAX_SUMMARY else message[: MAX_SUMMARY - 2].rstrip() + " …"
     return record(
         DECLINED,
-        f"{stage}-{pr}",
-        repository=TAUCETI,
+        subject(stage, pr, repository),
+        **_identity(repository, repository_id),
         stage=stage,
         pr=pr,
         head=head,
@@ -156,29 +201,59 @@ def record_declined(stage: str, pr: int, head: str, *, reason: str = "", message
     )
 
 
-def declined(stage: str, pr: int, head: str) -> bool:
-    """Whether `stage` is held off `pr` at `head`: TAUCETI_HOLD_DECLINED is on and a `declined`
-    record, live or acknowledged, names this head."""
-    return hold_declined() and any(value.get("head") == head for value in find(DECLINED, f"{stage}-{pr}"))
+def declined(stage: str, pr: int, head: str, repository: RepositoryRef | str | None = None) -> bool:
+    """Whether `stage` is held off `pr` of `repository` at `head`: TAUCETI_HOLD_DECLINED is on and a
+    `declined` record, live or acknowledged, names this head."""
+    return hold_declined() and any(
+        value.get("head") == head for value in find(DECLINED, subject(stage, pr, repository))
+    )
 
 
-def note_budget_spent(stage: str, pr: int, head: str, detail: str) -> None:
+def note_budget_spent(
+    stage: str,
+    pr: int,
+    head: str,
+    detail: str,
+    *,
+    repository: RepositoryRef | str | None = None,
+    repository_id: int | None = None,
+) -> None:
     """Record that `stage` has no attempts left for `pr` at `head`. A survey sees a spent budget on
     every round, so a record that already names this head, acknowledged or not, is left as it is."""
-    if any(value.get("head") == head for value in find(BUDGET_SPENT, f"{stage}-{pr}")):
+    key = subject(stage, pr, repository)
+    if any(value.get("head") == head for value in find(BUDGET_SPENT, key)):
         return
-    record(BUDGET_SPENT, f"{stage}-{pr}", repository=TAUCETI, stage=stage, pr=pr, head=head, detail=detail)
+    record(
+        BUDGET_SPENT,
+        key,
+        **_identity(repository, repository_id),
+        stage=stage,
+        pr=pr,
+        head=head,
+        detail=detail,
+    )
 
 
-def note_sandbox_failed(stage: str, pr: int, head: str, *, failures: int, tail=(), transcript: str = "") -> Path | None:
+def note_sandbox_failed(
+    stage: str,
+    pr: int,
+    head: str,
+    *,
+    failures: int,
+    tail=(),
+    transcript: str = "",
+    repository: RepositoryRef | str | None = None,
+    repository_id: int | None = None,
+) -> Path | None:
     """Record that `failures` rounds of `stage` on `pr` at `head` ended before their agent started,
     with the last lines the sandbox printed. One write per head, as for a spent budget."""
-    if any(value.get("head") == head for value in find(SANDBOX_FAILED, f"{stage}-{pr}")):
+    key = subject(stage, pr, repository)
+    if any(value.get("head") == head for value in find(SANDBOX_FAILED, key)):
         return None
     return record(
         SANDBOX_FAILED,
-        f"{stage}-{pr}",
-        repository=TAUCETI,
+        key,
+        **_identity(repository, repository_id),
         stage=stage,
         pr=pr,
         head=head,

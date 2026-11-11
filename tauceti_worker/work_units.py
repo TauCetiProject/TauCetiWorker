@@ -560,14 +560,7 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         reason = f"its review has errored {n_err} times without completing a review"
         w.gh.ensure_stuck_issue(pr, reason, diagnostic)
 
-    if incidents.directory() is not None and not opts.dry_run:
-        for stage in incidents.STAGES:
-            for c in sv.kind(stage).suppressed:
-                if in_scope(c.pr) and not incidents.declined(stage, c.pr, c.head):
-                    detail = f"{c.reason}; {c.attempts}/{c.budget} attempts used"
-                    if stage == "fix-ci":
-                        detail += f" at this head, {w.counters.read(f'ci-pr-{c.pr}')}/{MAX_CI_PR_ATTEMPTS} on the PR"
-                    incidents.note_budget_spent(stage, c.pr, c.head, detail)
+    note_spent_budgets(w, sv, opts)
 
     if global_pick:
         counts = ", ".join(
@@ -812,6 +805,31 @@ def log_round_file_changes(cfg: Config, pre_head: str | None) -> None:
             log(f"    … {len(dirty) - _MAX_CHANGED_FILES} more")
 
 
+def note_spent_budgets(w: Worker, sv: Survey, opts: RoundOpts) -> None:
+    """Leave a `budget-spent` record for each repair candidate the survey suppressed with its
+    attempts used up, within the round's `--pr` scope and not under `--dry-run`."""
+    if incidents.directory() is None or opts.dry_run:
+        return
+    targets = frozenset(getattr(opts, "prs", ()) or ())
+    for stage in incidents.STAGES:
+        for c in sv.kind(stage).suppressed:
+            repository, repository_id = _incident_source(w, c)
+            if (not targets or c.pr in targets) and not incidents.declined(stage, c.pr, c.head, repository):
+                detail = f"{c.reason}; {c.attempts}/{c.budget} attempts used"
+                if stage == "fix-ci":
+                    detail += f" at this head, {w.counters.read(f'ci-pr-{c.pr}')}/{MAX_CI_PR_ATTEMPTS} on the PR"
+                incidents.note_budget_spent(
+                    stage, c.pr, c.head, detail, repository=repository, repository_id=repository_id
+                )
+
+
+def _incident_source(w, c) -> tuple:
+    return (
+        getattr(c, "source_repository", None) or incidents.source_of(getattr(w, "gh", None)),
+        getattr(c, "source_repository_id", None),
+    )
+
+
 def _record_declined(stage: str, w: Worker, sv: Survey, c: Candidate) -> Path | None:
     # An automatic bump is retried without an attempt budget, so no round on it is its last word.
     if (
@@ -822,10 +840,13 @@ def _record_declined(stage: str, w: Worker, sv: Survey, c: Candidate) -> Path | 
     ):
         return None
     run = take_last_agent_run() or {}
+    repository, repository_id = _incident_source(w, c)
     return incidents.record_declined(
         stage,
         c.pr,
         c.head,
+        repository=repository,
+        repository_id=repository_id,
         reason=c.reason,
         message=run.get("last_message") or "\n".join(run.get("tail") or ()),
         transcript=run.get("transcript") or str(w.cfg.logdir),
@@ -1309,7 +1330,12 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         if retained_repair(getattr(w, "cfg", None), getattr(getattr(w, "gh", None), "repo", TAUCETI), c.pr):
             log(f"  #{c.pr}: retained source recovery has priority; selecting unrelated work")
             return None
-    if c.pr and stage in incidents.STAGES and incidents.hold_declined() and incidents.declined(stage, c.pr, c.head):
+    if (
+        c.pr
+        and stage in incidents.STAGES
+        and incidents.hold_declined()
+        and incidents.declined(stage, c.pr, c.head, _incident_source(w, c)[0])
+    ):
         log(f"  {stage} #{c.pr}: {incidents.HELD}; selecting unrelated work")
         return None
     os.environ["TAUCETI_GITHUB_PR"] = str(c.pr or "")
@@ -1830,10 +1856,13 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
         detail += f", {at_head}/{MAX_SANDBOX_REFUNDS} at this head"
         if at_head >= MAX_SANDBOX_REFUNDS:
             run = take_last_agent_run() or {}
+            repository, repository_id = _incident_source(w, c)
             recorded = incidents.note_sandbox_failed(
                 label,
                 c.pr,
                 c.head,
+                repository=repository,
+                repository_id=repository_id,
                 failures=at_head,
                 tail=run.get("tail") or (),
                 transcript=run.get("transcript") or str(w.cfg.logdir),
@@ -1918,7 +1947,11 @@ def _do_fixlike(
         return None
 
     # A peer may have recorded its decline between dispatch's check and this claim.
-    if label in incidents.STAGES and incidents.hold_declined() and incidents.declined(label, pr, head):
+    if (
+        label in incidents.STAGES
+        and incidents.hold_declined()
+        and incidents.declined(label, pr, head, _incident_source(w, c)[0])
+    ):
         log(f"  {label} #{pr}: {incidents.HELD}; selecting unrelated work")
         return decline_repair()
     if label == "fix" or bubble:
@@ -2265,7 +2298,7 @@ def _close_spent_pr(w, sv, c) -> int | None:
     if not w.claims.begin_branch_work(c.pr, c.head, p.head_ref, p.head_owner, p.head_repo):
         return None
     try:
-        if incidents.hold_declined() and incidents.declined("fix", c.pr, c.head):
+        if incidents.hold_declined() and incidents.declined("fix", c.pr, c.head, _incident_source(w, c)[0]):
             log(f"  fix #{c.pr}: {incidents.HELD}; leaving it open")
             return None
         with read_context(fresh=True, direct=True):
