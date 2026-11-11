@@ -79,7 +79,7 @@ class MixedFixture:
             native=self.native,
         )
         self.controller.mixed = registry
-        self.controller.source = registry.port
+        self.controller.source = registry.port if mode == "admit" else self.github
         registry.controller = self.controller
         return registry
 
@@ -158,6 +158,58 @@ class Mixed(MixedFixture, unittest.TestCase):
                 for name, _ in self.native.calls
             )
         )
+
+    def test_observation_keeps_the_existing_github_main_writer(self):
+        from tauceti_queue.controller import Controller
+
+        registry = self.registry("observe")
+        self.controller = Controller(
+            self.controller.store,
+            self.github,
+            str(self.repo.clone),
+            self.controller.repository,
+            revision="observe-restart",
+            canonical_branch="main",
+            mixed=registry,
+            clock=self.clock,
+        )
+        self.assertIs(self.controller.source, self.github)
+        self.controller.set_setting("publication_enabled", True, "fixture")
+        head = self.github.create_pr(1, {"Github.lean": "github\n"})
+        self.controller.approve(self.controller.repository, 1, head, "fixture")
+        with patch.object(self.github, "fast_forward_leased", side_effect=AssertionError("changed GitHub writer")):
+            self.controller.tick()
+            self.github.start_runs()
+            self.github.complete_runs()
+            self.clock.advance(60)
+            self.controller.tick()
+        self.assertEqual(self.controller.store.rows("batches")[0]["state"], "landed")
+
+    def test_mixed_attribution_requires_explicit_source_and_never_reinterprets_a_suffix(self):
+        registry = self.registry()
+        native = registry.number(7)
+        github = self.controller.repository + "#12"
+        text = f"Interacting-PR: {github}\nFinding: interacts with {native.source_pr} and #12."
+        self.assertEqual(self.controller._attribution(text, native, qualified=True)["interacting"], 12)
+        self.assertEqual(self.controller._mentioned_prs(native.source_pr, 12, qualified=True), [native])
+        self.assertEqual(self.controller._attribution("Interacting-PR: #12", native)["interacting"], None)
+        self.assertEqual(self.controller._mentioned_prs("#7 and #12", 12, qualified=True), [])
+        self.assertEqual(self.controller._mentioned_prs(native.source_pr, 12), [native])
+        self.assertEqual(self.controller._mentioned_prs("other/repo#7", 12, qualified=True), [])
+        self.assertEqual(self.controller._mentioned_prs(f"#3 before {github}", 99), [3, 12])
+
+    def test_native_followup_recognizes_exact_qualified_main_provenance(self):
+        from tauceti_queue.fakes import run_git
+
+        registry = self.registry()
+        head = self.native.create_pr(70, {"Native.lean": "native\n"})
+        self.controller.approve(self.native_id.repository.key, 70, head, "fixture")
+        self.controller.tick()
+        batch = self.controller._head()
+        run_git(self.repo.clone, "push", "-q", "origin", batch["tip"] + ":refs/heads/main")
+        self.controller._canonical = batch["tip"]
+        self.assertTrue(self.controller._on_canonical(registry.number(70)))
+        self.assertFalse(self.controller._on_canonical(registry.number(7)))
 
     def test_same_number_from_both_sources_forms_distinct_attributed_members(self):
         registry = self.registry()
@@ -693,6 +745,13 @@ class MixedExecution(MixedFixture, unittest.TestCase):
 
         linear = repair.read_chain(self.repo.clone, restored.base, restored.tip)
         self.assertEqual(len({commit.pr for commit in linear}), 2)
+        context = repair_task.prompt_context(restored, None)
+        for member in context.members:
+            member["no_repair"] = True
+        guarded = "\n".join(repair._no_repair_section(context, linear))
+        self.assertIn("other member's exact Source-PR", guarded)
+        self.assertIn(self.registry_value.number(17).source_pr, guarded)
+        self.assertNotIn("#forgejo:", guarded)
         run_git(self.repo.clone, "checkout", "-q", "--detach", restored.tip)
         listings = repair.listings_path(self.repo.clone)
         repair.compose_prompt(
@@ -713,6 +772,10 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         self.ledger.policy = dataclasses.replace(self.ledger.policy, harness_revision="e" * 40)
         self.assertGreater(self.controller.renew_task(task_id, task.claim_token), self.clock())
         self.profile.raw["authority_generation"] = "2" * 32
+        self.assertGreater(self.controller.renew_task(task_id, task.claim_token), self.clock())
+        self.registry_value.profile = dataclasses.replace(self.profile, reviewers=frozenset({3, 5}))
+        self.assertGreater(self.controller.renew_task(task_id, task.claim_token), self.clock())
+        self.ledger.policy = dataclasses.replace(self.ledger.policy, base_branch="other")
         with self.assertRaises(TaskError):
             self.controller.renew_task(task_id, task.claim_token)
         self.assertEqual(loads(self.controller.store.row("tasks", {"id": task_id})["task_binding"]), original_binding)

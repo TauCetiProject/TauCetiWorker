@@ -17,9 +17,7 @@ def binding(registry):
         "schema": SCHEMA,
         "github": registry.profile.github.record(),
         "forgejo": registry.profile.forgejo.record(),
-        "policy_digest": digest(
-            {"profile": registry.profile.digest, "ci_scope": registry.ci.ledger.binding(registry.ci.ledger.policy)}
-        ),
+        "policy_digest": digest(registry.ci.ledger.binding(registry.ci.ledger.policy)),
         "epoch": registry.store.get_setting("mixed-ci:epoch"),
     }
 

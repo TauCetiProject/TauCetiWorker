@@ -59,6 +59,11 @@ private regular files as required by the existing control-policy loader.
 
 Observation needs only the schema, source identities, reviewer/publisher IDs and
 source token path. Admission additionally requires execution and mirror roles.
+`check-config` validates the profile shape; it does not prove enabled-mode
+readiness. Startup also validates policy/configuration bytes, stored source
+bindings, authority history, credentials and remote repository identities.
+Validate an enabled configuration against a disposable queue before applying it
+to the live service. A configuration check alone is insufficient for rollout.
 The source account needs repository access sufficient for current native
 publisher ACL checks. In admission mode its authenticated native ID must match
 `publisher_id` before source publication or retention. Protect the native CI
@@ -78,8 +83,9 @@ sequence. Stage 1B Worker comments remain useful discussion; completing automati
 trusted Review publication is Stage 2 work. Never bypass this gate to make a
 canary enter the queue. The explicit `authority_generation` is a fresh nonzero 128-bit value; rotate it
 when changing native review authority and never reuse a retired generation.
-Credential-path, caller and mirror changes preserve reviews and paid repair
-claims. A trust change can require fresh publication of the retained review;
+Credential-path, caller, mirror and review-authority changes preserve paid repair
+claims, which bind to the enrolled repositories, queue epoch and CI scope.
+Landing always rechecks current review authority. A trust change can require fresh publication of the retained review;
 it does not require paying for the review again.
 
 The execution policy must enroll both exact repository identities in its
@@ -119,6 +125,16 @@ control files with the explicitly approved caller. In-flight requests retain
 their original immutable caller. Changes to `.github`, `.tauceti`, `scripts` or
 `tauceti.toml` require an explicit approval/configuration update.
 
+This is an operational hold, including after an ordinary human-approved control
+change lands on GitHub: subsequent source-candidate requests wait until the new
+execution caller is approved. Queue status reports the control-comparison error
+in the head's source-CI freeze reason. Update `execution.workflow_revision` to
+the inspected execution commit and restart the service. Separately update
+`mirror.approved_caller` when the GitHub content mirror's controls change. These
+pins may name different repositories when execution uses a dedicated repository;
+when they refer to the same repository, approve the same inspected commit for
+both roles. Ordinary mathematics changes need no re-approval.
+
 GitHub starts as primary. Landings enqueue follower synchronization in the
 existing retryable outbox. Both primary writers use an atomic expected-old Git
 lease and verify ancestry locally. A lost landing reply is reconciled by reading main;
@@ -147,7 +163,12 @@ the queue takes ownership of synchronization. Do not run independent merge
 queues or permit direct main writes on either host.
 
 Disabling native admission retains mixed work and pending native publications;
-it does not reinterpret them as GitHub work. A native-primary ledger refuses to
+it does not reinterpret them as GitHub work. GitHub-only batches before the first
+held batch can continue. Once a held mixed batch reaches the head, it and its
+successors wait: disabling Forgejo is not a way to remove frozen native members
+and resume GitHub-only landing. Cancelling an input does not change fixed batch
+membership. To recover, restore the enrolled `admit` configuration and reconcile
+the retained batch before disabling again. A native-primary ledger refuses to
 start without its explicit active mixed configuration. Switch back with matching
 tips before disabling the native primary's configuration. Production enablement,
 hosted mixed CI/landing evidence and production primary changes are separate

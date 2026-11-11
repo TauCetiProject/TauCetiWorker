@@ -206,12 +206,14 @@ LIVE_RUN_STATUSES = ("queued", "in_progress", "waiting", "requested", "pending")
 LOST_IN_PROGRESS = "lost-run: in_progress"
 
 _PR_MENTION_RE = re.compile(r"(?:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(?P<number>\d+)")
+_SOURCE_PR_MENTION_RE = re.compile(
+    r"forgejo:https?://[^\s`<>]+@[1-9][0-9]*#[1-9][0-9]*"
+    r"|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*"
+)
 # The subject of a squash commit bors-ng lands: `<title> (#<number>)`, with no `Source-PR` trailer.
 _BORS_SUBJECT_RE = re.compile(r"\(#(?P<number>\d+)\)\s*$")
 # What the agent appends to an emptied `no_repair` member's message (the repair prompt's "Do not edit").
-_INTERACTING_PR_RE = re.compile(
-    r"^\s*Interacting-PR:\s*(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#(?P<number>\d+)", re.M | re.I
-)
+_INTERACTING_PR_RE = re.compile(r"^\s*Interacting-PR:\s*`?(?P<reference>[^\s`]+)", re.M | re.I)
 _INTERACTING_FILE_RE = re.compile(r"^\s*Interacting-File:\s*`?(?P<file>[^`\n]+?)`?\s*$", re.M | re.I)
 _FINDING_RE = re.compile(r"^\s*Finding:\s*(?P<finding>\S.*?)\s*$", re.M | re.I)
 
@@ -392,7 +394,7 @@ class Controller:
         self.admission = None  # primary policy intake, attached by the service in policy mode
         if store.get_setting("mixed:primary", "github") != "github" and mixed is None:
             raise ValueError("Forgejo primary cannot run without its explicit mixed-source configuration")
-        self.source = mixed.port if mixed is not None else github
+        self.source = mixed.port if mixed is not None and mixed.mode == "admit" else github
         self.mixed = mixed
         self.mixed_ci = None
         self.execution = execution if execution is not None else github
@@ -6374,7 +6376,11 @@ class Controller:
                     + ", ".join(f"[`{sha[:12]}`](https://github.com/{self.repository}/commit/{sha})" for sha in edited)
                     + ".",
                 ]
-            mentioned = self._mentioned_prs(member["explanation"], exclude=member["number"])
+            mentioned = self._mentioned_prs(
+                member["explanation"],
+                exclude=member["number"],
+                qualified=any(isinstance(m["number"], SourceNumber) for m in self._members(batch["id"])),
+            )
             if mentioned:
                 lines += [
                     "",
@@ -6434,33 +6440,48 @@ class Controller:
             ]
         return lines
 
-    def _mentioned_prs(self, text: str, exclude: int) -> list[int]:
+    def _mentioned_prs(self, text: str, exclude: int, *, qualified=False) -> list[int]:
+        from .mixed_identity import from_source_pr
+
+        candidates = []
+        references = list(_SOURCE_PR_MENTION_RE.finditer(text))
+        for match in references:
+            value = match.group()
+            if not value.startswith("forgejo:") and value.rsplit("#", 1)[0] not in {
+                self.provenance_repository,
+                self.repository,
+            }:
+                continue
+            try:
+                number = from_source_pr(value)
+            except (ValueError, TypeError):
+                continue
+            candidates.append((match.start(), number))
+        if not (qualified or isinstance(exclude, SourceNumber)):
+            for match in _PR_MENTION_RE.finditer(text):
+                if any(reference.start() <= match.start() < reference.end() for reference in references):
+                    continue
+                if match["repo"] is None or match["repo"] == self.repository:
+                    candidates.append((match.start(), int(match["number"])))
         found: list[int] = []
-        for match in _PR_MENTION_RE.finditer(text):
-            repo = match["repo"]
-            number = int(match["number"])
-            if repo is None and isinstance(exclude, SourceNumber):
-                number = SourceNumber(number, exclude.source)
-            if (repo is None or repo == self.repository) and number != exclude and number not in found:
+        for _, number in sorted(candidates, key=lambda candidate: candidate[0]):
+            if number != exclude and number not in found:
                 found.append(number)
         return found
 
     # --- the no-repair opt-out: problem-anticipated withdrawals ----------------------------------
 
-    def _attribution(self, explanation: str, exclude: int) -> dict[str, Any]:
+    def _attribution(self, explanation: str, exclude: int, *, qualified=False) -> dict[str, Any]:
         """The interacting PR, file and finding the agent appended to an emptied `no_repair` member's
         message (`Interacting-PR:`, `Interacting-File:`, `Finding:` lines); the PR falls back to the
         first other PR the text mentions. Missing parts are None."""
         number = None
         match = _INTERACTING_PR_RE.search(explanation)
         if match:
-            candidate = int(match["number"])
-            if isinstance(exclude, SourceNumber):
-                candidate = SourceNumber(candidate, exclude.source)
-            if candidate != exclude:
-                number = candidate
+            mentioned = self._mentioned_prs(match["reference"], exclude, qualified=qualified)
+            number = mentioned[0] if mentioned else None
         if number is None:
-            mentioned = self._mentioned_prs(explanation, exclude=exclude)
+            mentioned = self._mentioned_prs(explanation, exclude=exclude, qualified=qualified)
             number = mentioned[0] if mentioned else None
         file_match = _INTERACTING_FILE_RE.search(explanation)
         finding_match = _FINDING_RE.search(explanation)
@@ -6475,10 +6496,12 @@ class Controller:
         if self._canonical is None:
             return False
         # Git uses POSIX ERE, whose literal escaping differs from Python re.escape.
-        repository = "".join("\\" + char if char in ".[](){}*+?^$|\\" else char for char in self.provenance_repository)
-        pattern = rf"(\(#{number}\)$|^{chain.SOURCE_PR_TRAILER}: {repository}#{number}$)"
-        if self.native_source:
-            pattern = rf"^{chain.SOURCE_PR_TRAILER}: {repository}#{number}$"
+        repository = "".join(
+            "\\" + char if char in ".[](){}*+?^$|\\" else char for char in self._member_repository(number)
+        )
+        pattern = rf"(\(#{int(number)}\)$|^{chain.SOURCE_PR_TRAILER}: {repository}#{int(number)}$)"
+        if self.native_source or isinstance(number, SourceNumber):
+            pattern = rf"^{chain.SOURCE_PR_TRAILER}: {repository}#{int(number)}$"
         result = chain._git(
             self.clone, "log", "-n", "5", "--format=%H", "-E", f"--grep={pattern}", self._canonical, "--"
         )
@@ -6510,7 +6533,11 @@ class Controller:
         the PR comes back through `needs-rebase` and re-approval once the other side lands, or is
         re-admitted at its original age if the other side leaves the queue without landing (`_follow_anticipated`).
         """
-        attribution = self._attribution(explanation, member["number"])
+        attribution = self._attribution(
+            explanation,
+            member["number"],
+            qualified=any(isinstance(m["number"], SourceNumber) for m in self._members(batch["id"])),
+        )
         interacting = attribution["interacting"]
         record = {
             "batch_id": batch["id"],

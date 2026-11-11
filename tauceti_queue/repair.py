@@ -1673,7 +1673,10 @@ def _landed_section(
 def _no_repair_section(context: PromptContext, chain: list[ChainCommit]) -> list[str]:
     """The "Do not edit" section: members whose authors opted out of repair (``no_repair``), and those
     the queue already withdrew that way (``withdrawn``), which stay empty commits."""
+    from .mixed_identity import SourceNumber
+
     by_number = _members_by_number(context)
+    mixed = any(isinstance(number, SourceNumber) for number in by_number)
     titles = {c.pr: c.subject for c in chain if c.pr is not None}
     guarded = [n for n, m in by_number.items() if m.get("no_repair") and n in titles]
     if not guarded:
@@ -1686,14 +1689,19 @@ def _no_repair_section(context: PromptContext, chain: list[ChainCommit]) -> list
     ]
     for number in guarded:
         state = " (withdrawn: keep it an empty commit)" if by_number[number].get("withdrawn") else ""
-        lines.append(f"- #{number} {by_number[number].get('title') or titles[number]}{state}")
+        reference = by_number[number].get("source_pr") if mixed else f"#{number}"
+        lines.append(f"- {reference} {by_number[number].get('title') or titles[number]}{state}")
     lines += [
         "",
         "If making the batch build needs a change to one of them, do not make it: reduce that member to an empty "
         "commit instead (its content removed, its message kept) and append to its message, as its explanation, which "
         "other PR, file and finding made the change necessary, one per line:",
         "",
-        "    Interacting-PR: #<the other PR>",
+        (
+            "    Interacting-PR: <the other member's exact Source-PR value>"
+            if mixed
+            else "    Interacting-PR: #<the other PR>"
+        ),
         "    Interacting-File: <path of the file>",
         "    Finding: <conflict, duplicate declaration, rename ripple or build error>: <one sentence>",
         "",
