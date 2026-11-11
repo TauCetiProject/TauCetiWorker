@@ -2,10 +2,13 @@
 """--roadmap-targets: the list format, live statuses, selection, the claim, the prompt and the wiring,
 without GitHub or model access. The fixture is the example in docs/target-lists.md."""
 
+import contextlib
 import importlib
+import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -246,6 +249,38 @@ class Round(unittest.TestCase):
         env = {"PATH": f"{self.tmp / 'bin'}:{os.environ['PATH']}", "TAUCETI_TARGET_MARKER": required}
         script = REPO / "scripts" / "gh-safe-pr-create"
         return subprocess.run([script, "--body", body], env=env, capture_output=True).returncode
+
+    def test_the_markers_reach_the_wrapper_in_a_bubble_round(self):
+        """The two-line TAUCETI_TARGET_MARKER through the Bubble command string: built by run_in_bubble's
+        echo path, then sent the way Bubble sends `--command`, as one `bash -lc` string over ssh."""
+        self.author()
+        complete, partial = os.environ["TAUCETI_TARGET_MARKER"].splitlines()
+        (self.tmp / "bin").mkdir()
+        (self.tmp / "bin" / "gh").symlink_to(shutil.which("true"))
+        script = REPO / "scripts" / "gh-safe-pr-create"
+        inner = f'env PATH={self.tmp / "bin"}:"$PATH" {shlex.quote(str(script))} --body "$TCW_BODY"'
+        cfg = SimpleNamespace(state=self.tmp / "state", home=self.tmp / "home", wid="w", logdir=self.tmp / "logs")
+        out = io.StringIO()
+        with (
+            patch.dict(os.environ, TAUCETI_AGENT_ECHO="1"),
+            patch.object(tc.agents, "ensure_bubble_home", lambda _cfg: dict(os.environ)),
+            patch.object(tc.agents, "_bubble_pop", lambda _cfg, _env: None),
+            contextlib.redirect_stdout(out),
+        ):
+            rc = tc.run_in_bubble(
+                SimpleNamespace(cfg=cfg), tc.TAUCETI, "", SimpleNamespace(work_model="claude"), inner_cmd=inner
+            )
+        self.assertEqual(rc, 0)
+        argv = shlex.split(out.getvalue().removeprefix("BUBBLE "))
+        command = argv[argv.index("--command") + 1]
+        self.assertIn("TAUCETI_TARGET_MARKER=", command)
+        remote = shlex.join(["bash", "-lc", f"cd {shlex.quote(str(self.tmp))} && exec {command}"])
+        env = {k: v for k, v in os.environ.items() if k != "TAUCETI_TARGET_MARKER"} | {"HOME": str(self.tmp)}
+        verdicts = {
+            body: subprocess.run(["bash", "-c", remote], env=env | {"TCW_BODY": body}, capture_output=True).returncode
+            for body in (complete, partial, complete[: -len("}-->")])
+        }
+        self.assertEqual(list(verdicts.values()), [0, 0, 1])
 
     def test_live_statuses_reach_the_prompt(self):
         self.w.gh = github(merged=[(7, marker("Probability", "truncation-bounds"))])
