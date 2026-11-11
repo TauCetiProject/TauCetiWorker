@@ -110,8 +110,7 @@ def attributed_rate_display(row):
     rate = attributed_rate(row)
     if rate is None:
         return "—"
-    partial = "partial " if row.get("attribution_missing_prs") or row.get("attribution_preparing") else ""
-    return partial + "~" + amount(rate, rate=True)
+    return "~" + amount(rate, rate=True)
 
 
 def display(value, default_kinds=()):
@@ -361,22 +360,6 @@ def display(value, default_kinds=()):
             print("Landed LOC unavailable from older summaries; refresh activity collectors.")
         if any(windows[w].get("loc_estimated") for w in cost_windows):
             print("~ Missing LOC estimated from measured landed PRs; zero if none measured.")
-        if any(windows[w].get("attribution_version") for w in cost_windows):
-            print(
-                "~ Attribution uses observed review counts and measured local costs; all spending, including failures and overhead, is charged."
-            )
-            if any(attribution_backfilling(windows[w]) for w in cost_windows):
-                print(
-                    "Attribution history is being prepared; adjusted LOC and cost rates are unavailable until backfill finishes."
-                )
-            elif any(windows[w].get("attribution_preparing") for w in cost_windows):
-                print("Attribution refresh is pending; showing the last prepared estimate.")
-            if any(windows[w].get("attribution_missing_prs") for w in cost_windows):
-                print(
-                    "Attribution coverage is incomplete; PRs missing cost links, review records or LOC contribute no attributed output."
-                )
-            if any(windows[w].get("attribution_known_prs") is None for w in cost_windows):
-                print("Attribution unavailable from older hosts; refresh activity collectors.")
     funding = costs.get("funding")
     if funding:
         print()
