@@ -10,6 +10,8 @@ the worker uses:
     candidates(targets, only, skip)    the eligible items, in the order a worker tries to claim them
     landed_pr(item, gh)                the merged pull request that completed an item, at any age
     marked_prs(targets, prs)           the pull requests among `prs` whose marker names an item
+    GitHubMarkerReads()                the GitHub repository's marked pull requests, for a round
+                                       whose sources do not include GitHub
     render_assignment(targets, item)   the roadmap prompt's bullet assigning one item
     target_markers(item)               the item's complete and partial markers, one of which the
                                        pull request body must carry
@@ -21,6 +23,7 @@ are the pure pieces those are built from; none of them reads GitHub or the envir
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 from collections.abc import Iterable
@@ -225,6 +228,53 @@ def live_targets(targets: Targets, gh, others: Iterable = ()) -> Targets:
         recent = source.merged_prs(f"{MERGED_SEARCH} sort:updated-desc", limit=MERGED_LIMIT)
         done |= set(landed(targets.items(), recent))
     return overlay_live(targets, inflight, done)
+
+
+def search_phrases(search: str) -> list[str]:
+    """The quoted phrases of a GitHub-style search, unescaped; what a body must contain to match."""
+    return [p.replace('\\"', '"') for p in re.findall(r'"((?:[^"\\]|\\.)*)"', search)]
+
+
+def github_history_enabled() -> bool:
+    """TAUCETI_ROADMAP_TARGETS_GITHUB: whether a round with no GitHub source still reads the GitHub
+    content repository's marked pull requests (`GitHubMarkerReads`). On unless set to 0."""
+    return os.environ.get("TAUCETI_ROADMAP_TARGETS_GITHUB", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+class GitHubMarkerReads:
+    """A source for `live_targets` and `landed_pr` made of the GitHub content repository's
+    marker-bearing pull requests, for a round whose sources do not include GitHub (a list carried
+    over from GitHub). One listing (`GitHub.target_marker_prs`) serves the open side, the merged
+    side and every item's landing search. A failed read is logged once and counts as no pull
+    requests, which leaves the list's own marks."""
+
+    def __init__(self, gh=None):
+        from .github import GitHub
+
+        self.gh = gh if gh is not None else GitHub()
+        self._rows: list[dict] | None = None
+
+    def _listing(self) -> list[dict]:
+        if self._rows is None:
+            from .config import GitHubUnavailable
+            from .github import GitHubError
+            from .worker_sources import shared_github_environment
+
+            try:
+                with shared_github_environment():
+                    self._rows = self.gh.target_marker_prs(limit=MERGED_LIMIT)
+            except (GitHubError, GitHubUnavailable, SourceUnavailable, OSError, ValueError) as e:
+                log(f"target list: GitHub pull requests unreadable ({e}); using the list's own marks for them")
+                self._rows = []
+        return self._rows
+
+    def open_prs(self) -> list[dict]:
+        return [d for d in self._listing() if d.get("state") == "OPEN"]
+
+    def merged_prs(self, search: str, *, limit: int = MERGED_LIMIT) -> list[dict]:
+        phrases = search_phrases(search)
+        rows = [d for d in self._listing() if d.get("state") == "MERGED"]
+        return [d for d in rows if all(p in (d.get("body") or "") for p in phrases)][:limit]
 
 
 def landed_pr(item: TargetItem, gh) -> int | None:

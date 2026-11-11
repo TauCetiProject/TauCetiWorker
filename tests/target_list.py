@@ -645,9 +645,12 @@ class ForgejoRound(unittest.TestCase):
             "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `first` — a\n- [ ] `second` — b (needs: `first`)\n"
             "- [ ] `third` — c\n"
         )
+        self.github_rows = []
+        self.github_reads = Mock(side_effect=lambda limit: self.github_rows)
         for item in (
             patch("tauceti_worker.worker_sources.current", return_value=self.forgejo),
             patch("tauceti_worker.worker_sources.shared_github_environment", contextlib.nullcontext),
+            patch("tauceti_worker.github.GitHub.target_marker_prs", lambda _gh, *, limit: self.github_reads(limit)),
         ):
             item.start()
             self.addCleanup(item.stop)
@@ -674,6 +677,33 @@ class ForgejoRound(unittest.TestCase):
         self.forgejo.open_prs.return_value = []
         self.api.pages.return_value = iter([])
         self.assertIn("Your target is assigned: `first` in `Algebra`", self.author())
+
+    def test_a_forgejo_only_round_reads_the_lists_github_history_in_one_request(self):
+        self.github_rows = [
+            {"number": 30, "title": "t", "body": marker("Algebra", "first"), "state": "MERGED"},
+            {"number": 31, "title": "t", "body": marker("Algebra", "third"), "state": "OPEN"},
+        ]
+        prompt = self.author()
+        self.assertIn("Your target is assigned: `second` in `Algebra`", prompt)
+        self.assertIn("  - [x] `first` — a", prompt)
+        self.assertIn("  - [~] `third` — c", prompt)
+        self.github_reads.assert_called_once_with(200)
+
+    def test_a_github_item_in_flight_is_not_assigned_again(self):
+        self.github_rows = [{"number": 31, "title": "t", "body": marker("Algebra", "first"), "state": "OPEN"}]
+        self.assertIn("Your target is assigned: `third` in `Algebra`", self.author())
+
+    def test_unreadable_github_leaves_the_lists_own_marks(self):
+        self.github_reads.side_effect = tc.GitHubError("rate limited")
+        with patch.object(t, "log") as log:
+            self.assertIn("Your target is assigned: `first` in `Algebra`", self.author())
+        self.assertIn("GitHub pull requests unreadable (rate limited)", log.call_args_list[0].args[0])
+
+    def test_the_github_read_can_be_turned_off(self):
+        self.github_rows = [{"number": 31, "title": "t", "body": marker("Algebra", "first"), "state": "OPEN"}]
+        with patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS_GITHUB": "0"}):
+            self.assertIn("Your target is assigned: `first` in `Algebra`", self.author())
+        self.github_reads.assert_not_called()
 
     def test_an_unavailable_forgejo_listing_authors_nothing(self):
         self.forgejo.open_prs.return_value = None

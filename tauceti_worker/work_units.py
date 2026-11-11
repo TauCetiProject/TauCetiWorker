@@ -120,9 +120,11 @@ from .survey import (
     survey,
 )
 from .targets import (
+    GitHubMarkerReads,
     TargetItem,
     Targets,
     candidates,
+    github_history_enabled,
     inventory_keys,
     landed_pr,
     live_targets,
@@ -3066,7 +3068,10 @@ def assign_target(w, path: Path, only: str, skip: list[str]) -> tuple[Targets, T
 
     listed = load_targets(path)
     claims = getattr(w, "claims", None)
-    sources = [_target_reads(source) for source in (w.gh, *getattr(w, "target_sources", ()))]
+    seen = (w.gh, *getattr(w, "target_sources", ()))
+    sources = [_target_reads(source) for source in seen]
+    if all(getattr(source, "direct_source", False) for source in seen) and github_history_enabled():
+        sources.append(GitHubMarkerReads())
     try:
         live = live_targets(listed, sources[0], sources[1:])
         # A multi-source round's inventory also names the other forge's open pull requests.
