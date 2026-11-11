@@ -69,7 +69,11 @@ try:
     env = {k: v for k, v in os.environ.items() if k not in ("TAUCETI_RUNTIME_DIR", "TAUCETI_WORKERS_STATE_DIR")}
     result = subprocess.run(
         [sys.executable, "-m", "tauceti_worker", "workers", "--config", str(config), "apply"],
-        cwd=REPO, env=env, capture_output=True, text=True, timeout=60,
+        cwd=REPO,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert not (root / "xdg-run" / "tauceti" / "manager.lock").exists(), "a second manager was started"
@@ -78,7 +82,11 @@ try:
     conflicting = dict(env, TAUCETI_RUNTIME_DIR=str(root / "other-run"))
     result = subprocess.run(
         [sys.executable, "-m", "tauceti_worker", "workers", "--config", str(config), "apply"],
-        cwd=REPO, env=conflicting, capture_output=True, text=True, timeout=60,
+        cwd=REPO,
+        env=conflicting,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     assert result.returncode != 0 and "would start a second manager" in result.stdout + result.stderr, (
         result.stdout + result.stderr
