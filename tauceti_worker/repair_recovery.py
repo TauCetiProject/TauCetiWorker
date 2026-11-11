@@ -175,7 +175,9 @@ def environment(**changes):
 
 
 def repository_url(repository):
-    return f"https://github.com/{repository}.git"
+    from .worker_sources import repository_url as source_repository_url
+
+    return source_repository_url(repository) + ".git"
 
 
 def source_tree(checkout):
@@ -576,7 +578,7 @@ class WorkerBackend:
             "baseRefName",
             "body",
         ]
-        if cached:
+        if cached and getattr(self.w.gh, "worker_capable", False) is not True:
             from .github_state import read
 
             available, data = read(m["repository"], "pr", number=m["pr"])
@@ -625,12 +627,30 @@ class WorkerBackend:
                 "The checkpoint has an unfinished Git operation whose native metadata was not retained",
             )
         auth = m.get("authorization") or {}
-        if not auth or auth.get("actor", "").lower() != me().lower():
+        native = getattr(self.w.gh, "worker_capable", False) is True
+        if native:
+            actor = self.w.gh.authenticated_actor()
+            row = self.w.gh.live_pull(m["pr"])
+            if (
+                actor is None
+                or row is None
+                or auth.get("source") != self.w.gh.identity.record()
+                or auth.get("actor_id") != int(actor.principal.native_id)
+                or auth.get("author_id") != row["user"]["id"]
+                or row["user"]["id"] != int(actor.principal.native_id)
+            ):
+                raise Block(
+                    "original-authorization-missing", "Original native source and actor IDs cannot be established"
+                )
+        if not auth or (not native and auth.get("actor", "").lower() != me().lower()):
             raise Block(
                 "original-authorization-missing",
                 "Original worker identity/publication permissions cannot be established",
             )
-        if any(facts[key] != auth.get(key) for key in ("author", "repository", "ref")):
+        if any(
+            facts[key] != auth.get(key)
+            for key in (("repository", "ref") if native else ("author", "repository", "ref"))
+        ):
             raise Block(
                 "ownership-changed",
                 "PR author or head destination differs from the original authorization",
@@ -646,7 +666,7 @@ class WorkerBackend:
                 "foreign-scope",
                 "Original foreign-fork canary has no automatic replay authority",
             )
-        if facts["author"].lower() != me().lower() and not auth.get("automatic_bump"):
+        if not native and facts["author"].lower() != me().lower() and not auth.get("automatic_bump"):
             raise Block("ownership-policy", "Current identity does not own this PR")
         if can_push(facts["repository"]) is not True:
             raise Block(

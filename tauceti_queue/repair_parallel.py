@@ -55,7 +55,15 @@ import typing
 from pathlib import Path
 
 from tauceti_queue import chain as chain_tool
-from tauceti_queue import repair, repair_audit, repair_context, repair_sandbox, repair_stream, repair_tools
+from tauceti_queue import (
+    repair,
+    repair_audit,
+    repair_context,
+    repair_publish,
+    repair_sandbox,
+    repair_stream,
+    repair_tools,
+)
 from tauceti_queue.repair import ChainCommit, PromptContext, git
 
 DEFAULT_PARALLEL_AGENTS = 3
@@ -745,7 +753,14 @@ def repair_groups(
         if ownership is not None and hasattr(ownership, "members"):
             repair_context.write_files(ownership, path)
         repair_tools.write_build_script(path / repair_tools.TOOLS_DIR, lock=lock)
-        repair_audit.write_settings(path, base=base, tools_root=cfg.root / repair_audit.TOOLS_DIR, lake=tuple(cfg.lake))
+        repair_audit.write_settings(
+            path,
+            base=base,
+            tools_root=cfg.root / repair_audit.TOOLS_DIR,
+            lake=tuple(cfg.lake),
+            checks_owner="staging" if repair_audit.staging_checks(task) else "worker",
+            policy_file=worktree / repair_tools.TOOLS_DIR / repair_audit.SETTINGS_FILE,
+        )
         group.worktree = str(path)
         return path
 
@@ -863,13 +878,20 @@ def repair_groups(
                 record["lock_wait_seconds"] = round(time.monotonic() - lock_wait, 1)
                 # CI's offline bwrap sandbox, as every build the worker runs (``repair_sandbox``).
                 build = repair.run_logged(
-                    repair_sandbox.sandboxed_lake([*cfg.lake, "build", "--iofail"], worktree, env_lake),
+                    repair_sandbox.sandboxed_lake(
+                        [*cfg.lake, "build", *repair_publish.build_flags(worktree)], worktree, env_lake
+                    ),
                     worktree,
                     logdir / "verify-build.log",
                     env_lake,
                     cfg.build_timeout,
                 )
-                if build["rc"] == 0 and getattr(cfg, "worker_audits", False) and task.kind == "repair":
+                if (
+                    build["rc"] == 0
+                    and getattr(cfg, "worker_audits", False)
+                    and task.kind == "repair"
+                    and not repair_audit.staging_checks(task)
+                ):
                     # CI's audits and changed-module lint over the green build, still under the lock.
                     checks = repair_audit.check(
                         worktree,
@@ -879,6 +901,7 @@ def repair_groups(
                         logdir=logdir,
                         lake=tuple(cfg.lake),
                         timeout=cfg.build_timeout,
+                        defer_when=lambda: repair_audit.staging_checks(task),
                     )
                     record["checks"] = {k: v for k, v in checks.items() if k != "diagnostics"}
                     check_findings = checks["diagnostics"]
@@ -899,8 +922,8 @@ def repair_groups(
     ):
         record["status"] = "ok"
         record["tip"] = folded_tip
-        if "checks" in record:
-            record["verified_tip"] = folded_tip  # built and checked: the sequential path need not repeat it
+        if "checks" in record or repair_audit.staging_checks(task):
+            record["verified_tip"] = folded_tip  # the task's assigned worker verification completed
     else:
         record["status"] = "partial"
         record["remaining"] = remaining_findings(findings, groups, failed_modules)

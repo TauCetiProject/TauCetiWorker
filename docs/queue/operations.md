@@ -746,7 +746,6 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `claim_ttl_seconds` | `900` | integer, at least 0 |
 | `dispatch_timeout_seconds` | `600` | integer, at least 0 |
 | `lost_run_seconds` | `14400` | integer, at least 0 |
-| `infrastructure_retry_limit` | `3` | integer, at least 0 |
 | `infrastructure_retry_backoff_seconds` | `60` | integer, at least 0 |
 | `inference_failure_threshold` | `3` | integer, at least 0 |
 | `inference_hold_backoff_seconds` | `60` | integer, at least 0 |
@@ -970,7 +969,7 @@ and lets the next tick dispatch a fresh attempt. It is for a head whose commits 
 without a source change, for example after a chain tool fix changed the commit message format and the
 head's CI failed on a consequence of the old format; it is refused while the head is claimed and when a
 member carries agent edits, which a rebuild would discard. `POST /admin/retry-ci` stays the action for
-exhausted infrastructure retries.
+persistent infrastructure failures; automatic retries continue with capped backoff.
 
 ## Monitoring
 

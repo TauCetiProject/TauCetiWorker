@@ -762,6 +762,18 @@ class GitHubAdapter:
 
     # -- CI dispatch and observation
 
+    def retry_status_delivery(self, repo: str, run_id: str, run_attempt: int, *, base_ref: str) -> None:
+        """Replay original-run reporting; never rerun compilation or publish a verdict here."""
+        if not str(run_id).isdigit() or int(run_id) <= 0 or int(run_attempt) <= 0:
+            raise ValueError("invalid original-run status identity")
+        self.client.request(
+            "POST",
+            f"repos/{repo}/actions/workflows/retry-ci-status.yml/dispatches",
+            json_body={"ref": base_ref, "inputs": {"source_run_id": str(run_id), "source_attempt": str(run_attempt)}},
+            ok=(204,),
+            single_attempt=True,
+        )
+
     def dispatch_candidate(
         self,
         repo: str,
