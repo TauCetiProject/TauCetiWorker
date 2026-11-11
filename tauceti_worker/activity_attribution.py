@@ -399,6 +399,10 @@ def prepare_reviews(db, now, priority=()):
             "INSERT OR IGNORE INTO review_archive_checks VALUES (?,?,?,?,?)",
             (repo, number, checked_at if complete else now, complete, fingerprint),
         )
+        if prior and complete and prior[2] < fetched:
+            from .activity_attribution_prepare import queue
+
+            queue(db, "pr", [repo, number])
         if remaining <= 0 or time.monotonic() >= deadline:
             break
 

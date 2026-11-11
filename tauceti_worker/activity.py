@@ -576,8 +576,8 @@ def _refresh_prs(db, config, now, errors):
                         counter_values,
                     )
                     db.execute(
-                        "INSERT OR IGNORE INTO pr_review_counts VALUES (?,?,?,?,?,?,?)",
-                        (*counter_values[-2:], *counter_values[:-2]),
+                        "INSERT OR IGNORE INTO pr_review_counts(head,count,observed,checked,basis,repo,number) VALUES (?,?,?,?,?,?,?)",
+                        counter_values,
                     )
                     loc = p.get("lean_loc") or git_locs.get(p["number"]) or stored_locs.get(p["number"])
                     if loc is not None:
