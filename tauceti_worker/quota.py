@@ -2336,7 +2336,8 @@ class Quota:
         """Stable account identity for shared usage polling and cooldowns.
 
         Prefer a provider account identifier; otherwise share by canonical credential
-        source. Separate credential copies on separate hosts do not coordinate.
+        source, or by the usage login's file, since several can share a directory.
+        Separate credential copies on separate hosts do not coordinate.
         """
         if oauth is None:
             oauth, _kc = self._claude_creds()
@@ -2350,7 +2351,7 @@ class Quota:
                 for sub in ("uuid", "id", "email_address"):
                     if isinstance(blk.get(sub), str) and blk[sub]:
                         return f"account:{blk[sub]}"
-        return f"creds:{self._claude_creds_source()}"
+        return f"creds:{claude_usage_credentials() or self._claude_creds_source()}"
 
     @staticmethod
     def _next_eligible(windows: list[Window], now: float | None = None) -> float | None:

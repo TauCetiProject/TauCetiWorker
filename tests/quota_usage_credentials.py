@@ -263,6 +263,30 @@ def cases():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+    # 5b) Two usage logins kept as files in one directory are two accounts to the cooldowns, unless the
+    #     OAuth block names the account.
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        logins = tmp / "logins"
+        logins.mkdir()
+        (logins / "alice.json").write_text(login("alice-access"))
+        (logins / "bob.json").write_text(login("bob-access"))
+        alice, _, _ = setup(tmp, worker="alice")
+        os.environ[VARIABLE] = str(logins / "alice.json")
+        seen, usage = usage_seen([(429, {}, 3600)])
+        with usage:
+            limited = alice.claude(refresh=True, renew=True)
+        bob, _, _ = setup(tmp, worker="bob")
+        os.environ[VARIABLE] = str(logins / "bob.json")
+        with usage:
+            other = bob.claude(refresh=True, renew=True)
+        check("alice is rate limited", limited.rate_limited, True)
+        check("bob's login is read on its own", seen, ["Bearer alice-access", "Bearer bob-access"])
+        check("bob is not held by alice's cooldown", other.available, True)
+        check("the key is the file", bob._claude_account_key(), f"creds:{logins / 'bob.json'}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
     # 6) The loop's advice after a refusal points at the usage login, not at the agents' credential.
     refused = tc.quota.Provider("claude", False, None, error="claude usage HTTP 401 (access token expired)")
     os.environ[VARIABLE] = "/logins/usage/.credentials.json"
