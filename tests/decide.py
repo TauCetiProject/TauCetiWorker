@@ -539,6 +539,44 @@ def test_rounds(tmp):
             ("retry", ["acked"]),
         )
 
+    root = tmp / "refreshed-landed"
+    with settings(root, TAUCETI_HOLD_DECLINED="0"):
+        declined(1)
+        hub = Hub(p1={}, p20={})
+        rounds(tmp, hub, answer((1, "wait", {"blocked_on": [20]})))
+        incidents.record_declined("fix", 1, "head-1", message="declined again, with new evidence")
+        hub.prs[20]["state"] = "MERGED"
+        seen = rounds(tmp, hub, answer((1, "retry", {})))
+        case = seen["packet"]["cases"][0]
+        check(
+            "a blocker landed while a newer record is live: that record goes to the model, retry still open",
+            (case["final_message"], "retry" in case["allowed"], ruling(root)["by"], ruling(root)["ruling"]),
+            ("declined again, with new evidence", True, "model", "retry"),
+        )
+
+    root = tmp / "refreshed-crowded"
+    with settings(root, TAUCETI_HOLD_DECLINED="0"):
+        declined(1)
+        hub = Hub(p1={}, p20={}, **{f"p{n}": {} for n in range(2, 8)})
+        rounds(tmp, hub, answer((1, "wait", {"blocked_on": [20]})))
+        declined(*range(2, 8))
+        later()
+        incidents.record_declined("fix", 1, "head-1", message="declined again, with new evidence")
+        fresh = incidents.find(incidents.DECLINED, "fix-1")[0]
+        hub.prs[20]["state"] = "CLOSED"
+        seen = rounds(tmp, hub, {"rulings": []})
+        check(
+            "…and when the batch is full of older cases, the superseded record is not put to the model instead",
+            ("declined-fix-1" in [c["case"] for c in seen["packet"]["cases"]], where(root, "declined-fix-1.json")),
+            (False, ["live", "acked"]),
+        )
+        seen = rounds(tmp, hub, answer((1, "retry", {})))
+        check(
+            "…the newer record is ruled on in a later round, with its retry",
+            ([c["case"] for c in seen["packet"]["cases"]], decide.ruling_on(fresh)["ruling"]),
+            (["declined-fix-1"], "retry"),
+        )
+
     root = tmp / "rewritten"
     with settings(root):
         declined(1, 2, 3)

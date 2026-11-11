@@ -81,7 +81,7 @@ any other), so the sources' rounds neither wait on nor delay each other.
 | Ruling | Meaning | What the worker does |
 | --- | --- | --- |
 | `retry` | The round stopped for a reason that is not about the pull request, or there is evidence it did not have. | Lifts the hold at that head, and adds the ruling's note to the stage's next prompt for it. Once per head, and for `declined` incidents only. |
-| `wait` | Other open pull requests are doing the missing work. | Records them. When all have merged the ruling becomes a `retry`; when one closes unmerged the incident is put to the model again, under the same hold-label and branch-claim checks as a new one (until it passes them the `wait` stands). |
+| `wait` | Other open pull requests are doing the missing work. | Records them. When all have merged the ruling becomes a `retry`; when one closes unmerged the incident is put to the model again, under the same hold-label and branch-claim checks as a new one (until it passes them the `wait` stands). Where a newer record of the incident is live, neither happens: that record is put to the model as a new case, with the `wait` shown as the earlier ruling. |
 | `escalate` | Anything else. | Nothing: the record carries the analysis and a recommendation for a person. |
 | `prerequisite` | A roadmap milestone nobody is building blocks it. | Adds the milestone to the target list and waits for it as `wait` does. Offered only with a target list and a readable roadmap checkout. |
 | `roadmap` | Only a change to a roadmap resolves it. | Writes the proposed change to a local file. Nothing is opened. Offered only with a readable roadmap checkout. |
