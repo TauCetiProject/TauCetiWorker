@@ -4721,11 +4721,11 @@ class WorkerAudits(Fixture):
         self.service.tasks[1]["extra"]["checks_owner"] = "staging"
         self.findings("lint-findings-always", "simpNF: unrelated declaration")
         cfg = self.config()
-        with patch.object(repair_audit, "check", side_effect=AssertionError("duplicate full checks")):
+        with patch.object(repair_audit, "build_drivers", side_effect=AssertionError("head check setup")):
             outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
         self.assertEqual(outcome["verification"][-1]["build"]["rc"], 0)
-        self.assertNotIn("checks", outcome["verification"][-1])
+        self.assertEqual(outcome["verification"][-1]["checks"]["status"], "deferred")
         self.assertFalse((self.stub_dir / "audit-runs.log").exists())
         self.assertFalse((self.stub_dir / "lint-runs.jsonl").exists())
         self.assertEqual(len(self.service.results), 1)
@@ -4788,7 +4788,7 @@ class WorkerAudits(Fixture):
         self.service.tasks[1].update(kind="prepare")
         self.service.tasks[1]["extra"]["checks_owner"] = "staging"
         cfg = self.config()
-        with patch.object(repair_audit, "check", side_effect=AssertionError("duplicate discovery checks")):
+        with patch.object(repair_audit, "build_drivers", side_effect=AssertionError("head discovery setup")):
             outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         if self.BROKEN:
             self.assertEqual(outcome["status"], "adopted", outcome)
@@ -5106,6 +5106,95 @@ class WorkerAudits(Fixture):
         self.assertEqual(scoped.returncode, 0, scoped.stdout + scoped.stderr)
         self.assertIn("audits: CI's audits and lint run after a whole-library build", scoped.stdout)
         self.assertEqual(len((self.stub_dir / "audit-runs.log").read_text().splitlines()), runs)
+
+
+class HeadHandoff(Fixture):
+    BASE_FILES = WorkerAudits.BASE_FILES
+
+    def setUp(self):
+        super().setUp()
+        os.environ[repair_audit.URL_VARIABLE] = str(TOOLS_REPOSITORY)
+        self.addCleanup(os.environ.pop, repair_audit.URL_VARIABLE, None)
+
+    def test_running_background_audit_yields_on_renewal_and_submits_its_compiled_chain(self):
+        self.run_check_handoff("audit-driver")
+
+    def test_running_background_lint_yields_on_renewal_and_submits_its_compiled_chain(self):
+        self.run_check_handoff("lint-env.sh")
+
+    def test_head_handoff_survives_helper_settings_write_failure(self):
+        with patch.object(repair_audit, "update_checks_owner", return_value=None):
+            self.run_check_handoff("lint-env.sh")
+
+    def test_parallel_helper_observes_its_parent_check_priority(self):
+        parent = repair_audit.write_settings(self.content.clone, base=self.content.base, tools_root=self.root / "tools")
+        group = self.root / "group"
+        repair_audit.write_settings(group, base=self.content.base, tools_root=self.root / "tools", policy_file=parent)
+        self.assertFalse(repair_audit.checks_deferred(group))
+        repair_audit.update_checks_owner(parent, "staging")
+        self.assertTrue(repair_audit.checks_deferred(group))
+        with patch.object(repair_audit, "check", side_effect=AssertionError("full helper checks during head handoff")):
+            self.assertEqual(repair_audit.helper_checks(group), 0)
+
+    def test_waiting_pre_rebase_runs_full_checks(self):
+        self.service.tasks[1].update(kind="pre_rebase")
+        self.service.tasks[1]["extra"]["checks_owner"] = "worker"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        checks = outcome["verification"][-1]["checks"]
+        self.assertEqual(checks["status"], "passed")
+        self.assertEqual(checks["lint"]["scope"], "full")
+        notes = json.loads(self.service.results[0]["worker_notes"])
+        self.assertEqual(notes["pre_rebase_verification"]["scope"], "full")
+
+    def run_check_handoff(self, check):
+        self.service.tasks[1].update(kind="pre_rebase")
+        self.service.tasks[1]["extra"]["checks_owner"] = "worker"
+        self.service.renew_after = 0.05
+        cfg = self.config()
+        client = self.client(cfg)
+        renew = self.service.renew_task
+        sandboxed = repair_audit._sandboxed
+        marker = self.stub_dir / "audit-processes.json"
+
+        def policy(task_id, token):
+            expires = renew(task_id, token)
+            return {"expires_at": expires, "checks_owner": "staging" if marker.exists() else "worker"}
+
+        def slow_audit(argv, *args, **kwargs):
+            if str(argv[-1]).endswith("/" + check):
+                program = (
+                    "import json,os,subprocess,sys,time; from pathlib import Path; "
+                    "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+                    "(Path(os.environ['STUB_DIR'])/'audit-processes.json').write_text(json.dumps([os.getpid(),child.pid])); "
+                    "time.sleep(60)"
+                )
+                argv = [sys.executable, "-c", program]
+            return sandboxed(argv, *args, **kwargs)
+
+        started = time.monotonic()
+        with (
+            patch.object(self.service, "renew_task", side_effect=policy),
+            patch.object(repair_audit, "_sandboxed", side_effect=slow_audit),
+        ):
+            outcome = repair_task.claim_and_run(cfg, client)
+        self.assertLess(time.monotonic() - started, 10, outcome)
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        checks = outcome["verification"][-1]["checks"]
+        self.assertEqual(checks["status"], "deferred")
+        self.assertEqual(checks["audit"]["deferred"], check == "audit-driver")
+        self.assertTrue(checks["lint"]["deferred"])
+        if check == "audit-driver":
+            self.assertEqual(checks["lint"]["seconds"], 0.0, "lint never starts after head readiness")
+        notes = json.loads(self.service.results[0]["worker_notes"])
+        self.assertEqual(notes["pre_rebase_verification"]["scope"], "build")
+        for pid in json.loads(marker.read_text()):
+            path = Path(f"/proc/{pid}/stat")
+            self.assertTrue(
+                not path.exists() or path.read_text().split(") ", 1)[1].startswith("Z"), f"check child {pid} survived"
+            )
+        self.assertFalse((cfg.root / "worktrees/task-1").exists())
 
 
 class TargetedRepairChecks(Fixture):

@@ -262,6 +262,8 @@ class ClaudeAPIContext:
                 else None,
             )
             if self.enabled:
+                from .activity_attribution import invocation_context
+
                 answer = self.budget.admit_work(
                     invocation,
                     self.worker,
@@ -271,6 +273,7 @@ class ClaudeAPIContext:
                     resume=request.get("resume"),
                     owner=process_identity(),
                     lifecycle=lifecycle,
+                    activity=invocation_context(self.phase),
                 )
             else:
                 answer = dict(allowed=True)
