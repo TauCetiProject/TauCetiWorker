@@ -73,7 +73,7 @@ def setup(tmp, *, expires_in=60, refresh="operator-refresh", opt_in=True, plan="
     for d in (src, dst):
         d.mkdir(parents=True)
     (dst / ".tauceti-creds-source").write_text(str(src))
-    for key in ("CLAUDE_CONFIG_DIR", "TAUCETI_AUTO_REFRESH", "TAUCETI_REFRESH_MIRROR"):
+    for key in ("CLAUDE_CONFIG_DIR", "TAUCETI_AUTO_REFRESH", "TAUCETI_REFRESH_MIRROR", "TAUCETI_CODEX_REFRESH_PLANS"):
         os.environ.pop(key, None)
     os.environ["CODEX_HOME"] = str(dst)
     if opt_in:
@@ -351,6 +351,86 @@ for plan, want in (("plus", 1), ("team", 1), ("business", 0), ("hc", 0), ("edu_p
         check(f"plan {plan!r} under explicit file stores: exchanges", post.call_count, want)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# 6g) $TAUCETI_CODEX_REFRESH_PLANS names further plans the operator asserts are file-backed. Only the
+#     exact strings named are added; everything else above still applies, and a malformed value
+#     disables Codex renewal with a log line rather than widening it.
+def named(tmp, value, plan, *, source_store="file"):
+    quota, src, mirror, stale = setup(tmp, plan=plan)
+    os.environ["TAUCETI_CODEX_REFRESH_PLANS"] = value
+    (src.parent / "config.toml").write_text(f'cli_auth_credentials_store = "{source_store}"\n')
+    logged = []
+    with (
+        rotates_to(jwt(10 * DAY)) as post,
+        usage_seen()[1],
+        patch.object(tc.quota, "log", side_effect=logged.append),
+    ):
+        quota.codex(renew=True)
+    os.environ.pop("TAUCETI_CODEX_REFRESH_PLANS", None)
+    return post.call_count, logged
+
+
+for name, value, plan, store, want in (
+    ("a named plan renews", "edu_pro", "edu_pro", "file", 1),
+    ("one of several named plans renews", "business,edu_pro", "edu_pro", "file", 1),
+    ("an unnamed plan is still refused", "edu_pro", "business", "file", 0),
+    ("a plan is matched exactly", "edu", "edu_pro", "file", 0),
+    ("a named plan still needs a file store", "edu_pro", "edu_pro", "keyring", 0),
+    ("the default plans still renew beside a named one", "edu_pro", "plus", "file", 1),
+    ("an empty value adds nothing", "", "edu_pro", "file", 0),
+):
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        check(f"{name}: exchanges", named(tmp, value, plan, source_store=store)[0], want)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+for value in ("*", "edu_pro,", "edu pro", "EDU_PRO", "edu_pro;business"):
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        count, logged = named(tmp, value, "plus")
+        check(f"malformed {value!r} renews nothing, not even a default plan", count, 0)
+        check(
+            f"...and says so ({value!r})",
+            any("TAUCETI_CODEX_REFRESH_PLANS" in line for line in logged),
+            True,
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+check(
+    "the setting parses to the named plans", tc.quota.codex_refresh_plans("business,edu_pro"), {"business", "edu_pro"}
+)
+for value in ("*", ",", "a b"):
+    try:
+        tc.quota.codex_refresh_plans(value)
+        raised = False
+    except ValueError:
+        raised = True
+    check(f"parsing {value!r} raises", raised, True)
+
+
+# 6h) Every command checks the setting at startup, beside the other configuration lints.
+class Reached(Exception):
+    pass
+
+
+def startup(value):
+    with (
+        patch.dict(os.environ, {"TAUCETI_CODEX_REFRESH_PLANS": value}),
+        patch.object(tc.cli, "resolve_pace", side_effect=Reached),
+    ):
+        try:
+            tc.cli.main(["usage"])
+        except tc.Die as e:
+            return str(e)
+        except Reached:
+            return "reached"
+
+
+check("a well-formed setting passes the startup check", startup("edu_pro"), "reached")
+check("a malformed setting stops the command", "TAUCETI_CODEX_REFRESH_PLANS" in startup("edu pro"), True)
 
 
 # 6d) A stop signal that lands while the endpoint answers must not unwind before the answer is

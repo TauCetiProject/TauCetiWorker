@@ -10,6 +10,7 @@ import json
 import math
 import os
 import random
+import re
 import shlex
 import signal
 import subprocess
@@ -91,9 +92,10 @@ CODEX_REFRESH_RETRY_S = 600
 CODEX_SYSTEM_CONFIG = Path("/etc/codex/config.toml")
 CODEX_REQUIREMENT_FILES = (Path("/etc/codex/requirements.toml"), Path("/etc/codex/managed_config.toml"))
 CODEX_MANAGED_PREFERENCES = Path("/Library/Managed Preferences")
-# The ChatGPT plans for which Codex 0.160.0 fetches no cloud policy (`cloud_config_eligible_auth` in
-# codex-rs/cloud-config/src/service.rs). That policy can require a non-file store over every local
-# layer and is fetched on demand, so a credential whose plan is not listed here is never renewed.
+# The ChatGPT plans for which Codex fetches no cloud policy (0.160.0 `cloud_config_eligible_auth` in
+# codex-rs/cloud-config/src/service.rs; 0.167.1 `ChatGptSource::auth` in .../chatgpt.rs). That policy
+# can require a non-file store over every local layer and is fetched on demand, so a credential whose
+# plan is neither listed here nor named in $TAUCETI_CODEX_REFRESH_PLANS is never renewed.
 CODEX_NO_CLOUD_POLICY_PLANS = frozenset(
     {
         "free",
@@ -107,6 +109,22 @@ CODEX_NO_CLOUD_POLICY_PLANS = frozenset(
         "self_serve_business_usage_based",
     }
 )
+
+
+def codex_refresh_plans(value: str | None) -> frozenset[str]:
+    """The plans $TAUCETI_CODEX_REFRESH_PLANS adds to CODEX_NO_CLOUD_POLICY_PLANS: comma-separated plan
+    strings exactly as Codex's tokens spell them. Unset or empty adds none; anything else that is not
+    such a list raises ValueError."""
+    if not value:
+        return frozenset()
+    plans = value.split(",")
+    bad = [p for p in plans if not re.fullmatch(r"[a-z0-9_]+", p)]
+    if bad:
+        raise ValueError(
+            f"$TAUCETI_CODEX_REFRESH_PLANS={value!r}: expected comma-separated lowercase plan names, got {bad[0]!r}"
+        )
+    return frozenset(plans)
+
 
 # Shared TauCeti usage observations live beside the credential source.
 CLAUDE_QUOTA_DIRNAME = ".tauceti-quota"
@@ -2107,7 +2125,12 @@ class Quota:
             return False
         tokens = _as_dict(_as_dict(_read_json_file(source / "auth.json")).get("tokens"))
         plans = {_TokenIdentity.of(_jwt_claims(tokens.get(key))).plan for key in ("access_token", "id_token")} - {None}
-        if not plans or not plans <= CODEX_NO_CLOUD_POLICY_PLANS:
+        try:
+            named = codex_refresh_plans(os.environ.get("TAUCETI_CODEX_REFRESH_PLANS"))
+        except ValueError as e:
+            log(f"codex credential: not renewing ({e})")
+            return False
+        if not plans or not plans <= CODEX_NO_CLOUD_POLICY_PLANS | named:
             return False
         prov = credential_refresh.provider("codex", credentials=source / "auth.json")
         if not credential_refresh.renewable(prov):
