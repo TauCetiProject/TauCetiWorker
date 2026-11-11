@@ -80,7 +80,7 @@ def _parse_item(line: str, area: str) -> TargetItem | None:
             if key.strip().lower() != "needs":
                 meta.append(clause)
             elif value.strip().lower() != "none":
-                needs = tuple(s.strip() for s in _SLUG_RE.findall(value) or value.split(",") if s.strip())
+                needs = tuple(s.strip().strip("`").strip() for s in value.split(",") if s.strip("` \t"))
     return TargetItem(area, slug.group(1).strip(), _STATUS[m.group(1)], text, needs, tuple(meta))
 
 

@@ -75,9 +75,9 @@ class Format(unittest.TestCase):
             parsed = t.parse_targets(
                 "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] no slug\n- [ ] `a` - b (needs: c, `d`)\n"
             )
-        self.assertEqual([(it.slug, it.needs) for it in parsed.items()], [("a", ("d",))])
+        self.assertEqual([(it.slug, it.needs) for it in parsed.items()], [("a", ("c", "d"))])
         self.assertIn("1 malformed item line(s), first at line 3", log.call_args_list[0].args[0])
-        self.assertIn("undefined slug(s), which block nothing: d", log.call_args_list[1].args[0])
+        self.assertIn("undefined slug(s), which block nothing: c, d", log.call_args_list[1].args[0])
         with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(tc.Die, "roadmap targets: .*absent.md"):
             t.load_targets(Path(tmp) / "absent.md")
 
@@ -143,6 +143,11 @@ class Selection(unittest.TestCase):
         self.assertEqual(self.slugs(landed, only="any", skip=["MeasureTheory"]), ["strong-law"])
         undefined = t.parse_targets("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — b (needs: `nowhere`)\n")
         self.assertEqual(self.slugs(undefined), ["a"])
+        mixed = t.parse_targets(
+            "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — open\n- [x] `b` — done\n- [ ] `c` — x (needs: a, `b`)\n"
+        )
+        self.assertEqual(mixed.find("c").needs, ("a", "b"))
+        self.assertEqual(self.slugs(mixed), ["a"])
 
     def test_an_empty_offer_says_why(self):
         for only, skip, why in (
