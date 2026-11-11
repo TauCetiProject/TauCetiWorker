@@ -117,7 +117,8 @@ def settle(targets: Targets, seen: Seen) -> tuple[list[Change], list[tuple[Targe
     An item is done when a merged pull request completes it by marker (`targets.landed`), when the
     pull request its `in flight:` clause names merged, or when that pull request closed and
     `seen.subsumed` names what replaced it. A named pull request that merged as partial reopens
-    the item and joins its `partial:` clause."""
+    the item and joins its `partial:` clause; one that was partial and closed reopens it with its
+    replacements in that clause instead."""
     pending = [it for it in targets.items() if it.status != "done"]
     by_marker = landed(pending, seen.merged)
     changes: list[Change] = []
@@ -126,15 +127,21 @@ def settle(targets: Targets, seen: Seen) -> tuple[list[Change], list[tuple[Targe
         key = (it.area, it.slug)
         named = inflight_pr(it) if it.status == "inflight" else None
         pull = seen.pulls.get(named) or {}
+        partial = key in marker_keys(pull.get("body"))[1] or named in partial_prs(it)
         if key in by_marker:
             n = by_marker[key]
             changes.append(Change(it, "done", f"#{n} merged", ("in flight",), (f"landed: #{n}",)))
-        elif pull.get("state") == "MERGED" and (key in marker_keys(pull.get("body"))[1] or named in partial_prs(it)):
-            partial = "partial: " + _refs(sorted(partial_prs(it) | {named}))
+        elif pull.get("state") == "MERGED" and partial:
+            clause = "partial: " + _refs(sorted(partial_prs(it) | {named}))
             note = f"#{named} merged without completing it; open again"
-            changes.append(Change(it, "open", note, ("in flight", "partial"), (partial,)))
+            changes.append(Change(it, "open", note, ("in flight", "partial"), (clause,)))
         elif pull.get("state") == "MERGED":
             changes.append(Change(it, "done", f"#{named} merged", ("in flight",), (f"landed: #{named}",)))
+        elif pull.get("state") == "CLOSED" and named in seen.subsumed and partial:
+            replaced = seen.subsumed[named]
+            clauses = ("partial: " + _refs(sorted(partial_prs(it) | set(replaced))), f"closed: #{named}")
+            note = f"#{named} closed without completing it, subsumed by {_refs(replaced)}; open again"
+            changes.append(Change(it, "open", note, ("in flight", "partial"), clauses))
         elif pull.get("state") == "CLOSED" and named in seen.subsumed:
             by = _refs(seen.subsumed[named])
             clauses = (f"subsumed by: {by}", f"closed: #{named}")

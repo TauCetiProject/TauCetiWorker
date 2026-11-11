@@ -155,6 +155,17 @@ class Settle(unittest.TestCase):
         self.assertEqual((t.parse_targets(out).find("truncation-bounds").status, stranded), ("done", []))
         self.assertEqual(settled(EXAMPLE, seen(pulls=closed)), (EXAMPLE, [("truncation-bounds", 1234)]))
 
+    def test_a_partial_pull_request_closed_and_replaced_opens_its_item_again(self):
+        body = marker("Probability", "truncation-bounds", partial=True)
+        closed = {1234: {"state": "CLOSED", "body": body}}
+        out, stranded = settled(EXAMPLE, seen(pulls=closed, subsumed={1234: [398]}))
+        self.assertIn("(needs: none; partial: #398; closed: #1234)", out)
+        self.assertEqual((t.parse_targets(out).find("truncation-bounds").status, stranded), ("open", []))
+        named = EXAMPLE.replace("in flight: #1234", "partial: #7, #1234; in flight: #1234")
+        out, _ = settled(named, seen(pulls={1234: {"state": "CLOSED", "body": ""}}, subsumed={1234: [398]}))
+        self.assertIn("(needs: none; partial: #7, #398, #1234; closed: #1234)", out)
+        self.assertEqual(t.parse_targets(out).find("truncation-bounds").status, "open")
+
 
 class Records(Tmp):
     def setUp(self):
