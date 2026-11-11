@@ -1008,7 +1008,14 @@ def _defer_reload(spec: WorkerSpec, live: dict) -> bool:
         return False
     # A worker waiting for fleet admission polls every five seconds and has no round to lose.
     if live.get("state") != "waiting-capacity":
-        if live.get("state") not in ("idle", "backoff", "waiting-github", "waiting-budget", "waiting-quota"):
+        if live.get("state") not in (
+            "idle",
+            "backoff",
+            "waiting-github",
+            "waiting-budget",
+            "waiting-quota",
+            "waiting-storage",
+        ):
             return True
         if (live.get("next_action_at") or 0) - time.time() < 15:
             return True

@@ -263,6 +263,10 @@ try:
     # Any other field in the same edit keeps the immediate restart.
     for other in ({"sandbox": "bubble"}, {"roadmap_only": "Algebra"}, {"env": (("A", "b"),)}, {"pace": "0:10"}):
         assert not wm._defer_reload(dataclasses.replace(slot, agent="claude", author_model=None, **other), in_round)
+    retuned = dataclasses.replace(slot, only=("fix",))
+    storage = {"applied_spec": slot.as_dict(), "state": "waiting-storage", "next_action_at": time.time() + 60}
+    assert not wm._defer_reload(retuned, storage)
+    assert wm._defer_reload(retuned, dict(storage, next_action_at=time.time() + 1))
 
     # Desired fields win over a stale actual status generation in CLI/TUI snapshots.
     wm.update_status(
