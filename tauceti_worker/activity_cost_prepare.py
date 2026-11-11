@@ -419,6 +419,10 @@ def prepare(db, now, scope_for_worker):
                 "prepared_usage",
             ):
                 db.execute(f"DELETE FROM {table} WHERE id NOT IN (SELECT id FROM cost_sessions)")
+        if replay["rebuilt"]:
+            from .activity_attribution_prepare import rebuild_cost_queue
+
+            rebuild_cost_queue(db, active)
         metrics["usage_and_allocation_seconds"] = time.monotonic() - phase
         info = budget.ledger.stat()
         pending = sum((money(s.get("reserve", s["estimate"])) for s in active.values()), Decimal(0))

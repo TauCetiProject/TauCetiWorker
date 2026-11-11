@@ -457,7 +457,16 @@ def fill_prompt(path: Path, **subs) -> str:
         from tauceti_tools.templates import render
 
         if active():
-            text = render(text, active())
+            from .source_project import shared_settings
+
+            text = render(text, shared_settings(active()))
+    from .worker_sources import current
+
+    source = current()
+    if source is not None:
+        host_repo = source.repository.forge.url.split("://", 1)[1] + "/" + source.repo
+        text = text.replace("https://github.com/" + TAUCETI, source.repository.url)
+        text = text.replace("--repo " + TAUCETI, "--repo " + host_repo)
     # An unfilled placeholder ships literal `__BIN__/git-safe-push` to the agent, which is the
     # command-not-found failure wrapper_bin exists to end. Fail here instead, but only for the
     # prompts we ship: the progress prompt is served by the pinned TauCetiProgress build (written
@@ -618,6 +627,13 @@ def clean_lake_cache_after_toolchain_bump(cfg: Config) -> None:
 CHECKOUT_URL = f"https://github.com/{TAUCETI}"
 
 
+def checkout_url():
+    from .worker_sources import current
+
+    source = current()
+    return source.repository.url if source is not None else CHECKOUT_URL
+
+
 def _same_repository(url: str, canonical: str) -> bool:
     """Compare raw remote URLs, ignoring .git, a trailing slash, case, and GitHub's SSH spelling."""
 
@@ -643,7 +659,7 @@ def repair_origin(co: Path) -> bool:
     main-cache warm-up. A clone whose origin was re-pointed (at a fork, say) silently resets each
     round to that remote's main, however stale, and searches the cache for its history instead."""
     current = _remote_url(co, "origin")
-    if _same_repository(current, CHECKOUT_URL):
+    if _same_repository(current, checkout_url()):
         return True
     if current:
         spare = next(
@@ -653,8 +669,8 @@ def repair_origin(co: Path) -> bool:
         )
         if subprocess.run(["git", "-C", str(co), "remote", "rename", "origin", spare]).returncode:
             return False
-        log(f"checkout origin was {current}, not {CHECKOUT_URL}; kept it as remote '{spare}'")
-    return subprocess.run(["git", "-C", str(co), "remote", "add", "origin", CHECKOUT_URL]).returncode == 0
+        log(f"checkout origin was {current}, not {checkout_url()}; kept it as remote '{spare}'")
+    return subprocess.run(["git", "-C", str(co), "remote", "add", "origin", checkout_url()]).returncode == 0
 
 
 def prepare_checkout(
@@ -680,7 +696,7 @@ def prepare_checkout(
             log(f"checkout ownership detach deferred: {error}")
             return False
         log(f"cloning {TAUCETI} → {co} ({why})")
-        return subprocess.run(["git", "clone", "-q", CHECKOUT_URL, str(co)]).returncode == 0
+        return subprocess.run(["git", "clone", "-q", checkout_url(), str(co)]).returncode == 0
 
     if co.exists() and not (co / ".git").is_dir():
         # An interrupted clone (or anything else without git metadata) would fail every round.
@@ -733,11 +749,14 @@ def prepare_checkout(
             "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main"),
         ):
             return False
-    from .verification_scope import local_main
-
+    # Origin was validated and fetched above, and HEAD is now its main commit.
+    # Carry that exact base into verification rather than asking the standalone
+    # verifier to rediscover a canonical remote (which defaults to GitHub).
     os.environ.pop("TAUCETI_VERIFY_BASE", None)
-    with contextlib.suppress(ValueError, subprocess.CalledProcessError):
-        os.environ["TAUCETI_VERIFY_BASE"] = local_main(co)
+    with contextlib.suppress(subprocess.CalledProcessError):
+        os.environ["TAUCETI_VERIFY_BASE"] = subprocess.check_output(
+            ["git", "-C", str(co), "rev-parse", "--verify", "HEAD^{commit}"], text=True
+        ).strip()
     os.environ["TAUCETI_VERIFY_STATE"] = str(cfg.state.resolve())
     # The checkout is quiescent here: the previous agent has exited and the next one has not started.
     # Compare canonical main, rather than an arbitrary PR branch, and retire old-toolchain artifacts
@@ -1363,8 +1382,10 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
             api_env["TAUCETI_REVIEW_MATHLIB_CACHE"] = review_mathlib_cache()
             from .github import claims_repo
             from .paths import CLAIM_SH
+            from .worker_sources import current
 
-            api_env.update(CLAIM_REPO=claims_repo(), TAUCETI_CLAIM_SH=CLAIM_SH)
+            if current() is None:
+                api_env.update(CLAIM_REPO=claims_repo(), TAUCETI_CLAIM_SH=CLAIM_SH)
     env_kwargs = {"env": api_env} if api_env is not None else {}
     if os.environ.get("TAUCETI_STREAM"):
         return run_process(argv, **env_kwargs).returncode
@@ -1731,8 +1752,8 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
                 "TauCeti main cache has no published outputs in the requested history"
                 + (
                     ""
-                    if _same_repository(origin, CHECKOUT_URL)
-                    else f" (checkout origin is {origin}, not {CHECKOUT_URL})"
+                    if _same_repository(origin, checkout_url())
+                    else f" (checkout origin is {origin}, not {checkout_url()})"
                 )
             )
     elif result == "miss":
@@ -2530,7 +2551,7 @@ def run_in_bubble(
         tcenv += " TAUCETI_CONF=/opt/project.toml TAUCETI_CONF_SOURCE=/opt/project.toml TAUCETI_CONF_SNAPSHOT=/opt/project.toml"
         from tauceti_tools.project import active
 
-        for key, value in active().environment().items():
+        for key, value in active().qualified_environment().items():
             tcenv += f" {key}={shlex.quote(value)}"
     command_inner = inner_cmd if inner_cmd is not None else agent_inner_cmd(profile)
     if inner_cmd is None:
@@ -2880,26 +2901,10 @@ def _review_in_bubble(
     cross-repo `gh api` for its own rev. TAUCETI_REVIEW_ENGINE_DIR pins a local engine checkout
     (operator override / pre-merge testing); otherwise a shallow REVIEW clone is staged."""
     cfg = w.cfg
-    eng = os.environ.get("TAUCETI_REVIEW_ENGINE_DIR")
-    engine_dir = Path(eng) if eng else (cfg.state / "refs" / "review-engine")
-    if not eng:
-        ref = os.environ.get("TAUCETI_REVIEW_REF")
-        if ref:
-            engine_dir = cfg.state / "refs" / f"review-engine-{ref}"
-            current = subprocess.run(
-                ["git", "-C", str(engine_dir), "rev-parse", "HEAD"], capture_output=True, text=True
-            )
-            if current.returncode or current.stdout.strip() != ref:
-                engine_dir.mkdir(parents=True, exist_ok=True)
-                commands = (
-                    ["git", "init", "-q", str(engine_dir)],
-                    ["git", "-C", str(engine_dir), "fetch", "--depth", "1", f"https://github.com/{REVIEW}", ref],
-                    ["git", "-C", str(engine_dir), "checkout", "--detach", "FETCH_HEAD"],
-                )
-                if any(subprocess.run(command, timeout=120).returncode for command in commands):
-                    raise Die(f"fetch pinned {REVIEW}@{ref} failed")
-        elif not fetch_ref(REVIEW, engine_dir):
-            raise Die(f"fetch {REVIEW} failed")
+    from .review_runtime import resolve
+
+    runtime = getattr(w, "review_runtime", None) or resolve(cfg)
+    engine_dir = runtime.directory
     roadmap_dir = cfg.state / "refs" / "roadmap"
     if not fetch_ref(ROADMAP, roadmap_dir):
         raise Die(f"fetch {ROADMAP} failed")
