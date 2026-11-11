@@ -142,8 +142,24 @@ holds that `auth.json`, counting `/etc/codex/config.toml`, the requirements file
 in `/etc/codex` and any managed `com.openai.codex` preference as Codex does. It
 also leaves it alone for a business, education or enterprise plan, or one it does
 not recognise, since Codex applies a workspace's cloud policy to those, and that
-policy can choose the store. A stop signal that arrives during the exchange takes effect once the new token is
-saved.
+policy can choose the store. A stop signal that arrives during the exchange takes
+effect once the new token is saved.
+
+`$TAUCETI_CODEX_REFRESH_PLANS` adds plans to the ones renewed: a comma-separated
+list of plan names exactly as Codex's tokens carry them, such as `edu_pro`. It is
+unset by default, and it changes only the plan rule; every other condition above
+still applies. A malformed value stops the worker at startup. Set it
+per worker through the `env` table in `workers.toml`.
+
+Naming a plan asserts that your workspace's policy leaves Codex on the file store
+for this login, which `codex doctor` on the worker's host reports as the auth
+storage mode. If the policy requires the keyring, Codex keeps the login there,
+under a key derived from the Codex directory, and deletes `auth.json` whenever it
+saves to it. Renewing a leftover file is then usually just wasted: Codex never
+reads it, or the exchange fails because its refresh token was already spent. It
+logs you out only when the leftover file and the keyring hold the same refresh
+token, for example after a failed delete or a restored copy: the exchange retires
+the keyring's token, and that login needs `codex login` again.
 
 **Only turn it on when nothing else uses that credential file.** Claude and Codex
 issue single-use refresh tokens: exchanging one retires it and returns a
