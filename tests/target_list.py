@@ -222,18 +222,28 @@ class Round(unittest.TestCase):
             prompt.index("- **Choose a concrete target.** Start with `MeasureTheory`"),
         )
         self.assertEqual(json.loads(self.status.read_text())["roadmap_target"], "MeasureTheory/kolmogorov-zero-one")
-        stem = os.environ["TAUCETI_TARGET_MARKER"]
-        self.assertEqual(prompt.count(stem + "}-->"), 1)
-        self.assertEqual(prompt.count(stem + ',"partial":true}-->'), 1)
-        accepted = [self.wrapper(stem, stem + end) for end in ("}-->", ',"partial":true}-->')]
-        self.assertEqual([*accepted, self.wrapper(stem, stem.replace("zero-one", "zero-two") + "}-->")], [0, 0, 1])
+        required = os.environ["TAUCETI_TARGET_MARKER"]
+        complete, partial = required.splitlines()
+        self.assertEqual(prompt.count(complete), 1)
+        self.assertEqual(prompt.count(partial), 1)
+        self.assertEqual(t.marker_keys(complete), ({("MeasureTheory", "kolmogorov-zero-one")}, set()))
+        self.assertEqual(t.marker_keys(partial)[1], {("MeasureTheory", "kolmogorov-zero-one")})
+        bodies = {
+            f"Adds the law.\n\n{complete}\n": 0,
+            partial: 0,
+            complete.replace("zero-one", "zero-two"): 1,
+            complete[: -len("}-->")]: 1,
+            complete[: -len("-->")]: 1,
+            partial[: -len("}-->")]: 1,
+        }
+        self.assertEqual({body: self.wrapper(required, body) for body in bodies}, bodies)
 
-    def wrapper(self, stem, body):
+    def wrapper(self, required, body):
         """gh-safe-pr-create's verdict on a pull request body, with `true` standing in for gh."""
         if not (self.tmp / "bin").exists():
             (self.tmp / "bin").mkdir()
             (self.tmp / "bin" / "gh").symlink_to(shutil.which("true"))
-        env = {"PATH": f"{self.tmp / 'bin'}:{os.environ['PATH']}", "TAUCETI_TARGET_MARKER": stem}
+        env = {"PATH": f"{self.tmp / 'bin'}:{os.environ['PATH']}", "TAUCETI_TARGET_MARKER": required}
         script = REPO / "scripts" / "gh-safe-pr-create"
         return subprocess.run([script, "--body", body], env=env, capture_output=True).returncode
 
