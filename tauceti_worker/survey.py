@@ -1067,7 +1067,7 @@ def survey(
             c.reason = f"{reason}; {error}"
             c.attempts = MAX_REBASE_ATTEMPTS
         c.budget = 1 if foreign else MAX_REBASE_ATTEMPTS
-        if held := incidents.declined("rebase", p.number, p.head_oid):
+        if held := incidents.declined("rebase", p.number, p.head_oid, getattr(gh, "repo", None)):
             c.reason = incidents.HELD
         (sv.rebaseable.suppressed if held or c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
 
@@ -1191,7 +1191,7 @@ def survey(
                         partial_history=True,
                     )
                     c.final_resolution = c.attempts >= c.budget - 1 and sv.owns(p) and not p.automatic_bump
-                    if held := incidents.declined("fix", p.number, p.head_oid):
+                    if held := incidents.declined("fix", p.number, p.head_oid, getattr(gh, "repo", None)):
                         c.reason, c.final_resolution = incidents.HELD, False
                     (
                         sv.needs_fix.suppressed
@@ -1219,7 +1219,9 @@ def survey(
             )
             if disp == "skip":
                 continue
-            if disp in ("actionable", "exhausted") and incidents.declined("fix", p.number, p.head_oid):
+            if disp in ("actionable", "exhausted") and incidents.declined(
+                "fix", p.number, p.head_oid, getattr(gh, "repo", None)
+            ):
                 sv.fix_waiting.append((p.number, incidents.HELD))
                 sv.needs_fix.suppressed.append(
                     Candidate(p.number, p.head_oid, incidents.HELD, attempts=per_head, budget=MAX_FIX_ATTEMPTS)
@@ -1259,7 +1261,7 @@ def survey(
         per_head = counters.read(f"ci-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"ci-pr-{p.number}")
         c.attempts, c.budget = per_head, MAX_CI_ATTEMPTS
-        if held := incidents.declined("fix-ci", p.number, p.head_oid):
+        if held := incidents.declined("fix-ci", p.number, p.head_oid, getattr(gh, "repo", None)):
             c.reason = incidents.HELD
         if held or per_head >= MAX_CI_ATTEMPTS or per_pr >= MAX_CI_PR_ATTEMPTS:
             sv.red_ci.suppressed.append(c)
