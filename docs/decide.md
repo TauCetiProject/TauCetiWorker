@@ -35,7 +35,7 @@ one finds the directory's lock held and stands aside.
 | `TAUCETI_INCIDENTS_DIR` | _(unset)_ | Required. The directory whose records are ruled on. |
 | `TAUCETI_DECIDE_GAP` | `600` | Seconds between rounds on one directory. |
 | `TAUCETI_DECIDE_MAX_CASES` | `6` | Incidents put to the model in one round. |
-| `TAUCETI_ROADMAP_TARGETS` | _(unset)_ | With a [target list](target-lists.md) set, `prerequisite` is offered and may add items to it. |
+| `TAUCETI_ROADMAP_TARGETS` | _(unset)_ | With a [target list](target-lists.md) set, `prerequisite` is offered and may add items to it. Its statuses are read as a roadmap round reads them, from every source the round has and, in a round with no GitHub source, from the GitHub repository's marked pull requests unless `TAUCETI_ROADMAP_TARGETS_GITHUB=0`. |
 | `TAUCETI_DECIDE_CLOSE` | _(unset)_ | `1` lets a `close` ruling close a pull request. |
 | `TAUCETI_DECIDE_MAX_CLOSES_PER_DAY` | `3` | Closures per UTC day across the directory. |
 

@@ -330,9 +330,9 @@ class _Round:
         if path is None:
             return None
         from .config import SourceUnavailable
-        from .work_units import _target_reads
+        from .work_units import target_read_sources
 
-        sources = [_target_reads(source) for source in (self.gh, *getattr(self.w, "target_sources", ()))]
+        sources = target_read_sources(self.w)
         try:
             return path, live_targets(load_targets(path), sources[0], sources[1:])
         except (Die, GitHubError, SourceUnavailable) as error:

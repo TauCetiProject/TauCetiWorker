@@ -3128,6 +3128,17 @@ def _target_reads(source):
     return source if native or current() is None else _SharedGitHubReads(source)
 
 
+def target_read_sources(w) -> list:
+    """The sources a round reads a target list's live statuses from: the worker's own and the
+    others a multi-source round hands it, and, in a round with no GitHub source, the GitHub
+    repository's marked pull requests unless TAUCETI_ROADMAP_TARGETS_GITHUB is 0."""
+    seen = (w.gh, *getattr(w, "target_sources", ()))
+    sources = [_target_reads(source) for source in seen]
+    if all(getattr(source, "direct_source", False) for source in seen) and github_history_enabled():
+        sources.append(GitHubMarkerReads())
+    return sources
+
+
 def _landed_link(item, source) -> str | None:
     number = landed_pr(item, source)
     if number is None:
@@ -3142,10 +3153,7 @@ def assign_target(w, path: Path, only: str, skip: list[str]) -> tuple[Targets, T
 
     listed = load_targets(path)
     claims = getattr(w, "claims", None)
-    seen = (w.gh, *getattr(w, "target_sources", ()))
-    sources = [_target_reads(source) for source in seen]
-    if all(getattr(source, "direct_source", False) for source in seen) and github_history_enabled():
-        sources.append(GitHubMarkerReads())
+    sources = target_read_sources(w)
     try:
         live = live_targets(listed, sources[0], sources[1:])
         # A multi-source round's inventory also names the other forge's open pull requests.

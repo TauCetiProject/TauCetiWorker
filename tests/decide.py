@@ -28,6 +28,7 @@ from tauceti_tools.forge import Forge, RepositoryRef
 
 import tauceti_worker as tc
 from tauceti_worker import agents, cli, decide, github, incidents, work_units
+from tauceti_worker import targets as targets_module
 from tauceti_worker.constants import ROADMAP_DIR, TAUCETI
 from tauceti_worker.targets import parse_targets
 
@@ -56,6 +57,7 @@ def settings(root=None, **env):
         "GH_TOKEN",
         "TAUCETI_WORKER_FORGES",
         "TAUCETI_NEW_PR_FORGE",
+        "TAUCETI_ROADMAP_TARGETS_GITHUB",
     )
     base = {k: v for k, v in os.environ.items() if k not in drop and not k.startswith("TAUCETI_DECIDE_")}
     if root is not None:
@@ -875,6 +877,40 @@ def test_prerequisite(tmp):
             (value["ruling"], value["by"], "`strong-law` landed" in value["note"]),
             ("retry", "recheck", True),
         )
+
+    root = tmp / "prerequisite-native"
+    path.write_text(LIST)
+    case = f"declined-{incidents.subject('fix', 4, FORGEJO)}"
+    marker = targets_module.target_markers(parse_targets(LIST).find("strong-law"))[0]
+
+    landed = []
+
+    class History:
+        """The GitHub repository's marked pull requests: #99 lands `strong-law` once `landed` says so."""
+
+        def open_prs(self):
+            return []
+
+        def merged_prs(self, search, *, limit=200):
+            return [{"number": 99, "title": "", "body": marker}] if landed else []
+
+    for history, want in (("1", "retry"), ("0", "prerequisite")):
+        with (
+            settings(root / history, TAUCETI_ROADMAP_TARGETS=str(path), TAUCETI_ROADMAP_TARGETS_GITHUB=history),
+            patch.object(work_units, "GitHubMarkerReads", History),
+        ):
+            hub = ForgejoHub(p4={})
+            incidents.record_declined("fix", 4, "head-4", message="needs the strong law", repository=FORGEJO)
+            asked = {"rulings": [{"case": case, "ruling": "prerequisite", "note": "n", "items": [item("strong-law")]}]}
+            landed.clear()
+            rounds(tmp, hub, asked)
+            landed.append(True)
+            rounds(tmp, hub)
+            check(
+                f"a Forgejo-only round reads GitHub's landed targets unless TAUCETI_ROADMAP_TARGETS_GITHUB=0 ({history})",
+                load(root / history / f"ruling-{case}.json")["ruling"],
+                want,
+            )
 
 
 def test_roadmap(tmp):
