@@ -361,6 +361,17 @@ try:
         for f in agent_files:
             f.unlink()
         check("a missing agents' file is not", quota.claude(renew=True).available, False)
+        # A native agent given the token in $CLAUDE_CODE_OAUTH_TOKEN does not read the file at all.
+        with patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "env-setup-token"}):
+            _argv, agent_env = tc.agents.host_agent_argv("prompt", "claude")
+            check(
+                "the native agent receives the environment token",
+                agent_env.get("CLAUDE_CODE_OAUTH_TOKEN"),
+                "env-setup-token",
+            )
+            check("an environment token with no file is admitted", quota.claude(renew=True).available, True)
+            agent_files[1].write_text(login("setup-token", -60, None))
+            check("so is one beside a stale file", quota.claude(renew=True).available, True)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
