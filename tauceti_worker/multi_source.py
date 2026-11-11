@@ -266,6 +266,7 @@ def run_round(w, opts, *, use_fleet_focus=True):
             and not opts.prs
         ):
             worker.cross_source_targets = inventory
+            worker.target_sources = [other.gh for _, other, _ in healthy if other is not worker]
             selected = dataclasses.replace(opts, only=["roadmap"])
             if name == "github":
                 return ordinary_round(worker, selected, prepared_survey=result)

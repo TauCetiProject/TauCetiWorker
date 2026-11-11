@@ -9,9 +9,9 @@ whose prerequisites have landed, claims it, and hands the agent that item.
 Turn it on with `--roadmap-targets FILE`, `TAUCETI_ROADMAP_TARGETS`, or the
 `roadmap_targets` key in `workers.toml`. Several workers, on one host or many,
 may be given copies of the same list. Without the setting nothing changes.
-A list authors on GitHub, so a worker whose new pull requests go to Forgejo
-(`--new-pr-forge forgejo`) refuses to start with one; `--forgejo` alone, which
-also maintains Forgejo pull requests while authoring on GitHub, keeps it.
+A list works on whichever forge new pull requests go to (`--new-pr-forge`, see
+[forgejo-worker.md](forgejo-worker.md)), and a worker that discovers both forges
+reads both for the live view.
 
 ## The file
 
@@ -45,10 +45,11 @@ first `## ` heading is shown to the agent with the items of its area.
   once work has started.
 - A trailing parenthesised group holds `key: value` clauses separated by `;`,
   with no parentheses inside. `needs:` is a comma list of slugs from any area,
-  or `none`. `partial: #N, #M` names merged pull requests that did not complete
-  the item. `in flight: #N` on a `[~]` item names the pull request it waits on,
-  which is how [curation](#curation) follows it. Every other clause is passed
-  to the agent as written.
+  or `none`. `partial: #N, #M` names merged GitHub pull requests that did not
+  complete the item; a Forgejo pull request is named by its URL. `in flight: #N`
+  on a `[~]` item names the pull request it waits on, which is how
+  [curation](#curation) follows it. Every other clause is passed to the agent as
+  written.
 - An item line that does not parse is logged and skipped. A `needs:` slug the
   file never defines is logged and blocks nothing.
 
@@ -60,21 +61,20 @@ unless a worker's `only` names it (see [Curation](#curation)).
 
 The marks in the file go stale between edits, so each round overlays them:
 
-- An open pull request whose body carries
+- An open pull request, on any forge the worker discovers, whose body carries
   `<!--tauceti-target:v1 {"focus":"<Area>","id":"<slug>"}-->` puts that item in
-  flight. When the worker also maintains Forgejo pull requests, an open one
-  there with that marker does too.
+  flight.
 - A merged one marks it done, unless its marker also says `"partial":true` or
   the item's `partial:` clause names the pull request. A pull request Bors
   landed, closed under a `[Merged by Bors] - ` title, counts as merged.
 
 The overlay only moves an item forward: `[x]` in the file stays done and `[~]`
-stays in flight until the file changes. The merged side reads the 200 most
-recently updated closed GitHub pull requests that carry a target marker; a
-landing on Forgejo is not read. An older landing is still found before its item
-is assigned again (see below), but it no longer unlocks the items that need it,
-so an item's landing is permanent only once the file says `[x]`: by hand, or
-through [curation](#curation).
+stays in flight until the file changes. The merged side reads, on each forge,
+the 200 most recent merged pull requests that carry a target marker (on GitHub
+the most recently updated, on Forgejo the most recently created). An older
+landing is still found before its item is assigned again (see below), but it
+no longer unlocks the items that need it, so tick an item `[x]` in the file to
+make its landing permanent.
 
 ## Selection
 
@@ -84,12 +84,13 @@ eligible item, minus `--roadmap-skip`, in random order, and each area's items
 in file order. `--roadmap-only AREA` restricts it to that area. Fleet roadmap
 focus does not apply to a worker with a list.
 
-For each candidate in turn the worker first searches the closed pull requests
-for that slug's marker, and passes over an item that a merged pull request of
+For each candidate in turn the worker first searches each forge's closed pull
+requests for that slug's marker (on Forgejo, the keyword search), and passes over an item that a merged pull request of
 any age completed, logging the pull request so the file can be ticked. It then
 acquires `author/<Area>/<slug>` in its
 [claim namespace](reference.md#the-claim-namespace) and keeps the lease renewed
-until the round ends. A candidate another worker holds is passed over. A claim
+until the round ends. Author claims stay in that GitHub namespace when the pull
+request goes to Forgejo, as all author leases do. A candidate another worker holds is passed over. A claim
 that cannot be registered does not stop the round. The claim is cooperative: it
 keeps workers that share a list off each other's items, and the live view
 covers the rest.
@@ -100,10 +101,10 @@ reason, no model is started, and the loop backs off as after any round without
 progress. The same happens when pull requests cannot be read. Maintenance and
 review are unaffected by the list.
 
-A roadmap round under a list costs one listing of open pull requests, one
-search for recent landings, and one search and one claim push per candidate
-tried. The searches are shared between workers of one account on a host for two
-minutes.
+A roadmap round under a list costs, on each forge it reads, one listing of
+open pull requests, one search for recent landings, and one search per candidate
+tried, plus one claim push per candidate. The GitHub searches are shared
+between workers of one account on a host for two minutes.
 
 ## Curation
 
@@ -189,7 +190,8 @@ inside the same roadmap and nothing else, the exact marker for the pull request
 body (with `"partial":true` when the pull request lands only part of the item),
 and the area's items with their live statuses under the file's preamble.
 `gh-safe-pr-create` refuses a body that does not carry the assigned item's
-marker.
+marker; in a Forgejo round its `gh pr create` goes through the source-bound
+`gh`, so the check is the same on both forges.
 
 ## Runtime status
 

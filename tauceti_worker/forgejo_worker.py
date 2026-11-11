@@ -84,6 +84,46 @@ class ForgejoWorkerSource(ForgejoReadSource):
             raise Incomplete("Forgejo PR listing is unavailable")
         return rows
 
+    def merged_prs(self, search, *, limit=200):
+        """`GitHub.merged_prs` on this source: number, title, body and URL of merged pull requests whose
+        body contains every quoted phrase of the GitHub-style `search` (its qualifiers are not
+        native and are ignored). A phrase other than the target-marker tag goes to the native
+        keyword search, which reaches a pull request of any age; otherwise the `limit` most
+        recently created merged pull requests are read. Raises SourceUnavailable when it fails."""
+        import urllib.parse
+
+        from .config import SourceUnavailable
+        from .targets import MARKER_TAG
+
+        phrases = [p.replace('\\"', '"') for p in re.findall(r'"((?:[^"\\]|\\.)*)"', search)]
+        keyword = next((p for p in phrases if p != MARKER_TAG), None)
+
+        def fetch():
+            if keyword is None:
+                rows = self.api.pulls(self.repository, state="merged", limit=limit)
+            else:
+                query = urllib.parse.urlencode({"type": "pulls", "state": "closed", "q": keyword})
+                rows = []
+                for batch in self.api.pages(f"repos/{self.repository.name}/issues?{query}"):
+                    rows += [r for r in batch if (r.get("pull_request") or {}).get("merged") is True]
+                    if len(rows) >= limit:
+                        break
+            return [
+                {
+                    "number": r["number"],
+                    "title": r.get("title") or "",
+                    "body": r.get("body") or "",
+                    "url": self.repository.pull_url(r["number"]),
+                }
+                for r in rows[:limit]
+                if all(p in (r.get("body") or "") for p in phrases)
+            ]
+
+        rows = self._read("merged_prs", [search, limit], fetch)
+        if rows is None:
+            raise SourceUnavailable("Forgejo merged pull request listing is unavailable")
+        return rows
+
     def issue_list(self, repository, **options):
         from .github import GitHub
 
