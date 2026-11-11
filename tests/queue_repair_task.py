@@ -5154,6 +5154,7 @@ class TargetedRepairChecks(Fixture):
         )
         result = self.command()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("full checks run in staging", result.stdout)
         self.assertIn("build --iofail TauCeti.One TauCeti.Two", self.lake_calls())
         calls = [json.loads(line) for line in (self.stub_dir / "targeted-lint-runs.jsonl").read_text().splitlines()]
         self.assertEqual(calls, [{"modules": ["TauCeti.One", "TauCeti.Two"], "linters": ["simpNF"]}])
