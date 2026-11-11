@@ -850,7 +850,7 @@ class FakeService:
         self.releases.append({"task_id": task_id, "reason": reason, "error": error, "worker": claim["worker"]})
         return {"task_id": task_id, "released": True}
 
-    def submit_task(self, task_id: int, token: str, tip_sha: str, worker_notes: str) -> dict:
+    def submit_task(self, task_id: int, token: str, tip_sha: str, worker_notes: str, *, checkpoint=False) -> dict:
         task = self.tasks[task_id]
         claim = next((c for c in self.claims.values() if c["task_id"] == task_id and c["token"] == token), None)
         if claim is None:
@@ -880,6 +880,13 @@ class FakeService:
                 and previous["response"].get("accepted")
             ):
                 return dict(previous["response"], reason="already-adopted", version=None)
+            if (
+                checkpoint
+                and previous["claim_id"] == claim["id"]
+                and previous["tip_sha"] == tip_sha
+                and previous["response"]["reason"] == "repair-checkpoint"
+            ):
+                return previous["response"]
         if self.result_script:
             scripted = self.result_script.pop(0)
             return adoption(scripted.get("accepted", False), scripted.get("reason", ""), scripted.get("violations", ()))
@@ -915,6 +922,15 @@ class FakeService:
                     for m in unexplained
                 ],
             )
+        if checkpoint:
+            task.setdefault("extra", {})["repair_checkpoint"] = {
+                "tip": tip_sha,
+                "diagnostics": json.loads(worker_notes)["repair_checkpoint"],
+            }
+            task["retained_refs"].append(ref)
+            claim["released_at"] = time.time()
+            claim["release_reason"] = "repair-checkpoint"
+            return adoption(False, "repair-checkpoint")
         self.done.add(task_id)
         claim["released_at"] = time.time()
         claim["release_reason"] = "adopted"
@@ -940,7 +956,7 @@ class FakeService:
                         raise RuntimeError("database unavailable")
                     result = self.claim_task(str(body.get("worker") or ""))
                     return (204, None) if result is None else (200, result)
-                match = re.fullmatch(r"/tasks/([^/]+)/(renew|result|release)", path)
+                match = re.fullmatch(r"/tasks/([^/]+)/(renew|result|release|checkpoint)", path)
                 if not match:
                     return 404, {"error": "no such route"}
                 task_id, verb = int(match.group(1)), match.group(2)
@@ -959,7 +975,11 @@ class FakeService:
                         raise RuntimeError("database unavailable")
                     return 200, self.release_task(task_id, token, str(body.get("reason")), str(body.get("error", "")))
                 return 200, self.submit_task(
-                    task_id, token, str(body.get("tip_sha") or ""), str(body.get("worker_notes", ""))
+                    task_id,
+                    token,
+                    str(body.get("tip_sha") or ""),
+                    str(body.get("worker_notes", "")),
+                    checkpoint=verb == "checkpoint",
                 )
             except LookupError as error:  # TaskError: a stable code in the body
                 return 409, {"error": str(error), "code": str(error)}
@@ -4666,6 +4686,44 @@ class WorkerAudits(Fixture):
     def errors_file(self) -> list[dict]:
         path = self.root / "state" / "worktrees" / "task-1" / ".tauceti-repair" / "errors.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()]
+
+    def test_lint_checkpoint_survives_lost_receipt_and_continues_on_a_new_claim(self):
+        self.service.tasks[1].setdefault("extra", {})["can_checkpoint_repair"] = True
+        cfg = self.config(poll_seconds=0, verify_retries=0)
+        client = self.client(cfg)
+        finding = {"kind": "lint", "path": "TauCeti/Two.lean", "message": "unused argument"}
+        failed = {"ok": False, "build": {"rc": 0}, "checks": {"status": "failed"}, "diagnostics": [finding]}
+        submit = client.submit
+
+        def lost(*args, **kwargs):
+            self.assertTrue(kwargs.get("checkpoint"))
+            self.assertEqual(submit(*args, **kwargs)["reason"], "repair-checkpoint")
+            raise repair_task.ServiceError("lost checkpoint reply")
+
+        with (
+            patch.object(repair_audit, "verify", return_value=failed),
+            patch.object(client, "submit", side_effect=lost),
+        ):
+            pending = repair_task.claim_and_run(cfg, client)
+        self.assertEqual(pending["status"], "delivery_pending", pending)
+        tip = pending["repair_checkpoint"]["tip"]
+        self.assertEqual(self.service.done, set())
+        self.assertEqual(len(self.service.results), 1)
+        before = (len(self.agent_calls()), len(self.lake_calls()))
+        [saved] = repair_task.resume_pending(cfg, client)
+        self.assertEqual(saved["reason"], "repair-checkpoint", saved)
+        self.assertEqual((len(self.agent_calls()), len(self.lake_calls())), before)
+        self.assertFalse((cfg.root / "worktrees/task-1").exists())
+
+        os.environ["STUB_AGENT_MODE"] = "noop"
+        passed = {"ok": True, "build": {"rc": 0}, "checks": {"status": "passed"}, "diagnostics": []}
+        with patch.object(repair_audit, "verify", return_value=passed) as verify:
+            resumed = repair_task.claim_and_run(cfg, client)
+        self.assertEqual((resumed["status"], resumed["tip"]), ("adopted", tip), resumed)
+        verify.assert_called_once()
+        prompt = self.agent_calls()[-1]["prompt"]
+        self.assertIn(tip[:12], prompt)
+        self.assertIn("unused argument", prompt)
 
     def test_submission_preflight_failure_defers_before_inference(self):
         cfg = self.config()

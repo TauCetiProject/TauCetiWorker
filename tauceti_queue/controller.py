@@ -36,6 +36,7 @@ from . import admission_planning, chain, declaration_names
 from .eligibility import KEEP as BLOCKING_LABELS
 from .ports import (
     AGENT_INSTRUCTION,
+    REPAIR_CHECKPOINT,
     Adoption,
     CandidateRun,
     DispatchNotAccepted,
@@ -1615,6 +1616,7 @@ class Controller:
         tip_sha: str,
         worker_notes: str = "",
         *,
+        checkpoint: bool = False,
         source_access=None,
         source_refresh=None,
     ) -> Adoption:
@@ -1622,6 +1624,8 @@ class Controller:
 
         A late result (expired claim, superseded task or batch version) is rejected but its commits
         stay retained under a submissions ref. See `Adoption` for the reason codes.
+        A repair checkpoint takes the same validation path, retains the chain for the next claim
+        and releases the current claim without adopting the chain.
         """
         with self._lock.priority():
             now = self.clock()
@@ -1644,6 +1648,15 @@ class Controller:
                 return Adoption(
                     True, "already-adopted", task_id, task["batch_id"], None, tip_sha, receipt["retained_ref"], []
                 )
+            if checkpoint:
+                saved = self.store.row(
+                    "submissions",
+                    {"task_id": task_id, "claim_id": claim["id"], "tip": tip_sha, "reason": REPAIR_CHECKPOINT},
+                )
+                if saved is not None:
+                    return Adoption(
+                        False, REPAIR_CHECKPOINT, task_id, task["batch_id"], None, tip_sha, saved["retained_ref"], []
+                    )
             self._task_binding(task, allow_stale_policy=True)
             batch = self.store.row("batches", {"id": task["batch_id"]})
             assert batch is not None
@@ -1664,7 +1677,8 @@ class Controller:
                     created_at=now,
                 )
                 self.store.update("tasks", {"id": task_id}, submissions=task["submissions"] + 1)
-                self.store.journal(now, "submission-rejected", batch["id"], task_id=task_id, reason=reason, tip=tip_sha)
+                kind = "repair-checkpoint-retained" if reason == REPAIR_CHECKPOINT else "submission-rejected"
+                self.store.journal(now, kind, batch["id"], task_id=task_id, reason=reason, tip=tip_sha)
                 return Adoption(
                     False,
                     reason,
@@ -1794,6 +1808,30 @@ class Controller:
                 knowledge = next(
                     (d for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions"), {}
                 )
+            if checkpoint:
+                try:
+                    notes = loads(worker_notes, {})
+                except ValueError:
+                    notes = {}
+                findings = notes.get("repair_checkpoint") if isinstance(notes, dict) else None
+                if not (
+                    self._can_checkpoint_repair(task)
+                    and isinstance(findings, list)
+                    and 0 < len(findings) <= 20
+                    and all(
+                        isinstance(finding, dict)
+                        and finding.get("kind") in ("audit", "lint")
+                        and isinstance(finding.get("message"), str)
+                        and len(finding["message"]) <= 2000
+                        for finding in findings
+                    )
+                ):
+                    return reject("invalid-repair-checkpoint")
+                with self.store.transaction():
+                    result = reject(REPAIR_CHECKPOINT)
+                    self._release_claim(claim, REPAIR_CHECKPOINT, now)
+                self._wake.set()
+                return result
             if tip_sha == task["tip"] and knowledge.get("was_proactive"):
                 self._release_claim(claim, "source-failure-refresh", now)
                 return reject(
@@ -2018,9 +2056,17 @@ class Controller:
             m["source_pr"]: "edited" if m["source_pr"] in edits else m["provenance"] for m in self._task_members(task)
         }
         ref = self.pre_rebase_ref(batch["id"], task["onto"])
+        prepared = self._verified_pre_rebase(task, tip_sha, worker_notes)
         with self.store.transaction():
             self._set_pre_rebase(
-                batch, PRE_REBASE_ADOPTED, now, tip=tip_sha, onto=task["onto"], source=task["tip"], edits=edits
+                batch,
+                PRE_REBASE_ADOPTED,
+                now,
+                tip=tip_sha,
+                onto=task["onto"],
+                source=task["tip"],
+                edits=edits,
+                prepared=prepared,
             )
             self.store.update(
                 "tasks",
@@ -2054,10 +2100,26 @@ class Controller:
                 onto=task["onto"],
                 tip=tip_sha,
                 provenance=provenance,
+                prepared=prepared,
             )
         self.report_inference(claim["worker"], True)
         self._wake.set()
         return Adoption(True, "adopted", task["id"], batch["id"], batch["version"], tip_sha, ref, provenance=provenance)
+
+    def _verified_pre_rebase(self, task: dict[str, Any], tip: str, worker_notes: str) -> bool:
+        from . import repair_audit
+
+        try:
+            notes = loads(worker_notes, {})
+            evidence = notes.get("pre_rebase_verification") if isinstance(notes, dict) else None
+            if not isinstance(evidence, dict) or evidence.get("tip") != tip or evidence.get("base") != task["onto"]:
+                return False
+            # The commit binds the toolchain, manifest and full-library inputs.
+            # Compare the actual tools the worker ran to the pin in that commit.
+            repo, ref = repair_audit.parse_tools_pin(chain.git(self.clone, "show", f"{tip}:tauceti.toml"))
+        except (ValueError, chain.ChainError, repair_audit.Unavailable):
+            return False
+        return evidence.get("tools") == f"{repo}@{ref}"
 
     def _claim_for(self, task_id: int, token: str, now: float, *, allow_stale_policy=False) -> dict[str, Any]:
         claim = self.store.row("claims", {"task_id": task_id, "token": token})
@@ -2188,6 +2250,20 @@ class Controller:
             )
         refs = [self.batch_ref(batch["id"], task["batch_version"])] + [m.retained_ref for m in members]
         extra: dict[str, Any] = {"canonical_branch": self.canonical_branch, "claim_id": claim_id}
+        warm_revs = self._warm_revs(task, batch)
+        if self._can_checkpoint_repair(task):
+            extra["can_checkpoint_repair"] = True
+            checkpoint = self.store.row(
+                "submissions", {"task_id": task["id"], "reason": REPAIR_CHECKPOINT}, order="id DESC"
+            )
+            if checkpoint is not None:
+                tip = checkpoint["tip"]
+                extra["repair_checkpoint"] = {
+                    "tip": tip,
+                    "diagnostics": loads(checkpoint["worker_notes"])["repair_checkpoint"],
+                }
+                refs.append(checkpoint["retained_ref"])
+                warm_revs = list(dict.fromkeys([tip, *warm_revs]))
         if task["kind"] == TASK_PREPARE:
             extra["renew_after"] = PREPARE_RENEW_SECONDS
         if self._pre_rebased_prepare(task):
@@ -2232,9 +2308,12 @@ class Controller:
             instruction=AGENT_INSTRUCTION,
             created_at=task["created_at"],
             extra=extra,
-            warm_revs=self._warm_revs(task, batch),
+            warm_revs=warm_revs,
             binding=self._task_binding(task),
         )
+
+    def _can_checkpoint_repair(self, task: dict[str, Any]) -> bool:
+        return self.candidate_ci is None and task["kind"] in (TASK_REPAIR, TASK_REBASE_CONFLICT, TASK_PRE_REBASE)
 
     def _create_task(
         self,

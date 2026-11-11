@@ -92,10 +92,20 @@ def tools_pin(worktree: Path) -> tuple[str, str]:
     if not path.is_file():
         raise Unavailable("the worktree has no tauceti.toml naming the TauCetiTools pin")
     try:
-        data = tomllib.loads(path.read_text())
-    except (OSError, tomllib.TOMLDecodeError) as error:
+        return parse_tools_pin(path.read_text())
+    except OSError as error:
         raise Unavailable(f"tauceti.toml: {error}") from error
-    tools = (data.get("tools") or {}).get("tools") or {}
+
+
+def parse_tools_pin(text: str) -> tuple[str, str]:
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise Unavailable(f"tauceti.toml: {error}") from error
+    section = data.get("tools")
+    tools = section.get("tools") if isinstance(section, dict) else None
+    if not isinstance(tools, dict):
+        raise Unavailable("tauceti.toml: missing [tools.tools]")
     repo, ref = str(tools.get("repo") or ""), str(tools.get("ref") or "")
     if not REPO.match(repo) or not SHA.match(ref):
         raise Unavailable(f"tauceti.toml: [tools.tools] needs repo and a 40-hex ref, found {repo!r} {ref!r}")

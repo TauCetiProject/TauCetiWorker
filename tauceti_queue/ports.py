@@ -419,6 +419,8 @@ class Adoption:
         return vars(self) | {"violations": list(self.violations), "provenance": dict(self.provenance)}
 
 
+REPAIR_CHECKPOINT = "repair-checkpoint"
+
 AGENT_INSTRUCTION = (
     "Resolve the reported conflicts or CI failures in this batch. Preserve the constituent PRs' intent as best "
     "you can; where they conflict, use your judgment to choose the best alternative or combination. Update the "
