@@ -149,6 +149,39 @@ class Sources(unittest.TestCase):
         self.assertFalse(still_actionable("review", SimpleNamespace(gh=self.source), None, candidate))
         self.source.live_pull.assert_not_called()
 
+    def native_worker(self):
+        from tauceti_worker.forgejo_worker import ForgejoWorkerSource
+
+        api = Mock(forge=self.repo.forge, _token="token")
+        source = ForgejoWorkerSource(self.identity, api, token_file=self.root / "token")
+        return SimpleNamespace(gh=source, cfg=self.cfg, counters=Mock(), rs=Mock())
+
+    def test_authoring_has_no_pull_request_for_the_native_source_to_authorize(self):
+        worker = self.native_worker()
+        self.assertTrue(still_actionable("roadmap", worker, None, Candidate(0, "", "Algebra")))
+        self.assertFalse(still_actionable("review", worker, None, Candidate(1, "a" * 40)))
+
+    def test_dispatch_authors_on_the_native_source(self):
+        from tauceti_worker import work_units
+        from tauceti_worker.config import NoProgress
+
+        worker = self.native_worker()
+        worker.gh.pr_list = Mock(return_value=[])
+        options = work_units.RoundOpts(
+            only=["roadmap"], agent="claude", work_model="claude", sandbox_host=True, dry_run=False
+        )
+        with (
+            patch.dict(os.environ),
+            patch.object(work_units.shutil, "which", return_value="/usr/bin/claude"),
+            patch.object(work_units, "_check_stage_read_quota"),
+            patch.object(work_units, "do_roadmap", return_value=0) as author,
+            patch("tauceti_worker.activity.select"),
+            # The stubbed round opens no pull request, so the progress guard ends it afterwards.
+            self.assertRaisesRegex(NoProgress, "nothing landed"),
+        ):
+            work_units.dispatch("roadmap", worker, Survey("worker"), Candidate(0, "", "Algebra"), options)
+        author.assert_called_once()
+
     def test_github_identity_outage_does_not_hide_native_inventory(self):
         worker = SimpleNamespace(cfg=self.cfg, gh=Mock(repo="one/project"), rs=Mock(), counters=Mock(), rc=None)
         native = Survey(worker_id="worker")
