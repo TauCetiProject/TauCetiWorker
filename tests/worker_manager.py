@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -84,6 +85,47 @@ specs = [
 ]
 manager = None
 try:
+    if sys.platform == "linux":
+        supervisor_dir = root / "supervisor-budget"
+        supervisor_dir.mkdir()
+        supervisor = subprocess.Popen(
+            [sys.executable, "-m", "tauceti_worker.usage_supervisor", str(supervisor_dir)],
+            cwd=REPO,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        round_process = None
+        try:
+            ready = supervisor_dir / "usage-supervisor.json"
+            wait_for(lambda: wm.read_json(ready).get("owner", {}).get("pid") == supervisor.pid)
+            old_policy = wm.WorkerSpec("policy-reload", max_open_prs=512)
+            new_policy = dataclasses.replace(old_policy, max_open_prs=1024)
+            idle = dict(
+                applied_spec=old_policy.as_dict(),
+                state="idle",
+                child_pid=os.getpid(),
+                next_action_at=time.time() + 60,
+            )
+            assert wm._detached_usage_supervisor(supervisor.pid)
+            assert not wm._defer_read_policy_reload(new_policy, idle), "the supervisor must not strand a reload"
+            assert wm._defer_read_policy_reload(new_policy, dict(idle, state="running"))
+            assert wm._defer_read_policy_reload(new_policy, dict(idle, next_action_at=time.time() + 1))
+            registered = wm.read_json(ready)
+            stale = {**registered, "owner": {**registered["owner"], "start": "stale"}}
+            with patch.object(wm, "read_json", return_value=stale):
+                assert wm._defer_read_policy_reload(new_policy, idle), "the registered birth identity must match"
+            with patch.object(wm.os, "getsid", return_value=os.getsid(0)):
+                assert wm._defer_read_policy_reload(new_policy, idle), "the supervisor must have its own session"
+            round_process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            assert wm._defer_read_policy_reload(new_policy, idle), "an ordinary child must still block the reload"
+        finally:
+            if round_process is not None:
+                round_process.terminate()
+                round_process.wait(5)
+            supervisor.terminate()
+            supervisor.wait(5)
+
     wm.save_worker_specs(config, specs)
     assert wm.load_worker_specs(config) == specs
 
