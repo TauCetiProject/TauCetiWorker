@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fixtures.review_runtime_stub import install_runtime_stub
+
 install_runtime_stub()
 
 from tauceti_worker import github_state as state

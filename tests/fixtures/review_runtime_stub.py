@@ -2,6 +2,7 @@
 
 import atexit
 from unittest.mock import patch
+
 from tauceti_worker.review_runtime import ReviewRuntime
 
 

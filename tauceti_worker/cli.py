@@ -1527,7 +1527,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
                         )
                         from .review_runtime import recover as recover_review
 
-                        if recover_review(recovery_worker, numbers=getattr(recovery_opts, "prs", ())) or recover(recovery_worker, recovery_opts):
+                        if recover_review(recovery_worker, numbers=getattr(recovery_opts, "prs", ())) or recover(
+                            recovery_worker, recovery_opts
+                        ):
                             return 0
                     except Exception as error:
                         log(f"GitHub recovery deferred ({type(error).__name__}); checking other selected sources")

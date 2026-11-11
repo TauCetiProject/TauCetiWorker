@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fixtures.review_runtime_stub import install_runtime_stub
+
 install_runtime_stub()
 
 from tauceti_worker import activity

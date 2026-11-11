@@ -112,9 +112,10 @@ def recover(worker, *, numbers=()):
     """Reconcile paid output before provider admission, independently of the source."""
     import shutil
 
-    from .retention import locked, read_json
-    from . import work_recovery
     from tauceti_tools.forge import GITHUB
+
+    from . import work_recovery
+    from .retention import locked, read_json
 
     root = worker.cfg.state / "review-work"
     if not root.is_dir():

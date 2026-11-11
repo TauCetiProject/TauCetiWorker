@@ -80,7 +80,10 @@ tmp = Path(tempfile.mkdtemp())
 (tmp / "engine/runner/cli.py").touch()
 (tmp / "engine/rubrics").mkdir()
 os.environ["TAUCETI_REVIEW_ENGINE_DIR"] = str(tmp / "engine")  # skip the engine fetch
-w = types.SimpleNamespace(gh=types.SimpleNamespace(repo="TauCetiProject/TauCeti"), cfg=types.SimpleNamespace(state=tmp / "state", store_dir=tmp / "store"))
+w = types.SimpleNamespace(
+    gh=types.SimpleNamespace(repo="TauCetiProject/TauCeti"),
+    cfg=types.SimpleNamespace(state=tmp / "state", store_dir=tmp / "store"),
+)
 opts = types.SimpleNamespace()
 
 os.environ.pop("TAUCETI_REVIEW_CODEX_MODEL", None)

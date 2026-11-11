@@ -978,21 +978,21 @@ def _selected_pr_matches(stage: str, c: Candidate, live) -> bool | None:
 def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool | None:
     from tauceti_tools.forge import GITHUB, RepositoryRef
 
-    source_repository = getattr(c, 'source_repository', None)
+    source_repository = getattr(c, "source_repository", None)
     if source_repository is not None:
-        selected = getattr(w.gh, 'repository', None)
+        selected = getattr(w.gh, "repository", None)
         if not isinstance(selected, RepositoryRef):
             selected = RepositoryRef(GITHUB, w.gh.repo)
         if source_repository != selected:
             return False
-        identity = getattr(w.gh, 'identity', None)
-        if identity is not None and getattr(c, 'source_repository_id', None) != identity.native_id:
+        identity = getattr(w.gh, "identity", None)
+        if identity is not None and getattr(c, "source_repository_id", None) != identity.native_id:
             return False
     # Native authorization stays with its adapter; freshness, labels, contests,
     # attempt budgets and finding policy below are shared for every source.
-    authorize = getattr(type(w.gh), 'authorize_candidate', None)
+    authorize = getattr(type(w.gh), "authorize_candidate", None)
     if authorize is not None:
-        allowed = authorize(w.gh, c, require_writer=stage in {'fix', 'rebase', 'fix-ci'})
+        allowed = authorize(w.gh, c, require_writer=stage in {"fix", "rebase", "fix-ci"})
         if allowed is not True:
             return allowed
     from .github_transport import read_context
@@ -1543,7 +1543,8 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
 
             with review_workspace(w.cfg) as scratch:
                 rc = run_to_logfile(
-                    [*runtime.command(),
+                    [
+                        *runtime.command(),
                         str(pr),
                         "--repo",
                         getattr(w.gh, "review_repository", w.gh.repo),

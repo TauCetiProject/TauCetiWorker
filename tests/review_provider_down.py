@@ -35,6 +35,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 from fixtures.review_runtime_stub import install_runtime_stub
+
 install_runtime_stub()
 
 import tauceti_worker as tc
@@ -70,7 +71,9 @@ def fake_worker(state):
         cfg=types.SimpleNamespace(state=state, logdir=state, wid="w", store_dir=state / "store"),
         counters=Counters(),
         rs=types.SimpleNamespace(bust=lambda pr: None, review_rounds=lambda pr, c: 0),
-        gh=types.SimpleNamespace(repo="TauCetiProject/TauCeti", add_reaction=lambda i: True, remove_reaction=lambda i: True),
+        gh=types.SimpleNamespace(
+            repo="TauCetiProject/TauCeti", add_reaction=lambda i: True, remove_reaction=lambda i: True
+        ),
     )
 
 

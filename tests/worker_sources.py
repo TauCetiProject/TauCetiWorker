@@ -208,8 +208,8 @@ class Sources(unittest.TestCase):
         self.assertEqual([len(row[2].reviewable.actionable) for row in observations], [0, 1])
 
     def test_native_review_entrypoint_delegates_to_the_common_runtime(self):
-        from tauceti_worker.source_review import main
         from tauceti_worker.review_runtime import ReviewRuntime
+        from tauceti_worker.source_review import main
 
         runtime = ReviewRuntime(self.root / "engine", "a" * 40)
         argv = [
@@ -560,8 +560,8 @@ class Sources(unittest.TestCase):
         self.assertEqual(result.review_stuck, [])
 
     def test_shared_preparation_failure_does_not_consume_inference_error_allowance(self):
-        from tauceti_worker.source_execution import review
         from tauceti_worker.config import NoProgress
+        from tauceti_worker.source_execution import review
 
         counters = Counters(self.cfg)
         worker = SimpleNamespace(cfg=self.cfg, gh=self.source, counters=counters, rs=Mock())
@@ -575,7 +575,7 @@ class Sources(unittest.TestCase):
         self.assertEqual(counters.read("review-err-1"), 0)
 
     def test_shared_workspace_retains_paid_publication_after_interruption(self):
-        from tauceti_worker.retention import review_workspace, collect_review_scratch, fresh_report
+        from tauceti_worker.retention import collect_review_scratch, fresh_report, review_workspace
 
         with review_workspace(self.cfg) as work:
             receipt = work / "publication.json"

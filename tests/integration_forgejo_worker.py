@@ -15,13 +15,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
 
 from forgejo_git_source import source_fixture
+from runner import cli as review_cli
+from runner import publication as shared_publication
 from tauceti_tools.ci_candidate import RepositoryIdentity
 
 from tauceti_worker.config import Config
 from tauceti_worker.forgejo_worker import ForgejoWorkerSource
 from tauceti_worker.review_state import ReviewState
 from tauceti_worker.source_publication import pending
-from runner import cli as review_cli, publication as shared_publication
 
 
 def retain_plan(source, cfg, number, head, path, *, actor_id):
