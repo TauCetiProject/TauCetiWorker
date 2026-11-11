@@ -340,6 +340,20 @@ def merge3(base: str, ours: str, theirs: str) -> str | None:
     return merged.stdout if merged.returncode == 0 else None
 
 
+def _write(path: Path, text: str) -> bool:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(text)
+        shutil.copymode(path, temporary)
+        os.replace(temporary, path)
+    except OSError as error:
+        log(f"curate: {path} cannot be written ({error.strerror}); nothing written")
+        return False
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
+
+
 def publish(path: Path, base: str, ours: str, notes: list[str]) -> str | None:
     """Put `ours`, the list as this curation edited it from `base`, into the file and return what
     the file then holds, or None when it could not be merged or written. Call with the lock held.
@@ -347,7 +361,8 @@ def publish(path: Path, base: str, ours: str, notes: list[str]) -> str | None:
     A tracked list is first brought up to the branch it tracks. The edit is then merged three ways
     with the file as it is now, so an edit made meanwhile by hand or on another host is kept; when
     both touch the same lines nothing is written and a later curation starts from the new file. A
-    tracked list is committed, that path only, and pushed."""
+    tracked list is committed, that path only, and pushed; when the commit fails the file is put
+    back as it was found, so a later curation makes the edit again."""
     tracked = _tracked(path)
     if tracked:
         _sync(path)
@@ -356,22 +371,18 @@ def publish(path: Path, base: str, ours: str, notes: list[str]) -> str | None:
     if merged is None:
         log(f"curate: {path.name} changed on the same lines during this curation; nothing written")
         return None
-    if merged != theirs:
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        try:
-            temporary.write_text(merged)
-            shutil.copymode(path, temporary)
-            os.replace(temporary, path)
-        except OSError as error:
-            log(f"curate: {path} cannot be written ({error.strerror}); nothing written")
-            return None
-        finally:
-            temporary.unlink(missing_ok=True)
+    if merged != theirs and not _write(path, merged):
+        return None
     if tracked and merged != theirs:
         message = f"Curate {path.name}: {len(notes)} item(s)\n\n" + "\n".join(f"- {note}" for note in notes)
         committed = _git(path, "commit", "-q", "-m", message, "--", path.name)
         if committed.returncode != 0:
-            log(f"curate: commit failed ({one_line(committed.stderr or committed.stdout)}); the file is written")
+            log(
+                f"curate: commit failed ({one_line(committed.stderr or committed.stdout)}); the edit waits for a later look"
+            )
+            if path.read_text() == merged:
+                _write(path, theirs)
+            return None
     if tracked:
         _push(path)
     return merged

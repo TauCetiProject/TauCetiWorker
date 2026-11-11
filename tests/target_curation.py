@@ -322,6 +322,22 @@ class Publish(Tmp):
         self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", both)
         self.assertEqual(git(self.tmp / "remote.git", "rev-list", "--count", "main"), "3")
 
+    def test_a_commit_that_fails_leaves_the_edit_to_a_later_look(self):
+        first = self.clone("first")
+        by_hand = EXAMPLE.replace("Goal: the strong law", "Goal: the weak law")
+        first.write_text(by_hand)
+        hook = first.parent / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
+        self.assertIsNone(curate.publish(first, EXAMPLE, a, ["n"]))
+        self.assertEqual((first.read_text(), git(first.parent, "rev-list", "--count", "HEAD")), (by_hand, "1"))
+        hook.unlink()
+        both = curate.publish(first, EXAMPLE, a, ["n"])
+        self.assertIn("- [x] `strong-law`", both)
+        self.assertIn("Goal: the weak law", both)
+        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", both)
+
     def test_a_push_that_loses_the_race_is_retried_after_a_rebase(self):
         first, second = self.clone("first"), self.clone("second")
         a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
