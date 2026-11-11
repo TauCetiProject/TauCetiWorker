@@ -169,6 +169,34 @@ class IdentityHaltTests(unittest.TestCase):
             github.pin_github_account("alice", recheck=True)
         self.assertNotIsInstance(raised.exception, Halted)
 
+    def test_a_verdict_outranks_a_peer_exhausting_the_shared_quota(self):
+        self.assertEqual(github.pin_github_account("alice", recheck=True), "alice")
+        real_budget, real_execute = github.transport.observed_budget, github.transport.execute
+        no_wait = SimpleNamespace(time=time.time, sleep=lambda nap: self.fail(f"waited {nap}s for the quota reset"))
+        self.enterContext(patch.object(github, "time", no_wait))
+        cases = ((SUSPENDED, "account-halt", True), (BAD_CREDENTIALS, "invalid-credentials", True))
+        for mode, reason, recheck in (*cases, *((m, r, False) for m, r, _ in cases)):
+            if not recheck:  # a fresh `work --loop` start, with nothing verified yet
+                for name in ("_TAUCETI_PINNED_GITHUB_ACCOUNT", "GH_TOKEN"):
+                    os.environ.pop(name, None)
+            self.mode.write_text(mode)
+            answered = []
+
+            def budget(env=None, answered=answered):
+                return {"core": (0, int(time.time()) + 600)} if answered else real_budget(env)
+
+            def execute(*args, answered=answered, **kwargs):
+                result = real_execute(*args, **kwargs)
+                answered.append(result)
+                return result
+
+            with (
+                patch.object(github.transport, "observed_budget", side_effect=budget),
+                patch.object(github.transport, "execute", side_effect=execute),
+            ):
+                self.assertEqual(self.halted(recheck=recheck, wait_for_reset=True), reason)
+            self.assertEqual(len(answered), 1)
+
     def run_cli(self, *argv):
         with (
             patch.object(sys, "argv", ["tauceti", *argv]),

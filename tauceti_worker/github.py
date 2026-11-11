@@ -171,6 +171,8 @@ def pin_github_account(account: str, *, wait_for_reset: bool = False, recheck: b
                 immutable=True,
             )
             identity = attempts[-1] if attempts else subprocess.CompletedProcess([], 0, verified or "", "")
+            if identity.returncode != 0 and _identity_halt(identity):
+                break
             if verified is None and transport.observed_budget(env).get("core", (1,))[0] == 0:
                 identity.stderr = "API rate limit exceeded"
             if identity.returncode == 0 or carried:
