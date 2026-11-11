@@ -782,7 +782,7 @@ class Wiring(Tmp):
                 try:
                     result = multi_source.run_round(None, opts)
                 except tc.NoProgress as error:
-                    result = str(error)
+                    self.raised, result = error, str(error)
             calls = [
                 (call.args[0], call.args[1].only, call.kwargs["prepared_survey"]) for call in execute.call_args_list
             ]
@@ -795,6 +795,9 @@ class Wiring(Tmp):
         result, calls, _ = ran(["roadmap", "curate"], both, [current, 0])
         self.assertEqual((result, [only for _, only, _ in calls]), (0, [["curate"], ["roadmap"]]))
         self.assertEqual(ran(["curate"], both, [current])[:2], ("curate: the target list is current", calls[:1]))
+        paused = tc.AdmissionUnavailable("storage unavailable", state="waiting-storage")
+        self.assertEqual(ran(["curate", "fix"], both, [paused])[0], "storage unavailable")
+        self.assertIs(self.raised, paused)
         alone = observed(("forgejo", forgejo))
         self.assertEqual(ran(["curate"], alone, [0], "forgejo"), (0, [(forgejo, ["curate"], alone[0][2])], 1))
         self.assertEqual(forgejo.target_sources, [])

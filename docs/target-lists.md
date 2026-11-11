@@ -126,7 +126,9 @@ after one that changes nothing the round goes on to its other phases. A round
 given `--pr` does not curate. One worker per list is enough. In a round over
 several sources the look runs once, ahead of either source's work, and reads
 every source surveyed that round: in GitHub's round when GitHub was surveyed,
-otherwise in the round of the forge new pull requests go to. A round with no
+otherwise in the round of the forge new pull requests go to; a pause the look
+meets (admission, an unavailable forge) ends the round as such when no other
+work runs. A round with no
 GitHub source reads GitHub's marked pull requests as the roadmap round does
 (above): the same single listing of 200, the same fallback when GitHub cannot
 be read, and the same `TAUCETI_ROADMAP_TARGETS_GITHUB=0` to stop it. A `#N`

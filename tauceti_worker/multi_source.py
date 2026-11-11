@@ -209,6 +209,9 @@ def run_round(w, opts, *, use_fleet_focus=True):
         except NoProgress as error:
             if opts.only == ["curate"]:
                 raise
+            # A typed pause (admission, an unavailable forge) is raised if nothing else runs.
+            if type(error) is not NoProgress and not isinstance(error, NoEligibleWork):
+                waits.append(error)
             log(f"{error}; going on to the other selected work")
         opts = dataclasses.replace(opts, only=[task for task in opts.only if task != "curate"])
     executable = [(name, worker, result) for name, worker, result in healthy if name == "github" or opts.sandbox_host]
