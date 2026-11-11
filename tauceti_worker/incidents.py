@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 
@@ -132,15 +133,19 @@ def _write(root: Path, kind: str, key: str, fields: dict) -> Path | None:
         "count": (previous.get("count") if type(previous.get("count")) is int else 0) + 1,
         **fields,
     }
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary = None
     try:
+        text = json.dumps(value, indent=1, sort_keys=True) + "\n"
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temporary.write_text(json.dumps(value, indent=1, sort_keys=True) + "\n")
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=root)
+        with os.fdopen(fd, "w") as out:
+            out.write(text)
         os.replace(temporary, path)
     except (OSError, TypeError, ValueError) as error:
         log(f"incident {path.name} could not be written under {root}: {error}")
-        with contextlib.suppress(OSError):
-            temporary.unlink()
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
         return None
     return path
 

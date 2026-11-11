@@ -4,8 +4,9 @@
 With TAUCETI_INCIDENTS_DIR unset nothing is written and selection is what it was. Set, a rebase, fix
 or fix-ci round that ends with no push, closure or reply leaves a `declined` record carrying the
 agent's final message, and a spent attempt budget leaves a `budget-spent` record once per head.
-TAUCETI_HOLD_DECLINED=1 then keeps the stage off a declined head, in the survey and again at
-dispatch, until the head moves or the record is deleted; an acknowledged record holds as well.
+TAUCETI_HOLD_DECLINED=1 then keeps the stage off a declined head, in the survey, at dispatch and
+again once the branch claim is held, until the head moves or the record is deleted; an acknowledged
+record holds as well.
 
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
@@ -161,6 +162,25 @@ def test_records(root):
         )
         check("…or one kind, live only", len(incidents.records(incidents.DECLINED, acked=False)), 1)
 
+    with settings(root):
+        # A second writer of the same record runs to completion inside the first one's rename.
+        rename, inside = os.replace, []
+
+        def interleaved(src, dst):
+            if not inside:
+                inside.append(None)
+                inside[0] = incidents.record("declined", "fix-30", pr=30, by="B")
+            rename(src, dst)
+
+        with patch.object(incidents.os, "replace", interleaved):
+            first = incidents.record("declined", "fix-30", pr=30, by="A")
+        check(
+            "concurrent writers of one record each publish a whole file",
+            (inside[0], first, load(root / "declined-fix-30.json")["by"]),
+            (root / "declined-fix-30.json", root / "declined-fix-30.json", "A"),
+        )
+        check("…and leave no temporary file", sorted(p.name for p in root.glob(".*.tmp")), [])
+
     blocked = root / "torn.json" / "below"
     with settings(blocked), patch.object(incidents, "log") as said:
         check("a write that fails returns None", incidents.record("declined", "fix-1", pr=1), None)
@@ -309,6 +329,65 @@ def test_prompt(root):
         check("…and one at another head does not", "main moved since" in prompt(), False)
 
 
+def test_claim_race(root):
+    """A peer's decline written while this worker acquires the branch claim holds the head too."""
+    p = SimpleNamespace(
+        number=30, head_ref="feature", head_owner="me", head_repo="TauCeti", automatic_bump=False, labels=[]
+    )
+    sv = SimpleNamespace(open_prs=[p], owns=lambda _p: True)
+    counts, released = {"fix-30-head-30": tc.MAX_FIX_ATTEMPTS}, []
+
+    def claim(*_args):
+        incidents.record_declined("fix", 30, "head-30", message="peer declined")
+        claims.held = ("branch/30", "token")
+        return True
+
+    claims = SimpleNamespace(
+        held=None,
+        begin_branch_work=claim,
+        stop_heartbeat=lambda: None,
+        release=lambda: released.append(30),
+    )
+    w = SimpleNamespace(
+        claims=claims, counters=SimpleNamespace(read=lambda k: counts.get(k, 0), write=counts.__setitem__)
+    )
+    c = tc.Candidate(30, "head-30", "blocking review at head")
+    with (
+        settings(root, hold=True),
+        patch.object(work_units, "_progress_snapshot") as snapshot,
+        patch.object(work_units, "run_in_bubble") as agent,
+    ):
+        got = work_units._do_fixlike(
+            w,
+            sv,
+            c,
+            SimpleNamespace(agent_name="Codex"),
+            True,
+            prompt_file="fix.md",
+            label="fix",
+            charged=("fix-30-head-30",),
+        )
+        check(
+            "a repair whose head was declined during the claim launches nothing and refunds its attempt",
+            (got, snapshot.called, agent.called, released, counts["fix-30-head-30"]),
+            (None, False, False, [30], tc.MAX_FIX_ATTEMPTS - 1),
+        )
+
+    (root / "declined-fix-30.json").unlink()
+    counts["fix-30-head-30"], released[:] = tc.MAX_FIX_ATTEMPTS, []
+    with (
+        settings(root, hold=True),
+        patch.object(work_units, "_still_actionable", return_value=True),
+        patch.object(work_units, "gh_run") as close,
+    ):
+        got = work_units._close_spent_pr(w, sv, c)
+        check(
+            "a spent head declined during the claim is left open",
+            (got, close.called, released),
+            (None, False, [30]),
+        )
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -316,6 +395,7 @@ def main():
         test_survey(tmp / "survey")
         test_round(tmp / "round", tmp)
         test_prompt(tmp / "prompt")
+        test_claim_race(tmp / "race")
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
     return 1 if fails else 0
 

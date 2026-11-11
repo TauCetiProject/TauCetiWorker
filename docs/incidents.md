@@ -34,9 +34,9 @@ A [managed worker](workers.md) gets both through its `env` table.
 ```
 
 The worker writes live files only, each by a rename from a temporary file in
-the same directory (`.<name>.<pid>.tmp`), so a reader never sees a partial
-record. It never deletes a file, and it moves one only in the decide phase,
-which acknowledges the records it has settled.
+the same directory (`.<name>.<random>.tmp`, one per write), so a reader never
+sees a partial record. It never deletes a file, and it moves one only in the
+decide phase, which acknowledges the records it has settled.
 
 Whoever reads the records acknowledges one by moving it into `acked/` under the
 same name, and discards one by deleting it. A hyphen can occur in both `<kind>`
@@ -119,7 +119,8 @@ With `TAUCETI_HOLD_DECLINED=1`, a stage takes no further round on a pull request
 while a `declined` record for that stage, live or acknowledged, names its
 current head. The survey lists the pull request as suppressed with the reason
 `an earlier round declined at this head; waiting for a new head`, and dispatch
-checks again before spending, for a record written after the survey.
+checks again before spending and once more after taking the branch claim, for a
+record written after the survey or by a peer that just released the claim.
 
 The hold ends when the head moves, when the record is deleted from both
 folders, or when the decide phase rules `retry` on the latest record for that
