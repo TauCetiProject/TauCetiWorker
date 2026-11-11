@@ -48,6 +48,10 @@ RAW = [
 ]
 
 
+STATE = tempfile.TemporaryDirectory()
+WORKER = SimpleNamespace(wid="test", state=Path(STATE.name))
+
+
 class Counters:
     def read(self, _name):
         return 0
@@ -62,9 +66,7 @@ def scope(pattern):
 
 def classify(pattern, can_push=lambda _repo: True):
     with scope(pattern), patch.object(survey_mod, "me", lambda: "me"), patch.object(survey_mod, "can_push", can_push):
-        sv = survey_mod.survey(
-            SimpleNamespace(wid="test"), SimpleNamespace(open_prs=lambda: RAW), None, Counters(), deep=False
-        )
+        sv = survey_mod.survey(WORKER, SimpleNamespace(open_prs=lambda: RAW), None, Counters(), deep=False)
     return {
         "rebase": sorted(c.pr for c in sv.rebaseable.actionable),
         "fix-ci": [c.pr for c in sv.red_ci.actionable],
@@ -83,9 +85,7 @@ def automatic_open_count(pattern):
         patch("tauceti_worker.github_state.read_survey", return_value=(True, rows)),
     ):
         gh = SimpleNamespace(open_prs=lambda: RAW, repo="TauCetiProject/TauCeti")
-        return survey_mod.survey(
-            SimpleNamespace(wid="test"), gh, None, Counters(), stages=[], count_all_roadmaps=True
-        ).n_mine_open
+        return survey_mod.survey(WORKER, gh, None, Counters(), stages=[], count_all_roadmaps=True).n_mine_open
 
 
 def listing_outage(pattern, totals, *, cached=False):
@@ -103,7 +103,7 @@ def listing_outage(pattern, totals, *, cached=False):
     ):
         try:
             sv = survey_mod.survey(
-                SimpleNamespace(wid="test"),
+                WORKER,
                 SimpleNamespace(open_prs=fail, repo="TauCetiProject/TauCeti"),
                 None,
                 Counters(),
@@ -117,7 +117,7 @@ def listing_outage(pattern, totals, *, cached=False):
 
 
 def forgejo(pattern):
-    """A Forgejo source: the account's conflicting #1 and #2 and a peer's #3 awaiting review."""
+    """A Forgejo source: the account's conflicting #1 and #2 and a peer's #3, all awaiting review."""
     repo = RepositoryRef(Forge("forgejo", "https://git.example.org"), "one/project")
     source = Mock(repository=repo, identity=RepositoryIdentity(repo, 7))
     source.authenticated_actor.return_value = SourceActor.from_native(repo.forge, {"id": 3, "login": "me"})
@@ -229,11 +229,11 @@ def main():
         ("dashboard worker, unset: no flag", dashboard_worker(None), []),
         ("dashboard worker, set: the dashboard's pattern", dashboard_worker("-alpha$"), ["--own-branches=-alpha$"]),
         ("dashboard worker, set empty: explicitly every branch", dashboard_worker(""), ["--own-branches="]),
-        ("Forgejo, unset: every PR of the account", forgejo(None), {"rebase": [1, 2], "review": [3], "open": 2}),
+        ("Forgejo, unset: every PR of the account", forgejo(None), {"rebase": [1, 2], "review": [1, 2, 3], "open": 2}),
         (
-            "Forgejo, set: matching branches of the account only; #2 falls through to review as any PR does",
+            "Forgejo, set: matching branches of the account only; reviews unchanged",
             forgejo("-alpha$"),
-            {"rebase": [1], "review": [2, 3], "open": 1},
+            {"rebase": [1], "review": [1, 2, 3], "open": 1},
         ),
     ]
     failures = 0

@@ -6,14 +6,12 @@ inventory remains read-only; worker_survey adds native review and repair selecti
 
 from __future__ import annotations
 
-import json
 from dataclasses import asdict, dataclass
 
 from tauceti_tools.forge import Incomplete, RepositoryRef
 
-from .config import own_branches
 from .source_identity import SourceActor
-from .survey import PRInfo, Survey, bucket_status_labels, roadmap_open_count
+from .survey import PRInfo, Survey, bucket_status_labels, own_branch, roadmap_open_count
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -85,11 +83,6 @@ def source_pr_info(row, repository):
     return SourcePRInfo(
         **asdict(base), source_repository=repository, source_author=actor, source_head_repository=head_ref
     )
-
-
-def own_branch(pr: PRInfo) -> bool:
-    own = own_branches()
-    return own is None or own.search(pr.head_ref) is not None
 
 
 def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count_all_roadmaps):
@@ -166,14 +159,7 @@ def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count
 
 def worker_survey(cfg, source, rs, counters, *, roadmap, skip, deep, stages, numbers, count_all_roadmaps):
     """Schedule review and owned-branch repair without asserting native CI authority."""
-    from .constants import (
-        MAX_FIX_ATTEMPTS,
-        MAX_REBASE_ATTEMPTS,
-        MAX_REVIEW_CONTESTS,
-        MAX_REVIEW_CONTESTS_PER_RUBRIC,
-        MAX_REVIEW_ERRORS,
-    )
-    from .survey import Candidate, _unchanged_review_recent
+    from .survey import classify_survey
 
     result = inventory_survey(
         cfg,
@@ -199,103 +185,21 @@ def worker_survey(cfg, source, rs, counters, *, roadmap, skip, deep, stages, num
             if numbers
             else [pr for pr in result.open_prs if in_scope(pr.labels, pr.target_focuses, pr.head_ref, roadmap, skip)]
         )
-    pending = set()
-    for path in (cfg.state / "review-work").glob("*/publication.json"):
-        value = json.loads(path.read_text())
-        if value.get("state") == "prepared" and value.get("source") == source.identity.record():
-            pending.add((value["pr"], value["head"]))
-    for path in (cfg.state / "review-work").glob("*/review-context.json"):
-        if not path.with_name("publication.json").exists() and path.with_name("plan.json").is_file():
-            value = json.loads(path.read_text())
-            if value.get("source") == source.identity.record() and not value.get("complete"):
-                pending.add((value["pr"], value["head"]))
     rs.observe(result.open_prs)
-    for pr in result.open_prs:
-        labels = {label.lower() for label in pr.labels}
-        if pr.is_draft or labels & {"hold", "wip", "human", "on-hold"}:
-            continue
-        if (pr.number, pr.head_oid) in pending:
-            continue
-        meta = rs.gh_meta(pr.number)
-        if meta.provenance not in {"fresh", "missing", "assumed"}:
-            result.errors.append(f"Forgejo PR #{pr.number} review history unavailable")
-            result.discovery_gaps += 1
-            result.discovery_gap_prs.append(pr.number)
-            continue
-        owns = result.owns(pr) and own_branch(pr)
-        repair_allowed = not labels & {"keep", "do-not-close"}
-        if owns and repair_allowed and "rebase" in stages and pr.mergeable == "CONFLICTING":
-            key = counters.rebase_budget_key(pr.number)
-            candidate = Candidate(
-                pr.number,
-                pr.head_oid,
-                "conflicting",
-                attempts=counters.read(key),
-                budget=MAX_REBASE_ATTEMPTS,
-                rebase_budget_key=key,
-            )
-            bucket = (
-                result.rebaseable.suppressed if candidate.attempts >= candidate.budget else result.rebaseable.actionable
-            )
-            bucket.append(candidate)
-            continue
-        states = meta.data.get("states") or {}
-        has_findings = (
-            any(value in {"blocking_request", "blocking_block"} for value in states.values())
-            if states
-            else any(run.get("verdict") in {"request_changes", "block"} for run in meta.data.get("runs", []))
-        )
-        blocking = has_findings and rs.ledger_blocking(pr.number, pr.head_oid)
-        reply = rs.newest_contest_reply(pr.number) if blocking else None
-        through = meta.data.get("replies_through", 0)
-        contest = reply if isinstance(reply, dict) and reply["id"] > through else None
-        if owns and repair_allowed and "fix" in stages and blocking and not contest:
-            candidate = Candidate(
-                pr.number,
-                pr.head_oid,
-                "current source review requests changes",
-                attempts=counters.read(f"fix-{pr.number}-{pr.head_oid[:12]}"),
-                budget=MAX_FIX_ATTEMPTS,
-                final_resolution=counters.read(f"fix-{pr.number}-{pr.head_oid[:12]}") >= MAX_FIX_ATTEMPTS - 1,
-            )
-            bucket = (
-                result.needs_fix.suppressed if candidate.attempts >= candidate.budget else result.needs_fix.actionable
-            )
-            bucket.append(candidate)
-        if (
-            "review" in stages
-            and (contest or rs.ledger_clean_head(pr.number) != pr.head_oid)
-            and not _unchanged_review_recent(counters, pr.number, pr.head_oid)
-        ):
-            # Review may run while mixed queue CI is being installed. The engine
-            # receives unknown CI, and source statuses confer no build authority.
-            candidate = Candidate(
-                pr.number,
-                pr.head_oid,
-                "source head awaits review; execution CI not yet observed",
-                attempts=counters.read(f"review-err-{pr.number}"),
-                budget=MAX_REVIEW_ERRORS,
-                contest=contest["rubric"] if contest else "",
-                contest_reply_id=contest["id"] if contest else 0,
-            )
-            if contest and (
-                counters.read(f"review-contest-{pr.number}") >= MAX_REVIEW_CONTESTS
-                or counters.read(f"review-contest-{pr.number}-{contest['rubric']}") >= MAX_REVIEW_CONTESTS_PER_RUBRIC
-            ):
-                candidate.attempts = candidate.budget
-            bucket = (
-                result.reviewable.suppressed if candidate.attempts >= candidate.budget else result.reviewable.actionable
-            )
-            bucket.append(candidate)
+    classify_survey(
+        cfg,
+        source,
+        rs,
+        counters,
+        result,
+        enabled=set(stages) & {"review", "fix", "rebase"},
+        deep=deep,
+        review_without_ci=True,
+        supports_external_repair=False,
+    )
     for stage in ("rebase", "review", "fix", "fix-ci", "bump", "lint-repair"):
         kind = result.kind(stage)
         for candidate in kind.actionable + kind.suppressed:
             candidate.source_repository = source.repository
             candidate.source_repository_id = source.identity.native_id
-    result.review_stuck = [
-        candidate.pr
-        for candidate in result.reviewable.suppressed
-        if counters.read(f"review-err-{candidate.pr}") >= MAX_REVIEW_ERRORS
-    ]
-    result.n_reviewable = len(result.reviewable.actionable)
     return result
