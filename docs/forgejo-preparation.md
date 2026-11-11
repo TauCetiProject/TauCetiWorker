@@ -510,10 +510,10 @@ attempt; this is not a producer-verified request binding. A missing run
 alone does not prove rejection, so normal ticks do not retransmit uncertain sends
 after a timeout. An explicit operator `retry_ci` can supersede one after the same
 live-run check and observation of any completed run. Ordinary source preparation
-failures and temporary dispatch rejections retry with capped exponential backoff,
-respecting a persisted server retry deadline. Permanent HTTP rejections use a
-separate finite budget and raise an operator alert. These non-sends do not exhaust
-the retry budget for failed CI runs. Credential preparation failures are proven
+failures and dispatch rejections retry with capped exponential backoff,
+respecting a persisted server retry deadline. Permanent HTTP rejections also
+raise an operator alert so configuration can be repaired while retries continue.
+Credential preparation failures are proven
 non-sends; other transport failures remain uncertain unless the backend can prove
 rejection. Existing ledger rows migrate with the
 `legacy` dispatch state and retain their previous observation behavior.
@@ -529,8 +529,8 @@ Late live runs attach to a previously sent attempt and its existing candidate re
 newer rejected receipts remain in history without hiding that active attempt.
 The monitoring exporter also reads older ledgers before controller migration.
 The candidate feed excludes preparations and rejected sends, so they cannot hide
-the retained ref of a late run. Exhausted retry budgets continue looking for late
-live runs at the normal observation interval. The intent compare-and-set prevents
+the retained ref of a late run. The controller still looks for late live runs
+before retrying. The intent compare-and-set prevents
 two connections from sending the same preparation; the service still requires a
 single active controller for its other operations.
 
