@@ -287,6 +287,24 @@ def cases():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+    # 5c) A usage login behind a directory this worker cannot enter reads as a missing login, and the
+    #     selection still reaches its other providers.
+    tmp = Path(tempfile.mkdtemp())
+    locked = tmp / "locked"
+    try:
+        quota, usage_file, agent_files = setup(tmp)
+        (locked / "usage").mkdir(parents=True)
+        os.environ[VARIABLE] = str(locked / "usage")
+        locked.chmod(0)
+        seen, usage = usage_seen()
+        with usage:
+            agent, provs = quota.choose("claude", renew=True)
+        check("an unreadable usage login makes no request", seen, [])
+        check("claude reads as unavailable", (agent, provs["claude"].available), (None, False))
+    finally:
+        locked.chmod(0o700)
+        shutil.rmtree(tmp, ignore_errors=True)
+
     # 6) The loop's advice after a refusal points at the usage login, not at the agents' credential.
     refused = tc.quota.Provider("claude", False, None, error="claude usage HTTP 401 (access token expired)")
     os.environ[VARIABLE] = "/logins/usage/.credentials.json"

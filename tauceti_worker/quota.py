@@ -879,7 +879,11 @@ def claude_usage_credentials() -> Path | None:
     if not raw:
         return None
     path = Path(raw).expanduser()
-    return path / ".credentials.json" if path.is_dir() else path
+    try:
+        is_dir = path.is_dir()
+    except OSError:  # an unreadable path reads as a missing login, as _read_json_file then reports
+        is_dir = False
+    return path / ".credentials.json" if is_dir else path
 
 
 def _write_json_atomic(path: Path, data: dict) -> None:
