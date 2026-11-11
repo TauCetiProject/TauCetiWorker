@@ -28,6 +28,7 @@ from tauceti_worker import worker_manager as wm
 from tauceti_worker.github_state import SurveyRows
 
 work = importlib.import_module("tauceti_worker.work_units")
+TARGET_MARKER_PRS = tc.GitHub.target_marker_prs  # unpatched, for the one test of the listing itself
 EXAMPLE = re.search(r"```markdown\n(.*?)```", (REPO / "docs" / "target-lists.md").read_text(), re.S).group(1)
 
 
@@ -688,6 +689,17 @@ class ForgejoRound(unittest.TestCase):
         self.assertIn("  - [x] `first` — a", prompt)
         self.assertIn("  - [~] `third` — c", prompt)
         self.github_reads.assert_called_once_with(200)
+        closed = {"number": 32, "title": "t", "body": "", "state": "CLOSED", "headRefOid": "c" * 40}
+        listed = subprocess.CompletedProcess([], 0, json.dumps([closed]), "")
+        with (
+            patch("tauceti_worker.github_transport.shared_read", lambda _key, fetch, ttl: fetch()),
+            patch.object(tc.GitHub, "_gh", return_value=listed) as gh,
+        ):
+            rows = TARGET_MARKER_PRS(tc.GitHub(), limit=200)
+        self.assertIn("number,title,body,state,headRefOid", gh.call_args.args[0])
+        self.assertEqual(rows[0]["headRefOid"], "c" * 40)
+        self.github_rows = [closed]
+        self.assertEqual(t.GitHubMarkerReads()._listing()[0]["headRefOid"], "c" * 40)
 
     def test_a_github_item_in_flight_is_not_assigned_again(self):
         self.github_rows = [{"number": 31, "title": "t", "body": marker("Algebra", "first"), "state": "OPEN"}]
