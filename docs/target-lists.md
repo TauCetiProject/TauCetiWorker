@@ -17,7 +17,8 @@ repository's pull requests that carry a target marker, so a list carried over
 from GitHub keeps its GitHub items in flight or done: one search of the 200 most
 recently updated such pull requests per round, shared between workers of one
 account on a host for two minutes, and, once that history is longer than 200,
-one more search for each candidate the listing does not show as landed. If GitHub cannot be read the round goes on
+one more search, in any state, for each candidate the listing does not settle,
+so an older GitHub pull request that is still open or completed it is found. If GitHub cannot be read the round goes on
 with the list's own marks for those items and logs why. Once the file marks
 every GitHub-era item, set `TAUCETI_ROADMAP_TARGETS_GITHUB=0` (in the worker's
 environment, or its `env` in `workers.toml`) to stop that read.

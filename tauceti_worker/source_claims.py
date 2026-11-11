@@ -67,6 +67,9 @@ class SourceClaims(Claims):
         # Author leases stay in the shared GitHub claim namespace on every source.
         from .worker_sources import shared_github_environment
 
+        if self.held:
+            self.release()  # outside the shared environment, which restores the claim variables on exit
+        self.lease = None  # one left by a branch collision was never acquired
         with shared_github_environment():
             return super().begin_target_work(area, slug)
 
