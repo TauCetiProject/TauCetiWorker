@@ -4,14 +4,23 @@
 import importlib
 import os
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 survey_mod = importlib.import_module("tauceti_worker.survey")
+from tauceti_tools.ci_candidate import RepositoryIdentity
+from tauceti_tools.forge import Forge, RepositoryRef
+
+from tauceti_worker.config import Config
 from tauceti_worker.github import GitHubError
 from tauceti_worker.github_state import SurveyRows
+from tauceti_worker.review_state import Meta
+from tauceti_worker.source_identity import SourceActor
+from tauceti_worker.source_survey import worker_survey
+from tauceti_worker.worker_sources import source_config
 
 
 def pr(number, author, head, *, bot=False, owner="me", build="", conflicting=False):
@@ -107,6 +116,51 @@ def listing_outage(pattern, totals, *, cached=False):
     return {"rebase": [c.pr for c in sv.rebaseable.actionable], "open": sv.n_mine_open, "max": sv.max_open_prs}
 
 
+def forgejo(pattern):
+    """A Forgejo source: the account's conflicting #1 and #2 and a peer's #3 awaiting review."""
+    repo = RepositoryRef(Forge("forgejo", "https://git.example.org"), "one/project")
+    source = Mock(repository=repo, identity=RepositoryIdentity(repo, 7))
+    source.authenticated_actor.return_value = SourceActor.from_native(repo.forge, {"id": 3, "login": "me"})
+    source.binding_current.return_value = True
+
+    def row(number, author, head):
+        return {
+            "number": number,
+            "headRefOid": f"{number:x}" * 40,
+            "headRefName": head,
+            "headRepository": {"nameWithOwner": repo.name, "name": "project"},
+            "headRepositoryOwner": {"login": "one"},
+            "mergeable": "CONFLICTING" if author == 3 else "MERGEABLE",
+            "author": {"id": f"{repo.forge.key}/users/{author}", "login": "me" if author == 3 else "peer"},
+        }
+
+    source.open_prs.return_value = [row(1, 3, "roadmap/a-alpha"), row(2, 3, "roadmap/b-gamma"), row(3, 4, "x")]
+    rs = Mock()
+    rs.gh_meta.return_value = Meta({}, "missing")
+    rs.ledger_clean_head.return_value = ""
+    rs.ledger_blocking.return_value = False
+    with tempfile.TemporaryDirectory() as root, scope(pattern):
+        root = Path(root)
+        cfg = source_config(Config("test", root, root, root / "state", *(root / n for n in "abcde")), source)
+        sv = worker_survey(
+            cfg,
+            source,
+            rs,
+            survey_mod.Counters(cfg),
+            roadmap="any",
+            skip=[],
+            deep=True,
+            stages=["review", "rebase"],
+            numbers=(),
+            count_all_roadmaps=True,
+        )
+    return {
+        "rebase": [c.pr for c in sv.rebaseable.actionable],
+        "review": [c.pr for c in sv.reviewable.actionable],
+        "open": sv.n_mine_open,
+    }
+
+
 def main():
     def no_query(_repo):
         raise AssertionError("unexpected permission query")
@@ -148,6 +202,12 @@ def main():
             "set, listing fails with no total: maintenance kept, authoring held at the cap",
             listing_outage("-alpha$", None),
             {"rebase": [3], "open": survey_mod.configured_max_open_prs(), "max": survey_mod.configured_max_open_prs()},
+        ),
+        ("Forgejo, unset: every PR of the account", forgejo(None), {"rebase": [1, 2], "review": [3], "open": 2}),
+        (
+            "Forgejo, set: matching branches of the account only; #2 falls through to review as any PR does",
+            forgejo("-alpha$"),
+            {"rebase": [1], "review": [2, 3], "open": 1},
         ),
     ]
     failures = 0

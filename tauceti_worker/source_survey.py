@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 
 from tauceti_tools.forge import Incomplete, RepositoryRef
 
+from .config import own_branches
 from .source_identity import SourceActor
 from .survey import PRInfo, Survey, bucket_status_labels, roadmap_open_count
 
@@ -86,6 +87,11 @@ def source_pr_info(row, repository):
     )
 
 
+def own_branch(pr: PRInfo) -> bool:
+    own = own_branches()
+    return own is None or own.search(pr.head_ref) is not None
+
+
 def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count_all_roadmaps):
     from .survey_facts import in_scope
 
@@ -122,7 +128,7 @@ def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count
     result.source_actor, result.me_login = actor, actor.login if actor else ""
     if count_all_roadmaps:
         result._automatic_open_count = roadmap_open_count(
-            [p for p in prs if not p.is_draft and result.owns(p)], "auto", skip
+            [p for p in prs if not p.is_draft and result.owns(p) and own_branch(p)], "auto", skip
         )
     if deep:
         prs = [
@@ -141,7 +147,7 @@ def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count
         )
     ]
     result.n_open_nondraft = len(nondraft)
-    result._mine_open_prs = [p for p in nondraft if result.owns(p)]
+    result._mine_open_prs = [p for p in nondraft if result.owns(p) and own_branch(p)]
     result.rescope_roadmap()
     result.status_labels, result.n_status_unlabeled = bucket_status_labels(nondraft, result.me_login, owns=result.owns)
     # rescope_roadmap also chooses authoring for legacy surveys. This inventory
@@ -216,7 +222,7 @@ def worker_survey(cfg, source, rs, counters, *, roadmap, skip, deep, stages, num
             result.discovery_gaps += 1
             result.discovery_gap_prs.append(pr.number)
             continue
-        owns = result.owns(pr)
+        owns = result.owns(pr) and own_branch(pr)
         repair_allowed = not labels & {"keep", "do-not-close"}
         if owns and repair_allowed and "rebase" in stages and pr.mergeable == "CONFLICTING":
             key = counters.rebase_budget_key(pr.number)
