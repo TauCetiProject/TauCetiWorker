@@ -165,7 +165,11 @@ dashboard read Claude usage with that login, and `tauceti doctor` shows it as
 `claude usage`. Agents never receive it. They keep launching from
 `$CLAUDE_CONFIG_DIR`, whose `.credentials.json` holds the setup-token as
 `claudeAiOauth.accessToken` (with its `expiresAt` and `scopes`, and no
-`refreshToken`), and that file is mirrored into isolated workers as before.
+`refreshToken`), and off macOS that file is mirrored into isolated workers as
+before. On macOS the variable changes only which login usage is read with: the
+agents' credential is handled as [below](#macos-and-the-login-keychain), so a
+`--bubble` round is seeded from the login Keychain when it holds a Claude
+sign-in, and an isolated worker's copy of the token file is not re-mirrored.
 
 ```toml
 [[workers]]
