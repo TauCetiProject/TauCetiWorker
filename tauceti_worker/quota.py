@@ -2160,12 +2160,12 @@ class Quota:
         """Why the agents cannot launch, when a usage login answers for them and their own credential
         is known to be unusable: the file in $CLAUDE_CONFIG_DIR is missing, or it holds a token past
         its expiry with no refresh token. None otherwise, and always off this route, on macOS, where
-        agents read the Keychain first, and with $CLAUDE_CODE_OAUTH_TOKEN set, which a native agent
-        inherits and authenticates with ahead of the file."""
+        agents read the Keychain first, and with $CLAUDE_CODE_OAUTH_TOKEN set for host agents, which
+        inherit it and authenticate with it ahead of the file. A --bubble agent is not given it."""
         if (
             claude_usage_credentials() is None
             or sys.platform == "darwin"
-            or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+            or (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip() and os.environ.get("TAUCETI_SANDBOX") != "bubble")
         ):
             return None
         path = claude_dir(self.cfg.home) / ".credentials.json"

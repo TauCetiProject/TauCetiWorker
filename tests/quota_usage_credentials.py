@@ -372,8 +372,30 @@ try:
             check("an environment token with no file is admitted", quota.claude(renew=True).available, True)
             agent_files[1].write_text(login("setup-token", -60, None))
             check("so is one beside a stale file", quota.claude(renew=True).available, True)
+            # A --bubble round runs the agent in the container with only the mounted file.
+            inner = tc.agents.bubble_work_cmd(tc.agents.agent_inner_cmd("claude"))
+            check("the bubble agent is not given the environment token", "CLAUDE_CODE_OAUTH_TOKEN" in inner, False)
+            with patch.dict(os.environ, {"TAUCETI_SANDBOX": "bubble"}):
+                check("a bubble worker beside a stale file is not admitted", quota.claude(renew=True).available, False)
+                agent_files[1].unlink()
+                check("nor one with no file", quota.claude(renew=True).available, False)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
+
+# 9) `work` records where its agents run, so its loop children and the pacer agree on it.
+saved_env = dict(os.environ)
+try:
+    for bubble, expect in ((True, "bubble"), (False, "host")):
+        os.environ.pop("TAUCETI_SANDBOX", None)
+        args = types.SimpleNamespace(bubble=bubble, author_model=None, author_effort="high")
+        try:
+            tc.cli.cmd_work(args, only=[], agent="auto", one_round=False)
+        except tc.Die:
+            pass
+        check(f"--bubble={bubble} is recorded", os.environ.get("TAUCETI_SANDBOX"), expect)
+finally:
+    os.environ.clear()
+    os.environ.update(saved_env)
 
 for name in (VARIABLE, "CLAUDE_CONFIG_DIR", "TAUCETI_AUTO_REFRESH"):
     os.environ.pop(name, None)

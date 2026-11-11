@@ -197,7 +197,8 @@ worker also reads that file before Claude work starts, without a request: a
 missing file, or a token past its `expiresAt` with no refresh token, makes Claude
 unavailable whatever the usage login reports. With `CLAUDE_CODE_OAUTH_TOKEN` set
 the file is not checked: host agents inherit that variable and authenticate with
-it instead.
+it instead. A `--bubble` worker still checks it, because the agent in the
+container is given the file and not the variable.
 
 ## macOS and the login Keychain
 
