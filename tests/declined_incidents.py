@@ -161,6 +161,25 @@ def test_records(root):
         )
         check("…or one kind, live only", len(incidents.records(incidents.DECLINED, acked=False)), 1)
 
+    with settings(root):
+        # A second writer of the same record runs to completion inside the first one's rename.
+        rename, inside = os.replace, []
+
+        def interleaved(src, dst):
+            if not inside:
+                inside.append(None)
+                inside[0] = incidents.record("declined", "fix-30", pr=30, by="B")
+            rename(src, dst)
+
+        with patch.object(incidents.os, "replace", interleaved):
+            first = incidents.record("declined", "fix-30", pr=30, by="A")
+        check(
+            "concurrent writers of one record each publish a whole file",
+            (inside[0], first, load(root / "declined-fix-30.json")["by"]),
+            (root / "declined-fix-30.json", root / "declined-fix-30.json", "A"),
+        )
+        check("…and leave no temporary file", sorted(p.name for p in root.glob(".*.tmp")), [])
+
     blocked = root / "torn.json" / "below"
     with settings(blocked), patch.object(incidents, "log") as said:
         check("a write that fails returns None", incidents.record("declined", "fix-1", pr=1), None)

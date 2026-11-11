@@ -28,8 +28,8 @@ A [managed worker](workers.md) gets both through its `env` table.
 ```
 
 The worker writes live files only, each by a rename from a temporary file in
-the same directory (`.<name>.<pid>.tmp`), so a reader never sees a partial
-record. It never moves or deletes a file.
+the same directory (`.<name>.<random>.tmp`, one per write), so a reader never
+sees a partial record. It never moves or deletes a file.
 
 Whoever reads the records acknowledges one by moving it into `acked/` under the
 same name, and discards one by deleting it. A hyphen can occur in both `<kind>`
