@@ -549,6 +549,78 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         settled = loads(self.controller.store.row("outbox", {"id": entry["id"]})["payload"])
         self.assertEqual(settled["promotion_send"]["state"], "settled")
 
+    def test_github_prepare_before_ci_survives_primary_reversal_and_disablement(self):
+        self.registry_value.primary = "forgejo"
+        self.controller.set_setting("repair_concurrency", 2, "fixture")
+        head = self.github.create_pr(17, {"Github.lean": "github\n"})
+        self.controller.approve(self.controller.repository, 17, head, "fixture")
+        base = self.repo.main_sha()
+        with self.controller._lock:
+            self.controller._canonical = base
+            batch = self.controller._create_open_batch(base, self.clock())
+            row = self.controller.input_for(self.controller.repository, 17)
+            self.assertTrue(self.controller._probe(row, batch, self.clock()))
+            batch = self.controller.store.row("batches", {"id": batch["id"]})
+            task_id = self.controller._create_task(batch, "prepare", base, [], self.clock())
+        self.assertEqual(self.controller.store.count("ci_requests"), 0)
+        self.assertEqual(loads(self.controller.store.row("tasks", {"id": task_id})["task_binding"]), {})
+        self.github.admins.add("reviewer")
+        task = self.controller.claim_task("old-worker", "reviewer")
+        self.assertEqual(task.task_id, task_id)
+        self.assertTrue(self.controller.change_primary("github", "fixture")["changed"])
+        self.controller.mixed = self.controller.mixed_ci = None
+        self.controller.source = self.github
+        self.assertGreater(self.controller.renew_task(task_id, task.claim_token), self.clock())
+
+    def test_unsupported_pr_waits_without_new_empty_batch_probes_each_tick(self):
+        self.registry_value.primary = "forgejo"
+        self.native.admission_policy.prefix = "Math/"
+        self.native.admission_policy.allow_files = ()
+        head = self.native.create_pr(17, {"Math/Head.lean": "head\n"})
+        self.controller.approve(self.native_id.repository.key, 17, head, "fixture")
+        self.controller.tick()
+        later = self.native.create_pr(18, {"Math/Later.lean": "later\n"})
+        self.controller.approve(self.native_id.repository.key, 18, later, "fixture")
+        self.controller.tick()
+        human = self.github.create_pr(19, {"scripts/control.py": "control\n"})
+        self.controller.approve(self.controller.repository, 19, human, "fixture")
+        self.controller.tick()
+        batches = self.controller.store.count("batches")
+        probes = self.controller.input_for(self.controller.repository, 19)["probes"]
+        for _ in range(3):
+            self.clock.advance(60)
+            self.controller.tick()
+        self.assertEqual(self.controller.store.count("batches"), batches)
+        self.assertEqual(self.controller.input_for(self.controller.repository, 19)["probes"], probes)
+
+    def test_definite_landing_rejection_is_settled_and_does_not_block_primary_change(self):
+        from tauceti_queue.ports import FastForwardResult
+
+        frozen = self.start_mixed()
+        self.execution.add(frozen, classification="passed")
+        self.clock.advance(60)
+        with patch.object(
+            self.github, "fast_forward_leased", return_value=FastForwardResult(False, frozen.request.base, "protected")
+        ):
+            self.controller.tick()
+        entry = self.controller.store.rows("outbox", {"kind": "promote"})[0]
+        self.assertEqual(loads(entry["payload"])["promotion_send"]["state"], "settled")
+        self.assertTrue(self.controller.change_primary("forgejo", "fixture")["changed"])
+
+    def test_unknown_unleased_send_is_not_reinterpreted_as_leased_on_retry(self):
+        self.controller._enqueue("promote", "old-unleased", {"promotion_send": {"state": "sending"}})
+        entry = self.controller.store.row("outbox", {"key": "old-unleased"})
+        self.controller._promotion_send_state({"_outbox_id": entry["id"]}, "sending", lease=True)
+        self.assertNotIn(
+            "lease", loads(self.controller.store.row("outbox", {"id": entry["id"]})["payload"])["promotion_send"]
+        )
+        self.controller._promotion_send_state({"_outbox_id": entry["id"]}, "settled", refused=True)
+        intent = loads(self.controller.store.row("outbox", {"id": entry["id"]})["payload"])
+        self.assertEqual(intent["promotion_send"]["state"], "sending")
+        self.controller._promotion_send_state({"_outbox_id": entry["id"]}, "settled")
+        intent = loads(self.controller.store.row("outbox", {"id": entry["id"]})["payload"])
+        self.assertEqual(intent["promotion_send"]["state"], "settled")
+
     def test_changed_original_native_head_cannot_land_cached_pass(self):
         original = self.repo.main_sha()
         frozen = self.start_mixed()

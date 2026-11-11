@@ -681,7 +681,7 @@ class GitHubAdapter:
             raise GitHubError("fetch_refs needs the installation token source")
         self._git_with_token(repo, ["fetch", "--no-tags", "--quiet", f"https://github.com/{repo}.git", *refspecs])
 
-    def _git_with_token(self, repo: str, args: Sequence[str]) -> None:
+    def _git_with_token(self, repo: str, args: Sequence[str], *, check=True) -> subprocess.CompletedProcess:
         """Run git in the clone with the installation token as an `http.extraheader` in the environment."""
         token = self._tokens.token()
         auth = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
@@ -694,9 +694,10 @@ class GitHubAdapter:
         )
         command = ["git", "-C", self.clone_dir, *args]
         result = self._git(command, env=env, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
+        if check and result.returncode != 0:
             # The header never appears in git's own output; the stderr is safe to surface.
             raise GitHubError(f"git {args[0]} failed for {repo}: {result.stderr.strip()}")
+        return result
 
     def fast_forward(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult:
         """Advance `branch` from `expected_parent` to `tip` without a merge commit.
@@ -724,7 +725,7 @@ class GitHubAdapter:
         return FastForwardResult(False, current, detail or "update is not a fast forward")
 
     def fast_forward_leased(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult:
-        """Mixed-primary landing uses Git's atomic expected-old check on either host."""
+        """Publish GitHub main using Git's atomic expected-old check."""
         if self.clone_dir is None or self._tokens is None:
             raise GitHubError("leased main publication requires a clone and installation token source")
         if not SHA.fullmatch(expected_parent) or not SHA.fullmatch(tip):
@@ -738,8 +739,9 @@ class GitHubAdapter:
             return FastForwardResult(True, expected_parent)
         if current != expected_parent:
             return FastForwardResult(False, current, "parent changed before the push")
+        result = None
         try:
-            self._git_with_token(
+            result = self._git_with_token(
                 repo,
                 [
                     "push",
@@ -749,16 +751,26 @@ class GitHubAdapter:
                     f"https://github.com/{repo}.git",
                     f"{tip}:{ref}",
                 ],
+                check=False,
             )
         except (GitHubError, subprocess.TimeoutExpired):
-            actual = self.ref_sha(repo, f"heads/{branch}")
-            if actual == tip:
-                return FastForwardResult(True, expected_parent)
-            if actual != expected_parent:
-                return FastForwardResult(False, actual, "parent changed during the leased push")
-            # No definitive acknowledgement: retain the outbox intent for readback.
-            raise
-        return FastForwardResult(True, expected_parent)
+            pass  # Read back an interrupted send before deciding its outcome.
+        refusal = ""
+        if result is not None:
+            for line in result.stdout.splitlines():
+                fields = line.split("\t")
+                if len(fields) != 3 or fields[1].split(":", 1)[-1] != ref:
+                    continue
+                if fields[0] in {"*", " ", "="} and result.returncode == 0:
+                    return FastForwardResult(True, expected_parent)
+                if fields[0] == "!" and fields[2].startswith(("[rejected]", "[remote rejected]")):
+                    refusal = fields[2][:256]
+        actual = self.ref_sha(repo, f"heads/{branch}")
+        if actual == tip:
+            return FastForwardResult(True, expected_parent)
+        if refusal or actual != expected_parent:
+            return FastForwardResult(False, actual, refusal or "parent changed during the leased push")
+        raise GitHubError("leased main publication has no definitive acknowledgement; reconcile before retry")
 
     def update_ref(self, repo: str, ref: str, sha: str) -> None:
         """Create or force-update `refs/<ref>` (retained candidate refs, never the base branch).

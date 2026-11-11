@@ -2491,7 +2491,10 @@ class Controller:
             and self.mixed.mode == "admit"
             and (
                 any(isinstance(member["number"], SourceNumber) for member in self._members(head["id"]))
-                or self._candidate_coordinator(batch_id=head["id"]) is not None
+                or (
+                    (attempt := self._current_attempt(head)) is not None
+                    and self.store.row("ci_requests", {"attempt_id": attempt["id"]}) is not None
+                )
             )
         ):
             if self.mixed_ci is None:
@@ -3343,6 +3346,16 @@ class Controller:
                 if not remaining:
                     break
             if target is None:
+                # An out-of-scope input already tried on canonical cannot be
+                # helped by another empty batch on that same tree. A primary
+                # reversal clears the wait; a new canonical allows one retry.
+                remaining = [
+                    row
+                    for row in remaining
+                    if not (
+                        row["last_probe"].startswith("source-ci-scope:") and row["last_probe_tip"] == self._canonical
+                    )
+                ]
                 if not remaining or len(batches) >= max(1, int(self.setting("open_batch_limit"))):
                     break
                 assert self._canonical is not None
@@ -3582,9 +3595,14 @@ class Controller:
             )
         )
         if source_ci_required and not scope_supported:
-            reason = "source-ci-scope: human control-file changes require GitHub primary and a GitHub-only batch"
+            reason = (
+                "source-ci-scope: native candidate needs a compatible batch or changes within the native path policy"
+                if isinstance(row["number"], SourceNumber)
+                else "source-ci-scope: human control-file changes require GitHub primary and a GitHub-only batch"
+            )
             with self.store.transaction():
-                conflicts = loads(row["probe_conflicts"], {})
+                open_ids = {str(b["id"]) for b in self._open_batches()}
+                conflicts = {k: v for k, v in loads(row["probe_conflicts"], {}).items() if k in open_ids}
                 if self._members(batch["id"]):
                     conflicts[str(batch["id"])] = batch["base"]
                 self.store.update(
@@ -7109,16 +7127,22 @@ class Controller:
                 return f"gave-up: {str(error)[:200]}"
         raise ControllerError("unknown-outbox-kind", kind)
 
-    def _promotion_send_state(self, payload, state, *, lease=False):
+    def _promotion_send_state(self, payload, state, *, lease=False, refused=False):
         entry_id = payload.get("_outbox_id")
         if entry_id is None:
             return
         with self.store.transaction():
             entry = self.store.row("outbox", {"id": entry_id})
             intent = loads(entry["payload"], {})
+            previous = intent.get("promotion_send", {})
+            uncertain = previous.get("state") == "sending" or not previous.get("state") and entry["attempts"]
+            if refused and previous.get("unresolved_unleased"):
+                return  # A new refusal does not resolve a preceding lost API reply.
             intent["promotion_send"] = {"state": state}
-            if lease:
+            if lease and (not uncertain or previous.get("lease") is True):
                 intent["promotion_send"]["lease"] = True
+            elif state == "sending" and uncertain:
+                intent["promotion_send"]["unresolved_unleased"] = True
             self.store.update("outbox", {"id": entry_id}, payload=dumps(intent))
 
     def _perform_promotion(self, payload: dict[str, Any], now: float) -> str:
@@ -7247,7 +7271,7 @@ class Controller:
         if leased and (self.mixed is None or self.mixed.mode != "admit"):
             fast_forward = self.source.fast_forward_leased
         result = fast_forward(self.repository, self.canonical_branch, payload["expected_parent"], payload["tip"])
-        self._promotion_send_state(payload, "settled")
+        self._promotion_send_state(payload, "settled", refused=not result.ok)
         if result.ok:
             self._canonical = payload["tip"]
             self._set_state("canonical_sha", payload["tip"])

@@ -1255,6 +1255,22 @@ class LeasedMainPublication(unittest.TestCase):
         self.assertEqual(self.commands, [])
         self.assertEqual(self.repo.main_sha(), self.tip)
 
+    def test_definite_server_hook_rejection_returns_a_refusal_with_unchanged_main(self):
+        hook = self.repo.origin / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\necho 'fixture protection' >&2\nexit 1\n")
+        hook.chmod(0o700)
+        result = self.adapter.fast_forward_leased(TAUCETI, "main", self.base, self.tip)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.actual_parent, self.base)
+        self.assertIn("remote rejected", result.error)
+        self.assertEqual(self.repo.main_sha(), self.base)
+
+    def test_exit_zero_without_an_acknowledgement_or_visible_tip_is_uncertain(self):
+        self.adapter._git = lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", "")
+        with self.assertRaisesRegex(ga.GitHubError, "no definitive acknowledgement"):
+            self.adapter.fast_forward_leased(TAUCETI, "main", self.base, self.tip)
+        self.assertEqual(self.repo.main_sha(), self.base)
+
 
 if __name__ == "__main__":
     unittest.main()
