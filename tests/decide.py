@@ -497,6 +497,31 @@ def test_rounds(tmp):
         )
         check("…whose new ruling replaces the old", ruling(root, "declined-fix-3")["ruling"], "escalate")
 
+    root = tmp / "lost"
+    with settings(root):
+        declined(1)
+        hub = Hub(p1={}, p30={}, p31={})
+        rounds(tmp, hub, answer((1, "wait", {"blocked_on": [30, 31]})))
+        hub.prs[31]["state"] = "CLOSED"
+        seen = rounds(tmp, hub, answer((1, "escalate", {"recommend": ""})))
+        check(
+            "a later blocker closed unmerged while an earlier one is open: back to the model",
+            [c["case"] for c in seen.get("packet", {}).get("cases", [])],
+            ["declined-fix-1"],
+        )
+    targets = parse_targets(LIST)
+    view = SimpleNamespace(open_prs={20: {}}, gh=Hub(p20={}), listed=(Path("list"), targets))
+    check(
+        "a target gone from the list after one still open is noticed",
+        decide._blockers(view, {"blocked_on_targets": ["strong-law", "gone"]}),
+        (None, "`gone` is no longer on the target list"),
+    )
+    check(
+        "…and one still open keeps it waiting",
+        decide._blockers(view, {"blocked_on": [20], "blocked_on_targets": ["borel-cantelli"]}),
+        (None, ""),
+    )
+
 
 def test_model_call(tmp):
     captured = {}

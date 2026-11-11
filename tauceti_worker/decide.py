@@ -366,22 +366,20 @@ def _fresh(gh, pr: int) -> dict | None:
 def _blockers(rd: _Round, ruling: dict) -> tuple[list[str] | None, str]:
     """(what the ruling waited on, once all of it has landed, else None; "" or the blocker that
     can no longer land). A ruling that waits on nothing gives ([], "")."""
-    landed = []
+    landed, pending = [], False
     for n in filter(lambda n: type(n) is int, ruling.get("blocked_on") or []):
         state = "OPEN" if n in rd.open_prs else _state(rd.gh, n)
         if state == "CLOSED":
             return None, f"#{n} closed without merging"
-        if state != "MERGED":
-            return None, ""
+        pending |= state != "MERGED"
         landed.append(f"#{n} merged")
     for slug in ruling.get("blocked_on_targets") or []:
         item = rd.listed[1].find(slug) if rd.listed else None
-        if rd.listed is None or (item is not None and item.status != "done"):
-            return None, ""
-        if item is None:
+        if rd.listed is not None and item is None:
             return None, f"`{slug}` is no longer on the target list"
+        pending |= rd.listed is None or item.status != "done"
         landed.append(f"`{slug}` landed")
-    return landed, ""
+    return (None, "") if pending else (landed, "")
 
 
 def _recheck(rd: _Round) -> list[dict]:
