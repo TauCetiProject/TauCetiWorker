@@ -190,10 +190,17 @@ def run(root: Path) -> int:
                     return 1
         if findings.get("unchecked"):
             record["status"] = "partial"
-            print("scoped compilation passed; some findings need worker verification", flush=True)
+            owner = "staging" if settings.get("checks_owner") == "staging" else "worker"
+            print(f"scoped compilation passed; some findings need {owner} verification", flush=True)
             return 2
         record["status"] = "passed"
-        print("targeted checks passed; return for the worker's full build, audits and lint", flush=True)
+        if settings.get("checks_owner") == "staging":
+            print(
+                "targeted checks passed; return for final compilation and submission; full checks run in staging",
+                flush=True,
+            )
+        else:
+            print("targeted checks passed; return for the worker's full build, audits and lint", flush=True)
         return 0
     except (audit.Unavailable, OSError, ValueError) as error:
         record.update(status="unavailable", reason=str(error))

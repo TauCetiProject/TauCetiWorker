@@ -373,10 +373,12 @@ class SettingsCommand(Base):
         parser = cli.build_parser()
         fetch = mock.Mock(return_value={})
         with captured():
-            args = parser.parse_args(["settings", "--url", "http://q", "set", "infrastructure_retry_limit", "0"])
+            args = parser.parse_args(
+                ["settings", "--url", "http://q", "set", "infrastructure_retry_backoff_seconds", "0"]
+            )
             args.token = "t"
             self.assertEqual(cli.cmd_settings(args, fetch=fetch), 0)
-        self.assertEqual(fetch.call_args.kwargs["body"], {"infrastructure_retry_limit": 0})
+        self.assertEqual(fetch.call_args.kwargs["body"], {"infrastructure_retry_backoff_seconds": 0})
         with captured() as (_out, err):
             args = parser.parse_args(["settings", "--url", "http://q", "set", "publication_enabled", "maybe"])
             self.assertEqual(cli.cmd_settings(args, fetch=mock.Mock()), 1)

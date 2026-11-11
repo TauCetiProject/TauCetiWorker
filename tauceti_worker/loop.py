@@ -240,7 +240,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 continue
 
             # 2) Run ONE round as a child in its own process group, under the hard timeout.
-            tail = ["--worker-id", cfg.wid]
+            from .worker_sources import selection_arguments
+
+            tail = ["--worker-id", cfg.wid, *selection_arguments()]
             if overlap_batch := os.environ.get("TAUCETI_OVERLAP_BATCH_COMMITS"):
                 tail += ["--overlap-batch-commits", overlap_batch]
             if api_mode():
