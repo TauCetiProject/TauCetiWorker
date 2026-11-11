@@ -1645,7 +1645,7 @@ class Quota:
             conflict=conflict or email_conflict,
         )
 
-    def _codex_credentials_store(self) -> str | None:
+    def _codex_credentials_store(self, directory: Path | None = None) -> str | None:
         """Why auth.json may NOT be the credential codex uses, or None when it provably is.
 
         The invariant is deliberately one-sided: None means VERIFIED file-backed, so every path that
@@ -1660,8 +1660,10 @@ class Quota:
         available, so which store wins depends on the machine the agent lands on, and keyring
         availability can change between here and launch. Only the exact string `file` passes; codex
         itself rejects `" FILE "` and friends, so normalising them would be inventing an agreement it
-        does not have."""
-        cfg_path = codex_dir(self.cfg.home) / "config.toml"
+        does not have.
+
+        `directory` is the CODEX_HOME whose config to read, by default this worker's own."""
+        cfg_path = (directory or codex_dir(self.cfg.home)) / "config.toml"
         try:
             with open(cfg_path, "rb") as fh:
                 data = tomllib.load(fh)
@@ -2005,10 +2007,14 @@ class Quota:
 
         It stands down when codex's credential store is not verifiably that file: a keyring login can
         share the refresh token a leftover auth.json still carries, and spending it here would log that
-        login out."""
+        login out. An isolated worker spends the source's token, so the source directory's own config
+        must pass as well as the worker's."""
         if os.environ.get("TAUCETI_AUTO_REFRESH") != "1" or self._codex_credentials_store() is not None:
             return False
-        prov = credential_refresh.provider("codex", credentials=self._codex_creds_source() / "auth.json")
+        source = self._codex_creds_source()
+        if self._codex_credentials_store(source) is not None:
+            return False
+        prov = credential_refresh.provider("codex", credentials=source / "auth.json")
         if not credential_refresh.renewable(prov):
             return False
         if not force:

@@ -199,6 +199,35 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
+# 6b) An isolated worker spends the SOURCE's refresh token, so the source's own config must be file-backed
+#     too; the isolated directory has no config of its own and defaults to file.
+for name, body in (
+    ("keyring", 'cli_auth_credentials_store = "keyring"\n'),
+    ("auto", 'cli_auth_credentials_store = "auto"\n'),
+    ("malformed", "cli_auth_credentials_store = [\n"),
+):
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        quota, src, mirror, stale = setup(tmp)
+        (src.parent / "config.toml").write_text(body)
+        seen, usage = usage_seen()
+        with rotates_to(jwt(10 * DAY)) as post, usage:
+            quota.codex(renew=True)
+        check(f"a source store that is {name} is never rotated", post.call_count, 0)
+        check(f"...and its refresh token is kept ({name})", tokens(src)["refresh_token"], "operator-refresh")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+tmp = Path(tempfile.mkdtemp())
+try:
+    quota, src, mirror, stale = setup(tmp)
+    (src.parent / "config.toml").write_text('cli_auth_credentials_store = "file"\n')
+    with rotates_to(jwt(10 * DAY)) as post, usage_seen()[1]:
+        quota.codex(renew=True)
+    check("a source store that is file is rotated", post.call_count, 1)
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+
 # 7) The stored expiry says the token is live and the endpoint says otherwise. Believe the endpoint:
 #    rotate once, then re-read rather than reporting a 401 we can fix.
 tmp = Path(tempfile.mkdtemp())
