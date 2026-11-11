@@ -1572,6 +1572,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
 
                     if recover_native(cfg, ctx, recovery_opts):
                         return 0
+            except Halted:
+                raise
             except Exception as error:
                 log(f"recovery phase deferred; existing source is preserved: {type(error).__name__}: {error}")
                 report_runtime(

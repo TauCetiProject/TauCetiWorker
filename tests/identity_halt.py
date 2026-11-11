@@ -398,9 +398,10 @@ class ForgejoHaltTests(unittest.TestCase):
         class Opener:
             def open(self, request, timeout=None):
                 forgejo.requests.append(request.full_url)
-                if isinstance(forgejo.answer, int):
-                    raise urllib.error.HTTPError(request.full_url, forgejo.answer, "refused", {}, None)
-                return _Response(json.dumps(forgejo.answer).encode())
+                answer = forgejo.answer(request.full_url) if callable(forgejo.answer) else forgejo.answer
+                if isinstance(answer, int):
+                    raise urllib.error.HTTPError(request.full_url, answer, "refused", {}, None)
+                return _Response(json.dumps(answer).encode())
 
         import tauceti_tools.forge
 
@@ -457,6 +458,53 @@ class ForgejoHaltTests(unittest.TestCase):
         self.forgejo.answer = {"id": 4, "login": "other"}
         self.assertEqual(self.run_cli(*argv), (EX_HALTED, False))
         self.assertEqual(json.loads(self.halt.read_text())["reason"], "forgejo:identity-mismatch")
+
+    def serve(self, *users):
+        """Answer the repository binding, and /user with each of `users` in turn (the last repeats)."""
+        users = list(users)
+
+        def answer(url):
+            if url.endswith("/repos/one/project"):
+                return {"id": 7, "full_name": "one/project", "archived": False, "permissions": {"push": True}}
+            if url.endswith("/user"):
+                return users.pop(0) if len(users) > 1 else users[0]
+            return 404
+
+        self.forgejo.answer = answer
+
+    def activation(self):
+        from tauceti_worker import worker_sources
+
+        os.environ.update(TAUCETI_WORKER_ID="w1", TAUCETI_WORKER_FORGES="forgejo")
+        return worker_sources.activate(
+            worker_sources.native_source(SimpleNamespace(home=self.root)), SimpleNamespace(state=self.root / "native")
+        )
+
+    def test_the_executing_actor_is_held_to_the_configured_user(self):
+        from tauceti_worker.source_cli import load_source
+        from tauceti_worker.worker_sources import verify_forgejo_identity
+
+        other = {"id": 4, "login": "other"}
+        # An unanswered check, then the credential answers as another user; and a token replaced after a
+        # passing check. Either way the round's activation halts before anything runs as user 4.
+        for first in (503, {"id": 3, "login": "worker"}):
+            self.serve(first, other)
+            os.environ["TAUCETI_WORKER_FORGES"] = "forgejo"
+            verify_forgejo_identity()
+            with self.assertRaises(Halted) as raised, self.activation():
+                self.fail("activated as another user")
+            self.assertEqual(raised.exception.reason, "forgejo:identity-mismatch")
+            self.assertEqual(json.loads(self.halt.read_text())["reason"], "forgejo:identity-mismatch")
+            self.assertEqual(os.environ["TAUCETI_FORGEJO_USER_ID"], "3")
+            self.halt.unlink()
+
+        # A subprocess of a correctly bound round re-checks the actor its own credential resolves to.
+        self.serve({"id": 3, "login": "worker"})
+        with self.activation():
+            self.assertEqual(load_source().repo, "one/project")
+            self.serve(other)
+            with self.assertRaisesRegex(ValueError, "differs from the selected worker"):
+                load_source()
 
     def test_shared_github_coordination_uses_the_verified_account(self):
         from tauceti_tools import git_credentials

@@ -294,7 +294,10 @@ enforcement, server errors, and network failures are not halts. On GitHub,
 before the loop they are retried or waited out, and one that persists is an
 ordinary failure; at the start of a round the round proceeds on the loop's
 earlier verification. On Forgejo the round proceeds and discovery reports the
-source unavailable. A halt belongs to a worker id, so a start that fails before
+source unavailable, but no Forgejo work runs as anyone else: binding the source
+for execution compares its actor with `TAUCETI_FORGEJO_USER_ID` again and halts
+on a different user, and the round's `gh` and claim wrappers re-check that ID
+with their own credential. A halt belongs to a worker id, so a start that fails before
 `work` has auto-assigned one exits 84 without writing a file. A source without
 a configured identity is never checked or halted.
 

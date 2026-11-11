@@ -163,7 +163,7 @@ def verify_forgejo_identity():
     from tauceti_tools.forge import ForgeError
 
     from .config import Halted
-    from .identity import ACCOUNT_HALT, IDENTITY_MISMATCH, INVALID_CREDENTIALS
+    from .identity import ACCOUNT_HALT, INVALID_CREDENTIALS
 
     expected = forgejo_identity()
     if expected is None:
@@ -193,12 +193,19 @@ def verify_forgejo_identity():
             ) from None
         return
     if str(row["id"]) != expected:
-        raise Halted(
-            IDENTITY_MISMATCH,
-            f"Forgejo {origin}: expected user {expected}, but the credential belongs to {row['login']} "
-            f"(user {row['id']}); point TAUCETI_FORGEJO_TOKEN_FILE at a token for user {expected}",
-            forge="forgejo",
-        )
+        raise _forgejo_mismatch(origin, expected, row["login"], row["id"])
+
+
+def _forgejo_mismatch(origin, expected, login, user_id):
+    from .config import Halted
+    from .identity import IDENTITY_MISMATCH
+
+    return Halted(
+        IDENTITY_MISMATCH,
+        f"Forgejo {origin}: expected user {expected}, but the credential belongs to {login} "
+        f"(user {user_id}); point TAUCETI_FORGEJO_TOKEN_FILE at a token for user {expected}",
+        forge="forgejo",
+    )
 
 
 def source_config(cfg, source):
@@ -225,6 +232,15 @@ def activate(source, cfg):
     actor = source.authenticated_actor()
     if actor is None:
         raise SourceUnavailable("the Forgejo worker identity is unavailable")
+    # The round's check may have gone unanswered, or the token file may have changed since; the
+    # actor that executes is the one bound below, and source_cli enforces this ID in subprocesses.
+    expected = forgejo_identity()
+    if expected is not None and actor.principal.native_id != expected:
+        from .identity import halt_file, write_halt
+
+        halt = _forgejo_mismatch(source.repository.forge.url, expected, actor.login, actor.principal.native_id)
+        write_halt(halt_file(), halt)
+        raise halt
     original = dict(os.environ)
     marker = _selected.set(source)
     try:
