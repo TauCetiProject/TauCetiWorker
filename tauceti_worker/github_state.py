@@ -298,7 +298,13 @@ def _cached(path: Path, binding: dict):
     return cached
 
 
-PROBE_LEASE = 15.0
+# Each page gets a generous timeout, a guard against hung connections rather than a latency target.
+# A failed read already falls back (local snapshot or direct GitHub reads) and repeated failures open
+# the circuit, so a short timeout only turned slow successes into failures: a cold survey snapshot,
+# about 2,700 PRs and 1 MB in November 2026, takes 5-6s to build its first page.
+READ_PAGE_SECONDS = 60.0
+# The recovery probe's lease must outlive the longest page it covers; it is renewed between pages.
+PROBE_LEASE = READ_PAGE_SECONDS + 15.0
 
 
 def _circuit_update(circuit: Path, change, *args) -> None:
@@ -434,7 +440,7 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                 transport.atomic(circuit, {**state, "probe": probe, "probe_until": now + PROBE_LEASE})
     except OSError:
         state = {}
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + READ_PAGE_SECONDS
     last = _Failure("transport")
     for attempt in range(2):
         rows, cursor, cursors, revision = [], None, set(), None
@@ -457,9 +463,8 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                 request = urllib.request.Request(url + "/v1/query?" + urllib.parse.urlencode(params), headers=headers)
                 try:
                     with urllib.request.urlopen(
-                        # A healthy read can take 3–4s while the mirror commits
-                        # webhook updates. Use the remaining five-second budget
-                        # rather than abandoning it early and retrying the work.
+                        # Use the remaining page budget rather than abandoning a
+                        # slow healthy read early and retrying the work.
                         request,
                         timeout=max(0.1, deadline - time.monotonic()),
                     ) as response:
@@ -558,9 +563,8 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                 if len(cursors) >= 10000:
                     raise _Failure("pagination", "page bound exceeded")
                 # A responsive server with a large, stable snapshot is operable.
-                # Bound each request and stalled interval rather than treating
-                # a healthy multi-page response as an outage after five seconds.
-                deadline = time.monotonic() + 5
+                # Bound each request and stalled interval rather than the whole read.
+                deadline = time.monotonic() + READ_PAGE_SECONDS
                 if probe:
                     _circuit_update(circuit, _renew, probe)
                 cursors.add(next_cursor)
