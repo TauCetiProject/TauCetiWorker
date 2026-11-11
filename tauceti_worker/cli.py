@@ -81,6 +81,7 @@ from .constants import (
     EXPLICIT_TASKS,
     OPENROUTER_MODELS,
     PR_TASKS,
+    SANDBOX_DEFAULT,
     TAUCETI,
     WORK_TASKS,
 )
@@ -485,6 +486,16 @@ def parse_only(values: list[str], flag: str = "--only") -> list[str]:
                 )  # exit 1; argparse uses 2
             tasks.append(tok)
     return tasks
+
+
+def claude_env_token_reaches_agents(only: list[str], *, bubble: bool) -> bool:
+    """Whether every Claude agent these phases can launch inherits $CLAUDE_CODE_OAUTH_TOKEN. A Bubble
+    agent is handed only the credential file, and security-audit runs its agent in a private home with
+    a copy of that file and a restricted environment."""
+    phases = only or ALLOWED_TASKS
+    if "security-audit" in phases:
+        return False
+    return not (bubble and any(SANDBOX_DEFAULT.get(phase, False) for phase in phases))
 
 
 def resolve_tasks(only_vals: list[str], skip_vals: list[str]) -> list[str]:
@@ -1348,8 +1359,11 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             "--host is now the default (the agent runs directly on the host); it is a no-op. "
             "Pass --bubble to run inside the sandbox instead"
         )
-    # The pacer reads this to know which credential the agents will receive; loop children re-pin it.
-    os.environ["TAUCETI_SANDBOX"] = "bubble" if getattr(args, "bubble", False) else "host"
+    # The pacer reads this to know whether $CLAUDE_CODE_OAUTH_TOKEN reaches the agents; loop children
+    # re-pin it.
+    os.environ["TAUCETI_CLAUDE_ENV_TOKEN_ROUTE"] = (
+        "1" if claude_env_token_reaches_agents(only, bubble=getattr(args, "bubble", False)) else "0"
+    )
     author_model = getattr(args, "author_model", None)
     author_effort = getattr(args, "author_effort", None)
     resolved_author_fallback_model = getattr(args, "resolved_author_fallback_model", None)

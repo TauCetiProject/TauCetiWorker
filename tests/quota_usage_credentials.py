@@ -375,24 +375,34 @@ try:
             # A --bubble round runs the agent in the container with only the mounted file.
             inner = tc.agents.bubble_work_cmd(tc.agents.agent_inner_cmd("claude"))
             check("the bubble agent is not given the environment token", "CLAUDE_CODE_OAUTH_TOKEN" in inner, False)
-            with patch.dict(os.environ, {"TAUCETI_SANDBOX": "bubble"}):
-                check("a bubble worker beside a stale file is not admitted", quota.claude(renew=True).available, False)
+            with patch.dict(os.environ, {"TAUCETI_CLAUDE_ENV_TOKEN_ROUTE": "0"}):
+                check(
+                    "a file-only launch beside a stale file is not admitted", quota.claude(renew=True).available, False
+                )
                 agent_files[1].unlink()
                 check("nor one with no file", quota.claude(renew=True).available, False)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
-# 9) `work` records where its agents run, so its loop children and the pacer agree on it.
+# 9) `work` records whether its phases' Claude launches inherit the environment token, so its loop
+#    children and the pacer agree on it.
+reaches = tc.cli.claude_env_token_reaches_agents
+check("host phases inherit it", reaches([], bubble=False), True)
+check("bubble phases do not", reaches([], bubble=True), False)
+check("overlap-scan stays on the host under --bubble", reaches(["overlap-scan"], bubble=True), True)
+check("so does progress", reaches(["progress"], bubble=True), True)
+check("one bubble phase among them is enough", reaches(["overlap-scan", "review"], bubble=True), False)
+check("security-audit's private home does not", reaches(["security-audit"], bubble=False), False)
 saved_env = dict(os.environ)
 try:
-    for bubble, expect in ((True, "bubble"), (False, "host")):
-        os.environ.pop("TAUCETI_SANDBOX", None)
+    for bubble, only, expect in ((True, [], "0"), (False, [], "1"), (True, ["overlap-scan"], "1")):
+        os.environ.pop("TAUCETI_CLAUDE_ENV_TOKEN_ROUTE", None)
         args = types.SimpleNamespace(bubble=bubble, author_model=None, author_effort="high")
         try:
-            tc.cli.cmd_work(args, only=[], agent="auto", one_round=False)
+            tc.cli.cmd_work(args, only=only, agent="auto", one_round=False)
         except tc.Die:
             pass
-        check(f"--bubble={bubble} is recorded", os.environ.get("TAUCETI_SANDBOX"), expect)
+        check(f"--bubble={bubble} --only {only} is recorded", os.environ.get("TAUCETI_CLAUDE_ENV_TOKEN_ROUTE"), expect)
 finally:
     os.environ.clear()
     os.environ.update(saved_env)
