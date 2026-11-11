@@ -749,11 +749,14 @@ def prepare_checkout(
             "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main"),
         ):
             return False
-    from .verification_scope import local_main
-
+    # Origin was validated and fetched above, and HEAD is now its main commit.
+    # Carry that exact base into verification rather than asking the standalone
+    # verifier to rediscover a canonical remote (which defaults to GitHub).
     os.environ.pop("TAUCETI_VERIFY_BASE", None)
-    with contextlib.suppress(ValueError, subprocess.CalledProcessError):
-        os.environ["TAUCETI_VERIFY_BASE"] = local_main(co)
+    with contextlib.suppress(subprocess.CalledProcessError):
+        os.environ["TAUCETI_VERIFY_BASE"] = subprocess.check_output(
+            ["git", "-C", str(co), "rev-parse", "--verify", "HEAD^{commit}"], text=True
+        ).strip()
     os.environ["TAUCETI_VERIFY_STATE"] = str(cfg.state.resolve())
     # The checkout is quiescent here: the previous agent has exited and the next one has not started.
     # Compare canonical main, rather than an arbitrary PR branch, and retire old-toolchain artifacts
@@ -2856,26 +2859,10 @@ def _review_in_bubble(
     cross-repo `gh api` for its own rev. TAUCETI_REVIEW_ENGINE_DIR pins a local engine checkout
     (operator override / pre-merge testing); otherwise a shallow REVIEW clone is staged."""
     cfg = w.cfg
-    eng = os.environ.get("TAUCETI_REVIEW_ENGINE_DIR")
-    engine_dir = Path(eng) if eng else (cfg.state / "refs" / "review-engine")
-    if not eng:
-        ref = os.environ.get("TAUCETI_REVIEW_REF")
-        if ref:
-            engine_dir = cfg.state / "refs" / f"review-engine-{ref}"
-            current = subprocess.run(
-                ["git", "-C", str(engine_dir), "rev-parse", "HEAD"], capture_output=True, text=True
-            )
-            if current.returncode or current.stdout.strip() != ref:
-                engine_dir.mkdir(parents=True, exist_ok=True)
-                commands = (
-                    ["git", "init", "-q", str(engine_dir)],
-                    ["git", "-C", str(engine_dir), "fetch", "--depth", "1", f"https://github.com/{REVIEW}", ref],
-                    ["git", "-C", str(engine_dir), "checkout", "--detach", "FETCH_HEAD"],
-                )
-                if any(subprocess.run(command, timeout=120).returncode for command in commands):
-                    raise Die(f"fetch pinned {REVIEW}@{ref} failed")
-        elif not fetch_ref(REVIEW, engine_dir):
-            raise Die(f"fetch {REVIEW} failed")
+    from .review_runtime import resolve
+
+    runtime = getattr(w, "review_runtime", None) or resolve(cfg)
+    engine_dir = runtime.directory
     roadmap_dir = cfg.state / "refs" / "roadmap"
     if not fetch_ref(ROADMAP, roadmap_dir):
         raise Die(f"fetch {ROADMAP} failed")

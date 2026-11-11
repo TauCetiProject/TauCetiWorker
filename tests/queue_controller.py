@@ -1411,10 +1411,15 @@ class PreRebase(ControllerCase):
         self.assertEqual([t["kind"] for t in self.open_tasks(batch)], ["prepare"], "one background kind per batch")
         task = self.controller.claim_task("w", "admin-worker")
         self.assertEqual(task.kind, "prepare")
+        self.assertEqual(task.extra["checks_owner"], "worker", "rebasing is not enabled yet")
         self.controller.set_setting("pre_rebase_enabled", True, "kim")
         self.controller.tick()
         self.assertEqual(self.open_batch()["pre_rebase_state"], "conflict")
         self.assertEqual([t["kind"] for t in self.open_tasks(batch)], ["prepare"])
+        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "staging")
+        self.controller._set_state("inference_hold", {"since": self.clock(), "last_error": "held"})
+        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "worker")
+        self.controller._set_state("inference_hold", None)
         # The preparation edits 102 (so the chain is rewritten) and reports an error it left.
         agent = ScriptedAgent(
             "preparer",
@@ -1451,7 +1456,21 @@ class PreRebase(ControllerCase):
         )
         background = self.controller.status()["open_batches"][0]["background"]
         self.assertEqual((background["active"]["kind"], background["waiting"]), ("pre_rebase", None))
-        self.assertEqual(self.controller.claim_task("w", "admin-worker").kind, "pre_rebase")
+        rebasing = self.controller.claim_task("w", "admin-worker")
+        self.assertEqual(rebasing.kind, "pre_rebase")
+        self.assertEqual(rebasing.extra["checks_owner"], "worker", "full checks resume on the rebased chain")
+
+    def test_old_base_checks_continue_when_the_head_is_not_ready_for_rebasing(self):
+        self.controller.set_setting("prepare_min_members", 1, "kim")
+        self.controller.set_setting("prepare_quiet_seconds", 0, "kim")
+        self.controller.set_setting("pre_rebase_enabled", False, "kim")
+        self.conflicting_batch()
+        task = self.controller.claim_task("w", "admin-worker")
+        self.assertEqual(task.kind, "prepare")
+        self.controller.set_setting("pre_rebase_enabled", True, "kim")
+        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "staging")
+        self.assertTrue(self.controller.rebuild_head(PROJECT, "kim")["rebuilt"])
+        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "worker")
 
     def test_a_pre_rebase_task_names_the_heads_tips_then_its_base_to_warm_from(self):
         self.conflicting_batch()
@@ -2198,6 +2217,7 @@ class PreRebasedPreparation(ControllerCase):
         ]
         claimed = self.controller.claim_task("worker-1", "admin-worker")
         self.assertIn("pre_rebased", claimed.extra)
+        self.assertEqual(claimed.extra["checks_owner"], "worker", "this preparation is already on its intended parent")
         self.assertEqual(claimed.warm_revs[:2], [head["tip"], "1" * 40], "the head's tip, then its previous tip")
         self.assertEqual(claimed.warm_revs[2], batch["tip"], "then the batch tip the pre-rebase covers")
         self.assertEqual(claimed.warm_revs[3:], [t for t in own_tips if t != batch["tip"]][:4])

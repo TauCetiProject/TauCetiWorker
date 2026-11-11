@@ -34,6 +34,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+from fixtures.review_runtime_stub import install_runtime_stub
+
+install_runtime_stub()
+
 import tauceti_worker as tc
 from tauceti_worker.constants import MAX_REVIEW_ERRORS, REVIEW_PREPARATION_WAIT_EXIT, REVIEW_PROVIDER_DOWN_EXIT
 from tauceti_worker.review_diagnostics import classify_failure, read_review_failure
@@ -67,7 +71,9 @@ def fake_worker(state):
         cfg=types.SimpleNamespace(state=state, logdir=state, wid="w", store_dir=state / "store"),
         counters=Counters(),
         rs=types.SimpleNamespace(bust=lambda pr: None, review_rounds=lambda pr, c: 0),
-        gh=types.SimpleNamespace(add_reaction=lambda i: True, remove_reaction=lambda i: True),
+        gh=types.SimpleNamespace(
+            repo="TauCetiProject/TauCeti", add_reaction=lambda i: True, remove_reaction=lambda i: True
+        ),
     )
 
 
@@ -135,6 +141,16 @@ def main():
                     sync.assert_not_called()
                     bust.assert_called_once_with(42)
         check("preparation outages preserve existing error allowance in both launchers", True)
+
+        for code in (85, 86):
+            with patch.object(tc.work_units, "record_review_failure") as record:
+                retained, deferred, _ = drive(code, state)
+                check(f"publication status {code} defers without new inference", deferred is not None)
+                check(
+                    f"publication status {code} preserves the PR error allowance",
+                    retained.counters.read("review-err-42") == 0,
+                )
+                record.assert_not_called()
 
         # 2) an ordinary engine failure keeps the existing behaviour.
         w2, raised2, out2 = drive(1, state)

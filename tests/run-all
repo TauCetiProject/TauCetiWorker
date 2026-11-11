@@ -53,6 +53,7 @@ RUN_STDLIB=(
   activity.py
   activity_git.py
   activity_costs.py
+  activity_attribution.py
   activity_incremental.py
   activity_live.py
   api_budget.py
@@ -216,6 +217,7 @@ RUN_STDLIB=(
   review_diagnostics.py
   review_provider_down.py
   review_outcomes.py
+  review_runtime.py
   review_unchanged_memo.py
   synchronous_state_repair.py
   review_scheduling.py
