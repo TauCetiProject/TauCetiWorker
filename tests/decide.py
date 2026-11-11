@@ -91,6 +91,7 @@ class Hub:
             "isDraft": v.get("draft", False),
             "author": {"login": v.get("author", "me")},
             "labels": [{"name": name} for name in v.get("labels", [])],
+            "baseRefName": v.get("base", "main"),
             "headRefName": f"branch-{n}",
             "headRepositoryOwner": {"login": TAUCETI.split("/")[0]},
             "headRepository": {"name": TAUCETI.split("/")[1]},
@@ -1033,6 +1034,18 @@ def test_close(tmp):
         "under a hold label", attempt(merged(labels=["Do-Not-Close"])), (False, "it carries the label do-not-close", [])
     )
     check("the subsuming one is open", attempt(Hub(p1={}, p41={})), (False, "#41 has not merged", []))
+    check(
+        "…or merged into another branch than this one targets",
+        attempt(Hub(p1={}, p41={"state": "MERGED", "base": "integration"})),
+        (False, "#41 merged into integration, not main", []),
+    )
+    retargeted = merged()
+    retargeted.on_diff = lambda n: n == 41 and retargeted.prs[1].update(base="next")
+    check(
+        "a pull request retargeted while the diffs are read is not closed",
+        attempt(retargeted),
+        (False, "it targets next, not main", []),
+    )
     check("…or closed unmerged", attempt(Hub(p1={}, p41={"state": "CLOSED"})), (False, "#41 has not merged", []))
     check("…or itself", attempt(by=(1,)), (False, "#1 has not merged", []))
     other = Hub(p1={}, p41={"state": "MERGED", "diff": "+++ b/A.lean\n+theorem other : True\n"})

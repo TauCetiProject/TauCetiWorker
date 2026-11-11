@@ -863,11 +863,13 @@ def _reserve_closure(pr: str, head: str) -> str:
     return ""
 
 
-def _closable(gh, pr: int, head: str, login: str) -> str:
-    """ "" or why `pr` cannot be closed as it stands now."""
-    live = gh.pr_view(pr, ["state", "headRefOid", "author", "labels", "isDraft"])
+def _closable(gh, pr: int, head: str, login: str, base: str) -> str:
+    """ "" or why `pr` cannot be closed as it stands now: open at `head` against the branch `base`."""
+    live = gh.pr_view(pr, ["state", "headRefOid", "author", "labels", "isDraft", "baseRefName"])
     if not live or live.get("state") != "OPEN" or live.get("headRefOid") != head:
         return "it is no longer open at the head the ruling is about"
+    if not base or live.get("baseRefName") != base:
+        return f"it targets {live.get('baseRefName') or 'an unknown branch'}, not {base or 'a known branch'}"
     if live.get("isDraft") is not False:
         return "it is a draft"
     author = str((live.get("author") or {}).get("login") or "")
@@ -886,7 +888,7 @@ def close_subsumed(
     (True, the evidence posted with the closure) or (False, the check that refused). Nothing is
     closed unless closing is switched on, today's limit is not used up, the pull request is open at
     `head`, not a draft, authored by `login` and under no hold label, every subsuming pull request
-    has merged, and between them their diffs add every non-private declaration this one's adds. The
+    has merged into the branch this one targets, and between them their diffs add every non-private declaration this one's adds. The
     pull request itself is read again once the diffs are in, immediately before closing. `lost`, the
     branch claim's loss event where one is held, stops the closure once it is set."""
     if not close_enabled():
@@ -898,11 +900,15 @@ def close_subsumed(
         return False, "the closure log could not be read"
     named = ", ".join(f"#{n}" for n in subsumed_by)
     with read_context(fresh=True, direct=True):
-        if refused := _closable(gh, pr, head, login):
+        base = str((gh.pr_view(pr, ["baseRefName"]) or {}).get("baseRefName") or "")
+        if refused := _closable(gh, pr, head, login, base):
             return False, refused
         for n in subsumed_by:
-            if n == pr or _state(gh, n) != "MERGED":
+            row = gh.pr_view(n, ["state", "title", "baseRefName"]) if n != pr else None
+            if not row or normalize_merged(row).get("state") != "MERGED":
                 return False, f"#{n} has not merged"
+            if row.get("baseRefName") != base:
+                return False, f"#{n} merged into {row.get('baseRefName') or 'an unknown branch'}, not {base}"
     diffs = [gh.pr_diff(n) for n in (pr, *subsumed_by)]
     if None in diffs:
         return False, "a diff could not be read"
@@ -913,7 +919,7 @@ def close_subsumed(
     if missing := sorted(own - theirs):
         return False, f"{named} do not add {', '.join(f'`{name}`' for name in missing[:5])}"
     with read_context(fresh=True, direct=True):
-        if refused := _closable(gh, pr, head, login):
+        if refused := _closable(gh, pr, head, login, base):
             return False, refused
     if lost is not None and lost.is_set():
         return False, "its branch claim was lost"

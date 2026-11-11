@@ -240,8 +240,9 @@ all of these hold at the moment of closing:
   GitHub login, or the Forgejo source's authenticated actor), and under none of the
   hold labels listed above. It is made twice: before the diffs below are read,
   and again after, immediately before closing.
-- Every pull request the ruling names as subsuming it has merged; a Bors
-  landing counts.
+- Every pull request the ruling names as subsuming it has merged, into the
+  branch the pull request targets; a Bors landing counts. The target is read
+  again with the pull request just before closing.
 - Every non-private declaration the pull request's diff adds to a `.lean` file
   (`theorem`, `lemma`, `def`, `abbrev`, `instance`, `structure`, `class`,
   `inductive`, `opaque`, `axiom`, compared by name as written) is also added by
