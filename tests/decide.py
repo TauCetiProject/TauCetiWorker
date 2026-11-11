@@ -116,12 +116,15 @@ class Claims:
     """The branch claims a round takes: `taken` and `released` list the pull requests, and one in
     `elsewhere` is held by another worker."""
 
-    def __init__(self, elsewhere=()):
-        self.elsewhere, self.taken, self.released, self.held = set(elsewhere), [], [], None
+    def __init__(self, elsewhere=(), unregistered=()):
+        self.elsewhere, self.unregistered = set(elsewhere), set(unregistered)
+        self.taken, self.released, self.held = [], [], None
 
     def begin_branch_work(self, pr, head, refname, owner, repo):
         if pr in self.elsewhere:
             return False
+        if pr in self.unregistered:
+            return True  # as Claims does when claim.sh errors: go on, holding nothing
         self.taken.append(pr)
         self.held = (f"branch/{pr}", "claims")
         return True
@@ -869,6 +872,16 @@ def test_close(tmp):
         check(
             "a branch another worker claims is not closed",
             (5 in [n for n, _ in hub.closed], "branch claim" in ruling(root, "declined-fix-5")["note"]),
+            (False, True),
+        )
+        hub.prs[6] = {}
+        declined(6)
+        refused = rounds(
+            tmp, hub, answer((6, "close", {"subsumed_by": [41], "comment": comment})), claims=Claims(unregistered={6})
+        )
+        check(
+            "…nor one whose claim could not be registered",
+            (6 in [n for n, _ in hub.closed], "could not be taken" in ruling(root, "declined-fix-6")["note"]),
             (False, True),
         )
 

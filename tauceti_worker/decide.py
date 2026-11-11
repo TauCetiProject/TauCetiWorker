@@ -806,6 +806,10 @@ def _close(rd: _Round, incident: dict, answer: dict) -> tuple[str, dict]:
     repository = (row.get("headRepository") or {}).get("name") or ""
     if not claims.begin_branch_work(pr, incident["head"], row.get("headRefName") or "", owner, repository):
         return "another worker holds its branch claim", {}
+    # Repair work goes on when the claim could not be registered, since its push is a compare-and-swap;
+    # a closure has no such check, so it needs the claim itself.
+    if not (claims.held and claims.held[0] == f"branch/{pr}"):
+        return "its branch claim could not be taken", {}
     try:
         closed, detail = close_subsumed(
             rd.gh, pr, incident["head"], answer["subsumed_by"], answer["comment"], login=rd.login
