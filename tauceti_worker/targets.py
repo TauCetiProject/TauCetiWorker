@@ -8,7 +8,8 @@ the worker uses:
     candidates(targets, only, skip)    the eligible items, in the order a worker tries to claim them
     landed_pr(item, gh)                the merged pull request that completed an item, at any age
     render_assignment(targets, item)   the roadmap prompt's bullet assigning one item
-    marker_stem(item)                  what the pull request body must contain for that item
+    target_markers(item)               the item's complete and partial markers, one of which the
+                                       pull request body must carry
     rewrite_item(text, item, status)   the file's text with one item line changed, for the curate phase
 
 `parse_targets`, `marker_keys`, `landed`, `overlay_live`, `eligible_items` and `eligible_areas`
@@ -81,7 +82,7 @@ def _parse_item(line: str, area: str) -> TargetItem | None:
             if key.strip().lower() != "needs":
                 meta.append(clause)
             elif value.strip().lower() != "none":
-                needs = tuple(s.strip() for s in _SLUG_RE.findall(value) or value.split(",") if s.strip())
+                needs = tuple(s.strip().strip("`").strip() for s in value.split(",") if s.strip("` \t"))
     return TargetItem(area, slug.group(1).strip(), _STATUS[m.group(1)], text, needs, tuple(meta))
 
 
@@ -289,17 +290,17 @@ def rewrite_item(text: str, item: TargetItem, status: str, *, drop: Iterable[str
     return "".join(lines)
 
 
-def marker_stem(item: TargetItem) -> str:
-    """What the item's target marker starts with, whether it is complete or partial. As
-    TAUCETI_TARGET_MARKER it makes gh-safe-pr-create refuse a pull request body without it."""
-    ident = json.dumps({"focus": item.area, "id": item.slug}, separators=(",", ":"), ensure_ascii=False)
-    return f"<!--tauceti-target:v1 {ident[:-1]}"
+def target_markers(item: TargetItem) -> tuple[str, str]:
+    """The item's complete marker and its `"partial":true` marker. Joined by a newline as
+    TAUCETI_TARGET_MARKER, they make gh-safe-pr-create refuse a body that carries neither."""
+    ident = json.dumps({"focus": item.area, "id": item.slug}, separators=(",", ":"), ensure_ascii=False)[:-1]
+    return f"<!--tauceti-target:v1 {ident}}}-->", f'<!--tauceti-target:v1 {ident},"partial":true}}-->'
 
 
 def render_assignment(targets: Targets, item: TargetItem) -> str:
     """The bullet that opens the roadmap prompt's "Choose a target" section under a target list."""
     area, slug = item.area, item.slug
-    marker, partial = marker_stem(item) + "}-->", marker_stem(item) + ',"partial":true}-->'
+    marker, partial = target_markers(item)
     block = [render_item(targets, it) for it in targets.areas.get(area, [])]
     if targets.preamble:
         block = [*targets.preamble.splitlines(), "", *block]
