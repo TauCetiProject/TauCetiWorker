@@ -140,6 +140,67 @@ def native_source(cfg):
     )
 
 
+def forgejo_identity():
+    """The native user ID the selected Forgejo source must act as, or None when none is configured."""
+    expected = os.environ.get("TAUCETI_FORGEJO_USER_ID")
+    if os.environ.get("TAUCETI_WORKER_FORGES", "github") == "github" or not expected:
+        return None
+    if not expected.isascii() or not expected.isdigit() or int(expected) < 1:
+        raise Die("TAUCETI_FORGEJO_USER_ID must be a native Forgejo user ID")
+    return expected
+
+
+def verify_forgejo_identity():
+    """Ask the Forgejo source which account its credential belongs to, once; halt on a verdict.
+
+    A wrong user, HTTP 401, and HTTP 403 raise `Halted`. Forgejo answers `GET /user` with 403 for a
+    suspended, login-prohibited or unactivated account and for a token without `read:user`; the
+    response message that tells them apart does not reach `ForgeError`, and none is fixed by a retry.
+    An unavailable binding or forge is left to discovery, which reports the source unavailable.
+    """
+    from types import SimpleNamespace
+
+    from tauceti_tools.forge import ForgeError
+
+    from .config import Halted
+    from .identity import ACCOUNT_HALT, IDENTITY_MISMATCH, INVALID_CREDENTIALS
+
+    expected = forgejo_identity()
+    if expected is None:
+        return
+    try:
+        source = native_source(SimpleNamespace(home=Path.home()))
+    except (Die, ValueError, OSError):
+        return
+    origin = source.repository.forge.url
+    if source.anonymous_discovery:
+        raise Die(f"no Forgejo credential for user {expected} at {origin}; set TAUCETI_FORGEJO_TOKEN_FILE")
+    try:
+        row = source.api.current_user()
+    except ForgeError as error:
+        if error.status == 401:
+            raise Halted(
+                INVALID_CREDENTIALS,
+                f"Forgejo {origin} rejected the credential for user {expected} (HTTP 401); issue a new token",
+                forge="forgejo",
+            ) from None
+        if error.status == 403:
+            raise Halted(
+                ACCOUNT_HALT,
+                f"Forgejo {origin} refused the account behind user {expected}'s credential (HTTP 403): suspended, "
+                "prohibited from login or not activated, or the token lacks read:user",
+                forge="forgejo",
+            ) from None
+        return
+    if str(row["id"]) != expected:
+        raise Halted(
+            IDENTITY_MISMATCH,
+            f"Forgejo {origin}: expected user {expected}, but the credential belongs to {row['login']} "
+            f"(user {row['id']}); point TAUCETI_FORGEJO_TOKEN_FILE at a token for user {expected}",
+            forge="forgejo",
+        )
+
+
 def source_config(cfg, source):
     suffix = hashlib.sha256(
         json.dumps({"repository": source.repository.key, "id": source.identity.native_id}, sort_keys=True).encode()
@@ -231,16 +292,25 @@ def shared_github_environment():
 
     from tauceti_tools.git_credentials import scoped_git_environment
 
-    gh = os.environ.get("TAUCETI_REAL_GH") or shutil.which("gh")
-    if not gh:
-        raise SourceUnavailable("shared GitHub credentials unavailable")
-    credential = subprocess.run([gh, "auth", "token", "--hostname", "github.com"], capture_output=True, text=True)
-    if credential.returncode or not credential.stdout.strip():
-        raise SourceUnavailable("shared GitHub credentials unavailable")
+    account = os.environ.get("TAUCETI_GITHUB_ACCOUNT")
+    if account:
+        # pin_github_account verified GH_TOKEN for this account at the start of the round.
+        pinned = os.environ.get("_TAUCETI_PINNED_GITHUB_ACCOUNT", "").lower() == account.lower()
+        token = os.environ.get("GH_TOKEN") if pinned else None
+        if not token:
+            raise SourceUnavailable(f"the verified GitHub credential for {account} is unavailable")
+    else:
+        gh = os.environ.get("TAUCETI_REAL_GH") or shutil.which("gh")
+        if not gh:
+            raise SourceUnavailable("shared GitHub credentials unavailable")
+        credential = subprocess.run([gh, "auth", "token", "--hostname", "github.com"], capture_output=True, text=True)
+        token = credential.stdout.strip() if not credential.returncode else ""
+        if not token:
+            raise SourceUnavailable("shared GitHub credentials unavailable")
     original = dict(os.environ)
     marker = _selected.set(None)
     try:
-        env = scoped_git_environment(GITHUB, credential.stdout.strip())
+        env = scoped_git_environment(GITHUB, token)
         for key in list(os.environ):
             if key.startswith("GIT_CONFIG_") or key in ("TAUCETI_SOURCE_BINDING", "GH_REPO", "TAUCETI_CLAIM_SH"):
                 os.environ.pop(key, None)

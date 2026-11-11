@@ -48,7 +48,11 @@ export TAUCETI_FORGEJO_TOKEN_FILE="$HOME/.config/tauceti-forgejo/worker-token"
 ```
 
 The canonical instance defaults to those values. Other instances require
-explicit bindings. Token files must be private. A missing canonical credential
+explicit bindings. Set `TAUCETI_FORGEJO_USER_ID` to the native user ID the
+token must belong to, and each round first checks it: a different user, an
+HTTP 401, or an HTTP 403 from `GET /user` is an
+[identity halt](workers.md#identity-halt) that stops the worker until a person
+clears it. Token files must be private. A missing canonical credential
 allows public Forgejo discovery. Authenticated native work becomes available
 when a suitable credential is configured.
 

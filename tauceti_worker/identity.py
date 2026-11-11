@@ -1,7 +1,8 @@
-"""tauceti_worker.identity — the halt a worker records when its GitHub identity is one no retry fixes.
+"""tauceti_worker.identity — the halt a worker records when a forge identity is one no retry fixes.
 
-`pin_github_account` raises `Halted` for a login other than the configured one, a rejected
-credential, or a suspended account. The record written here stops every later start under the same
+`pin_github_account` (GitHub) and `verify_forgejo_identity` (a Forgejo source) raise `Halted` for an
+account other than the configured one, a rejected credential, or a suspended or locked account. The
+record written here stops every later start under the same
 worker id until a person has read it and run `tauceti work --worker-id ID --clear-halt`, or
 `tauceti workers clear-halt ID` for a managed worker.
 """
@@ -29,7 +30,12 @@ def halt_file() -> Path | None:
 def write_halt(path: Path | None, halt: Halted) -> None:
     if path is None:
         return
-    record = {"reason": halt.reason, "detail": str(halt), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    record = {
+        "reason": halt.reason,
+        "forge": halt.forge,
+        "detail": str(halt),
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
     try:
         atomic_json(path, record)
     except OSError as error:

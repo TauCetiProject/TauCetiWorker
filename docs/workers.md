@@ -244,24 +244,40 @@ without disturbing unchanged workers.
 
 ### Identity halt
 
-A worker with `github_account` asks GitHub which account its credential belongs
-to before its loop starts and once at the start of every round, one `GET /user`
-each time. Three answers stop the worker until a person intervenes:
+Each selected source with a configured identity is asked which account its
+credential belongs to before the loop starts and once at the start of every
+round, one request each time: GitHub's `GET /user` for a worker with
+`github_account`, and the Forgejo source's `GET /api/v1/user` for a worker with
+`--forgejo` and `TAUCETI_FORGEJO_USER_ID` in its environment. `workers.toml`
+has no source selection yet, so a managed worker is checked on GitHub only.
+Three answers stop the worker until a person intervenes:
 
-| Reason | GitHub's answer |
-| --- | --- |
-| `identity-mismatch` | A login other than `github_account` |
-| `invalid-credentials` | HTTP 401 |
-| `account-halt` | HTTP 403 stating that the account is suspended or locked |
+| Reason | GitHub's answer | Forgejo's answer |
+| --- | --- | --- |
+| `<forge>:identity-mismatch` | A login other than `github_account` | A native user ID other than `TAUCETI_FORGEJO_USER_ID` |
+| `<forge>:invalid-credentials` | HTTP 401 | HTTP 401 |
+| `<forge>:account-halt` | HTTP 403 stating that the account is suspended or locked | HTTP 403 |
 
-The worker writes the reason, a description, and the time to
-`state/<worker-id>/halt.json` and exits with status 84. Its loop ends without
-backoff or another round, and the manager leaves it stopped under every
-`restart` policy. The status record carries `state = "halted"`, `halt_reason`,
-and `failure_reason`; `workers status` shows the worker as `halted` with that
-reason. While the file exists, `tauceti work` for that worker id exits 84 again
-before it reads a credential or contacts GitHub. Once the account is in order,
-read and remove the record, then start the worker:
+`<forge>` is `github` or `forgejo`. Forgejo answers `GET /user` with 403 for a
+suspended, login-prohibited or unactivated account and for a token without the
+`read:user` scope; the worker cannot tell these apart, and none of them changes
+on a retry.
+
+The worker writes the reason, the forge, a description naming the forge, and
+the time to `state/<worker-id>/halt.json`:
+
+```json
+{"reason": "forgejo:invalid-credentials", "forge": "forgejo", "detail": "Forgejo https://git.example.org rejected the credential for user 3 (HTTP 401); issue a new token", "at": "2026-11-11T03:09:11Z"}
+```
+
+It exits with status 84. Its loop ends without backoff or another round, and
+the manager leaves it stopped under every `restart` policy. The status record
+carries `state = "halted"`, `halt_reason` (the reason above) and
+`failure_reason` (the description); `workers status` shows the worker as
+`halted` with that reason. While the file exists, `tauceti work` for that
+worker id exits 84 again before it reads a credential or contacts either forge.
+Once the account is in order, read and remove the record, then start the
+worker:
 
 ```bash
 tauceti workers clear-halt reviewer
@@ -273,13 +289,21 @@ the worker's own `conf` and `env`, so it finds the record under the worker's
 data root rather than the caller's. For a worker the manager does not run, use
 that `work` command directly.
 
-Rate limits, other 403 responses such as a missing scope or SSO enforcement,
-server errors, and network failures are not halts. Before the loop they are
-retried or waited out, and one that persists is an ordinary failure; at the
-start of a round the round proceeds on the loop's earlier verification. A halt
-belongs to a worker id, so a start that fails before `work` has auto-assigned
-one exits 84 without writing a file. A worker without `github_account` is never
-checked or halted.
+Rate limits, other GitHub 403 responses such as a missing scope or SSO
+enforcement, server errors, and network failures are not halts. On GitHub,
+before the loop they are retried or waited out, and one that persists is an
+ordinary failure; at the start of a round the round proceeds on the loop's
+earlier verification. On Forgejo the round proceeds and discovery reports the
+source unavailable. A halt belongs to a worker id, so a start that fails before
+`work` has auto-assigned one exits 84 without writing a file. A source without
+a configured identity is never checked or halted.
+
+A worker with `--no-github --forgejo` still uses GitHub for shared coordination
+(author target leases, the review archive, roadmap issues), so with
+`github_account` it is checked and halted on GitHub as well; that coordination
+then uses only the verified `github_account` credential, never `gh`'s active
+login. Without `github_account` it uses `gh`'s active login, unchecked, as
+before.
 
 `env` exists for running one worker differently from its peers when the
 difference has no flag: an A/B of a build setting, for instance. It is part of

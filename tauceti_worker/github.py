@@ -218,10 +218,14 @@ def pin_github_account(account: str, *, wait_for_reset: bool = False, recheck: b
         # gh's stderr can contain credential material when debugging is enabled. Do not log it.
         reason = _identity_halt(identity)
         if reason == INVALID_CREDENTIALS:
-            raise Halted(reason, f"GitHub rejected the credential for account {account} (HTTP 401); log in again")
+            raise Halted(
+                reason, f"GitHub rejected the credential for account {account} (HTTP 401); log in again", forge="github"
+            )
         if reason == ACCOUNT_HALT:
             raise Halted(
-                reason, f"GitHub reports the account behind {account}'s credential as suspended or locked (HTTP 403)"
+                reason,
+                f"GitHub reports the account behind {account}'s credential as suspended or locked (HTTP 403)",
+                forge="github",
             )
         if carried:
             return unanswered()
@@ -240,6 +244,7 @@ def pin_github_account(account: str, *, wait_for_reset: bool = False, recheck: b
         raise Halted(
             IDENTITY_MISMATCH,
             f"requested GitHub account {account}, but the credential belongs to {login}; log in as {account}",
+            forge="github",
         )
     if _SELECTION_BASE not in os.environ:
         os.environ[_SELECTION_BASE] = json.dumps(

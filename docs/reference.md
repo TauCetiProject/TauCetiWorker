@@ -164,7 +164,9 @@ credentials stop the command; TauCeti never switches to another account.
 an HTTP 401, or a suspended account stops the worker until
 `tauceti work --worker-id ID --clear-halt` (`tauceti workers clear-halt ID`
 for a managed worker); see
-[identity halt](workers.md#identity-halt).
+[identity halt](workers.md#identity-halt). A worker with `--forgejo` and
+`TAUCETI_FORGEJO_USER_ID` is checked and halted the same way on its Forgejo
+source.
 
 The selected token lives in the worker's environment and is inherited by loop
 rounds, review tools, host agents, and Git's `gh auth git-credential` helper.

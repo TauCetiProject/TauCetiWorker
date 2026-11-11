@@ -468,9 +468,9 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--clear-halt",
         dest="clear_halt",
         action="store_true",
-        help="print and remove this worker's halt.json, then exit. With --github-account, a wrong login, "
-        "a rejected credential or a suspended account writes that file, and the worker does not "
-        "start while it exists (needs --worker-id)",
+        help="print and remove this worker's halt.json, then exit. With --github-account (or --forgejo and "
+        "$TAUCETI_FORGEJO_USER_ID), a wrong account, a rejected credential or a suspended account writes "
+        "that file, and the worker does not start while it exists (needs --worker-id)",
     )
 
 
@@ -1026,11 +1026,13 @@ def main(argv: list[str] | None = None) -> int:
             report_runtime(max_open_prs=max_open_prs())
         if cmd == "work" and getattr(args, "loop", False):
             report_runtime(github_transport_loop_rev=os.environ.get("TAUCETI_GITHUB_TRANSPORT_REV"))
+        from .worker_sources import forgejo_identity, verify_forgejo_identity
+
         account = getattr(args, "github_account", os.environ.get("TAUCETI_GITHUB_ACCOUNT"))
+        halts = cmd in ("work", "_round")
+        if halts and (account is not None or forgejo_identity()):
+            refuse_if_halted(halt_file())
         if account is not None:
-            halts = cmd in ("work", "_round")
-            if halts:
-                refuse_if_halted(halt_file())
             try:
                 args.github_account = pin_github_account(
                     account, wait_for_reset=cmd == "work" and getattr(args, "loop", False), recheck=halts
@@ -1041,6 +1043,12 @@ def main(argv: list[str] | None = None) -> int:
                 write_halt(halt_file(), halt)
                 raise
             report_runtime(github_account=args.github_account)
+        if halts:
+            try:
+                verify_forgejo_identity()
+            except Halted as halt:
+                write_halt(halt_file(), halt)
+                raise
 
     if cmd == "overlap":
         from .overlaps import initialize
@@ -1469,7 +1477,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         wid = auto_assign_wid()
         os.environ["TAUCETI_WORKER_ID"] = wid
         log(f"auto-assigned worker slot {wid} (override with --worker-id)")
-        if getattr(args, "github_account", None):
+        from .worker_sources import forgejo_identity
+
+        if getattr(args, "github_account", None) or forgejo_identity():
             refuse_if_halted(halt_file())
     # A distinct worker id implies its own credential directories (so several workers' refreshes don't
     # race); --isolate-home forces it even for the 'default' id. This must run BEFORE Config.resolve so

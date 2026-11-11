@@ -109,3 +109,17 @@ output="$(launch '--worker-id final --github-account alice' --worker-id initial)
 test "$(tail -1 <<<"$output")" = '<alice>'
 grep -q '^auth status' "$temporary/gh.log"
 echo "[OK ] the halt check reads the worker id the CLI resolves from appended options"
+
+# A Forgejo-only worker with a configured Forgejo identity and no GitHub account idles the same way.
+rm -f "$temporary/gh.log"
+mkdir -p "$temporary/data/state/native"
+printf '%s\n' '{"reason": "forgejo:invalid-credentials", "forge": "forgejo", "detail": "rejected", "at": "then"}' \
+  >"$temporary/data/state/native/halt.json"
+output="$(TAUCETI_FORGEJO_USER_ID=3 launch '--worker-id native --no-github --forgejo')"
+test "$output" = '<idle infinity>'
+test ! -e "$temporary/gh.log"
+grep -q 'forgejo:invalid-credentials' "$temporary/stderr"
+grep -q -- '--worker-id native --clear-halt' "$temporary/stderr"
+output="$(launch '--worker-id native --no-github --forgejo')"
+test "$(tail -1 <<<"$output")" = '<--forgejo>'
+echo "[OK ] a Forgejo identity halt idles a Forgejo-only worker before any forge contact"

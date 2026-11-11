@@ -422,11 +422,15 @@ class Die(Exception):
 
 
 class Halted(Die):
-    """GitHub identity no retry can fix → exit EX_HALTED (84) from `work`; the loop and manager stay stopped."""
+    """Forge identity no retry can fix → exit EX_HALTED (84) from `work`; the loop and manager stay stopped.
 
-    def __init__(self, reason: str, message: str):
+    `reason` is `<forge>:<verdict>`, e.g. `forgejo:invalid-credentials`; a refusal re-raises a recorded one.
+    """
+
+    def __init__(self, reason: str, message: str, *, forge: str | None = None):
         super().__init__(message)
-        self.reason = reason
+        self.forge = forge or reason.partition(":")[0]
+        self.reason = f"{forge}:{reason}" if forge else reason
 
 
 class NoProgress(Exception):

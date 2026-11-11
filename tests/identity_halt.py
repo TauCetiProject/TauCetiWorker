@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -121,9 +122,9 @@ class IdentityHaltTests(unittest.TestCase):
 
     def test_start_halts_on_the_first_answer(self):
         for mode, reason in (
-            (BAD_CREDENTIALS, "invalid-credentials"),
-            (SUSPENDED, "account-halt"),
-            ("bob", "identity-mismatch"),
+            (BAD_CREDENTIALS, "github:invalid-credentials"),
+            (SUSPENDED, "github:account-halt"),
+            ("bob", "github:identity-mismatch"),
         ):
             before = self.requests()
             self.answer(mode)
@@ -158,7 +159,7 @@ class IdentityHaltTests(unittest.TestCase):
             self.assertEqual(github.pin_github_account("alice", recheck=True), "alice")
         self.assertEqual(self.naps, [])
 
-        for mode, reason in ((SUSPENDED, "account-halt"), (BAD_CREDENTIALS, "invalid-credentials")):
+        for mode, reason in ((SUSPENDED, "github:account-halt"), (BAD_CREDENTIALS, "github:invalid-credentials")):
             self.answer(mode)
             self.assertEqual(self.halted(recheck=True), reason)
 
@@ -174,7 +175,7 @@ class IdentityHaltTests(unittest.TestCase):
         real_budget, real_execute = github.transport.observed_budget, github.transport.execute
         no_wait = SimpleNamespace(time=time.time, sleep=lambda nap: self.fail(f"waited {nap}s for the quota reset"))
         self.enterContext(patch.object(github, "time", no_wait))
-        cases = ((SUSPENDED, "account-halt", True), (BAD_CREDENTIALS, "invalid-credentials", True))
+        cases = ((SUSPENDED, "github:account-halt", True), (BAD_CREDENTIALS, "github:invalid-credentials", True))
         for mode, reason, recheck in (*cases, *((m, r, False) for m, r, _ in cases)):
             if not recheck:  # a fresh `work --loop` start, with nothing verified yet
                 for name in ("_TAUCETI_PINNED_GITHUB_ACCOUNT", "GH_TOKEN"):
@@ -213,12 +214,12 @@ class IdentityHaltTests(unittest.TestCase):
         self.answer("bob")
         self.assertEqual(self.run_cli(*round_argv), (EX_HALTED, False))
         record = json.loads(self.halt.read_text())
-        self.assertEqual(record["reason"], "identity-mismatch")
+        self.assertEqual((record["reason"], record["forge"]), ("github:identity-mismatch", "github"))
         self.assertIn("belongs to bob", record["detail"])
         published = json.loads(status.read_text())
         self.assertEqual(
             (published["state"], published["halt_reason"], published["failure_code"]),
-            ("halted", "identity-mismatch", EX_HALTED),
+            ("halted", "github:identity-mismatch", EX_HALTED),
         )
         self.assertIn("belongs to bob", published["failure_reason"])
 
@@ -348,6 +349,134 @@ class IdentityHaltTests(unittest.TestCase):
         self.assertIn("reason:   belongs to bob", lines)
         workers = f"tauceti workers --config {config}"
         self.assertIn(f"{workers} clear-halt w1, then {workers} restart w1", lines)
+
+
+class FakeForgejo:
+    """What /api/v1/user answers through tauceti_tools' real Forgejo client: a user row or an HTTP status."""
+
+    def __init__(self):
+        self.answer, self.requests = {"id": 3, "login": "worker"}, []
+
+
+class _Response:
+    def __init__(self, body):
+        self.body, self.status, self.reason, self.headers = body, 200, "OK", {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, limit=None):
+        return self.body
+
+
+class ForgejoHaltTests(unittest.TestCase):
+    answer = IdentityHaltTests.answer
+    requests = IdentityHaltTests.requests
+    run_cli = IdentityHaltTests.run_cli
+
+    def setUp(self):
+        IdentityHaltTests.setUp(self)
+        token = self.root / "forgejo"
+        token.mkdir(mode=0o700)
+        token = token.resolve()  # The credential reader refuses a symlinked ancestor such as macOS's /tmp.
+        (token / "worker-token").write_text("forgejo-test-token")
+        (token / "worker-token").chmod(0o600)
+        os.environ.update(
+            TAUCETI_FORGEJO_ORIGIN="https://forgejo.test",
+            TAUCETI_FORGEJO_REPO="one/project",
+            TAUCETI_FORGEJO_REPOSITORY_ID="7",
+            TAUCETI_FORGEJO_TOKEN_FILE=str(token / "worker-token"),
+            TAUCETI_FORGEJO_USER_ID="3",
+            TAUCETI_RUNTIME_STATUS=str(self.root / "status.json"),
+        )
+        self.forgejo = FakeForgejo()
+        forgejo = self.forgejo
+
+        class Opener:
+            def open(self, request, timeout=None):
+                forgejo.requests.append(request.full_url)
+                if isinstance(forgejo.answer, int):
+                    raise urllib.error.HTTPError(request.full_url, forgejo.answer, "refused", {}, None)
+                return _Response(json.dumps(forgejo.answer).encode())
+
+        import tauceti_tools.forge
+
+        self.enterContext(patch.object(tauceti_tools.forge.urllib.request, "build_opener", return_value=Opener()))
+
+    def published(self):
+        return json.loads((self.root / "status.json").read_text())
+
+    def test_a_forgejo_only_worker_halts_on_its_forgejo_identity_alone(self):
+        round_argv = ("_round", "--worker-id", "w1", "--no-github", "--forgejo")
+        for answer, reason in (
+            ({"id": 4, "login": "other"}, "forgejo:identity-mismatch"),
+            (401, "forgejo:invalid-credentials"),
+            (403, "forgejo:account-halt"),
+        ):
+            self.forgejo.answer, self.forgejo.requests = answer, []
+            self.assertEqual(self.run_cli(*round_argv), (EX_HALTED, False))
+            self.assertEqual(self.forgejo.requests, ["https://forgejo.test/api/v1/user"])
+            record = json.loads(self.halt.read_text())
+            self.assertEqual((record["reason"], record["forge"]), (reason, "forgejo"))
+            self.assertIn("Forgejo https://forgejo.test", record["detail"])
+            published = self.published()
+            self.assertEqual((published["state"], published["halt_reason"]), ("halted", reason))
+            self.assertIn("Forgejo https://forgejo.test", published["failure_reason"])
+            self.halt.unlink()
+        # Neither the halts nor the passing check contacted GitHub, which this worker has no account for.
+        self.assertFalse(self.calls.exists())
+
+        # The record refuses later starts before either forge is asked.
+        self.forgejo.answer = 401
+        self.run_cli(*round_argv)
+        self.forgejo.answer, self.forgejo.requests = {"id": 3, "login": "worker"}, []
+        self.assertEqual(self.run_cli(*round_argv), (EX_HALTED, False))
+        self.assertEqual(self.forgejo.requests, [])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.run_cli("work", "--worker-id", "w1", "--clear-halt"), (0, False))
+        self.assertEqual(self.run_cli(*round_argv), (0, True))
+
+    def test_outages_and_unselected_sources_do_not_halt(self):
+        for answer in (500, 404):
+            self.forgejo.answer = answer
+            self.assertEqual(self.run_cli("_round", "--worker-id", "w1", "--forgejo"), (0, True))
+        self.forgejo.answer, self.forgejo.requests = 401, []
+        self.assertEqual(self.run_cli("_round", "--worker-id", "w1"), (0, True))
+        del os.environ["TAUCETI_FORGEJO_USER_ID"]
+        self.assertEqual(self.run_cli("_round", "--worker-id", "w1", "--forgejo"), (0, True))
+        self.assertEqual(self.forgejo.requests, [])
+        self.assertFalse(self.halt.exists())
+
+    def test_both_sources_are_checked_and_either_halts(self):
+        argv = ("_round", "--worker-id", "w1", "--forgejo", "--github-account", "alice")
+        self.assertEqual(self.run_cli(*argv), (0, True))
+        self.assertEqual((self.requests(), len(self.forgejo.requests)), (1, 1))
+        self.forgejo.answer = {"id": 4, "login": "other"}
+        self.assertEqual(self.run_cli(*argv), (EX_HALTED, False))
+        self.assertEqual(json.loads(self.halt.read_text())["reason"], "forgejo:identity-mismatch")
+
+    def test_shared_github_coordination_uses_the_verified_account(self):
+        from tauceti_tools import git_credentials
+
+        from tauceti_worker.config import SourceUnavailable
+        from tauceti_worker.worker_sources import shared_github_environment
+
+        tokens = []
+        with patch.object(
+            git_credentials, "scoped_git_environment", side_effect=lambda forge, token: tokens.append(token) or {}
+        ):
+            github.pin_github_account("alice")
+            with shared_github_environment():
+                pass
+            self.assertEqual(tokens, ["test-alice"])
+            os.environ["_TAUCETI_PINNED_GITHUB_ACCOUNT"] = "bob"
+            with self.assertRaises(SourceUnavailable), shared_github_environment():
+                pass
+        auth = [json.loads(line) for line in self.calls.read_text().splitlines()]
+        self.assertNotIn(["auth", "token", "--hostname", "github.com"], auth)
 
 
 if __name__ == "__main__":
