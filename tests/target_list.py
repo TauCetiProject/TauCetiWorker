@@ -375,6 +375,145 @@ class Round(unittest.TestCase):
         self.assertEqual(seen, [("roadmap", "auto"), ("roadmap", "Topology")])
 
 
+class Forgejo(unittest.TestCase):
+    """A list on a Forgejo source, built the way upstream's Forgejo tests build one: a real
+    ForgejoWorkerSource over a mocked native API."""
+
+    def setUp(self):
+        from tauceti_tools.ci_candidate import RepositoryIdentity
+        from tauceti_tools.forge import Forge, RepositoryRef
+
+        from tauceti_worker.forgejo_worker import ForgejoWorkerSource
+
+        self.repo = RepositoryRef(Forge("forgejo", "https://git.example.org"), "one/project")
+        self.api = Mock(forge=self.repo.forge, _token="fixture-token", max_bytes=1024 * 1024, max_pages=100)
+        self.source = ForgejoWorkerSource(RepositoryIdentity(self.repo, 7), self.api, token_file=None)
+        self.api.pulls.return_value = []
+        self.api.pages.return_value = iter([])
+        self.source.open_prs = Mock(return_value=[])
+
+    @staticmethod
+    def pull(number, body, merged=True):
+        return {"number": number, "title": "t", "body": body, "state": "closed", "merged": merged}
+
+    def test_merged_listing_and_keyword_search(self):
+        self.api.pulls.return_value = [self.pull(3, marker("Algebra", "a")), self.pull(4, "none")]
+        recent = self.source.merged_prs(f"{t.MERGED_SEARCH} sort:updated-desc", limit=200)
+        self.assertEqual([(d["number"], d["url"]) for d in recent], [(3, self.repo.pull_url(3))])
+        self.api.pulls.assert_called_once_with(self.repo, state="merged", limit=200)
+        item = t.TargetItem("Algebra", "a", "open", "x")
+        landed = t.target_markers(item)[0]
+        self.api.pages.return_value = iter(
+            [
+                [
+                    {"number": 8, "body": landed, "pull_request": {"merged": True}},
+                    {"number": 9, "body": landed, "pull_request": {"merged": False}},
+                    {"number": 10, "body": marker("Algebra", "ab"), "pull_request": {"merged": True}},
+                ]
+            ]
+        )
+        self.assertEqual(t.landed_pr(item, self.source), 8)
+        path = self.api.pages.call_args.args[0]
+        self.assertTrue(path.startswith("repos/one/project/issues?type=pulls&state=closed&q="), path)
+        from tauceti_tools.forge import ForgeError
+
+        from tauceti_worker.config import SourceUnavailable
+
+        self.api.pulls.side_effect = ForgeError("down")
+        with self.assertRaises(SourceUnavailable):
+            self.source.merged_prs(f"{t.MERGED_SEARCH} sort:created", limit=200)
+
+    def test_partial_clause_names_a_forgejo_pull_request_by_url(self):
+        url = self.repo.pull_url(5)
+        listed = t.parse_targets(f"<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — x (partial: #5, {url})\n")
+        item = listed.find("a")
+        self.assertEqual(t.landed([item], [{"number": 5, "body": marker("Algebra", "a"), "url": url}]), {})
+        self.assertEqual(t.landed([item], [{"number": 5, "body": marker("Algebra", "a")}]), {})
+        other = {"number": 5, "body": marker("Algebra", "a"), "url": self.repo.pull_url(6).replace("/6", "/5x")}
+        self.assertEqual(t.landed([item], [other]), {("Algebra", "a"): 5})
+
+    def test_author_claims_stay_in_the_shared_github_namespace(self):
+        from tauceti_worker.source_claims import SourceClaims
+
+        entered = []
+
+        @contextlib.contextmanager
+        def shared():
+            entered.append(True)
+            yield
+
+        cleanups = []
+        claims = SourceClaims(SimpleNamespace(wid="w1"), SimpleNamespace(add_cleanup=cleanups.append), self.source)
+        with (
+            patch("tauceti_worker.worker_sources.shared_github_environment", shared),
+            patch("tauceti_worker.round.claims_repo", return_value="org/claims"),
+            patch("tauceti_worker.round.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run,
+            patch.object(SourceClaims, "start_heartbeat"),
+            patch.object(SourceClaims, "stop_heartbeat"),
+        ):
+            self.assertEqual(claims.begin_target_work("Algebra", "a"), 0)
+            for cleanup in cleanups:
+                cleanup()
+        self.assertEqual(
+            [c.args[0][1:3] for c in run.call_args_list],
+            [["acquire", "author/Algebra/a"], ["release", "author/Algebra/a"]],
+        )
+        self.assertEqual(len(entered), 2)
+        self.assertIsNone(claims.held)
+
+
+class ForgejoRound(unittest.TestCase):
+    """A roadmap round whose new pull requests go to Forgejo, alone and beside GitHub."""
+
+    author = Round.author
+
+    def setUp(self):
+        Round.setUp(self)
+        fixture = Forgejo()
+        fixture.setUp()
+        self.forgejo, self.api = fixture.source, fixture.api
+        self.w.gh = self.forgejo
+        self.path.write_text(
+            "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `first` — a\n- [ ] `second` — b (needs: `first`)\n"
+            "- [ ] `third` — c\n"
+        )
+        for item in (
+            patch("tauceti_worker.worker_sources.current", return_value=self.forgejo),
+            patch("tauceti_worker.worker_sources.shared_github_environment", contextlib.nullcontext),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
+
+    def test_a_forgejo_landing_unlocks_its_dependents(self):
+        self.api.pulls.return_value = [Forgejo.pull(12, marker("Algebra", "first"))]
+        prompt = self.author()
+        self.assertIn("Your target is assigned: `second` in `Algebra`", prompt)
+        self.assertIn("  - [x] `first` — a", prompt)
+        self.claims.begin_target_work.assert_called_once_with("Algebra", "second")
+        complete, partial = os.environ["TAUCETI_TARGET_MARKER"].splitlines()
+        self.assertEqual(complete, '<!--tauceti-target:v1 {"focus":"Algebra","id":"second"}-->')
+
+    def test_an_open_forgejo_pull_request_puts_its_item_in_flight(self):
+        self.forgejo.open_prs.return_value = [{"number": 4, "body": marker("Algebra", "first")}]
+        self.assertIn("Your target is assigned: `third` in `Algebra`", self.author())
+
+    def test_a_mixed_round_reads_both_forges(self):
+        self.w.target_sources = [github(merged=[(7, marker("Algebra", "third"))])]
+        self.forgejo.open_prs.return_value = [{"number": 4, "body": marker("Algebra", "first")}]
+        with self.assertRaisesRegex(tc.NoProgress, "wait on needs"):
+            self.author()
+        self.w.target_sources = [github(open_bodies=[marker("Algebra", "third")])]
+        self.forgejo.open_prs.return_value = []
+        self.api.pages.return_value = iter([])
+        self.assertIn("Your target is assigned: `first` in `Algebra`", self.author())
+
+    def test_an_unavailable_forgejo_listing_authors_nothing(self):
+        self.forgejo.open_prs.return_value = None
+        with self.assertRaisesRegex(tc.NoProgress, "cannot read pull requests for the target list"):
+            self.author()
+        self.claims.begin_target_work.assert_not_called()
+
+
 class Wiring(unittest.TestCase):
     def test_setting_and_flag(self):
         with patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS": " "}):
@@ -405,16 +544,19 @@ class Wiring(unittest.TestCase):
             heartbeat.assert_called_once_with("author/Algebra/a", "org/claims")
             self.assertEqual(cleanups, [claims.release])
 
-    def test_lists_author_on_github_alone(self):
-        """Startup refuses a list whose new pull requests would go to Forgejo; a worker that also
-        maintains Forgejo pull requests but authors on GitHub keeps its list."""
+    def test_every_source_selection_starts_with_a_list(self):
         cli = importlib.import_module("tauceti_worker.cli")
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "targets.md"
             path.write_text(EXAMPLE)
             common = ["work", "--roadmap-targets", str(path), "--only", "roadmap", "--agent", "claude"]
-            outcomes = []
-            for flags in (["--forgejo", "--new-pr-forge", "forgejo"], ["--no-github", "--forgejo"], ["--forgejo"], []):
+            reached = []
+            for flags in (
+                ["--no-github", "--forgejo", "--new-pr-forge", "forgejo"],
+                ["--forgejo", "--new-pr-forge", "forgejo"],
+                ["--forgejo"],
+                [],
+            ):
                 with (
                     patch.dict(os.environ),
                     patch.object(cli, "configure_api"),
@@ -422,15 +564,10 @@ class Wiring(unittest.TestCase):
                 ):
                     for name in ("TAUCETI_WORKER_FORGES", "TAUCETI_NEW_PR_FORGE", "TAUCETI_ROADMAP_TARGETS"):
                         os.environ.pop(name, None)
-                    try:
+                    with self.assertRaisesRegex(RuntimeError, "past the checks"):
                         cli.main(common + flags)
-                    except (tc.Die, RuntimeError) as e:
-                        outcomes.append((os.environ["TAUCETI_NEW_PR_FORGE"], type(e).__name__, str(e)))
-        self.assertEqual(
-            [o[:2] for o in outcomes],
-            [("forgejo", "Die"), ("github", "RuntimeError"), ("github", "RuntimeError"), ("github", "RuntimeError")],
-        )
-        self.assertIn("--roadmap-targets authors on GitHub only", outcomes[0][2])
+                    reached.append(os.environ["TAUCETI_NEW_PR_FORGE"])
+        self.assertEqual(reached, ["forgejo", "forgejo", "github", "github"])
 
     def test_workers_toml_key(self):
         spec = wm.WorkerSpec.from_dict({"id": "w", "only": ["roadmap"], "roadmap_targets": "/srv/targets.md"}, 0)

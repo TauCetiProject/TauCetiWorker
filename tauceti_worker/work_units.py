@@ -3097,21 +3097,58 @@ def random_roadmap_area(w, *, focus=None, fallback=True) -> str | None:
 MAX_TARGET_TRIES = 8  # per round; each one is a search and a push to the claim repository
 
 
+class _SharedGitHubReads:
+    """A GitHub client's target-list reads from inside a Forgejo round, whose `gh` on PATH is the
+    source-bound wrapper."""
+
+    def __init__(self, gh):
+        self.gh = gh
+
+    def open_prs(self):
+        from .worker_sources import shared_github_environment
+
+        with shared_github_environment():
+            return self.gh.open_prs()
+
+    def merged_prs(self, search, *, limit):
+        from .worker_sources import shared_github_environment
+
+        with shared_github_environment():
+            return self.gh.merged_prs(search, limit=limit)
+
+
+def _target_reads(source):
+    from .worker_sources import current
+
+    native = getattr(source, "direct_source", False)
+    return source if native or current() is None else _SharedGitHubReads(source)
+
+
+def _landed_link(item, source) -> str | None:
+    number = landed_pr(item, source)
+    if number is None:
+        return None
+    return source.repository.pull_url(number) if getattr(source, "direct_source", False) else f"#{number}"
+
+
 def assign_target(w, path: Path, only: str, skip: list[str]) -> tuple[Targets, TargetItem]:
     """Choose and claim this round's item of the operator's target list (docs/target-lists.md).
     Returns the list under its live statuses and the item; NoProgress when there is none to take."""
+    from .config import SourceUnavailable
+
     listed = load_targets(path)
     claims = getattr(w, "claims", None)
+    sources = [_target_reads(source) for source in (w.gh, *getattr(w, "target_sources", ()))]
     try:
-        live = live_targets(listed, w.gh)
+        live = live_targets(listed, sources[0], sources[1:])
         # A multi-source round's inventory also names the other forge's open pull requests.
         live = overlay_live(live, inventory_keys(getattr(w, "cross_source_targets", None) or ()), set())
         offered = candidates(live, only, skip)
         for item in offered[:MAX_TARGET_TRIES]:
             name = f"{item.area}/{item.slug}"
-            merged = landed_pr(item, w.gh)
+            merged = next((link for source in sources if (link := _landed_link(item, source)) is not None), None)
             if merged is not None:
-                log(f"target {name} landed in #{merged}; mark it `[x]` in {path.name} — trying the next")
+                log(f"target {name} landed in {merged}; mark it `[x]` in {path.name} — trying the next")
                 continue
             rc = claims.begin_target_work(item.area, item.slug) if claims is not None else 2
             if rc == 1:
@@ -3125,7 +3162,7 @@ def assign_target(w, path: Path, only: str, skip: list[str]) -> tuple[Targets, T
                 )
             log(f"→ ROADMAP target: {name} ({len(offered)} eligible in {path.name})")
             return live, item
-    except GitHubError as e:
+    except (GitHubError, SourceUnavailable) as e:
         raise NoProgress(f"roadmap: cannot read pull requests for the target list ({e})") from None
     raise NoProgress(
         f"roadmap: none of the {min(len(offered), MAX_TARGET_TRIES)} eligible target(s) of {path.name} tried this "
