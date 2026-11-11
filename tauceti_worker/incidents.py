@@ -12,6 +12,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -91,11 +92,22 @@ def records(kind: str = "", *, acked: bool = True) -> list[tuple[Path, dict]]:
     return out
 
 
+_held = threading.local()
+
+
 @contextlib.contextmanager
 def _locked(root: Path):
     """Hold the directory's record lock: `record` takes it to replace a live record, and
     `acknowledge` to compare one before moving it. Where the lock cannot be opened, the caller goes
-    on without it and meets the same error in its own write."""
+    on without it and meets the same error in its own write. A thread that holds it already goes on:
+    a second `flock` from the same process would wait on itself."""
+    if getattr(_held, "depth", 0):
+        _held.depth += 1
+        try:
+            yield
+        finally:
+            _held.depth -= 1
+        return
     try:
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(root / LOCK, os.O_RDWR | os.O_CREAT, 0o600)
@@ -104,8 +116,10 @@ def _locked(root: Path):
         return
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
+        _held.depth = 1
         yield
     finally:
+        _held.depth = 0
         os.close(fd)
 
 
