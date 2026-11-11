@@ -115,12 +115,12 @@ class ProgressStrategyTests(unittest.TestCase):
     def round(self, *, retained=None, listing=None, apply=0):
         """One `_do_progress_inner`, with GitHub, git, the tool and the writer stubbed."""
 
-        def pr_list(_self, fields, *, author=None, state="open"):
+        def pr_list(_self, fields, *, author=None, state="open", limit=200):
             self.listings += 1
             self.assertEqual((fields, author, state), (["number", "headRefName"], "fixture", "open"))
             if listing is not None:
                 raise listing
-            return self.open_reports
+            return self.open_reports[:limit]
 
         def execute(args, **kwargs):
             if args[0] == "git":
@@ -301,6 +301,22 @@ class ProgressStrategyTests(unittest.TestCase):
         self.assertEqual(self.round(), 0)
         self.assertEqual(len(self.plans), 1)
         self.applied.assert_called_once()
+
+    def test_threshold_counts_reports_behind_other_open_prs(self):
+        os.environ["TAUCETI_PROGRESS_STRATEGY"] = "threshold"
+        others = [{"number": 1000 - n, "headRefName": f"roadmap/worker-{n}"} for n in range(200)]
+        self.open_reports = [*others, *({"number": n, "headRefName": f"progress/{n}/Area"} for n in (3, 4))]
+        self.assertIsNone(self.round())
+        self.assertEqual(self.plans, [])
+        self.assertIn("2 report(s) of this account open (#3, #4)", self.due()[1])
+
+        self.open_reports = [{"number": n, "headRefName": f"roadmap/worker-{n}"} for n in range(5000)]
+        self.values.pop("progress-poll-at")
+        self.assertIsNone(self.round())
+        self.assertEqual(self.plans, [])
+        self.assertIn(
+            f"could not count this account's open reports (more than {wu.PROGRESS_REPORT_SCAN}", self.due()[1]
+        )
 
     def test_threshold_does_not_plan_when_the_count_is_unknown(self):
         os.environ["TAUCETI_PROGRESS_STRATEGY"] = "threshold"

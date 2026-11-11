@@ -816,7 +816,9 @@ class GitHub:
         # whole project, which is exactly the failure `--limit` used to hide.
         raise GitHubError(f"open PR query exceeded {OPEN_PR_MAX_PAGES} pages of {page} ({len(out)} PRs so far)")
 
-    def pr_list(self, fields: list[str], *, author: str | None = None, state: str = "open") -> list[dict]:
+    def pr_list(
+        self, fields: list[str], *, author: str | None = None, state: str = "open", limit: int = 200
+    ) -> list[dict]:
         from .github_state import read
 
         if state == "open":
@@ -827,7 +829,7 @@ class GitHub:
                     for row in rows
                     if not author or row.get("author", {}).get("login") == author
                 ]
-        args = ["pr", "list", "--repo", self.repo, "--state", state, "--limit", "200", "--json", ",".join(fields)]
+        args = ["pr", "list", "--repo", self.repo, "--state", state, "--limit", str(limit), "--json", ",".join(fields)]
         if author:
             args += ["--author", author]
         p = self._gh(args)

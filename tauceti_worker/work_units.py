@@ -2479,22 +2479,32 @@ def _progress_deadline_wait(w):
     )
 
 
+# Open roadmap PRs of the account listed to find its reports: `gh` pages 100 at a time and stops early.
+PROGRESS_REPORT_SCAN = 1000
+
+
 def _progress_reports_held(w) -> str | None:
     """Why the threshold strategy may not plan a report now, or None: the account's open reports
     in the roadmap repository have reached progress_max_open, or could not be counted."""
     limit = progress_max_open()
     try:
-        rows = GitHub(ROADMAP).pr_list(["number", "headRefName"], author=me())
+        rows = GitHub(ROADMAP).pr_list(["number", "headRefName"], author=me(), limit=PROGRESS_REPORT_SCAN)
     except GitHubError as exc:
         reason = f"could not count this account's open reports ({one_line(str(exc), 120)})"
     else:
         held = sorted(r["number"] for r in rows if str(r.get("headRefName") or "").startswith("progress/"))
-        if len(held) < limit:
+        if len(rows) >= PROGRESS_REPORT_SCAN:
+            reason = (
+                f"could not count this account's open reports (more than {PROGRESS_REPORT_SCAN} "
+                "open pull requests in the roadmap repository)"
+            )
+        elif len(held) < limit:
             return None
-        reason = (
-            f"{len(held)} report(s) of this account open ({', '.join(f'#{n}' for n in held)}), "
-            f"the limit is {limit}; waiting for one to land or close"
-        )
+        else:
+            reason = (
+                f"{len(held)} report(s) of this account open ({', '.join(f'#{n}' for n in held)}), "
+                f"the limit is {limit}; waiting for one to land or close"
+            )
     progress_poll_wait(w.cfg, w.counters, PROGRESS_TTL, reason)
     return reason
 
