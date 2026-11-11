@@ -1310,11 +1310,12 @@ class GitHub:
             return None
         return max(0, int(time.time()) - newest)
 
-    def add_reaction(self, comment_id: int, emoji: str = CONTEST_CLAIM_EMOJI) -> bool:
+    def add_reaction(self, comment_id: int, emoji: str = CONTEST_CLAIM_EMOJI) -> bool | None:
         """Add `emoji` to a review comment (idempotent per (login, content)). False on failure — a
         claim we couldn't post just means a peer may double up, which is acceptable. With
         TAUCETI_REACTIONS=0 the claim is a file under the shared GitHub state directory instead: the
-        workers sharing that directory honour it, workers elsewhere cannot see it."""
+        workers sharing that directory honour it, workers elsewhere cannot see it, and None means a
+        peer sharing it holds an unexpired claim."""
         if not reactions_enabled():
             return _record_local_claim(comment_id, emoji)
         p = self._gh(
@@ -1334,9 +1335,7 @@ class GitHub:
         """Remove our own `emoji` reaction from a review comment (releases the claim). Looks up the
         reaction id for THIS login, then deletes it; a no-op (True) if we hold none."""
         if not reactions_enabled():
-            if _local_claim(comment_id, emoji)[1] == _claimant():
-                _local_claim_path(comment_id, emoji).unlink(missing_ok=True)
-            return True
+            return _release_local_claim(comment_id, emoji)
         ids = getattr(self, "_claim_reaction_ids", {})
         rid = ids.get((comment_id, emoji))
         if rid is None:
@@ -1373,19 +1372,37 @@ def _local_claim(comment_id: int, emoji: str) -> tuple[int, str | None]:
         return 0, None
 
 
-def _record_local_claim(comment_id: int, emoji: str) -> bool:
+def _local_claims_lock():
+    return transport.locked(transport.root() / "contest-claims" / "claims.lock")
+
+
+def _record_local_claim(comment_id: int, emoji: str) -> bool | None:
     path = _local_claim_path(comment_id, emoji)
     try:
-        transport.atomic(path, {"at": int(time.time()), "holder": _claimant()})
+        with _local_claims_lock():
+            at, holder = _local_claim(comment_id, emoji)
+            if holder not in (None, _claimant()) and time.time() - at < CONTEST_CLAIM_TTL:
+                return None
+            transport.atomic(path, {"at": int(time.time()), "holder": _claimant()})
+            # A worker that died mid-review never released its record; nothing else would remove it.
+            for other in path.parent.glob("*.json"):
+                try:
+                    if time.time() - other.stat().st_mtime >= CONTEST_CLAIM_TTL:
+                        other.unlink()
+                except OSError:
+                    pass
     except OSError:
         return False
-    # A worker that died mid-review never released its record; nothing else would remove it.
-    for other in path.parent.glob("*.json"):
-        try:
-            if time.time() - other.stat().st_mtime >= CONTEST_CLAIM_TTL:
-                other.unlink()
-        except OSError:
-            pass
+    return True
+
+
+def _release_local_claim(comment_id: int, emoji: str) -> bool:
+    try:
+        with _local_claims_lock():
+            if _local_claim(comment_id, emoji)[1] == _claimant():
+                _local_claim_path(comment_id, emoji).unlink(missing_ok=True)
+    except OSError:
+        return False
     return True
 
 

@@ -9,15 +9,18 @@ is the contest claimed? — without touching the live API (the reaction round-tr
 the GitHub class; here we stub `reactions()` and assert the survey-time skip/fire decision).
 
 With TAUCETI_REACTIONS=0 the claim is a file under the shared GitHub state directory instead. The second
-half runs the real add/age/remove against a temporary directory and a `_gh` that records its calls.
+half runs the real add/age/remove against a temporary directory and a `_gh` that records its calls,
+then has forked workers race for one contest: exactly one may hold it.
 
 Exit 0 = all cases agree; 1 = a mismatch.
 """
 
 import json
+import multiprocessing
 import os
 import sys
 import tempfile
+import types
 from datetime import UTC
 from pathlib import Path
 from unittest.mock import patch
@@ -127,7 +130,51 @@ def local_claims() -> list[tuple[str, object, object]]:
             out.append(("off: a 👀 from elsewhere still counts", claimed_by(FakeGitHub(CASES[3][1])), True))
             out.append(("off: the holder's release removes it", mine.remove_reaction(456) and files(), []))
             out.append(("off: no write reached GitHub", mine.calls + peer.calls, []))
+            out.append(("off: a new claim", mine.add_reaction(789), True))
+            with patch.dict(os.environ, {"TAUCETI_WORKER_ID": "b"}):
+                out.append(("off: a peer cannot take a held claim", peer.add_reaction(789), None))
+            out.append(("off: the holder may claim again", mine.add_reaction(789), True))
+            record = Path(tmp) / "contest-claims" / "789-eyes.json"
+            record.write_text(json.dumps(json.loads(record.read_text()) | {"at": NOW - tc.CONTEST_CLAIM_TTL - 30}))
+            with patch.dict(os.environ, {"TAUCETI_WORKER_ID": "b"}):
+                out.append(("off: a peer takes over an expired claim", peer.add_reaction(789), True))
+            out.append(
+                ("off: the old holder's release leaves it", mine.remove_reaction(789) and files(), ["789-eyes.json"])
+            )
     return out
+
+
+def race_child(tmp, worker, start, results):
+    os.environ.update({"TAUCETI_GITHUB_SHARED_DIR": tmp, "TAUCETI_REACTIONS": "0", "TAUCETI_WORKER_ID": worker})
+    start.wait(10)
+    results.put(FakeGitHub([]).add_reaction(321))
+
+
+def racing_claims() -> list[tuple[str, object, object]]:
+    """(name, got, want) for workers in separate processes claiming one contest at the same moment."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = multiprocessing.get_context("fork")
+        start, results = ctx.Barrier(8), ctx.Queue()
+        children = [ctx.Process(target=race_child, args=(tmp, f"w{i}", start, results)) for i in range(8)]
+        for child in children:
+            child.start()
+        got = sorted(str(results.get(timeout=20)) for _ in children)
+        for child in children:
+            child.join(10)
+        return [("off: of eight racing workers exactly one holds the claim", got, ["None"] * 7 + ["True"])]
+
+
+def review_skips_held_contest() -> list[tuple[str, object, object]]:
+    """do_review leaves a contest a peer on this host holds without running the engine or releasing it."""
+    released, ran = [], []
+    w = types.SimpleNamespace(
+        gh=types.SimpleNamespace(add_reaction=lambda i: None, remove_reaction=released.append),
+        counters=types.SimpleNamespace(read=lambda k: 0),
+    )
+    c = types.SimpleNamespace(pr=42, head="a" * 40, contest="thread", contest_reply_id=123)
+    with patch.object(tc.work_units, "run_to_logfile", side_effect=lambda *a, **k: ran.append(a) or 0):
+        out = tc.work_units.do_review(w, None, c, types.SimpleNamespace(work_model="claude"), bubble=False)
+    return [("off: a review of a held contest selects other work", (out, ran, released), (None, [], []))]
 
 
 def main() -> int:
@@ -138,7 +185,7 @@ def main() -> int:
         fails += not ok
         verb = "SKIP" if got else "fire"
         print(f"[{'OK ' if ok else 'BAD'}] {name:<26} -> {verb} (want {'SKIP' if want else 'fire'})")
-    for name, got, want in local_claims():
+    for name, got, want in local_claims() + racing_claims() + review_skips_held_contest():
         ok = got == want
         fails += not ok
         print(f"[{'OK ' if ok else 'BAD'}] {name}" + ("" if ok else f": got {got!r}, want {want!r}"))
