@@ -122,6 +122,33 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
+# 0b) A `~/…` value means the operator's home, also after isolation moves $HOME off macOS.
+tmp = Path(tempfile.mkdtemp())
+saved_env = dict(os.environ)
+try:
+    real = tmp / "real"
+    (real / "usage").mkdir(parents=True)
+    (real / "usage" / ".credentials.json").write_text(login("usage-access"))
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "TAUCETI_DATA_HOME"):
+        os.environ.pop(name, None)
+    os.environ.update({"HOME": str(real), VARIABLE: "~/usage"})
+    with (
+        patch.object(sys, "platform", "linux"),
+        patch.object(tc.agents, "_worker_iso_home", lambda wid, _base=None: tmp / "iso"),
+        patch.object(tc.agents, "share_build_caches", lambda wid, home: {}),
+    ):
+        tc.agents.isolate_home("worker1")
+    check("isolation moved $HOME", os.environ["HOME"], str(tmp / "iso"))
+    check(
+        "the usage login still resolves in the operator's home",
+        tc.quota.claude_usage_credentials(),
+        real / "usage" / ".credentials.json",
+    )
+finally:
+    os.environ.clear()
+    os.environ.update(saved_env)
+    shutil.rmtree(tmp, ignore_errors=True)
+
 
 def cases():
     # 1) Usage is read with the login, shared beside it, and the agents' token is neither sent to
@@ -233,6 +260,30 @@ def cases():
             prov.error,
             f"no {usage_file} (the usage login $TAUCETI_CLAUDE_USAGE_CREDENTIALS names)",
         )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # 5b) Two usage logins kept as files in one directory are two accounts to the cooldowns, unless the
+    #     OAuth block names the account.
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        logins = tmp / "logins"
+        logins.mkdir()
+        (logins / "alice.json").write_text(login("alice-access"))
+        (logins / "bob.json").write_text(login("bob-access"))
+        alice, _, _ = setup(tmp, worker="alice")
+        os.environ[VARIABLE] = str(logins / "alice.json")
+        seen, usage = usage_seen([(429, {}, 3600)])
+        with usage:
+            limited = alice.claude(refresh=True, renew=True)
+        bob, _, _ = setup(tmp, worker="bob")
+        os.environ[VARIABLE] = str(logins / "bob.json")
+        with usage:
+            other = bob.claude(refresh=True, renew=True)
+        check("alice is rate limited", limited.rate_limited, True)
+        check("bob's login is read on its own", seen, ["Bearer alice-access", "Bearer bob-access"])
+        check("bob is not held by alice's cooldown", other.available, True)
+        check("the key is the file", bob._claude_account_key(), f"creds:{logins / 'bob.json'}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
