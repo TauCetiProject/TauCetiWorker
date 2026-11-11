@@ -2,10 +2,13 @@
 """--roadmap-targets: the list format, live statuses, selection, the claim, the prompt and the wiring,
 without GitHub or model access. The fixture is the example in docs/target-lists.md."""
 
+import contextlib
 import importlib
+import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -75,9 +78,9 @@ class Format(unittest.TestCase):
             parsed = t.parse_targets(
                 "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] no slug\n- [ ] `a` - b (needs: c, `d`)\n"
             )
-        self.assertEqual([(it.slug, it.needs) for it in parsed.items()], [("a", ("d",))])
+        self.assertEqual([(it.slug, it.needs) for it in parsed.items()], [("a", ("c", "d"))])
         self.assertIn("1 malformed item line(s), first at line 3", log.call_args_list[0].args[0])
-        self.assertIn("undefined slug(s), which block nothing: d", log.call_args_list[1].args[0])
+        self.assertIn("undefined slug(s), which block nothing: c, d", log.call_args_list[1].args[0])
         with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(tc.Die, "roadmap targets: .*absent.md"):
             t.load_targets(Path(tmp) / "absent.md")
 
@@ -143,6 +146,11 @@ class Selection(unittest.TestCase):
         self.assertEqual(self.slugs(landed, only="any", skip=["MeasureTheory"]), ["strong-law"])
         undefined = t.parse_targets("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — b (needs: `nowhere`)\n")
         self.assertEqual(self.slugs(undefined), ["a"])
+        mixed = t.parse_targets(
+            "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — open\n- [x] `b` — done\n- [ ] `c` — x (needs: a, `b`)\n"
+        )
+        self.assertEqual(mixed.find("c").needs, ("a", "b"))
+        self.assertEqual(self.slugs(mixed), ["a"])
 
     def test_an_empty_offer_says_why(self):
         for only, skip, why in (
@@ -217,20 +225,62 @@ class Round(unittest.TestCase):
             prompt.index("- **Choose a concrete target.** Start with `MeasureTheory`"),
         )
         self.assertEqual(json.loads(self.status.read_text())["roadmap_target"], "MeasureTheory/kolmogorov-zero-one")
-        stem = os.environ["TAUCETI_TARGET_MARKER"]
-        self.assertEqual(prompt.count(stem + "}-->"), 1)
-        self.assertEqual(prompt.count(stem + ',"partial":true}-->'), 1)
-        accepted = [self.wrapper(stem, stem + end) for end in ("}-->", ',"partial":true}-->')]
-        self.assertEqual([*accepted, self.wrapper(stem, stem.replace("zero-one", "zero-two") + "}-->")], [0, 0, 1])
+        required = os.environ["TAUCETI_TARGET_MARKER"]
+        complete, partial = required.splitlines()
+        self.assertEqual(prompt.count(complete), 1)
+        self.assertEqual(prompt.count(partial), 1)
+        self.assertEqual(t.marker_keys(complete), ({("MeasureTheory", "kolmogorov-zero-one")}, set()))
+        self.assertEqual(t.marker_keys(partial)[1], {("MeasureTheory", "kolmogorov-zero-one")})
+        bodies = {
+            f"Adds the law.\n\n{complete}\n": 0,
+            partial: 0,
+            complete.replace("zero-one", "zero-two"): 1,
+            complete[: -len("}-->")]: 1,
+            complete[: -len("-->")]: 1,
+            partial[: -len("}-->")]: 1,
+        }
+        self.assertEqual({body: self.wrapper(required, body) for body in bodies}, bodies)
 
-    def wrapper(self, stem, body):
+    def wrapper(self, required, body):
         """gh-safe-pr-create's verdict on a pull request body, with `true` standing in for gh."""
         if not (self.tmp / "bin").exists():
             (self.tmp / "bin").mkdir()
             (self.tmp / "bin" / "gh").symlink_to(shutil.which("true"))
-        env = {"PATH": f"{self.tmp / 'bin'}:{os.environ['PATH']}", "TAUCETI_TARGET_MARKER": stem}
+        env = {"PATH": f"{self.tmp / 'bin'}:{os.environ['PATH']}", "TAUCETI_TARGET_MARKER": required}
         script = REPO / "scripts" / "gh-safe-pr-create"
         return subprocess.run([script, "--body", body], env=env, capture_output=True).returncode
+
+    def test_the_markers_reach_the_wrapper_in_a_bubble_round(self):
+        """The two-line TAUCETI_TARGET_MARKER through the Bubble command string: built by run_in_bubble's
+        echo path, then sent the way Bubble sends `--command`, as one `bash -lc` string over ssh."""
+        self.author()
+        complete, partial = os.environ["TAUCETI_TARGET_MARKER"].splitlines()
+        (self.tmp / "bin").mkdir()
+        (self.tmp / "bin" / "gh").symlink_to(shutil.which("true"))
+        script = REPO / "scripts" / "gh-safe-pr-create"
+        inner = f'env PATH={self.tmp / "bin"}:"$PATH" {shlex.quote(str(script))} --body "$TCW_BODY"'
+        cfg = SimpleNamespace(state=self.tmp / "state", home=self.tmp / "home", wid="w", logdir=self.tmp / "logs")
+        out = io.StringIO()
+        with (
+            patch.dict(os.environ, TAUCETI_AGENT_ECHO="1"),
+            patch.object(tc.agents, "ensure_bubble_home", lambda _cfg: dict(os.environ)),
+            patch.object(tc.agents, "_bubble_pop", lambda _cfg, _env: None),
+            contextlib.redirect_stdout(out),
+        ):
+            rc = tc.run_in_bubble(
+                SimpleNamespace(cfg=cfg), tc.TAUCETI, "", SimpleNamespace(work_model="claude"), inner_cmd=inner
+            )
+        self.assertEqual(rc, 0)
+        argv = shlex.split(out.getvalue().removeprefix("BUBBLE "))
+        command = argv[argv.index("--command") + 1]
+        self.assertIn("TAUCETI_TARGET_MARKER=", command)
+        remote = shlex.join(["bash", "-lc", f"cd {shlex.quote(str(self.tmp))} && exec {command}"])
+        env = {k: v for k, v in os.environ.items() if k != "TAUCETI_TARGET_MARKER"} | {"HOME": str(self.tmp)}
+        verdicts = {
+            body: subprocess.run(["bash", "-c", remote], env=env | {"TCW_BODY": body}, capture_output=True).returncode
+            for body in (complete, partial, complete[: -len("}-->")])
+        }
+        self.assertEqual(list(verdicts.values()), [0, 0, 1])
 
     def test_live_statuses_reach_the_prompt(self):
         self.w.gh = github(merged=[(7, marker("Probability", "truncation-bounds"))])

@@ -128,8 +128,8 @@ from .targets import (
     landed_pr,
     live_targets,
     load_targets,
-    marker_stem,
     render_assignment,
+    target_markers,
 )
 from .worker_sources import pull_url as source_pull_url
 from .worker_sources import repository_url as source_repository_url
@@ -3109,7 +3109,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         live, item = assign_target(w, targets_path, only, skip)
         only = item.area
         assignment = render_assignment(live, item)
-        os.environ["TAUCETI_TARGET_MARKER"] = marker_stem(item)
+        os.environ["TAUCETI_TARGET_MARKER"] = "\n".join(target_markers(item))
         report_runtime(target=f"new PR (target: {only}/{item.slug})", roadmap_target=f"{only}/{item.slug}")
     elif only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
         only = random_roadmap_area(w, focus=[])
