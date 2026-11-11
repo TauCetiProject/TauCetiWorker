@@ -245,6 +245,7 @@ class SourceGit(unittest.TestCase):
     @unittest.skipUnless(Path("/proc").exists(), "Linux process-group observation")
     def test_real_timeout_terminates_git_helpers_in_the_same_process_group(self):
         import signal
+        import time
 
         pidfile = self.clone / "child.pid"
         program = (
@@ -257,10 +258,18 @@ class SourceGit(unittest.TestCase):
         with self.assertRaises(AmbiguousWrite):
             self.source._git("push", write=True)
         pid = int(pidfile.read_text())
-        try:
-            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-        except (FileNotFoundError, ProcessLookupError):
-            state = "gone"
+
+        def observed():
+            try:
+                return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            except (FileNotFoundError, ProcessLookupError):
+                return "gone"
+
+        # _git returns once the killed helper has closed its pipes, which a dying process does
+        # before it becomes a zombie. A helper that survived the group kill sleeps for a minute.
+        deadline = time.monotonic() + 5
+        while (state := observed()) not in {"gone", "Z"} and time.monotonic() < deadline:
+            time.sleep(0.05)
         if state not in {"gone", "Z"}:
             os.kill(pid, signal.SIGKILL)
         self.assertIn(state, {"gone", "Z"})
