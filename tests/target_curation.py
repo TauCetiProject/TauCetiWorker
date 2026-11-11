@@ -409,6 +409,32 @@ class Publish(Tmp):
         self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", both)
         self.assertIn("- [x] `strong-law`", both)
 
+    def test_a_tracked_list_keeps_its_own_git_settings_inside_a_source_activation(self):
+        from tauceti_worker.source_identity import SourceActor
+        from tauceti_worker.worker_sources import activate
+
+        first = self.clone("first")
+        hook = first.parent / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        token = self.tmp / "native-token"
+        token.write_text("synthetic\n")
+        token.chmod(0o600)
+        native = RepositoryRef(Forge("forgejo", "https://git.example.org"), "one/project")
+        source = Mock(repository=native, token_file=token)
+        source.authenticated_actor.return_value = SourceActor.from_native(
+            native.forge, {"id": 3, "login": "native-bot"}
+        )
+        source.api.request.return_value = {"id": 3, "email": "bot@example.invalid"}
+        source.identity.record.return_value = {}
+        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
+        with activate(source, SimpleNamespace(state=self.tmp / "native-state")):
+            self.assertIsNone(curate.publish(first, EXAMPLE, a, ["n"]))
+            hook.unlink()
+            self.assertEqual(curate.publish(first, EXAMPLE, a, ["n"]), a)
+        self.assertEqual(git(first.parent, "log", "-1", "--format=%an"), "curator")
+        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", a)
+
     def test_a_push_that_loses_the_race_is_retried_after_a_rebase(self):
         first, second = self.clone("first"), self.clone("second")
         a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")

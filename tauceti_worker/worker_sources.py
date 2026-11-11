@@ -26,6 +26,7 @@ from .config import Die, SourceUnavailable
 from .constants import TAUCETI
 
 _selected = contextvars.ContextVar("worker_source", default=None)
+_outer = contextvars.ContextVar("operator_environment", default=None)
 
 
 def current():
@@ -166,6 +167,7 @@ def activate(source, cfg):
         raise SourceUnavailable("the Forgejo worker identity is unavailable")
     original = dict(os.environ)
     marker = _selected.set(source)
+    outer = _outer.set(original)
     try:
         directory = cfg.state / "bin"
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -221,7 +223,15 @@ def activate(source, cfg):
     finally:
         os.environ.clear()
         os.environ.update(original)
+        _outer.reset(outer)
         _selected.reset(marker)
+
+
+def operator_environment() -> dict[str, str]:
+    """The environment as it was before `activate` bound a source: for a subprocess that acts in the
+    operator's own repository (a target list's clone) rather than in the source's workspace."""
+    outer = _outer.get()
+    return dict(os.environ if outer is None else outer)
 
 
 @contextlib.contextmanager

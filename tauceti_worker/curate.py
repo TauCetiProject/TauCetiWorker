@@ -383,10 +383,18 @@ def ask(w, profile, checkout: Path, targets: Targets, candidates: list[tuple[Tar
 
 
 def _git(path: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    """Git in the list's clone, with the operator's identity, credentials and hooks even inside a
+    source's activation."""
+    from .worker_sources import operator_environment
+
     argv = ["git", "-C", str(path.parent), *args]
     try:
         return subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**operator_environment(), "GIT_TERMINAL_PROMPT": "0"},
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         return subprocess.CompletedProcess(argv, 124, "", str(error))
