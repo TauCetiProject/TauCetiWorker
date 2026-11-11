@@ -72,10 +72,8 @@ class SourceClaims(Claims):
 
     def release(self):
         self.stop_heartbeat()
-        if self.lease is not None:
-            self.lease.release()
-            self.lease = None
-        elif self.held and self.held[0].startswith("author/"):
+        lease, self.lease = self.lease, None
+        if self.held and self.held[0].startswith("author/"):
             from .config import log
             from .worker_sources import shared_github_environment
 
@@ -84,6 +82,8 @@ class SourceClaims(Claims):
                     super().release()
             except SourceUnavailable:
                 log(f"claim {self.held[0]}: not released (shared GitHub credentials unavailable); it expires")
+        elif lease is not None:
+            lease.release()
         self.held = None
         for key in ("TAUCETI_CLAIM_KEY", "TAUCETI_CLAIM_REPO"):
             os.environ.pop(key, None)

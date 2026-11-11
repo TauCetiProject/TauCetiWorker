@@ -85,29 +85,35 @@ class ForgejoWorkerSource(ForgejoReadSource):
         return rows
 
     def merged_prs(self, search, *, limit=200):
-        """`GitHub.merged_prs` on this source: number, title, body and URL of merged pull requests whose
-        body contains every quoted phrase of the GitHub-style `search` (its qualifiers are not
-        native and are ignored). A phrase other than the target-marker tag goes to the native
-        keyword search, which reaches a pull request of any age; otherwise the `limit` most
-        recently created merged pull requests are read. Raises SourceUnavailable when it fails."""
+        """`GitHub.merged_prs` on this source: number, title, body and URL of the `limit` most recently
+        created merged pull requests whose body matches the GitHub-style `search` (`body_matches`;
+        its qualifiers are not native and are ignored), among the closed pull requests the client's
+        page bound reaches. One item's search (`landed_pr`) goes to the native keyword search for
+        its slug, which reaches a pull request of any age. Raises SourceUnavailable when it fails."""
         import urllib.parse
 
         from .config import SourceUnavailable
-        from .targets import MARKER_TAG, search_phrases
+        from .targets import MARKER_TAG, body_matches, search_id, search_phrases
 
         phrases = search_phrases(search)
-        keyword = next((p for p in phrases if p != MARKER_TAG), None)
+        keyword = search_id(phrases) or next((p for p in phrases if p != MARKER_TAG), None)
+        if keyword is None:
+            path = f"repos/{self.repository.name}/pulls?state=closed"
+        else:
+            query = urllib.parse.urlencode({"type": "pulls", "state": "closed", "q": keyword})
+            path = f"repos/{self.repository.name}/issues?{query}"
+
+        def merged(row):
+            # A pull listing row says `merged`; an issue search row says it under `pull_request`.
+            return (row if keyword is None else row.get("pull_request") or {}).get("merged") is True
 
         def fetch():
-            if keyword is None:
-                rows = self.api.pulls(self.repository, state="merged", limit=limit)
-            else:
-                query = urllib.parse.urlencode({"type": "pulls", "state": "closed", "q": keyword})
-                rows = []
-                for batch in self.api.pages(f"repos/{self.repository.name}/issues?{query}"):
-                    rows += [r for r in batch if (r.get("pull_request") or {}).get("merged") is True]
-                    if len(rows) >= limit:
-                        break
+            rows = []
+            # Stop at the client's page bound, where `pages` would raise, rather than fail the read.
+            for n, batch in enumerate(self.api.pages(path), 1):
+                rows += [r for r in batch if merged(r) and body_matches(r.get("body") or "", phrases)]
+                if len(rows) >= limit or n >= self.api.max_pages:
+                    break
             return [
                 {
                     "number": r["number"],
@@ -116,7 +122,6 @@ class ForgejoWorkerSource(ForgejoReadSource):
                     "url": self.repository.pull_url(r["number"]),
                 }
                 for r in rows[:limit]
-                if all(p in (r.get("body") or "") for p in phrases)
             ]
 
         rows = self._read("merged_prs", [search, limit], fetch)
