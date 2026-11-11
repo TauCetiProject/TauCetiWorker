@@ -186,7 +186,7 @@ class TaskMember:
     no_repair: bool = False  # the PR opted out of repair: never edited, only emptied with an attribution
     withdrawn: bool = False  # already withdrawn that way: it stays an empty commit
     declaration_names: dict = dataclasses.field(default_factory=dict)
-    source_identity: str = ""
+    source_identity: str | dict = ""
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -223,13 +223,34 @@ class Task:
     extra: dict = dataclasses.field(default_factory=dict)
     warm_revs: list[str] = dataclasses.field(default_factory=list)  # repair outputs to restore, in order
     binding: TaskBinding | None = None
+    mixed_binding: dict | None = None
 
     @classmethod
     def from_json(cls, data: dict) -> Task:
         if not isinstance(data, dict):
             raise ValueError("task record must be an object")
         binding = None
-        if "binding" in data or "schema" in data:
+        mixed_binding = None
+        from .mixed_tasks import SCHEMA as MIXED_SCHEMA
+        from .mixed_tasks import validate as validate_mixed
+
+        if data.get("schema") == MIXED_SCHEMA:
+            from .mixed_identity import decode
+
+            data = json.loads(json.dumps(data), object_hook=decode)
+            validate_mixed(data)
+            mixed_binding = data["mixed_binding"]
+        elif "mixed_binding" in data or any(
+            isinstance(member, dict)
+            and (
+                isinstance(member.get("source_identity"), dict)
+                or str(member.get("source_pr", "")).startswith("forgejo:")
+                and "@" in str(member.get("source_pr", ""))
+            )
+            for member in data.get("members", [])
+        ):
+            raise TaskBindingMismatch("mixed task identity schema was removed")
+        elif "binding" in data or "schema" in data:
             if data.get("schema") != TASK_SCHEMA or "repository" in data:
                 raise TaskBindingMismatch("unknown or downgraded task identity schema")
             binding = TaskBinding.parse(data.get("binding"))
@@ -256,11 +277,21 @@ class Task:
                 }:
                     raise TaskBindingMismatch("task member belongs to another qualified source")
             number = raw.get("number", raw.get("pr"))
+            if mixed_binding is not None:
+                from tauceti_tools.ci_candidate import RepositoryIdentity
+
+                from .mixed_identity import SourceNumber
+
+                source = RepositoryIdentity.parse(raw["source_identity"])
+                if source.repository.forge.kind == "forgejo":
+                    number = SourceNumber(number, source)
             source_pr = raw.get("source_pr") or f"{repository}#{number}"
             members.append(
                 TaskMember(
                     source_pr=str(source_pr),
-                    number=int(number if number is not None else source_pr.rsplit("#", 1)[1]),
+                    number=number
+                    if mixed_binding is not None
+                    else int(number if number is not None else source_pr.rsplit("#", 1)[1]),
                     accepted_head=str(raw.get("accepted_head") or ""),
                     commit=raw.get("commit"),
                     provenance=raw.get("provenance"),
@@ -274,7 +305,9 @@ class Task:
                     declaration_names=raw.get("declaration_names")
                     if isinstance(raw.get("declaration_names"), dict)
                     else {},
-                    source_identity=raw.get("source_identity", "") if binding is not None else "",
+                    source_identity=raw.get("source_identity", "")
+                    if binding is not None or mixed_binding is not None
+                    else "",
                 )
             )
         extra = dict(data.get("extra") or {})
@@ -324,13 +357,24 @@ class Task:
             extra=extra,
             warm_revs=[str(r) for r in (data.get("warm_revs") or extra.get("warm_revs") or []) if r],
             binding=binding,
+            mixed_binding=mixed_binding,
         )
 
     def to_json(self) -> dict:
         record = dataclasses.asdict(self)
         record["members"] = [m.to_json() for m in self.members]
         record.pop("binding")
-        if self.binding is not None:
+        record.pop("mixed_binding")
+        if self.mixed_binding is not None:
+            from .mixed_tasks import SCHEMA
+
+            record.update(schema=SCHEMA, mixed_binding=self.mixed_binding)
+            for member in record["members"]:
+                member["number"] = int(member["number"])
+            from .mixed_identity import encode
+
+            record = encode(record)
+        elif self.binding is not None:
             record.pop("repository")
             record.update(schema=TASK_SCHEMA, binding=self.binding.record())
         else:

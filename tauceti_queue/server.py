@@ -588,6 +588,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin/urgent":
             self._admin_urgent()
             return
+        if path == "/admin/primary":
+            self._admin_primary()
+            return
         if path == "/admin/retry-ci":
             self._admin_retry_ci()
             return
@@ -868,6 +871,19 @@ class Handler(BaseHTTPRequestHandler):
         self._call(
             lambda: self.server.controller.rebuild_head(repo, identity[0], **self._source_task_kwargs(refresh=True))
         )
+
+    def _admin_primary(self) -> None:
+        identity, body = self._authenticated_json()
+        if identity is None or body is None or not self._admin(identity[0]):
+            return
+        if (
+            set(body) != {"primary"}
+            or not isinstance(body["primary"], str)
+            or body["primary"] not in {"github", "forgejo"}
+        ):
+            self._error(400, "body must contain primary: github or forgejo")
+            return
+        self._call(lambda: self.server.controller.change_primary(body["primary"], identity[0]))
 
     def _admin_retry_ci(self) -> None:
         identity, body = self._authenticated_json()

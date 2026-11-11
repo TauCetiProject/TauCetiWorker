@@ -43,6 +43,7 @@ from pathlib import Path
 
 from tauceti_queue import chain as chain_tool
 from tauceti_queue import diagnostics, repair_sandbox, repair_tools
+from tauceti_queue.mixed_identity import public
 
 DEFAULT_REPOSITORY = "TauCetiProject/TauCeti"
 CACHE_DOMAIN = os.environ.get("TAUCETI_CACHE_DOMAIN", "cache.taucetiproject.org")
@@ -350,8 +351,10 @@ def read_chain(clone: Path, base: str, tip: str) -> list[ChainCommit]:
         message, trailers = split_trailers(body)
         pr = None
         if "Source-PR" in trailers:
-            match = re.search(r"#(\d+)\s*$", trailers["Source-PR"])
-            pr = int(match.group(1)) if match else None
+            try:
+                pr = pr_number(trailers["Source-PR"])
+            except (ValueError, IndexError):
+                pr = None
         if pr is None:
             match = SUBJECT_PR.search(subject)
             pr = int(match.group(1)) if match else None
@@ -473,7 +476,9 @@ def owners_of(clone: Path, chain: list[ChainCommit], path: str) -> list[int]:
 
 def pr_number(source_pr: str) -> int:
     """``owner/repo#N`` to ``N``."""
-    return int(source_pr.rsplit("#", 1)[1])
+    from .mixed_identity import from_source_pr
+
+    return from_source_pr(source_pr)
 
 
 def chain_report(
@@ -1168,6 +1173,10 @@ def member_records(
             record["state"] = (
                 MEMBER_STATES[0] if index < stop else MEMBER_STATES[1] if index == stop else MEMBER_STATES[2]
             )
+        from .mixed_identity import SourceNumber
+
+        if isinstance(commit.pr, SourceNumber):
+            record["source_pr"] = commit.pr.source_pr
         records.append(record)
     return records
 
@@ -1232,7 +1241,7 @@ for member, sha in zip(members, shas):
     if len(parents.split()) != 1:
         fail(f"{{where}}: a merge commit; the chain must be linear")
     found = trailers(message)
-    expected_pr = f"{{REPOSITORY}}#{{member['pr']}}"
+    expected_pr = member.get("source_pr") or f"{{REPOSITORY}}#{{member['pr']}}"
     if found.get("Source-PR") != [expected_pr]:
         fail(f"{{where}}: expected one `Source-PR: {{expected_pr}}` trailer (recorded order), found {{found.get('Source-PR')}}")
     if found.get("Accepted-Head") != [member["accepted_head"]]:
@@ -1270,7 +1279,8 @@ if ! in_progress; then
 fi
 while in_progress; do
   sha=$(git rev-parse --verify -q REBASE_HEAD) || break
-  pr=$(git show -s --format=%B "$sha" | sed -n 's/^Source-PR: .*#\\([0-9][0-9]*\\).*$/\\1/p' | head -1)
+  source_pr=$(git show -s --format=%B "$sha" | sed -n 's/^Source-PR: //p' | head -1)
+  case "$source_pr" in forgejo:*@*#*) pr="$source_pr" ;; *) pr="${{source_pr##*#}}" ;; esac
   conflicted=$(git diff --name-only --diff-filter=U)
   if [ -n "$conflicted" ] && ! grep -qx -- "${{pr:-none}}" <<<"$landed"; then
     printf 'stopped at PR #%s, commit %s: resolve the conflict in\n%s\n' "$pr" "${{sha:0:12}}" "$conflicted"; exit 1
@@ -1299,7 +1309,7 @@ def write_listings(
     directory = context.listings_path.parent
     directory.mkdir(parents=True, exist_ok=True)
     context.listings_path.write_text(
-        "".join(json.dumps(record, sort_keys=False) + "\n" for record in member_records(context, chain, landed))
+        "".join(json.dumps(public(record), sort_keys=False) + "\n" for record in member_records(context, chain, landed))
     )
     check = directory / CHECK_FILE
     check.write_text(check_script(context.base, context.repository))
@@ -2330,5 +2340,5 @@ def agent_usage(stream: Path, config_dir: Path | None = None) -> dict:
 def write_record(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(record, indent=1, default=str))
+    tmp.write_text(json.dumps(public(record), indent=1, default=str))
     os.replace(tmp, path)

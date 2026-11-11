@@ -88,6 +88,8 @@ class Config:
     canonical_branch: str = ""  # empty until discovered from the repository
     host: str = ""  # empty: this machine's host name
     publication_enabled: bool = False
+    forgejo_mode: str = "disabled"  # disabled, observe, admit; independent of publication_enabled
+    forgejo_profile: str = ""  # explicit private source/execution profile; never read while disabled
     content_clone: Path = Path("~/.local/share/tauceti-queue/content")
     database: Path = Path("~/.local/state/tauceti-queue/queue.sqlite3")
     credentials_dir: Path = Path("~/.config/tauceti-queue")
@@ -271,6 +273,13 @@ def validate(config: Config, *, check_credentials: bool = True) -> list[str]:
         problems.append("reconcile_interval_seconds must be at least 1")
     if config.review_app_id < 1:
         problems.append("review_app_id must be a positive GitHub App id")
+    if config.forgejo_mode not in {"disabled", "observe", "admit"}:
+        problems.append("forgejo_mode must be disabled, observe or admit")
+    if config.forgejo_mode != "disabled":
+        if not config.forgejo_profile or not Path(config.forgejo_profile).is_absolute():
+            problems.append("enabled Forgejo requires an explicit absolute forgejo_profile path")
+        if config.admission_source != "policy":
+            problems.append("Forgejo requires policy admission")
     if config.admission_source not in ("eligibility", "policy"):
         problems.append("admission_source must be eligibility or policy")
     if not config.admission_rubrics or any(

@@ -5,6 +5,10 @@
 repository = "TauCetiProject/TauCeti"
 # Leave empty to discover the default branch from the repository at start.
 canonical_branch = ""
+# Optional second source. Disabled never reads the private profile or contacts Forgejo.
+# See docs/queue/mixed-sources.md before enabling observe or admit.
+forgejo_mode = "disabled"
+forgejo_profile = ""
 # The host this service runs on, as reported in status; empty means this machine's host name.
 host = ""
 # The cutover flag. false is shadow mode: the service observes, builds batches and reports what
