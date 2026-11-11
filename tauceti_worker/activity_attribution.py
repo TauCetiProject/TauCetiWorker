@@ -481,7 +481,8 @@ def summarize(db, now, windows, column=None, identity=None):
         or db.execute("SELECT 1 FROM meta WHERE key='attribution-report-dirty'").fetchone() is not None
     )
     prior = db.execute("SELECT value FROM meta WHERE key='attribution-report-backfilling'").fetchone()
-    backfilling = history_pending(db) or bool(prior and prior[0] == "1") or not cached
+    no_reports = not cached and db.execute("SELECT 1 FROM attribution_reports LIMIT 1").fetchone() is None
+    backfilling = history_pending(db) or bool(prior and prior[0] == "1") or no_reports
     for key in windows:
         row = values.get(
             key, dict(attribution_version=1, attributed_loc=None, attribution_known_prs=0, attribution_missing_prs=0)

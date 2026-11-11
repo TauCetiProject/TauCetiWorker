@@ -535,6 +535,9 @@ class AttributionTests(unittest.TestCase):
         self.assertIn(("legacy_cost", '["old-1"]'), keys)
         self.assertNotIn(("cost", '["old-1"]'), keys)
         self.assertIn(("cost", '["active"]'), keys)
+        row = a._summary(self.db, self.now)["costs"]["windows"]["total"]
+        self.assertTrue(row["attribution_backfilling"])
+        self.assertIsNone(activity_summary.attributed_rate(row))
 
     def test_live_work_is_processed_before_legacy_backfill(self):
         self.example()
@@ -694,6 +697,16 @@ class AttributionTests(unittest.TestCase):
         adapter.queue(self.db, "cost", ["new-live-session"])
         row = a._summary(self.db, self.now)["costs"]["windows"]["total"]
         self.assertTrue(row["attribution_preparing"])
+        self.assertFalse(row["attribution_backfilling"])
+        self.assertIsNotNone(activity_summary.attributed_rate(row))
+
+    def test_empty_scope_does_not_keep_whole_fleet_backfilling(self):
+        self.example()
+        host = self.prepare()
+        empty = a._summary(self.db, self.now, "scope", "queue-only")
+        self.assertFalse(empty["costs"]["windows"]["total"]["attribution_backfilling"])
+        combined = activity_summary.combine([dict(available=True, summary=host), dict(available=True, summary=empty)])
+        row = combined["summary"]["costs"]["windows"]["total"]
         self.assertFalse(row["attribution_backfilling"])
         self.assertIsNotNone(activity_summary.attributed_rate(row))
 
