@@ -704,7 +704,9 @@ class GlobalMaintenance(unittest.TestCase):
         survey = importlib.import_module("tauceti_worker.survey")
         for recorded, offered in ((HEAD, False), ("b" * 40, True)):
             self.w.counters.unchanged_review_recent = lambda pr, head, recorded=recorded: head == recorded
-            with patch("tauceti_worker.github_state.read_survey", return_value=(True, [row(10, "Other", complete=False)])):
+            with patch(
+                "tauceti_worker.github_state.read_survey", return_value=(True, [row(10, "Other", complete=False)])
+            ):
                 result = survey.survey(
                     self.w.cfg,
                     self.w.gh,
