@@ -714,29 +714,37 @@ def closes_today() -> int:
     )
 
 
+def _closable(gh, pr: int, head: str, login: str) -> str:
+    """ "" or why `pr` cannot be closed as it stands now."""
+    live = gh.pr_view(pr, ["state", "headRefOid", "author", "labels", "isDraft"])
+    if not live or live.get("state") != "OPEN" or live.get("headRefOid") != head:
+        return "it is no longer open at the head the ruling is about"
+    if live.get("isDraft") is not False:
+        return "it is a draft"
+    author = str((live.get("author") or {}).get("login") or "")
+    if not login or author.casefold() != login.casefold():
+        return f"its author is {author or 'unknown'}, not this account"
+    if held := sorted(_labels(live) & HOLD_LABELS):
+        return f"it carries the label {held[0]}"
+    return ""
+
+
 def close_subsumed(gh, pr: int, head: str, subsumed_by: list[int], comment: str, *, login: str) -> tuple[bool, str]:
     """Close `pr`, one of `login`'s own, as subsumed by the merged pull requests `subsumed_by`.
 
     (True, the evidence posted with the closure) or (False, the check that refused). Nothing is
     closed unless closing is switched on, today's limit is not used up, the pull request is open at
     `head`, not a draft, authored by `login` and under no hold label, every subsuming pull request
-    has merged, and between them their diffs add every non-private declaration this one's adds."""
+    has merged, and between them their diffs add every non-private declaration this one's adds. The
+    pull request itself is read again once the diffs are in, immediately before closing."""
     if not close_enabled():
         return False, f"{CLOSE_ENV} is not on"
     if closes_today() >= max_closes():
         return False, f"today's limit of {max_closes()} closure(s) is used"
     named = ", ".join(f"#{n}" for n in subsumed_by)
     with read_context(fresh=True, direct=True):
-        live = gh.pr_view(pr, ["state", "headRefOid", "author", "labels", "isDraft"])
-        if not live or live.get("state") != "OPEN" or live.get("headRefOid") != head:
-            return False, "it is no longer open at the head the ruling is about"
-        if live.get("isDraft") is not False:
-            return False, "it is a draft"
-        author = str((live.get("author") or {}).get("login") or "")
-        if not login or author.casefold() != login.casefold():
-            return False, f"its author is {author or 'unknown'}, not this account"
-        if held := sorted(_labels(live) & HOLD_LABELS):
-            return False, f"it carries the label {held[0]}"
+        if refused := _closable(gh, pr, head, login):
+            return False, refused
         for n in subsumed_by:
             if n == pr or _state(gh, n) != "MERGED":
                 return False, f"#{n} has not merged"
@@ -749,6 +757,9 @@ def close_subsumed(gh, pr: int, head: str, subsumed_by: list[int], comment: str,
     theirs = set().union(*(added_declarations(diff, private=True) for diff in diffs[1:]))
     if missing := sorted(own - theirs):
         return False, f"{named} do not add {', '.join(f'`{name}`' for name in missing[:5])}"
+    with read_context(fresh=True, direct=True):
+        if refused := _closable(gh, pr, head, login):
+            return False, refused
     evidence = f"{named} merged and add all {len(own)} declaration(s) this pull request adds"
     body = (
         f"{comment.strip()}\n\nChecked before closing: {evidence}.\n\n"
@@ -766,9 +777,18 @@ def _own(rd: _Round, incident: dict) -> bool:
 
 
 def _close(rd: _Round, incident: dict, answer: dict) -> tuple[str, dict]:
-    closed, detail = close_subsumed(
-        rd.gh, incident["pr"], incident["head"], answer["subsumed_by"], answer["comment"], login=rd.login
-    )
+    pr, row, claims = incident["pr"], rd.open_prs[incident["pr"]], rd.w.claims
+    owner = (row.get("headRepositoryOwner") or {}).get("login") or ""
+    repository = (row.get("headRepository") or {}).get("name") or ""
+    if not claims.begin_branch_work(pr, incident["head"], row.get("headRefName") or "", owner, repository):
+        return "another worker holds its branch claim", {}
+    try:
+        closed, detail = close_subsumed(
+            rd.gh, pr, incident["head"], answer["subsumed_by"], answer["comment"], login=rd.login
+        )
+    finally:
+        claims.stop_heartbeat()
+        claims.release()
     return ("", {"subsumed_by": answer["subsumed_by"], "evidence": detail}) if closed else (detail, {})
 
 

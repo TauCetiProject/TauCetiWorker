@@ -195,9 +195,11 @@ all of these hold at the moment of closing:
 - `TAUCETI_DECIDE_CLOSE` is on, and fewer than
   `TAUCETI_DECIDE_MAX_CLOSES_PER_DAY` `close` rulings were recorded in the
   directory today (UTC).
+- The worker holds the pull request's branch claim, as a repair round would.
 - A fresh read shows the pull request open, not a draft, at the head the
   incident names, authored by the worker's own account, and under none of the
-  hold labels listed above.
+  hold labels listed above. It is made twice: before the diffs below are read,
+  and again after, immediately before closing.
 - Every pull request the ruling names as subsuming it has merged; a Bors
   landing counts.
 - Every non-private declaration the pull request's diff adds to a `.lean` file

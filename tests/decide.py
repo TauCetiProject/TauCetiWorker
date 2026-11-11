@@ -90,7 +90,11 @@ class Hub:
         return []
 
     def pr_diff(self, n):
+        self.on_diff(n)
         return self.prs[n].get("diff", LEAN)
+
+    def on_diff(self, n):
+        pass
 
     def close_pr(self, n, comment):
         self.closed.append((n, comment))
@@ -103,7 +107,30 @@ def declined(*numbers):
         incidents.record_declined("fix", number, f"head-{number}", message=f"#{number} cannot move")
 
 
-def rounds(tmp, hub, answer=None, *, rc=0, claimed=()):
+class Claims:
+    """The branch claims a round takes: `taken` and `released` list the pull requests, and one in
+    `elsewhere` is held by another worker."""
+
+    def __init__(self, elsewhere=()):
+        self.elsewhere, self.taken, self.released, self.held = set(elsewhere), [], [], None
+
+    def begin_branch_work(self, pr, head, refname, owner, repo):
+        if pr in self.elsewhere:
+            return False
+        self.taken.append(pr)
+        self.held = (f"branch/{pr}", "claims")
+        return True
+
+    def stop_heartbeat(self):
+        pass
+
+    def release(self):
+        if self.held:
+            self.released.append(int(self.held[0].split("/")[1]))
+        self.held = None
+
+
+def rounds(tmp, hub, answer=None, *, rc=0, claimed=(), claims=None):
     """One `decide.run`; `answer` is the answer file's parsed contents. Returns the run's result
     as `rc`, and the packet when the model was asked."""
     seen = {}
@@ -116,7 +143,7 @@ def rounds(tmp, hub, answer=None, *, rc=0, claimed=()):
         (checkout / ROADMAP_DIR / "Probability").mkdir(parents=True, exist_ok=True)
         return True
 
-    w = SimpleNamespace(gh=hub, cfg=SimpleNamespace(state=tmp / "state", wid="w1"))
+    w = SimpleNamespace(gh=hub, cfg=SimpleNamespace(state=tmp / "state", wid="w1"), claims=claims or Claims())
     with (
         patch.object(decide, "_ask", side_effect=ask),
         patch.object(work_units, "_branch_claimed_elsewhere", side_effect=lambda _w, n: n in claimed),
@@ -627,6 +654,13 @@ def test_close(tmp):
     check("it does not add every declaration", attempt(other), (False, "#41 do not add `strong_law`", []))
     check("nothing to compare", attempt(merged(diff="+++ b/README.md\n+words\n"))[::2], (False, []))
     check("an unreadable diff", attempt(merged(diff=None)), (False, "a diff could not be read", []))
+    pushed = merged()
+    pushed.on_diff = lambda n: n == 41 and pushed.prs[1].update(head="pushed")
+    check(
+        "a push while the diffs are read",
+        attempt(pushed),
+        (False, "it is no longer open at the head the ruling is about", []),
+    )
     bors = {"state": "CLOSED", "title": "[Merged by Bors] - the strong law"}
     hub = Hub(p1={}, p41=bors, p42={"state": "MERGED", "diff": ""})
     done, why, closed = attempt(hub, by=(41, 42))
@@ -660,7 +694,9 @@ def test_close(tmp):
         check("…and a close answer closes nothing", (hub.closed, ruling(root)["ruling"]), ([], "escalate"))
     with settings(root, TAUCETI_DECIDE_CLOSE="1"):
         declined(1, 2, 3)
-        seen = rounds(tmp, hub, asked)
+        claims = Claims()
+        seen = rounds(tmp, hub, asked, claims=claims)
+        check("each closure holds the branch claim and lets it go", (claims.taken, claims.released), ([1, 2], [1, 2]))
         allowed = {case["pr"]: "close" in case["allowed"] for case in seen["packet"]["cases"]}
         check("with it, on the account's own pull requests only", allowed, {1: True, 2: True, 3: False})
         value = ruling(root)
@@ -678,6 +714,14 @@ def test_close(tmp):
         )
         rounds(tmp, hub)
         check("the closed pull request's ruling is retired", where(root, "ruling-declined-fix-1.json"), ["acked"])
+        hub.prs[5] = {}
+        declined(5)
+        refused = rounds(tmp, hub, answer((5, "close", {"subsumed_by": [41], "comment": comment})), claims=Claims({5}))
+        check(
+            "a branch another worker claims is not closed",
+            (5 in [n for n, _ in hub.closed], "branch claim" in ruling(root, "declined-fix-5")["note"]),
+            (False, True),
+        )
 
 
 def main():
