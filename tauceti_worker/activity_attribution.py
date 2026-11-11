@@ -87,7 +87,20 @@ def archive_fetch(root):
                     if line.endswith(" " + ref)
                 )
         remote = git / "refs" / "remotes" / "origin" / "main"
-        remote_head = remote.read_text().strip() if remote.is_file() else None
+        remote_head = (
+            remote.read_text().strip()
+            if remote.is_file()
+            else next(
+                (
+                    line.split()[0]
+                    for line in (git / "packed-refs").read_text().splitlines()
+                    if line.endswith(" refs/remotes/origin/main")
+                ),
+                None,
+            )
+            if (git / "packed-refs").is_file()
+            else None
+        )
         if len(fetched) not in (40, 64) or any(c not in "0123456789abcdef" for c in fetched):
             return None
         if head != fetched and head != remote_head:
@@ -110,7 +123,7 @@ def read_record(path):
 
 
 def round_work(row, repo, number):
-    if not isinstance(row, dict):
+    if not isinstance(row, dict) or not isinstance(row.get("ts"), str):
         raise ValueError("invalid review round")
     if row.get("repo") != repo:
         return None
@@ -129,7 +142,9 @@ def round_work(row, repo, number):
     # Cache only a timestamp and pass identity, not the individual review
     # records/IDs. Preparing many worker scopes reuses this compact evidence.
     return dict(
-        at=epoch(row["ts"]), review=hashlib.sha256(json.dumps(sorted(set(ids))).encode()).hexdigest() if ids else None
+        at=epoch(row["ts"]),
+        round_id=row.get("round_id"),
+        review=hashlib.sha256(json.dumps(sorted(set(ids))).encode()).hexdigest() if ids else None,
     )
 
 
@@ -142,6 +157,8 @@ def install(db):
       CREATE TABLE IF NOT EXISTS review_archives(path TEXT PRIMARY KEY,full INTEGER NOT NULL DEFAULT 1);
       CREATE TABLE IF NOT EXISTS review_archive_sources(path TEXT PRIMARY KEY,fetched REAL);
       CREATE TABLE IF NOT EXISTS attribution_worker_paths(worker TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS pr_review_counts(repo TEXT,number INTEGER,head TEXT,count INTEGER,
+        observed REAL,checked REAL,basis TEXT,PRIMARY KEY(repo,number));
       CREATE TABLE IF NOT EXISTS review_archive_checks(repo TEXT,number INTEGER,
         checked REAL,complete INTEGER,fingerprint TEXT,PRIMARY KEY(repo,number));
       CREATE TABLE IF NOT EXISTS review_archive_records(path TEXT,
@@ -151,6 +168,8 @@ def install(db):
     from .activity_attribution_prepare import install as install_adapters
 
     install_adapters(db)
+    if db.execute("INSERT OR IGNORE INTO meta VALUES ('attribution-review-counts-v1','1')").rowcount:
+        db.execute("UPDATE report_pr_refresh SET next_at=0 WHERE next_at IS NULL")
 
 
 def ingest(db, event):
@@ -191,10 +210,18 @@ class CostTargets:
         rid = context.get("round_id") or self.containing(session["worker"], session["started"])
         repo, number = context.get("repository"), context.get("pr")
         if not (repo and type(number) is int and number > 0):
-            targets = {tuple(r) for r in self.db.execute("SELECT repo,number FROM round_prs WHERE round_id=?", (rid,))}
+            phase = session.get("phase", "unknown")
+            creating = phase in AUTHOR_PHASES or phase == "overlap-fix"
+            targets = (
+                set()
+                if creating
+                else {tuple(r) for r in self.db.execute("SELECT repo,number FROM round_prs WHERE round_id=?", (rid,))}
+            )
             round = self.db.execute("SELECT worker,started,finished FROM rounds WHERE id=?", (rid,)).fetchone()
             if round and round[1] is not None and round[2] is not None:
-                for table, field in (("prs", "created"), ("pr_contributions", "at")):
+                for table, field in (
+                    (("prs", "created"),) if creating else (("prs", "created"), ("pr_contributions", "at"))
+                ):
                     targets.update(
                         tuple(r)
                         for r in self.db.execute(
@@ -203,7 +230,16 @@ class CostTargets:
                         )
                     )
             repo, number = next(iter(targets)) if len(targets) == 1 else (None, None)
-        return session["id"], session.get("phase", "unknown"), rid, repo, number
+        phase = session.get("phase", "unknown")
+        if phase == "overlap-fix" and not context.get("pr") and repo:
+            created = self.db.execute(
+                "SELECT 1 FROM prs p JOIN rounds r ON r.id=? WHERE p.repo=? AND p.number=? "
+                "AND p.worker=r.worker AND p.created BETWEEN r.started AND r.finished",
+                (rid, repo, number),
+            ).fetchone()
+            if created:
+                phase = "roadmap"
+        return session["id"], phase, rid, repo, number
 
 
 def prepare_reviews(db, now, priority=()):
@@ -249,6 +285,17 @@ def prepare_reviews(db, now, priority=()):
     pending = list(dict.fromkeys(pending))[:MAX_PRS]
     deadline, remaining = time.monotonic() + MAX_SECONDS, MAX_RECORDS
     for repo, number in pending:
+        counts = db.execute(
+            "SELECT head,count FROM pr_review_counts WHERE repo=? AND number=?", (repo, number)
+        ).fetchone()
+        observed = db.execute("SELECT head FROM prs WHERE repo=? AND number=?", (repo, number)).fetchone()
+        observed = (
+            observed
+            or db.execute("SELECT head FROM pr_observations WHERE repo=? AND number=?", (repo, number)).fetchone()
+        )
+        if counts and counts[1] is not None and observed and observed[0] == counts[0]:
+            db.execute("UPDATE review_archive_checks SET checked=1e99 WHERE repo=? AND number=?", (repo, number))
+            continue
         fingerprints = []
         for root in roots:
             try:
@@ -268,7 +315,13 @@ def prepare_reviews(db, now, priority=()):
                 "SELECT landed,state FROM pr_observations WHERE repo=? AND number=?", (repo, number)
             ).fetchone()
         )
-        settled = bool(landed and landed[0] is not None and fetched >= landed[0] + ARCHIVE_GRACE)
+        settled = bool(
+            landed
+            and (
+                (landed[0] is not None and fetched >= landed[0] + ARCHIVE_GRACE)
+                or (landed[0] is None and landed[1] == "CLOSED")
+            )
+        )
         checked_at = 1e99 if settled else now
         if prior and prior[0] and prior[1] == fingerprint:
             # Archive records are write-if-absent. Unchanged directory entries
@@ -307,7 +360,7 @@ def prepare_reviews(db, now, priority=()):
                         "INSERT OR REPLACE INTO review_archive_records VALUES (?,?,?,?,?)",
                         (key, stamp, repo, number, json.dumps(row)),
                     )
-                except (OSError, ValueError, KeyError, TypeError):
+                except Exception:
                     complete = False
             if not complete:
                 break
@@ -318,6 +371,11 @@ def prepare_reviews(db, now, priority=()):
                 r[0]
                 for r in db.execute("SELECT path FROM review_archive_records WHERE repo=? AND number=?", (repo, number))
                 if r[0] not in found
+                and not any(
+                    Path(r[0]).is_relative_to(root)
+                    for root in roots
+                    if not snapshots or root != max(snapshots)[1] / "records" / "rounds"
+                )
             ]
             db.executemany(
                 "DELETE FROM review_archive_records WHERE path=? AND repo=? AND number=?",
@@ -369,7 +427,7 @@ def calculate(records, now, windows, reference=None):
         ):
             continue
         unit_cost = row["review"] / row["local_runs"] if row["local_runs"] else review_rate
-        outside_runs = row["total_runs"] - row["local_runs"]
+        outside_runs = max(0, row["total_runs"] - row.get("attempted_runs", row["local_runs"]))
         if outside_runs and unit_cost is None:
             continue
         if not row["owned"] and production_rate is None:

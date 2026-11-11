@@ -26,12 +26,16 @@ def install(db):
       CREATE TABLE IF NOT EXISTS attribution_reports(subject TEXT PRIMARY KEY,payload TEXT,next_at REAL);
       CREATE TABLE IF NOT EXISTS attribution_due(repo TEXT,number INTEGER,at REAL,PRIMARY KEY(repo,number));
       CREATE INDEX IF NOT EXISTS attribution_due_at ON attribution_due(at);
+      CREATE INDEX IF NOT EXISTS attribution_round_pr ON round_prs(repo,number);
+      CREATE INDEX IF NOT EXISTS attribution_pr_worker ON prs(worker,created);
+      CREATE INDEX IF NOT EXISTS attribution_contribution_worker ON pr_contributions(worker,at);
       CREATE INDEX IF NOT EXISTS invocation_pr ON invocation_work(repo,number);
       CREATE INDEX IF NOT EXISTS invocation_round ON invocation_work(round_id);
       CREATE INDEX IF NOT EXISTS attribution_session_worker ON cost_sessions(worker,started);
       CREATE INDEX IF NOT EXISTS attribution_round_worker ON rounds(worker,started DESC);
       CREATE INDEX IF NOT EXISTS attribution_archive_next ON review_archive_checks(checked);
     """)
+    upgrade = db.execute("INSERT OR IGNORE INTO meta VALUES ('attribution-triggers-v2','1')").rowcount
     for table, source, keys, fields in (
         ("cost_sessions", "cost", ["id"], ["data", "scope"]),
         ("cost_accruals", "cost", ["id"], None),
@@ -40,6 +44,7 @@ def install(db):
         ("pr_contributions", "receipt", ["repo", "number"], None),
         ("pr_observations", "pr", ["repo", "number"], ["head", "landed", "state"]),
         ("pr_loc", "pr", ["repo", "number"], ["head", "added"]),
+        ("pr_review_counts", "pr", ["repo", "number"], ["head", "count", "observed", "basis"]),
         ("review_archive_records", "pr", ["repo", "number"], ["payload"]),
         ("review_archive_checks", "pr", ["repo", "number"], ["complete"]),
     ):
@@ -51,11 +56,12 @@ def install(db):
                 if fields and action == "UPDATE"
                 else ""
             )
-            if table == "review_archive_checks" and action == "INSERT":
-                changed = " WHEN NEW.complete=1"
+            if upgrade:
+                db.execute(f"DROP TRIGGER IF EXISTS attribution_{table}_{action}")
             db.execute(f"""CREATE TRIGGER IF NOT EXISTS attribution_{table}_{action}
                 AFTER {action} ON {table}{changed} BEGIN
-                INSERT OR IGNORE INTO attribution_dirty VALUES ('{source}',{expression}); END""")
+                INSERT OR IGNORE INTO attribution_dirty VALUES ('{source}',{expression});
+                {f"UPDATE review_archive_checks SET checked=0 WHERE repo={prefix}.repo AND number={prefix}.number;" if table in {"prs", "pr_observations"} else ""} END""")
     if db.execute("INSERT OR IGNORE INTO meta VALUES ('attribution-seed-v1','1')").rowcount:
         db.execute("INSERT OR IGNORE INTO attribution_dirty SELECT 'legacy_cost',json_array(id) FROM cost_sessions")
         db.execute("INSERT OR IGNORE INTO attribution_dirty SELECT 'legacy_receipt',json_array(repo,number) FROM prs")
@@ -64,6 +70,18 @@ def install(db):
         )
         db.execute("INSERT OR IGNORE INTO review_archive_checks SELECT repo,number,0,0,NULL FROM prs")
         db.execute("INSERT OR IGNORE INTO review_archive_checks SELECT repo,number,0,0,NULL FROM pr_contributions")
+
+
+def rebuild_cost_queue(db, active):
+    """Ledger reconstruction is backfill; current paid invocations remain live."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='attribution_dirty'").fetchone():
+        return
+    db.execute(
+        "INSERT OR IGNORE INTO attribution_dirty SELECT 'legacy_cost',key FROM attribution_dirty WHERE source='cost'"
+    )
+    db.execute("DELETE FROM attribution_dirty WHERE source='cost'")
+    for identity in active:
+        queue(db, "cost", [identity])
 
 
 def round_sessions(db, rid, now, source="cost"):
@@ -118,7 +136,7 @@ def invocation(db, identity, legacy=False):
             db.execute("INSERT OR REPLACE INTO invocation_work VALUES (?,?,?,?,?)", row)
         if row[3]:
             queue(db, source, row[3:])
-            if row[1] == "review":
+            if row[1] == "review" and not legacy:
                 db.execute("UPDATE review_archive_checks SET checked=0 WHERE repo=? AND number=?", row[3:])
     else:
         db.execute("DELETE FROM invocation_work WHERE id=?", (identity,))
@@ -163,33 +181,41 @@ def fact(db, key, now):
         if finish > start:
             value *= Decimal(str(max(0, min(finish, end) - start))) / Decimal(str(finish - start))
         row = work.setdefault(
-            (worker, scope), dict(author="0", fix="0", review="0", author_known=False, passes={}, unpriced=False)
+            (worker, scope),
+            dict(author="0", fix="0", review="0", author_known=False, passes={}, attempted={}, unpriced=False),
         )
-        if outcome != "completed":
+        if kind == "review" and rid and value > 0:
+            row["attempted"][rid] = start
+        if outcome not in {"completed", "unconfirmed"}:
             continue  # Failed attempts are charged as overhead, never output.
         row[kind] = str(Decimal(row[kind]) + value)
         if kind == "author":
             row["author_known"] = True
-        if kind == "review" and rid and outcome == "completed" and value > 0:
+        if kind == "review" and rid and value > 0:
             sample = row["passes"].setdefault(rid, dict(cost="0", at=start))
             sample["cost"] = str(Decimal(sample["cost"]) + value)
             sample["at"] = max(start, sample["at"])
     for rid, worker, scope in db.execute(
-        "SELECT r.id,r.worker,r.scope FROM round_prs p JOIN rounds r ON r.id=p.round_id "
-        "WHERE p.repo=? AND p.number=? AND r.kind='review' AND r.outcome='completed' AND r.started<=?",
+        "SELECT DISTINCT r.id,r.worker,r.scope FROM invocation_work w JOIN rounds r ON r.id=w.round_id "
+        "WHERE w.repo=? AND w.number=? AND w.phase='review' AND r.outcome IN ('completed','unconfirmed') "
+        "AND r.started<=? AND NOT EXISTS (SELECT 1 FROM cost_accruals c WHERE c.id=w.id AND CAST(c.cost AS REAL)>0)",
         (*key, end),
     ):
         row = work.setdefault(
-            (worker, scope), dict(author="0", fix="0", review="0", author_known=False, passes={}, unpriced=False)
+            (worker, scope),
+            dict(author="0", fix="0", review="0", author_known=False, passes={}, attempted={}, unpriced=False),
         )
         if rid not in row["passes"]:
             row["unpriced"] = True
     passes = set()
+    archived_rounds = set()
     for row in db.execute("SELECT payload FROM review_archive_records WHERE repo=? AND number=?", key):
         record = json.loads(row[0])
         if record and record["review"]:
             if record["at"] <= end:
                 passes.add(record["review"])
+                if record.get("round_id"):
+                    archived_rounds.add(record["round_id"])
             elif record["at"] > now:
                 future.append(record["at"])
     checked = db.execute("SELECT complete,checked FROM review_archive_checks WHERE repo=? AND number=?", key).fetchone()
@@ -197,14 +223,25 @@ def fact(db, key, now):
     fresh = (
         p.get("landed") is not None and fetched >= p["landed"] + a.ARCHIVE_GRACE and checked and checked[1] >= fetched
     )
+    counter = db.execute("SELECT head,count,observed FROM pr_review_counts WHERE repo=? AND number=?", key).fetchone()
+    cached_counts = bool(
+        counter
+        and counter[1] is not None
+        and counter[0] == p.get("head")
+        and p.get("landed") is not None
+        and counter[2] is not None
+        and counter[2] >= p["landed"]
+    )
     value = dict(
         key=list(key),
         landed=p.get("landed"),
         loc=loc[1] if loc and loc[0] == p.get("head") else None,
         owner=[owned["worker"], owned["scope"]] if owned else None,
         work=[[worker, scope, row] for (worker, scope), row in work.items()],
-        total_runs=len(passes),
-        review_known=bool(checked and checked[0] and passes and fresh),
+        total_runs=counter[1] if cached_counts else len(passes),
+        review_known=cached_counts or bool(checked and checked[0] and passes and fresh),
+        archived_rounds=list(archived_rounds),
+        counter_basis=cached_counts,
     )
     payload = json.dumps(value)
     previous = db.execute("SELECT payload FROM attribution_prs WHERE repo=? AND number=?", key).fetchone()
@@ -233,7 +270,9 @@ def reports(db, now):
         for profile in owners | groups.keys():
             work = groups[profile]
             passes = {}
+            attempted = set()
             for w in work:
+                attempted.update(w.get("attempted", {}))
                 for rid, sample in w["passes"].items():
                     passes[rid] = sample
             row = dict(
@@ -245,6 +284,9 @@ def reports(db, now):
                 review=sum((Decimal(w["review"]) for w in work), Decimal(0)),
                 author_known=any(w["author_known"] for w in work),
                 local_runs=len(passes),
+                attempted_runs=len(attempted)
+                if p.get("counter_basis")
+                else len(set(passes) | (attempted & set(p.get("archived_rounds", [])))),
                 total_runs=p["total_runs"],
                 review_known=p["review_known"]
                 and p["total_runs"] >= len(passes)
@@ -314,6 +356,13 @@ def prepare(db, now):
                 changed = fact(db, key, now) or changed
     for repo, number in db.execute("SELECT repo,number FROM attribution_due WHERE at<=? LIMIT ?", (now, MAX_FACTS)):
         changed = fact(db, (repo, number), now) or changed
+    if changed:
+        db.execute("INSERT OR REPLACE INTO meta VALUES ('attribution-report-dirty','1')")
+    last = db.execute("SELECT value FROM meta WHERE key='attribution-report-last'").fetchone()
+    small = len(db.execute("SELECT 1 FROM attribution_prs LIMIT 129").fetchall()) <= 128
+    pending = db.execute("SELECT 1 FROM meta WHERE key='attribution-report-dirty'").fetchone()
     cached = db.execute("SELECT next_at FROM attribution_reports LIMIT 1").fetchone()
-    if changed or not cached or cached[0] <= now:
+    if not cached or cached[0] <= now or (pending and (small or not last or float(last[0]) <= now - 300)):
         reports(db, now)
+        db.execute("DELETE FROM meta WHERE key='attribution-report-dirty'")
+        db.execute("INSERT OR REPLACE INTO meta VALUES ('attribution-report-last',?)", (str(now),))

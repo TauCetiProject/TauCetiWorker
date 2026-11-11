@@ -459,14 +459,82 @@ class AttributionTests(unittest.TestCase):
 
     def test_unpriced_completed_local_review_is_not_imputed_as_outside_work(self):
         self.example()
+        self.prepare()
         self.db.execute(
             "INSERT INTO rounds(id,worker,scope,kind,started,finished,outcome) VALUES ('unpriced','peer','machine','review',?,?, 'completed')",
             (self.now - 200, self.now - 190),
         )
-        self.event("round_selected", round_id="unpriced", repository=REPO, pr=1, round_type="review", worker="peer")
-        row = self.prepare()["costs"]["windows"]["total"]
+        self.db.execute("INSERT INTO invocation_work VALUES ('lost-paid-invocation','review','unpriced',?,1)", (REPO,))
+        adapter.fact(self.db, (REPO, 1), self.now)
+        adapter.reports(self.db, self.now)
+        row = a._summary(self.db, self.now)["costs"]["windows"]["total"]
         self.assertEqual(row["attribution_missing_prs"], 1)
         self.assertEqual(Decimal(row["estimated_usd"]), 37)
+
+    def test_model_free_completed_review_does_not_make_coverage_incomplete(self):
+        self.example()
+        self.event("round_started", round_id="carry", worker="peer")
+        self.db.execute(
+            "UPDATE rounds SET started=?,finished=?,kind='review',outcome='completed' WHERE id='carry'",
+            (self.now - 200, self.now - 190),
+        )
+        self.event("round_selected", round_id="carry", repository=REPO, pr=1, round_type="review", worker="peer")
+        row = self.prepare()["costs"]["windows"]["total"]
+        self.assertEqual(row["attribution_missing_prs"], 0)
+
+    def test_malformed_shared_record_never_escapes_collector(self):
+        self.example()
+        directory = self.root / "archive" / "records" / "rounds" / "1"
+        (directory / "broken.json").write_text(json.dumps(dict(repo=REPO, pr=1, ts=None, run_ids=["x"])))
+        row = self.prepare()["costs"]["windows"]["total"]
+        self.assertEqual(Decimal(row["estimated_usd"]), 37)
+        self.assertEqual(row["attribution_missing_prs"], 1)
+        with patch.object(attr, "read_record", side_effect=RecursionError("nested input")):
+            attr.prepare_reviews(self.db, self.now + 301)
+
+    def test_failed_archived_local_review_is_not_priced_as_an_outside_review(self):
+        self.example()
+        baseline = Decimal(self.prepare()["costs"]["windows"]["total"]["attributed_loc"])
+        self.cost("bad", 1, "review", 20)
+        self.db.execute("UPDATE rounds SET outcome='waiting' WHERE id='bad'")
+        directory = self.root / "archive" / "records" / "rounds" / "1"
+        (directory / "bad.json").write_text(
+            json.dumps(
+                dict(
+                    repo=REPO,
+                    pr=1,
+                    round_id="bad",
+                    ts=datetime.fromtimestamp(self.now - 190, UTC).isoformat(),
+                    run_ids=["bad-run"],
+                )
+            )
+        )
+        self.now += 301
+        self.db.execute("UPDATE review_archive_checks SET checked=0 WHERE number=1")
+        row = self.prepare()["costs"]["windows"]["total"]
+        self.assertEqual(Decimal(row["estimated_usd"]), 57)
+        self.assertEqual(Decimal(row["attributed_loc"]), baseline)
+
+    def test_pr_created_by_overlap_fix_is_authoring_despite_declined_selections(self):
+        self.pr(1, 1000)
+        self.cost("new-pr", None, "overlap-fix", 10)
+        self.db.execute("UPDATE prs SET created=? WHERE number=1", (self.now - 199,))
+        self.db.execute("INSERT INTO round_prs VALUES ('new-pr',?,999)", (REPO,))
+        self.reviews(1, 0, 1, rid="outside")
+        self.prepare()
+        row = self.db.execute("SELECT phase,repo,number FROM invocation_work WHERE id='new-pr'").fetchone()
+        self.assertEqual(tuple(row), ("roadmap", REPO, 1))
+
+    def test_ledger_rebuild_keys_are_backfill_and_active_keys_stay_live(self):
+        self.example()
+        self.prepare()
+        for identity in ("old-1", "old-2", "active"):
+            adapter.queue(self.db, "cost", [identity])
+        adapter.rebuild_cost_queue(self.db, ["active"])
+        keys = set(map(tuple, self.db.execute("SELECT source,key FROM attribution_dirty")))
+        self.assertIn(("legacy_cost", '["old-1"]'), keys)
+        self.assertNotIn(("cost", '["old-1"]'), keys)
+        self.assertIn(("cost", '["active"]'), keys)
 
     def test_live_work_is_processed_before_legacy_backfill(self):
         self.example()
@@ -484,6 +552,65 @@ class AttributionTests(unittest.TestCase):
         row = a._summary(self.db, self.now)["costs"]["windows"]["total"]
         self.assertGreater(Decimal(row["attributed_loc"]), before)
         self.assertTrue(row["attribution_preparing"])
+
+    def test_cached_shared_counters_work_without_any_local_archive(self):
+        self.example()
+        for number, count in ((1, 3), (2, 24)):
+            self.db.execute(
+                "INSERT INTO pr_review_counts VALUES (?,?,?,?,?,?,?)",
+                (REPO, number, "head", count, self.now, self.now, "scoreboard-round-counters"),
+            )
+        with (
+            patch.object(attr, "archive_fetch", return_value=None),
+            patch.object(attr, "read_record", side_effect=AssertionError("unneeded archive read")),
+        ):
+            row = self.prepare()["costs"]["windows"]["total"]
+        expected = Decimal(15000) * 17 / 31 + Decimal(10000) * 20 / (80 + Decimal(10000) * 10 / 15000)
+        self.assertAlmostEqual(Decimal(row["attributed_loc"]), expected)
+        self.assertEqual(row["attribution_known_prs"], 2)
+
+    def test_counter_measurements_are_bound_to_the_observed_head(self):
+        self.example()
+        self.db.execute(
+            "INSERT INTO pr_review_counts VALUES (?,?,?,?,?,?,?)",
+            (REPO, 1, "old-head", 3, self.now, self.now, "scoreboard-round-counters"),
+        )
+        with patch.object(attr, "archive_fetch", return_value=None):
+            row = self.prepare()["costs"]["windows"]["total"]
+        self.assertEqual(row["attribution_known_prs"], 0)
+        self.assertEqual(row["attribution_missing_prs"], 2)
+
+    def test_existing_observation_batch_imports_counters_once_after_landing(self):
+        self.pr(1, 15000)
+        response = dict(
+            prs=[
+                dict(
+                    number=1,
+                    state="MERGED",
+                    head_sha="head",
+                    observed_at=self.now * 1000,
+                    landed_at=datetime.fromtimestamp(self.now - 100, UTC).isoformat(),
+                    lean_loc=dict(head_sha="head", added=15000, deleted=0),
+                    review_passes=dict(
+                        count=3, boards=1, basis="scoreboard-round-counters", observed_at=self.now * 1000
+                    ),
+                )
+            ],
+            missing=[],
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"TAUCETI_GITHUB_STATE_URL": "https://state.example", "TAUCETI_GITHUB_STATE_TOKEN_FILE": "/not-read"},
+            ),
+            patch.object(a, "observe", return_value=response) as observe,
+        ):
+            a._refresh_prs(self.db, None, self.now, [])
+            self.assertEqual(observe.call_count, 1)
+            a._refresh_prs(self.db, None, self.now + 301, [])
+            self.assertEqual(observe.call_count, 1)
+        row = self.db.execute("SELECT head,count,checked FROM pr_review_counts WHERE number=1").fetchone()
+        self.assertEqual(tuple(row), ("head", 3, self.now))
 
 
 if __name__ == "__main__":

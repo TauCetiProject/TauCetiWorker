@@ -128,30 +128,37 @@ credited LOC = LOC × our PR cost / (our PR cost + outside costs)
 ```
 
 Our PR cost includes authoring, reviews and fixes (`fix`, `fix-ci`, `rebase`,
-`lint-repair`, `overlap-fix`, and recovery continuations), accumulated through landing.
-Only completed rounds enter contribution shares or calibration; failed attempts remain
-fully charged in the spending numerator. Review passes are completed native work rounds,
-counting a pass once even when it launches several model conversations. Every recorded
-review pass counts equally; no verdict or review dimension changes its weight. Total
-observed passes come from production round records already present in the normal
-TauCetiData archive sync's local checkout. Copies of the same record in multiple local
-checkouts count once. Model-free carry/repair records and shadow experiments supply no
-review credit. If the archive contains fewer passes than our recorded completed paid
-passes, attribution stays incomplete until the normal sync catches up. Existing worker
-outboxes are included so unpushed local records are counted, with duplicate pass
-identities removed.
+`lint-repair`, `overlap-fix`, and recovery continuations), accumulated through
+landing. Only completed rounds enter contribution shares or calibration; failed
+attempts remain fully charged in the spending numerator. Local paid review
+passes count once even when they launch several model conversations.
+
+The existing shared-state activity response supplies estimated total review
+passes from cumulative `round` counters on cached scoreboard comments. It
+requires complete cached comment history, current compact fragments, and a
+scoreboard at the observed PR head. Counter granularity can include reply,
+carry and publication-control passes; this is a participation proxy, not an
+exact count of model calls. Every observed pass receives equal weight, with no
+review-quality or dimension judgments. The collector reads the new scalar in
+its existing PR observation batch. Already-landed PRs receive a bounded initial
+observation backfill; incomplete cached histories remain unknown and retry at
+most hourly. No GitHub collection is scheduled by these reads.
+
+Existing full local archive clones and worker outboxes remain a fallback when
+cached counters are unavailable. This fallback deduplicates execution IDs,
+excludes model-free/shadow records, and requires a consistent normal archive
+fetch covering landing plus one minute. It never creates or refreshes a clone.
 
 We use the PR's own measured local cost per review pass where possible. When we did none
 of its reviews, the fallback is our measured average per paid review pass over the last
 seven days, falling back to retained history. The production rate likewise uses local
 authoring plus fixes on measured, locally authored landed PRs from the last seven days,
 with a retained-history fallback. Other contributors' review costs and production costs
-are estimates based on these local measurements, not their actual bills. Archive
-observations may lag until the existing review sync next runs; reporting never fetches
-missing records. Existing Git fetch/HEAD metadata must show a consistent archive
-snapshot fetched at least one minute after landing. Older copies stay explicitly
-incomplete, even when they already contain some reviews. Settled archive measurements
-are parked; new local reviews reopen their PR's measurement.
+are estimates based on these local measurements, not their actual bills. Cached counters require a comment-history verification at or after landing. Archive
+fallback observations may lag until an existing review sync runs; hosts that do not
+push archives may never refresh that fallback. Neither source schedules collection.
+Missing or stale evidence remains explicitly incomplete. Settled measurements are
+parked; new local reviews reopen their PR's measurement.
 
 `Estimated $ / attributed LOC` divides **all** accrued spending by summed credited LOC.
 Unsuccessful work, open/unmerged PRs, unlinked costs, and spending on `bump`,
@@ -179,9 +186,10 @@ Ambiguous links remain unknown; no transcript parsing is used. Archive reads sta
 existing collector, with at most 32 tracked PRs, 256 small round records and a
 one-second archive work budget per pass. Session links and PR facts use a separate
 one-second budget with at most 1,024 changed/backfill sessions and 128 keys per fact
-stage. Backfill progress is explicit. Live session, receipt and PR updates run before historical backfill, so new completions do not wait behind retained history. Quiet passes read cached reports and do not scan
-billing history. Current measured rates are recomputed from compact prepared PR facts
-when evidence or time-window boundaries change; rates are not frozen per PR. Unchanged
+stage. Backfill progress is explicit. Live session, receipt and PR updates run before
+historical backfill. Quiet passes read cached reports and do not scan billing history.
+Current measured rates are recomputed from compact prepared PR facts when evidence or
+time-window boundaries change, at most every five minutes for large histories; rates are not frozen per PR. Unchanged
 archive directories require no enumeration or record reads. The default source is the
 review runner's existing cache; previously recorded worker cache paths are also reused.
 `TAUCETI_ACTIVITY_REVIEW_ARCHIVES` can select already-existing archive checkouts

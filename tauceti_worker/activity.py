@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import signal
 import socket
@@ -453,10 +454,26 @@ def _refresh_prs(db, config, now, errors):
         p = p or h
         checked = max(h["checked"] or 0, p["checked"] or 0)
         loc = db.execute("SELECT head FROM pr_loc WHERE repo=? AND number=?", key).fetchone()
-        settled = p["landed"] is not None and loc and loc[0] == p["head"]
+        counts = db.execute(
+            "SELECT head,count,checked,observed FROM pr_review_counts WHERE repo=? AND number=?", key
+        ).fetchone()
+        landed_loc = p["landed"] is not None and loc and loc[0] == p["head"]
+        settled = (
+            landed_loc
+            and counts
+            and counts[0] == p["head"]
+            and counts[1] is not None
+            and counts[3] is not None
+            and counts[3] >= p["landed"]
+        )
         db.execute(
             "UPDATE report_pr_refresh SET next_at=? WHERE repo=? AND number=?",
-            (None if settled else max(now, checked) + 300, *key),
+            (
+                None
+                if settled
+                else max(now, checked) + (3600 if landed_loc and counts and counts[2] >= p["landed"] else 300),
+                *key,
+            ),
         )
         if settled or checked > now - 300:
             continue
@@ -526,6 +543,29 @@ def _refresh_prs(db, config, now, errors):
                         "UPDATE pr_observations SET state=?,landed=COALESCE(?,landed),observed=?,checked=?,head=?,source=COALESCE(?,source),created=COALESCE(?,created) WHERE repo=? AND number=?",
                         fields,
                     )
+                    counter = p.get("review_passes")
+                    count = counter.get("count") if isinstance(counter, dict) else None
+                    stamp = counter.get("observed_at") if isinstance(counter, dict) else None
+                    valid = (
+                        type(count) is int
+                        and 0 <= count <= 2**53 - 1
+                        and counter.get("basis") == "scoreboard-round-counters"
+                        and type(stamp) in (int, float)
+                        and math.isfinite(stamp)
+                        and stamp >= 0
+                    )
+                    db.execute(
+                        "INSERT INTO pr_review_counts VALUES (?,?,?,?,?,?,?) ON CONFLICT(repo,number) DO UPDATE SET head=excluded.head,count=excluded.count,observed=excluded.observed,checked=excluded.checked,basis=excluded.basis",
+                        (
+                            repo,
+                            p["number"],
+                            p.get("head_sha"),
+                            count if valid else None,
+                            stamp / 1000 if valid else None,
+                            now,
+                            "scoreboard-round-counters" if valid else "unavailable",
+                        ),
+                    )
                     loc = p.get("lean_loc") or git_locs.get(p["number"])
                     if loc is not None:
                         if loc.get("head_sha") != p.get("head_sha") or not all(
@@ -558,10 +598,27 @@ def _refresh_prs(db, config, now, errors):
                 if p is None:
                     p = db.execute("SELECT * FROM pr_observations WHERE repo=? AND number=?", (repo, number)).fetchone()
                 loc = db.execute("SELECT head FROM pr_loc WHERE repo=? AND number=?", (repo, number)).fetchone()
-                settled = p and (p["landed"] is not None and loc and loc[0] == p["head"])
+                counts = db.execute(
+                    "SELECT head,count,checked,observed FROM pr_review_counts WHERE repo=? AND number=?", (repo, number)
+                ).fetchone()
+                landed_loc = p and p["landed"] is not None and loc and loc[0] == p["head"]
+                settled = (
+                    landed_loc
+                    and counts
+                    and counts[0] == p["head"]
+                    and counts[1] is not None
+                    and counts[3] is not None
+                    and counts[3] >= p["landed"]
+                )
                 db.execute(
                     "UPDATE report_pr_refresh SET next_at=? WHERE repo=? AND number=?",
-                    (None if settled else now + 300, repo, number),
+                    (
+                        None
+                        if settled
+                        else now + (3600 if landed_loc and counts and counts[2] >= p["landed"] else 300),
+                        repo,
+                        number,
+                    ),
                 )
     db.execute("INSERT OR REPLACE INTO meta VALUES ('observation_errors',?)", (json.dumps(observation_errors),))
     errors.extend(observation_errors.values())
@@ -786,7 +843,7 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                 _bors(db, errors)
                 try:
                     activity_attribution.prepare(db, now)
-                except (OSError, ValueError, KeyError, sqlite3.Error) as error:
+                except Exception as error:
                     errors.append(
                         "Local attribution preparation failed; retaining last-known summary ("
                         + type(error).__name__
