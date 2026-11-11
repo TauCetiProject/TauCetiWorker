@@ -164,8 +164,9 @@ The answer is `{"rulings": [...]}` with one object per case: `case`, `ruling`,
 | `close` | `subsumed_by`: 1 to 3 pull request numbers; `comment`: 40 to 1500 characters |
 
 The model runs on the host, as `progress` and `overlap-scan` do, with
-`GH_TOKEN` and `GITHUB_TOKEN` removed from its environment. Every write is made
-by the worker, after the checks on this page.
+`GH_TOKEN` and `GITHUB_TOKEN` removed from its environment, and with them the
+copy of the environment from before `--github-account` selected an account.
+Every write is made by the worker, after the checks on this page.
 
 ## What `prerequisite` writes
 

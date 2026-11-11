@@ -23,7 +23,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import tauceti_worker as tc
-from tauceti_worker import agents, cli, decide, incidents, work_units
+from tauceti_worker import agents, cli, decide, github, incidents, work_units
 from tauceti_worker.constants import ROADMAP_DIR, TAUCETI
 from tauceti_worker.targets import parse_targets
 
@@ -535,7 +535,14 @@ def test_model_call(tmp):
     for n in range(decide.KEPT_RUNS + 3):
         (tmp / "state" / "decide" / f"2020010{n:02d}").mkdir(parents=True)
     with (
-        patch.dict(os.environ, {"GH_TOKEN": "secret", "GITHUB_TOKEN": "secret"}),
+        patch.dict(
+            os.environ,
+            {
+                "GH_TOKEN": "secret",
+                "GITHUB_TOKEN": "secret",
+                "_TAUCETI_GITHUB_BASE_ENV": json.dumps({"GH_TOKEN": "secret-before-selection"}),
+            },
+        ),
         patch.object(agents, "run_agent_proc", side_effect=proc),
         patch.object(
             agents, "host_agent_argv", side_effect=lambda prompt, _profile: (["agent", prompt], dict(os.environ))
@@ -552,6 +559,11 @@ def test_model_call(tmp):
     )
     check("the case file holds the packet", load(work / "cases.json"), {"cases": []})
     check("the process is given no GitHub token", {"GH_TOKEN", "GITHUB_TOKEN"} & set(captured["env"]), set())
+    check(
+        "…nor one the account selection kept to restore",
+        "secret" in json.dumps(github.unselected_github_env(captured["env"])),
+        False,
+    )
     check("older run directories are pruned", len(list((tmp / "state" / "decide").iterdir())), decide.KEPT_RUNS)
 
 

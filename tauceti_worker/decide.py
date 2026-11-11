@@ -29,7 +29,7 @@ from pathlib import Path
 from . import incidents
 from .config import Die, GitHubUnavailable, NoProgress, log, roadmap_targets
 from .constants import ROADMAP, ROADMAP_DIR
-from .github import GitHubError, normalize_merged
+from .github import _SELECTION_BASE, GitHubError, normalize_merged
 from .github_transport import read_context
 from .paths import HERE
 from .targets import _AREA_RE, Targets, live_targets, load_targets, parse_targets
@@ -481,8 +481,9 @@ def _ask(w, opts, packet: dict) -> tuple[int, object]:
     prompt = fill_prompt(HERE / "prompts" / "decide.md", CASES=str(work / "cases.json"), RESULT=str(answer))
     profile = _effective_authoring_profile(opts)
     argv, env = host_agent_argv(prompt, profile)
-    # The answer is a file and every write to GitHub is this module's, so the agent gets no token.
-    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+    # The answer is a file and every write to GitHub is this module's, so the agent gets no token,
+    # nor the pre-selection environment `--github-account` keeps, which can hold one.
+    for name in ("GH_TOKEN", "GITHUB_TOKEN", _SELECTION_BASE):
         env.pop(name, None)
     label = f"agent-{profile.provider}"
     rc = run_agent_proc(argv, env=env, cwd=work, logdir=work, label=label, provider=profile.provider, quota_cfg=w.cfg)
