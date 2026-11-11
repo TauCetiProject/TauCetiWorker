@@ -12,7 +12,7 @@ cache (32 GB) and 22 toolchain installs covering 6 distinct toolchains (63 GB).
     scripts/share-build-caches --link --prune  # ... then drop per-worker copies the pool holds
 
 `--link` only ever ADDS names to the pool, and a hardlink is atomic, so it is safe alongside a live
-fleet. `--prune` is not: it deletes, and it must not race a round that is reading or writing what it
+fleet. A toolchain lands whole, by rename, or not at all. `--prune` is not: it deletes, and it must not race a round that is reading or writing what it
 deletes. On a live fleet use `--link` alone: the cache collector already reclaims unused private
 copies at ordinary round boundaries, so there is no need to stop workers to prune. Run `--prune`
 only when no worker rounds are running anyway.
@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import filecmp
 import os
+import shutil
 import stat
 import sys
 from pathlib import Path
@@ -72,6 +73,37 @@ def poolable(rel: Path) -> bool:
     """Is this path one the pool should hold at all? Excludes Lake's mutable per-toolchain store."""
     text = rel.as_posix()
     return not any(part in text for part in EXCLUDED)
+
+
+def publish_toolchains(src: Path, dst: Path, skip=None) -> tuple[int, int]:
+    """`link_into` for elan's `toolchains/`, publishing each toolchain the pool lacks whole or not at
+    all: it is linked into a hidden sibling and renamed into place only if every file linked.
+
+    A Bubble round mounts any pool toolchain with `bin/lean` over the image's own copy, so a partly
+    linked one must never appear under its release name. A toolchain the pool already has is left
+    alone, as elan would leave an installed one."""
+    linked = present = 0
+    if not src.is_dir() or not same_device(src, dst):
+        return (0, 0)
+    dst.mkdir(parents=True, exist_ok=True)
+    for tc in sorted(p for p in src.iterdir() if p.is_dir() and not p.is_symlink()):
+        final = dst / tc.name
+        if final.exists() or final.is_symlink():
+            present += 1
+            continue
+        stage = dst / f".{tc.name}.{os.getpid()}"
+        shutil.rmtree(stage, ignore_errors=True)
+        count, _ = link_into(tc, stage, skip)
+        try:
+            if count != sum(1 for _ in walk(tc, skip)):
+                raise OSError(f"{tc.name}: not every file linked")
+            os.rename(stage, final)
+            linked += count
+        except OSError as e:
+            print(f"    ! {tc.name}: not pooled ({e})", file=sys.stderr)
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+    return (linked, present)
 
 
 def classify(src: Path, dst: Path) -> tuple[list[Path], list[Path], int]:
@@ -159,7 +191,8 @@ def main() -> int:
                     print(f"  {name}: SKIPPED — {s} and {d} are on different filesystems")
                     continue
                 if args.link:
-                    linked, present = link_into(s, d, skip=lambda rel: not poolable(rel))
+                    publish = publish_toolchains if sub == Path("toolchains") else link_into
+                    linked, present = publish(s, d, skip=lambda rel: not poolable(rel))
                     total_linked += linked
                     print(f"  {name}: linked {linked}, already pooled {present}")
                 prunable, unmatched, reclaimable = classify(s, d)

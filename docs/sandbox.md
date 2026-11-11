@@ -86,7 +86,9 @@ read-only at the same name under `/home/user/.elan/toolchains` in code-writing
 rounds, so a toolchain the host has installed is available without a download.
 A toolchain present in both places is served from the host's copy. A toolchain
 registered with `elan toolchain link` is not mounted, since elan inside the
-container would read its name as a release to download. The setting
+container would read its name as a release to download. A toolchain still
+being installed by elan or pooled by `scripts/share-build-caches --link` sits
+under a temporary name until it is complete and is not mounted. The setting
 applies on Linux hosts only and adds one disk device per toolchain; review
 rounds are unaffected.
 

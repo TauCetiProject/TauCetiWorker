@@ -7,6 +7,8 @@ as tests/bubble_cache.py does. Exit 0 = the argv agrees; 1 = a mismatch.
 """
 
 import contextlib
+import importlib.machinery
+import importlib.util
 import io
 import os
 import shlex
@@ -97,6 +99,53 @@ try:
         _, specs = mounts()
         check("a linked toolchain is not mounted", not any("/.elan/toolchains/local" in spec for spec in specs))
         check("the other toolchains still are", [s for s in specs if "/.elan/" in s] == toolchains)
+        (pool / "toolchains" / "local").unlink()
+
+        # A worker's private toolchain folded into the pool by `scripts/share-build-caches --link`,
+        # with linking failing part-way (a full disk, say): the pool must not show it at all.
+        loader = importlib.machinery.SourceFileLoader("share_build_caches", str(REPO / "scripts/share-build-caches"))
+        share = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(share)
+        private = tmp / "worker" / "toolchains"
+        migrating = private / "leanprover--lean4---v4.36.0"
+        (migrating / "lib" / "lean").mkdir(parents=True)
+        (migrating / "bin").mkdir()
+        (migrating / "bin" / "lean").write_text("#!/bin/sh\n")
+        (migrating / "lib" / "lean" / "libleanshared.so").write_text("")
+        real_link = os.link
+
+        def no_space(src, dst, *a, **kw):
+            if str(src).endswith(".so"):
+                raise OSError(28, "No space left on device")
+            return real_link(src, dst, *a, **kw)
+
+        with patch.object(os, "link", no_space), contextlib.redirect_stderr(io.StringIO()):
+            share.publish_toolchains(private, pool / "toolchains")
+        check(
+            "a failed migration leaves no toolchain in the pool",
+            sorted(p.name for p in (pool / "toolchains").iterdir())
+            == sorted([*complete, "leanprover--lean4---v4.35.0", "leanprover--lean4---v4.35.tmp"]),
+        )
+        check("so it is not mounted", [s for s in mounts()[1] if "/.elan/" in s] == toolchains)
+        hidden = pool / "toolchains" / ".leanprover--lean4---v4.36.0.1"
+        (hidden / "bin").mkdir(parents=True)
+        (hidden / "bin" / "lean").write_text("#!/bin/sh\n")
+        check("a migration still staging is not mounted", [s for s in mounts()[1] if "/.elan/" in s] == toolchains)
+        shutil.rmtree(hidden)
+        linked, _ = share.publish_toolchains(private, pool / "toolchains")
+        check(
+            "a complete migration lands under the release name",
+            linked == 2 and (pool / "toolchains" / migrating.name / "lib" / "lean" / "libleanshared.so").is_file(),
+        )
+        check(
+            "and is mounted",
+            f"{pool}/toolchains/{migrating.name}:/home/user/.elan/toolchains/{migrating.name}:ro" in mounts()[1],
+        )
+        check(
+            "no staging directory is left behind",
+            not any(p.name.startswith(".") for p in (pool / "toolchains").iterdir()),
+        )
+
         os.environ["ELAN_HOME"] = str(tmp / "missing")
         check("a missing pool mounts none", not any("/.elan/" in spec for spec in mounts()[1]))
 finally:

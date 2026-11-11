@@ -2278,7 +2278,8 @@ def pooled_toolchain_mounts() -> list[str]:
     `elan toolchain link` is left out: elan reads a custom name only from a symlink, and a bind
     mount presents a directory, which elan would take for a release to download. Elan unpacks an
     install into a `<name>.tmp` sibling and renames it on completion, so that name can vanish
-    between listing and mounting."""
+    between listing and mounting; `scripts/share-build-caches` stages in a hidden sibling the same
+    way. A final name is assumed complete, since both producers only ever rename a whole one in."""
     if os.environ.get("TAUCETI_BUBBLE_TOOLCHAINS", "0") != "1" or not sys.platform.startswith("linux"):
         return []
     pool = build_caches.elan_pool(_host_home(), os.environ) / "toolchains"
@@ -2286,7 +2287,11 @@ def pooled_toolchain_mounts() -> list[str]:
         names = sorted(
             d.name
             for d in pool.iterdir()
-            if ":" not in d.name and d.suffix != ".tmp" and not d.is_symlink() and (d / "bin" / "lean").is_file()
+            if ":" not in d.name
+            and not d.name.startswith(".")
+            and d.suffix != ".tmp"
+            and not d.is_symlink()
+            and (d / "bin" / "lean").is_file()
         )
     except OSError:
         return []
