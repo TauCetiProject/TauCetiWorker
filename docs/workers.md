@@ -615,7 +615,9 @@ GitHub account's backlog in that file, where `workers status --json` shows it:
 The counts come from the inventory the survey already holds and cost no GitHub
 request. A round that surveys named PRs or a Fleet focus area, or that reads a
 retained snapshot while shared GitHub state is unavailable, leaves all four
-fields as they were, so `survey_at` gives their age.
+fields as they were, so `survey_at` gives their age. Each managed start resets
+them to `null` until that start's first such survey, so they never describe an
+account or scope the worker had before.
 
 Work rounds read kernel resource counters at start and finish, with live refreshes once a
 minute. Telemetry never scans the host process table. Live statistics appear under
