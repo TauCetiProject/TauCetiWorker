@@ -213,6 +213,7 @@ RUN_STDLIB=(
   review_diagnostics.py
   review_provider_down.py
   review_outcomes.py
+  review_unchanged_memo.py
   synchronous_state_repair.py
   review_scheduling.py
   review_state_freshness.py
