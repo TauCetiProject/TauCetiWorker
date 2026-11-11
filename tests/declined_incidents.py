@@ -72,7 +72,7 @@ RAW = [pr(1, conflicting=True), pr(2, build="FAILURE"), pr(3, build="SUCCESS"), 
 SPENT = {"fix-4-head-4": tc.MAX_FIX_ATTEMPTS}
 
 
-def classify():
+def classify(repository=None):
     reviews = SimpleNamespace(
         observe=lambda _prs: None,
         gh_meta=lambda number: Meta({"head_sha": f"head-{number}" if number > 2 else ""}, "fresh"),
@@ -81,8 +81,8 @@ def classify():
     )
     with patch.object(survey_mod, "me", lambda: "me"):
         sv = survey_mod.survey(
-            SimpleNamespace(wid="test"),
-            SimpleNamespace(open_prs=lambda: RAW),
+            SimpleNamespace(wid="test", state=Path("/nonexistent")),
+            SimpleNamespace(open_prs=lambda: RAW, repository=repository),
             reviews,
             SimpleNamespace(read=lambda name: SPENT.get(name, 0)),
             stages=["rebase", "fix", "fix-ci"],
@@ -211,6 +211,13 @@ def test_survey(root):
         for stage, number in (("rebase", 1), ("fix-ci", 2), ("fix", 3), ("fix", 4)):
             incidents.record_declined(stage, number, "an-earlier-head", message="declined")
         check("a new head is offered again", classify()[0], everything)
+        for stage, number in (("rebase", 1), ("fix-ci", 2), ("fix", 3), ("fix", 4)):
+            incidents.record_declined(stage, number, f"head-{number}", message="declined", repository=FORGEJO)
+        check(
+            "the classification holds by the surveyed source's records only",
+            (classify()[0], classify(FORGEJO)[0]["fix"]),
+            (everything, ([], [3, 4])),
+        )
 
 
 def test_round(root, tmp):

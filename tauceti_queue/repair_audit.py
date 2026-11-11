@@ -73,6 +73,7 @@ def write_settings(
     lake: tuple[str, ...] = ("lake",),
     logdir: Path | None = None,
     checks_owner: str = "worker",
+    policy_file: Path | None = None,
 ) -> Path:
     """``.tauceti-repair/audit.json``: the base the lint scope is taken against, where the TauCetiTools
     checkouts live and the Lake command, for ``.tauceti-repair/build``."""
@@ -81,6 +82,8 @@ def write_settings(
     settings = {"base": base, "tools_root": str(tools_root), "lake": list(lake), "checks_owner": checks_owner}
     if logdir is not None:
         settings["logdir"] = str(logdir)
+    if policy_file is not None:
+        settings["policy_file"] = str(policy_file)
     path.write_text(json.dumps(settings))
     return path
 
@@ -90,7 +93,42 @@ def read_settings(worktree: Path) -> dict | None:
         data = json.loads((worktree / repair_tools.TOOLS_DIR / SETTINGS_FILE).read_text())
     except (OSError, ValueError):
         return None
-    return data if isinstance(data, dict) and data.get("base") and data.get("tools_root") else None
+    if not isinstance(data, dict) or not data.get("base") or not data.get("tools_root"):
+        return None
+    if data.get("policy_file"):
+        try:
+            policy = json.loads(Path(data["policy_file"]).read_text())
+            if isinstance(policy, dict) and policy.get("checks_owner") in ("worker", "staging"):
+                data["checks_owner"] = policy["checks_owner"]
+        except (OSError, ValueError, TypeError):
+            pass
+    return data
+
+
+def update_checks_owner(path: Path, owner: str | None) -> None:
+    """Refresh the existing helper settings when claim renewal changes check priority."""
+    if owner not in ("worker", "staging"):
+        return
+    temporary = None
+    try:
+        settings = json.loads(path.read_text())
+        if settings.get("checks_owner") == owner:
+            return
+        settings["checks_owner"] = owner
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(settings, stream)
+        os.replace(temporary, path)
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass  # The next renewal retries; a settings write never loses the claim.
+    finally:
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                temporary.unlink(missing_ok=True)
+
+
+def checks_deferred(worktree: Path) -> bool:
+    return (read_settings(worktree) or {}).get("checks_owner") == "staging"
 
 
 # ----------------------------------------------------------------------------------------------
@@ -186,8 +224,22 @@ def _sandboxed(
     timeout: float | None,
     *,
     read_only_build: bool = False,
+    defer_when=None,
 ) -> dict:
     """``argv`` in the build sandbox with ``extra`` set inside it; output to ``log``."""
+    should_defer = defer_when or functools.partial(checks_deferred, worktree)
+    if read_only_build and should_defer():
+        now = time.time()
+        return {
+            "rc": 0,
+            "deferred": True,
+            "sampled_peak_rss_bytes": 0,
+            "seconds": 0.0,
+            "started_at": now,
+            "finished_at": now,
+            "log": str(log),
+            "output": "",
+        }
     extra = {k: str(v) for k, v in (extra or {}).items()}
     run_env = {**env, **extra}
     wrapped = repair_sandbox.sandboxed_lake([str(a) for a in argv], worktree, run_env, extra_env=extra)
@@ -200,6 +252,7 @@ def _sandboxed(
     started = time.monotonic()
     started_at = time.time()
     peak = 0
+    deferred = False
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("ab") as handle:
         handle.write(f"$ {' '.join(str(a) for a in argv)}\n".encode())
@@ -211,6 +264,10 @@ def _sandboxed(
             ) as proc:
                 try:
                     while True:
+                        if read_only_build and should_defer():
+                            deferred = True
+                            rc = 0
+                            break
                         peak = max(peak, process_tree_rss(proc.pid))
                         if timeout is not None and time.monotonic() - started >= timeout:
                             raise subprocess.TimeoutExpired(wrapped, timeout)
@@ -234,6 +291,7 @@ def _sandboxed(
         output = handle.read().decode("utf-8", errors="replace")
     return {
         "rc": rc,
+        "deferred": deferred,
         "sampled_peak_rss_bytes": peak,
         "seconds": round(time.monotonic() - started, 1),
         "started_at": started_at,
@@ -375,12 +433,16 @@ def check(
     logdir: Path,
     lake: tuple[str, ...] = ("lake",),
     timeout: float | None = None,
+    defer_when=None,
 ) -> dict:
     """CI's audits and full environment lint, over the environment already built
     in ``worktree``; the caller holds the build lock. ``status`` is ``passed``, ``failed`` (``diagnostics``
     lists the findings in the controller's shape) or ``unavailable`` (``reason``)."""
     started = time.monotonic()
     record: dict = {"status": "passed", "diagnostics": []}
+    should_defer = defer_when or functools.partial(checks_deferred, worktree)
+    if should_defer():
+        return {"status": "deferred", "diagnostics": [], "seconds": 0.0}
     from tauceti_queue import repair_publish
 
     publication = repair_publish.start_early(worktree, env)
@@ -393,9 +455,13 @@ def check(
         record["tools"] = f"{repo}@{ref}"
         checkout = tools_checkout(tools_root, repo, ref)
         record["tools_seconds"] = round(time.monotonic() - setup_started, 3)
+        if should_defer():
+            return dict(record, status="deferred", seconds=round(time.monotonic() - started, 1))
         materialize_started = time.monotonic()
         scripts = materialize(checkout, worktree, work / "scripts")
         record["materialize_seconds"] = round(time.monotonic() - materialize_started, 3)
+        if should_defer():
+            return dict(record, status="deferred", seconds=round(time.monotonic() - started, 1))
         drivers_started = time.monotonic()
         drivers, built = build_drivers(worktree, scripts, env, ref, logdir / "audit-drivers.log", timeout)
         record["drivers_seconds"] = round(time.monotonic() - drivers_started, 3)
@@ -424,6 +490,7 @@ def check(
         logdir / "audit.log",
         timeout,
         read_only_build=True,
+        defer_when=should_defer,
     )
     # The task has no frozen GitHub label/branch policy that could justify scoped
     # lint. Use staging's conservative full-library fallback, including unchanged
@@ -445,6 +512,7 @@ def check(
         logdir / "lint-env.log",
         timeout,
         read_only_build=True,
+        defer_when=should_defer,
     )
     record["driver_key"] = _driver_key(worktree, ref)
     record["rss_sampling"] = RSS_SAMPLING
@@ -461,13 +529,15 @@ def check(
             shutil.copyfile(phases_path, phase_record)
     with contextlib.suppress(OSError):
         shutil.copyfile(phases_path, logdir / "audit-phases.tsv")
-    found = findings_of("audit", "audit-driver", audit)
+    found = [] if audit.get("deferred") else findings_of("audit", "audit-driver", audit)
     record["audit"] = {k: v for k, v in audit.items() if k != "output"} | {"findings": len(found)}
     record["diagnostics"] += found
-    found = findings_of("lint", "lint-env.sh", lint)
+    found = [] if lint.get("deferred") else findings_of("lint", "lint-env.sh", lint)
     record["lint"] = {k: v for k, v in lint.items() if k != "output"} | {"scope": "full", "findings": len(found)}
     record["diagnostics"] += found
-    record["status"] = "failed" if record["diagnostics"] else "passed"
+    record["status"] = (
+        "deferred" if audit.get("deferred") or lint.get("deferred") else "failed" if record["diagnostics"] else "passed"
+    )
     record["seconds"] = round(time.monotonic() - started, 1)
     with contextlib.suppress(OSError):
         (logdir / "checks-timing.json").write_text(
@@ -501,7 +571,7 @@ def audit_phases(path: Path, run: dict) -> list[dict]:
             "name": name,
             "started_at": stamp,
             "seconds": round((events[index + 1][1] if index + 1 < len(events) else run["finished_at"]) - stamp, 3),
-            "complete": index + 1 < len(events) or run["rc"] == 0,
+            "complete": index + 1 < len(events) or run["rc"] == 0 and not run.get("deferred"),
         }
         for index, (name, stamp) in enumerate(events)
     ]
@@ -541,6 +611,7 @@ def verify(
     timeout: float | None = None,
     lock: Path | None = None,
     audits: bool = True,
+    defer_when=None,
 ) -> dict:
     """The worker's verification: hold the build lock, run the whole-library ``lake build --iofail`` in
     the sandbox and, when it is green and ``audits``, ``check``. ``ok`` is false when the build failed or a
@@ -568,7 +639,16 @@ def verify(
             ]
             record["ok"] = False
         elif audits:
-            checks = check(worktree, env, base=base, tools_root=tools_root, logdir=logdir, lake=lake, timeout=timeout)
+            checks = check(
+                worktree,
+                env,
+                base=base,
+                tools_root=tools_root,
+                logdir=logdir,
+                lake=lake,
+                timeout=timeout,
+                defer_when=defer_when,
+            )
             record["checks"] = {k: v for k, v in checks.items() if k != "diagnostics"}
             record["diagnostics"] = checks["diagnostics"]
             record["ok"] = checks["status"] != "failed"

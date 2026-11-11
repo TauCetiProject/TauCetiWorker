@@ -65,7 +65,7 @@ def classify(record, stages, reviews=None, rounds=0, attempts=100):
             json.dumps({"prs": {"1": {"rounds": [{"ts": datetime.now(UTC).isoformat()} for _ in range(rounds)]}}})
         )
         return s.survey(
-            SimpleNamespace(wid="test", store_dir=Path(directory)),
+            SimpleNamespace(wid="test", store_dir=Path(directory), state=Path(directory)),
             SimpleNamespace(open_prs=lambda: [record], fresh_claim_age=lambda _: None),
             reviews or Reviews(),
             SimpleNamespace(read=lambda _: attempts),
