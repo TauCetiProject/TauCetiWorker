@@ -184,6 +184,28 @@ class Settle(unittest.TestCase):
         self.assertEqual(t.parse_targets(out).find("truncation-bounds").status, "open")
 
 
+class NativeReferences(unittest.TestCase):
+    def test_a_forgejo_url_matches_whatever_the_case_of_its_repository(self):
+        repo = RepositoryRef(Forge("forgejo", "https://git.example.org"), "taucetiproject/tauceti")
+        canonical = "https://git.example.org/TauCetiProject/TauCeti/pulls/12"
+        source = curate.Source(None, repo, native=True)
+        self.assertEqual((source.number(canonical), source.number(repo.pull_url(12))), (12, 12))
+        listed = EXAMPLE.replace(
+            "- [ ] `kolmogorov-zero-one` — tail events have probability 0 or 1 (serves: G2;",
+            f"- [ ] `kolmogorov-zero-one` — tail events have probability 0 or 1 (serves: G2; partial: {canonical};",
+        )
+        out, _ = settled(listed, seen(merged=[(repo.pull_url(12), marker("MeasureTheory", "kolmogorov-zero-one"))]))
+        self.assertEqual(out, listed)
+        inflight = EXAMPLE.replace("in flight: #1234", f"in flight: {canonical}")
+        body = marker("Probability", "truncation-bounds", partial=True)
+        out, _ = settled(inflight, seen(pulls={canonical: {"state": "MERGED", "body": body}}))
+        self.assertIn(f"(needs: none; partial: {canonical})", out)
+        named = inflight.replace("(needs: none;", f"(needs: none; partial: {canonical};")
+        out, _ = settled(named, seen(pulls={canonical: {"state": "MERGED", "body": ""}}))
+        self.assertIn(f"(needs: none; partial: {canonical})", out)
+        self.assertEqual(t.parse_targets(out).find("truncation-bounds").status, "open")
+
+
 class Records(Tmp):
     def setUp(self):
         super().setUp()

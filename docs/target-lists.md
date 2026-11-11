@@ -56,7 +56,8 @@ first `## ` heading is shown to the agent with the items of its area.
   or `none`. `partial: #N, #M` names merged pull requests that did not complete
   the item. `in flight: #N` on a `[~]` item names the pull request it waits on,
   which is how [curation](#curation) follows it. A GitHub pull request is named
-  `#N` in these clauses and a Forgejo one by its URL. Every other clause is
+  `#N` in these clauses and a Forgejo one by its URL, which curation matches in
+  any case. Every other clause is
   passed to the agent as written.
 - An item line that does not parse is logged and skipped. A `needs:` slug the
   file never defines is logged and blocks nothing.
