@@ -142,7 +142,8 @@ exact count of model calls. Every observed pass receives equal weight, with no
 review-quality or dimension judgments. The collector reads the new scalar in
 its existing PR observation batch. Already-landed PRs receive a bounded initial
 observation backfill; incomplete cached histories remain unknown and retry at
-most hourly. No GitHub collection is scheduled by these reads.
+most hourly for a week after landing, with one initial read for older landed PRs.
+Existing verified LOC at the same head is retained without re-measurement. No GitHub collection is scheduled by these reads.
 
 Existing full local archive clones and worker outboxes remain a fallback when
 cached counters are unavailable. This fallback deduplicates execution IDs,

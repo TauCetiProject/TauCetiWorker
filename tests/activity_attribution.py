@@ -602,6 +602,59 @@ class AttributionTests(unittest.TestCase):
         self.assertTrue(row["attribution_preparing"])
         self.assertIsNotNone(self.db.execute("SELECT 1 FROM meta WHERE key='attribution-report-dirty'").fetchone())
 
+    def test_counter_is_at_least_our_observed_local_passes(self):
+        self.example()
+        self.db.execute(
+            "INSERT INTO pr_review_counts VALUES (?,?,?,?,?,?,?)",
+            (REPO, 2, "head", 3, self.now, self.now, "scoreboard-round-counters"),
+        )
+        row = self.prepare()["costs"]["windows"]["total"]
+        self.assertEqual(row["attribution_known_prs"], 2)
+
+    def test_older_prepared_fact_shapes_do_not_freeze_reports(self):
+        self.example()
+        self.prepare()
+        for repo, number, payload in self.db.execute("SELECT repo,number,payload FROM attribution_prs").fetchall():
+            value = json.loads(payload)
+            value["archived_rounds"] = ["old-archive-id"]
+            for _, _, work in value["work"]:
+                work["attempted"] = {"old-native-id": 12345.0}
+            self.db.execute(
+                "UPDATE attribution_prs SET payload=? WHERE repo=? AND number=?", (json.dumps(value), repo, number)
+            )
+        adapter.reports(self.db, self.now)
+        self.assertIsNotNone(self.db.execute("SELECT payload FROM attribution_reports LIMIT 1").fetchone())
+
+    def test_counter_only_refresh_reuses_loc_and_parks_old_landings(self):
+        self.pr(1, 15000, age=8 * 86400)
+        response = dict(
+            prs=[
+                dict(
+                    number=1,
+                    state="MERGED",
+                    head_sha="head",
+                    observed_at=self.now * 1000,
+                    landed_at=datetime.fromtimestamp(self.now - 8 * 86400, UTC).isoformat(),
+                    lean_loc=None,
+                )
+            ],
+            missing=[],
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"TAUCETI_GITHUB_STATE_URL": "https://state.example", "TAUCETI_GITHUB_STATE_TOKEN_FILE": "/not-read"},
+            ),
+            patch.object(a, "observe", return_value=response) as observe,
+            patch.object(a.activity_git, "measure", return_value={}) as measure,
+        ):
+            a._refresh_prs(self.db, None, self.now, [])
+            self.assertEqual(measure.call_args.args[2], [])
+            a._refresh_prs(self.db, None, self.now + 3601, [])
+            self.assertEqual(observe.call_count, 1)
+        self.assertEqual(self.db.execute("SELECT added FROM pr_loc WHERE number=1").fetchone()[0], 15000)
+        self.assertIsNone(self.db.execute("SELECT next_at FROM report_pr_refresh WHERE number=1").fetchone()[0])
+
     def test_existing_observation_batch_imports_counters_once_after_landing(self):
         self.pr(1, 15000)
         response = dict(

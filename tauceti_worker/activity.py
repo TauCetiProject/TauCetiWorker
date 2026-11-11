@@ -466,16 +466,17 @@ def _refresh_prs(db, config, now, errors):
             and counts[3] is not None
             and counts[3] >= p["landed"]
         )
+        expired = bool(landed_loc and counts and counts[2] >= p["landed"] and now > p["landed"] + 7 * 86400)
         db.execute(
             "UPDATE report_pr_refresh SET next_at=? WHERE repo=? AND number=?",
             (
                 None
-                if settled
+                if settled or expired
                 else max(now, checked) + (3600 if landed_loc and counts and counts[2] >= p["landed"] else 300),
                 *key,
             ),
         )
-        if settled or checked > now - 300:
+        if settled or expired or checked > now - 300:
             continue
         spec = specs.get(worker)
         url = getattr(spec, "github_state_url", None) or os.environ.get("TAUCETI_GITHUB_STATE_URL")
@@ -517,7 +518,14 @@ def _refresh_prs(db, config, now, errors):
                     p["number"] not in batch or p.get("state") not in ("OPEN", "CLOSED", "MERGED") for p in value["prs"]
                 ):
                     raise ValueError("invalid PR observation")
-                missing_loc = [p for p in value["prs"] if p.get("lean_loc") is None]
+                stored_locs = {}
+                for p in value["prs"]:
+                    loc = db.execute(
+                        "SELECT head,added,deleted FROM pr_loc WHERE repo=? AND number=?", (repo, p["number"])
+                    ).fetchone()
+                    if loc and loc[0] == p.get("head_sha"):
+                        stored_locs[p["number"]] = dict(head_sha=loc[0], added=loc[1], deleted=loc[2])
+                missing_loc = [p for p in value["prs"] if p.get("lean_loc") is None and p["number"] not in stored_locs]
                 git_locs = activity_git.measure(root(), repo, missing_loc)
                 if any(p.get("head_sha") and p.get("base_sha") and p["number"] not in git_locs for p in missing_loc):
                     message = "Some exact PR LOC comparisons are unavailable; normal refresh will retry"
@@ -566,7 +574,7 @@ def _refresh_prs(db, config, now, errors):
                             "scoreboard-round-counters" if valid else "unavailable",
                         ),
                     )
-                    loc = p.get("lean_loc") or git_locs.get(p["number"])
+                    loc = p.get("lean_loc") or git_locs.get(p["number"]) or stored_locs.get(p["number"])
                     if loc is not None:
                         if loc.get("head_sha") != p.get("head_sha") or not all(
                             type(loc.get(k)) is int and loc[k] >= 0 for k in ("added", "deleted")
@@ -615,6 +623,7 @@ def _refresh_prs(db, config, now, errors):
                     (
                         None
                         if settled
+                        or (landed_loc and counts and counts[2] >= p["landed"] and now > p["landed"] + 7 * 86400)
                         else now + (3600 if landed_loc and counts and counts[2] >= p["landed"] else 300),
                         repo,
                         number,

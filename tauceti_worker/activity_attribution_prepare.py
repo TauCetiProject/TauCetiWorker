@@ -35,7 +35,7 @@ def install(db):
       CREATE INDEX IF NOT EXISTS attribution_round_worker ON rounds(worker,started DESC);
       CREATE INDEX IF NOT EXISTS attribution_archive_next ON review_archive_checks(checked);
     """)
-    upgrade = db.execute("INSERT OR IGNORE INTO meta VALUES ('attribution-triggers-v2','1')").rowcount
+    upgrade = db.execute("INSERT OR IGNORE INTO meta VALUES ('attribution-triggers-v3','1')").rowcount
     for table, source, keys, fields in (
         ("cost_sessions", "cost", ["id"], ["data", "scope"]),
         ("cost_accruals", "cost", ["id"], None),
@@ -61,7 +61,7 @@ def install(db):
             db.execute(f"""CREATE TRIGGER IF NOT EXISTS attribution_{table}_{action}
                 AFTER {action} ON {table}{changed} BEGIN
                 INSERT OR IGNORE INTO attribution_dirty VALUES ('{source}',{expression});
-                {f"UPDATE review_archive_checks SET checked=0 WHERE repo={prefix}.repo AND number={prefix}.number;" if table in {"prs", "pr_observations"} else ""} END""")
+                {f"UPDATE review_archive_checks SET checked=0 WHERE repo={prefix}.repo AND number={prefix}.number;" if table in {"prs", "pr_observations", "pr_review_counts"} else ""} END""")
     if db.execute("INSERT OR IGNORE INTO meta VALUES ('attribution-seed-v1','1')").rowcount:
         db.execute("INSERT OR IGNORE INTO attribution_dirty SELECT 'legacy_cost',json_array(id) FROM cost_sessions")
         db.execute("INSERT OR IGNORE INTO attribution_dirty SELECT 'legacy_receipt',json_array(repo,number) FROM prs")
@@ -70,6 +70,11 @@ def install(db):
         )
         db.execute("INSERT OR IGNORE INTO review_archive_checks SELECT repo,number,0,0,NULL FROM prs")
         db.execute("INSERT OR IGNORE INTO review_archive_checks SELECT repo,number,0,0,NULL FROM pr_contributions")
+
+    if db.execute("INSERT OR IGNORE INTO meta VALUES ('attribution-facts-v2','1')").rowcount:
+        db.execute(
+            "INSERT OR IGNORE INTO attribution_dirty SELECT 'legacy_pr',json_array(repo,number) FROM attribution_prs"
+        )
 
 
 def rebuild_cost_queue(db, active):
@@ -233,6 +238,7 @@ def fact(db, key, now):
         and counter[2] >= p["landed"]
     )
     value = dict(
+        version=2,
         key=list(key),
         landed=p.get("landed"),
         loc=loc[1] if loc and loc[0] == p.get("head") else None,
@@ -291,14 +297,21 @@ def reports(db, now):
                     | {
                         rid
                         for rid, bounds in attempted.items()
-                        if bounds[0] is not None
+                        if isinstance(bounds, list)
+                        and len(bounds) == 2
+                        and bounds[0] is not None
                         and bounds[1] is not None
-                        and any(bounds[0] <= at <= bounds[1] for at in p.get("archived_rounds", {}).values())
+                        and any(
+                            bounds[0] <= at <= bounds[1]
+                            for at in (
+                                p.get("archived_rounds") if isinstance(p.get("archived_rounds"), dict) else {}
+                            ).values()
+                        )
                     }
                 ),
-                total_runs=p["total_runs"],
+                total_runs=max(p["total_runs"], len(passes)) if p.get("counter_basis") else p["total_runs"],
                 review_known=p["review_known"]
-                and p["total_runs"] >= len(passes)
+                and (p.get("counter_basis") or p["total_runs"] >= len(passes))
                 and not any(w["unpriced"] for w in work),
                 samples=[(json.dumps([p["key"], rid]), sample["cost"], sample["at"]) for rid, sample in passes.items()],
             )
