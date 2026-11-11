@@ -23,7 +23,7 @@ from . import work_recovery as saved
 from .config import log
 from .constants import BASE_BRANCH
 from .runtime_status import atomic_json, read_json, report_runtime
-from .survey import checkpoint_counters, restore_counters
+from .survey import charge_attempts, checkpoint_counters, restore_counters
 
 STATES = {"retained", "eligible", "resuming", "verified", "publication-pending", "published", "obsolete", "blocked"}
 TERMINAL = {"published", "obsolete"}
@@ -1420,8 +1420,8 @@ class WorkerBackend:
                     self.policy(m, latest)
                     if latest != facts or self.claim_lost():
                         raise Wait("claim-or-head-changed", "PR facts or claim changed before paid continuation")
-                    for key in keys:
-                        self.w.counters.write(key, self.w.counters.read(key) + 1)
+                    if not charge_attempts(self.w.counters, dict.fromkeys(keys, auth.get("budget") or 3)):
+                        raise Block("content-allowance", "Another worker spent the source repair allowance")
                     write(
                         record,
                         j,

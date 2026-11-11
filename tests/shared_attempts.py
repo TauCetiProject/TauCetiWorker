@@ -224,6 +224,41 @@ class SharedAttemptsTests(unittest.TestCase):
         survey_mod.restore_counters(counters, saved)
         self.assertEqual(counters.read(FIX), 0)
 
+    def test_a_candidate_surveyed_before_a_peer_spent_the_budget_is_declined(self):
+        first, second = self.counters("first"), self.counters("second")
+        ci = ("ci-7-" + HEAD[:12], "ci-pr-7")
+        for _ in range(survey_mod.MAX_CI_ATTEMPTS - 1):
+            first.charge(dict.fromkeys(ci))
+        candidate = SimpleNamespace(pr=7, head=HEAD, rebase_budget_key="rebase-pr-7", foreign_repair_base="")
+        sv = SimpleNamespace(open_prs=[])
+        with patch.object(work_units, "_do_fixlike", return_value=0) as launched:
+            self.assertEqual(work_units.do_fix_ci(SimpleNamespace(counters=first), sv, candidate, None, False), 0)
+            self.assertIsNone(work_units.do_fix_ci(SimpleNamespace(counters=second), sv, candidate, None, False))
+            self.assertEqual(launched.call_count, 1)
+            self.assertEqual([first.read(key) for key in ci], [survey_mod.MAX_CI_ATTEMPTS] * 2)
+
+            # Each budget declines at its own limit, and nothing is charged when one of two is spent.
+            for stage, key, limit in (
+                (work_units.do_fix, FIX, survey_mod.MAX_FIX_ATTEMPTS),
+                (work_units.do_rebase, "rebase-pr-7", survey_mod.MAX_REBASE_ATTEMPTS),
+                (work_units.do_bump, "bump-pr-7", survey_mod.MAX_BUMP_PR_ATTEMPTS),
+                (work_units.do_lint_repair, "lint-repair-pr-7", survey_mod.MAX_LINT_REPAIR_PR_ATTEMPTS),
+            ):
+                (self.shared / key).write_text(str(limit))
+                self.assertIsNone(stage(SimpleNamespace(counters=second), sv, candidate, None, False), key)
+            self.assertEqual(second.read("bump-7-" + HEAD[:12]), 0)
+            self.assertEqual(launched.call_count, 1)
+
+            # An automatic bump PR has no attempt limit.
+            sv.open_prs.append(SimpleNamespace(number=7, automatic_bump=True))
+            self.assertEqual(work_units.do_bump(SimpleNamespace(counters=second), sv, candidate, None, False), 0)
+
+            # A private store charges as it always has.
+            private = self.counters("private", shared=False)
+            for _ in range(survey_mod.MAX_CI_ATTEMPTS + 1):
+                work_units.do_fix_ci(SimpleNamespace(counters=private), sv, candidate, None, False)
+            self.assertEqual(private.read(ci[0]), survey_mod.MAX_CI_ATTEMPTS + 1)
+
     def test_the_outage_refund_allowance_is_shared(self):
         first, second = self.counters("first"), self.counters("second")
         candidate = SimpleNamespace(pr=7, head=HEAD)

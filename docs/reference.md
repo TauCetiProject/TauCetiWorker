@@ -341,8 +341,10 @@ progress-report state stay with the worker.
 
 Set it in the environment the workers start from, or in each worker's `env` table. A charge
 or refund takes an exclusive `flock` on the directory, which must be on a local filesystem,
-and one synced write. A refund hands back only what the refunding process charged, so it
-leaves a peer's concurrent attempt counted.
+and one synced write. A stage checks its budgets and charges its attempt under one lock, so a
+candidate surveyed before another worker spent the last attempt is skipped at dispatch. A
+refund hands back only what the refunding process charged, so it leaves a peer's concurrent
+attempt counted.
 Counter files take the directory's read and write bits. Workers running as different users
 share a budget through a directory their common group can write, with the setgid bit so new
 files carry that group and without the sticky bit so one user can replace another's file:

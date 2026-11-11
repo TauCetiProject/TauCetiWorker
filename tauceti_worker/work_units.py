@@ -64,8 +64,15 @@ from .constants import (
     CONTEST_CLAIM_TTL,
     EX_CLAIM_COLLISION,
     EX_NOPROGRESS,
+    MAX_BUMP_ATTEMPTS,
+    MAX_BUMP_PR_ATTEMPTS,
+    MAX_CI_ATTEMPTS,
+    MAX_CI_PR_ATTEMPTS,
     MAX_FIX_ATTEMPTS,
     MAX_INFRA_REFUNDS,
+    MAX_LINT_REPAIR_ATTEMPTS,
+    MAX_LINT_REPAIR_PR_ATTEMPTS,
+    MAX_REBASE_ATTEMPTS,
     OPENROUTER_MODELS,
     PR_TASKS,
     PROGRESS_ATTEMPT_GAP,
@@ -107,6 +114,7 @@ from .survey import (
     bump_prs,
     bust_progress_cache,
     cascade,
+    charge_attempts,
     checkpoint_counters,
     fix_disposition,
     owns_author,
@@ -2165,18 +2173,31 @@ def _close_spent_pr(w, sv, c) -> int | None:
         w.claims.release()
 
 
+def _charge(w, c, stage: str, limits: dict[str, int | None]) -> bool:
+    if charge_attempts(w.counters, limits):
+        return True
+    log(f"  {stage} #{c.pr}: another worker spent this attempt budget since the survey; skipping")
+    return False
+
+
+def _automatic_bump(sv, pr: int) -> bool:
+    return any(p.number == pr and getattr(p, "automatic_bump", False) for p in getattr(sv, "open_prs", ()))
+
+
 def do_fix(w, sv, c, opts, bubble) -> int | None:
     pr, head = c.pr, c.head
     key = f"fix-{pr}-{head[:12]}"
-    w.counters.incr(key)  # count up front (an un-checkout-able PR mustn't loop)
+    limit = None if _automatic_bump(sv, pr) else MAX_FIX_ATTEMPTS
+    if not _charge(w, c, "fix", {key: limit}):  # count up front (an un-checkout-able PR mustn't loop)
+        return None
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix.md", label="fix", charged=(key,))
 
 
 def do_fix_ci(w, sv, c, opts, bubble) -> int | None:
     pr, head = c.pr, c.head
     keys = (f"ci-{pr}-{head[:12]}", f"ci-pr-{pr}")
-    for key in keys:
-        w.counters.incr(key)
+    if not _charge(w, c, "fix-ci", {keys[0]: MAX_CI_ATTEMPTS, keys[1]: MAX_CI_PR_ATTEMPTS}):
+        return None
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix-ci.md", label="fix-ci", charged=keys)
 
 
@@ -2188,7 +2209,8 @@ def do_rebase(w, sv, c, opts, bubble) -> int | None:
         w.counters.read(key) >= 1 or w.counters.foreign_repair_launched(c.pr)
     ):
         return None
-    w.counters.incr(key)
+    if not _charge(w, c, "rebase", {key: 1 if getattr(c, "foreign_repair_base", "") else MAX_REBASE_ATTEMPTS}):
+        return None
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="rebase.md", label="rebase", charged=(key,))
 
 
@@ -2197,8 +2219,10 @@ def do_bump(w, sv, c, opts, bubble) -> int | None:
     shape as a fix: claim the branch, check the PR out, drive the agent on prompts/bump.md to green it."""
     pr, head = c.pr, c.head
     keys = (f"bump-{pr}-{head[:12]}", f"bump-pr-{pr}")  # count up front so an un-checkout-able PR can't loop
-    for key in keys:
-        w.counters.incr(key)
+    unlimited = _automatic_bump(sv, pr)
+    limits = {keys[0]: None if unlimited else MAX_BUMP_ATTEMPTS, keys[1]: None if unlimited else MAX_BUMP_PR_ATTEMPTS}
+    if not _charge(w, c, "bump", limits):
+        return None
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="bump.md", label="bump", charged=keys)
 
 
@@ -2208,8 +2232,8 @@ def do_lint_repair(w, sv, c, opts, bubble) -> int | None:
     prompts/lint-repair.md to fix TauCeti/ until the PR's full lint passes."""
     pr, head = c.pr, c.head
     keys = (f"lint-repair-{pr}-{head[:12]}", f"lint-repair-pr-{pr}")  # counted up front, as for bump
-    for key in keys:
-        w.counters.incr(key)
+    if not _charge(w, c, "lint-repair", {keys[0]: MAX_LINT_REPAIR_ATTEMPTS, keys[1]: MAX_LINT_REPAIR_PR_ATTEMPTS}):
+        return None
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="lint-repair.md", label="lint-repair", charged=keys)
 
 

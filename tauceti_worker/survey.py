@@ -91,6 +91,17 @@ def restore_counters(counters, saved: dict[str, tuple[int, int]]) -> None:
         counters.write(name, min(value, counters.read(name)))
 
 
+def charge_attempts(counters, limits: dict[str, int | None]) -> bool:
+    """Charge one attempt to each counter; False, with nothing charged, if another worker sharing the
+    counters spent one of the limits since the survey. `None` is no limit."""
+    charge = getattr(counters, "charge", None)
+    if charge:
+        return charge(limits)
+    for name in limits:
+        counters.incr(name)
+    return True
+
+
 class Counters:
     """Integer files in the worker's state directory.
 
@@ -204,6 +215,22 @@ class Counters:
 
     def incr(self, name: str) -> int:
         return self._write(name, self.read(name) + 1)
+
+    def charge(self, limits: dict[str, int | None]) -> bool:
+        """Count one attempt on every counter in `limits`. In the shared directory the counters are
+        checked against their limits and charged under one lock, and none is charged when one is spent."""
+        shared = {name: limit for name, limit in limits.items() if self._store(name) is not self.state}
+        if shared:
+            with self._locked():
+                stored = {name: self._read(name) for name in shared}
+                if any(limit is not None and stored[name] >= limit for name, limit in shared.items()):
+                    return False
+                for name in shared:
+                    self._seen[name] = self._apply(name, stored[name], 1)
+        for name in limits:
+            if name not in shared:
+                self.incr(name)
+        return True
 
     def record_unchanged_review(self, pr: int, head: str) -> None:
         """Remember that the review engine found this head's verdict already published."""
