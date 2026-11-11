@@ -109,6 +109,9 @@ try:
             )
             assert wm._detached_usage_supervisor(supervisor.pid)
             assert not wm._defer_reload(new_policy, idle), "the supervisor must not strand a reload"
+            retasked = dataclasses.replace(old_policy, only=("review",))
+            assert not wm._defer_reload(retasked, idle), "the supervisor must not strand a phase edit"
+            assert wm._defer_reload(retasked, dict(idle, state="running"))
             assert wm._defer_reload(new_policy, dict(idle, state="running"))
             assert wm._defer_reload(new_policy, dict(idle, next_action_at=time.time() + 1))
             registered = wm.read_json(ready)
