@@ -12,6 +12,14 @@ may be given copies of the same list. Without the setting nothing changes.
 A list works on whichever forge new pull requests go to (`--new-pr-forge`, see
 [forgejo-worker.md](forgejo-worker.md)), and a worker that discovers both forges
 reads both for the live view.
+A worker that discovers only Forgejo still reads the GitHub content
+repository's pull requests that carry a target marker, so a list carried over
+from GitHub keeps its GitHub items in flight or done: one search of the 200 most
+recently updated such pull requests per round, shared between workers of one
+account on a host for two minutes. If GitHub cannot be read the round goes on
+with the list's own marks for those items and logs why. Once the file marks
+every GitHub-era item, set `TAUCETI_ROADMAP_TARGETS_GITHUB=0` (in the worker's
+environment, or its `env` in `workers.toml`) to stop that read.
 
 ## The file
 

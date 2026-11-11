@@ -93,9 +93,9 @@ class ForgejoWorkerSource(ForgejoReadSource):
         import urllib.parse
 
         from .config import SourceUnavailable
-        from .targets import MARKER_TAG
+        from .targets import MARKER_TAG, search_phrases
 
-        phrases = [p.replace('\\"', '"') for p in re.findall(r'"((?:[^"\\]|\\.)*)"', search)]
+        phrases = search_phrases(search)
         keyword = next((p for p in phrases if p != MARKER_TAG), None)
 
         def fetch():
