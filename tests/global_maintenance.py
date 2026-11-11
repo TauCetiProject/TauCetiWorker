@@ -700,6 +700,22 @@ class GlobalMaintenance(unittest.TestCase):
         self.assertEqual(result.discovery_gap_prs, [10])
         self.assertEqual(result.next_auto_stage, "review")
 
+    def test_recent_unchanged_engine_result_suppresses_partial_history_review(self):
+        survey = importlib.import_module("tauceti_worker.survey")
+        for recorded, offered in ((HEAD, False), ("b" * 40, True)):
+            self.w.counters.unchanged_review_recent = lambda pr, head, recorded=recorded: head == recorded
+            with patch("tauceti_worker.github_state.read_survey", return_value=(True, [row(10, "Other", complete=False)])):
+                result = survey.survey(
+                    self.w.cfg,
+                    self.w.gh,
+                    self.w.rs,
+                    self.w.counters,
+                    stages=["review"],
+                    selected_roadmap="auto",
+                    cached_only=True,
+                )
+            self.assertEqual([c.pr for c in result.reviewable.actionable] == [10], offered)
+
     def test_disabled_maintenance_remains_disabled(self):
         self.opts.only = ["roadmap"]
         self.run_round([row(10, "Other", complete=False)])
