@@ -83,6 +83,13 @@ CLAUDE_REFRESH_RETRY_S = 600
 CODEX_REFRESH_SKEW_S = 48 * 3600
 CODEX_REFRESH_RETRY_S = 600
 
+# Codex's administrator layers (codex-rs/config/src/loader): the system config sits below the user's
+# config.toml, the requirements files above it, and a forced managed preference under this directory
+# (per user one level down) can set either.
+CODEX_SYSTEM_CONFIG = Path("/etc/codex/config.toml")
+CODEX_REQUIREMENT_FILES = (Path("/etc/codex/requirements.toml"), Path("/etc/codex/managed_config.toml"))
+CODEX_MANAGED_PREFERENCES = Path("/Library/Managed Preferences")
+
 # Shared TauCeti usage observations live beside the credential source.
 CLAUDE_QUOTA_DIRNAME = ".tauceti-quota"
 
@@ -902,6 +909,36 @@ def _write_json_atomic(path: Path, data: dict) -> None:
         raise
 
 
+def _codex_store_setting(path: Path) -> str | None:
+    """The `cli_auth_credentials_store` one Codex config file sets: None when the file or the key is
+    absent, the value when it is a string, an `unreadable:` reason otherwise."""
+    try:
+        with open(path, "rb") as fh:
+            data = tomllib.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        return f"unreadable:{type(e).__name__}"
+    if not isinstance(data, dict):
+        return "unreadable:not-a-table"
+    if "cli_auth_credentials_store" not in data:
+        return None
+    value = data["cli_auth_credentials_store"]
+    return value if isinstance(value, str) else "unreadable:non-string-value"
+
+
+def _codex_managed_preferences() -> bool:
+    """Whether a managed com.openai.codex preference exists; an unreadable directory counts as one."""
+    try:
+        if not CODEX_MANAGED_PREFERENCES.exists():
+            return False
+        return any(CODEX_MANAGED_PREFERENCES.glob("com.openai.codex.plist")) or any(
+            CODEX_MANAGED_PREFERENCES.glob("*/com.openai.codex.plist")
+        )
+    except OSError:
+        return True
+
+
 def _read_marker(p: Path) -> str | None:
     try:
         with p.open() as stream:
@@ -1663,26 +1700,12 @@ class Quota:
         does not have.
 
         `directory` is the CODEX_HOME whose config to read, by default this worker's own."""
-        cfg_path = (directory or codex_dir(self.cfg.home)) / "config.toml"
-        try:
-            with open(cfg_path, "rb") as fh:
-                data = tomllib.load(fh)
-        except FileNotFoundError:
-            pass  # no user config ⇒ codex's default, which is file
-        except (OSError, tomllib.TOMLDecodeError) as e:
-            # NOT "codex would fail to start anyway": a permission or transient I/O error can clear
-            # before launch, and TauCeti's entitlement probe passes --ignore-user-config, so some codex
-            # invocations start happily on a config we could not read. We simply do not know.
-            return f"unreadable:{type(e).__name__}"
-        else:
-            if not isinstance(data, dict):
-                return "unreadable:not-a-table"
-            if "cli_auth_credentials_store" in data:
-                value = data["cli_auth_credentials_store"]
-                if not isinstance(value, str):
-                    return "unreadable:non-string-value"
-                if value != "file":
-                    return value
+        # NOT "codex would fail to start anyway" for an unreadable file: a permission or transient I/O
+        # error can clear before launch, and TauCeti's entitlement probe passes --ignore-user-config, so
+        # some codex invocations start happily on a config we could not read. We simply do not know.
+        value = _codex_store_setting((directory or codex_dir(self.cfg.home)) / "config.toml")
+        if value is not None and value != "file":
+            return value
         # A trusted project-level config layer overrides the user one — verified against 0.146.0: a
         # trusted <project>/.codex/config.toml setting `ephemeral` makes doctor report Ephemeral even
         # when the user config says `file`. Host rounds launch codex with cwd set to the checkout, so
@@ -2000,6 +2023,25 @@ class Quota:
         nxt = self._next_eligible(wins, now)
         return Provider("codex", avail, "gpt-5" if avail else None, wins, None, nxt)
 
+    def _codex_effective_store(self, directory: Path | None = None) -> str | None:
+        """_codex_credentials_store for a CODEX_HOME, with the administrator layers resolved in
+        Codex's order: a requirements file or managed preference overrides the user's config.toml,
+        which overrides the system config. None only when every layer that applies says file or is
+        silent; a layer that exists but cannot be read is a reason, as it is for the user's."""
+        if _codex_managed_preferences():
+            return "managed-preferences"
+        for path in CODEX_REQUIREMENT_FILES:
+            value = _codex_store_setting(path)
+            if value is not None and value != "file":
+                return value
+        if reason := self._codex_credentials_store(directory):
+            return reason
+        if _codex_store_setting((directory or codex_dir(self.cfg.home)) / "config.toml") is None:
+            value = _codex_store_setting(CODEX_SYSTEM_CONFIG)
+            if value is not None and value != "file":
+                return value
+        return None
+
     def _refresh_codex_credential(self, *, force: bool = False) -> bool:
         """Codex's counterpart of _refresh_claude_credential, under the same --auto-refresh opt-in:
         rotate the operator's source auth.json when its access token has expired or is about to, and
@@ -2008,11 +2050,11 @@ class Quota:
         It stands down when codex's credential store is not verifiably that file: a keyring login can
         share the refresh token a leftover auth.json still carries, and spending it here would log that
         login out. An isolated worker spends the source's token, so the source directory's own config
-        must pass as well as the worker's."""
-        if os.environ.get("TAUCETI_AUTO_REFRESH") != "1" or self._codex_credentials_store() is not None:
+        must pass as well as the worker's, each resolved with Codex's administrator layers."""
+        if os.environ.get("TAUCETI_AUTO_REFRESH") != "1":
             return False
         source = self._codex_creds_source()
-        if self._codex_credentials_store(source) is not None:
+        if self._codex_effective_store() is not None or self._codex_effective_store(source) is not None:
             return False
         prov = credential_refresh.provider("codex", credentials=source / "auth.json")
         if not credential_refresh.renewable(prov):

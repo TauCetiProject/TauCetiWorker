@@ -77,6 +77,12 @@ def setup(tmp, *, expires_in=60, refresh="operator-refresh", opt_in=True):
     stale = jwt(expires_in)
     (src / "auth.json").write_text(auth(stale, refresh))
     (dst / "auth.json").write_text(auth(stale, CODEX_RT_PLACEHOLDER))
+    # Codex's administrator layers, redirected into the temporary tree.
+    etc = tmp / "etc" / "codex"
+    etc.mkdir(parents=True)
+    tc.quota.CODEX_SYSTEM_CONFIG = etc / "config.toml"
+    tc.quota.CODEX_REQUIREMENT_FILES = (etc / "requirements.toml", etc / "managed_config.toml")
+    tc.quota.CODEX_MANAGED_PREFERENCES = tmp / "Managed Preferences"
     cfg = types.SimpleNamespace(home=tmp / "iso", quota_cache=tmp / "cache")
     return tc.Quota(cfg), src / "auth.json", dst / "auth.json", stale
 
@@ -94,6 +100,20 @@ def usage_seen(*answers):
         return script.pop(0) if script else (200, USAGE_OK, None)
 
     return seen, patch.object(tc.quota, "_http_get_json", side_effect=fake)
+
+
+def renews_with(tmp, files, *, expires_in=60, first=(200, USAGE_OK, None)):
+    """Write `files` (path relative to tmp -> text), then make one renewing read. Returns how many
+    token exchanges it made."""
+    quota, src, mirror, stale = setup(tmp, expires_in=expires_in)
+    for rel, text in files.items():
+        path = tmp / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    seen, usage = usage_seen(first)
+    with rotates_to(jwt(10 * DAY)) as post, usage:
+        quota.codex(renew=True)
+    return post.call_count
 
 
 # 1) A credential inside the skew is rotated at the SOURCE, and the fresh token reaches both the
@@ -227,6 +247,68 @@ try:
     check("a source store that is file is rotated", post.call_count, 1)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
+
+# 6c) Codex reads /etc/codex/config.toml below the user layer, and requirements.toml and the legacy
+#     managed_config.toml above it; a forced macOS managed preference can set the store too. With the
+#     user layers silent, an administrator's non-file store is the one codex uses.
+KEYRING = 'cli_auth_credentials_store = "keyring"\n'
+FILE = 'cli_auth_credentials_store = "file"\n'
+SOURCE, WORKER = "real/.codex/config.toml", "iso/.codex/config.toml"
+for name, files, expires_in, first, want in (
+    ("system keyring", {"etc/codex/config.toml": KEYRING}, 60, (200, USAGE_OK, None), 0),
+    ("system keyring, 401 path", {"etc/codex/config.toml": KEYRING}, 5 * DAY, (401, {}, None), 0),
+    ("system auto", {"etc/codex/config.toml": 'cli_auth_credentials_store = "auto"\n'}, 60, (200, USAGE_OK, None), 0),
+    (
+        "unreadable system config",
+        {"etc/codex/config.toml": "cli_auth_credentials_store = [\n"},
+        60,
+        (200, USAGE_OK, None),
+        0,
+    ),
+    (
+        "system keyring under a source-only file override",
+        {"etc/codex/config.toml": KEYRING, SOURCE: FILE},
+        60,
+        (200, USAGE_OK, None),
+        0,
+    ),
+    (
+        "system keyring under file overrides in both user layers",
+        {"etc/codex/config.toml": KEYRING, SOURCE: FILE, WORKER: FILE},
+        60,
+        (200, USAGE_OK, None),
+        1,
+    ),
+    (
+        "requirements keyring",
+        {"etc/codex/requirements.toml": KEYRING, SOURCE: FILE, WORKER: FILE},
+        60,
+        (200, USAGE_OK, None),
+        0,
+    ),
+    (
+        "managed_config keyring",
+        {"etc/codex/managed_config.toml": KEYRING, SOURCE: FILE, WORKER: FILE},
+        60,
+        (200, USAGE_OK, None),
+        0,
+    ),
+    ("system file", {"etc/codex/config.toml": FILE}, 60, (200, USAGE_OK, None), 1),
+    ("a managed preference", {"Managed Preferences/com.openai.codex.plist": ""}, 60, (200, USAGE_OK, None), 0),
+    (
+        "a per-user managed preference",
+        {"Managed Preferences/someone/com.openai.codex.plist": ""},
+        60,
+        (200, USAGE_OK, None),
+        0,
+    ),
+):
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        check(f"{name}: exchanges", renews_with(tmp, files, expires_in=expires_in, first=first), want)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
 
 # 7) The stored expiry says the token is live and the endpoint says otherwise. Believe the endpoint:
 #    rotate once, then re-read rather than reporting a 401 we can fix.
