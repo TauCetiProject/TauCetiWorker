@@ -87,6 +87,32 @@ def loc_estimate(row):
     )
 
 
+def attribution_backfilling(row):
+    # Older collectors exposed one flag for historical backfill and live refresh.
+    return bool(row.get("attribution_backfilling", row.get("attribution_preparing", False)))
+
+
+def attributed_rate(row):
+    if attribution_backfilling(row):
+        return None
+    if row.get("attribution_known_prs") == 0 and (
+        row.get("attribution_missing_prs") or row.get("attribution_preparing")
+    ):
+        return None
+    loc, cost = row.get("attributed_loc"), row.get("estimated_usd")
+    if loc is None or cost is None:
+        return None
+    loc, cost = Decimal(loc), Decimal(cost)
+    return str(cost / loc if loc else Decimal("Infinity") if cost else Decimal(0))
+
+
+def attributed_rate_display(row):
+    rate = attributed_rate(row)
+    if rate is None:
+        return "—"
+    return "~" + amount(rate, rate=True)
+
+
 def display(value, default_kinds=()):
     if not value.get("available"):
         print("Activity: " + value.get("reason", "unavailable"))
@@ -246,6 +272,33 @@ def display(value, default_kinds=()):
                 ],
             )
         )
+        if any(windows[w].get("attribution_version") for w in cost_windows):
+            loc_rows.extend(
+                [
+                    (
+                        "Attributed landed Lean LOC",
+                        [
+                            "—"
+                            if attribution_backfilling(windows[w]) or windows[w].get("attributed_loc") is None
+                            else "~" + number(f"{Decimal(windows[w]['attributed_loc']):.1f}")
+                            for w in cost_windows
+                        ],
+                    ),
+                    (
+                        "Estimated $ / attributed LOC",
+                        [attributed_rate_display(windows[w]) for w in cost_windows],
+                    ),
+                    (
+                        "Landed PRs with attribution data",
+                        [
+                            "—"
+                            if windows[w].get("attribution_known_prs") is None
+                            else f"{windows[w]['attribution_known_prs']}/{windows[w]['attribution_known_prs'] + windows[w]['attribution_missing_prs']}"
+                            for w in cost_windows
+                        ],
+                    ),
+                ]
+            )
         if any(windows[w].get("missing_loc_prs") for w in cost_windows):
             loc_rows.append(
                 (
@@ -574,6 +627,16 @@ def combine(values):
                 )
             )
         row.update(loc_estimate(row))
+        if any(r.get("attribution_version") for r in rows):
+            compatible = len(known) == len(values) and all(r.get("attribution_version") == 1 for r in rows)
+            row["attribution_version"] = 1
+            row["attribution_preparing"] = any(r.get("attribution_preparing") for r in rows)
+            row["attribution_backfilling"] = any(attribution_backfilling(r) for r in rows)
+            for field in ("attribution_known_prs", "attribution_missing_prs"):
+                row[field] = sum(r[field] for r in rows) if compatible else None
+            row["attributed_loc"] = (
+                str(sum((Decimal(r.get("attributed_loc") or "0") for r in rows), Decimal(0))) if compatible else None
+            )
         s["costs"]["windows"][w] = row
     if any(v.get("costs", {}).get("spending") for v in known):
         s["costs"]["spending"] = {}
