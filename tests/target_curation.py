@@ -263,6 +263,19 @@ class Evidence(Tmp):
         self.assertEqual(curate.evidence(checkout, item), hits)
         self.assertNotEqual(before, curate._fingerprint(checkout, item, hits))
 
+    def test_a_declaration_past_the_shown_hits_changes_the_fingerprint(self):
+        checkout = self.lean_checkout()
+        for n in range(curate.MAX_HITS):
+            (checkout / f"A{n}.lean").write_text(f"theorem Other{n}.done_theorem : True := trivial\n")
+        item = t.TargetItem("Probability", "goal", "open", "`Goal.done_theorem`")
+        git(checkout, "add", ".")
+        before = curate._fingerprint(checkout, item, curate.evidence(checkout, item))
+        (checkout / "ZGoal.lean").write_text("theorem Goal.done_theorem : True := trivial\n")
+        git(checkout, "add", ".")
+        hits = curate.evidence(checkout, item)
+        self.assertEqual(len(hits["Goal.done_theorem"]), curate.MAX_HITS + 1)
+        self.assertNotEqual(before, curate._fingerprint(checkout, item, hits))
+
     def test_a_verdict_counts_only_for_a_declaration_the_file_has(self):
         checkout = self.lean_checkout()
         file = "TauCeti/Probability/Tail.lean"

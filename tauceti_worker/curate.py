@@ -189,8 +189,8 @@ def identifiers(text: str) -> list[str]:
 
 
 def declared(checkout: Path, pattern: str, *, pathspec: str = "*.lean", ignore_case: bool = False) -> list[str]:
-    """The first `path:line:text` lines of the checkout's Lean files that declare a name matching
-    the ERE `pattern` as their last component."""
+    """The `path:line:text` lines of the checkout's Lean files that declare a name matching the ERE
+    `pattern` as their last component."""
     try:
         found = subprocess.run(
             ["git", "-C", str(checkout), "grep", "-nE" + ("i" if ignore_case else ""), "-e"]
@@ -201,7 +201,7 @@ def declared(checkout: Path, pattern: str, *, pathspec: str = "*.lean", ignore_c
         )
     except (OSError, subprocess.TimeoutExpired):
         return []
-    return [line.strip()[:240] for line in found.stdout.splitlines() if line.strip()][:MAX_HITS]
+    return [line.strip()[:240] for line in found.stdout.splitlines() if line.strip()]
 
 
 def evidence(checkout: Path, item: TargetItem) -> dict[str, list[str]]:
@@ -251,7 +251,10 @@ def ask(w, profile, checkout: Path, candidates: list[tuple[TargetItem, dict]]) -
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
     listing, verdicts = work / "candidates.json", work / "verdicts.json"
-    rows = [{"slug": it.slug, "area": it.area, "milestone": it.text, "hits": hits} for it, hits in candidates]
+    rows = [
+        {"slug": it.slug, "area": it.area, "milestone": it.text, "hits": {k: v[:MAX_HITS] for k, v in hits.items()}}
+        for it, hits in candidates
+    ]
     listing.write_text(json.dumps({"checkout": str(checkout), "candidates": rows}, indent=1, ensure_ascii=False))
     prompt = fill_prompt(
         HERE / "prompts" / "curate.md", CANDIDATES=str(listing), CHECKOUT=str(checkout), VERDICTS=str(verdicts)
