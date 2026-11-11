@@ -144,7 +144,9 @@ no model.
 
 **Writing.** A look holds `.<file name>.lock` beside the list from start to
 end, so two workers on a host never curate one file at once; the lock file's
-modification time is what shares the gap between them. Each write merges the
+modification time is what shares the gap between them, and it is read again
+once the lock is held, so a worker that was due when its round began does not
+look again just after another one did. Each write merges the
 edit three ways with the file as it then is, so a change made by hand while the
 look ran is kept; if both changed the same or adjacent lines nothing is written
 and the next look starts from the new file. The file is replaced by a rename.

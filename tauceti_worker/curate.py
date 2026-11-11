@@ -519,6 +519,11 @@ def run(w, c, profile) -> int | None:
             c.reason = "another worker is curating the target list"
             log(f"curate: {c.reason}")
             return None
+        waited = time.time() - os.fstat(fd).st_mtime
+        if waited < GAP:
+            c.reason = f"another worker looked at the target list {waited / 3600:.1f}h ago"
+            log(f"curate: {c.reason}")
+            return None
         rc = _curate(w, c, path, profile)
         # Only a look that ran to its end moves the shared gap; one that raised is due again.
         with contextlib.suppress(OSError):

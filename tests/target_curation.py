@@ -395,7 +395,11 @@ class Round(Tmp):
         (cwd / "verdicts.json").write_text(json.dumps(self.verdicts))
         return 0
 
-    def curate(self):
+    def curate(self, *, after_gap=True):
+        lock = self.path.with_name(".targets.md.lock")
+        if after_gap and lock.exists():
+            old = time.time() - curate.GAP - 60
+            os.utime(lock, (old, old))
         c = tc.Candidate(0, "", "")
         return curate.run(self.w, c, "claude"), c.reason
 
@@ -474,7 +478,7 @@ class Round(Tmp):
 
     def test_the_gap_is_shared_through_the_lock_file(self):
         self.assertEqual(curate.due(self.w.counters), (True, "the target list is due a look"))
-        self.curate()
+        self.curate(after_gap=False)
         due, reason = curate.due(self.w.counters)
         self.assertFalse(due)
         self.assertIn("looked at 0.0h ago; it is looked at every 6h", reason)
@@ -486,6 +490,15 @@ class Round(Tmp):
         self.assertFalse(curate.due(self.w.counters)[0])
         with patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS": ""}):
             self.assertEqual(curate.due(other), (False, "no target list is set (--roadmap-targets)"))
+
+    def test_a_worker_that_was_due_before_another_looked_does_not_look_again(self):
+        self.verdicts = {"kolmogorov-zero-one": {"landed": False, "missing": "the statement"}}
+        self.assertTrue(curate.due(self.w.counters)[0])
+        self.curate()
+        self.w.counters = tc.Counters(SimpleNamespace(state=self.tmp / "other"))
+        rc, reason = self.curate(after_gap=False)
+        self.assertEqual((rc, len(self.asked)), (None, 1))
+        self.assertIn("another worker looked at the target list 0.0h ago", reason)
 
     def test_a_first_look_that_stops_early_leaves_the_list_due(self):
         with (
