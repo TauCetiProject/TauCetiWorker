@@ -57,3 +57,35 @@ test "$status" -ne 0
 [[ "$error" == tauceti-entrypoint:*TAUCETI_WORKER_ARGS*invalid\ quoting* ]]
 [[ "$error" != *Traceback* ]]
 echo "[OK ] malformed quoting fails closed with a useful error"
+
+# An identity halt stops the container before any GitHub contact, on every restart.
+bin="$temporary/bin"
+mkdir -p "$bin" "$temporary/data/state/docker"
+ln -s "$ROOT/tauceti_worker" "$temporary/tauceti_worker"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "$*" >>"$TEST_GH_LOG"; [[ "$1" == api ]] && echo 11; exit 0' >"$bin/gh"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$bin/git"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "<idle $*>"' >"$bin/sleep"
+chmod +x "$bin/gh" "$bin/git" "$bin/sleep"
+record="$temporary/data/state/docker/halt.json"
+printf '%s\n' '{"reason": "account-halt", "detail": "suspended", "at": "then"}' >"$record"
+launch() {
+  (
+    cd "$temporary"
+    PATH="$bin:$PATH" TEST_GH_LOG="$temporary/gh.log" TAUCETI_LEGACY_DATA_ROOT="$temporary/data" \
+      TAUCETI_WORKER_ID=docker TAUCETI_WORKER_ARGS="$1" \
+      "$ROOT/scripts/docker-entrypoint" ./tauceti work --loop 2>"$temporary/stderr"
+  )
+}
+for _ in 1 2; do
+  output="$(launch '--github-account alice')"
+  test "$output" = '<idle infinity>'
+  test ! -e "$temporary/gh.log"
+  grep -q 'docker compose exec tauceti ./tauceti work --worker-id docker --clear-halt' "$temporary/stderr"
+done
+test -e "$record"
+echo "[OK ] a halted worker idles before any gh call, on every restart"
+
+output="$(launch '--only roadmap')"
+test "$(tail -1 <<<"$output")" = '<roadmap>'
+grep -q '^auth status' "$temporary/gh.log"
+echo "[OK ] a halt record without a configured account leaves startup unchanged"

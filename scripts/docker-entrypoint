@@ -1,6 +1,57 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+worker_command() { [[ "${1:-}" == "./tauceti" && "${2:-}" == "work" && "${3:-}" == "--loop" ]]; }
+
+# An identity halt (docs/workers.md#identity-halt) must stop GitHub contact, including the
+# identity lookup below. The container idles rather than exiting, because every restart policy
+# that brings the worker back after a crash would also relaunch it here.
+if worker_command "$@"; then
+  halted=0
+  python3 -c '
+import os
+import shlex
+import sys
+
+try:
+    argv = sys.argv[1:] + shlex.split(os.environ.get("TAUCETI_WORKER_ARGS", ""))
+except ValueError:
+    sys.exit(0)  # Reported when the worker command is assembled below.
+
+
+def option(flag):
+    for index, item in enumerate(argv):
+        if item == flag and index + 1 < len(argv):
+            return argv[index + 1]
+        if item.startswith(flag + "="):
+            return item.split("=", 1)[1]
+    return None
+
+
+if not (option("--github-account") or os.environ.get("TAUCETI_GITHUB_ACCOUNT")):
+    sys.exit(0)
+if option("--worker-id"):
+    os.environ["TAUCETI_WORKER_ID"] = option("--worker-id")
+sys.argv = argv  # The package resolves --conf from its argv on import.
+from tauceti_worker.identity import halt_file
+
+path = halt_file()
+if path is not None and path.exists():
+    clear = ["./tauceti", "work", "--worker-id", path.parent.name, "--clear-halt"]
+    if option("--conf"):
+        clear[2:2] = ["--conf", option("--conf")]
+    sys.stderr.write(
+        f"tauceti-entrypoint: halted on its GitHub identity ({path}):\n{path.read_text().rstrip()}\n"
+        "tauceti-entrypoint: idling without contacting GitHub. Once the account is in order, run\n"
+        f"  docker compose exec tauceti {shlex.join(clear)}\n  docker compose restart tauceti\n"
+    )
+    sys.exit(84)
+' "$@" || halted=$?
+  if [[ "$halted" == 84 ]]; then
+    exec sleep infinity
+  fi
+fi
+
 # Prefer the authenticated GitHub identity for commits. The image-level fallback still lets
 # setup and CI run before `gh auth login` has populated the persistent credential volume.
 if [[ "${TAUCETI_SKIP_GIT_IDENTITY:-0}" != 1 ]]; then
@@ -24,7 +75,7 @@ fi
 # Append operator options from .env using Python's shell-like parser; never evaluate them
 # as shell code. Restrict this to the worker command so setup and diagnostic overrides are
 # unaffected.
-if [[ -n "${TAUCETI_WORKER_ARGS:-}" && "${1:-}" == "./tauceti" && "${2:-}" == "work" && "${3:-}" == "--loop" ]]; then
+if [[ -n "${TAUCETI_WORKER_ARGS:-}" ]] && worker_command "$@"; then
   exec python3 -c '
 import os
 import shlex
