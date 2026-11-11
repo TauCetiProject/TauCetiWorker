@@ -287,6 +287,24 @@ def cases():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+    # 5c) A usage login behind a directory this worker cannot enter reads as a missing login, and the
+    #     selection still reaches its other providers.
+    tmp = Path(tempfile.mkdtemp())
+    locked = tmp / "locked"
+    try:
+        quota, usage_file, agent_files = setup(tmp)
+        (locked / "usage").mkdir(parents=True)
+        os.environ[VARIABLE] = str(locked / "usage")
+        locked.chmod(0)
+        seen, usage = usage_seen()
+        with usage:
+            agent, provs = quota.choose("claude", renew=True)
+        check("an unreadable usage login makes no request", seen, [])
+        check("claude reads as unavailable", (agent, provs["claude"].available), (None, False))
+    finally:
+        locked.chmod(0o700)
+        shutil.rmtree(tmp, ignore_errors=True)
+
     # 6) The loop's advice after a refusal points at the usage login, not at the agents' credential.
     refused = tc.quota.Provider("claude", False, None, error="claude usage HTTP 401 (access token expired)")
     os.environ[VARIABLE] = "/logins/usage/.credentials.json"
@@ -318,6 +336,31 @@ try:
         os.environ.pop(VARIABLE)
         wait.prepare(quota)
         check("the Keychain identity still is", "_claude_creds" in vars(quota), True)
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+
+# 8) Off macOS the agents launch from the file in $CLAUDE_CONFIG_DIR, so a healthy usage login does not
+#    admit work while that file is missing or holds a setup-token past its expiry.
+tmp = Path(tempfile.mkdtemp())
+try:
+    quota, usage_file, agent_files = setup(tmp)
+    seen, usage = usage_seen()
+    with patch.object(sys, "platform", "linux"), usage:
+        check("a live setup-token is admitted", quota.claude(renew=True).available, True)
+        for f in agent_files:
+            f.write_text(login("setup-token", -60, None))
+        seen.clear()
+        expired = quota.claude(renew=True)
+        check("an expired setup-token is not", expired.available, False)
+        check("no usage request is made for it", seen, [])
+        check("the error names the agents' file", str(agent_files[1]) in (expired.error or ""), True)
+        # An isolated copy never holds a refresh token, so only an unisolated worker's own login renews.
+        (agent_files[1].parent / ".tauceti-creds-source").unlink()
+        agent_files[1].write_text(login("agent-login", -60))
+        check("an expired login that can renew itself is", quota.claude(renew=True).available, True)
+        for f in agent_files:
+            f.unlink()
+        check("a missing agents' file is not", quota.claude(renew=True).available, False)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 

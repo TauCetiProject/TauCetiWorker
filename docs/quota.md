@@ -196,6 +196,11 @@ cooldowns under `<usage login directory>/.tauceti-quota/usage/`, exactly as
 workers sharing a credential source do. Model-limit refusals are recorded against
 the usage login too, so the two credentials must belong to one account.
 
+The usage login says nothing about the agents' own token, so off macOS the
+worker also reads that file before Claude work starts, without a request: a
+missing file, or a token past its `expiresAt` with no refresh token, makes Claude
+unavailable whatever the usage login reports.
+
 ## macOS and the login Keychain
 
 On macOS, Claude Code keeps its credentials in the login Keychain rather than in
