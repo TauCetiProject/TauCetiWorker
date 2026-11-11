@@ -163,6 +163,12 @@ def prepare(argv, env, cwd=None, input=None):
     context = {}
     context["repository"] = _flag(args, "--repo", "-R")
     context["pr"] = env.get("TAUCETI_GITHUB_PR") or None
+    if round_id := env.get("TAUCETI_ACTIVITY_ROUND_ID"):
+        context["activity"] = {
+            "round_id": round_id,
+            "worker": env.get("TAUCETI_WORKER_ID", "default"),
+            "machine_id": env.get("TAUCETI_FLEET_MACHINE_ID"),
+        }
     if args[:2] == ["pr", "close"]:
         context["expected_head"] = env.get("TAUCETI_PUSH_EXPECT")
         context["actor"] = env.get("TAUCETI_GITHUB_ACCOUNT") or actor(env)

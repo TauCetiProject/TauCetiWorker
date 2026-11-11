@@ -82,10 +82,20 @@ source can continue. Authoring new roadmap work requires the selected inventorie
 to be available so the worker can check existing targets. Open-PR pressure is
 counted across both sources.
 
-Native review uses the installed review engine with exact source commits,
-pinned rubrics, source-qualified provenance, and its existing ledger and archive
-outbox. Inference receives prepared files and provider credentials. Source
-credentials stay in the trusted preparation and publication process.
+Both sources use the same scheduling policy and review coordinator. The review
+engine is resolved on demand, honoring the existing configured revision and
+checkout override. Source shims and installed wheels follow the same path;
+the launcher needs no additional review dependency pin. Review and archive
+delivery use that same resolved engine.
+
+One preparation pipeline supplies exact source commits, matching rubrics,
+history, roadmap and Mathlib context. Its Git cache fetches the two comparison
+endpoints together and reuses their objects. Immutable source operations keep
+strict Git settings; dependency and tool preparation permit stock Lake partial
+clones and trusted local package caches. Inference receives prepared files and
+provider credentials. Source credentials stay in the trusted preparation and
+publication process. Failures before inference do not consume a PR's review-error
+allowance.
 
 Publication retains the rendered plan before writing. Findings are published
 and read back before the scoreboard. Retrying adopts the same remote markers.
@@ -106,15 +116,24 @@ eligible GitHub work. Native reviews report execution CI as unknown until
 Stage 1C supplies trusted evidence for mixed queue admission and landing.
 
 `tests/worker_sources.py` covers defaults, destinations, identities, duplicates,
-outages, counters, and the installed engine with a deterministic reviewer fixture.
+outages, counters, and delegation to the shared coordinator. `tests/review_runtime.py`
+covers runtime resolution and archive reuse. TauCetiReview's shared CLI and
+publication suites exercise both source adapters with the same deterministic
+reviewer, unchanged/changed-head retries, and publication recovery scenarios.
 `tests/integration_forgejo_worker.py` starts stock Forgejo over HTTPS and tests
 the actual token scopes, PR creation, Git claims, source preparation, publication,
 retry recovery, repair selection, replies, and stale-head refusal.
 
 ```sh
 python tests/worker_sources.py
-FORGEJO_BINARY=/path/to/forgejo python tests/integration_forgejo_worker.py
+TAUCETI_REVIEW_ENGINE_DIR=/path/to/TauCetiReview \
+  FORGEJO_BINARY=/path/to/forgejo python tests/integration_forgejo_worker.py
 ```
+
+The native fixture uses the selected Review checkout for its recovery subprocess;
+an installed Review wheel supplies Python modules but does not bundle rubrics.
+An editable Review checkout is detected automatically. Normal worker rounds
+resolve their engine through the shared on-demand resolver.
 
 Finding roots retain their reviewed head; a new head receives new roots. Native
 UI reply recognition uses the containing review and line location. Replies

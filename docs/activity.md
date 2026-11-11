@@ -176,8 +176,14 @@ time window, so daily rates still fluctuate with landing delays.
 `Landed PRs with attribution data` reports coverage. Missing exact LOC, review records,
 cost links or calibration samples supply no attributed output. With no covered PRs the
 attributed rate is unavailable; partial output is shown with its coverage rather than
-silently assuming there was no outside work. Rates using incomplete output are labelled
-`partial`; an all-missing rate is unavailable. Unpriced completed local review passes
+silently assuming there was no outside work. The compact report shows estimates with
+`~` and the coverage counts, without repeated attribution caveats or `partial` prefixes.
+An all-missing rate is unavailable. During historical backfill, adjusted
+LOC and cost rates are unavailable: full spending divided by partly reconstructed
+credit is not a fleet estimate. The underlying provisional sums remain in JSON for
+diagnostics, with `attribution_backfilling=true`. This is separate from an ordinary
+pending live refresh, which retains the last prepared estimate. Finishing backfill
+forces a final report refresh before the backfilling flag clears. Unpriced completed local review passes
 also make coverage incomplete. Older hosts cannot supply attribution until their
 collectors are updated. Fleet reporting pools dollars and locally estimated credit
 before dividing. Worker and group summaries share host-wide measured rates and per-PR
@@ -342,3 +348,11 @@ The same totals cover worker time, rounds, PR/LOC output, contributions and CI.
 A new schema or discarded/replaced cache may require one migration scan.
 `--inventory` explicitly reads the prepared PR table; the collector does not
 serialize the entire inventory every minute.
+
+Confirmed deferred publications retain their original worker, host and round ID.
+A successful PR creation reconciles an unconfirmed authoring round; a branch push
+or closure reconciles an unconfirmed repair round. This changes only the outcome,
+keeping the original finish timestamp and counts. Receipt order and duplicate
+replays do not change the result. Execution failures and rounds without a recorded
+finish remain separate; replies alone do not prove a repair that required a push.
+Legacy intents without a saved round ID never borrow the round draining them.

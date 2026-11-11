@@ -195,6 +195,8 @@ def _connect():
     db.executescript("""
       PRAGMA journal_mode=WAL;
       CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS round_publications(round_id TEXT,worker TEXT,scope TEXT,publication TEXT,
+        PRIMARY KEY(round_id,worker,scope,publication));
       CREATE TABLE IF NOT EXISTS rounds(id TEXT PRIMARY KEY,worker TEXT,scope TEXT,kind TEXT,
         started REAL,finished REAL,outcome TEXT,pid INTEGER,identity TEXT,hostname TEXT);
       DROP INDEX IF EXISTS round_finish_covering;
@@ -250,6 +252,42 @@ def _connect():
     return db
 
 
+def _reconcile_publication(db, e, worker, scope):
+    """Keep positive publication evidence across receipt ordering and restarts.
+
+    Only matching, normally finished rounds can be reconciled. A push or closure
+    proves a repair outcome; creation proves authorship. Replies alone cannot
+    prove a repair that required a push. Never invent a completion timestamp or
+    turn an execution failure into a successful round.
+    """
+    rid = e.get("round_id")
+    if not rid:
+        return
+    publication = (
+        "creation"
+        if e["kind"] == "pr_created"
+        else "push"
+        if e["kind"] == "pr_activity" and e.get("activity") == "branch_push"
+        else "closure"
+        if e["kind"] == "pr_activity" and e.get("publication") == "closure"
+        else None
+    )
+    if publication:
+        db.execute("INSERT OR IGNORE INTO round_publications VALUES (?,?,?,?)", (rid, worker, scope, publication))
+    if publication or e["kind"].startswith("round_"):
+        db.execute(
+            """UPDATE rounds SET outcome='completed'
+               WHERE id=? AND worker=? AND scope=? AND finished IS NOT NULL
+                 AND outcome IN ('unknown','unconfirmed')
+                 AND EXISTS(SELECT 1 FROM round_publications p
+                   WHERE p.round_id=rounds.id AND p.worker=rounds.worker AND p.scope=rounds.scope
+                     AND ((p.publication='creation' AND rounds.kind IN ('roadmap','bump'))
+                       OR (p.publication IN ('push','closure') AND rounds.kind IN
+                         ('fix','fix-ci','rebase','bump','lint-repair','overlap-fix'))))""",
+            (rid, worker, scope),
+        )
+
+
 def _ingest(db, e):
     if e.get("version") != 1 or not isinstance(e.get("at"), (int, float)):
         raise ValueError("invalid activity receipt")
@@ -273,6 +311,7 @@ def _ingest(db, e):
             (e["id"], e["repository"], e["pr"], worker, scope, e["at"], e.get("activity", "work")),
         )
     if not db.execute("INSERT OR IGNORE INTO events VALUES (?)", (e["id"],)).rowcount:
+        _reconcile_publication(db, e, worker, scope)
         return
     if kind == "review_coordination":
         row = db.execute("SELECT value FROM meta WHERE key='local_coordination'").fetchone()
@@ -305,6 +344,8 @@ def _ingest(db, e):
             "INSERT OR IGNORE INTO ci_activity VALUES (?,?,?,?,?,?)",
             (e["id"], scope, e["at"], e.get("conclusion"), e.get("wait_seconds"), e.get("run_seconds")),
         )
+
+    _reconcile_publication(db, e, worker, scope)
 
 
 def _consume(db, errors):
@@ -562,17 +603,22 @@ def _refresh_prs(db, config, now, errors):
                         and math.isfinite(stamp)
                         and stamp >= 0
                     )
+                    counter_values = (
+                        p.get("head_sha"),
+                        count if valid else None,
+                        stamp / 1000 if valid else None,
+                        now,
+                        "scoreboard-round-counters" if valid else "unavailable",
+                        repo,
+                        p["number"],
+                    )
                     db.execute(
-                        "INSERT INTO pr_review_counts VALUES (?,?,?,?,?,?,?) ON CONFLICT(repo,number) DO UPDATE SET head=excluded.head,count=excluded.count,observed=excluded.observed,checked=excluded.checked,basis=excluded.basis",
-                        (
-                            repo,
-                            p["number"],
-                            p.get("head_sha"),
-                            count if valid else None,
-                            stamp / 1000 if valid else None,
-                            now,
-                            "scoreboard-round-counters" if valid else "unavailable",
-                        ),
+                        "UPDATE pr_review_counts SET head=?,count=?,observed=?,checked=?,basis=? WHERE repo=? AND number=?",
+                        counter_values,
+                    )
+                    db.execute(
+                        "INSERT OR IGNORE INTO pr_review_counts(head,count,observed,checked,basis,repo,number) VALUES (?,?,?,?,?,?,?)",
+                        counter_values,
                     )
                     loc = p.get("lean_loc") or git_locs.get(p["number"]) or stored_locs.get(p["number"])
                     if loc is not None:
@@ -581,7 +627,11 @@ def _refresh_prs(db, config, now, errors):
                         ):
                             raise ValueError("invalid LOC observation")
                         db.execute(
-                            "INSERT OR REPLACE INTO pr_loc VALUES (?,?,?,?,?,?)",
+                            "UPDATE pr_loc SET head=?,added=?,deleted=?,observed=? WHERE repo=? AND number=?",
+                            (loc["head_sha"], loc["added"], loc["deleted"], p["observed_at"] / 1000, repo, p["number"]),
+                        )
+                        db.execute(
+                            "INSERT OR IGNORE INTO pr_loc VALUES (?,?,?,?,?,?)",
                             (repo, p["number"], loc["head_sha"], loc["added"], loc["deleted"], p["observed_at"] / 1000),
                         )
                     else:

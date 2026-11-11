@@ -535,6 +535,9 @@ class AttributionTests(unittest.TestCase):
         self.assertIn(("legacy_cost", '["old-1"]'), keys)
         self.assertNotIn(("cost", '["old-1"]'), keys)
         self.assertIn(("cost", '["active"]'), keys)
+        row = a._summary(self.db, self.now)["costs"]["windows"]["total"]
+        self.assertTrue(row["attribution_backfilling"])
+        self.assertIsNone(activity_summary.attributed_rate(row))
 
     def test_live_work_is_processed_before_legacy_backfill(self):
         self.example()
@@ -655,6 +658,137 @@ class AttributionTests(unittest.TestCase):
             self.assertEqual(observe.call_count, 1)
         self.assertEqual(self.db.execute("SELECT added FROM pr_loc WHERE number=1").fetchone()[0], 15000)
         self.assertIsNone(self.db.execute("SELECT next_at FROM report_pr_refresh WHERE number=1").fetchone()[0])
+
+    def test_history_backfill_does_not_quote_full_spend_over_provisional_credit(self):
+        self.example()
+        self.prepare()
+        adapter.queue(self.db, "legacy_cost", ["author"])
+        row = a._summary(self.db, self.now)["costs"]["windows"]["total"]
+        self.assertTrue(row["attribution_backfilling"])
+        self.assertEqual(Decimal(row["estimated_usd"]), 37)
+        self.assertIsNone(activity_summary.attributed_rate(row))
+        self.assertEqual(activity_summary.attributed_rate_display(row), "—")
+
+    def test_final_backfill_refresh_bypasses_large_report_throttle(self):
+        self.example()
+        self.prepare()
+        raw = self.db.execute("SELECT payload FROM attribution_prs LIMIT 1").fetchone()[0]
+        for number in range(100, 240):
+            self.db.execute("INSERT INTO attribution_prs VALUES (?,?,?)", (REPO, number, raw))
+        for identity in ("author", "review-own"):
+            adapter.queue(self.db, "legacy_cost", [identity])
+        with (
+            patch.object(adapter, "MAX_SESSIONS", 1),
+            patch.object(adapter, "reports", wraps=adapter.reports) as report,
+        ):
+            attr.prepare(self.db, self.now + 1)
+            self.assertEqual(report.call_count, 0)
+            row = a._summary(self.db, self.now + 1)["costs"]["windows"]["total"]
+            self.assertTrue(row["attribution_backfilling"])
+            attr.prepare(self.db, self.now + 2)
+            self.assertEqual(report.call_count, 1)
+        row = a._summary(self.db, self.now + 2)["costs"]["windows"]["total"]
+        self.assertFalse(row["attribution_backfilling"])
+        self.assertIsNotNone(activity_summary.attributed_rate(row))
+
+    def test_normal_live_refresh_is_distinct_from_history_backfill(self):
+        self.example()
+        self.prepare()
+        adapter.queue(self.db, "cost", ["new-live-session"])
+        row = a._summary(self.db, self.now)["costs"]["windows"]["total"]
+        self.assertTrue(row["attribution_preparing"])
+        self.assertFalse(row["attribution_backfilling"])
+        self.assertIsNotNone(activity_summary.attributed_rate(row))
+
+    def test_empty_scope_does_not_keep_whole_fleet_backfilling(self):
+        self.example()
+        host = self.prepare()
+        empty = a._summary(self.db, self.now, "scope", "queue-only")
+        self.assertFalse(empty["costs"]["windows"]["total"]["attribution_backfilling"])
+        combined = activity_summary.combine([dict(available=True, summary=host), dict(available=True, summary=empty)])
+        row = combined["summary"]["costs"]["windows"]["total"]
+        self.assertFalse(row["attribution_backfilling"])
+        self.assertIsNotNone(activity_summary.attributed_rate(row))
+
+    def test_unchanged_observation_preserves_freshness_without_requeueing_attribution(self):
+        self.pr(1, 15000)
+        self.db.execute("UPDATE prs SET landed=NULL,state='OPEN' WHERE number=1")
+        response = dict(
+            prs=[
+                dict(
+                    number=1,
+                    state="OPEN",
+                    head_sha="head",
+                    observed_at=self.now * 1000,
+                    landed_at=None,
+                    lean_loc=dict(head_sha="head", added=15000, deleted=0),
+                )
+            ],
+            missing=[],
+        )
+        response["prs"][0]["review_passes"] = dict(
+            count=2, basis="scoreboard-round-counters", observed_at=self.now * 1000
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"TAUCETI_GITHUB_STATE_URL": "https://state.example", "TAUCETI_GITHUB_STATE_TOKEN_FILE": "/not-read"},
+            ),
+            patch.object(a, "observe", return_value=response),
+        ):
+            a._refresh_prs(self.db, None, self.now, [])
+            self.assertIsNotNone(self.db.execute("SELECT 1 FROM attribution_dirty WHERE source='pr'").fetchone())
+            self.db.execute("UPDATE review_archive_checks SET checked=? WHERE number=1", (self.now,))
+            self.db.execute("DELETE FROM attribution_dirty")
+            response["prs"][0]["observed_at"] = (self.now + 301) * 1000
+            a._refresh_prs(self.db, None, self.now + 301, [])
+            self.assertEqual(list(self.db.execute("SELECT * FROM attribution_dirty")), [])
+            self.assertEqual(
+                self.db.execute("SELECT observed FROM pr_loc WHERE number=1").fetchone()[0], self.now + 301
+            )
+            self.assertEqual(
+                self.db.execute("SELECT checked FROM review_archive_checks WHERE number=1").fetchone()[0], self.now
+            )
+            response["prs"][0]["lean_loc"]["added"] = 16000
+            a._refresh_prs(self.db, None, self.now + 602, [])
+            self.assertIsNotNone(self.db.execute("SELECT 1 FROM attribution_dirty WHERE source='pr'").fetchone())
+            # A changed counter must update even if the PR already has queued work.
+            response["prs"][0]["review_passes"] = dict(
+                count=3, basis="scoreboard-round-counters", observed_at=self.now * 1000
+            )
+            errors = []
+            a._refresh_prs(self.db, None, self.now + 903, errors)
+            self.assertEqual(errors, [])
+            self.assertEqual(self.db.execute("SELECT count FROM pr_review_counts WHERE number=1").fetchone()[0], 3)
+
+    def test_unchanged_incomplete_archive_does_not_requeue_but_repaired_record_does(self):
+        self.example()
+        path = self.root / "archive" / "records" / "rounds" / "1" / "broken.json"
+        path.write_text("{broken")
+        attr.prepare_reviews(self.db, self.now)
+        self.db.execute("DELETE FROM attribution_dirty")
+        attr.prepare_reviews(self.db, self.now + 301)
+        self.assertEqual(list(self.db.execute("SELECT * FROM attribution_dirty")), [])
+        self.assertEqual(
+            self.db.execute("SELECT checked FROM review_archive_checks WHERE number=1").fetchone()[0], self.now + 301
+        )
+        path.unlink()
+        attr.prepare_reviews(self.db, self.now + 602)
+        self.assertIsNotNone(self.db.execute("SELECT 1 FROM attribution_dirty WHERE source='pr'").fetchone())
+        self.assertEqual(self.db.execute("SELECT complete FROM review_archive_checks WHERE number=1").fetchone()[0], 1)
+
+    def test_archive_freshness_requeues_even_when_rescan_finds_identical_records(self):
+        self.example()
+        fetch = self.root / "archive" / ".git" / "FETCH_HEAD"
+        os.utime(fetch, (self.now - 500, self.now - 500))
+        result = self.prepare()["costs"]["windows"]["total"]
+        self.assertEqual(result["attribution_known_prs"], 0)
+        # Force the full-scan path while the immutable JSON records stay unchanged.
+        (self.root / "archive" / "records" / "rounds" / "1" / "extra.txt").write_text("non-record")
+        self.now += 301
+        os.utime(fetch, (self.now, self.now))
+        result = self.prepare()["costs"]["windows"]["total"]
+        self.assertEqual(result["attribution_known_prs"], 2)
 
     def test_existing_observation_batch_imports_counters_once_after_landing(self):
         self.pr(1, 15000)
