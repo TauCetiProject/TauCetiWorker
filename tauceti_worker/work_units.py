@@ -2492,10 +2492,15 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
     invalid_plan = None
     recovery = False
 
+    def source_binding(value):
+        # Presence is part of the binding: an explicit null is not the legacy plan that has none.
+        return ("source" in value, value.get("source"))
+
     def plan_identity(value):
         return {
             **{key: value.get(key) for key in ("roadmap", "from_sha", "to_sha", "prs", "documentation")},
             "history_migration_sha256": publication.history_policy_digest(value),
+            "source": source_binding(value),
         }
 
     for attempt in range(3):
@@ -2581,10 +2586,11 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                     facts["docs_sha"] != plan["to_sha"]
                     or facts["to_sha"] != plan["to_sha"]
                     or facts.get("documentation") != plan.get("documentation")
+                    or source_binding(facts) != source_binding(plan)
                 ):
                     reason = (
                         f"successful facts name docs={facts['docs_sha']} to={facts['to_sha']}, "
-                        f"expected={plan['to_sha']} or documentation pin differs; replanning"
+                        f"expected={plan['to_sha']} or documentation pin or source binding differs; replanning"
                     )
                     log(f"progress: {reason}")
                 else:
