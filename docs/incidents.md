@@ -28,6 +28,7 @@ A [managed worker](workers.md) gets both through its `env` table.
 ```
 <dir>/<kind>-<key>.json          live
 <dir>/acked/<kind>-<key>.json    acknowledged
+<dir>/acked/<kind>-<key>.json.<n> earlier acknowledged records of that name
 <dir>/.decide.lock               the decide phase's lock and last-round time
 <dir>/.records.lock              held while a live record is written or acknowledged
 <dir>/drafts/roadmap-<pr>.md     roadmap changes the decide phase drafted
@@ -145,7 +146,7 @@ records:
 | `record(kind, key, **fields)` | Write or refresh a live record; returns its path, or `None` when off or the write failed |
 | `find(kind, key)` | The live and the acknowledged record of that name, where they exist |
 | `records(kind="", acked=True)` | Every readable record with its path, live ones first |
-| `acknowledge(kind, key, version=None)` | Move a live record into `acked/`; with `version`, only while the live record is still that one |
+| `acknowledge(kind, key, version=None)` | Move a live record into `acked/`, keeping the one it replaces as `<name>.<n>`; with `version`, only while the live record is still that one |
 | `record_declined(...)`, `note_budget_spent(...)` | The two kinds above |
 | `declined(stage, pr, head)` | Whether the hold applies |
 

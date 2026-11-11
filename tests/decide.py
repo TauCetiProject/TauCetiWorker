@@ -426,6 +426,23 @@ def test_rounds(tmp):
             ([False], ["live"]),
         )
 
+    root = tmp / "displaced"
+    with settings(root):
+        for head in ("h1", "h2", "h3"):
+            incidents.record_declined("fix", 9, head, message=head)
+            incidents.acknowledge("declined", "fix-9")
+        kept = sorted(path.name for path in (root / incidents.ACKED).iterdir())
+        check(
+            "an acknowledged record that another replaces is kept beside it",
+            kept,
+            ["declined-fix-9.json", "declined-fix-9.json.1", "declined-fix-9.json.2"],
+        )
+        check(
+            "…out of the hold's sight",
+            [load(root / incidents.ACKED / name)["head"] for name in kept] + [len(incidents.find("declined", "fix-9"))],
+            ["h3", "h1", "h2", 1],
+        )
+
     root = tmp / "cap"
     with settings(root, TAUCETI_DECIDE_MAX_CASES="2"):
         for n in (1, 2, 3):

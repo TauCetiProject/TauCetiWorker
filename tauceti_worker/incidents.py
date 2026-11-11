@@ -150,10 +150,23 @@ def _write(root: Path, kind: str, key: str, fields: dict) -> Path | None:
     return path
 
 
+def _keep_displaced(path: Path) -> None:
+    """Hard-link an acknowledged record about to be replaced as `<name>.<n>`, the first free `n`."""
+    n = 1
+    while True:
+        try:
+            os.link(path, path.with_name(f"{path.name}.{n}"))
+            return
+        except FileExistsError:
+            n += 1
+        except FileNotFoundError:
+            return
+
+
 def acknowledge(kind: str, key: str, version: dict | None = None) -> bool:
-    """Move the live record `<kind>-<key>` into `acked/`, over an older acknowledged one of that
-    name; with `version`, only while the live record is exactly that one, as read earlier. False
-    when there is no such live record or the move failed."""
+    """Move the live record `<kind>-<key>` into `acked/`; an earlier acknowledged one of that name
+    is kept as `acked/<name>.<n>`. With `version`, only while the live record is exactly that one,
+    as read earlier. False when there is no such live record or the move failed."""
     root = directory()
     if root is None:
         return False
@@ -163,6 +176,8 @@ def acknowledge(kind: str, key: str, version: dict | None = None) -> bool:
             return False
         try:
             (root / ACKED).mkdir(mode=0o700, exist_ok=True)
+            if (root / name).exists():
+                _keep_displaced(root / ACKED / name)
             os.replace(root / name, root / ACKED / name)
         except FileNotFoundError:
             return False
