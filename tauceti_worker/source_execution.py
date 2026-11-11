@@ -122,6 +122,20 @@ def review(w, sv, candidate, opts, bubble):
                 w.counters.incr(f"review-contest-{candidate.pr}")
                 w.counters.incr(f"review-contest-{candidate.pr}-{candidate.contest}")
         else:
+            from .review_diagnostics import record_review_failure
+            from .runtime_status import runtime_snapshot
+
+            failure = runtime_snapshot()
+            record_review_failure(
+                w.cfg.state,
+                worker=w.cfg.wid,
+                pr=candidate.pr,
+                head=candidate.head,
+                provider=opts.work_model,
+                code=rc,
+                reason=str(failure.get("failure_reason") or "native review failed"),
+                log_file=log_file,
+            )
             w.counters.incr(key)
         w.rs.bust(candidate.pr)
         return rc
