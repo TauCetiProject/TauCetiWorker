@@ -591,6 +591,9 @@ class FakeGitHub:
             self._call("commit_status", sha, context)
             return self.statuses.get((sha, context))
 
+    def fast_forward_leased(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult:
+        return self.fast_forward(repo, branch, expected_parent, tip)
+
     def fast_forward(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult:
         with self.lock:
             self._call("fast_forward", branch, expected_parent, tip)

@@ -26,7 +26,11 @@ class MixedNativePolicy(NativeAdmissionPolicy):
             snapshot, statuses={**snapshot.statuses, "build": "success", "scope": "success", "bump-guard": "success"}
         )
         static, _, _, _, _ = AdmissionPolicy.evaluate(self, preliminary)
-        if result["review_safe"] and not result.get("recovery_heads"):
+        if (
+            result["review_safe"]
+            and not result.get("recovery_authority_hold")
+            and snapshot.pull.head_sha not in result.get("recovery_heads", ())
+        ):
             result["merge"] = static["merge"]
             result["reason"] = (
                 "review and static policy ready; exact mixed candidate CI required"

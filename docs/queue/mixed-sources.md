@@ -106,6 +106,13 @@ Deploy the matching repair runner before enabling mixed admission. CI validates 
 existing per-member scope/dependency gates; landing rechecks original heads,
 targets, holds and current review authority.
 
+Human-approved GitHub control-file changes keep their existing GitHub-only CI
+path. Admission separates them from native batches before dispatch. Under
+Forgejo primary, changes outside the configured native path policy wait with an
+explicit reason; switch temporarily to GitHub primary to land them. A primary
+change to Forgejo refuses pending batches containing these changes. This keeps
+the current CI scope checks intact without spending a build on a known refusal.
+
 When the execution repository is also the moving GitHub content repository,
 new requests capture its current caller SHA only after comparing execution
 control files with the explicitly approved caller. In-flight requests retain
@@ -113,7 +120,8 @@ their original immutable caller. Changes to `.github`, `.tauceti`, `scripts` or
 `tauceti.toml` require an explicit approval/configuration update.
 
 GitHub starts as primary. Landings enqueue follower synchronization in the
-existing retryable outbox. A lost landing reply is reconciled by reading main;
+existing retryable outbox. Both primary writers use an atomic expected-old Git
+lease and verify ancestry locally. A lost landing reply is reconciled by reading main;
 a lost mirror reply is reconciled by reading both tips. Sync refuses divergence
 and only fast-forwards. Queue status reports primary, generation, native
 observation errors and the last confirmed sync. The old Bors-compatible feed

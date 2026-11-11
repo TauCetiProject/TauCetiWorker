@@ -123,25 +123,8 @@ class MixedCandidateCI(SourceCandidateCI):
             from tauceti_tools.ci_candidate_evidence import EvidenceUnavailable
 
             raise EvidenceUnavailable("mixed candidate has no verified exact passing result")
-        native_policy = self.registry.native.admission_policy
-        if hasattr(native_policy, "prefix"):
-            from . import chain
-
-            paths = chain.git(
-                self.controller.clone,
-                "diff",
-                "--name-only",
-                "-z",
-                "--no-renames",
-                frozen.request.base,
-                frozen.request.head,
-                "--",
-            ).split("\0")
-            if any(
-                path and not (path.startswith(native_policy.prefix) or path in native_policy.allow_files)
-                for path in paths
-            ):
-                raise PromotionRefused("mixed candidate exceeds the current native path policy")
+        if not self.registry.supports_candidate(frozen.request.base, frozen.request.head):
+            raise PromotionRefused("mixed candidate exceeds the current native path policy")
         for member in members:
             if member.get("withdrawn"):
                 continue
@@ -169,6 +152,7 @@ class MixedCandidateCI(SourceCandidateCI):
             if (
                 self.controller._blocking_labels(snapshot.pull)
                 or not decision["review_safe"]
-                or decision.get("recovery_heads")
+                or decision.get("recovery_authority_hold")
+                or member["accepted_head"] in decision.get("recovery_heads", ())
             ):
                 raise PromotionRefused("an original source review or hold no longer authorizes this candidate")

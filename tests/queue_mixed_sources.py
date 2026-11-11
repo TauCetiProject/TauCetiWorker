@@ -430,6 +430,125 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         self.assertTrue(any(comment["number"] == 17 for comment in self.github.comments))
         self.assertTrue(any(comment["number"] == 17 for comment in self.native.comments))
 
+    def test_historical_recovery_does_not_block_new_accepted_heads(self):
+        frozen = self.start_mixed()
+        self.execution.add(frozen, classification="passed")
+        for decision in (self.native.admission_policy, self.controller.admission.github.policy):
+            evaluate = decision.evaluate
+
+            def historical(snapshot, evaluate=evaluate):
+                result, *rest = evaluate(snapshot)
+                return ({**result, "recovery_heads": ["a" * 40]}, *rest)
+
+            decision.evaluate = historical
+        self.clock.advance(60)
+        self.controller.tick()
+        self.assertEqual(self.repo.main_sha(), frozen.request.head, self.controller._reasons)
+
+    def test_github_only_repair_keeps_legacy_claim_when_native_admission_is_disabled(self):
+        head = self.github.create_pr(17, {"Github.lean": "github\n"})
+        self.controller.approve(self.controller.repository, 17, head, "fixture")
+        self.controller.tick()
+        batch = self.controller._head()
+        task_id = self.controller._create_task(batch, "repair", batch["base"], [], self.clock())
+        self.assertEqual(loads(self.controller.store.row("tasks", {"id": task_id})["task_binding"]), {})
+        self.github.admins.add("reviewer")
+        task = self.controller.claim_task("old-worker", "reviewer")
+        self.assertEqual(task.task_id, task_id)
+        self.controller.mixed = self.controller.mixed_ci = None
+        self.controller.source = self.github
+        self.assertGreater(self.controller.renew_task(task_id, task.claim_token), self.clock())
+        self.assertEqual(self.controller.store.row("claims", {"token": task.claim_token})["released_at"], None)
+        from tauceti_queue.fakes import Resolution, ScriptedAgent
+
+        agent = ScriptedAgent(
+            "old-worker",
+            "reviewer",
+            self.repo,
+            self.root / "repair-worker",
+            lambda task: {task.members[0].source_pr: Resolution({"Github.lean": "repaired\n"})},
+        )
+        repaired = agent.produce(task)
+        result = self.controller.submit_task(task_id, task.claim_token, repaired)
+        self.assertTrue(result.accepted, result)
+        self.controller.tick()
+        self.github.start_runs()
+        self.github.complete_runs()
+        self.clock.advance(60)
+        self.controller.tick()
+        self.assertEqual(
+            self.controller.store.row("batches", {"id": batch["id"]})["state"], "landed", self.controller._reasons
+        )
+
+    def test_human_control_changes_split_from_native_batches_before_ci(self):
+        self.native.admission_policy.prefix = "Math/"
+        self.native.admission_policy.allow_files = ()
+        human = self.github.create_pr(17, {"scripts/control.py": "control\n"})
+        native = self.native.create_pr(17, {"Math/Native.lean": "native\n"})
+        self.controller.approve(self.controller.repository, 17, human, "fixture")
+        self.controller.approve(self.native_id.repository.key, 17, native, "fixture")
+        self.controller.tick()
+        batches = self.controller.store.rows("batches", {"state": ["open", "head"]})
+        for batch in batches:
+            self.assertEqual(len(self.controller._members(batch["id"])), 1)
+        self.assertEqual(len(batches), 2)
+        for request in self.execution.dispatches:
+            self.assertTrue(self.registry_value.supports_candidate(request.request.base, request.request.head))
+            self.assertTrue(all(member.source == self.native_id for member in request.request.accepted_members))
+        from tauceti_queue.controller import ControllerError
+
+        with self.assertRaisesRegex(ControllerError, "human control-file"):
+            self.controller.change_primary("forgejo", "fixture")
+
+    def test_human_control_changes_wait_under_native_primary_without_dispatch(self):
+        self.registry_value.primary = "forgejo"
+        self.native.admission_policy.prefix = "Math/"
+        self.native.admission_policy.allow_files = ()
+        human = self.github.create_pr(17, {"scripts/control.py": "control\n"})
+        self.controller.approve(self.controller.repository, 17, human, "fixture")
+        self.controller.tick()
+        row = self.controller.input_for(self.controller.repository, 17)
+        self.assertEqual(row["state"], "waiting")
+        self.assertIn("require GitHub primary", row["last_probe"])
+        self.assertEqual(self.execution.dispatches, [])
+        self.assertEqual(self.controller.store.count("ci_attempts"), 0)
+        self.assertTrue(self.controller.change_primary("github", "fixture")["changed"])
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(self.controller.repository, 17)["state"], "inserted")
+
+    def test_old_uncertain_lease_is_settled_when_main_has_moved_off_its_expected_parent(self):
+        from tauceti_queue.controller import ControllerError
+        from tauceti_queue.fakes import run_git
+
+        frozen = self.start_mixed()
+        # A candidate ancestor still permits a legacy API fast-forward, but an
+        # atomic expected-old Git lease can no longer apply.
+        moved = run_git(self.repo.clone, "rev-parse", frozen.request.head + "^")
+        run_git(self.repo.origin, "update-ref", "refs/heads/main", moved)
+        run_git(self.native_repo.origin, "update-ref", "refs/heads/main", moved)
+        self.controller._enqueue(
+            "promote",
+            "obsolete-sent-lease",
+            {
+                "batch_id": 1,
+                "version": -1,
+                "tip": frozen.request.head,
+                "expected_parent": frozen.request.base,
+                "primary": "github",
+                "promotion_send": {"state": "sending"},
+            },
+        )
+        entry = self.controller.store.row("outbox", {"key": "obsolete-sent-lease"})
+        self.controller.store.update("outbox", {"id": entry["id"]}, state="done", attempts=1)
+        with self.assertRaisesRegex(ControllerError, "reconcile a sent landing"):
+            self.controller.change_primary("forgejo", "fixture")
+        intent = loads(entry["payload"])
+        intent["promotion_send"]["lease"] = True
+        self.controller.store.update("outbox", {"id": entry["id"]}, payload=dumps(intent))
+        self.assertTrue(self.controller.change_primary("forgejo", "fixture")["changed"])
+        settled = loads(self.controller.store.row("outbox", {"id": entry["id"]})["payload"])
+        self.assertEqual(settled["promotion_send"]["state"], "settled")
+
     def test_changed_original_native_head_cannot_land_cached_pass(self):
         original = self.repo.main_sha()
         frozen = self.start_mixed()

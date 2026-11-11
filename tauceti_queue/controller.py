@@ -2486,7 +2486,14 @@ class Controller:
             task_binding = TaskBinding.from_policy(
                 self.candidate_ci.ledger.policy, queue_epoch=self.candidate_ci.ledger.epoch
             ).record()
-        elif self.mixed is not None and self.mixed.mode == "admit":
+        elif (
+            self.mixed is not None
+            and self.mixed.mode == "admit"
+            and (
+                any(isinstance(member["number"], SourceNumber) for member in self._members(head["id"]))
+                or self._candidate_coordinator(batch_id=head["id"]) is not None
+            )
+        ):
             if self.mixed_ci is None:
                 raise TaskError("source-disabled", "mixed task requires active enrolled sources")
             from .mixed_tasks import binding
@@ -2844,6 +2851,15 @@ class Controller:
                 if check_actor is not None:
                     check_actor()
                 if target == "forgejo":
+                    if any(
+                        not self.mixed.supports_candidate(batch["base"], batch["tip"])
+                        for batch in self.store.rows(
+                            "batches", {"repository": self.repository, "state": [BATCH_OPEN, BATCH_HEAD]}
+                        )
+                    ):
+                        raise ControllerError(
+                            "github-primary-required", "land pending human control-file changes on GitHub first"
+                        )
                     self.mixed.mirror.preflight(
                         self.mixed.native, current[target], current[target], self.mixed.approved_caller
                     )
@@ -2858,7 +2874,15 @@ class Controller:
                 if not unknown:
                     continue
                 original = intent.get("primary", "github")
-                if chain.is_ancestor(self.clone, intent["tip"], current[original]):
+                send = intent.get("promotion_send", {})
+                expected = intent.get("expected_parent")
+                observed = current[original]
+                cannot_apply = (
+                    expected
+                    and observed != expected
+                    and (send.get("lease") is True or not chain.is_ancestor(self.clone, observed, intent["tip"]))
+                )
+                if chain.is_ancestor(self.clone, intent["tip"], observed) or cannot_apply:
                     intent["promotion_send"] = {"state": "settled"}
                     self.store.update("outbox", {"id": entry["id"]}, payload=dumps(intent))
                 else:
@@ -2877,6 +2901,17 @@ class Controller:
             with self.store.transaction():
                 self.store.set_setting("mixed:primary", target, actor, self.clock())
                 self.store.set_setting("mixed:primary_generation", generation, actor, self.clock())
+                if target == "github":
+                    for row in self._waiting():
+                        if row["last_probe"].startswith("source-ci-scope:"):
+                            self.store.update(
+                                "inputs",
+                                {"id": row["id"]},
+                                last_probe="",
+                                last_probe_tip="",
+                                last_probe_base="",
+                                probe_conflicts="{}",
+                            )
                 self._set_state("canonical_sha", current[target])
                 self.store.journal(
                     self.clock(),
@@ -3421,6 +3456,7 @@ class Controller:
         result: chain.ChainResult | None = None
         gaps: list[tuple[str, str]] = []
         scan_unavailable: str | None = None
+        scope_supported = True
         try:
             with self._lock.unlocked():
                 if not self._fetch_head(row["number"], row["head_sha"]):
@@ -3429,6 +3465,8 @@ class Controller:
                 gaps, scan_unavailable = (
                     self._new_import_gaps(batch["tip"], result) if result.status == chain.CLEAN else ([], None)
                 )
+                if result.status == chain.CLEAN and self.mixed is not None and self.mixed.mode == "admit":
+                    scope_supported = self.mixed.supports_candidate(batch["base"], result.tip)
         except chain.ChainError as error:
             failure = error
         finally:
@@ -3536,6 +3574,32 @@ class Controller:
                 )
             return False
         record = result.commits[0]
+        source_ci_required = (
+            self.mixed is not None
+            and self.mixed.mode == "admit"
+            and (
+                isinstance(row["number"], SourceNumber) or self._candidate_coordinator(batch_id=batch["id"]) is not None
+            )
+        )
+        if source_ci_required and not scope_supported:
+            reason = "source-ci-scope: human control-file changes require GitHub primary and a GitHub-only batch"
+            with self.store.transaction():
+                conflicts = loads(row["probe_conflicts"], {})
+                if self._members(batch["id"]):
+                    conflicts[str(batch["id"])] = batch["base"]
+                self.store.update(
+                    "inputs",
+                    {"id": row["id"]},
+                    state=INPUT_WAITING,
+                    batch_id=None,
+                    last_probe=reason,
+                    last_probe_tip=batch["tip"],
+                    last_probe_base=batch["base"],
+                    probe_conflicts=dumps(conflicts),
+                )
+                self._release_claim(claim, "source-ci-scope", now)
+                self.store.journal(now, "probe-source-ci-scope", batch["id"], number=row["number"], reason=reason)
+            return False
         if scan_unavailable is not None:
             self.store.journal(
                 now, "probe-import-scan-unavailable", batch["id"], number=row["number"], reason=scan_unavailable
@@ -7045,7 +7109,7 @@ class Controller:
                 return f"gave-up: {str(error)[:200]}"
         raise ControllerError("unknown-outbox-kind", kind)
 
-    def _promotion_send_state(self, payload, state):
+    def _promotion_send_state(self, payload, state, *, lease=False):
         entry_id = payload.get("_outbox_id")
         if entry_id is None:
             return
@@ -7053,6 +7117,8 @@ class Controller:
             entry = self.store.row("outbox", {"id": entry_id})
             intent = loads(entry["payload"], {})
             intent["promotion_send"] = {"state": state}
+            if lease:
+                intent["promotion_send"]["lease"] = True
             self.store.update("outbox", {"id": entry_id}, payload=dumps(intent))
 
     def _perform_promotion(self, payload: dict[str, Any], now: float) -> str:
@@ -7175,10 +7241,12 @@ class Controller:
                 return "stale-primary-generation"
         if not self.setting("publication_enabled"):
             raise ControllerError("publication-disabled", "landing remains pending while publication is disabled")
-        self._promotion_send_state(payload, "sending")
-        result = self.source.fast_forward(
-            self.repository, self.canonical_branch, payload["expected_parent"], payload["tip"]
-        )
+        leased = (self.mixed is not None and self.mixed.mode == "admit") or bool(primary_generation)
+        self._promotion_send_state(payload, "sending", lease=leased)
+        fast_forward = self.source.fast_forward
+        if leased and (self.mixed is None or self.mixed.mode != "admit"):
+            fast_forward = self.source.fast_forward_leased
+        result = fast_forward(self.repository, self.canonical_branch, payload["expected_parent"], payload["tip"])
         self._promotion_send_state(payload, "settled")
         if result.ok:
             self._canonical = payload["tip"]

@@ -723,6 +723,43 @@ class GitHubAdapter:
             pass
         return FastForwardResult(False, current, detail or "update is not a fast forward")
 
+    def fast_forward_leased(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult:
+        """Mixed-primary landing uses Git's atomic expected-old check on either host."""
+        if self.clone_dir is None or self._tokens is None:
+            raise GitHubError("leased main publication requires a clone and installation token source")
+        if not SHA.fullmatch(expected_parent) or not SHA.fullmatch(tip):
+            raise ValueError("leased publication requires immutable commits")
+        ref = f"refs/heads/{branch}"
+        chain.git(self.clone_dir, "check-ref-format", ref)
+        if not chain.is_ancestor(self.clone_dir, expected_parent, tip):
+            return FastForwardResult(False, None, "candidate is not a descendant of the expected parent")
+        current = self.ref_sha(repo, f"heads/{branch}")
+        if current == tip:
+            return FastForwardResult(True, expected_parent)
+        if current != expected_parent:
+            return FastForwardResult(False, current, "parent changed before the push")
+        try:
+            self._git_with_token(
+                repo,
+                [
+                    "push",
+                    "--porcelain",
+                    "--no-verify",
+                    f"--force-with-lease={ref}:{expected_parent}",
+                    f"https://github.com/{repo}.git",
+                    f"{tip}:{ref}",
+                ],
+            )
+        except (GitHubError, subprocess.TimeoutExpired):
+            actual = self.ref_sha(repo, f"heads/{branch}")
+            if actual == tip:
+                return FastForwardResult(True, expected_parent)
+            if actual != expected_parent:
+                return FastForwardResult(False, actual, "parent changed during the leased push")
+            # No definitive acknowledgement: retain the outbox intent for readback.
+            raise
+        return FastForwardResult(True, expected_parent)
+
     def update_ref(self, repo: str, ref: str, sha: str) -> None:
         """Create or force-update `refs/<ref>` (retained candidate refs, never the base branch).
 

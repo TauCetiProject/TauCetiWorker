@@ -68,7 +68,7 @@ class SourcePorts:
     def fast_forward(self, repo, branch, expected, tip):
         registry = self.registry
         if registry.primary == "github":
-            return registry.github.fast_forward(repo, branch, expected, tip)
+            return registry.github.fast_forward_leased(repo, branch, expected, tip)
         registry.check_native()
         registry.check_writer()
         return registry.native_main.fast_forward(registry.profile.forgejo.repository.name, branch, expected, tip)
@@ -395,6 +395,14 @@ class MixedSources:
             self.check_native(number)
             return number
         return SourceNumber(int(number), self.profile.forgejo)
+
+    def supports_candidate(self, base, tip):
+        """The existing source CI scope cannot authorize human control-file changes."""
+        policy = self.native.admission_policy
+        if not hasattr(policy, "prefix"):
+            return True
+        paths = chain.git(self.clone, "diff", "--name-only", "-z", "--no-renames", base, tip, "--").split("\0")
+        return all(not path or path.startswith(policy.prefix) or path in policy.allow_files for path in paths)
 
     def check_native(self, number=None):
         if self.mode != "admit":

@@ -25,10 +25,6 @@ class MainWriter(ForgejoGitSource):
         if type(actor.get("id")) is not int or actor["id"] != self.actor_id:
             raise ValueError("Forgejo main writer differs from its configured native actor ID")
 
-    def fast_forward(self, *args):
-        self.check_actor()
-        return super().fast_forward(*args)
-
 
 def configure(registry):
     value = registry.profile.raw.get("mirror")
@@ -80,6 +76,9 @@ def preflight(registry, expected, candidate):
     registry.check_writer()
     registry.check_github()
     if registry.primary == "forgejo":
+        check_actor = getattr(registry.native_main, "check_actor", None)
+        if check_actor is not None:
+            check_actor()
         current = tips(registry)
         if current != {"github": expected, "forgejo": expected}:
             raise ValueError("repair main synchronization before the next Forgejo-primary landing")
@@ -98,6 +97,9 @@ def synchronize(registry):
         old = current["forgejo"]
         if not chain.is_ancestor(registry.clone, old, primary):
             raise ValueError("Forgejo follower diverged or is ahead; preserve both histories")
+        check_actor = getattr(registry.native_main, "check_actor", None)
+        if check_actor is not None:
+            check_actor()
         result = registry.native_main.fast_forward(
             registry.profile.forgejo.repository.name, registry.branch, old, primary
         )
