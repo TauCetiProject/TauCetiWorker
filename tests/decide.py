@@ -627,7 +627,7 @@ def test_prerequisite(tmp):
     lines, slugs, problem = decide.prerequisite_lines(asked, 7, targets, areas)
     check(
         "new items become lines",
-        ([(a, s) for a, s, _ in lines], problem),
+        ([(a, s) for a, s, _, _ in lines], problem),
         ([("Probability", "zero-one"), ("Topology", "nets")], ""),
     )
     check("…and one the list has is only waited on", slugs, ["zero-one", "strong-law", "nets"])
@@ -658,7 +658,7 @@ def test_prerequisite(tmp):
         )[2],
         True,
     )
-    check("the list is written", decide.add_prerequisites(path, lines), ["zero-one", "nets"])
+    check("the list is written", decide.add_prerequisites(path, lines), (["zero-one", "nets"], ""))
     check("…under its lock", (tmp / ".targets.md.lock").exists(), True)
     after = parse_targets(path.read_text())
     added = after.find("zero-one")
@@ -675,10 +675,20 @@ def test_prerequisite(tmp):
     check(
         "an item the list gained meanwhile is not added twice",
         (decide.add_prerequisites(path, lines), path.read_text().count("`zero-one` —")),
-        ([], 1),
+        (([], ""), 1),
     )
     check(
-        "a list that cannot be read is reported, not raised", decide.add_prerequisites(tmp / "absent.md", lines), None
+        "a list that cannot be read is reported, not raised",
+        decide.add_prerequisites(tmp / "absent.md", lines),
+        (None, "the target list could not be written"),
+    )
+    path.write_text(LIST)
+    later_lines, _, _ = decide.prerequisite_lines([item("dependent", needs=["strong-law"])], 7, targets, areas)
+    path.write_text(LIST.replace("- [ ] `strong-law` — the strong law (needs: `borel-cantelli`)\n", ""))
+    check(
+        "a need removed from the list after the ruling was asked for refuses it",
+        (decide.add_prerequisites(path, later_lines), "dependent" in path.read_text()),
+        ((None, "`dependent` needs `strong-law`, which the target list no longer has"), False),
     )
 
     root = tmp / "prerequisite"

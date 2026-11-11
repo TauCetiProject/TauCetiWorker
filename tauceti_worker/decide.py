@@ -589,8 +589,8 @@ def insert_item(text: str, area: str, line: str) -> str:
 
 def prerequisite_lines(
     items: list[dict], pr: int, targets: Targets, areas: set[str]
-) -> tuple[list[tuple[str, str, str]], list[str], str]:
-    """Check a `prerequisite` ruling's items against the list. Returns the (area, slug, line) to add,
+) -> tuple[list[tuple[str, str, str, list[str]]], list[str], str]:
+    """Check a `prerequisite` ruling's items against the list. Returns the (area, slug, line, needs) to add,
     every slug the pull request then waits on, and "" or the reason the ruling cannot be applied.
     An item the list already has, not yet done, adds nothing and is waited on. A new item may need
     only items already on the list or earlier in the ruling, so the items added form no cycle."""
@@ -612,33 +612,39 @@ def prerequisite_lines(
             return [], [], f"`{slug}` needs `{unknown[0]}`, which the target list does not have"
         needs = ", ".join(f"`{s}`" for s in item["needs"]) or "none"
         text = " ".join(item["text"].split())
-        lines.append((area, slug, f"- [ ] `{slug}` — {text} (unblocks: #{pr}; needs: {needs}; added by: decide)"))
+        line = f"- [ ] `{slug}` — {text} (unblocks: #{pr}; needs: {needs}; added by: decide)"
+        lines.append((area, slug, line, list(item["needs"])))
     return lines, slugs, ""
 
 
-def add_prerequisites(path: Path, additions: list[tuple[str, str, str]]) -> list[str] | None:
-    """Add (area, slug, line) items to the target list under its lock, `.<name>.lock` beside it.
-    Returns the slugs added, leaving out any the list gained meanwhile; None when it was not written."""
+def add_prerequisites(path: Path, additions: list[tuple[str, str, str, list[str]]]) -> tuple[list[str] | None, str]:
+    """Add (area, slug, line, needs) items to the target list under its lock, `.<name>.lock` beside it.
+    Returns the slugs added, leaving out any the list gained meanwhile, and ""; or None and why
+    nothing was written. Each item's needs are checked again against the list as it is under the
+    lock: one removed since the ruling was asked for refuses the whole ruling."""
     try:
         path = path.resolve()  # the lock and the rename are beside the file itself, not a link to it
         with _list_lock(path):
             text = path.read_text()
             have = {item.slug for item in parse_targets(text).items()}
             added = []
-            for area, slug, line in additions:
-                if slug not in have:
-                    text = insert_item(text, area, line)
-                    added.append(slug)
-                    have.add(slug)
+            for area, slug, line, needs in additions:
+                if slug in have:
+                    continue
+                if missing := [need for need in needs if need not in have]:
+                    return None, f"`{slug}` needs `{missing[0]}`, which the target list no longer has"
+                text = insert_item(text, area, line)
+                added.append(slug)
+                have.add(slug)
             if added:
                 temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
                 temporary.write_text(text)
                 shutil.copymode(path, temporary)
                 os.replace(temporary, path)
-            return added
+            return added, ""
     except (OSError, UnicodeDecodeError, Die) as error:
         log(f"decide: the target list {path} was not written: {getattr(error, 'strerror', None) or error}")
-        return None
+        return None, "the target list could not be written"
 
 
 def _prerequisite(rd: _Round, incident: dict, answer: dict) -> tuple[str, dict]:
@@ -646,9 +652,9 @@ def _prerequisite(rd: _Round, incident: dict, answer: dict) -> tuple[str, dict]:
     lines, slugs, problem = prerequisite_lines(answer["items"], incident["pr"], targets, rd.areas | set(targets.areas))
     if problem:
         return problem, {}
-    added = add_prerequisites(path, lines)
+    added, refused = add_prerequisites(path, lines)
     if added is None:
-        return "the target list could not be written", {}
+        return refused, {}
     return "", {"blocked_on_targets": slugs, "added": added}
 
 

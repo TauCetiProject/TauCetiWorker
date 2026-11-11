@@ -183,10 +183,12 @@ does not have gets a section at the end of the file:
 The area must be a roadmap directory or a section of the list, every `needs`
 slug must be on the list or an earlier item of the same ruling, never the item
 itself, and a slug the list already has open or in flight is waited on without
-being added. The file is rewritten by rename while holding an
-exclusive `flock` on `.<file name>.lock` beside it; anything else that writes
-the list should take the same lock. The phase does not commit the file, and
-does not remove an item once the pull request it unblocks has gone.
+being added. The file is rewritten by rename while holding an exclusive `flock`
+on `.<file name>.lock` beside it; anything else that writes the list should take
+the same lock. Under that lock each new item's `needs` are checked again against
+the file as it then is, and a ruling one of whose needs has left the list
+meanwhile writes nothing and is escalated. The phase does not commit the file,
+and does not remove an item once the pull request it unblocks has gone.
 
 ## Roadmap drafts
 
