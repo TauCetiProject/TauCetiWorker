@@ -583,6 +583,9 @@ class FakeGitHub:
         self._call("declaration_names", repo, head_sha)
         return self.declaration_records.get(head_sha, {"state": "unknown", "reason": "record_missing"})
 
+    def retry_status_delivery(self, repo: str, run_id: str, run_attempt: int, *, base_ref: str) -> None:
+        self._call("retry_status_delivery", repo, run_id, run_attempt, base_ref)
+
     def commit_status(self, repo: str, sha: str, context: str) -> Status | None:
         with self.lock:
             self._call("commit_status", sha, context)
