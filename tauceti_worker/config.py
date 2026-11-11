@@ -453,6 +453,10 @@ class AdmissionUnavailable(NoProgress):
         self.state = state
 
 
+class SourceUnavailable(NoProgress):
+    """A source dependency failed before a paid unit could start."""
+
+
 class GitHubUnavailable(NoProgress):
     """GitHub infrastructure pause; completed work and PR attempt budgets survive."""
 

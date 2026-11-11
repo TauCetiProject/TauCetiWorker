@@ -30,8 +30,21 @@ from .worker_manager import (
 )
 
 
+def candidate_label(candidate):
+    repository = candidate.source_repository
+    prefix = "forgejo " if repository is not None and repository.forge.kind == "forgejo" else ""
+    return f"{prefix}#{candidate.pr}"
+
+
+def candidate_key(value):
+    repository = getattr(value, "source_repository", None)
+    if repository is not None and repository.forge.kind == "github":
+        repository = None
+    return (repository.key if repository is not None else "github", getattr(value, "pr", getattr(value, "number", 0)))
+
+
 def _sample(cands: list[Candidate], n: int = 3) -> str:
-    nums = [f"#{c.pr}" if c.pr else c.reason for c in cands]
+    nums = [candidate_label(c) if c.pr else c.reason for c in cands]
     head = " ".join(nums[:n])
     return head + (f" +{len(nums) - n}" if len(nums) > n else "")
 
@@ -93,8 +106,8 @@ def _expansion_rows(sv: Survey, name: str, titles: dict, areas: list | None) -> 
         return [("    └ (none)", "")]
     rows = []
     for c, supp in cands:
-        title = titles.get(c.pr) or c.reason or ""
-        label = f"    └ #{c.pr}" if c.pr else "    └ " + (c.head or name)
+        title = titles.get(candidate_key(c)) or titles.get(c.pr) or c.reason or ""
+        label = f"    └ {candidate_label(c)}" if c.pr else "    └ " + (c.head or name)
         rows.append((label, title + ("  (suppressed)" if supp else "")))
     return rows
 
@@ -125,11 +138,13 @@ def render_survey(
         return
 
     expanded = expanded or set()
-    titles = {p.number: p.title for p in sv.open_prs}
+    titles = {candidate_key(p): p.title for p in sv.open_prs}
 
     header = f"[bold]{TAUCETI}[/]   worker: {sv.worker_id}   open: {sv.status_label_line()}"
     if account := os.environ.get("TAUCETI_GITHUB_ACCOUNT"):
         header += "\ngithub: " + escape(account)
+    if getattr(sv, "source_states", None):
+        header += "\n" + " · ".join(f"{name} {state}" for name, state in sv.source_states.items())
     if quota_snap is not None:
         header += "\nquota: " + quota_line(quota_snap)
     console.print(Panel(header, title="tauceti"))
@@ -236,7 +251,7 @@ def _dashboard_app(cfg, loader=None):
 
     def default_loader():
         gh = GitHub()
-        sv = survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True)
+        sv = dashboard_survey(cfg, gh)
         _, q = Quota(cfg).choose(None)
         areas = roadmap_areas(gh)  # [] on failure; the area picker falls back to free text
         return sv, q, areas
@@ -510,7 +525,7 @@ def _dashboard_app(cfg, loader=None):
             sv = self.sv
             if sv is None or sv.github_failed:
                 return
-            titles = {p.number: p.title for p in sv.open_prs}
+            titles = {candidate_key(p): p.title for p in sv.open_prs}
             sel_name = ALLOWED_TASKS[self.sel]
             for name in ALLOWED_TASKS:
                 num = KIND_BY_NAME[name]
@@ -882,18 +897,31 @@ def _dashboard_app(cfg, loader=None):
     return Dashboard()
 
 
+def dashboard_survey(cfg, gh):
+    from .worker_sources import enabled
+
+    if enabled():
+        from .multi_source import display_survey
+
+        return display_survey(cfg, gh)
+    return survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True)
+
+
 def cmd_tui(args) -> int:
     """Default view: available work plus persistent desired/actual worker monitoring. Over a pipe or
     without a TTY it prints a survey snapshot. A one-round action exits and owns the tty; a loop action
     adds a durable worker definition for the portable manager to reconcile."""
     from rich.console import Console
 
+    from .worker_sources import configure
+
+    configure(args)
     console = Console()
     cfg = Config.resolve(None)
 
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         gh = GitHub()
-        sv = survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True)
+        sv = dashboard_survey(cfg, gh)
         _, q = Quota(cfg).choose(None)
         render_survey(sv, console, q)
         console.print("[dim](not a TTY — snapshot only; use `tauceti status [--json]` in scripts)[/]")
