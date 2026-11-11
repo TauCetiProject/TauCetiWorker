@@ -926,7 +926,7 @@ def main(argv: list[str] | None = None) -> int:
     selected_conf, remaining = conf_argument(list(sys.argv[1:] if argv is None else argv))
     args = parser.parse_args(remaining)
     cmd = args.cmd
-    if cmd in ("work", "_round", "status"):
+    if cmd in (None, "work", "_round", "status"):
         from .worker_sources import configure
 
         configure(args)

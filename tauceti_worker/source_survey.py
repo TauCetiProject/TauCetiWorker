@@ -1,7 +1,7 @@
 """Direct source inventory and qualified ownership in the ordinary survey consumer.
 
-Native commit statuses are observations, not trusted execution evidence. Source
-scheduling remains unavailable until CI, claims and publication are integrated.
+Native commit statuses are observations, not trusted execution evidence. The
+inventory remains read-only; worker_survey adds native review and repair selection.
 """
 
 from __future__ import annotations
