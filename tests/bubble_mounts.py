@@ -46,7 +46,9 @@ pool = tmp / "elan"
 complete = ("leanprover--lean4---v4.34.0-rc1", "leanprover--lean4---v4.34.0-rc2")
 for name in (*complete, "leanprover--lean4---v4.35.0"):
     (pool / "toolchains" / name / "bin").mkdir(parents=True)
-for name in complete:
+# elan's unpack directory for v4.35.0, already holding `bin/lean` before its rename
+(pool / "toolchains" / "leanprover--lean4---v4.35.tmp" / "bin").mkdir(parents=True)
+for name in (*complete, "leanprover--lean4---v4.35.tmp"):
     (pool / "toolchains" / name / "bin" / "lean").write_text("#!/bin/sh\n")
 toolchains = [f"{pool}/toolchains/{name}:/home/user/.elan/toolchains/{name}:ro" for name in complete]
 
@@ -82,7 +84,10 @@ try:
 
         os.environ["TAUCETI_BUBBLE_TOOLCHAINS"] = "1"
         _, specs = mounts()
-        check("a work round mounts each complete toolchain", [s for s in specs if "/.elan/" in s] == toolchains)
+        check(
+            "a work round mounts each complete toolchain and no install in progress",
+            [s for s in specs if "/.elan/" in s] == toolchains,
+        )
         _, specs = mounts(**review)
         check("a review round mounts none", not any("/.elan/" in spec for spec in specs))
         _, specs = mounts(platform="darwin")
