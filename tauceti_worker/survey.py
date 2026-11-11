@@ -17,6 +17,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from tauceti_tools.forge import RepositoryRef
+
 from .config import Config, log, roadmap_only, roadmap_skip
 from .config import max_open_prs as configured_max_open_prs
 from .constants import (
@@ -361,6 +363,23 @@ def target_marker_focuses(body: str) -> tuple[str, ...]:
     return tuple(target_focuses(body))
 
 
+def work_target_keys(body):
+    result = set()
+    for match in TARGET_MARKER_RE.finditer(body):
+        try:
+            target = json.loads(match[1])
+        except ValueError:
+            continue
+        if all(isinstance(target.get(key), str) and target[key] for key in ("focus", "id")):
+            result.add(json.dumps([target["focus"], target["id"]], separators=(",", ":")))
+    return tuple(sorted(result))
+
+
+def origin_pr_url(body):
+    match = re.search(r"^Origin-PR:\s*(https?://[^\s]+)\s*$", body, re.M | re.I)
+    return match[1].rstrip("/") if match else ""
+
+
 @dataclass(frozen=True)
 class PRInfo:
     number: int
@@ -388,6 +407,8 @@ class PRInfo:
     updated_at: str = ""
     bump_integration_failed: bool = False
     self_tested: bool = False
+    work_targets: tuple[str, ...] = ()
+    origin_pr: str = ""
 
     @property
     def review_ready(self) -> bool:
@@ -450,6 +471,8 @@ class PRInfo:
             build_status_at=max([t for t in posted if t is not None], default=None),
             updated_at=str(d.get("updatedAt") or ""),
             self_tested=local,
+            work_targets=work_target_keys(d.get("body", "")),
+            origin_pr=origin_pr_url(d.get("body", "")),
             bump_integration_failed=any(
                 c.get("context") == "bump-integration" and c.get("state") in BUILD_FAIL for c in rollup
             ),
@@ -472,6 +495,8 @@ class Candidate:
     bump_integration_failure: bool = False
     final_resolution: bool = False  # existing own-PR fix budget is spent; resolve or close
     partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
+    source_repository: RepositoryRef | None = None
+    source_repository_id: int | None = None
     progress: dict | None = field(
         default=None, repr=False, compare=False
     )  # current claimed-PR baseline; never persisted
@@ -937,9 +962,11 @@ def survey(
         roadmap_skip=roadmap_skip(),
     )
     if getattr(gh, "direct_source", False) is True:
-        from .source_survey import inventory_survey
+        from .source_survey import inventory_survey, worker_survey
 
-        return inventory_survey(
+        consumer = worker_survey if getattr(gh, "worker_capable", False) is True else inventory_survey
+        runtime = {"rs": rs, "counters": counters} if consumer is worker_survey else {}
+        return consumer(
             cfg,
             gh,
             roadmap=sv.roadmap_only,
@@ -948,6 +975,7 @@ def survey(
             stages=enabled,
             numbers=numbers,
             count_all_roadmaps=count_all_roadmaps,
+            **runtime,
         )
     compact = []
     if seed := getattr(rs, "seed_survey", None):

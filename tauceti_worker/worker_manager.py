@@ -810,7 +810,7 @@ def cmd_managed_runner(args) -> int:
                 from tauceti_tools.project import active
 
                 if active():
-                    for key in active().environment():
+                    for key in active().qualified_environment():
                         env.pop(key, None)
                 env.pop("TAUCETI_CONF", None)
             env[STATUS_ENV] = str(state)

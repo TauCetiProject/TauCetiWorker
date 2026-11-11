@@ -115,6 +115,36 @@ class GlobalMaintenance(unittest.TestCase):
             result = run_round(self.w, self.opts)
         return result, query, areas
 
+    def test_prepared_source_survey_keeps_global_peer_claim_checks(self):
+        from tauceti_worker.survey import Candidate, Survey
+
+        prepared = Survey(worker_id="test", roadmap_only="auto")
+        prepared._round_scope = (True, False)
+        prepared.needs_fix.actionable = [Candidate(10, HEAD)]
+        self.opts.only = ["fix"]
+        with (
+            patch.object(work, "_branch_claimed_elsewhere", return_value=True) as hint,
+            patch.object(work, "dispatch") as dispatch,
+        ):
+            with self.assertRaises(ClaimCollision):
+                run_round(self.w, self.opts, prepared_survey=prepared)
+        hint.assert_called_once_with(self.w, 10)
+        dispatch.assert_not_called()
+
+    def test_prepared_fleet_focus_falls_back_to_both_sources(self):
+        from tauceti_worker.survey import Survey
+
+        prepared = Survey(worker_id="test", roadmap_only="Algebra")
+        prepared._round_scope = (False, True)
+        prepared.roadmap_backpressure = True
+        self.opts.only = ["roadmap"]
+        with (
+            patch.dict(os.environ, {"TAUCETI_WORKER_FORGES": "both", "TAUCETI_NEW_PR_FORGE": "github"}),
+            patch("tauceti_worker.multi_source.run_round", return_value=0) as global_round,
+        ):
+            self.assertEqual(run_round(self.w, self.opts, prepared_survey=prepared), 0)
+        self.assertFalse(global_round.call_args.kwargs["use_fleet_focus"])
+
     def test_held_prs_do_not_consume_automatic_maintenance_or_reviews(self):
         for label in ("on-hold", "human", "hold", "keep", "do-not-close"):
             held = row(10, "Other", mergeable="CONFLICTING")
