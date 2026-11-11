@@ -2526,18 +2526,35 @@ def _progress_deadline_wait(w):
     )
 
 
-def _progress_reports_held(w, rows=None) -> str | None:
+# Open roadmap PRs of the account listed to find its reports: `gh` pages 100 at a time and stops early.
+PROGRESS_REPORT_SCAN = 1000
+
+
+def progress_reports(fields: list[str], account: str) -> list[dict]:
+    """The account's open pull requests in the roadmap repository whose head branch starts with
+    `progress/`, by number, as rows with `fields`. Raises GitHubError when they could not be listed
+    in full."""
+    rows = GitHub(ROADMAP).pr_list(fields, author=account, limit=PROGRESS_REPORT_SCAN)
+    if len(rows) >= PROGRESS_REPORT_SCAN:
+        raise GitHubError(f"more than {PROGRESS_REPORT_SCAN} open pull requests in the roadmap repository")
+    return sorted(
+        (row for row in rows if str(row.get("headRefName") or "").startswith("progress/")),
+        key=lambda row: row["number"],
+    )
+
+
+def _progress_reports_held(w, reports=None) -> str | None:
     """Why the threshold strategy may not plan a report now, or None: the account's open reports
-    in the roadmap repository have reached progress_max_open, or could not be counted. `rows` is
-    this round's listing of them where the shepherd already made one."""
+    in the roadmap repository have reached progress_max_open, or could not be counted. `reports` is
+    this round's `progress_reports` where the shepherd already read them."""
     limit = progress_max_open()
     try:
-        if rows is None:
-            rows = GitHub(ROADMAP).pr_list(["number", "headRefName"], author=me())
+        if reports is None:
+            reports = progress_reports(["number", "headRefName"], me())
     except GitHubError as exc:
         reason = f"could not count this account's open reports ({one_line(str(exc), 120)})"
     else:
-        held = sorted(r["number"] for r in rows if str(r.get("headRefName") or "").startswith("progress/"))
+        held = [row["number"] for row in reports]
         if len(held) < limit:
             return None
         reason = (

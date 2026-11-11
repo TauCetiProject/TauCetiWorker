@@ -28,11 +28,10 @@ from .constants import (
     ROADMAP,
 )
 from .github import GitHub, GitHubError, _gh_rate_kind, _parse_iso8601, me, run
+from .work_units import progress_reports
 
 LEDGER = "progress/shepherd.json"
 FIELDS = ["number", "headRefName", "headRefOid", "createdAt", "isDraft", "url"]
-# `gh pr list --limit` in GitHub.pr_list: a listing this long may be missing reports.
-LISTING_CAP = 200
 # The opening words of the comment the gate leaves when it refuses a report; its reason follows in
 # a fenced block.
 REFUSAL = "progress gate did not merge"
@@ -198,39 +197,16 @@ def _consider(roadmap: GitHub, account: str, row: dict, entry: dict, save) -> No
         log(f"progress: asking the merge gate about {label} gave no clear answer ({error}); counted as asked")
 
 
-def _inventory(roadmap: GitHub, account: str) -> list[dict]:
-    """Every open pull request of `account` in the roadmap repository with a `progress/` head, as
-    rows with FIELDS, read page by page."""
-    jq = (
-        f'.[] | select(.user.login == {json.dumps(account)} and (.head.ref | startswith("progress/")))'
-        " | {number, headRefName: .head.ref, headRefOid: .head.sha, createdAt: .created_at,"
-        " isDraft: .draft, url: .html_url}"
-    )
-    result = roadmap._gh(["api", "--paginate", f"repos/{roadmap.repo}/pulls?state=open&per_page=100", "--jq", jq])
-    if result.returncode != 0:
-        raise GitHubError(f"gh api pulls failed: {(result.stderr or '').strip()}")
-    try:
-        return [json.loads(line) for line in (result.stdout or "").splitlines() if line.strip()]
-    except ValueError as exc:
-        raise GitHubError(f"gh api pulls gave an unreadable page: {exc}") from exc
-
-
 def look(cfg) -> list[dict] | None:
     """One pass over this account's open progress reports in the roadmap repository. Returns their
     rows (`number` and `headRefName` among the fields), or None when they could not be listed."""
     account = me()
     roadmap = GitHub(ROADMAP)
     try:
-        rows = roadmap.pr_list(FIELDS, author=account)
-        if len(rows) >= LISTING_CAP:
-            rows = _inventory(roadmap, account)
+        reports = progress_reports(FIELDS, account)
     except GitHubError as exc:
         log(f"progress: could not list this account's open reports ({one_line(str(exc), 120)}); asking about none")
         return None
-    reports = sorted(
-        (row for row in rows if str(row.get("headRefName") or "").startswith("progress/")),
-        key=lambda row: row["number"],
-    )
     path = cfg.state / LEDGER
     before = _ledger(path)
     if before is None:

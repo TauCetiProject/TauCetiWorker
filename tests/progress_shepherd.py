@@ -49,8 +49,8 @@ def report(number=31, *, area="Area", opened=T0, draft=False):
     }
 
 
-def answer(code=0, stderr="", *, statuses=(), before_request=False, stdout=""):
-    result = subprocess.CompletedProcess([], code, stdout, stderr)
+def answer(code=0, stderr="", *, statuses=(), before_request=False):
+    result = subprocess.CompletedProcess([], code, "", stderr)
     result.github_records = [{"status": status} for status in statuses]
     result.github_before_request = before_request
     # As the transport marks one `gh api` request that GitHub answered 403 or 429.
@@ -78,23 +78,15 @@ class ProgressShepherdTests(unittest.TestCase):
         self.result = answer()
         self.run_reads, self.dispatches, self.logged, self.warned = [], [], [], []
         self.listings = 0
-        self.crowded, self.inventory, self.inventories = False, None, []
+        self.others = 1
 
-        def pr_list(_self, fields, *, author=None, state="open"):
+        def pr_list(_self, fields, *, author=None, state="open", limit=200):
             self.listings += 1
             self.assertEqual((_self.repo, fields, author, state), (ROADMAP, shepherd.FIELDS, "fixture", "open"))
             if self.listing is not None:
                 raise self.listing
-            if self.crowded:
-                return [{**report(1000 + n), "headRefName": f"roadmap/unrelated-{n}"} for n in range(200)]
-            return [*self.open_reports, {**report(12), "headRefName": "roadmap/unrelated-worker1"}]
-
-        def gh(_self, args):
-            self.inventories.append(args)
-            if isinstance(self.inventory, subprocess.CompletedProcess):
-                return self.inventory
-            rows = [*self.open_reports, {**report(12), "headRefName": "roadmap/unrelated-worker1"}]
-            return answer(0, stdout="".join(json.dumps(row) + "\n" for row in rows))
+            others = [{**report(1000 + n), "headRefName": f"roadmap/unrelated-{n}"} for n in range(self.others)]
+            return [*others, *self.open_reports][:limit]
 
         def api_jq(_self, path, jq):
             self.run_reads.append(path)
@@ -112,7 +104,6 @@ class ProgressShepherdTests(unittest.TestCase):
         for target, attribute, value in (
             (shepherd.GitHub, "pr_list", pr_list),
             (shepherd.GitHub, "api_jq", api_jq),
-            (shepherd.GitHub, "_gh", gh),
             (shepherd.GitHub, "issue_comments", lambda _self, number: self.comments),
             (shepherd, "run", run),
             (shepherd, "me", lambda: "fixture"),
@@ -317,23 +308,19 @@ class ProgressShepherdTests(unittest.TestCase):
         self.look(PROGRESS_SHEPHERD_GRACE + 60)
         self.assertEqual(list(json.loads(self.ledger.read_text())["reports"]), ["31"])
 
-    def test_a_capped_listing_is_completed_before_the_ledger_is_pruned(self):
+    def test_a_report_behind_other_pull_requests_is_still_asked_about(self):
         self.look(PROGRESS_SHEPHERD_GRACE + 5)
-        self.assertEqual((self.entry()["asks"], self.inventories), (1, []))
-        self.crowded = True
+        self.others = 200
         rows = self.look(PROGRESS_SHEPHERD_GRACE + PROGRESS_SHEPHERD_INTERVAL + 10)
         self.assertEqual([row["number"] for row in rows], [31])
         self.assertEqual([d[3] for d in self.dispatches], [1, 2])
-        args = self.inventories[0]
-        self.assertEqual(args[:3], ["api", "--paginate", f"repos/{ROADMAP}/pulls?state=open&per_page=100"])
-        self.assertIn('"fixture"', args[-1])
 
-    def test_an_unreadable_inventory_keeps_the_ledger(self):
+    def test_a_listing_cut_off_asks_nothing_and_keeps_the_ledger(self):
         self.look(PROGRESS_SHEPHERD_GRACE + 5)
-        self.crowded, self.inventory = True, answer(1, "gh: Bad Gateway (HTTP 502)", statuses=[502])
+        self.others = wu.PROGRESS_REPORT_SCAN
         self.assertIsNone(self.look(PROGRESS_SHEPHERD_GRACE + PROGRESS_SHEPHERD_INTERVAL + 10))
         self.assertEqual((len(self.dispatches), self.entry()["asks"]), (1, 1))
-        self.assertIn("could not list this account's open reports", self.logged[-1])
+        self.assertIn(f"more than {wu.PROGRESS_REPORT_SCAN} open pull requests", self.logged[-1])
 
     def test_an_unreadable_ledger_asks_about_nothing(self):
         self.ledger.parent.mkdir(parents=True)

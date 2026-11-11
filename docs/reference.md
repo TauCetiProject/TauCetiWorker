@@ -537,10 +537,9 @@ worker, so of several workers acting as one account each makes its own asks: set
 them.
 
 The pass costs one listing per progress round, which a `threshold` round then also uses for its
-`--progress-max-open` count. That listing stops at 200 pull requests of the account; when it is that
-long, the account's reports are read instead from every page of the repository's open pull
-requests, and while that read fails no report is asked about and none leaves the ledger. On top of
-the listing comes one read of the workflow's runs for each report that has come
+`--progress-max-open` count: up to 1000 of the account's open pull requests in the roadmap
+repository, a page of 100 per request. A listing cut off at 1000, like one that fails, asks about no
+report and leaves the ledger as it is. On top of the listing comes one read of the workflow's runs for each report that has come
 due. It runs only with a progress round, so the times above are the earliest: under
 `--progress-strategy threshold` a round normally starts at least every `TAUCETI_PROGRESS_POLL`
 seconds, and every ten minutes at the open-report limit; under the default strategy one starts only
