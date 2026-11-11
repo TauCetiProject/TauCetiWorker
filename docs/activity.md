@@ -176,8 +176,9 @@ time window, so daily rates still fluctuate with landing delays.
 `Landed PRs with attribution data` reports coverage. Missing exact LOC, review records,
 cost links or calibration samples supply no attributed output. With no covered PRs the
 attributed rate is unavailable; partial output is shown with its coverage rather than
-silently assuming there was no outside work. Rates using incomplete output are labelled
-`partial`; an all-missing rate is unavailable. During historical backfill, adjusted
+silently assuming there was no outside work. The compact report shows estimates with
+`~` and the coverage counts, without repeated attribution caveats or `partial` prefixes.
+An all-missing rate is unavailable. During historical backfill, adjusted
 LOC and cost rates are unavailable: full spending divided by partly reconstructed
 credit is not a fleet estimate. The underlying provisional sums remain in JSON for
 diagnostics, with `attribution_backfilling=true`. This is separate from an ordinary
