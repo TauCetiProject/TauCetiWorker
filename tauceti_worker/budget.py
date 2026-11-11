@@ -649,7 +649,9 @@ class Budget:
             if event["id"] not in state["sessions"]:
                 self.append(state, [self.accrue(state), event])
 
-    def admit(self, invocation, worker, model, phase, *, bridge=None, resume=None, owner=None, lifecycle=None):
+    def admit(
+        self, invocation, worker, model, phase, *, bridge=None, resume=None, owner=None, lifecycle=None, activity=None
+    ):
         with self.locked():
             state = self.current()
             if invocation in state["sessions"]:
@@ -723,6 +725,7 @@ class Budget:
                     resume=resume,
                     owner=owner,
                     **({"lifecycle": lifecycle} if lifecycle else {}),
+                    **({"activity": activity} if activity else {}),
                 )
             )
             self.append(state, events)

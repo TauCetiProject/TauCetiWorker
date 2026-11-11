@@ -655,7 +655,7 @@ class SourceTests(unittest.TestCase):
             GitHub.for_repository("one/project", api=self.api)
         self.assertIsInstance(GitHub.for_repository(RepositoryRef(GITHUB, self.repo.name)), GitHub)
 
-    def test_real_worker_bootstrap_refuses_incomplete_forgejo_activation(self):
+    def test_real_worker_bootstrap_accepts_native_content_and_refuses_unported_shared_sources(self):
         root = Path(self.root.name)
         config = root / "project.toml"
         config.write_text("""schema_version=2
@@ -681,10 +681,11 @@ repository="one/Project"
             text=True,
             timeout=60,
         )
-        self.assertEqual(result.returncode, 2)
-        # Tripwire for a Tools update enabling a consumer before Worker is ready.
-        self.assertIn("GitHub-only bindings", result.stderr)
-        script = "import tauceti_tools.project as p; p.Project._legacy_bindings=lambda self:None; import tauceti_worker"
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config.write_text(
+            config.read_text().replace('roadmap="one/Roadmap"', 'roadmap={forge="source",name="one/Roadmap"}')
+        )
+        script = "import tauceti_worker"
         result = subprocess.run(
             [sys.executable, "-c", script, "--conf", str(config)],
             env=env,
@@ -694,7 +695,7 @@ repository="one/Project"
             timeout=60,
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("Worker Forgejo activation", result.stderr)
+        self.assertIn("Stage 1B requires GitHub bindings", result.stderr)
 
     def test_generic_test_doubles_do_not_select_direct_source_by_truthiness(self):
         cfg = SimpleNamespace(sbcache=Path(self.root.name) / "legacy")
