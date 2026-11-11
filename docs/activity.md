@@ -347,3 +347,11 @@ The same totals cover worker time, rounds, PR/LOC output, contributions and CI.
 A new schema or discarded/replaced cache may require one migration scan.
 `--inventory` explicitly reads the prepared PR table; the collector does not
 serialize the entire inventory every minute.
+
+Confirmed deferred publications retain their original worker, host and round ID.
+A successful PR creation reconciles an unconfirmed authoring round; a branch push
+or closure reconciles an unconfirmed repair round. This changes only the outcome,
+keeping the original finish timestamp and counts. Receipt order and duplicate
+replays do not change the result. Execution failures and rounds without a recorded
+finish remain separate; replies alone do not prove a repair that required a push.
+Legacy intents without a saved round ID never borrow the round draining them.

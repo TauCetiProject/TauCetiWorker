@@ -120,6 +120,8 @@ class StateRepair(unittest.TestCase):
             return dict(headRefOid=NEW, state="OPEN", isDraft=False)
 
         self.w.gh = SimpleNamespace(pr_view=read)
+        self.w.rs.gh_meta = lambda *_, **__: SimpleNamespace(provenance="missing")
+        self.w.rs.ledger_clean_head = lambda *_: ""
         with patch.object(state, "refresh_pr", return_value=dict(status="ok")) as refresh:
             self.assertFalse(work._still_actionable("review", self.w, None, Candidate(7, HEAD)))
         refresh.assert_called_once_with(TAUCETI, 7, HEAD, NEW)

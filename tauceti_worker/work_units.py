@@ -1056,6 +1056,20 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) ->
         return bool(w.gh.bump_repair_requested(c.pr, c.head))
     if stage not in ("review", "fix"):
         return True
+    # Refresh cheap shared review evidence before a direct PR-header read. Many
+    # workers can encounter the same just-reviewed head in one survey cascade;
+    # declining it spends nothing and needs no current GitHub eligibility proof.
+    # Candidates we do launch still get the direct head/pause checks below.
+    meta = w.rs.gh_meta(c.pr, force=True) if stage == "review" and not getattr(c, "partial_history", False) else None
+    if (
+        stage == "review"
+        and not c.contest
+        and not getattr(c, "partial_history", False)
+        and meta.provenance not in ("stale", "fetch_failed", "missing")
+        and w.rs.ledger_clean_head(c.pr) == c.head
+    ):
+        log(f"  review #{c.pr}: this head was reviewed since the survey read it — skipping")
+        return False
     # The head the survey saw. A contributor pushing since then makes every verdict below describe a
     # commit that is no longer there, and _do_fixlike would check the NEW head out and work on it.
     from .github_transport import read_context
@@ -1075,7 +1089,8 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) ->
         # claims and the review engine's per-head coordination remain authoritative.
         log(f"  {stage} #{c.pr}: investigating with partial cached history")
         return True
-    meta = w.rs.gh_meta(c.pr, force=True)
+    if meta is None:
+        meta = w.rs.gh_meta(c.pr, force=True)
     if getattr(c, "partial_history", False) and meta.provenance in ("stale", "fetch_failed", "missing"):
         log(f"  {stage} #{c.pr}: current head verified; investigating incomplete review history")
         return True
