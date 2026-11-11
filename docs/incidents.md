@@ -1,7 +1,7 @@
 # Incident records
 
 An incident record is a small JSON file a worker writes when a round concludes
-something about a pull request that GitHub does not show. Two kinds exist:
+something about a pull request that its forge does not show. Two kinds exist:
 
 - `declined`: a `rebase`, `fix`, or `fix-ci` round finished and left no push,
   closure, or reply. The record keeps the agent's final message.
@@ -35,6 +35,34 @@ Whoever reads the records acknowledges one by moving it into `acked/` under the
 same name, and discards one by deleting it. A hyphen can occur in both `<kind>`
 and `<key>`, so take them from the fields inside the file.
 
+### Keys and sources
+
+A record is about one pull request of one source repository, a GitHub or a
+Forgejo repository. Its `<key>` is:
+
+- `<stage>-<pr>` for a pull request of the GitHub repository the worker is
+  configured for (`TAUCETI_REPO`, `TauCetiProject/TauCeti` by default), so
+  `declined-fix-412.json`;
+- `<stage>-<pr>.<digest>` for a pull request of any other repository, where
+  `<digest>` is the first 12 hexadecimal digits of the SHA-256 of the UTF-8
+  string `<forge kind>:<forge origin>/<owner/name in lower case>`, which is
+  `RepositoryRef.key` in `tauceti_tools.forge`. For example a Forgejo pull
+  request 412 of `TauCetiProject/TauCeti` at `https://forge.example` is keyed
+  by the digest of `forgejo:https://forge.example/taucetiproject/tauceti`.
+
+`incidents.subject(stage, pr, repository)` computes the key. The record's
+`repository` and `forge` fields name the source, and a reader that needs it
+takes it from there rather than from the digest. A directory serves one
+configured GitHub repository: workers configured for different ones each name
+their own repository's records `<stage>-<pr>`, so they need separate
+directories.
+
+`find(kind, key)` reads `<dir>/<kind>-<key>.json` and then
+`<dir>/acked/<kind>-<key>.json`, so a key built for one source never finds
+another source's record. `declined(stage, pr, head, repository)` and the
+`budget-spent` once-per-head check look up `subject(stage, pr, repository)`
+that way. `records()` lists every source; filter on `repository` and `forge`.
+
 ## Fields
 
 Every record has:
@@ -43,11 +71,13 @@ Every record has:
 | --- | --- | --- |
 | `schema` | string | `tauceti-incident/v1` |
 | `kind` | string | `declined` or `budget-spent` |
-| `key` | string | `<stage>-<pr>` for both kinds |
+| `key` | string | `<stage>-<pr>`, or `<stage>-<pr>.<digest>` for another source (see above) |
 | `worker` | string | Id of the worker that wrote the file last |
 | `first_at`, `last_at` | string | UTC times of the first and the latest write, `YYYY-MM-DDTHH:MM:SSZ` |
 | `count` | integer | Number of times the live file has been written |
 | `repository` | string | `owner/name` of the pull request's repository |
+| `forge` | object | `{"kind": "github" or "forgejo", "url": <origin>}` of that repository |
+| `repository_id` | integer | The repository's native id on a Forgejo source; absent for GitHub |
 | `stage` | string | `rebase`, `fix`, or `fix-ci` |
 | `pr` | integer | Pull request number |
 | `head` | string | Full head commit the record is about |
@@ -69,6 +99,7 @@ the attempts used.
 {
  "count": 1,
  "first_at": "2026-01-15T09:30:00Z",
+ "forge": {"kind": "github", "url": "https://github.com"},
  "head": "5f2c9d0e8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d",
  "key": "rebase-412",
  "kind": "declined",
@@ -134,9 +165,11 @@ before acting on it.
 | --- | --- |
 | `directory()` | The configured directory, or `None` |
 | `record(kind, key, **fields)` | Write or refresh a live record; returns its path, or `None` when off or the write failed |
+| `subject(stage, pr, repository=None)` | The key for a pull request of `repository` (a `RepositoryRef`, a GitHub `owner/name`, or `None` for `TAUCETI_REPO`) |
+| `source_of(gh)` | The repository a worker's forge client serves, for `subject` |
 | `find(kind, key)` | The live and the acknowledged record of that name, where they exist |
 | `records(kind="", acked=True)` | Every readable record with its path, live ones first |
-| `record_declined(...)`, `note_budget_spent(...)` | The two kinds above |
-| `declined(stage, pr, head)` | Whether the hold applies |
+| `record_declined(...)`, `note_budget_spent(...)` | The two kinds above; both take `repository=` and `repository_id=` |
+| `declined(stage, pr, head, repository=None)` | Whether the hold applies |
 
 A new kind needs only a name and a key that is unique within it.

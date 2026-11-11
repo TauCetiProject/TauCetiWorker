@@ -12,6 +12,7 @@ Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
 import contextlib
+import hashlib
 import importlib
 import json
 import os
@@ -22,6 +23,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tauceti_tools.forge import Forge, RepositoryRef
+
 import tauceti_worker as tc
 from tauceti_worker import agents, incidents, work_units
 from tauceti_worker.review_state import Meta
@@ -382,6 +385,56 @@ def test_claim_race(root):
         )
 
 
+FORGEJO = RepositoryRef(Forge("forgejo", "https://forge.example"), "TauCetiProject/TauCeti")
+
+
+def test_sources(root):
+    """Records of one PR number on two sources are separate files; GitHub names are unchanged."""
+    digest = hashlib.sha256(FORGEJO.key.encode()).hexdigest()[:12]
+    with settings(root, hold=True):
+        github = incidents.record_declined("fix", 7, "h-github", message="github")
+        native = incidents.record_declined("fix", 7, "h-native", message="forgejo", repository=FORGEJO, repository_id=1)
+        check(
+            "the GitHub record keeps its name and a native one is qualified by its repository",
+            (github.name, native.name),
+            ("declined-fix-7.json", f"declined-fix-7.{digest}.json"),
+        )
+        check(
+            "each names its forge and repository",
+            (load(github)["forge"], load(native)["forge"], load(native)["repository"], load(native)["repository_id"]),
+            (
+                {"kind": "github", "url": "https://github.com"},
+                {"kind": "forgejo", "url": "https://forge.example"},
+                "TauCetiProject/TauCeti",
+                1,
+            ),
+        )
+        check(
+            "the holds are independent",
+            (
+                incidents.declined("fix", 7, "h-github"),
+                incidents.declined("fix", 7, "h-github", tc.TAUCETI),
+                incidents.declined("fix", 7, "h-github", FORGEJO),
+                incidents.declined("fix", 7, "h-native", FORGEJO),
+                incidents.declined("fix", 7, "h-native"),
+            ),
+            (True, True, False, True, False),
+        )
+        (root / incidents.ACKED).mkdir()
+        native.rename(root / incidents.ACKED / native.name)
+        check("an acknowledged native record still holds", incidents.declined("fix", 7, "h-native", FORGEJO), True)
+        check(
+            "another GitHub repository is qualified too",
+            incidents.subject("fix", 7, "Other/Repo"),
+            f"fix-7.{hashlib.sha256(b'github:https://github.com/other/repo').hexdigest()[:12]}",
+        )
+        check(
+            "the source of a native client is its repository, of a GitHub client its name",
+            (incidents.source_of(SimpleNamespace(repository=FORGEJO, repo=tc.TAUCETI)), incidents.source_of(None)),
+            (FORGEJO, None),
+        )
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -390,6 +443,7 @@ def main():
         test_round(tmp / "round", tmp)
         test_prompt(tmp / "prompt")
         test_claim_race(tmp / "race")
+        test_sources(tmp / "sources")
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
     return 1 if fails else 0
 
