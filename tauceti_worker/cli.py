@@ -1348,6 +1348,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             "--host is now the default (the agent runs directly on the host); it is a no-op. "
             "Pass --bubble to run inside the sandbox instead"
         )
+    # The pacer reads this to know which credential the agents will receive; loop children re-pin it.
+    os.environ["TAUCETI_SANDBOX"] = "bubble" if getattr(args, "bubble", False) else "host"
     author_model = getattr(args, "author_model", None)
     author_effort = getattr(args, "author_effort", None)
     resolved_author_fallback_model = getattr(args, "resolved_author_fallback_model", None)
