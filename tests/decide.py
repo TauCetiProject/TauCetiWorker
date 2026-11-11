@@ -519,6 +519,25 @@ def test_rounds(tmp):
         hub.listing, hub.unreadable = None, set()
         check("the listing catches up: it is ruled on", len(rounds(tmp, hub, {"rulings": []})["packet"]["cases"]), 2)
 
+    root = tmp / "reconsidered"
+    with settings(root, TAUCETI_HOLD_DECLINED="0"):
+        declined(1)
+        hub = Hub(p1={}, p20={})
+        rounds(tmp, hub, answer((1, "wait", {"blocked_on": [20]})))
+        incidents.record_declined("fix", 1, "head-1", message="declined again, with new evidence")
+        hub.prs[20]["state"] = "CLOSED"
+        seen = rounds(tmp, hub, answer((1, "retry", {})))
+        check(
+            "a waiting case reconsidered while a newer record of it is live is put to the model once, as the newer",
+            [(c["case"], c["final_message"]) for c in seen["packet"]["cases"]],
+            [("declined-fix-1", "declined again, with new evidence")],
+        )
+        check(
+            "…and ruled on once",
+            (ruling(root)["ruling"], where(root, "declined-fix-1.json")),
+            ("retry", ["acked"]),
+        )
+
     root = tmp / "rewritten"
     with settings(root):
         declined(1, 2, 3)

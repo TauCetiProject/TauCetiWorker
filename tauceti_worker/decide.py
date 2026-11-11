@@ -393,7 +393,9 @@ def run(w, opts) -> int | None:
                 raise SourceUnavailable("open pull requests are unavailable")
             rd = _Round(w, source, {row["number"]: row for row in rows})
             _settle(rd)
-            cases = (_recheck(rd) + _unruled(rd))[: max_cases()]
+            # A reconsidered incident and a newer live record of it share a case; the newer one wins.
+            cases = list({case_id(incident): incident for incident in _recheck(rd) + _unruled(rd)}.values())
+            cases = cases[: max_cases()]
             return _rule(rd, opts, cases) if cases else None
         except (GitHubError, SourceUnavailable, ForgeError) as error:
             raise NoProgress(f"decide: {error}") from None
