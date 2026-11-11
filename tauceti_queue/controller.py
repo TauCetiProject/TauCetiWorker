@@ -176,7 +176,7 @@ BACKGROUND_OPERATIONS = tuple(f"task:{kind}" for kind in BACKGROUND_TASKS)
 # How often a worker holding a `prepare` claim renews it (`Task.extra.renew_after`): a refused renewal
 # is how the worker learns that the controller took the batch back (it sealed, or the head needs the
 # worker), so the interval bounds how long a superseded preparation keeps running.
-PREPARE_RENEW_SECONDS = 60
+HANDOFF_RENEW_SECONDS = 15
 # Resolutions of a `prepare` task that settle its batch version: no second task is created for it.
 PREPARE_SETTLED = ("adopted", "prepared", "failed")
 # Worker release reasons: `prepared_clean` (the batch built without errors, nothing to repair) and the
@@ -1543,6 +1543,32 @@ class Controller:
                     del self._renewal_waiters[claim_token]
                     self._renewing.pop(claim_token, None)
 
+    def _task_checks_owner(self, task: dict[str, Any]) -> str:
+        if task["kind"] not in BACKGROUND_TASKS:
+            return "staging"
+        head = self._head()
+        if head is not None:
+            return "staging" if head["id"] == task["batch_id"] else "worker"
+        first = self._open_batch()
+        ready = (
+            first is not None
+            and first["id"] == task["batch_id"]
+            and not self._state("inference_hold")
+            and not self._external_head_blocks_sealing()
+        )
+        return "staging" if ready else "worker"
+
+    def task_check_policy(self, task_id: int) -> dict:
+        """Refresh optional check priority over the existing authenticated claim renewal."""
+        with self._lock:
+            task = self.store.row("tasks", {"id": task_id})
+            if task is None:
+                return {}
+            policy = {"checks_owner": self._task_checks_owner(task)}
+            if task["kind"] in BACKGROUND_TASKS:
+                policy["renew_after"] = HANDOFF_RENEW_SECONDS
+            return policy
+
     def release_task(self, task_id: int, claim_token: str, reason: str, error: str = "", *, source_access=None) -> None:
         """A worker gives a task back. Reason `inference_unavailable` counts toward the inference hold.
 
@@ -2252,7 +2278,7 @@ class Controller:
         extra: dict[str, Any] = {
             "canonical_branch": self.canonical_branch,
             "claim_id": claim_id,
-            "checks_owner": "staging",
+            "checks_owner": self._task_checks_owner(task),
         }
         warm_revs = self._warm_revs(task, batch)
         if self._can_checkpoint_repair(task):
@@ -2268,8 +2294,8 @@ class Controller:
                 }
                 refs.append(checkpoint["retained_ref"])
                 warm_revs = list(dict.fromkeys([tip, *warm_revs]))
-        if task["kind"] == TASK_PREPARE:
-            extra["renew_after"] = PREPARE_RENEW_SECONDS
+        if task["kind"] in BACKGROUND_TASKS:
+            extra["renew_after"] = HANDOFF_RENEW_SECONDS
         if self._pre_rebased_prepare(task):
             # The pre-rebased chain exists only in the controller's clone until `_prepare_pre_rebased`
             # retains it on GitHub; the worker builds on the head's tip and falls back to the public
