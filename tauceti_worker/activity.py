@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import signal
 import socket
@@ -22,7 +23,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import activity_ci, activity_costs, activity_git, activity_summary
+from . import activity_attribution, activity_ci, activity_costs, activity_git, activity_summary
 from .constants import WORK_TASKS
 from .runtime_status import atomic_json, read_json
 
@@ -103,7 +104,16 @@ class Round:
     def select(self, kind):
         self.kind = kind
         self.observation = None
-        emit("round_selected", key=self.id + ":select", round_id=self.id, worker=self.worker, round_type=kind)
+        emit(
+            "round_selected",
+            key=self.id + ":select",
+            round_id=self.id,
+            worker=self.worker,
+            round_type=kind,
+            review_archive=str(activity_attribution.archive_root()) if kind == "review" else None,
+            review_outbox=str(activity_attribution.archive_outbox(self.worker)) if kind == "review" else None,
+            **{k: v for k, v in activity_attribution.invocation_context(kind).items() if k != "round_id"},
+        )
 
     def finish(self, exc=None):
         global _round
@@ -236,6 +246,7 @@ def _connect():
     from .activity_rollup_sources import install as install_rollups
 
     install_rollups(db)
+    activity_attribution.install(db)
     return db
 
 
@@ -248,6 +259,7 @@ def _ingest(db, e):
     if cutoff and e["at"] < cutoff[0] and e.get("kind") != "pr_created":
         return
     kind, worker, scope = e["kind"], e.get("worker", "unknown"), e.get("group", e.get("machine_id", "local"))
+    activity_attribution.ingest(db, e)
     if kind == "pr_created":
         # Replays must restore PRs removed by older collectors even when the
         # event's deduplication tombstone already exists.
@@ -442,12 +454,29 @@ def _refresh_prs(db, config, now, errors):
         p = p or h
         checked = max(h["checked"] or 0, p["checked"] or 0)
         loc = db.execute("SELECT head FROM pr_loc WHERE repo=? AND number=?", key).fetchone()
-        settled = p["landed"] is not None and loc and loc[0] == p["head"]
+        counts = db.execute(
+            "SELECT head,count,checked,observed FROM pr_review_counts WHERE repo=? AND number=?", key
+        ).fetchone()
+        landed_loc = p["landed"] is not None and loc and loc[0] == p["head"]
+        settled = (
+            landed_loc
+            and counts
+            and counts[0] == p["head"]
+            and counts[1] is not None
+            and counts[3] is not None
+            and counts[2] >= p["landed"]
+        )
+        expired = bool(landed_loc and counts and counts[2] >= p["landed"] and now > p["landed"] + 7 * 86400)
         db.execute(
             "UPDATE report_pr_refresh SET next_at=? WHERE repo=? AND number=?",
-            (None if settled else max(now, checked) + 300, *key),
+            (
+                None
+                if settled or expired
+                else max(now, checked) + (3600 if landed_loc and counts and counts[2] >= p["landed"] else 300),
+                *key,
+            ),
         )
-        if settled or checked > now - 300:
+        if settled or expired or checked > now - 300:
             continue
         spec = specs.get(worker)
         url = getattr(spec, "github_state_url", None) or os.environ.get("TAUCETI_GITHUB_STATE_URL")
@@ -489,7 +518,14 @@ def _refresh_prs(db, config, now, errors):
                     p["number"] not in batch or p.get("state") not in ("OPEN", "CLOSED", "MERGED") for p in value["prs"]
                 ):
                     raise ValueError("invalid PR observation")
-                missing_loc = [p for p in value["prs"] if p.get("lean_loc") is None]
+                stored_locs = {}
+                for p in value["prs"]:
+                    loc = db.execute(
+                        "SELECT head,added,deleted FROM pr_loc WHERE repo=? AND number=?", (repo, p["number"])
+                    ).fetchone()
+                    if loc and loc[0] == p.get("head_sha"):
+                        stored_locs[p["number"]] = dict(head_sha=loc[0], added=loc[1], deleted=loc[2])
+                missing_loc = [p for p in value["prs"] if p.get("lean_loc") is None and p["number"] not in stored_locs]
                 git_locs = activity_git.measure(root(), repo, missing_loc)
                 if any(p.get("head_sha") and p.get("base_sha") and p["number"] not in git_locs for p in missing_loc):
                     message = "Some exact PR LOC comparisons are unavailable; normal refresh will retry"
@@ -515,7 +551,30 @@ def _refresh_prs(db, config, now, errors):
                         "UPDATE pr_observations SET state=?,landed=COALESCE(?,landed),observed=?,checked=?,head=?,source=COALESCE(?,source),created=COALESCE(?,created) WHERE repo=? AND number=?",
                         fields,
                     )
-                    loc = p.get("lean_loc") or git_locs.get(p["number"])
+                    counter = p.get("review_passes")
+                    count = counter.get("count") if isinstance(counter, dict) else None
+                    stamp = counter.get("observed_at") if isinstance(counter, dict) else None
+                    valid = (
+                        type(count) is int
+                        and 0 <= count <= 2**53 - 1
+                        and counter.get("basis") == "scoreboard-round-counters"
+                        and type(stamp) in (int, float)
+                        and math.isfinite(stamp)
+                        and stamp >= 0
+                    )
+                    db.execute(
+                        "INSERT INTO pr_review_counts VALUES (?,?,?,?,?,?,?) ON CONFLICT(repo,number) DO UPDATE SET head=excluded.head,count=excluded.count,observed=excluded.observed,checked=excluded.checked,basis=excluded.basis",
+                        (
+                            repo,
+                            p["number"],
+                            p.get("head_sha"),
+                            count if valid else None,
+                            stamp / 1000 if valid else None,
+                            now,
+                            "scoreboard-round-counters" if valid else "unavailable",
+                        ),
+                    )
+                    loc = p.get("lean_loc") or git_locs.get(p["number"]) or stored_locs.get(p["number"])
                     if loc is not None:
                         if loc.get("head_sha") != p.get("head_sha") or not all(
                             type(loc.get(k)) is int and loc[k] >= 0 for k in ("added", "deleted")
@@ -547,10 +606,28 @@ def _refresh_prs(db, config, now, errors):
                 if p is None:
                     p = db.execute("SELECT * FROM pr_observations WHERE repo=? AND number=?", (repo, number)).fetchone()
                 loc = db.execute("SELECT head FROM pr_loc WHERE repo=? AND number=?", (repo, number)).fetchone()
-                settled = p and (p["landed"] is not None and loc and loc[0] == p["head"])
+                counts = db.execute(
+                    "SELECT head,count,checked,observed FROM pr_review_counts WHERE repo=? AND number=?", (repo, number)
+                ).fetchone()
+                landed_loc = p and p["landed"] is not None and loc and loc[0] == p["head"]
+                settled = (
+                    landed_loc
+                    and counts
+                    and counts[0] == p["head"]
+                    and counts[1] is not None
+                    and counts[3] is not None
+                    and counts[2] >= p["landed"]
+                )
                 db.execute(
                     "UPDATE report_pr_refresh SET next_at=? WHERE repo=? AND number=?",
-                    (None if settled else now + 300, repo, number),
+                    (
+                        None
+                        if settled
+                        or (landed_loc and counts and counts[2] >= p["landed"] and now > p["landed"] + 7 * 86400)
+                        else now + (3600 if landed_loc and counts and counts[2] >= p["landed"] else 300),
+                        repo,
+                        number,
+                    ),
                 )
     db.execute("INSERT OR REPLACE INTO meta VALUES ('observation_errors',?)", (json.dumps(observation_errors),))
     errors.extend(observation_errors.values())
@@ -670,6 +747,12 @@ def _summary(db, now, column=None, identity=None):
         )
         row["loc_basis"] = "landed_at"
         row.update(activity_summary.loc_estimate(row))
+    for window, attribution in activity_attribution.summarize(db, now, activity_costs.COST_WINDOWS, column, identity):
+        row = costs["windows"][window]
+        attribution["attribution_missing_prs"] += max(
+            0, row["landed_prs"] - attribution.get("attribution_authored_prs", 0)
+        )
+        row.update(attribution)
     raw_observed = minimum("prs", "observed")
     raw_checked = minimum("prs", "checked")
     unresolved = "landed IS NULL AND state IS NOT 'CLOSED'"
@@ -767,6 +850,14 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                     errors.append("Conversation cost preparation failed; retaining last-known budget data")
                 _refresh_prs(db, config, now, errors)
                 _bors(db, errors)
+                try:
+                    activity_attribution.prepare(db, now)
+                except Exception as error:
+                    errors.append(
+                        "Local attribution preparation failed; retaining last-known summary ("
+                        + type(error).__name__
+                        + ")"
+                    )
             from . import expanded_cache, shared_mathlib, work_recovery
 
             try:
