@@ -255,13 +255,17 @@ def main():
 
             command = {"argv": ["pr", "comment", "1", "--repo", "TauCetiProject/TauCeti"], "created": 1}
             with patch.dict(os.environ, TAUCETI_ACTIVITY_ROUND_ID="other-round"):
-                fleet_events.mutation(command, types.SimpleNamespace(stdout=""))
+                fleet_events.mutation(
+                    command | {"context": {"activity": {"round_id": "other-round"}}},
+                    types.SimpleNamespace(stdout=""),
+                )
             check("a peer's reply is not attributed", tc.work_units._round_mutated(candidate, baseline) is None)
             with patch.dict(os.environ, TAUCETI_ACTIVITY_ROUND_ID="this-round"):
                 fleet_events.mutation(
                     command
                     | {
                         "created": 2,
+                        "context": {"activity": {"round_id": "this-round"}},
                         "argv": [
                             "api",
                             "-X",
@@ -285,6 +289,7 @@ def main():
                         command
                         | {
                             "created": method,
+                            "context": {"activity": {"round_id": "this-round"}},
                             "argv": [
                                 "api",
                                 "-X",

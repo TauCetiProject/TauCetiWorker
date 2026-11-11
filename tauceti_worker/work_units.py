@@ -1060,7 +1060,7 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) ->
     # workers can encounter the same just-reviewed head in one survey cascade;
     # declining it spends nothing and needs no current GitHub eligibility proof.
     # Candidates we do launch still get the direct head/pause checks below.
-    meta = w.rs.gh_meta(c.pr, force=True) if stage == "review" else None
+    meta = w.rs.gh_meta(c.pr, force=True) if stage == "review" and not getattr(c, "partial_history", False) else None
     if (
         stage == "review"
         and not c.contest
