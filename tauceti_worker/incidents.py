@@ -233,18 +233,27 @@ def note_budget_spent(
     )
 
 
-def progress_stuck(pr: int) -> bool:
-    """Whether progress report `pr` has a `progress-stuck` record, live or acknowledged."""
-    return bool(find(PROGRESS_STUCK, f"progress-{pr}"))
+def progress_stuck(repository: RepositoryRef | str, pr: int) -> bool:
+    """Whether progress report `pr` of `repository` has a `progress-stuck` record, live or
+    acknowledged."""
+    return bool(find(PROGRESS_STUCK, subject("progress", pr, repository)))
 
 
-def note_progress_stuck(repository: str, pr: int, head: str, **fields) -> bool:
+def note_progress_stuck(repository: RepositoryRef | str, pr: int, head: str, **fields) -> bool:
     """Record that the merge gate has left progress report `pr` of `repository` open and the worker
     has stopped asking it. One write per report: an existing record is left as it is. False when
     the directory is not configured or the write failed."""
-    if progress_stuck(pr):
+    if progress_stuck(repository, pr):
         return True
     return (
-        record(PROGRESS_STUCK, f"progress-{pr}", repository=repository, stage="progress", pr=pr, head=head, **fields)
+        record(
+            PROGRESS_STUCK,
+            subject("progress", pr, repository),
+            **_identity(repository, None),
+            stage="progress",
+            pr=pr,
+            head=head,
+            **fields,
+        )
         is not None
     )

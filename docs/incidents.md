@@ -98,8 +98,11 @@ A `declined` record adds:
 A `budget-spent` record adds `detail`, one line naming the survey's reason and
 the attempts used.
 
-A `progress-stuck` record is about a pull request in the roadmap repository,
-which `repository` names, and adds:
+A `progress-stuck` record is about a pull request in the roadmap repository
+(`TAUCETI_ROADMAP_REPO`, `TauCetiProject/TauCetiRoadmap` by default), which
+`repository` and `forge` name. Its key is `progress-<pr>.<digest>` by the rule
+above, so `progress-stuck-progress-31.<digest>.json` for report 31, and a pull
+request of `TAUCETI_REPO` with the same number never shares its file. It adds:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -199,6 +202,6 @@ before acting on it.
 | `records(kind="", acked=True)` | Every readable record with its path, live ones first |
 | `record_declined(...)`, `note_budget_spent(...)` | The two kinds above; both take `repository=` and `repository_id=` |
 | `declined(stage, pr, head, repository=None)` | Whether the hold applies |
-| `note_progress_stuck(repository, pr, head, **fields)`, `progress_stuck(pr)` | The third kind, and whether a report has a record |
+| `note_progress_stuck(repository, pr, head, **fields)`, `progress_stuck(repository, pr)` | The third kind, and whether a report has a record |
 
 A new kind needs only a name and a key that is unique within it.

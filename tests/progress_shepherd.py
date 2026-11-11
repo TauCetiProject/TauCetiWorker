@@ -4,6 +4,7 @@ roadmap repository's gate workflow for a report left open, a bounded number of t
 recorded before it is sent, and then records the report for a person."""
 
 import contextlib
+import hashlib
 import json
 import os
 import subprocess
@@ -15,6 +16,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tauceti_tools.forge import GITHUB, RepositoryRef
+
 from tauceti_worker import cli, config, incidents
 from tauceti_worker import progress_landing as shepherd
 from tauceti_worker import progress_publication as publication
@@ -123,7 +126,8 @@ class ProgressShepherdTests(unittest.TestCase):
         return json.loads(self.ledger.read_text())["reports"].get(str(number))
 
     def incident(self, number=31):
-        return json.loads((Path(os.environ[incidents.ENV]) / f"progress-stuck-progress-{number}.json").read_text())
+        name = f"progress-stuck-{incidents.subject('progress', number, ROADMAP)}.json"
+        return json.loads((Path(os.environ[incidents.ENV]) / name).read_text())
 
     def use_incidents(self):
         os.environ[incidents.ENV] = str(self.root / "incidents")
@@ -226,11 +230,12 @@ class ProgressShepherdTests(unittest.TestCase):
         value = self.incident()
         refusal = "Area was reported 1.5h ago; reports for one roadmap are at least 6h apart"
         self.assertEqual(
-            {key: value[key] for key in ("kind", "key", "repository", "stage", "pr", "head", "count")},
+            {key: value[key] for key in ("kind", "key", "repository", "forge", "stage", "pr", "head", "count")},
             {
                 "kind": "progress-stuck",
-                "key": "progress-31",
+                "key": f"progress-31.{hashlib.sha256(RepositoryRef(GITHUB, ROADMAP).key.encode()).hexdigest()[:12]}",
                 "repository": ROADMAP,
+                "forge": {"kind": "github", "url": "https://github.com"},
                 "stage": "progress",
                 "pr": 31,
                 "head": HEAD,
@@ -280,13 +285,22 @@ class ProgressShepherdTests(unittest.TestCase):
 
     def test_a_record_another_worker_wrote_ends_the_asks(self):
         self.use_incidents()
-        incidents.record(incidents.PROGRESS_STUCK, "progress-31", pr=31, head=HEAD)
+        name = incidents.note_progress_stuck(ROADMAP, 31, HEAD) and f"progress-stuck-{self.incident()['key']}.json"
         acked = Path(os.environ[incidents.ENV]) / incidents.ACKED
         acked.mkdir()
-        os.replace(acked.parent / "progress-stuck-progress-31.json", acked / "progress-stuck-progress-31.json")
+        os.replace(acked.parent / name, acked / name)
         self.look(PROGRESS_SHEPHERD_GRACE + 5)
         self.assertEqual((self.dispatches, self.run_reads, self.warned), ([], [], []))
         self.assertEqual(self.entry(), {"stuck": True})
+
+    def test_a_record_for_another_repository_does_not(self):
+        self.use_incidents()
+        for repository in (incidents.TAUCETI, "elsewhere/TauCetiRoadmap"):
+            self.assertTrue(incidents.note_progress_stuck(repository, 31, HEAD))
+        self.assertFalse(incidents.progress_stuck(ROADMAP, 31))
+        self.look(PROGRESS_SHEPHERD_GRACE + 5)
+        self.assertEqual(len(self.dispatches), 1)
+        self.assertEqual(self.entry()["asks"], 1)
 
     def test_a_failed_record_is_written_again_later(self):
         self.use_incidents()

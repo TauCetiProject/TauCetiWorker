@@ -165,7 +165,7 @@ def _consider(roadmap: GitHub, account: str, row: dict, entry: dict, save) -> No
         return
     number = int(row["number"])
     label = f"report #{number} ({row['headRefName'].rsplit('/', 1)[-1]})"
-    if incidents.progress_stuck(number):
+    if incidents.progress_stuck(ROADMAP, number):
         entry["stuck"] = True
         return
     if not entry.get("rejected"):
