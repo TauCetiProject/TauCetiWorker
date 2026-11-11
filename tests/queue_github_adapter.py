@@ -384,6 +384,17 @@ def adapter(transport, git=None):
 
 
 class Adapter(unittest.TestCase):
+    def test_reporting_recovery_dispatch_references_the_original_run_without_building(self):
+        transport = FakeTransport()
+        url = f"https://api.github.com/repos/{TAUCETI}/actions/workflows/retry-ci-status.yml/dispatches"
+        transport.add("POST", url, 204)
+        adapter(transport).retry_status_delivery(TAUCETI, "123", 2, base_ref="main")
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(
+            json.loads(transport.calls[0][3]),
+            {"ref": "main", "inputs": {"source_run_id": "123", "source_attempt": "2"}},
+        )
+
     def test_declaration_names_uses_exact_successful_status_run_attempt_and_job(self):
         from tauceti_queue import declaration_names as dn
 

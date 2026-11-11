@@ -70,6 +70,11 @@ SHARED_ATTEMPT_RE = re.compile(
     r"|infra-(?:fix|fix-ci|rebase|bump|lint-repair)-\d+|rebase-progress-\d+\.json"
 )
 
+# How long an engine "already published at this head" result suppresses re-dispatching a PR whose
+# review history is incomplete. A new push changes the head and is reviewed at once; the TTL bounds
+# how late a contest reply on such a PR is noticed while its history is still being filled in.
+UNCHANGED_REVIEW_TTL = 6 * 3600
+
 
 class Counters:
     """Integer files in the worker's state directory.
@@ -166,6 +171,20 @@ class Counters:
     def incr(self, name: str) -> int:
         return self._write(name, self.read(name) + 1)
 
+    def record_unchanged_review(self, pr: int, head: str) -> None:
+        """Remember that the review engine found this head's verdict already published."""
+        self._atomic_write(f"review-unchanged-{pr}.json", json.dumps({"head": head, "at": time.time()}))
+
+    def unchanged_review_recent(self, pr: int, head: str, ttl: float = UNCHANGED_REVIEW_TTL) -> bool:
+        """Whether the engine recently found `head`'s verdict already published. A partial history
+        cannot show that, so without this record the same PRs are re-dispatched on every pass."""
+        try:
+            value = json.loads((self.state / f"review-unchanged-{pr}.json").read_text())
+            at = float(value["at"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+        return value.get("head") == head and 0 <= time.time() - at < ttl
+
     def foreign_repair_launched(self, pr: int) -> bool:
         # An unreadable/malformed receipt still consumes the optional canary.
         return (self.state / f"rebase-foreign-launch-{pr}.json").exists()
@@ -242,6 +261,11 @@ BUILD_FAIL = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "
 TARGET_MARKER_RE = re.compile(r"<!--tauceti-target:v1 (\{[^}]*\})-->")
 
 TARGET_ID_RE = re.compile(r'"id"\s*:\s*"([^"]+)"')
+
+
+def _unchanged_review_recent(counters, pr: int, head: str) -> bool:
+    check = getattr(counters, "unchanged_review_recent", None)
+    return bool(check and check(pr, head))
 
 
 def target_marker_focuses(body: str) -> tuple[str, ...]:
@@ -1061,7 +1085,11 @@ def survey(
             # A partial projection is not an empty history. Let the review engine
             # inspect the selected PR and coordinate its real per-head claim.
             # Author-action PRs are handled by their writer instead.
-            if "awaiting-author" not in p.labels and "ready-to-merge" not in p.labels:
+            if (
+                "awaiting-author" not in p.labels
+                and "ready-to-merge" not in p.labels
+                and not _unchanged_review_recent(counters, p.number, p.head_oid)
+            ):
                 c = Candidate(
                     p.number,
                     p.head_oid,

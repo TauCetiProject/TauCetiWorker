@@ -44,6 +44,7 @@ REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 TAIL_LINES = 30
 TAIL_CHARS = 2000
+RSS_SAMPLING = "thread-children/v1"
 
 
 class Unavailable(RuntimeError):
@@ -91,10 +92,20 @@ def tools_pin(worktree: Path) -> tuple[str, str]:
     if not path.is_file():
         raise Unavailable("the worktree has no tauceti.toml naming the TauCetiTools pin")
     try:
-        data = tomllib.loads(path.read_text())
-    except (OSError, tomllib.TOMLDecodeError) as error:
+        return parse_tools_pin(path.read_text())
+    except OSError as error:
         raise Unavailable(f"tauceti.toml: {error}") from error
-    tools = (data.get("tools") or {}).get("tools") or {}
+
+
+def parse_tools_pin(text: str) -> tuple[str, str]:
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise Unavailable(f"tauceti.toml: {error}") from error
+    section = data.get("tools")
+    tools = section.get("tools") if isinstance(section, dict) else None
+    if not isinstance(tools, dict):
+        raise Unavailable("tauceti.toml: missing [tools.tools]")
     repo, ref = str(tools.get("repo") or ""), str(tools.get("ref") or "")
     if not REPO.match(repo) or not SHA.match(ref):
         raise Unavailable(f"tauceti.toml: [tools.tools] needs repo and a 40-hex ref, found {repo!r} {ref!r}")
@@ -234,7 +245,12 @@ def process_tree_rss(pid: int) -> int:
         try:
             status = Path(f"/proc/{child}/status").read_text()
             total += next(int(line.split()[1]) * 1024 for line in status.splitlines() if line.startswith("VmRSS:"))
-            pending.extend(int(n) for n in Path(f"/proc/{child}/task/{child}/children").read_text().split())
+            # Linux attributes each fork to the spawning thread. Lake starts
+            # executables from its task pool, so the leader's children file alone
+            # misses the audit/lint processes that consume most of the memory.
+            for children in Path(f"/proc/{child}/task").glob("*/children"):
+                with contextlib.suppress(OSError, ValueError):
+                    pending.extend(int(n) for n in children.read_text().split())
         except (OSError, ValueError, StopIteration):
             continue
     return total
@@ -273,7 +289,8 @@ def can_overlap(logdir: Path, key: str) -> bool:
         previous = json.loads((logdir / "checks-timing.json").read_text())
         peaks = [previous[name]["sampled_peak_rss_bytes"] for name in ("audit", "lint")]
         return (
-            previous.get("driver_key") == key
+            previous.get("rss_sampling") == RSS_SAMPLING
+            and previous.get("driver_key") == key
             and all(p > 0 for p in peaks)
             and available_memory() > 2 * sum(peaks) + 8 * 1024**3
         )
@@ -419,6 +436,7 @@ def check(
         read_only_build=True,
     )
     record["driver_key"] = _driver_key(worktree, ref)
+    record["rss_sampling"] = RSS_SAMPLING
     record["overlap"] = can_overlap(logdir, record["driver_key"])
     if record["overlap"]:
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as checks:

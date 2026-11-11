@@ -285,6 +285,10 @@ class ExecutionPort(Protocol):
         """
         ...
 
+    def retry_status_delivery(self, repo: str, run_id: str, run_attempt: int, *, base_ref: str) -> None:
+        """Request the existing retained-intent reporter for an exact original run/attempt."""
+        ...
+
     def commit_status(self, repo: str, sha: str, context: str) -> Status | None: ...
 
 
@@ -414,6 +418,8 @@ class Adoption:
     def to_dict(self) -> dict[str, Any]:
         return vars(self) | {"violations": list(self.violations), "provenance": dict(self.provenance)}
 
+
+REPAIR_CHECKPOINT = "repair-checkpoint"
 
 AGENT_INSTRUCTION = (
     "Resolve the reported conflicts or CI failures in this batch. Preserve the constituent PRs' intent as best "
