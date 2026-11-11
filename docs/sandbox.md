@@ -76,6 +76,12 @@ revision and content-addressed GET routes are shared across rounds; containers
 cannot select another origin or upload, and their writable Lake views are
 discarded when the container is popped.
 
+Each work round unpacks Mathlib's build into its own container. With
+`TAUCETI_MATHLIB_STORE` set, a round instead links a build that the host holds
+once per Mathlib revision and mounts read-only; see
+[Read-only Mathlib store](mathlib-store.md) for the directory layout and the rules
+for building and removing entries.
+
 ## Requirements
 
 Bubble needs a working [Incus](https://linuxcontainers.org/incus/) runtime.
