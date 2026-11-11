@@ -192,6 +192,19 @@ def run_round(w, opts, *, use_fleet_focus=True):
         if waits:
             raise waits[0]
         raise NoProgress("all selected source surveys are unavailable")
+    if want(opts.only, "curate") and not getattr(opts, "prs", ()):
+        # The target list is curated against GitHub, once a round and ahead of any source's work.
+        github = next(((worker, result) for name, worker, result in healthy if name == "github"), None)
+        if github is not None:
+            try:
+                return ordinary_round(github[0], dataclasses.replace(opts, only=["curate"]), prepared_survey=github[1])
+            except NoProgress as error:
+                if opts.only == ["curate"]:
+                    raise
+                log(f"{error}; going on to the other selected work")
+        elif opts.only == ["curate"]:
+            raise NoProgress("curate: GitHub was not surveyed this round, and the target list is curated against it")
+        opts = dataclasses.replace(opts, only=[task for task in opts.only if task != "curate"])
     executable = [(name, worker, result) for name, worker, result in healthy if name == "github" or opts.sandbox_host]
     if len(executable) != len(healthy):
         log("Forgejo agent rounds currently require host mode")

@@ -113,7 +113,9 @@ looks at the list first when a look is due, which is once every
 `TAUCETI_CURATE_GAP` seconds (six hours by default) for all the workers that
 share the file on one host. A look that changes the file is the round's work;
 after one that changes nothing the round goes on to its other phases. A round
-given `--pr` does not curate. One worker per list is enough.
+given `--pr` does not curate. One worker per list is enough. A worker that also
+works a Forgejo source curates against GitHub, ahead of either source's work;
+in a round where GitHub could not be surveyed it does not curate.
 
 A look makes these edits, each to one item line; every other line stays as it
 was:

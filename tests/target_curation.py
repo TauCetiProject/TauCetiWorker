@@ -584,6 +584,47 @@ class Wiring(Tmp):
         self.assertEqual(self.round(["curate"], outcome=None), (["curate", "curate: the target list is current"], 1))
         self.assertEqual(self.round(["curate"], due=(False, "looked at 1.0h ago")), (["curate: looked at 1.0h ago"], 1))
 
+    def test_a_round_over_several_sources_curates_against_github_first(self):
+        import contextlib
+
+        from tauceti_worker import multi_source
+
+        github = SimpleNamespace(cfg=SimpleNamespace(wid="test"))
+
+        def observed(*sources):
+            return [(name, worker, tc.Survey(worker_id="test")) for name, worker in sources]
+
+        def ran(only, observations, outcomes):
+            opts = work.RoundOpts(only=only, agent="auto", work_model="auto", sandbox_host=True, dry_run=True)
+            with (
+                patch.dict(os.environ, {"TAUCETI_NEW_PR_FORGE": "github"}),
+                patch.object(multi_source, "log"),
+                patch.object(multi_source, "collect", return_value=observations),
+                patch.object(multi_source, "deduplicate"),
+                patch.object(multi_source, "activate", return_value=contextlib.nullcontext()),
+                patch.object(work, "run_round", side_effect=outcomes) as execute,
+            ):
+                try:
+                    result = multi_source.run_round(None, opts)
+                except tc.NoProgress as error:
+                    result = str(error)
+            return result, [
+                (call.args[0], call.args[1].only, call.kwargs["prepared_survey"]) for call in execute.call_args_list
+            ]
+
+        both = observed(("github", github), ("forgejo", SimpleNamespace()))
+        self.assertEqual(ran(["curate"], both, [0]), (0, [(github, ["curate"], both[0][2])]))
+        current = tc.NoProgress("curate: the target list is current")
+        result, calls = ran(["roadmap", "curate"], both, [current, 0])
+        self.assertEqual((result, [only for _, only, _ in calls]), (0, [["curate"], ["roadmap"]]))
+        self.assertEqual(ran(["curate"], both, [current]), ("curate: the target list is current", calls[:1]))
+        alone = observed(("forgejo", SimpleNamespace()))
+        result, calls = ran(["curate"], alone, [])
+        self.assertEqual(
+            (result, calls),
+            ("curate: GitHub was not surveyed this round, and the target list is curated against it", []),
+        )
+
     def test_the_task_is_explicit_and_runs_on_the_host(self):
         self.assertEqual((work.want([], "curate"), work.want(["curate"], "curate")), (False, True))
         self.assertEqual(tc.resolve_tasks(["roadmap,curate"], []), ["roadmap", "curate"])
