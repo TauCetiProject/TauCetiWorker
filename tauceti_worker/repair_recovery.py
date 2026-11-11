@@ -23,7 +23,7 @@ from . import work_recovery as saved
 from .config import log
 from .constants import BASE_BRANCH
 from .runtime_status import atomic_json, read_json, report_runtime
-from .survey import charge_attempts, checkpoint_counters, restore_counters
+from .survey import charge_attempts, checkpoint_counters, restore_counters, settle_counters
 
 STATES = {"retained", "eligible", "resuming", "verified", "publication-pending", "published", "obsolete", "blocked"}
 TERMINAL = {"published", "obsolete"}
@@ -1414,108 +1414,117 @@ class WorkerBackend:
             f"If no safe repair is possible, leave source in the checkout and structured diagnostics under {record / 'diagnostics'}, outside the source tree."
         )
         before_counts = checkpoint_counters(self.w.counters, keys)
-        before_content = j.get("content_attempts", 0)
-        api = None
+        try:
+            before_content = j.get("content_attempts", 0)
+            api = None
 
-        def refund_content(*, known_no_launch=False):
-            if not known_no_launch and ((api is not None and api.launched) or unit_admitted()):
-                return False
-            restore_counters(self.w.counters, before_counts)
-            write(record, j, "resuming", content_attempts=before_content, content_started=None)
-            return True
+            def refund_content(*, known_no_launch=False):
+                if not known_no_launch and ((api is not None and api.launched) or unit_admitted()):
+                    return False
+                restore_counters(self.w.counters, before_counts)
+                write(record, j, "resuming", content_attempts=before_content, content_started=None)
+                return True
 
-        with (
-            admission_unit(self.w.cfg.wid),
-            environment(
-                TAUCETI_RECOVERY_CONTINUATION="1",
-                TAUCETI_GITHUB_PR=m["pr"],
-                TAUCETI_VERIFY_BASE=saved._rev(checkout, f"origin/{BASE_BRANCH}"),
-            ),
-        ):
-            try:
-                with api_context(
-                    self.w.cfg.wid if api_mode() else "", "recovery", host=True, model=profile.model
-                ) as api:
-                    latest = self.facts(m)
-                    self.policy(m, latest)
-                    if latest != facts or self.claim_lost():
-                        raise Wait("claim-or-head-changed", "PR facts or claim changed before paid continuation")
-                    if not charge_attempts(self.w.counters, dict.fromkeys(keys, auth.get("budget") or 3)):
-                        raise Block("content-allowance", "Another worker spent the source repair allowance")
-                    write(
-                        record,
-                        j,
-                        "resuming",
-                        content_attempts=j.get("content_attempts", 0) + 1,
-                        content_started=uuid.uuid4().hex,
-                        content_delta=(j.get("delta_integration") or {}).get("id"),
-                        conversation_mode="narrow-new",
-                        conversation_reason="fresh-checkout-no-historical-cwd-rebinding",
-                    )
-                    try:
-                        rc = run_agent_host(
-                            checkout,
-                            prompt,
-                            profile,
-                            self.w.cfg.logdir,
-                            cancel_event=self.w.claims.lost,
-                            session_path=record / "continuation-session.json",
-                            session_actor=auth.get("actor"),
-                            session_scope=scope,
-                            quota_cfg=self.w.cfg,
-                        )
-                    except BuildCacheUnavailable as error:
-                        refund_content(known_no_launch=True)
-                        raise RuntimeError(
-                            f"Continuation infrastructure failed before model launch: {error}"
-                        ) from error
-                    except AdmissionUnavailable as error:
-                        if refund_content():
-                            raise Wait("worker-capacity", str(error)) from error
-                        raise
-                    if api and api.blocked_reason:
-                        if refund_content():
-                            raise Wait("budget-refused", api.blocked_reason)
-                        write(record, j, "resuming", continuation_admission_note=api.blocked_reason)
-            except AdmissionUnavailable as error:
-                if refund_content():
-                    raise Wait("worker-capacity", str(error)) from error
-                raise
-            except BudgetError as error:
-                raise Wait("budget-refused", str(error)) from error
-        self.snapshot_continuation(checkout, record, m, j)
-        self.prepare_source(checkout, record, m, j)
-        if not rc and j.get("delta_integration"):
-            snapshot = saved.inspect(checkout)
-            unresolved = bool(snapshot.conflicted or snapshot.operations)
-            write(record, j, "resuming", delta_integration={**j["delta_integration"], "requires_reasoning": unresolved})
-            if unresolved:
-                raise ContentFailure(
-                    "recovery-source-unresolved", "Continuation left unresolved source; retain and replan"
-                )
-        if rc:
-            from .constants import MAX_INFRA_REFUNDS
-
-            infra = take_last_agent_infra_failure()
-            account_limit = infra in {"provider subscription limit reached", "provider credit balance exhausted"}
-            if (
-                infra
-                and not infra.startswith("local API admission")
-                and not (api and api.blocked_reason)
-                and (account_limit or j.get("provider_refunds", 0) < MAX_INFRA_REFUNDS)
+            with (
+                admission_unit(self.w.cfg.wid),
+                environment(
+                    TAUCETI_RECOVERY_CONTINUATION="1",
+                    TAUCETI_GITHUB_PR=m["pr"],
+                    TAUCETI_VERIFY_BASE=saved._rev(checkout, f"origin/{BASE_BRANCH}"),
+                ),
             ):
-                refund_content(known_no_launch=True)
+                try:
+                    with api_context(
+                        self.w.cfg.wid if api_mode() else "", "recovery", host=True, model=profile.model
+                    ) as api:
+                        latest = self.facts(m)
+                        self.policy(m, latest)
+                        if latest != facts or self.claim_lost():
+                            raise Wait("claim-or-head-changed", "PR facts or claim changed before paid continuation")
+                        if not charge_attempts(self.w.counters, dict.fromkeys(keys, auth.get("budget") or 3)):
+                            raise Block("content-allowance", "Another worker spent the source repair allowance")
+                        write(
+                            record,
+                            j,
+                            "resuming",
+                            content_attempts=j.get("content_attempts", 0) + 1,
+                            content_started=uuid.uuid4().hex,
+                            content_delta=(j.get("delta_integration") or {}).get("id"),
+                            conversation_mode="narrow-new",
+                            conversation_reason="fresh-checkout-no-historical-cwd-rebinding",
+                        )
+                        try:
+                            rc = run_agent_host(
+                                checkout,
+                                prompt,
+                                profile,
+                                self.w.cfg.logdir,
+                                cancel_event=self.w.claims.lost,
+                                session_path=record / "continuation-session.json",
+                                session_actor=auth.get("actor"),
+                                session_scope=scope,
+                                quota_cfg=self.w.cfg,
+                            )
+                        except BuildCacheUnavailable as error:
+                            refund_content(known_no_launch=True)
+                            raise RuntimeError(
+                                f"Continuation infrastructure failed before model launch: {error}"
+                            ) from error
+                        except AdmissionUnavailable as error:
+                            if refund_content():
+                                raise Wait("worker-capacity", str(error)) from error
+                            raise
+                        if api and api.blocked_reason:
+                            if refund_content():
+                                raise Wait("budget-refused", api.blocked_reason)
+                            write(record, j, "resuming", continuation_admission_note=api.blocked_reason)
+                except AdmissionUnavailable as error:
+                    if refund_content():
+                        raise Wait("worker-capacity", str(error)) from error
+                    raise
+                except BudgetError as error:
+                    raise Wait("budget-refused", str(error)) from error
+            self.snapshot_continuation(checkout, record, m, j)
+            self.prepare_source(checkout, record, m, j)
+            if not rc and j.get("delta_integration"):
+                snapshot = saved.inspect(checkout)
+                unresolved = bool(snapshot.conflicted or snapshot.operations)
                 write(
                     record,
                     j,
                     "resuming",
-                    provider_refunds=j.get("provider_refunds", 0) + (0 if account_limit else 1),
+                    delta_integration={**j["delta_integration"], "requires_reasoning": unresolved},
                 )
-                raise RuntimeError(f"Provider failed before structured work: {infra}")
-            raise ContentFailure(
-                "continuation-source-failed",
-                f"Narrow continuation exited {rc}; its exact source remains in the isolated checkout",
-            )
+                if unresolved:
+                    raise ContentFailure(
+                        "recovery-source-unresolved", "Continuation left unresolved source; retain and replan"
+                    )
+            if rc:
+                from .constants import MAX_INFRA_REFUNDS
+
+                infra = take_last_agent_infra_failure()
+                account_limit = infra in {"provider subscription limit reached", "provider credit balance exhausted"}
+                if (
+                    infra
+                    and not infra.startswith("local API admission")
+                    and not (api and api.blocked_reason)
+                    and (account_limit or j.get("provider_refunds", 0) < MAX_INFRA_REFUNDS)
+                ):
+                    refund_content(known_no_launch=True)
+                    write(
+                        record,
+                        j,
+                        "resuming",
+                        provider_refunds=j.get("provider_refunds", 0) + (0 if account_limit else 1),
+                    )
+                    raise RuntimeError(f"Provider failed before structured work: {infra}")
+                raise ContentFailure(
+                    "continuation-source-failed",
+                    f"Narrow continuation exited {rc}; its exact source remains in the isolated checkout",
+                )
+        finally:
+            # An attempt that ran stays charged; it counts toward a peer's closure once it is settled.
+            settle_counters(self.w.counters, before_counts)
 
     def snapshot_continuation(self, checkout, record, m, j):
         snapshot = saved._record(
