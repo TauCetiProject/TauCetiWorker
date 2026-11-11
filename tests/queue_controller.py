@@ -236,20 +236,55 @@ class Verdicts(ControllerCase):
             self.controller.store.row("tasks", {"batch_id": head["id"], "state": "open"})["kind"], "repair"
         )
 
-    def test_build_alone_waits_for_the_other_verdicts_then_counts_as_a_missing_status(self):
+    def test_verified_build_retries_status_delivery_forever_without_rebuilding(self):
         head, attempt = self.observe("build-only")
-        self.assertEqual(attempt["outcome"], "pending", "a bound build with the others absent is not yet a verdict")
-        self.assertEqual(attempt["needs_observation"], 0)
-        self.assertEqual(self.verdict_states(), {"build": "success", "bump-guard": "absent", "scope": "absent"})
-        self.assertIn("waiting for bump-guard, scope", " ".join(self.controller.status()["reasons"]))
-        self.clock.advance(LOG_GRACE_SECONDS)
+        self.assertEqual(attempt["outcome"], "pending")
+        self.assertIn("awaits delivery of bump-guard, scope", " ".join(self.controller.status()["reasons"]))
+        self.assertEqual(len(self.github.dispatches), 1)
+        for _ in range(7):
+            self.clock.advance(LOG_GRACE_SECONDS + 1)
+            self.controller.tick()
+        current = self.attempt(head)
+        self.assertEqual((current["id"], current["outcome"]), (attempt["id"], "pending"))
+        self.assertEqual(len(self.github.dispatches), 1, "healthy source was never rebuilt")
+        deliveries = [call for call in self.github.calls if call[0] == "retry_status_delivery"]
+        self.assertGreaterEqual(len(deliveries), 7)
+        # The durable same entry survives controller restart, then ordinary status
+        # observation lands the original verified candidate when delivery recovers.
+        self.assertEqual(self.controller.store.count("outbox", {"kind": "retry_status_delivery"}), 1)
+        restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(restarted.store.close)
+        build = self.github.statuses[(head["tip"], "build")]
+        for context in ("scope", "bump-guard"):
+            self.github.statuses[(head["tip"], context)] = build
+        self.clock.advance(LOG_GRACE_SECONDS + 1)
+        restarted.tick()
+        self.assertEqual(self.repo.main_sha(), head["tip"])
+        self.assertEqual(len(self.github.dispatches), 1)
+
+    def test_reporting_dispatch_failure_remains_pending_in_the_existing_outbox(self):
+        self.github.fail_next["retry_status_delivery"] = 6
+        head, attempt = self.observe("build-only")
+        for _ in range(7):
+            self.clock.advance(3601)
+            self.controller.tick()
+        entry = self.controller.store.row("outbox", {"kind": "retry_status_delivery"})
+        self.assertGreaterEqual(entry["attempts"], 7)
+        self.assertEqual(self.attempt(head)["outcome"], "pending")
+        self.assertEqual(len(self.github.dispatches), 1)
+
+    def test_reporting_uses_the_observed_run_attempt_after_a_rerun(self):
+        self.github.fail_next["retry_status_delivery"] = 1
+        head, attempt = self.observe("build-only")
+        run = self.github.runs[0]
+        run.attempt = 2
+        self.clock.advance(LOG_GRACE_SECONDS + 1)
+        self.controller._observe_attempt(head, attempt, self.clock())
+        before = len(self.github.calls)
         self.controller.tick()
-        attempt = self.attempt(head)
-        self.assertEqual(attempt["outcome"], "infrastructure")
-        self.assertEqual(
-            attempt["outcome_detail"], "missing-status: the completed run posted no bound bump-guard, scope status"
-        )
-        self.assertNotEqual(self.repo.main_sha(), head["tip"])
+        self.assertEqual([args[2] for name, args in self.github.calls[before:] if name == "retry_status_delivery"], [2])
+        self.assertEqual(self.attempt(head)["id"], attempt["id"])
+        self.assertEqual(len(self.github.dispatches), 1)
 
     def test_delayed_build_status_can_land_without_redispatch(self):
         head, attempt = self.observe("no-status")
@@ -1273,6 +1308,71 @@ class PreRebase(ControllerCase):
         self.assertEqual([t["kind"] for t in self.open_tasks(batch)], ["pre_rebase"])
         self.assertEqual(self.controller.claim_task("w", "admin-worker").kind, "pre_rebase")
         self.assertIsNone(batch["prepared_version"])
+
+    def test_verified_pre_rebase_needs_no_second_preparation(self):
+        ref = "a" * 40
+        pin = f'[tools.tools]\nrepo = "org/Tools"\nref = "{ref}"\n'
+        self.repo.advance_main({"tauceti.toml": pin})
+        self.controller.set_setting("prepare_min_members", 1, "kim")
+        self.controller.set_setting("prepare_quiet_seconds", 0, "kim")
+        self.conflicting_batch()
+        agent = ScriptedAgent(
+            "w",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {
+                f"{PROJECT}#102": Resolution({"Shared.lean": "combined\n"}, explanation="Resolved both changes.")
+            },
+        )
+        task = agent.claim(self.controller)
+        tip = agent.produce(task)
+        evidence = {"tip": tip, "base": task.onto, "tools": f"org/Tools@{ref}"}
+        row = self.controller.store.row("tasks", {"id": task.task_id})
+        for stale in ({"tip": task.tip}, {"base": task.base}, {"tools": "org/Tools@" + "b" * 40}):
+            notes = json.dumps({"pre_rebase_verification": dict(evidence, **stale)})
+            self.assertFalse(self.controller._verified_pre_rebase(row, tip, notes))
+        result = self.controller.submit_task(
+            task.task_id, task.claim_token, tip, json.dumps({"pre_rebase_verification": evidence})
+        )
+        self.assertTrue(result.accepted, result)
+        self.controller.tick()
+        self.assertEqual(self.open_batch()["pre_rebase_prepared"], tip)
+        self.assertEqual(self.open_tasks(self.open_batch()), [])
+
+    def test_compiling_repair_is_retained_for_the_next_claim_without_adoption(self):
+        self.conflicting_batch()
+        agent = ScriptedAgent(
+            "w",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {
+                f"{PROJECT}#102": Resolution({"Shared.lean": "combined\n"}, explanation="Resolved both changes.")
+            },
+        )
+        task = agent.claim(self.controller)
+        tip = agent.produce(task)
+        findings = [{"kind": "lint", "module": "Shared", "message": "unused argument"}]
+        notes = json.dumps({"repair_checkpoint": findings})
+        before = self.open_batch()
+        result = self.controller.submit_task(task.task_id, task.claim_token, tip, notes, checkpoint=True)
+        self.assertFalse(result.accepted, result)
+        self.assertEqual(result.reason, "repair-checkpoint")
+        self.assertEqual(self.open_batch(), before)
+        self.assertEqual(
+            self.controller.submit_task(task.task_id, task.claim_token, tip, notes, checkpoint=True).reason,
+            "repair-checkpoint",
+        )
+        self.assertEqual(self.controller.store.count("submissions", {"task_id": task.task_id}), 1)
+        next_task = self.controller.claim_task("next", "admin-worker")
+        self.assertEqual(next_task.extra["repair_checkpoint"], {"tip": tip, "diagnostics": findings})
+        self.assertEqual(next_task.warm_revs[0], tip)
+        self.assertIn(result.retained_ref, next_task.retained_refs)
+        self.assertEqual(next_task.tip, task.tip, "the original membership and validation baseline survive")
+        adoption = self.controller.submit_task(task.task_id, next_task.claim_token, tip)
+        self.assertTrue(adoption.accepted, adoption)
+        self.assertEqual(self.open_batch()["pre_rebase_tip"], tip)
 
     def test_claimed_own_base_preparation_finishes_before_rebase(self):
         self.controller.set_setting("prepare_min_members", 1, "kim")

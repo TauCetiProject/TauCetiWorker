@@ -1530,6 +1530,12 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 result = None
             if isinstance(result, dict) and result.get("head_sha") == head and result.get("changed") is False:
                 log(f"  review #{pr}: published verdict unchanged — selecting other work")
+                record = getattr(w.counters, "record_unchanged_review", None)
+                if record:
+                    try:
+                        record(pr, head)
+                    except OSError:
+                        pass  # Only an optimization: the next survey re-dispatches and the engine re-checks.
                 w.rs.bust(pr)
                 from .activity import select
 
