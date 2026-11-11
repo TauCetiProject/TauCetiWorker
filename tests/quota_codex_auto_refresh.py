@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -309,6 +310,44 @@ for name, files, expires_in, first, want in (
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+
+# 6d) A stop signal that lands while the endpoint answers must not unwind before the answer is
+#     written: the endpoint has already retired the old refresh token. The stop is honoured after.
+class Stopped(KeyboardInterrupt):
+    pass
+
+
+def stop(_signum, _frame):
+    raise Stopped
+
+
+for sig in (signal.SIGTERM, signal.SIGINT):
+    tmp = Path(tempfile.mkdtemp())
+    previous = signal.signal(sig, stop)
+    try:
+        quota, src, mirror, stale = setup(tmp)
+        fresh = jwt(10 * DAY)
+
+        def answer(url, payload, timeout=15, sig=sig, fresh=fresh):
+            signal.raise_signal(sig)
+            return 200, {"access_token": fresh, "refresh_token": "rt2"}
+
+        stopped = False
+        with patch.object(oauth, "_post_json", side_effect=answer), usage_seen()[1]:
+            try:
+                quota.codex(renew=True)
+            except Stopped:
+                stopped = True
+        check(f"{sig.name} during the exchange still stops the caller", stopped, True)
+        check(
+            f"...after the rotated token is saved ({sig.name})",
+            tokens(src),
+            {"access_token": fresh, "refresh_token": "rt2"},
+        )
+        check(f"...and the handler is restored ({sig.name})", signal.getsignal(sig), stop)
+    finally:
+        signal.signal(sig, previous)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 # 7) The stored expiry says the token is live and the endpoint says otherwise. Believe the endpoint:
 #    rotate once, then re-read rather than reporting a 401 we can fix.

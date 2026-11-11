@@ -11,9 +11,11 @@ import math
 import os
 import random
 import shlex
+import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import tomllib
 import urllib.error
@@ -937,6 +939,28 @@ def _codex_managed_preferences() -> bool:
         )
     except OSError:
         return True
+
+
+@contextmanager
+def _stop_deferred():
+    """Hold SIGTERM and SIGINT until the block ends, then deliver them to the handlers they had. The
+    token endpoint retires a refresh token when it answers, so an exchange unwound before its write
+    leaves only the consumed one on disk. The exchange is bounded by its 15-second request timeout."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    pending: list[int] = []
+    previous = {
+        sig: signal.signal(sig, lambda signum, _frame: pending.append(signum))
+        for sig in (signal.SIGTERM, signal.SIGINT)
+    }
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+        for sig in dict.fromkeys(pending):
+            signal.raise_signal(sig)
 
 
 def _read_marker(p: Path) -> str | None:
@@ -2064,12 +2088,13 @@ class Quota:
             if expiry is None or expiry > time.time() + CODEX_REFRESH_SKEW_S:
                 return False
         try:
-            result = credential_refresh.refresh_if_due(
-                prov,
-                CODEX_REFRESH_SKEW_S,
-                force=force,
-                attempt_interval_seconds=CODEX_REFRESH_RETRY_S,
-            )
+            with _stop_deferred():
+                result = credential_refresh.refresh_if_due(
+                    prov,
+                    CODEX_REFRESH_SKEW_S,
+                    force=force,
+                    attempt_interval_seconds=CODEX_REFRESH_RETRY_S,
+                )
         except (OSError, RuntimeError, ValueError) as e:
             log(f"codex credential: refresh failed ({e}) — codex stays unavailable until it is renewed")
             return False
