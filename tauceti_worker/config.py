@@ -127,22 +127,22 @@ def respect_claims() -> bool:
     return os.environ.get("TAUCETI_RESPECT_CLAIMS", "true").strip().lower() not in ("0", "false", "no", "off")
 
 
-def _switch(name: str) -> bool:
-    return os.environ.get(name, "true").strip().lower() not in ("0", "false", "no", "off")
+def _switch(name: str, env=None) -> bool:
+    return (os.environ if env is None else env).get(name, "true").strip().lower() not in ("0", "false", "no", "off")
 
 
-def reactions_enabled() -> bool:
+def reactions_enabled(env=None) -> bool:
     """Whether a contest claim is posted as a reaction on GitHub; off keeps it in a file under the
     shared GitHub state directory. On by default; read live from TAUCETI_REACTIONS so --no-reactions
     (which sets it to 0) is inherited by loop children."""
-    return _switch("TAUCETI_REACTIONS")
+    return _switch("TAUCETI_REACTIONS", env)
 
 
-def stuck_issues_enabled() -> bool:
+def stuck_issues_enabled(env=None) -> bool:
     """Whether the worker files a "Review stuck" tracking issue for a PR it cannot review. On by
     default; read live from TAUCETI_STUCK_ISSUES so --no-stuck-issues (which sets it to 0) is
     inherited by loop children."""
-    return _switch("TAUCETI_STUCK_ISSUES")
+    return _switch("TAUCETI_STUCK_ISSUES", env)
 
 
 def _only_label(sv=None) -> str:

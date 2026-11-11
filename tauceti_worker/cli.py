@@ -1284,6 +1284,11 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         if problem:
             raise Die(problem)
         require_admin()  # Before quota/model selection, including on the loop-driver path.
+    # Before the outbox drain: replaying retained publications honours both switches.
+    if getattr(args, "reactions", None) is False:
+        os.environ["TAUCETI_REACTIONS"] = "0"
+    if getattr(args, "stuck_issues", None) is False:
+        os.environ["TAUCETI_STUCK_ISSUES"] = "0"
     if one_round and not getattr(args, "dry_run", False):
         from .github_outbox import drain
 
@@ -1350,10 +1355,6 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         os.environ["TAUCETI_ROADMAP_EXTRA_IDENTITIES"] = args.roadmap_extra_identities
     if getattr(args, "respect_claims", None) is False:
         os.environ["TAUCETI_RESPECT_CLAIMS"] = "false"
-    if getattr(args, "reactions", None) is False:
-        os.environ["TAUCETI_REACTIONS"] = "0"
-    if getattr(args, "stuck_issues", None) is False:
-        os.environ["TAUCETI_STUCK_ISSUES"] = "0"
     # --auto-refresh likewise, so a loop child renews on the same authority the driver was given.
     if getattr(args, "auto_refresh", None):
         os.environ["TAUCETI_AUTO_REFRESH"] = "1"

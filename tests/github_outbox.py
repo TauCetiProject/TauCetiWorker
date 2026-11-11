@@ -372,3 +372,59 @@ with (
     value = json.loads(path.read_text())
     assert value["status"] == "rejected" and value["retry_at"] >= time.time() + 295
     assert not getattr(rejected, "github_permanent_failure", False)
+
+# With a switch off, recovery drops retained publications of that kind and still sends the rest.
+with (
+    tempfile.TemporaryDirectory() as tmp,
+    patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": tmp, "GH_TOKEN": "switch-fixture", "TAUCETI_WORKER_ID": "w"}),
+):
+    stuck_body = "The autonomous worker cannot make progress on #42\n\n<!--tauceti-review-stuck:42-->"
+    switched = {
+        "TAUCETI_REACTIONS": [
+            "gh",
+            "api",
+            "-X",
+            "POST",
+            "/repos/org/repo/pulls/comments/5/reactions",
+            "-f",
+            "content=eyes",
+        ],
+        "TAUCETI_STUCK_ISSUES": [
+            "gh",
+            "issue",
+            "create",
+            "--repo",
+            "org/repo",
+            "--title",
+            "Review stuck: PR #42",
+            "--body",
+            stuck_body,
+        ],
+        "TAUCETI_STUCK_ISSUES edit": ["gh", "issue", "edit", "17", "--repo", "org/repo", "--body", stuck_body],
+    }
+    unrelated = ["gh", "pr", "comment", "8", "--repo", "org/repo", "--body", "paid review"]
+
+    def seed():
+        paths = {}
+        for name, argv in [*switched.items(), ("unrelated", unrelated)]:
+            paths[name] = outbox.prepare(argv, dict(os.environ), tmp)
+            outbox.finish(paths[name], subprocess.CompletedProcess(argv, 1, "", "rate limit"), before_request=True)
+            value = json.loads(paths[name].read_text())
+            assert value["status"] == "rejected"
+            tr.atomic(paths[name], {**value, "retry_at": 0})
+        return paths
+
+    for off in (
+        {"TAUCETI_REACTIONS": "0"},
+        {"TAUCETI_STUCK_ISSUES": "0"},
+        {"TAUCETI_REACTIONS": "0", "TAUCETI_STUCK_ISSUES": "0"},
+    ):
+        paths = seed()
+        with patch.object(
+            tr, "execute", side_effect=lambda cmd, **k: subprocess.CompletedProcess(cmd, 0, "{}", "")
+        ) as sent:
+            assert outbox.drain({**os.environ, **off}) == []
+        out = [call.args[0][1:] for call in sent.call_args_list]
+        kept = [argv[1:] for name, argv in switched.items() if name.split()[0] not in off]
+        assert sorted(map(json.dumps, out)) == sorted(map(json.dumps, [*kept, unrelated[1:]])), (off, out)
+        assert not any(p.exists() for p in paths.values())
