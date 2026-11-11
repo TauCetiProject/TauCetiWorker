@@ -11,7 +11,6 @@ import random
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from dataclasses import dataclass, replace
@@ -977,17 +976,25 @@ def _selected_pr_matches(stage: str, c: Candidate, live) -> bool | None:
 
 
 def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool | None:
-    if getattr(getattr(w, "gh", None), "worker_capable", False) is True:
-        from .source_execution import still_actionable
-
-        return still_actionable(stage, w, sv, c)
-    from tauceti_tools.forge import GITHUB
+    from tauceti_tools.forge import GITHUB, RepositoryRef
 
     source_repository = getattr(c, "source_repository", None)
-    if source_repository is not None and (
-        source_repository.forge != GITHUB or source_repository.name.casefold() != w.gh.repo.casefold()
-    ):
-        return False
+    if source_repository is not None:
+        selected = getattr(w.gh, "repository", None)
+        if not isinstance(selected, RepositoryRef):
+            selected = RepositoryRef(GITHUB, w.gh.repo)
+        if source_repository != selected:
+            return False
+        identity = getattr(w.gh, "identity", None)
+        if identity is not None and getattr(c, "source_repository_id", None) != identity.native_id:
+            return False
+    # Native authorization stays with its adapter; freshness, labels, contests,
+    # attempt budgets and finding policy below are shared for every source.
+    authorize = getattr(type(w.gh), "authorize_candidate", None)
+    if authorize is not None:
+        allowed = authorize(w.gh, c, require_writer=stage in {"fix", "rebase", "fix-ci"})
+        if allowed is not True:
+            return allowed
     from .github_transport import read_context
 
     try:
@@ -1493,10 +1500,6 @@ def do_overlap_fix(w, sv, c, opts, bubble):
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int | None:
-    if getattr(getattr(w, "gh", None), "worker_capable", False) is True:
-        from .source_execution import review
-
-        return review(w, sv, c, opts, bubble)
     from .github_transport import blocked_since
 
     github_started = time.time()
@@ -1525,6 +1528,11 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
     # Never accept a result from an earlier invocation, including a same-head retry.
     result_file.unlink(missing_ok=True)
     try:
+        from .review_runtime import resolve
+
+        if bubble and not getattr(w.gh, "supports_review_sandbox", True):
+            raise NoProgress("selected source does not support review sandbox transport")
+        runtime = w.review_runtime = resolve(w.cfg)
         if bubble:
             rc = review_in_bubble(w, pr, head, reviewers, opts, result_file=result_file)
         else:
@@ -1536,12 +1544,10 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             with review_workspace(w.cfg) as scratch:
                 rc = run_to_logfile(
                     [
-                        "uvx",
-                        "--from",
-                        f"git+https://github.com/{REVIEW}"
-                        + ("@" + os.environ["TAUCETI_REVIEW_REF"] if os.environ.get("TAUCETI_REVIEW_REF") else ""),
-                        "tauceti-review",
+                        *runtime.command(),
                         str(pr),
+                        "--repo",
+                        getattr(w.gh, "review_repository", w.gh.repo),
                         "--workdir",
                         str(scratch),
                         "--store",
@@ -1553,8 +1559,6 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                         *(["--auth", "api"] if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else []),
                         "--expect-head",
                         head,
-                        "--submitted-by",
-                        me(),
                         *(["--claude-model", claude_model] if claude_model else []),
                         *(["--codex-model", cm] if cm else []),
                         *(["--kiro-model", km] if km else []),
@@ -1582,6 +1586,9 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         if rc == EX_CLAIM_COLLISION:  # Review engine: another run already owns this head; no inference or verdict.
             log(f"  review #{pr}: claimed by a peer — selecting other work")
             return None
+        if rc in (85, 86):
+            reason = "publisher/record repair" if rc == 86 else "publication retry"
+            raise NoProgress(f"review #{pr}: rendered output retained for {reason} — no new inference")
         if rc == REVIEW_PREPARATION_WAIT_EXIT:
             # A fetch/host outage is not a defect in the selected PR. Refresh
             # discovery on the next ordinary attempt, including a changed head.
@@ -1616,7 +1623,11 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             # Publish them to TauCetiData with the host's creds. The posted scoreboard is the live
             # auto-merge verdict; TauCetiData is the analytics/provenance archive, so a sync failure is
             # visible and non-lossy but must not turn a successfully posted review into failed work.
-            srv = _sync_review_outbox(w, pr)
+            try:
+                srv = _sync_review_outbox(w, pr)
+            except Exception as error:
+                log(f"review #{pr}: archive retained for retry ({type(error).__name__})")
+                srv = 1
             if srv != 0:
                 # A push-capable host hit an archive outage (auth, network, remote, or local checkout).
                 # Keep the records for the next review's whole-outbox retry and warn, but continue the
@@ -1695,40 +1706,24 @@ def _sync_review_outbox(w: Worker, pr: int) -> int:
     archive_repo = os.environ.get("TAUCETI_DATA_REPO", "TauCetiProject/TauCetiData")
     if not archive_repo:
         return 0
-    if can_push(archive_repo) is False:
-        log(
-            f"  review #{pr}: no write access to TauCetiData — review posted and counts for "
-            f"auto-merge; analytics/provenance records kept in {outbox}"
-        )
-        return 0
-    eng = os.environ.get("TAUCETI_REVIEW_ENGINE_DIR")  # a local engine checkout, for pre-merge tests
-    if eng:
-        argv = [
-            sys.executable,
-            str(Path(eng) / "runner" / "cli.py"),
-            str(pr),
-            "--sync-only",
-            "--store",
-            str(w.cfg.store_dir),
-        ]
-    else:
-        argv = [
-            "uvx",
-            "--from",
-            f"git+https://github.com/{REVIEW}"
-            + ("@" + os.environ["TAUCETI_REVIEW_REF"] if os.environ.get("TAUCETI_REVIEW_REF") else ""),
-            "tauceti-review",
-            str(pr),
-            "--sync-only",
-            "--store",
-            str(w.cfg.store_dir),
-        ]
-    # The sync echoes a full `$ …python …/archive.py sync --store … --data-dir …` command line and a
-    # "synced N file(s)" line. Capture it so that noise stays out of the main log, surfacing only a
-    # one-line summary; keep the detail in a subsidiary file only when the sync FAILS (the diagnosable case).
-    if os.environ.get("TAUCETI_STREAM"):
-        return subprocess.run(argv).returncode
-    p = subprocess.run(argv, capture_output=True, text=True)
+    from .review_runtime import resolve
+    from .worker_sources import shared_github_environment
+
+    # Archive permissions belong to the archive's forge. A selected content
+    # source must not redirect this check to a same-named native repository.
+    with shared_github_environment(required=False):
+        if can_push(archive_repo) is False:
+            log(
+                f"  review #{pr}: no write access to TauCetiData — review posted and counts for "
+                f"auto-merge; analytics/provenance records kept in {outbox}"
+            )
+            return 0
+        runtime = getattr(w, "review_runtime", None) or resolve(w.cfg)
+        argv = runtime.command(pr, "--sync-only", "--store", w.cfg.store_dir)
+        # Capture sync details; keep a diagnostic log on failure.
+        if os.environ.get("TAUCETI_STREAM"):
+            return subprocess.run(argv).returncode
+        p = subprocess.run(argv, capture_output=True, text=True)
     if p.returncode == 0:
         m = re.search(r"synced (\d+) file", (p.stdout or "") + (p.stderr or ""))
         log(f"  review #{pr}: synced {m.group(1) if m else '?'} record(s) to TauCetiData")
