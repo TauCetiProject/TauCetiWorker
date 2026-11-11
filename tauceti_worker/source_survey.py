@@ -1,7 +1,7 @@
 """Direct source inventory and qualified ownership in the ordinary survey consumer.
 
-Native commit statuses are observations, not trusted execution evidence. Source
-scheduling remains unavailable until CI, claims and publication are integrated.
+Native commit statuses are observations, not trusted execution evidence. The
+inventory remains read-only; worker_survey adds native review and repair selection.
 """
 
 from __future__ import annotations
@@ -107,7 +107,7 @@ def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count
         return result
 
     actor = source.authenticated_actor()
-    if actor is None:
+    if actor is None and getattr(source, "anonymous_discovery", False) is not True:
         return unavailable("authenticated_actor", source.last_failure)
     raw = source.open_prs()
     if raw is None:
@@ -118,7 +118,7 @@ def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count
         return unavailable("inventory_projection")
     if not source.binding_current():
         return unavailable("binding", source.last_failure)
-    result.source_actor, result.me_login = actor, actor.login
+    result.source_actor, result.me_login = actor, actor.login if actor else ""
     if count_all_roadmaps:
         result._automatic_open_count = roadmap_open_count(
             [p for p in prs if not p.is_draft and result.owns(p)], "auto", skip
@@ -142,7 +142,7 @@ def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count
     result.n_open_nondraft = len(nondraft)
     result._mine_open_prs = [p for p in nondraft if result.owns(p)]
     result.rescope_roadmap()
-    result.status_labels, result.n_status_unlabeled = bucket_status_labels(nondraft, actor.login, owns=result.owns)
+    result.status_labels, result.n_status_unlabeled = bucket_status_labels(nondraft, result.me_login, owns=result.owns)
     # rescope_roadmap also chooses authoring for legacy surveys. This inventory
     # supplies no source write, claim or execution authority, including authoring.
     result.next_auto_stage = None
@@ -154,4 +154,52 @@ def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count
     if deep and stages:
         result.github_failed = True
         result.errors.append("source scheduling requires verified CI, qualified claims and publication adapters")
+    return result
+
+
+def worker_survey(cfg, source, rs, counters, *, roadmap, skip, deep, stages, numbers, count_all_roadmaps):
+    """Schedule review and owned-branch repair without asserting native CI authority."""
+    from .survey import classify_survey
+
+    result = inventory_survey(
+        cfg,
+        source,
+        roadmap=roadmap,
+        skip=skip,
+        deep=False,
+        stages=(),
+        numbers=numbers,
+        count_all_roadmaps=count_all_roadmaps,
+    )
+    if result.github_failed:
+        return result
+    result.dependency_wait = None
+    if result.source_actor is None:
+        result.errors.append("Forgejo discovery is public; native work requires an authenticated Forgejo account")
+        return result
+    if deep:
+        from .survey_facts import in_scope
+
+        result.open_prs = (
+            [pr for pr in result.open_prs if pr.number in numbers]
+            if numbers
+            else [pr for pr in result.open_prs if in_scope(pr.labels, pr.target_focuses, pr.head_ref, roadmap, skip)]
+        )
+    rs.observe(result.open_prs)
+    classify_survey(
+        cfg,
+        source,
+        rs,
+        counters,
+        result,
+        enabled=set(stages) & {"review", "fix", "rebase"},
+        deep=deep,
+        review_without_ci=True,
+        supports_external_repair=False,
+    )
+    for stage in ("rebase", "review", "fix", "fix-ci", "bump", "lint-repair"):
+        kind = result.kind(stage)
+        for candidate in kind.actionable + kind.suppressed:
+            candidate.source_repository = source.repository
+            candidate.source_repository_id = source.identity.native_id
     return result

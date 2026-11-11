@@ -15,6 +15,7 @@ Exit 0 = all cases agree; 1 = a mismatch.
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -114,6 +115,17 @@ check("a review candidate that still stands is taken", still("review", rs), True
 # the dashboard, either of which can republish an entitled record in the gap between the two.
 check("...having read every answer live", [f for _, f in rs.forced], [True] * len(rs.forced))
 check("...and without busting a cache other processes share", rs.busted, [])
+
+# A shared fresh scoreboard can decline already-reviewed candidates before any
+# direct PR-header request. Sixty workers must not spend sixty GraphQL points
+# just to rediscover that no review is needed.
+with patch.object(FakeGH, "pr_view", side_effect=AssertionError("completed head needs no direct eligibility read")):
+    for _ in range(60):
+        check("completed head skips its direct header read", still("review", FakeRS(clean_head=HEAD)), False)
+# Stale cached verdicts cannot short-circuit the fresh head check.
+with patch.object(FakeGH, "pr_view", return_value=FakeGH().view) as headers:
+    still("review", FakeRS(meta=tc.Meta({"head_sha": HEAD}, "stale"), clean_head=HEAD))
+    check("stale evidence still checks the candidate head", headers.call_count, 1)
 
 for pause in ("hold", "on-hold", "human"):
     gh = FakeGH()

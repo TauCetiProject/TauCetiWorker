@@ -850,7 +850,7 @@ class FakeService:
         self.releases.append({"task_id": task_id, "reason": reason, "error": error, "worker": claim["worker"]})
         return {"task_id": task_id, "released": True}
 
-    def submit_task(self, task_id: int, token: str, tip_sha: str, worker_notes: str) -> dict:
+    def submit_task(self, task_id: int, token: str, tip_sha: str, worker_notes: str, *, checkpoint=False) -> dict:
         task = self.tasks[task_id]
         claim = next((c for c in self.claims.values() if c["task_id"] == task_id and c["token"] == token), None)
         if claim is None:
@@ -880,6 +880,13 @@ class FakeService:
                 and previous["response"].get("accepted")
             ):
                 return dict(previous["response"], reason="already-adopted", version=None)
+            if (
+                checkpoint
+                and previous["claim_id"] == claim["id"]
+                and previous["tip_sha"] == tip_sha
+                and previous["response"]["reason"] == "repair-checkpoint"
+            ):
+                return previous["response"]
         if self.result_script:
             scripted = self.result_script.pop(0)
             return adoption(scripted.get("accepted", False), scripted.get("reason", ""), scripted.get("violations", ()))
@@ -915,6 +922,15 @@ class FakeService:
                     for m in unexplained
                 ],
             )
+        if checkpoint:
+            task.setdefault("extra", {})["repair_checkpoint"] = {
+                "tip": tip_sha,
+                "diagnostics": json.loads(worker_notes)["repair_checkpoint"],
+            }
+            task["retained_refs"].append(ref)
+            claim["released_at"] = time.time()
+            claim["release_reason"] = "repair-checkpoint"
+            return adoption(False, "repair-checkpoint")
         self.done.add(task_id)
         claim["released_at"] = time.time()
         claim["release_reason"] = "adopted"
@@ -940,7 +956,7 @@ class FakeService:
                         raise RuntimeError("database unavailable")
                     result = self.claim_task(str(body.get("worker") or ""))
                     return (204, None) if result is None else (200, result)
-                match = re.fullmatch(r"/tasks/([^/]+)/(renew|result|release)", path)
+                match = re.fullmatch(r"/tasks/([^/]+)/(renew|result|release|checkpoint)", path)
                 if not match:
                     return 404, {"error": "no such route"}
                 task_id, verb = int(match.group(1)), match.group(2)
@@ -959,7 +975,11 @@ class FakeService:
                         raise RuntimeError("database unavailable")
                     return 200, self.release_task(task_id, token, str(body.get("reason")), str(body.get("error", "")))
                 return 200, self.submit_task(
-                    task_id, token, str(body.get("tip_sha") or ""), str(body.get("worker_notes", ""))
+                    task_id,
+                    token,
+                    str(body.get("tip_sha") or ""),
+                    str(body.get("worker_notes", "")),
+                    checkpoint=verb == "checkpoint",
                 )
             except LookupError as error:  # TaskError: a stable code in the body
                 return 409, {"error": str(error), "code": str(error)}
@@ -2859,6 +2879,24 @@ class PublishOutputs(Fixture):
         self.assertEqual(len(records), 1, records)
         return records[0]
 
+    def test_staging_submission_precedes_configured_before_upload(self):
+        self.service.tasks[1]["extra"]["checks_owner"] = "staging"
+        gate = self.stub_dir / "staged-upload-gate"
+        gate.touch()
+        self.addCleanup(lambda: gate.unlink(missing_ok=True))
+        cfg = self.config(publish=self.settings(when="before"))
+        try:
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+            self.assertEqual(outcome["status"], "adopted", outcome)
+            self.assertEqual(len(self.service.results), 1)
+            self.assertTrue(outcome["publish"]["background"])
+            self.assertTrue(gate.exists(), "submission did not wait for the upload")
+            self.assertEqual(cfg.publish.when, "before", "the per-task choice leaves shared configuration intact")
+        finally:
+            gate.unlink(missing_ok=True)
+        self.assertTrue(self.published()["published"])
+        self.assertFalse((cfg.root / "worktrees/task-1").exists())
+
     def test_a_green_repair_submits_and_then_publishes_the_tip(self):
         submitted: list[float] = []
         submit = self.service.submit_task
@@ -3177,6 +3215,18 @@ class ParallelRepair(Fixture):
 
     def group_worktree(self, number: int) -> Path:
         return self.root / "state" / "worktrees" / f"task-1-group-{number}"
+
+    def test_staging_parallel_build_satisfies_final_worker_verification(self):
+        self.service.tasks[1]["extra"]["checks_owner"] = "staging"
+        cfg = self.config(parallel_agents=3)
+        with (
+            patch.object(repair_audit, "verify", side_effect=AssertionError("duplicate final build")),
+            patch.object(repair_audit, "check", side_effect=AssertionError("duplicate full checks")),
+        ):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(outcome["parallel"]["verified_tip"], outcome["tip"])
+        self.assertNotIn("checks", outcome["parallel"])
 
     def assert_two_groups_folded(self, outcome: dict) -> None:
         parallel = outcome["parallel"]
@@ -3777,7 +3827,7 @@ exit 1
         self.assertIn("`.tauceti-repair/build <Module> ...` waits for the lock", prompt)
         self.assertIn("`--dependents` adds the modules importing them", prompt)
         self.assertIn("build finished, exit N, M errors total", prompt)
-        self.assertIn("the worker runs the final full build, audits and lint", prompt)
+        self.assertIn("the worker completes its assigned verification before submission", prompt)
         # The scoped build helper waited for the lock, ran lake for the named module and returned its status.
         agent = json.loads((self.stub_dir / "stream-agent.json").read_text())
         self.assertEqual(agent["helper_rc"], 0, agent)
@@ -4675,6 +4725,124 @@ class WorkerAudits(Fixture):
         path = self.root / "state" / "worktrees" / "task-1" / ".tauceti-repair" / "errors.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()]
 
+    def test_staging_owns_full_checks_but_worker_still_compiles(self):
+        self.service.tasks[1]["extra"]["checks_owner"] = "staging"
+        self.findings("lint-findings-always", "simpNF: unrelated declaration")
+        cfg = self.config()
+        with patch.object(repair_audit, "build_drivers", side_effect=AssertionError("head check setup")):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(outcome["verification"][-1]["build"]["rc"], 0)
+        self.assertEqual(outcome["verification"][-1]["checks"]["status"], "deferred")
+        self.assertFalse((self.stub_dir / "audit-runs.log").exists())
+        self.assertFalse((self.stub_dir / "lint-runs.jsonl").exists())
+        self.assertEqual(len(self.service.results), 1)
+
+    def test_staging_ownership_still_rejects_a_failed_final_build(self):
+        self.service.tasks[1]["extra"]["checks_owner"] = "staging"
+        cfg = self.config(verify_retries=0)
+        run = repair_audit._sandboxed
+
+        def fail_build(argv, *args, **kwargs):
+            if "build" in argv:
+                return {"rc": 1, "output": "TauCeti/Two.lean:1:1: error: final build failed"}
+            return run(argv, *args, **kwargs)
+
+        with patch.object(repair_audit, "_sandboxed", side_effect=fail_build):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["reason"], "agent_failed", outcome)
+        self.assertEqual(self.service.results, [])
+
+    def test_staging_helper_keeps_targeted_settings_and_skips_full_checks(self):
+        path = repair_audit.write_settings(
+            self.content.clone,
+            base=self.content.base,
+            tools_root=self.root / "tools",
+            checks_owner="staging",
+        )
+        self.assertEqual(json.loads(path.read_text())["checks_owner"], "staging")
+        with patch.object(repair_audit, "check", side_effect=AssertionError("duplicate helper checks")):
+            self.assertEqual(repair_audit.helper_checks(self.content.clone), 0)
+
+    def test_delivery_receipt_distinguishes_compilation_from_full_checks(self):
+        task = repair_task.Task.from_json(self.service.task_record(1, self.service.preclaim(1, "token", "worker")))
+        cfg = self.config()
+        full = repair_task.delivery_identity(cfg, task, task.tip)
+        task.extra["checks_owner"] = "staging"
+        compilation = repair_task.delivery_identity(cfg, task, task.tip)
+        self.assertNotEqual(full, compilation)
+        self.assertTrue(full["full_checks"])
+        self.assertFalse(compilation["full_checks"])
+
+    def test_staging_pre_rebase_retains_build_receipt_without_full_check_claim(self):
+        self.service.tasks[1].update(kind="pre_rebase")
+        self.service.tasks[1]["extra"]["checks_owner"] = "staging"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        notes = json.loads(self.service.results[0]["worker_notes"])
+        receipt = notes["pre_rebase_verification"]
+        self.assertEqual(
+            receipt,
+            {
+                "tip": outcome["tip"],
+                "base": self.content.base,
+                "tools": f"TauCetiProject/TauCetiTools@{TOOLS_REF}",
+                "scope": "build",
+            },
+        )
+
+    def test_staging_preparation_stream_does_not_run_full_checks(self):
+        self.service.tasks[1].update(kind="prepare")
+        self.service.tasks[1]["extra"]["checks_owner"] = "staging"
+        cfg = self.config()
+        with patch.object(repair_audit, "build_drivers", side_effect=AssertionError("head discovery setup")):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        if self.BROKEN:
+            self.assertEqual(outcome["status"], "adopted", outcome)
+            self.assertEqual(outcome["verification"][-1]["build"]["rc"], 0)
+        else:
+            self.assertEqual((outcome["status"], outcome["reason"]), ("released", "prepared_clean"), outcome)
+            self.assertNotIn("verification", outcome)
+
+    def test_lint_checkpoint_survives_lost_receipt_and_continues_on_a_new_claim(self):
+        self.service.tasks[1].setdefault("extra", {})["can_checkpoint_repair"] = True
+        cfg = self.config(poll_seconds=0, verify_retries=0)
+        client = self.client(cfg)
+        finding = {"kind": "lint", "path": "TauCeti/Two.lean", "message": "unused argument"}
+        failed = {"ok": False, "build": {"rc": 0}, "checks": {"status": "failed"}, "diagnostics": [finding]}
+        submit = client.submit
+
+        def lost(*args, **kwargs):
+            self.assertTrue(kwargs.get("checkpoint"))
+            self.assertEqual(submit(*args, **kwargs)["reason"], "repair-checkpoint")
+            raise repair_task.ServiceError("lost checkpoint reply")
+
+        with (
+            patch.object(repair_audit, "verify", return_value=failed),
+            patch.object(client, "submit", side_effect=lost),
+        ):
+            pending = repair_task.claim_and_run(cfg, client)
+        self.assertEqual(pending["status"], "delivery_pending", pending)
+        tip = pending["repair_checkpoint"]["tip"]
+        self.assertEqual(self.service.done, set())
+        self.assertEqual(len(self.service.results), 1)
+        before = (len(self.agent_calls()), len(self.lake_calls()))
+        [saved] = repair_task.resume_pending(cfg, client)
+        self.assertEqual(saved["reason"], "repair-checkpoint", saved)
+        self.assertEqual((len(self.agent_calls()), len(self.lake_calls())), before)
+        self.assertFalse((cfg.root / "worktrees/task-1").exists())
+
+        os.environ["STUB_AGENT_MODE"] = "noop"
+        passed = {"ok": True, "build": {"rc": 0}, "checks": {"status": "passed"}, "diagnostics": []}
+        with patch.object(repair_audit, "verify", return_value=passed) as verify:
+            resumed = repair_task.claim_and_run(cfg, client)
+        self.assertEqual((resumed["status"], resumed["tip"]), ("adopted", tip), resumed)
+        verify.assert_called_once()
+        prompt = self.agent_calls()[-1]["prompt"]
+        self.assertIn(tip[:12], prompt)
+        self.assertIn("unused argument", prompt)
+
     def test_submission_preflight_failure_defers_before_inference(self):
         cfg = self.config()
         with patch.object(repair_task, "check_submission_access", return_value={"rc": 1}):
@@ -4738,6 +4906,20 @@ class WorkerAudits(Fixture):
         self.assertEqual({d["kind"] for d in record["diagnostics"]}, {"audit", "lint"})
         self.assertTrue(all(record[name]["finished_at"] for name in ("audit", "lint")))
 
+    @unittest.skipUnless(Path("/proc/self/task").is_dir(), "requires Linux process accounting")
+    def test_rss_counts_a_child_spawned_by_another_thread(self):
+        child = 'import time; data=bytearray(48*1024**2); print("ready", flush=True); time.sleep(4)'
+        script = 'import sys,subprocess,threading; t=threading.Thread(target=lambda:subprocess.run([sys.executable,"-c",sys.argv[1]]));t.start();t.join()'
+        with subprocess.Popen(
+            [sys.executable, "-c", script, child], stdout=subprocess.PIPE, text=True, start_new_session=True
+        ) as process:
+            try:
+                self.assertEqual(process.stdout.readline().strip(), "ready")
+                self.assertGreaterEqual(repair_audit.process_tree_rss(process.pid), 48 * 1024**2)
+            finally:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+
     def test_overlap_requires_matching_measurements_and_memory_headroom(self):
         logdir = self.root / "timing"
         logdir.mkdir()
@@ -4751,6 +4933,11 @@ class WorkerAudits(Fixture):
             patch.object(repair_audit, "available_memory", return_value=80 * 1024**3),
         ):
             self.assertFalse(repair_audit.can_overlap(logdir, "key"))
+            (logdir / "checks-timing.json").write_text(json.dumps(timing))
+            self.assertFalse(
+                repair_audit.can_overlap(logdir, "key"), "old undercounted samples cannot authorize overlap"
+            )
+            timing["rss_sampling"] = repair_audit.RSS_SAMPLING
             (logdir / "checks-timing.json").write_text(json.dumps(timing))
             self.assertTrue(repair_audit.can_overlap(logdir, "key"))
             self.assertFalse(repair_audit.can_overlap(logdir, "other-key"))
@@ -4929,6 +5116,95 @@ class WorkerAudits(Fixture):
         self.assertEqual(len((self.stub_dir / "audit-runs.log").read_text().splitlines()), runs)
 
 
+class HeadHandoff(Fixture):
+    BASE_FILES = WorkerAudits.BASE_FILES
+
+    def setUp(self):
+        super().setUp()
+        os.environ[repair_audit.URL_VARIABLE] = str(TOOLS_REPOSITORY)
+        self.addCleanup(os.environ.pop, repair_audit.URL_VARIABLE, None)
+
+    def test_running_background_audit_yields_on_renewal_and_submits_its_compiled_chain(self):
+        self.run_check_handoff("audit-driver")
+
+    def test_running_background_lint_yields_on_renewal_and_submits_its_compiled_chain(self):
+        self.run_check_handoff("lint-env.sh")
+
+    def test_head_handoff_survives_helper_settings_write_failure(self):
+        with patch.object(repair_audit, "update_checks_owner", return_value=None):
+            self.run_check_handoff("lint-env.sh")
+
+    def test_parallel_helper_observes_its_parent_check_priority(self):
+        parent = repair_audit.write_settings(self.content.clone, base=self.content.base, tools_root=self.root / "tools")
+        group = self.root / "group"
+        repair_audit.write_settings(group, base=self.content.base, tools_root=self.root / "tools", policy_file=parent)
+        self.assertFalse(repair_audit.checks_deferred(group))
+        repair_audit.update_checks_owner(parent, "staging")
+        self.assertTrue(repair_audit.checks_deferred(group))
+        with patch.object(repair_audit, "check", side_effect=AssertionError("full helper checks during head handoff")):
+            self.assertEqual(repair_audit.helper_checks(group), 0)
+
+    def test_waiting_pre_rebase_runs_full_checks(self):
+        self.service.tasks[1].update(kind="pre_rebase")
+        self.service.tasks[1]["extra"]["checks_owner"] = "worker"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        checks = outcome["verification"][-1]["checks"]
+        self.assertEqual(checks["status"], "passed")
+        self.assertEqual(checks["lint"]["scope"], "full")
+        notes = json.loads(self.service.results[0]["worker_notes"])
+        self.assertEqual(notes["pre_rebase_verification"]["scope"], "full")
+
+    def run_check_handoff(self, check):
+        self.service.tasks[1].update(kind="pre_rebase")
+        self.service.tasks[1]["extra"]["checks_owner"] = "worker"
+        self.service.renew_after = 0.05
+        cfg = self.config()
+        client = self.client(cfg)
+        renew = self.service.renew_task
+        sandboxed = repair_audit._sandboxed
+        marker = self.stub_dir / "audit-processes.json"
+
+        def policy(task_id, token):
+            expires = renew(task_id, token)
+            return {"expires_at": expires, "checks_owner": "staging" if marker.exists() else "worker"}
+
+        def slow_audit(argv, *args, **kwargs):
+            if str(argv[-1]).endswith("/" + check):
+                program = (
+                    "import json,os,subprocess,sys,time; from pathlib import Path; "
+                    "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+                    "(Path(os.environ['STUB_DIR'])/'audit-processes.json').write_text(json.dumps([os.getpid(),child.pid])); "
+                    "time.sleep(60)"
+                )
+                argv = [sys.executable, "-c", program]
+            return sandboxed(argv, *args, **kwargs)
+
+        started = time.monotonic()
+        with (
+            patch.object(self.service, "renew_task", side_effect=policy),
+            patch.object(repair_audit, "_sandboxed", side_effect=slow_audit),
+        ):
+            outcome = repair_task.claim_and_run(cfg, client)
+        self.assertLess(time.monotonic() - started, 10, outcome)
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        checks = outcome["verification"][-1]["checks"]
+        self.assertEqual(checks["status"], "deferred")
+        self.assertEqual(checks["audit"]["deferred"], check == "audit-driver")
+        self.assertTrue(checks["lint"]["deferred"])
+        if check == "audit-driver":
+            self.assertEqual(checks["lint"]["seconds"], 0.0, "lint never starts after head readiness")
+        notes = json.loads(self.service.results[0]["worker_notes"])
+        self.assertEqual(notes["pre_rebase_verification"]["scope"], "build")
+        for pid in json.loads(marker.read_text()):
+            path = Path(f"/proc/{pid}/stat")
+            self.assertTrue(
+                not path.exists() or path.read_text().split(") ", 1)[1].startswith("Z"), f"check child {pid} survived"
+            )
+        self.assertFalse((cfg.root / "worktrees/task-1").exists())
+
+
 class TargetedRepairChecks(Fixture):
     BASE_FILES = WorkerAudits.BASE_FILES
 
@@ -4966,8 +5242,16 @@ class TargetedRepairChecks(Fixture):
         return subprocess.run([str(script)], cwd=self.worktree, env=env, capture_output=True, text=True)
 
     def test_targeted_helper_builds_finding_and_repair_delta_then_only_reported_linter(self):
+        repair_audit.write_settings(
+            self.worktree,
+            base=self.content.base,
+            tools_root=self.root / "tools",
+            logdir=self.telemetry,
+            checks_owner="staging",
+        )
         result = self.command()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("full checks run in staging", result.stdout)
         self.assertIn("build --iofail TauCeti.One TauCeti.Two", self.lake_calls())
         calls = [json.loads(line) for line in (self.stub_dir / "targeted-lint-runs.jsonl").read_text().splitlines()]
         self.assertEqual(calls, [{"modules": ["TauCeti.One", "TauCeti.Two"], "linters": ["simpNF"]}])

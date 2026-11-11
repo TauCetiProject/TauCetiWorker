@@ -601,6 +601,10 @@ def test_prepare_checkout(root):
         ok = agents.prepare_checkout(cfg, work="fix", pr=7)
         check("prepare_checkout: dirty checkout saved and reset", ok and not (co / "Draft.lean").exists())
         check("prepare_checkout lands on main", git(co, "symbolic-ref", "--short", "HEAD").strip() == "main")
+        check(
+            "verification uses the validated source's main commit",
+            os.environ.get("TAUCETI_VERIFY_BASE") == git(co, "rev-parse", "refs/remotes/origin/main").strip(),
+        )
         records = [p for p in (cfg.state / "recovery").iterdir() if p.is_dir()]
         check(
             "prepare_checkout saved the draft",
@@ -650,6 +654,10 @@ def test_prepare_checkout_restores_canonical_origin(root):
         check("origin is canonical again", git(co, "config", "--get", "remote.origin.url").strip() == str(origin))
         check("the fork is kept", git(co, "config", "--get", "remote.previous-origin.url").strip() == str(fork))
         check("main is canonical main, not the fork's", (co / "C.lean").exists())
+        check(
+            "verification base follows restored canonical main, not the fork",
+            os.environ.get("TAUCETI_VERIFY_BASE") == git(co, "rev-parse", "refs/remotes/origin/main").strip(),
+        )
         check(
             "a canonical origin is left alone",
             agents.repair_origin(co) and not agents._remote_url(co, "previous-origin-2"),

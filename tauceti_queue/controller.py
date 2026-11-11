@@ -36,6 +36,7 @@ from . import admission_planning, chain, declaration_names
 from .eligibility import KEEP as BLOCKING_LABELS
 from .ports import (
     AGENT_INSTRUCTION,
+    REPAIR_CHECKPOINT,
     Adoption,
     CandidateRun,
     DispatchNotAccepted,
@@ -86,7 +87,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # An in-progress run counts as lost only when neither its jobs nor GitHub's direct read of the run
     # (`updated_at`) have moved for this long; until then a long build is a `stall` reason line.
     "lost_run_seconds": 14400,
-    "infrastructure_retry_limit": 3,
     "infrastructure_retry_backoff_seconds": 60,
     "inference_failure_threshold": 3,
     "inference_hold_backoff_seconds": 60,
@@ -176,7 +176,7 @@ BACKGROUND_OPERATIONS = tuple(f"task:{kind}" for kind in BACKGROUND_TASKS)
 # How often a worker holding a `prepare` claim renews it (`Task.extra.renew_after`): a refused renewal
 # is how the worker learns that the controller took the batch back (it sealed, or the head needs the
 # worker), so the interval bounds how long a superseded preparation keeps running.
-PREPARE_RENEW_SECONDS = 60
+HANDOFF_RENEW_SECONDS = 15
 # Resolutions of a `prepare` task that settle its batch version: no second task is created for it.
 PREPARE_SETTLED = ("adopted", "prepared", "failed")
 # Worker release reasons: `prepared_clean` (the batch built without errors, nothing to repair) and the
@@ -1543,6 +1543,45 @@ class Controller:
                     del self._renewal_waiters[claim_token]
                     self._renewing.pop(claim_token, None)
 
+    def _task_checks_owner(self, task: dict[str, Any]) -> str:
+        if task["kind"] not in BACKGROUND_TASKS:
+            return "staging"
+        head = self._head()
+        if head is not None:
+            if head["id"] == task["batch_id"]:
+                return "staging"
+            if task["kind"] == TASK_PREPARE and not self._pre_rebased_prepare(task):
+                first = self._open_batch()
+                if (
+                    first is not None
+                    and first["id"] == task["batch_id"]
+                    and not self._state("inference_hold")
+                    and self._pre_rebase_blocked(head) is None
+                ):
+                    # Finish useful source work, then release the old-base owner so
+                    # the successor can rebase. Its rebased worker may run full checks.
+                    return "staging"
+            return "worker"
+        first = self._open_batch()
+        ready = (
+            first is not None
+            and first["id"] == task["batch_id"]
+            and not self._state("inference_hold")
+            and not self._external_head_blocks_sealing()
+        )
+        return "staging" if ready else "worker"
+
+    def task_check_policy(self, task_id: int) -> dict:
+        """Refresh optional check priority over the existing authenticated claim renewal."""
+        with self._lock.priority():
+            task = self.store.row("tasks", {"id": task_id})
+            if task is None:
+                return {}
+            policy = {"checks_owner": self._task_checks_owner(task)}
+            if task["kind"] in BACKGROUND_TASKS:
+                policy["renew_after"] = HANDOFF_RENEW_SECONDS
+            return policy
+
     def release_task(self, task_id: int, claim_token: str, reason: str, error: str = "", *, source_access=None) -> None:
         """A worker gives a task back. Reason `inference_unavailable` counts toward the inference hold.
 
@@ -1616,6 +1655,7 @@ class Controller:
         tip_sha: str,
         worker_notes: str = "",
         *,
+        checkpoint: bool = False,
         source_access=None,
         source_refresh=None,
     ) -> Adoption:
@@ -1623,6 +1663,8 @@ class Controller:
 
         A late result (expired claim, superseded task or batch version) is rejected but its commits
         stay retained under a submissions ref. See `Adoption` for the reason codes.
+        A repair checkpoint takes the same validation path, retains the chain for the next claim
+        and releases the current claim without adopting the chain.
         """
         with self._lock.priority():
             now = self.clock()
@@ -1645,6 +1687,15 @@ class Controller:
                 return Adoption(
                     True, "already-adopted", task_id, task["batch_id"], None, tip_sha, receipt["retained_ref"], []
                 )
+            if checkpoint:
+                saved = self.store.row(
+                    "submissions",
+                    {"task_id": task_id, "claim_id": claim["id"], "tip": tip_sha, "reason": REPAIR_CHECKPOINT},
+                )
+                if saved is not None:
+                    return Adoption(
+                        False, REPAIR_CHECKPOINT, task_id, task["batch_id"], None, tip_sha, saved["retained_ref"], []
+                    )
             self._task_binding(task, allow_stale_policy=True)
             batch = self.store.row("batches", {"id": task["batch_id"]})
             assert batch is not None
@@ -1665,7 +1716,8 @@ class Controller:
                     created_at=now,
                 )
                 self.store.update("tasks", {"id": task_id}, submissions=task["submissions"] + 1)
-                self.store.journal(now, "submission-rejected", batch["id"], task_id=task_id, reason=reason, tip=tip_sha)
+                kind = "repair-checkpoint-retained" if reason == REPAIR_CHECKPOINT else "submission-rejected"
+                self.store.journal(now, kind, batch["id"], task_id=task_id, reason=reason, tip=tip_sha)
                 return Adoption(
                     False,
                     reason,
@@ -1795,6 +1847,30 @@ class Controller:
                 knowledge = next(
                     (d for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions"), {}
                 )
+            if checkpoint:
+                try:
+                    notes = loads(worker_notes, {})
+                except ValueError:
+                    notes = {}
+                findings = notes.get("repair_checkpoint") if isinstance(notes, dict) else None
+                if not (
+                    self._can_checkpoint_repair(task)
+                    and isinstance(findings, list)
+                    and 0 < len(findings) <= 20
+                    and all(
+                        isinstance(finding, dict)
+                        and finding.get("kind") in ("audit", "lint")
+                        and isinstance(finding.get("message"), str)
+                        and len(finding["message"]) <= 2000
+                        for finding in findings
+                    )
+                ):
+                    return reject("invalid-repair-checkpoint")
+                with self.store.transaction():
+                    result = reject(REPAIR_CHECKPOINT)
+                    self._release_claim(claim, REPAIR_CHECKPOINT, now)
+                self._wake.set()
+                return result
             if tip_sha == task["tip"] and knowledge.get("was_proactive"):
                 self._release_claim(claim, "source-failure-refresh", now)
                 return reject(
@@ -2019,9 +2095,17 @@ class Controller:
             m["source_pr"]: "edited" if m["source_pr"] in edits else m["provenance"] for m in self._task_members(task)
         }
         ref = self.pre_rebase_ref(batch["id"], task["onto"])
+        prepared = self._verified_pre_rebase(task, tip_sha, worker_notes)
         with self.store.transaction():
             self._set_pre_rebase(
-                batch, PRE_REBASE_ADOPTED, now, tip=tip_sha, onto=task["onto"], source=task["tip"], edits=edits
+                batch,
+                PRE_REBASE_ADOPTED,
+                now,
+                tip=tip_sha,
+                onto=task["onto"],
+                source=task["tip"],
+                edits=edits,
+                prepared=prepared,
             )
             self.store.update(
                 "tasks",
@@ -2055,10 +2139,26 @@ class Controller:
                 onto=task["onto"],
                 tip=tip_sha,
                 provenance=provenance,
+                prepared=prepared,
             )
         self.report_inference(claim["worker"], True)
         self._wake.set()
         return Adoption(True, "adopted", task["id"], batch["id"], batch["version"], tip_sha, ref, provenance=provenance)
+
+    def _verified_pre_rebase(self, task: dict[str, Any], tip: str, worker_notes: str) -> bool:
+        from . import repair_audit
+
+        try:
+            notes = loads(worker_notes, {})
+            evidence = notes.get("pre_rebase_verification") if isinstance(notes, dict) else None
+            if not isinstance(evidence, dict) or evidence.get("tip") != tip or evidence.get("base") != task["onto"]:
+                return False
+            # The commit binds the toolchain, manifest and full-library inputs.
+            # Compare the actual tools the worker ran to the pin in that commit.
+            repo, ref = repair_audit.parse_tools_pin(chain.git(self.clone, "show", f"{tip}:tauceti.toml"))
+        except (ValueError, chain.ChainError, repair_audit.Unavailable):
+            return False
+        return evidence.get("tools") == f"{repo}@{ref}"
 
     def _claim_for(self, task_id: int, token: str, now: float, *, allow_stale_policy=False) -> dict[str, Any]:
         claim = self.store.row("claims", {"task_id": task_id, "token": token})
@@ -2188,9 +2288,27 @@ class Controller:
                 )
             )
         refs = [self.batch_ref(batch["id"], task["batch_version"])] + [m.retained_ref for m in members]
-        extra: dict[str, Any] = {"canonical_branch": self.canonical_branch, "claim_id": claim_id}
-        if task["kind"] == TASK_PREPARE:
-            extra["renew_after"] = PREPARE_RENEW_SECONDS
+        extra: dict[str, Any] = {
+            "canonical_branch": self.canonical_branch,
+            "claim_id": claim_id,
+            "checks_owner": self._task_checks_owner(task),
+        }
+        warm_revs = self._warm_revs(task, batch)
+        if self._can_checkpoint_repair(task):
+            extra["can_checkpoint_repair"] = True
+            checkpoint = self.store.row(
+                "submissions", {"task_id": task["id"], "reason": REPAIR_CHECKPOINT}, order="id DESC"
+            )
+            if checkpoint is not None:
+                tip = checkpoint["tip"]
+                extra["repair_checkpoint"] = {
+                    "tip": tip,
+                    "diagnostics": loads(checkpoint["worker_notes"])["repair_checkpoint"],
+                }
+                refs.append(checkpoint["retained_ref"])
+                warm_revs = list(dict.fromkeys([tip, *warm_revs]))
+        if task["kind"] in BACKGROUND_TASKS:
+            extra["renew_after"] = HANDOFF_RENEW_SECONDS
         if self._pre_rebased_prepare(task):
             # The pre-rebased chain exists only in the controller's clone until `_prepare_pre_rebased`
             # retains it on GitHub; the worker builds on the head's tip and falls back to the public
@@ -2233,9 +2351,12 @@ class Controller:
             instruction=AGENT_INSTRUCTION,
             created_at=task["created_at"],
             extra=extra,
-            warm_revs=self._warm_revs(task, batch),
+            warm_revs=warm_revs,
             binding=self._task_binding(task),
         )
+
+    def _can_checkpoint_repair(self, task: dict[str, Any]) -> bool:
+        return self.candidate_ci is None and task["kind"] in (TASK_REPAIR, TASK_REBASE_CONFLICT, TASK_PRE_REBASE)
 
     def _create_task(
         self,
@@ -4398,15 +4519,6 @@ class Controller:
         else:
             self._observe_attempt(head, attempt, now)
 
-    def _recover_exhausted(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> bool:
-        """Keep looking for a late live run after exhaustion, at the normal poll rate."""
-        if now - (attempt["last_observed_at"] or attempt["dispatched_at"]) < int(
-            self.setting("polling_interval_seconds")
-        ):
-            return False
-        self.store.update("ci_attempts", {"id": attempt["id"]}, last_observed_at=now)
-        return self._readopt_live_run(head, now)
-
     def _ci(self, head: dict[str, Any], now: float) -> None:
         attempt = self._current_attempt(head)
         if attempt is None or attempt["outcome"] == OUTCOME_SUPERSEDED:
@@ -4424,27 +4536,9 @@ class Controller:
             )
             retries = sum(a["dispatch_state"] != "rejected" for a in failures)
             rejected = attempt["dispatch_state"] == "rejected"
-            permanent_rejections = sum(
-                a["dispatch_state"] == "rejected" and not a["dispatch_retryable"] for a in failures
-            )
-            limit = int(self.setting("infrastructure_retry_limit"))
-            if rejected and not attempt["dispatch_retryable"] and permanent_rejections > limit:
-                if self._recover_exhausted(head, attempt, now):
-                    return
-                self._reasons.append(
-                    f"head {head['id']}: permanent dispatch rejections exhausted retries; repair configuration and use retry_ci"
-                )
-                return
-            if not rejected and retries > limit:
-                if self._recover_exhausted(head, attempt, now):
-                    return
-                self._reasons.append(
-                    f"head {head['id']}: {retries} infrastructure failures ({attempt['outcome_detail']}); retries exhausted, use retry_ci"
-                )
-                return
             # Proven non-sends need no CI-run retry budget. Keep retrying with bounded
             # backoff, respecting a backend's persisted rate-limit deadline.
-            exponent = min(3, len(failures) - retries - 1) if rejected else retries - 1
+            exponent = min(3, max(0, len(failures) - retries - 1 if rejected else retries - 1))
             backoff = int(self.setting("infrastructure_retry_backoff_seconds")) * (2 ** max(0, exponent))
             due = (attempt["last_observed_at"] or attempt["dispatched_at"]) + backoff
             due = max(due, attempt.get("dispatch_retry_at") or 0)
@@ -5167,6 +5261,30 @@ class Controller:
         if current["outcome"] == OUTCOME_PENDING and self.setting("publication_enabled"):
             self._cancel_superseded_runs(head["id"], now, reason=f"superseded by attempt {attempt_id}", by=attempt_id)
 
+    def _retry_status_delivery(self, attempt: dict[str, Any], run: CandidateRun, now: float) -> None:
+        """Reuse the durable outbox and existing intent-only workflow, without a retry limit."""
+        if self.candidate_ci is not None:
+            return  # native execution receipts use their existing result protocol
+        run_attempt = run.attempt or 1
+        key = f"status-delivery:{attempt['id']}:{run.run_id}:{run_attempt}"
+        existing = self.store.row("outbox", {"key": key})
+        if existing is None:
+            self._enqueue(
+                "retry_status_delivery",
+                key,
+                {
+                    "attempt_id": attempt["id"],
+                    "run_id": run.run_id,
+                    "run_attempt": run_attempt,
+                    "base_ref": attempt["base_ref"],
+                },
+            )
+        elif existing["state"] == "done" and now - (existing["done_at"] or 0) >= LOG_GRACE_SECONDS:
+            # A successful dispatch is not successful delivery. If its job died,
+            # timed out or lost the reply, retry the same retained original-run
+            # intents. Workflow concurrency coalesces these reporting jobs only.
+            self.store.update("outbox", {"id": existing["id"]}, state="pending", next_attempt_at=now)
+
     def _check_lost_run(
         self, head: dict[str, Any], attempt: dict[str, Any], run: CandidateRun, values: dict[str, Any], now: float
     ) -> None:
@@ -5378,23 +5496,14 @@ class Controller:
         if status.state == "success":
             unbound = [context for context in VERDICT_CONTEXTS if not bound[context]]
             if unbound:
-                # The finalizer posts all three statuses in the one step that posts `build`; a bound
-                # `build` with the others absent is that step still in flight (or a post that failed).
-                # Look again for a little while, then treat it as the missing `build` case above.
-                if now - values["run_completed_at"] < LOG_GRACE_SECONDS:
-                    self._reasons.append(
-                        f"head {head['id']}: run {run.run_id} posted build, waiting for {', '.join(unbound)}"
-                    )
-                    self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
-                    return
-                values.update(
-                    outcome=OUTCOME_INFRASTRUCTURE,
-                    outcome_detail=f"missing-status: the completed run posted no bound {', '.join(unbound)} status",
-                )
-                self.store.journal(
-                    now, "ci-infrastructure", head["id"], attempt_id=attempt["id"], detail=values["outcome_detail"]
+                # Compilation and exact cache publication already succeeded.
+                # Preserve this attempt forever while required status delivery
+                # recovers; a transport failure must not schedule another build.
+                self._reasons.append(
+                    f"head {head['id']}: verified run {run.run_id} awaits delivery of {', '.join(unbound)}"
                 )
                 self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
+                self._retry_status_delivery(attempt, run, now)
                 return
             failed = [context for context in VERDICT_CONTEXTS if statuses[context].state != "success"]
             if failed:
@@ -6465,7 +6574,7 @@ class Controller:
     def _outbox_failed(self, entry: dict[str, Any], history: list[Any], error: Exception, now: float) -> None:
         attempts = entry["attempts"] + 1
         backoff = min(
-            int(self.setting("outbox_retry_seconds")) * (2 ** (attempts - 1)),
+            int(self.setting("outbox_retry_seconds")) * (2 ** min(20, attempts - 1)),
             int(self.setting("outbox_retry_max_seconds")),
         )
         history.append({"at": now, "error": str(error)[:500]})
@@ -6574,6 +6683,23 @@ class Controller:
             return "closed"
         if kind == "promote":
             return self._perform_promotion(payload, now)
+        if kind == "retry_status_delivery":
+            attempt = self.store.row("ci_attempts", {"id": payload["attempt_id"]})
+            head = self._head()
+            if (
+                attempt is None
+                or head is None
+                or attempt["batch_id"] != head["id"]
+                or attempt["batch_version"] != head["version"]
+                or attempt["outcome"] != OUTCOME_PENDING
+                or attempt["run_id"] != payload["run_id"]
+                or (attempt["run_attempt"] or 1) != payload["run_attempt"]
+            ):
+                return "superseded status delivery"
+            self.execution.retry_status_delivery(
+                repo, payload["run_id"], payload["run_attempt"], base_ref=payload["base_ref"]
+            )
+            return "status recovery requested"
         if kind == "cancel_run":
             # The one retry of a cancel that failed inline: a second failure is recorded, not retried.
             try:
@@ -7075,7 +7201,12 @@ class Controller:
                     alerts.append(f"head {head['id']}: {attempt['outcome_detail']} (request {attempt['request_id']})")
             if attempt["dispatch_state"] == "rejected" and not attempt["dispatch_retryable"]:
                 alerts.append(
-                    f"head {head['id']} dispatch rejected; check CI permissions and configuration, then use retry_ci after repair if retries are exhausted"
+                    f"head {head['id']} dispatch rejected; automatic retries continue; check CI permissions and configuration"
+                )
+            if attempt["outcome"] == OUTCOME_INFRASTRUCTURE and attempt["infrastructure_retry"] >= 3:
+                alerts.append(
+                    f"head {head['id']} CI repeatedly failed on infrastructure: {attempt['outcome_detail']}; "
+                    "automatic retries continue"
                 )
             if attempt["outcome"] == OUTCOME_PENDING and attempt["dispatch_state"] in {"sending", "uncertain"}:
                 alerts.append(
@@ -7102,9 +7233,17 @@ class Controller:
                         "phase": (ci["phases"][-1]["name"] if ci["phases"] else None),
                     }
                     if silence >= 2 * interval:
-                        alerts.append(
-                            f"head {head['id']} build stalled for {silence:.0f}s on {attempt['runner_name'] or 'unknown runner'} ({attempt['host'] or 'unknown host'})"
-                        )
+                        if attempt["run_status"] == "completed" and (
+                            ci["verdicts"].get(BUILD_CONTEXT, {}).get("state") == "success"
+                        ):
+                            alerts.append(
+                                f"head {head['id']} verified run {attempt['run_id']} still awaits required status delivery; "
+                                "automatic reporting retries continue"
+                            )
+                        else:
+                            alerts.append(
+                                f"head {head['id']} build stalled for {silence:.0f}s on {attempt['runner_name'] or 'unknown runner'} ({attempt['host'] or 'unknown host'})"
+                            )
         if task is not None and not info["task"]["active_claims"]:
             unclaimed_at = task["created_at"]
             for claim in self.store.rows("claims", {"task_id": task["id"]}):
