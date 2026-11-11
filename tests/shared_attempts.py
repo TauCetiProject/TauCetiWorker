@@ -224,6 +224,15 @@ class SharedAttemptsTests(unittest.TestCase):
         survey_mod.restore_counters(counters, saved)
         self.assertEqual(counters.read(FIX), 0)
 
+    def test_the_helpers_need_only_read_and_write(self):
+        values = {}
+        counters = SimpleNamespace(read=lambda key: values.get(key, 0), write=values.__setitem__)
+        saved = survey_mod.checkpoint_counters(counters, (FIX,))
+        self.assertTrue(survey_mod.charge_attempts(counters, {FIX: 1, "ci-pr-7": None}))
+        self.assertEqual(values, {FIX: 1, "ci-pr-7": 1})
+        survey_mod.restore_counters(counters, saved)
+        self.assertEqual(values[FIX], 0)
+
     def test_a_candidate_surveyed_before_a_peer_spent_the_budget_is_declined(self):
         first, second = self.counters("first"), self.counters("second")
         ci = ("ci-7-" + HEAD[:12], "ci-pr-7")
