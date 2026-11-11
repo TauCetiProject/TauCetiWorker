@@ -16,7 +16,8 @@ A worker that discovers only Forgejo still reads the GitHub content
 repository's pull requests that carry a target marker, so a list carried over
 from GitHub keeps its GitHub items in flight or done: one search of the 200 most
 recently updated such pull requests per round, shared between workers of one
-account on a host for two minutes. If GitHub cannot be read the round goes on
+account on a host for two minutes, and, once that history is longer than 200,
+one more search for each candidate the listing does not show as landed. If GitHub cannot be read the round goes on
 with the list's own marks for those items and logs why. Once the file marks
 every GitHub-era item, set `TAUCETI_ROADMAP_TARGETS_GITHUB=0` (in the worker's
 environment, or its `env` in `workers.toml`) to stop that read.
@@ -56,9 +57,8 @@ first `## ` heading is shown to the agent with the items of its area.
   or `none`. `partial: #N, #M` names merged pull requests that did not complete
   the item. `in flight: #N` on a `[~]` item names the pull request it waits on,
   which is how [curation](#curation) follows it. A GitHub pull request is named
-  `#N` in these clauses and a Forgejo one by its URL, which curation matches in
-  any case. Every other clause is
-  passed to the agent as written.
+  `#N` in these clauses and a Forgejo one by its URL, in any case. Every other
+  clause is passed to the agent as written.
 - An item line that does not parse is logged and skipped. A `needs:` slug the
   file never defines is logged and blocks nothing.
 
@@ -80,7 +80,9 @@ The marks in the file go stale between edits, so each round overlays them:
 The overlay only moves an item forward: `[x]` in the file stays done and `[~]`
 stays in flight until the file changes. The merged side reads, on each forge,
 the 200 most recent merged pull requests that carry a target marker (on GitHub
-the most recently updated, on Forgejo the most recently created). An older
+the most recently updated, on Forgejo the most recently created among the closed
+pull requests its client's page bound reaches). A marker counts whatever the
+spacing of its JSON. An older
 landing is still found before its item is assigned again (see below), but it
 no longer unlocks the items that need it, so tick an item `[x]` in the file to
 make its landing permanent.
