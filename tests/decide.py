@@ -540,6 +540,9 @@ def test_rounds(tmp):
     )
 
 
+TOKEN, BASE_TOKEN = "decide-test-token-7f3a", "decide-test-base-token-91c2"
+
+
 def test_model_call(tmp):
     captured = {}
 
@@ -555,9 +558,9 @@ def test_model_call(tmp):
         patch.dict(
             os.environ,
             {
-                "GH_TOKEN": "secret",
-                "GITHUB_TOKEN": "secret",
-                "_TAUCETI_GITHUB_BASE_ENV": json.dumps({"GH_TOKEN": "secret-before-selection"}),
+                "GH_TOKEN": TOKEN,
+                "GITHUB_TOKEN": TOKEN,
+                "_TAUCETI_GITHUB_BASE_ENV": json.dumps({"GH_TOKEN": BASE_TOKEN, "GITHUB_TOKEN": BASE_TOKEN}),
             },
         ),
         patch.object(agents, "run_agent_proc", side_effect=proc),
@@ -578,8 +581,8 @@ def test_model_call(tmp):
     check("the process is given no GitHub token", {"GH_TOKEN", "GITHUB_TOKEN"} & set(captured["env"]), set())
     check(
         "…nor one the account selection kept to restore",
-        "secret" in json.dumps(github.unselected_github_env(captured["env"])),
-        False,
+        {TOKEN, BASE_TOKEN} & set(github.unselected_github_env(captured["env"]).values()),
+        set(),
     )
     check("older run directories are pruned", len(list((tmp / "state" / "decide").iterdir())), decide.KEPT_RUNS)
 
