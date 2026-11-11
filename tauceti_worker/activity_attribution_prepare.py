@@ -51,34 +51,46 @@ def install(db):
                 if fields and action == "UPDATE"
                 else ""
             )
+            if table == "review_archive_checks" and action == "INSERT":
+                changed = " WHEN NEW.complete=1"
             db.execute(f"""CREATE TRIGGER IF NOT EXISTS attribution_{table}_{action}
                 AFTER {action} ON {table}{changed} BEGIN
                 INSERT OR IGNORE INTO attribution_dirty VALUES ('{source}',{expression}); END""")
     if db.execute("INSERT OR IGNORE INTO meta VALUES ('attribution-seed-v1','1')").rowcount:
-        db.execute("INSERT OR IGNORE INTO attribution_dirty SELECT 'cost',json_array(id) FROM cost_sessions")
-        db.execute("INSERT OR IGNORE INTO attribution_dirty SELECT 'receipt',json_array(repo,number) FROM prs")
+        db.execute("INSERT OR IGNORE INTO attribution_dirty SELECT 'legacy_cost',json_array(id) FROM cost_sessions")
+        db.execute("INSERT OR IGNORE INTO attribution_dirty SELECT 'legacy_receipt',json_array(repo,number) FROM prs")
         db.execute(
-            "INSERT OR IGNORE INTO attribution_dirty SELECT 'receipt',json_array(repo,number) FROM pr_contributions"
+            "INSERT OR IGNORE INTO attribution_dirty SELECT 'legacy_receipt',json_array(repo,number) FROM pr_contributions"
         )
         db.execute("INSERT OR IGNORE INTO review_archive_checks SELECT repo,number,0,0,NULL FROM prs")
         db.execute("INSERT OR IGNORE INTO review_archive_checks SELECT repo,number,0,0,NULL FROM pr_contributions")
 
 
-def round_sessions(db, rid, now):
+def round_sessions(db, rid, now, source="cost"):
     for row in db.execute("SELECT id FROM invocation_work WHERE round_id=?", (rid,)):
-        queue(db, "cost", row)
+        if (
+            source == "legacy_cost"
+            and db.execute("SELECT 1 FROM invocation_work WHERE id=? AND repo IS NOT NULL", tuple(row)).fetchone()
+        ):
+            continue
+        queue(db, source, row)
     round = db.execute("SELECT worker,started,finished FROM rounds WHERE id=?", (rid,)).fetchone()
     if round and round[1] is not None:
         for row in db.execute(
             "SELECT id FROM cost_sessions WHERE worker=? AND started BETWEEN ? AND ?",
             (round[0], round[1], round[2] if round[2] is not None else now),
         ):
-            queue(db, "cost", row)
+            if (
+                source == "legacy_cost"
+                and db.execute("SELECT 1 FROM invocation_work WHERE id=? AND repo IS NOT NULL", tuple(row)).fetchone()
+            ):
+                continue
+            queue(db, source, row)
 
 
-def receipt(db, key, now):
+def receipt(db, key, now, legacy=False):
     repo, number = key
-    queue(db, "pr", key)
+    queue(db, "legacy_pr" if legacy else "pr", key)
     db.execute("INSERT OR IGNORE INTO review_archive_checks VALUES (?,?,0,0,NULL)", key)
     targets = a.CostTargets(db)
     for worker, at in db.execute(
@@ -88,13 +100,14 @@ def receipt(db, key, now):
     ):
         if at is not None and (rid := targets.containing(worker, at)):
             db.execute("INSERT OR IGNORE INTO round_prs VALUES (?,?,?)", (rid, repo, number))
-            round_sessions(db, rid, now)
+            round_sessions(db, rid, now, "legacy_cost" if legacy else "cost")
 
 
-def invocation(db, identity):
+def invocation(db, identity, legacy=False):
+    source = "legacy_pr" if legacy else "pr"
     previous = db.execute("SELECT repo,number FROM invocation_work WHERE id=?", (identity,)).fetchone()
     if previous and previous[0]:
-        queue(db, "pr", previous)
+        queue(db, source, previous)
     raw = db.execute("SELECT data FROM cost_sessions WHERE id=?", (identity,)).fetchone()
     if raw:
         session = json.loads(raw[0])
@@ -104,11 +117,15 @@ def invocation(db, identity):
         if old is None or tuple(old) != row:
             db.execute("INSERT OR REPLACE INTO invocation_work VALUES (?,?,?,?,?)", row)
         if row[3]:
-            queue(db, "pr", row[3:])
+            queue(db, source, row[3:])
             if row[1] == "review":
                 db.execute("UPDATE review_archive_checks SET checked=0 WHERE repo=? AND number=?", row[3:])
     else:
         db.execute("DELETE FROM invocation_work WHERE id=?", (identity,))
+    db.execute(
+        "DELETE FROM attribution_dirty WHERE source='legacy_cost' AND key=?",
+        (json.dumps([identity], separators=(",", ":")),),
+    )
 
 
 def fact(db, key, now):
@@ -267,12 +284,16 @@ def reports(db, now):
 def prepare(db, now):
     deadline = time.monotonic() + SECONDS
     changed = False
-    for source in ("round", "receipt", "cost", "pr"):
+    for source in ("round", "receipt", "cost", "pr", "legacy_cost", "legacy_pr", "legacy_receipt"):
         if source == "pr":
             started = time.monotonic()
-            a.prepare_reviews(db, now)
+            priority = [
+                json.loads(r[0])
+                for r in db.execute("SELECT key FROM attribution_dirty WHERE source='pr' LIMIT ?", (a.MAX_PRS,))
+            ]
+            a.prepare_reviews(db, now, priority)
             deadline += time.monotonic() - started
-        maximum = MAX_SESSIONS if source == "cost" else MAX_FACTS
+        maximum = MAX_SESSIONS if source in {"cost", "legacy_cost"} else MAX_FACTS
         keys = [r[0] for r in db.execute("SELECT key FROM attribution_dirty WHERE source=? LIMIT ?", (source, maximum))]
         for encoded in keys:
             if time.monotonic() >= deadline:
@@ -285,6 +306,10 @@ def prepare(db, now):
                 receipt(db, key, now)
             elif source == "cost":
                 invocation(db, key[0])
+            elif source == "legacy_cost":
+                invocation(db, key[0], legacy=True)
+            elif source == "legacy_receipt":
+                receipt(db, key, now, legacy=True)
             else:
                 changed = fact(db, key, now) or changed
     for repo, number in db.execute("SELECT repo,number FROM attribution_due WHERE at<=? LIMIT ?", (now, MAX_FACTS)):

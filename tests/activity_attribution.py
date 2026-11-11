@@ -468,6 +468,23 @@ class AttributionTests(unittest.TestCase):
         self.assertEqual(row["attribution_missing_prs"], 1)
         self.assertEqual(Decimal(row["estimated_usd"]), 37)
 
+    def test_live_work_is_processed_before_legacy_backfill(self):
+        self.example()
+        before = Decimal(self.prepare()["costs"]["windows"]["total"]["attributed_loc"])
+        for i in range(50):
+            adapter.queue(self.db, "legacy_cost", [f"000-history-{i}"])
+            adapter.queue(self.db, "legacy_pr", [REPO, 100 + i])
+        self.cost("zzz-live-fix", 2, "fix", 3, at=self.now - 150)
+        path = self.root / "budget" / "events.jsonl"
+        path.write_text("".join(json.dumps(r) + "\n" for r in self.ledger))
+        activity_costs.prepare(self.db, self.now, lambda _: "machine")
+        with patch.object(adapter, "MAX_SESSIONS", 1), patch.object(adapter, "MAX_FACTS", 1):
+            attr.prepare(self.db, self.now)
+        self.assertIsNotNone(self.db.execute("SELECT 1 FROM invocation_work WHERE id='zzz-live-fix'").fetchone())
+        row = a._summary(self.db, self.now)["costs"]["windows"]["total"]
+        self.assertGreater(Decimal(row["attributed_loc"]), before)
+        self.assertTrue(row["attribution_preparing"])
+
 
 if __name__ == "__main__":
     unittest.main()

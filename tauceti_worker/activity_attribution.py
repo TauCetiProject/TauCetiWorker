@@ -206,7 +206,7 @@ class CostTargets:
         return session["id"], session.get("phase", "unknown"), rid, repo, number
 
 
-def prepare_reviews(db, now):
+def prepare_reviews(db, now, priority=()):
     """Bounded reads of small records for tracked PRs; never clone or refresh."""
     roots = {archive_root(): True}
     roots.update((Path(path), full) for path, full in db.execute("SELECT path,full FROM review_archives"))
@@ -232,10 +232,21 @@ def prepare_reviews(db, now):
     roots = sorted(p / "records" / "rounds" for p in selected if (p / "records" / "rounds").is_dir())
     if not roots:
         return
-    pending = db.execute(
-        "SELECT repo,number FROM review_archive_checks WHERE checked<=? ORDER BY checked LIMIT ?",
-        (now - 300, MAX_PRS),
-    ).fetchall()
+    pending = [
+        tuple(key)
+        for key in priority
+        if db.execute(
+            "SELECT 1 FROM review_archive_checks WHERE repo=? AND number=? AND checked<=?", (*key, now - 300)
+        ).fetchone()
+    ]
+    pending += [
+        tuple(r)
+        for r in db.execute(
+            "SELECT repo,number FROM review_archive_checks WHERE checked<=? ORDER BY checked LIMIT ?",
+            (now - 300, MAX_PRS),
+        )
+    ]
+    pending = list(dict.fromkeys(pending))[:MAX_PRS]
     deadline, remaining = time.monotonic() + MAX_SECONDS, MAX_RECORDS
     for repo, number in pending:
         fingerprints = []

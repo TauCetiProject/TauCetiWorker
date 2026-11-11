@@ -179,7 +179,7 @@ Ambiguous links remain unknown; no transcript parsing is used. Archive reads sta
 existing collector, with at most 32 tracked PRs, 256 small round records and a
 one-second archive work budget per pass. Session links and PR facts use a separate
 one-second budget with at most 1,024 changed/backfill sessions and 128 keys per fact
-stage. Backfill progress is explicit. Quiet passes read cached reports and do not scan
+stage. Backfill progress is explicit. Live session, receipt and PR updates run before historical backfill, so new completions do not wait behind retained history. Quiet passes read cached reports and do not scan
 billing history. Current measured rates are recomputed from compact prepared PR facts
 when evidence or time-window boundaries change; rates are not frozen per PR. Unchanged
 archive directories require no enumeration or record reads. The default source is the
