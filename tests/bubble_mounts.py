@@ -90,10 +90,8 @@ try:
 
         (pool / "toolchains" / "local").symlink_to(pool / "toolchains" / complete[0], target_is_directory=True)
         _, specs = mounts()
-        check(
-            "a linked toolchain is mounted from its target",
-            f"{pool}/toolchains/{complete[0]}:/home/user/.elan/toolchains/local:ro" in specs,
-        )
+        check("a linked toolchain is not mounted", not any("/.elan/toolchains/local" in spec for spec in specs))
+        check("the other toolchains still are", [s for s in specs if "/.elan/" in s] == toolchains)
         os.environ["ELAN_HOME"] = str(tmp / "missing")
         check("a missing pool mounts none", not any("/.elan/" in spec for spec in mounts()[1]))
 finally:

@@ -2274,12 +2274,18 @@ def pooled_toolchain_mounts() -> list[str]:
 
     Bubble's image holds the toolchain the target pins and the container cannot download another,
     so a round that merges a main with a newer `lean-toolchain` otherwise has nothing to build with.
-    Linux only: a macOS host's pool holds macOS binaries."""
+    Linux only: a macOS host's pool holds macOS binaries. A toolchain registered with
+    `elan toolchain link` is left out: elan reads a custom name only from a symlink, and a bind
+    mount presents a directory, which elan would take for a release to download."""
     if os.environ.get("TAUCETI_BUBBLE_TOOLCHAINS", "0") != "1" or not sys.platform.startswith("linux"):
         return []
     pool = build_caches.elan_pool(_host_home(), os.environ) / "toolchains"
     try:
-        names = sorted(d.name for d in pool.iterdir() if ":" not in d.name and (d / "bin" / "lean").is_file())
+        names = sorted(
+            d.name
+            for d in pool.iterdir()
+            if ":" not in d.name and not d.is_symlink() and (d / "bin" / "lean").is_file()
+        )
     except OSError:
         return []
     return [f"{pool / name}:/home/user/.elan/toolchains/{name}:ro" for name in names]
