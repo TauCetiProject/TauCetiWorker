@@ -519,9 +519,11 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         )
         # The published backlog describes this worker's configured roadmap scope from a current
         # inventory. Named PRs and a Fleet focus area are narrower and a retained snapshot is older,
-        # so those rounds leave it as the last such survey reported it.
-        if not (focused_round or getattr(opts, "prs", ())) and backlog_current(sv):
-            publish_backlog({"github": sv}, complete=True)
+        # so those rounds leave it as the last such survey reported it. Special-task rounds reach this
+        # GitHub-only survey with Forgejo selected too; their counts are then GitHub's share alone.
+        forges = os.environ.get("TAUCETI_WORKER_FORGES", "github")
+        if forges != "forgejo" and not (focused_round or getattr(opts, "prs", ())) and backlog_current(sv):
+            publish_backlog({"github": sv}, complete=forges == "github")
     if sv.dependency_wait:
         # Unknown global coverage is neither an empty backlog nor a failed round. Nothing is selected,
         # so no PR repair allowance is charged; the loop resumes at the circuit's retry time.

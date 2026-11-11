@@ -614,12 +614,14 @@ accounts' backlog in that file, where `workers status --json` shows it:
 | `backlog_by_forge` | The same four fields for each forge, keyed `github` or `forgejo` |
 
 The counts come from the inventory the survey already holds and cost no forge
-request. On Forgejo they count the PRs the worker's Forgejo account authored,
-with labels read from Forgejo. A worker that reads both forges publishes the sum
-of the two accounts' counts as the totals, the same sum its authoring limit uses,
-and only when both forges were surveyed in that round; while one forge is
-unavailable, only the other's entry in `backlog_by_forge` is updated. Anonymous
-Forgejo discovery has no account and publishes nothing.
+request. On Forgejo they count the PRs the worker's Forgejo account authored in
+the same roadmap scope, with labels read from Forgejo. A worker that reads both
+forges publishes the sum of the two accounts' counts as the totals, the same sum
+its authoring limit uses, and only when both forges were surveyed in that round;
+while one forge is unavailable, or in a special-task round such as `--skip
+roadmap` that surveys only GitHub, only one entry in `backlog_by_forge` is
+updated. A Forgejo-only worker never publishes GitHub counts. Anonymous Forgejo
+discovery has no account and publishes nothing.
 
 A round that surveys named PRs or a Fleet focus area, or that reads a retained
 snapshot while shared GitHub state is unavailable, leaves all these fields as

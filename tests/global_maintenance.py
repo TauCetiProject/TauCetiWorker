@@ -558,6 +558,23 @@ class GlobalMaintenance(unittest.TestCase):
             self.run_round(rows)
             self.assertEqual(self.calls[0][:2], ("fix", 20))
             self.assertEqual(reported(runtime), [])
+        # A special-task round reaches this GitHub-only survey with Forgejo selected too: its counts
+        # update the GitHub entry, never a total that would omit Forgejo, and nothing without GitHub.
+        previous = {"github": {"mine_open": 9}, "forgejo": {"mine_open": 7}}
+        for forges, published in (("both", [{"github", "forgejo"}]), ("forgejo", [])):
+            with (
+                patch.dict(os.environ, TAUCETI_WORKER_FORGES=forges),
+                patch("tauceti_worker.worker_sources.enabled", return_value=False),
+                patch.object(work, "runtime_snapshot", return_value={"backlog_by_forge": previous}),
+                patch.object(work, "report_runtime") as runtime,
+            ):
+                self.run_round(rows)
+            calls = [c.kwargs for c in runtime.call_args_list if "backlog_by_forge" in c.kwargs]
+            self.assertEqual([set(c["backlog_by_forge"]) for c in calls], published)
+            self.assertFalse([c for c in calls if "mine_open" in c or "survey_at" in c])
+            if calls:
+                self.assertEqual(calls[0]["backlog_by_forge"]["forgejo"], {"mine_open": 7})
+                self.assertEqual(calls[0]["backlog_by_forge"]["github"]["mine_open"], 3)
 
     def test_missing_or_skipped_focus_keeps_global_maintenance(self):
         for focused, skip in ((["RemovedArea"], ""), (["NewArea"], "NewArea")):
