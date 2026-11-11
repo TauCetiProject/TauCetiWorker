@@ -142,7 +142,9 @@ holds that `auth.json`, counting `/etc/codex/config.toml`, the requirements file
 in `/etc/codex` and any managed `com.openai.codex` preference as Codex does. It
 also leaves it alone for a business, education or enterprise plan, or one it does
 not recognise, since Codex applies a workspace's cloud policy to those, and that
-policy can choose the store. A stop signal that arrives during the exchange takes
+policy can choose the store. For any plan, it leaves the file alone while a
+requirements file in `/etc/codex` enrolls a `config_server`, whose configuration
+can choose the store too. A stop signal that arrives during the exchange takes
 effect once the new token is saved.
 
 `$TAUCETI_CODEX_REFRESH_PLANS` adds plans to the ones renewed: a comma-separated
