@@ -106,7 +106,16 @@ try:
         loader = importlib.machinery.SourceFileLoader("share_build_caches", str(REPO / "scripts/share-build-caches"))
         share = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
         loader.exec_module(share)
-        private = tmp / "worker" / "toolchains"
+        fleet, pool_home = tmp / "fleet", tmp / "pool-home"
+        private = fleet / "w1" / "home" / ".elan" / "toolchains"
+        pool_home.mkdir()
+        (pool_home / ".elan").symlink_to(pool, target_is_directory=True)
+
+        def migrate():
+            argv = ["share-build-caches", "--link", "--state", str(fleet), "--home", str(pool_home)]
+            with patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                return share.main()
+
         migrating = private / "leanprover--lean4---v4.36.0"
         (migrating / "lib" / "lean").mkdir(parents=True)
         (migrating / "bin").mkdir()
@@ -120,7 +129,7 @@ try:
             return real_link(src, dst, *a, **kw)
 
         with patch.object(os, "link", no_space), contextlib.redirect_stderr(io.StringIO()):
-            share.publish_toolchains(private, pool / "toolchains")
+            migrate()
         check(
             "a failed migration leaves no toolchain in the pool",
             sorted(p.name for p in (pool / "toolchains").iterdir())
@@ -132,10 +141,10 @@ try:
         (hidden / "bin" / "lean").write_text("#!/bin/sh\n")
         check("a migration still staging is not mounted", [s for s in mounts()[1] if "/.elan/" in s] == toolchains)
         shutil.rmtree(hidden)
-        linked, _ = share.publish_toolchains(private, pool / "toolchains")
+        migrate()
         check(
             "a complete migration lands under the release name",
-            linked == 2 and (pool / "toolchains" / migrating.name / "lib" / "lean" / "libleanshared.so").is_file(),
+            (pool / "toolchains" / migrating.name / "lib" / "lean" / "libleanshared.so").is_file(),
         )
         check(
             "and is mounted",

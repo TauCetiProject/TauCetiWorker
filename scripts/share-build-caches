@@ -191,7 +191,7 @@ def main() -> int:
                     print(f"  {name}: SKIPPED — {s} and {d} are on different filesystems")
                     continue
                 if args.link:
-                    publish = publish_toolchains if sub == Path("toolchains") else link_into
+                    publish = publish_toolchains if sub == "toolchains" else link_into
                     linked, present = publish(s, d, skip=lambda rel: not poolable(rel))
                     total_linked += linked
                     print(f"  {name}: linked {linked}, already pooled {present}")
