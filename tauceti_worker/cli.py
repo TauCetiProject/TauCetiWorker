@@ -190,7 +190,32 @@ def add_github_account_flag(p: argparse.ArgumentParser) -> None:
     )
 
 
+def add_source_flags(parser):
+    parser.add_argument(
+        "--github",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help="discover GitHub PRs (default: enabled)",
+    )
+    parser.add_argument(
+        "--forgejo",
+        action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+        help="discover Forgejo PRs (default: disabled; opt in for supervised trials)",
+    )
+    parser.add_argument(
+        "--forges", choices=("both", "github", "forgejo"), default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--new-pr-forge",
+        choices=("github", "forgejo"),
+        default=argparse.SUPPRESS,
+        help="destination for new PRs (default: github)",
+    )
+
+
 def add_work_flags(p: argparse.ArgumentParser) -> None:
+    add_source_flags(p)
     p.add_argument("--recovery-only", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--recovery-agent", default=None, help=argparse.SUPPRESS)
     p.add_argument("--recovery-unpinned-profile", action="store_true", help=argparse.SUPPRESS)
@@ -609,6 +634,7 @@ def build_parser() -> argparse.ArgumentParser:
         "  https://github.com/TauCetiProject/TauCetiWorker",
     )
     add_github_account_flag(p)
+    add_source_flags(p)
     sub = p.add_subparsers(dest="cmd")
     from .verification import add_parser as add_verification_parser
 
@@ -666,6 +692,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true", help="emit the survey as JSON")
     s.add_argument("--worker-id", dest="worker_id", default=None)
     add_github_account_flag(s)
+    add_source_flags(s)
 
     u = sub.add_parser("usage", help="read Kiro/OpenRouter credits without sending a model prompt")
     u.add_argument(
@@ -928,6 +955,10 @@ def main(argv: list[str] | None = None) -> int:
     selected_conf, remaining = conf_argument(list(sys.argv[1:] if argv is None else argv))
     args = parser.parse_args(remaining)
     cmd = args.cmd
+    if cmd in (None, "work", "_round", "status"):
+        from .worker_sources import configure
+
+        configure(args)
     if cmd == "verify":
         from .verification import command
 
@@ -1263,16 +1294,35 @@ def cmd_status(args) -> int:
     gh = GitHub()
     rs = ReviewState(cfg, gh)
     counters = Counters(cfg)
-    sv = survey(cfg, gh, rs, counters, deep=True)
+    from .worker_sources import enabled
+
+    sources = None
+    if enabled():
+        from .multi_source import collect
+
+        worker = Worker(cfg, gh, rs, counters, None, None)
+        options = RoundOpts(only=[], agent="auto", work_model="auto", sandbox_host=True, dry_run=True)
+        sources = collect(worker, options)
+        sv = next((item[2] for item in sources if item[0] == "github"), sources[0][2])
+    else:
+        sv = survey(cfg, gh, rs, counters, deep=True)
     _, quota_snap = Quota(cfg).choose(None)
 
     if getattr(args, "json", False):
         out = {"survey": dataclasses.asdict(sv), "quota": {k: dataclasses.asdict(v) for k, v in quota_snap.items()}}
+        if sources is not None:
+            out["sources"] = {name: dataclasses.asdict(value) for name, _, value in sources}
         print(json.dumps(out, indent=2, default=str))
-        return 1 if sv.github_failed else 0
+        return int(all(value.github_failed for _, _, value in sources)) if sources else int(sv.github_failed)
 
     from rich.console import Console
 
+    if sources is not None:
+        console = Console()
+        for name, _, value in sources:
+            console.print(name, style="bold")
+            render_survey(value, console, quota_snap)
+        return int(all(value.github_failed for _, _, value in sources))
     render_survey(sv, Console(), quota_snap)
     return 1 if sv.github_failed else 0
 
@@ -1483,12 +1533,6 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
 
             try:
                 mirror_creds(cfg)
-                recovery_gh = GitHub()
-                if (cfg.checkout / ".git").exists():
-                    guard(cfg, cfg.checkout, repository=recovery_gh.repo)  # Preserve before selecting recovery.
-                recovery_worker = Worker(
-                    cfg, recovery_gh, ReviewState(cfg, recovery_gh), Counters(cfg), ctx, Claims(cfg, ctx)
-                )
                 recovery_opts = RoundOpts(
                     only=only,
                     agent=getattr(args, "recovery_agent", None) or agent,
@@ -1506,8 +1550,25 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
                         else None
                     ),
                 )
-                if recover(recovery_worker, recovery_opts):
-                    return 0
+                if os.environ.get("TAUCETI_WORKER_FORGES") != "forgejo":
+                    try:
+                        recovery_gh = GitHub()
+                        if (cfg.checkout / ".git").exists():
+                            guard(cfg, cfg.checkout, repository=recovery_gh.repo)  # Preserve before selecting recovery.
+                        recovery_worker = Worker(
+                            cfg, recovery_gh, ReviewState(cfg, recovery_gh), Counters(cfg), ctx, Claims(cfg, ctx)
+                        )
+                        if recover(recovery_worker, recovery_opts):
+                            return 0
+                    except Exception as error:
+                        log(f"GitHub recovery deferred ({type(error).__name__}); checking other selected sources")
+                from .worker_sources import enabled
+
+                if enabled():
+                    from .multi_source import recover_native
+
+                    if recover_native(cfg, ctx, recovery_opts):
+                        return 0
             except Exception as error:
                 log(f"recovery phase deferred; existing source is preserved: {type(error).__name__}: {error}")
                 report_runtime(
