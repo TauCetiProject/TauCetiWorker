@@ -503,8 +503,8 @@ class AttributionTests(unittest.TestCase):
                 dict(
                     repo=REPO,
                     pr=1,
-                    round_id="bad",
-                    ts=datetime.fromtimestamp(self.now - 190, UTC).isoformat(),
+                    round_id="1-archive-round",
+                    ts=datetime.fromtimestamp(self.now - 199, UTC).isoformat(),
                     run_ids=["bad-run"],
                 )
             )
@@ -579,6 +579,28 @@ class AttributionTests(unittest.TestCase):
             row = self.prepare()["costs"]["windows"]["total"]
         self.assertEqual(row["attribution_known_prs"], 0)
         self.assertEqual(row["attribution_missing_prs"], 2)
+
+    def test_stale_counter_uses_fresh_archive_instead_of_parking_it(self):
+        self.example()
+        self.db.execute(
+            "INSERT INTO pr_review_counts VALUES (?,?,?,?,?,?,?)",
+            (REPO, 1, "head", 1, self.now - 500, self.now, "scoreboard-round-counters"),
+        )
+        row = self.prepare()["costs"]["windows"]["total"]
+        self.assertEqual(row["attribution_known_prs"], 2)
+        self.assertEqual(self.archive_count(1), 3)
+
+    def test_large_reports_are_throttled_and_show_pending_evidence(self):
+        self.example()
+        self.prepare()
+        payload = self.db.execute("SELECT payload FROM attribution_prs LIMIT 1").fetchone()[0]
+        for number in range(100, 240):
+            self.db.execute("INSERT INTO attribution_prs VALUES (?,?,?)", (REPO, number, payload))
+        self.cost("new-fix", 2, "fix", 3)
+        with patch.object(adapter, "reports", side_effect=AssertionError("premature large recompute")):
+            row = self.prepare()["costs"]["windows"]["total"]
+        self.assertTrue(row["attribution_preparing"])
+        self.assertIsNotNone(self.db.execute("SELECT 1 FROM meta WHERE key='attribution-report-dirty'").fetchone())
 
     def test_existing_observation_batch_imports_counters_once_after_landing(self):
         self.pr(1, 15000)

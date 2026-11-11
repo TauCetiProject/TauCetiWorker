@@ -286,14 +286,24 @@ def prepare_reviews(db, now, priority=()):
     deadline, remaining = time.monotonic() + MAX_SECONDS, MAX_RECORDS
     for repo, number in pending:
         counts = db.execute(
-            "SELECT head,count FROM pr_review_counts WHERE repo=? AND number=?", (repo, number)
+            "SELECT head,count,observed FROM pr_review_counts WHERE repo=? AND number=?", (repo, number)
         ).fetchone()
-        observed = db.execute("SELECT head FROM prs WHERE repo=? AND number=?", (repo, number)).fetchone()
+        observed = db.execute("SELECT head,landed FROM prs WHERE repo=? AND number=?", (repo, number)).fetchone()
         observed = (
             observed
-            or db.execute("SELECT head FROM pr_observations WHERE repo=? AND number=?", (repo, number)).fetchone()
+            or db.execute(
+                "SELECT head,landed FROM pr_observations WHERE repo=? AND number=?", (repo, number)
+            ).fetchone()
         )
-        if counts and counts[1] is not None and observed and observed[0] == counts[0]:
+        if (
+            counts
+            and counts[1] is not None
+            and observed
+            and observed[0] == counts[0]
+            and observed[1] is not None
+            and counts[2] is not None
+            and counts[2] >= observed[1]
+        ):
             db.execute("UPDATE review_archive_checks SET checked=1e99 WHERE repo=? AND number=?", (repo, number))
             continue
         fingerprints = []
@@ -461,7 +471,10 @@ def summarize(db, now, windows, column=None, identity=None):
     subject = json.dumps([column, identity])
     cached = db.execute("SELECT payload FROM attribution_reports WHERE subject=?", (subject,)).fetchone()
     values = json.loads(cached[0]) if cached else {}
-    preparing = db.execute("SELECT 1 FROM attribution_dirty LIMIT 1").fetchone() is not None
+    preparing = (
+        db.execute("SELECT 1 FROM attribution_dirty LIMIT 1").fetchone() is not None
+        or db.execute("SELECT 1 FROM meta WHERE key='attribution-report-dirty'").fetchone() is not None
+    )
     for key in windows:
         row = values.get(
             key, dict(attribution_version=1, attributed_loc=None, attribution_known_prs=0, attribution_missing_prs=0)

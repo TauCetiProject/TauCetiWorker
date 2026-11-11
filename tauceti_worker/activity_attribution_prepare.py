@@ -156,8 +156,8 @@ def fact(db, key, now):
     end = min(now, p.get("landed") or now)
     work = {}
     future = [p["landed"]] if p.get("landed") is not None and p["landed"] > now else []
-    for phase, rid, worker, scope, start, finish, cost, outcome in db.execute(
-        "SELECT w.phase,w.round_id,c.worker,c.scope,c.started,c.finished,c.cost,r.outcome "
+    for phase, rid, worker, scope, start, finish, cost, outcome, round_start, round_finish in db.execute(
+        "SELECT w.phase,w.round_id,c.worker,c.scope,c.started,c.finished,c.cost,r.outcome,r.started,r.finished "
         "FROM invocation_work w INDEXED BY invocation_pr CROSS JOIN cost_accruals c ON c.id=w.id "
         "LEFT JOIN rounds r ON r.id=w.round_id WHERE w.repo=? AND w.number=?",
         key,
@@ -185,7 +185,7 @@ def fact(db, key, now):
             dict(author="0", fix="0", review="0", author_known=False, passes={}, attempted={}, unpriced=False),
         )
         if kind == "review" and rid and value > 0:
-            row["attempted"][rid] = start
+            row["attempted"][rid] = [round_start, round_finish]
         if outcome not in {"completed", "unconfirmed"}:
             continue  # Failed attempts are charged as overhead, never output.
         row[kind] = str(Decimal(row[kind]) + value)
@@ -198,7 +198,7 @@ def fact(db, key, now):
     for rid, worker, scope in db.execute(
         "SELECT DISTINCT r.id,r.worker,r.scope FROM invocation_work w JOIN rounds r ON r.id=w.round_id "
         "WHERE w.repo=? AND w.number=? AND w.phase='review' AND r.outcome IN ('completed','unconfirmed') "
-        "AND r.started<=? AND NOT EXISTS (SELECT 1 FROM cost_accruals c WHERE c.id=w.id AND CAST(c.cost AS REAL)>0)",
+        "AND r.started<=? AND NOT EXISTS (SELECT 1 FROM cost_accruals c WHERE c.id=w.id)",
         (*key, end),
     ):
         row = work.setdefault(
@@ -208,14 +208,14 @@ def fact(db, key, now):
         if rid not in row["passes"]:
             row["unpriced"] = True
     passes = set()
-    archived_rounds = set()
+    archived_rounds = {}
     for row in db.execute("SELECT payload FROM review_archive_records WHERE repo=? AND number=?", key):
         record = json.loads(row[0])
         if record and record["review"]:
             if record["at"] <= end:
                 passes.add(record["review"])
                 if record.get("round_id"):
-                    archived_rounds.add(record["round_id"])
+                    archived_rounds[record["round_id"]] = record["at"]
             elif record["at"] > now:
                 future.append(record["at"])
     checked = db.execute("SELECT complete,checked FROM review_archive_checks WHERE repo=? AND number=?", key).fetchone()
@@ -240,7 +240,7 @@ def fact(db, key, now):
         work=[[worker, scope, row] for (worker, scope), row in work.items()],
         total_runs=counter[1] if cached_counts else len(passes),
         review_known=cached_counts or bool(checked and checked[0] and passes and fresh),
-        archived_rounds=list(archived_rounds),
+        archived_rounds=archived_rounds,
         counter_basis=cached_counts,
     )
     payload = json.dumps(value)
@@ -270,7 +270,7 @@ def reports(db, now):
         for profile in owners | groups.keys():
             work = groups[profile]
             passes = {}
-            attempted = set()
+            attempted = {}
             for w in work:
                 attempted.update(w.get("attempted", {}))
                 for rid, sample in w["passes"].items():
@@ -284,9 +284,18 @@ def reports(db, now):
                 review=sum((Decimal(w["review"]) for w in work), Decimal(0)),
                 author_known=any(w["author_known"] for w in work),
                 local_runs=len(passes),
-                attempted_runs=len(attempted)
+                attempted_runs=len(passes)
                 if p.get("counter_basis")
-                else len(set(passes) | (attempted & set(p.get("archived_rounds", [])))),
+                else len(
+                    set(passes)
+                    | {
+                        rid
+                        for rid, bounds in attempted.items()
+                        if bounds[0] is not None
+                        and bounds[1] is not None
+                        and any(bounds[0] <= at <= bounds[1] for at in p.get("archived_rounds", {}).values())
+                    }
+                ),
                 total_runs=p["total_runs"],
                 review_known=p["review_known"]
                 and p["total_runs"] >= len(passes)
