@@ -435,6 +435,35 @@ def test_sources(root):
         )
 
 
+def test_multi_source_budgets(root):
+    """A source whose only repair candidates have spent budgets still leaves its records."""
+    from tauceti_worker import multi_source
+
+    def round_over(**options):
+        sv = tc.Survey(worker_id="test")
+        sv.rebaseable.suppressed = [
+            tc.Candidate(7, "head-7", "conflicting", attempts=3, budget=3, source_repository=FORGEJO)
+        ]
+        worker = SimpleNamespace(gh=SimpleNamespace(repository=FORGEJO, repo=tc.TAUCETI))
+        options = {"dry_run": False, **options}
+        opts = tc.RoundOpts(only=["rebase"], agent="claude", work_model="claude", sandbox_host=True, **options)
+        with (
+            patch.object(multi_source, "collect", return_value=[("forgejo", worker, sv)]),
+            patch.object(multi_source, "deduplicate"),
+        ):
+            try:
+                multi_source.run_round(worker, opts, use_fleet_focus=False)
+            except work_units.NoEligibleWork:
+                return "no work"
+        return "ran"
+
+    name = root / incidents._name(incidents.BUDGET_SPENT, incidents.subject("rebase", 7, FORGEJO))
+    with settings(root):
+        check("a dry run writes nothing", (round_over(dry_run=True), name.exists()), ("no work", False))
+        check("nor does a round scoped to another PR", (round_over(prs=[8]), name.exists()), ("no work", False))
+        check("an unscoped round records the spent budget", (round_over(), load(name)["head"]), ("no work", "head-7"))
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -444,6 +473,7 @@ def main():
         test_prompt(tmp / "prompt")
         test_claim_race(tmp / "race")
         test_sources(tmp / "sources")
+        test_multi_source_budgets(tmp / "multi")
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
     return 1 if fails else 0
 

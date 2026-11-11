@@ -131,7 +131,9 @@ recorded, and asks for the reason first and a closing `Subsumed-by: #N [#M ...]`
 or `Subsumed-by: none` line.
 
 **`budget-spent`.** At the start of a round, for each pull request the survey
-suppressed in one of the three stages because its attempts are used up. One
+suppressed in one of the three stages because its attempts are used up; with a
+Forgejo source enabled, for every source that answered its survey, whether or
+not it has work to offer. One
 write per head: a record that already names the head, live or acknowledged, is
 left alone, and a new head writes a new live record. Attempt budgets are kept
 per worker, so the record is the first worker's; another worker may still have
