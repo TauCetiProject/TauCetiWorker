@@ -137,7 +137,8 @@ the worker at `codex token expired; refresh left to the operator`. With the flag
 on, the worker renews the operator's `~/.codex/auth.json` once the access token,
 which lasts about ten days, is within two days of expiry, or when the usage
 endpoint answers 401. It leaves the file alone when `cli_auth_credentials_store`
-in Codex's configuration is anything other than `file`.
+in Codex's configuration, either the worker's own or the one beside that
+`auth.json`, is anything other than `file`.
 
 **Only turn it on when nothing else uses that credential file.** Claude and Codex
 issue single-use refresh tokens: exchanging one retires it and returns a
