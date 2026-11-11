@@ -361,8 +361,8 @@ def publish(path: Path, base: str, ours: str, notes: list[str]) -> str | None:
     A tracked list is first brought up to the branch it tracks. The edit is then merged three ways
     with the file as it is now, so an edit made meanwhile by hand or on another host is kept; when
     both touch the same lines nothing is written and a later curation starts from the new file. A
-    tracked list is committed, that path only, and pushed; when the commit fails the file is put
-    back as it was found, so a later curation makes the edit again."""
+    tracked list is committed, that path only, and pushed; when the commit fails this curation's
+    edit is taken back out of the file, so a later curation makes it again."""
     tracked = _tracked(path)
     if tracked:
         _sync(path)
@@ -380,8 +380,12 @@ def publish(path: Path, base: str, ours: str, notes: list[str]) -> str | None:
             log(
                 f"curate: commit failed ({one_line(committed.stderr or committed.stdout)}); the edit waits for a later look"
             )
-            if path.read_text() == merged:
-                _write(path, theirs)
+            # Take back this curation's edit alone, keeping one a hook or a hand made meanwhile.
+            undone = merge3(merged, path.read_text(), theirs)
+            if undone is None:
+                log(f"curate: {path.name} changed on the curated lines during the commit; left as it is")
+            else:
+                _write(path, undone)
             return None
     if tracked:
         _push(path)

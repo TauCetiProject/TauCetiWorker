@@ -338,6 +338,19 @@ class Publish(Tmp):
         self.assertIn("Goal: the weak law", both)
         self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", both)
 
+    def test_a_commit_that_fails_after_a_hook_edits_the_list_keeps_that_edit_alone(self):
+        first = self.clone("first")
+        hook = first.parent / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\necho '<!-- formatted -->' >> targets.md\nexit 1\n")
+        hook.chmod(0o755)
+        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
+        self.assertIsNone(curate.publish(first, EXAMPLE, a, ["n"]))
+        self.assertEqual(first.read_text(), EXAMPLE + "<!-- formatted -->\n")
+        hook.unlink()
+        both = curate.publish(first, EXAMPLE + "<!-- formatted -->\n", a + "<!-- formatted -->\n", ["n"])
+        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", both)
+        self.assertIn("- [x] `strong-law`", both)
+
     def test_a_push_that_loses_the_race_is_retried_after_a_rebase(self):
         first, second = self.clone("first"), self.clone("second")
         a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")

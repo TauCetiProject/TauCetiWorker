@@ -164,8 +164,8 @@ moved first. That is how workers on several hosts share one list: each keeps a
 clone, and their edits meet through the remote. Give the list a clone of its
 own, since the rebase moves the whole checkout. A clone with uncommitted
 changes to tracked files is not rebased, a rebase that conflicts is aborted
-and logged, a commit that fails puts the file back as it was found so the next
-look makes the edit again, and a commit that cannot be pushed goes with the
+and logged, a commit that fails takes the look's edit back out of the file, keeping any
+other change made meanwhile, so the next look makes it again, and a commit that cannot be pushed goes with the
 next look. A
 branch that tracks nothing is committed and not pushed. Add the lock file to
 `.gitignore`.
