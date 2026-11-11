@@ -695,7 +695,7 @@ repository="one/Project"
             timeout=60,
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("Stage 1B requires GitHub bindings", result.stderr)
+        self.assertIn("Shared roadmap, tool and archive repositories must currently use GitHub bindings", result.stderr)
 
     def test_generic_test_doubles_do_not_select_direct_source_by_truthiness(self):
         cfg = SimpleNamespace(sbcache=Path(self.root.name) / "legacy")
