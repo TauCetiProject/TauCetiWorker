@@ -641,6 +641,18 @@ def test_rounds(tmp):
         hub = Hub(p1={}, p30={}, p31={})
         rounds(tmp, hub, answer((1, "wait", {"blocked_on": [30, 31]})))
         hub.prs[31]["state"] = "CLOSED"
+        hub.prs[1]["labels"] = ["hold"]
+        held = rounds(tmp, hub, answer((1, "escalate", {"recommend": ""})))
+        check(
+            "a lost blocker on a pull request under a hold label: no model, the wait stands",
+            ("packet" in held, ruling(root)["ruling"]),
+            (False, "wait"),
+        )
+        hub.prs[1]["labels"] = []
+        claimed = rounds(tmp, hub, answer((1, "escalate", {"recommend": ""})), claimed={1})
+        check(
+            "…nor while another worker holds its branch", ("packet" in claimed, ruling(root)["ruling"]), (False, "wait")
+        )
         seen = rounds(tmp, hub, answer((1, "escalate", {"recommend": ""})))
         check(
             "a later blocker closed unmerged while an earlier one is open: back to the model",

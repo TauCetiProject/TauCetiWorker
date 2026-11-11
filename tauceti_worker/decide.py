@@ -449,7 +449,8 @@ def _blockers(rd: _Round, ruling: dict) -> tuple[list[str] | None, str]:
 def _recheck(rd: _Round) -> list[dict]:
     """Look again at each live ruling that waits. One whose blockers have all landed becomes a
     `retry`, or an `escalate` where no retry is left; the incident of one whose blocker can no
-    longer land is returned, to be put to the model again."""
+    longer land is returned, to be put to the model again, when `_eligible`; otherwise the ruling
+    stays and waits for a round in which it is."""
     again = []
     for _path, ruling in incidents.records(incidents.RULING, acked=False):
         landed, lost = _blockers(rd, ruling) if _ours(ruling, rd.source) else (None, "")
@@ -457,8 +458,9 @@ def _recheck(rd: _Round) -> list[dict]:
         if incident is None or not rd.at_head(incident):
             continue
         if lost:
-            log(f"decide: #{incident['pr']}: {lost}; ruling again")
-            again.append(incident)
+            if _eligible(rd, incident):
+                log(f"decide: #{incident['pr']}: {lost}; ruling again")
+                again.append(incident)
         else:
             note = f"What this waited on has landed: {'; '.join(landed)}. The ruling then said: {ruling.get('note')}"
             follow_up = RETRY if _may_retry(incident) else ESCALATE
@@ -469,9 +471,7 @@ def _recheck(rd: _Round) -> list[dict]:
 
 def _unruled(rd: _Round) -> list[dict]:
     """The live incidents to put to the model, oldest first: at their pull request's head (`_settle`
-    took the others), under no hold label, and with no other worker on the branch."""
-    from .work_units import _branch_claimed_elsewhere
-
+    took the others) and `_eligible`."""
     live = [
         value
         for _path, value in incidents.records(acked=False)
@@ -481,13 +481,23 @@ def _unruled(rd: _Round) -> list[dict]:
     for value in sorted(live, key=lambda value: value["last_at"]):
         if len(found) == max_cases():
             break
-        if held := sorted(_labels(rd.open_prs[value["pr"]]) & HOLD_LABELS):
-            log(f"decide: #{value['pr']}: carries the label {held[0]}; left for a person")
-        elif _branch_claimed_elsewhere(rd.w, value["pr"]):
-            log(f"decide: #{value['pr']}: a worker holds its branch claim; ruling on a later round")
-        else:
+        if _eligible(rd, value):
             found.append(value)
     return found
+
+
+def _eligible(rd: _Round, incident: dict) -> bool:
+    """Whether an incident at its pull request's head may go to the model: under no hold label,
+    and with no other worker on the branch. Says why not."""
+    from .work_units import _branch_claimed_elsewhere
+
+    if held := sorted(_labels(rd.open_prs[incident["pr"]]) & HOLD_LABELS):
+        log(f"decide: #{incident['pr']}: carries the label {held[0]}; left for a person")
+        return False
+    if _branch_claimed_elsewhere(rd.w, incident["pr"]):
+        log(f"decide: #{incident['pr']}: a worker holds its branch claim; ruling on a later round")
+        return False
+    return True
 
 
 # Whether a ruling is open to the model for a case; one that is not listed always is.
