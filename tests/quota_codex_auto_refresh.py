@@ -38,8 +38,11 @@ def check(name, got, expect):
         fails += 1
 
 
-def jwt(expires_in):
-    claims = json.dumps({"exp": int(time.time() + expires_in)}).encode()
+def jwt(expires_in, plan="plus"):
+    claims = {"exp": int(time.time() + expires_in)}
+    if plan is not None:
+        claims["https://api.openai.com/auth"] = {"chatgpt_plan_type": plan}
+    claims = json.dumps(claims).encode()
     return f"header.{base64.urlsafe_b64encode(claims).decode().rstrip('=')}.signature"
 
 
@@ -63,7 +66,7 @@ def tokens(path):
     return json.loads(path.read_text())["tokens"]
 
 
-def setup(tmp, *, expires_in=60, refresh="operator-refresh", opt_in=True):
+def setup(tmp, *, expires_in=60, refresh="operator-refresh", opt_in=True, plan="plus"):
     """An isolated worker: it reads a MIRROR of the operator's auth.json, with a marker naming the
     original. Returns (quota, source path, mirror path, the access token both start with)."""
     src, dst = tmp / "real" / ".codex", tmp / "iso" / ".codex"
@@ -75,7 +78,7 @@ def setup(tmp, *, expires_in=60, refresh="operator-refresh", opt_in=True):
     os.environ["CODEX_HOME"] = str(dst)
     if opt_in:
         os.environ["TAUCETI_AUTO_REFRESH"] = "1"
-    stale = jwt(expires_in)
+    stale = jwt(expires_in, plan)
     (src / "auth.json").write_text(auth(stale, refresh))
     (dst / "auth.json").write_text(auth(stale, CODEX_RT_PLACEHOLDER))
     # Codex's administrator layers, redirected into the temporary tree.
@@ -308,6 +311,24 @@ for name, files, expires_in, first, want in (
     try:
         check(f"{name}: exchanges", renews_with(tmp, files, expires_in=expires_in, first=first), want)
     finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# 6e) An unreadable managed-preference directory, at either level, cannot show that no policy applies.
+for name, locked in (("root", "Managed Preferences"), ("per-user directory", "Managed Preferences/someone")):
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        quota, src, mirror, stale = setup(tmp)
+        (tmp / "Managed Preferences/someone").mkdir(parents=True)
+        (tmp / "Managed Preferences/someone/com.openai.codex.plist").write_text("")
+        (tmp / locked).chmod(0)
+        with rotates_to(jwt(10 * DAY)) as post, usage_seen()[1]:
+            quota.codex(renew=True)
+        check(f"an unreadable managed-preference {name} blocks renewal", post.call_count, 0)
+    finally:
+        for d in ("Managed Preferences", "Managed Preferences/someone"):
+            if (tmp / d).exists():
+                (tmp / d).chmod(0o755)
         shutil.rmtree(tmp, ignore_errors=True)
 
 

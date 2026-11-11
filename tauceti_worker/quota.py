@@ -931,14 +931,22 @@ def _codex_store_setting(path: Path) -> str | None:
 
 def _codex_managed_preferences() -> bool:
     """Whether a managed com.openai.codex preference exists; an unreadable directory counts as one."""
+    # os.scandir, not Path.glob: glob skips directories it cannot list instead of raising.
+    name = "com.openai.codex.plist"
     try:
-        if not CODEX_MANAGED_PREFERENCES.exists():
-            return False
-        return any(CODEX_MANAGED_PREFERENCES.glob("com.openai.codex.plist")) or any(
-            CODEX_MANAGED_PREFERENCES.glob("*/com.openai.codex.plist")
-        )
+        with os.scandir(CODEX_MANAGED_PREFERENCES) as entries:
+            for entry in entries:
+                if entry.name == name:
+                    return True
+                if entry.is_dir(follow_symlinks=False):
+                    with os.scandir(entry.path) as inner:
+                        if any(e.name == name for e in inner):
+                            return True
+    except FileNotFoundError:
+        return False
     except OSError:
         return True
+    return False
 
 
 @contextmanager
