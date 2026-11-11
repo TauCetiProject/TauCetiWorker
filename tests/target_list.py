@@ -557,6 +557,26 @@ class ClaimsBeforeAuthoring(unittest.TestCase):
             [["release", "branch/5"], ["acquire", "author/Algebra/a"], ["release", "author/Algebra/a"]],
         )
 
+    def test_the_branch_heartbeat_stops_before_the_author_claim(self):
+        """Even when releasing the branch claim fails, its renewer must not outlive the handoff."""
+        claims = tc.Claims(SimpleNamespace(wid="w1"), SimpleNamespace(add_cleanup=lambda _f: None))
+        renewer = Mock()
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, read_end)
+        claims.held, claims._hb, claims._hb_wfd = ("branch/5", "org/claims"), renewer, write_end
+        verdicts = {"release": 2, "acquire": 0}
+        with (
+            patch("tauceti_worker.round.claims_repo", return_value="org/claims"),
+            patch(
+                "tauceti_worker.round.subprocess.run",
+                side_effect=lambda argv, **_k: SimpleNamespace(returncode=verdicts[argv[1]]),
+            ),
+            patch.object(tc.Claims, "start_heartbeat"),
+        ):
+            self.assertEqual(claims.begin_target_work("Algebra", "a"), 0)
+        renewer.terminate.assert_called_once_with()
+        self.assertEqual(os.read(read_end, 1), b"")  # the renewer's pipe is closed: it sees EOF
+
     def test_a_held_native_branch_lease_is_released_first(self):
         from tauceti_worker.source_claims import SourceClaims
 
