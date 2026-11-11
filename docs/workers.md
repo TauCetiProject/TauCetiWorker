@@ -136,6 +136,7 @@ tauceti workers disable reviewer   # persist desired stopped state
 tauceti workers enable reviewer    # and start it again
 tauceti workers restart reviewer   # without changing desired state
 tauceti workers remove reviewer    # drop the definition and stop it
+tauceti workers clear-halt reviewer  # after an identity halt; see below
 ```
 
 ## Editing the file directly
@@ -263,9 +264,14 @@ before it reads a credential or contacts GitHub. Once the account is in order,
 read and remove the record, then start the worker:
 
 ```bash
-tauceti work --worker-id reviewer --clear-halt
+tauceti workers clear-halt reviewer
 tauceti workers restart reviewer
 ```
+
+`workers clear-halt` runs `tauceti work --worker-id reviewer --clear-halt` with
+the worker's own `conf` and `env`, so it finds the record under the worker's
+data root rather than the caller's. For a worker the manager does not run, use
+that `work` command directly.
 
 Rate limits, other 403 responses such as a missing scope or SSO enforcement,
 server errors, and network failures are not halts. Before the loop they are

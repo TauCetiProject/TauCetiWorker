@@ -162,7 +162,8 @@ may be used, with the same identity check. Missing, rejected, or mismatched
 credentials stop the command; TauCeti never switches to another account.
 `work` repeats the check at the start of every round, and a mismatched login,
 an HTTP 401, or a suspended account stops the worker until
-`tauceti work --worker-id ID --clear-halt`; see
+`tauceti work --worker-id ID --clear-halt` (`tauceti workers clear-halt ID`
+for a managed worker); see
 [identity halt](workers.md#identity-halt).
 
 The selected token lives in the worker's environment and is inherited by loop

@@ -229,6 +229,9 @@ class IdentityHaltTests(unittest.TestCase):
             self.assertEqual(self.run_cli(*argv), (EX_HALTED, False))
         self.assertFalse(self.calls.exists())
         self.assertIn("--worker-id w1 --clear-halt", json.loads(status.read_text())["failure_reason"])
+        with patch.dict(os.environ, {"TAUCETI_MANAGED": "1"}):
+            self.assertEqual(self.run_cli(*round_argv), (EX_HALTED, False))
+        self.assertIn("`tauceti workers clear-halt w1`", json.loads(status.read_text())["failure_reason"])
 
         # Without a configured account the file is inert.
         self.assertEqual(self.run_cli("_round", "--worker-id", "w1"), (0, True))
@@ -251,6 +254,26 @@ class IdentityHaltTests(unittest.TestCase):
         self.assertNotIsInstance(raised.exception, Halted)
         self.assertIn("belongs to bob", str(raised.exception))
         self.assertFalse(self.halt.exists())
+
+    def test_workers_clear_halt_uses_the_workers_own_data_root(self):
+        config, data = self.root / "workers.toml", self.root / "worker-data"
+        record = data / "state" / "w1" / "halt.json"
+        record.parent.mkdir(parents=True)
+        record.write_text(json.dumps({"reason": "invalid-credentials", "detail": "rejected", "at": "then"}))
+        wm.save_worker_specs(config, [wm.WorkerSpec(id="w1", env={"TAUCETI_LEGACY_DATA_ROOT": str(data)})])
+        # The operator's own data root is self.root; only the worker's definition names `data`.
+        shown = subprocess.run(
+            [sys.executable, "-m", "tauceti_worker", "workers", "--config", str(config), "clear-halt", "w1"],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertIn("invalid-credentials", shown.stdout)
+        self.assertFalse(record.exists())
+        with self.assertRaises(wm.WorkersError):
+            wm.clear_worker_halt(config, "w2")
 
     def test_loop_stops_without_backoff(self):
         args = cli.build_parser().parse_args(["work", "--agent", "claude", "--claude-billing", "api", "--loop"])
@@ -320,10 +343,11 @@ class IdentityHaltTests(unittest.TestCase):
                 manager.wait(5)
 
         item = {**first, "id": "w1", "actual": "halted", "desired": "running", "failure_reason": "belongs to bob"}
-        lines = "\n".join(wm._worker_status_lines(config, [item], True, width=120))
+        lines = "\n".join(wm._worker_status_lines(config, [item], True, width=300))
         self.assertIn("w1 — halted", lines)
         self.assertIn("reason:   belongs to bob", lines)
-        self.assertIn("tauceti work --worker-id w1 --clear-halt, then tauceti workers restart w1", lines)
+        workers = f"tauceti workers --config {config}"
+        self.assertIn(f"{workers} clear-halt w1, then {workers} restart w1", lines)
 
 
 if __name__ == "__main__":

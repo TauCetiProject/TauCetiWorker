@@ -2,7 +2,8 @@
 
 `pin_github_account` raises `Halted` for a login other than the configured one, a rejected
 credential, or a suspended account. The record written here stops every later start under the same
-worker id until a person has read it and run `tauceti work --worker-id ID --clear-halt`.
+worker id until a person has read it and run `tauceti work --worker-id ID --clear-halt`, or
+`tauceti workers clear-halt ID` for a managed worker.
 """
 
 from __future__ import annotations
@@ -39,10 +40,15 @@ def refuse_if_halted(path: Path | None) -> None:
     if path is None or not path.exists():
         return
     record = read_json(path)
+    wid = path.parent.name
+    clear = (
+        f"tauceti workers clear-halt {wid}"
+        if os.environ.get("TAUCETI_MANAGED") == "1"
+        else f"tauceti work --worker-id {wid} --clear-halt"
+    )
     raise Halted(
         str(record.get("reason") or "unreadable"),
-        f"halted at {record.get('at')}: {record.get('detail')} — resolve it, then run "
-        f"`tauceti work --worker-id {path.parent.name} --clear-halt` ({path})",
+        f"halted at {record.get('at')}: {record.get('detail')} — resolve it, then run `{clear}` ({path})",
     )
 
 

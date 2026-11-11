@@ -760,6 +760,38 @@ def raise_oom_score(env=None, path=Path("/proc/self/oom_score_adj")) -> None:
         pass
 
 
+def worker_env(spec: WorkerSpec) -> dict[str, str]:
+    """The environment a managed worker runs in, before the manager's own reserved variables."""
+    # Per-worker configuration goes UNDER self_env, not over it: self_env derives PYTHONPATH
+    # and the CA bundle from what it is given, so a configured NIX_SSL_CERT_FILE takes part in
+    # that discovery while the PYTHONPATH the child needs to import itself is still prepended
+    # rather than replaced.
+    env = self_env(unselected_github_env({**unselected_github_env(), **dict(spec.env)}))
+    # A new managed worker starts a new configuration lifetime. Its round
+    # children inherit the snapshot created by that worker, not the manager's.
+    env.pop("TAUCETI_CONF_SNAPSHOT", None)
+    env.pop("TAUCETI_CONF_SOURCE", None)
+    if spec.conf:
+        env["TAUCETI_CONF"] = spec.conf
+    else:
+        from tauceti_tools.project import active
+
+        if active():
+            for key in active().environment():
+                env.pop(key, None)
+        env.pop("TAUCETI_CONF", None)
+    return env
+
+
+def clear_worker_halt(config: Path, wid: str) -> int:
+    """Run `work --clear-halt` in the worker's own environment, so it reads that worker's state."""
+    spec = next((spec for spec in load_worker_specs(config) if spec.id == wid), None)
+    if spec is None:
+        raise WorkersError(f"unknown worker: {wid}")
+    argv = self_argv("work", "--worker-id", spec.id, *(["--conf", spec.conf] if spec.conf else []), "--clear-halt")
+    return subprocess.run(argv, cwd=HERE, env=worker_env(spec), check=False).returncode
+
+
 def cmd_managed_runner(args) -> int:
     raise_oom_score()
     spec = _decode_spec(args.spec)
@@ -794,25 +826,9 @@ def cmd_managed_runner(args) -> int:
         old_term = signal.signal(signal.SIGTERM, stop)
         old_int = signal.signal(signal.SIGINT, stop)
         try:
-            # Per-worker configuration goes UNDER self_env, not over it: self_env derives PYTHONPATH
-            # and the CA bundle from what it is given, so a configured NIX_SSL_CERT_FILE takes part in
-            # that discovery while the PYTHONPATH the child needs to import itself is still prepended
-            # rather than replaced. The manager's own variables are assigned last and are reserved, so
-            # nothing here can shadow them.
-            env = self_env(unselected_github_env({**unselected_github_env(), **dict(spec.env)}))
-            # A new managed worker starts a new configuration lifetime. Its round
-            # children inherit the snapshot created by that worker, not the manager's.
-            env.pop("TAUCETI_CONF_SNAPSHOT", None)
-            env.pop("TAUCETI_CONF_SOURCE", None)
-            if spec.conf:
-                env["TAUCETI_CONF"] = spec.conf
-            else:
-                from tauceti_tools.project import active
-
-                if active():
-                    for key in active().environment():
-                        env.pop(key, None)
-                env.pop("TAUCETI_CONF", None)
+            # The manager's own variables are assigned last and are reserved, so nothing in the
+            # worker's configuration can shadow them.
+            env = worker_env(spec)
             env[STATUS_ENV] = str(state)
             env["TAUCETI_MANAGED"] = "1"
             # stderr is already the durable console log; suppress the second log() copy.
@@ -1586,7 +1602,10 @@ def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, w
         if state == "backoff":
             lines.extend(_status_field("logs", [f"tauceti workers logs {item['id']}"], width))
         if state == "halted":
-            resume = f"tauceti work --worker-id {item['id']} --clear-halt, then tauceti workers restart {item['id']}"
+            workers = "tauceti workers"
+            if config != default_workers_config().expanduser().resolve():
+                workers += f" --config {shlex.quote(str(config))}"
+            resume = f"{workers} clear-halt {item['id']}, then {workers} restart {item['id']}"
             lines.extend(_status_field("resume", [resume], width))
     return lines
 
@@ -2040,8 +2059,9 @@ def add_workers_parser(subparsers) -> None:
         "disable": "persist desired stopped state",
         "restart": "restart one worker without changing desired state",
         "remove": "remove a worker definition and stop it",
+        "clear-halt": "show and remove a worker's identity halt record, as that worker",
     }
-    for action in ("enable", "disable", "restart", "remove"):
+    for action in ("enable", "disable", "restart", "remove", "clear-halt"):
         item = actions.add_parser(action, help=descriptions[action])
         item.add_argument("worker_id", help="worker id")
     add = actions.add_parser("add", help="add an enabled persistent worker definition")
@@ -2195,6 +2215,8 @@ def cmd_workers(args) -> int:
         if action == "restart":
             restart_worker(config, args.worker_id)
             return 0
+        if action == "clear-halt":
+            return clear_worker_halt(config, args.worker_id)
         if action == "logs":
             item = next((item for item in worker_snapshots(config=config) if item["id"] == args.worker_id), None)
             if item is None:
