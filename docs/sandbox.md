@@ -76,6 +76,18 @@ revision and content-addressed GET routes are shared across rounds; containers
 cannot select another origin or upload, and their writable Lake views are
 discarded when the container is popped.
 
+## Lean toolchains from the host
+
+Bubble's image holds the Lean toolchain the round's target pins, and the
+container cannot download another. A round that merges a `main` with a newer
+`lean-toolchain` then has nothing to build with. `TAUCETI_BUBBLE_TOOLCHAINS=1`
+mounts each complete toolchain in the host's elan pool (`$ELAN_HOME/toolchains`)
+read-only at the same name under `/home/user/.elan/toolchains` in code-writing
+rounds, so a toolchain the host has installed is available without a download.
+A toolchain present in both places is served from the host's copy. The setting
+applies on Linux hosts only and adds one disk device per toolchain; review
+rounds are unaffected.
+
 ## Requirements
 
 Bubble needs a working [Incus](https://linuxcontainers.org/incus/) runtime.
@@ -100,9 +112,9 @@ snapshots they point to.
 
 What the worker mounts must itself sit under an allowed path: its state and
 data directories, the Python environment it is installed in,
-`TAUCETI_GITHUB_SHARED_DIR`, and a `TAUCETI_REVIEW_ENGINE_DIR` checkout. With
-`TAUCETI_VERIFY_HELPER=1`, set `TAUCETI_VERIFY_CACHE_DIR` as well, because its
-default is under `/tmp`.
+`TAUCETI_GITHUB_SHARED_DIR`, a `TAUCETI_REVIEW_ENGINE_DIR` checkout, and
+`ELAN_HOME` when host toolchains are mounted. With `TAUCETI_VERIFY_HELPER=1`,
+set `TAUCETI_VERIFY_CACHE_DIR` as well, because its default is under `/tmp`.
 
 The worker changes no ownership or permissions for the container. Connecting
 the container to the project's bridge and mapping the host user onto the
