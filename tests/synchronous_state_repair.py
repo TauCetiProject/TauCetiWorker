@@ -65,6 +65,18 @@ class StateRepair(unittest.TestCase):
         body = json.loads(read.call_args.args[0].data)
         self.assertEqual(body["expected_head"], HEAD)
 
+    def test_refresh_without_a_token_is_sent_anonymously(self):
+        result = dict(version=1, repository=TAUCETI, operation="pr", status="unavailable", retry_at=0)
+        env = {k: v for k, v in os.environ.items() if k != "TAUCETI_GITHUB_STATE_TOKEN_FILE"}
+        with (
+            patch.dict(os.environ, {**env, "TAUCETI_GITHUB_STATE_URL": "https://state.example"}, clear=True),
+            patch.object(state.urllib.request, "urlopen", return_value=io.BytesIO(json.dumps(result).encode())) as read,
+        ):
+            state.refresh_pr(TAUCETI, 7, HEAD)
+        request = read.call_args.args[0]
+        self.assertIsNone(request.get_header("Authorization"))
+        self.assertEqual(json.loads(request.data)["number"], 7)
+
     def test_old_server_and_timeout_are_optional_capability_failures(self):
         token = self.root / "token"
         token.write_text("private-test-token")
