@@ -1548,7 +1548,20 @@ class Controller:
             return "staging"
         head = self._head()
         if head is not None:
-            return "staging" if head["id"] == task["batch_id"] else "worker"
+            if head["id"] == task["batch_id"]:
+                return "staging"
+            if task["kind"] == TASK_PREPARE and not self._pre_rebased_prepare(task):
+                first = self._open_batch()
+                if (
+                    first is not None
+                    and first["id"] == task["batch_id"]
+                    and not self._state("inference_hold")
+                    and self._pre_rebase_blocked(head) is None
+                ):
+                    # Finish useful source work, then release the old-base owner so
+                    # the successor can rebase. Its rebased worker may run full checks.
+                    return "staging"
+            return "worker"
         first = self._open_batch()
         ready = (
             first is not None
