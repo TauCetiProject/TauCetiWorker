@@ -139,8 +139,10 @@ which lasts about ten days, is within two days of expiry, or when the usage
 endpoint answers 401. It leaves the file alone unless `cli_auth_credentials_store`
 resolves to `file` both for the worker's own Codex directory and for the one that
 holds that `auth.json`, counting `/etc/codex/config.toml`, the requirements files
-in `/etc/codex` and any managed `com.openai.codex` preference as Codex does. A
-stop signal that arrives during the exchange takes effect once the new token is
+in `/etc/codex` and any managed `com.openai.codex` preference as Codex does. It
+also leaves it alone for a business, education or enterprise plan, or one it does
+not recognise, since Codex applies a workspace's cloud policy to those, and that
+policy can choose the store. A stop signal that arrives during the exchange takes effect once the new token is
 saved.
 
 **Only turn it on when nothing else uses that credential file.** Claude and Codex
