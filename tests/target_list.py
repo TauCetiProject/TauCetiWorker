@@ -292,6 +292,18 @@ class Round(unittest.TestCase):
         self.assertIn("source-targets.json", prompt)
         self.claims.begin_target_work.assert_called_once_with("MeasureTheory", "kolmogorov-zero-one")
 
+    def test_open_pull_requests_on_the_other_forge_put_items_in_flight(self):
+        from tauceti_worker.survey import work_target_keys
+
+        self.path.write_text("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `first` — a\n- [ ] `second` — b\n")
+        targets = work_target_keys(marker("Algebra", "first"))
+        self.w.cross_source_targets = [{"source": "forgejo", "pr": 5, "head": "a" * 40, "targets": targets}]
+        for _ in range(2):
+            self.assertIn("Your target is assigned: `second` in `Algebra`", self.author())
+        self.assertIn("  - [~] `first` — a", self.prompts[-1])
+        self.claims.begin_target_work.assert_called_with("Algebra", "second")
+        self.assertEqual(t.inventory_keys([{"targets": [*targets, "junk", '["x"]']}, {}]), {("Algebra", "first")})
+
     def test_live_statuses_reach_the_prompt(self):
         self.w.gh = github(merged=[(7, marker("Probability", "truncation-bounds"))])
         prompt = self.author("Probability")
