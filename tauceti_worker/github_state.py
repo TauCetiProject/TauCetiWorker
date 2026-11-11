@@ -336,6 +336,16 @@ def _cooldown(state, operation, until, reason):
     return {**state, "coverage_until": until, "coverage_reason": reason}
 
 
+# The survey's first page builds the whole planning snapshot (about 2,700 PRs and 1 MB in
+# November 2026). A cold build takes 5-6s, so the ordinary five-second budget abandoned every
+# survey whose service cache had expired and left workers selecting from a stale local snapshot.
+SURVEY_FIRST_PAGE_SECONDS = 15
+
+
+def _first_page_seconds(operation: str) -> float:
+    return SURVEY_FIRST_PAGE_SECONDS if operation == "survey" else 5
+
+
 def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=False, _optional=False, **args):
     """Return (available, data). Failed transport/config/coverage falls back; bad queries raise.
 
@@ -434,7 +444,7 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
                 transport.atomic(circuit, {**state, "probe": probe, "probe_until": now + PROBE_LEASE})
     except OSError:
         state = {}
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + _first_page_seconds(operation)
     last = _Failure("transport")
     for attempt in range(2):
         rows, cursor, cursors, revision = [], None, set(), None

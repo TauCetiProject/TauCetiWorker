@@ -344,4 +344,21 @@ with (
     Path(tmp + "/token").write_text("malformed-json-client")
     with patch.object(state.urllib.request, "urlopen", side_effect=lambda *_a, **_kw: Response([])):
         assert state.read("org/repo", "issue_comments", number=7) == (False, None)
+    # A cold survey snapshot takes 5-6s to build; its first page gets a longer budget than other reads.
+    clock = [0.0]
+    budgets = []
+
+    def cold_survey(request, timeout):
+        budgets.append(timeout)
+        clock[0] += 6
+        return Response({**payload, "operation": "survey", "data": [{"id": "1"}]})
+
+    Path(tmp + "/token").write_text("cold-survey-client")
+    with (
+        patch.object(state.time, "monotonic", side_effect=lambda: clock[0]),
+        patch.object(state.urllib.request, "urlopen", side_effect=cold_survey),
+    ):
+        assert state.read("org/repo", "survey")[0]
+        assert budgets == [state.SURVEY_FIRST_PAGE_SECONDS]
+    assert state._first_page_seconds("issue_comments") == 5
 print("PASS: shared-state freshness, fallback, conditional reads and configurable cutoff")
