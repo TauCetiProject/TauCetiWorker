@@ -487,6 +487,17 @@ class Round(Tmp):
         with patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS": ""}):
             self.assertEqual(curate.due(other), (False, "no target list is set (--roadmap-targets)"))
 
+    def test_a_first_look_that_stops_early_leaves_the_list_due(self):
+        with (
+            patch.object(curate, "_curate", side_effect=tc.Die("admission refused")),
+            self.assertRaises(tc.Die),
+        ):
+            self.curate()
+        self.assertTrue(self.path.with_name(".targets.md.lock").exists())
+        self.w.counters.write(curate.ATTEMPT_KEY, 0)
+        self.assertTrue(curate.due(self.w.counters)[0])
+        self.assertTrue(curate.due(tc.Counters(SimpleNamespace(state=self.tmp / "other")))[0])
+
 
 class Wiring(Tmp):
     def round(self, only, *, due=(True, "the target list is due a look"), outcome=0, **opts):

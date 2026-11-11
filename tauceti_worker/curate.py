@@ -501,7 +501,13 @@ def run(w, c, profile) -> int | None:
     w.counters.write(ATTEMPT_KEY, int(time.time()))
     lock = _lock_path(path)
     try:
-        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o664)
+        try:
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o664)
+            # A new lock records no look yet; its modification time is when one last completed.
+            with contextlib.suppress(OSError):
+                os.utime(fd, (0, 0))
+        except FileExistsError:
+            fd = os.open(lock, os.O_RDWR)
     except OSError as error:
         c.reason = f"the lock {lock} cannot be opened ({error.strerror})"
         log(f"curate: {c.reason}; the target list is left as it is")
