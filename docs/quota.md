@@ -201,8 +201,11 @@ reads that file before Claude work starts, on macOS as elsewhere, without a
 request: a missing file, or a token past its `expiresAt` with no refresh token,
 makes Claude unavailable whatever the usage login reports. With
 `CLAUDE_CODE_OAUTH_TOKEN` set the file is not checked: host agents inherit that
-variable and authenticate with it instead. A `--bubble` worker still checks it,
-because the agent in the container is given the file and not the variable.
+variable and authenticate with it instead. The file is still checked when the
+worker's phases include one whose agent is given the file and not the variable:
+any Bubble-eligible phase under `--bubble` (`progress` and `overlap-scan` stay on
+the host), and `security-audit`, whose agent runs in a private home with a copy
+of the file.
 
 ## macOS and the login Keychain
 
