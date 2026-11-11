@@ -3819,7 +3819,7 @@ exit 1
         self.assertIn("`.tauceti-repair/build <Module> ...` waits for the lock", prompt)
         self.assertIn("`--dependents` adds the modules importing them", prompt)
         self.assertIn("build finished, exit N, M errors total", prompt)
-        self.assertIn("the worker runs the final full build, audits and lint", prompt)
+        self.assertIn("the worker completes its assigned verification before submission", prompt)
         # The scoped build helper waited for the lock, ran lake for the named module and returned its status.
         agent = json.loads((self.stub_dir / "stream-agent.json").read_text())
         self.assertEqual(agent["helper_rc"], 0, agent)
@@ -4780,8 +4780,12 @@ class WorkerAudits(Fixture):
         cfg = self.config()
         with patch.object(repair_audit, "check", side_effect=AssertionError("duplicate discovery checks")):
             outcome = repair_task.claim_and_run(cfg, self.client(cfg))
-        self.assertEqual(outcome["status"], "adopted", outcome)
-        self.assertEqual(outcome["verification"][-1]["build"]["rc"], 0)
+        if self.BROKEN:
+            self.assertEqual(outcome["status"], "adopted", outcome)
+            self.assertEqual(outcome["verification"][-1]["build"]["rc"], 0)
+        else:
+            self.assertEqual((outcome["status"], outcome["reason"]), ("released", "prepared_clean"), outcome)
+            self.assertNotIn("verification", outcome)
 
     def test_lint_checkpoint_survives_lost_receipt_and_continues_on_a_new_claim(self):
         self.service.tasks[1].setdefault("extra", {})["can_checkpoint_repair"] = True
