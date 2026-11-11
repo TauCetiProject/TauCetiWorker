@@ -32,6 +32,7 @@ A [managed worker](workers.md) gets both through its `env` table.
 <dir>/.decide.lock               the decide phase's lock and last-round time
 <dir>/.records.lock              held while a live record is written or acknowledged
 <dir>/drafts/roadmap-<pr>.md     roadmap changes the decide phase drafted
+<dir>/closures.log               one line per closure the decide phase attempted
 ```
 
 The worker writes live files only, each by a rename from a temporary file in

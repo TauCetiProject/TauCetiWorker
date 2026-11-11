@@ -833,16 +833,18 @@ def test_close(tmp):
     )
     check("…the evidence", why, "#41, #42 merged and add all 1 declaration(s) this pull request adds")
     check("…posted with the comment", (comment in hub.closed[0][1], why in hub.closed[0][1]), (True, True))
-    with settings(root):
-        for n in (7, 8):
-            incidents.record(incidents.RULING, f"declined-fix-{n}", ruling="close")
     check(
-        "the daily limit counts the directory's close rulings",
-        attempt(TAUCETI_DECIDE_MAX_CLOSES_PER_DAY="2"),
-        (False, "today's limit of 2 closure(s) is used", []),
+        "every closure is logged",
+        (root / decide.CLOSURES).read_text().split()[1:],
+        ["#1", "head-1"],
+    )
+    check(
+        "the daily limit counts the log, whatever became of the rulings",
+        attempt(TAUCETI_DECIDE_MAX_CLOSES_PER_DAY="1"),
+        (False, "today's limit of 1 closure(s) is used", []),
     )
     clock[0] += 86400
-    check("…and starts again the next day", attempt(TAUCETI_DECIDE_MAX_CLOSES_PER_DAY="2")[0], True)
+    check("…and starts again the next day", attempt(TAUCETI_DECIDE_MAX_CLOSES_PER_DAY="1")[0], True)
 
     root = tmp / "close-round"
     asked = answer(
@@ -876,6 +878,19 @@ def test_close(tmp):
         )
         rounds(tmp, hub)
         check("the closed pull request's ruling is retired", where(root, "ruling-declined-fix-1.json"), ["acked"])
+    with settings(root, TAUCETI_DECIDE_CLOSE="1", TAUCETI_DECIDE_MAX_CLOSES_PER_DAY="3"):
+        (root / decide.CLOSURES).unlink()
+        for cycle in range(5):
+            hub.prs[1] = {"head": f"reopened-{cycle}"}
+            incidents.record_declined("fix", 1, f"reopened-{cycle}", message="reopened")
+            rounds(tmp, hub, answer((1, "close", {"subsumed_by": [41], "comment": comment})))
+            rounds(tmp, hub)
+        check(
+            "a pull request reopened and closed again counts each time",
+            ([n for n, _ in hub.closed].count(1), len((root / decide.CLOSURES).read_text().splitlines())),
+            (4, 3),
+        )
+    with settings(root, TAUCETI_DECIDE_CLOSE="1"):
         hub.prs[5] = {}
         declined(5)
         refused = rounds(tmp, hub, answer((5, "close", {"subsumed_by": [41], "comment": comment})), claims=Claims({5}))

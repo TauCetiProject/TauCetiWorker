@@ -709,6 +709,7 @@ EFFECTS[ROADMAP_CHANGE] = _roadmap
 CLOSE = "close"
 CLOSE_ENV = "TAUCETI_DECIDE_CLOSE"
 CLOSES_ENV = "TAUCETI_DECIDE_MAX_CLOSES_PER_DAY"
+CLOSURES = "closures.log"
 _DECLARATION = re.compile(
     r"\+\s*(?:@\[[^\]]*\]\s*)*((?:(?:private|protected|noncomputable|unsafe|partial|nonrec|scoped|local)\s+)*)"
     r"(?:theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom)\s+([^\s:({\[⦃]+)"
@@ -737,11 +738,31 @@ def added_declarations(diff: str, *, private: bool = False) -> set[str]:
 
 
 def closes_today() -> int:
+    """The closures attempted today (UTC), from the directory's closure log. Raises OSError when
+    the log exists but cannot be read."""
+    root = incidents.directory()
     today = time.strftime("%Y-%m-%d", time.gmtime())
-    return sum(
-        value.get("ruling") == CLOSE and str(value.get("last_at") or "").startswith(today)
-        for _path, value in incidents.records(incidents.RULING)
-    )
+    try:
+        lines = (root / CLOSURES).read_text().splitlines() if root else []
+    except FileNotFoundError:
+        return 0
+    return sum(line.startswith(today) for line in lines)
+
+
+def _log_closure(pr: int, head: str) -> bool:
+    """Append one line to the closure log, which nothing rewrites, so the daily limit counts every
+    attempt however the ruling records are later replaced or acknowledged."""
+    root = incidents.directory()
+    if root is None:
+        return False
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with open(root / CLOSURES, "a") as log_file:
+            log_file.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} #{pr} {head}\n")
+    except OSError as error:
+        log(f"decide: the closure log under {root} was not written: {error}")
+        return False
+    return True
 
 
 def _closable(gh, pr: int, head: str, login: str) -> str:
@@ -769,8 +790,11 @@ def close_subsumed(gh, pr: int, head: str, subsumed_by: list[int], comment: str,
     pull request itself is read again once the diffs are in, immediately before closing."""
     if not close_enabled():
         return False, f"{CLOSE_ENV} is not on"
-    if closes_today() >= max_closes():
-        return False, f"today's limit of {max_closes()} closure(s) is used"
+    try:
+        if closes_today() >= max_closes():
+            return False, f"today's limit of {max_closes()} closure(s) is used"
+    except (OSError, UnicodeDecodeError):
+        return False, "the closure log could not be read"
     named = ", ".join(f"#{n}" for n in subsumed_by)
     with read_context(fresh=True, direct=True):
         if refused := _closable(gh, pr, head, login):
@@ -796,6 +820,8 @@ def close_subsumed(gh, pr: int, head: str, subsumed_by: list[int], comment: str,
         f"Closed by an automated worker's decide phase, ruling on this pull request at `{head[:12]}`. "
         "Reopen it if this is wrong."
     )
+    if not _log_closure(pr, head):
+        return False, "the closure could not be logged for the daily limit"
     if not gh.close_pr(pr, body):
         return False, "the closure could not be confirmed"
     return True, evidence

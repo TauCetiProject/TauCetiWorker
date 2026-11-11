@@ -203,8 +203,10 @@ repository; a person reads the draft and files the change, or does not.
 all of these hold at the moment of closing:
 
 - `TAUCETI_DECIDE_CLOSE` is on, and fewer than
-  `TAUCETI_DECIDE_MAX_CLOSES_PER_DAY` `close` rulings were recorded in the
-  directory today (UTC).
+  `TAUCETI_DECIDE_MAX_CLOSES_PER_DAY` closures were attempted today (UTC),
+  counted from `closures.log` in the incident directory. Each attempt appends
+  one line (time, pull request, head) before the pull request is closed; a log
+  that cannot be read or written refuses the closure.
 - The worker holds the pull request's branch claim. Where the claim cannot be
   registered at all, a repair round goes on unclaimed; a closure does not.
 - A fresh read shows the pull request open, not a draft, at the head the
