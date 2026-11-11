@@ -95,6 +95,7 @@ as `ruling-<incident kind>-<stage>-<pr>.json`. Beside the
 | `repository`, `stage`, `pr`, `head` | | Copied from the incident |
 | `incident` | string | `declined` or `budget-spent` |
 | `incident_at` | string | The incident's `last_at` when it was ruled on |
+| `incident_version` | string | `incidents.version()` of the incident record it rules on: two writes of a record never share it, even within one second. A `retry` lifts the hold only while the latest `declined` record at its head has this version. |
 | `ruling` | string | The ruling's name |
 | `by` | string | `model`, or `recheck` for the follow-up to a ruling that waited |
 | `note` | string | The reasoning, for whoever acts next; at most 1500 characters |
@@ -114,6 +115,7 @@ as `ruling-<incident kind>-<stage>-<pr>.json`. Beside the
  "head": "5f2c9d0e8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d",
  "incident": "declined",
  "incident_at": "2026-01-15T09:30:00Z",
+ "incident_version": "3c6d1f0a9b2e4d5c7a81",
  "key": "declined-rebase-412",
  "kind": "ruling",
  "last_at": "2026-01-15T09:42:00Z",

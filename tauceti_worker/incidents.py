@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -231,16 +232,23 @@ def record_declined(stage: str, pr: int, head: str, *, reason: str = "", message
     )
 
 
+def version(value: dict) -> str:
+    """An identifier for one write of a record: two writes differ in `last_at` or `count`."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()[:20]
+
+
 def declined(stage: str, pr: int, head: str) -> bool:
     """Whether `stage` is held off `pr` at `head`: TAUCETI_HOLD_DECLINED is on, a `declined`
     record, live or acknowledged, names this head, and no `retry` ruling has been made on the
-    latest of them."""
+    latest of them, the live one where it names this head."""
     if not hold_declined():
         return False
     key = f"{stage}-{pr}"
-    written = [str(value.get("last_at") or "") for value in find(DECLINED, key) if value.get("head") == head]
-    return bool(written) and not any(
-        value.get("ruling") == "retry" and value.get("head") == head and value.get("incident_at") == max(written)
+    latest = next((value for value in find(DECLINED, key) if value.get("head") == head), None)
+    return latest is not None and not any(
+        value.get("ruling") == "retry"
+        and value.get("head") == head
+        and value.get("incident_version") == version(latest)
         for value in find(RULING, f"{DECLINED}-{key}")
     )
 

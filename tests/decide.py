@@ -378,31 +378,38 @@ def test_rounds(tmp):
 
     root = tmp / "rewritten"
     with settings(root):
-        declined(1, 2)
-        hub = Hub(p1={}, p2={})
+        declined(1, 2, 3)
+        hub = Hub(p1={}, p2={}, p3={})
 
         def push_and_decline():
             hub.prs[1]["head"] = "head-1b"
             incidents.record_declined("fix", 1, "head-1b", message="declined at the new head")
+            incidents.record_declined("fix", 3, "head-3", message="declined again within the second")
             later()
             declined(2)
 
-        rounds(tmp, hub, answer((1, "retry", {}), (2, "retry", {})), meanwhile=push_and_decline)
+        rounds(tmp, hub, answer((1, "retry", {}), (2, "retry", {}), (3, "retry", {})), meanwhile=push_and_decline)
         check(
-            "an incident rewritten while the model ruled stays live: a new head, a same-head refresh",
-            [where(root, f"declined-fix-{n}.json") for n in (1, 2)],
-            [["live"]] * 2,
+            "an incident rewritten while the model ruled stays live: a new head, a later or same-second refresh",
+            [where(root, f"declined-fix-{n}.json") for n in (1, 2, 3)],
+            [["live"]] * 3,
+        )
+        same = incidents.find(incidents.DECLINED, "fix-3")[0]
+        check(
+            "…the same-second refresh has no ruling of its own",
+            (same["count"], same["last_at"] == ruling(root, "declined-fix-3")["incident_at"], decide.ruling_on(same)),
+            (2, True, None),
         )
         check(
-            "…and stays held",
-            (incidents.declined("fix", 1, "head-1b"), incidents.declined("fix", 2, "head-2")),
-            (True, True),
+            "…and each stays held",
+            [incidents.declined("fix", n, head) for n, head in ((1, "head-1b"), (2, "head-2"), (3, "head-3"))],
+            [True] * 3,
         )
         seen = rounds(tmp, hub, {"rulings": []})
         check(
             "…until it is ruled on in its own right",
             [(c["case"], c["head"]) for c in seen["packet"]["cases"]],
-            [("declined-fix-1", "head-1b"), ("declined-fix-2", "head-2")],
+            [("declined-fix-1", "head-1b"), ("declined-fix-3", "head-3"), ("declined-fix-2", "head-2")],
         )
 
     root = tmp / "locked"

@@ -91,12 +91,12 @@ def _usable(value: dict) -> bool:
 
 
 def ruling_on(incident: dict) -> dict | None:
-    """The ruling that stands on `incident`: made at its head, since the incident was last written."""
+    """The ruling that stands on `incident`: made on this write of it."""
     return next(
         (
             value
             for value in incidents.find(incidents.RULING, case_id(incident))
-            if value.get("head") == incident["head"] and value.get("incident_at") == incident["last_at"]
+            if value.get("head") == incident["head"] and value.get("incident_version") == incidents.version(incident)
         ),
         None,
     )
@@ -134,6 +134,7 @@ def _record(incident: dict, ruling: str, by: str, **fields) -> Path | None:
         head=incident["head"],
         incident=incident["kind"],
         incident_at=incident["last_at"],
+        incident_version=incidents.version(incident),
         ruling=ruling,
         by=by,
         retried=retried[-5:],
