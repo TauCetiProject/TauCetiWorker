@@ -48,6 +48,7 @@ from .targets import (
     overlay_live,
     parse_targets,
     partial_prs,
+    render_item,
     rewrite_item,
 )
 
@@ -216,11 +217,16 @@ def evidence(checkout: Path, item: TargetItem) -> dict[str, list[str]]:
     return {**found, f"slug {item.slug}": by_slug} if by_slug else found
 
 
-def _fingerprint(checkout: Path, item: TargetItem, hits: dict[str, list[str]]) -> str:
-    """Identifies what a verdict on `item` was given on: its description, the names looked up, and
-    the whole of every checkout file a hit is in, since a declaration's statement runs on past the
-    line that names it."""
-    digest = hashlib.sha256(json.dumps([item.text, sorted(hits)]).encode())
+def context(targets: Targets, item: TargetItem) -> tuple[str, str]:
+    """The list's goal (its preamble) and the item's line as the authoring prompt shows them."""
+    return targets.preamble, render_item(targets, item)
+
+
+def _fingerprint(checkout: Path, item: TargetItem, hits: dict[str, list[str]], around: tuple[str, ...] = ()) -> str:
+    """Identifies what a verdict on `item` was given on: its description and `around` (its
+    `context`), the names looked up, and the whole of every checkout file a hit is in, since a
+    declaration's statement runs on past the line that names it."""
+    digest = hashlib.sha256(json.dumps([item.text, list(around), sorted(hits)]).encode())
     for file in sorted({hit.split(":", 1)[0] for found in hits.values() for hit in found}):
         digest.update(b"\0" + file.encode() + b"\0")
         with contextlib.suppress(OSError):
@@ -241,9 +247,9 @@ def confirmed(checkout: Path, verdict) -> str | None:
     return f"{file} {name}" if declared(checkout, re.escape(name.rsplit(".", 1)[-1]), pathspec=file) else None
 
 
-def ask(w, profile, checkout: Path, candidates: list[tuple[TargetItem, dict]]) -> dict:
-    """Put the candidates and their hits to one host agent and return the `verdicts.json` it wrote,
-    `{}` when it wrote none that parses."""
+def ask(w, profile, checkout: Path, targets: Targets, candidates: list[tuple[TargetItem, dict]]) -> dict:
+    """Put the list's goal, the candidates and their hits to one host agent and return the
+    `verdicts.json` it wrote, `{}` when it wrote none that parses."""
     from .agents import fill_prompt, run_agent_host
     from .claude_api import blocked_failure
 
@@ -252,10 +258,20 @@ def ask(w, profile, checkout: Path, candidates: list[tuple[TargetItem, dict]]) -
     work.mkdir(parents=True)
     listing, verdicts = work / "candidates.json", work / "verdicts.json"
     rows = [
-        {"slug": it.slug, "area": it.area, "milestone": it.text, "hits": {k: v[:MAX_HITS] for k, v in hits.items()}}
+        {
+            "slug": it.slug,
+            "area": it.area,
+            "milestone": it.text,
+            "line": context(targets, it)[1],
+            "hits": {name: found[:MAX_HITS] for name, found in hits.items()},
+        }
         for it, hits in candidates
     ]
-    listing.write_text(json.dumps({"checkout": str(checkout), "candidates": rows}, indent=1, ensure_ascii=False))
+    listing.write_text(
+        json.dumps(
+            {"checkout": str(checkout), "goal": targets.preamble, "candidates": rows}, indent=1, ensure_ascii=False
+        )
+    )
     prompt = fill_prompt(
         HERE / "prompts" / "curate.md", CANDIDATES=str(listing), CHECKOUT=str(checkout), VERDICTS=str(verdicts)
     )
@@ -422,14 +438,14 @@ def _landed_elsewhere(w, profile, live: Targets) -> list[Change]:
     candidates = []
     for it in eligible:
         hits = evidence(checkout, it)
-        if hits and memo.get(it.slug) != _fingerprint(checkout, it, hits):
+        if hits and memo.get(it.slug) != _fingerprint(checkout, it, hits, context(live, it)):
             candidates.append((it, hits))
         if len(candidates) >= MAX_CANDIDATES:
             break
     changes = []
     if candidates:
         log(f"curate: asking about {len(candidates)} eligible item(s) that main declares by name")
-        verdicts = ask(w, profile, checkout, candidates)
+        verdicts = ask(w, profile, checkout, live, candidates)
         for it, hits in candidates:
             verdict = verdicts.get(it.slug)
             where = confirmed(checkout, verdict)
@@ -437,7 +453,7 @@ def _landed_elsewhere(w, profile, live: Targets) -> list[Change]:
                 clause = f"landed elsewhere: {where}"
                 changes.append(Change(it, "done", f"landed elsewhere, {where}", ("in flight",), (clause,)))
             elif isinstance(verdict, dict) and verdict.get("landed") is False:
-                memo[it.slug] = _fingerprint(checkout, it, hits)
+                memo[it.slug] = _fingerprint(checkout, it, hits, context(live, it))
                 log(f"curate: `{it.slug}` has not landed: {one_line(str(verdict.get('missing') or ''))[:160]}")
             else:
                 log(f"curate: `{it.slug}`: no usable verdict; it stays open")

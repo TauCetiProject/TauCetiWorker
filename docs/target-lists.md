@@ -137,12 +137,14 @@ for declarations of the Lean names the description quotes in backticks (dotted,
 capitalised or with an underscore), and of the slug's words in any case with or
 without underscores between them. An item qualifies when every quoted name is
 declared, or the slug is. Up to `TAUCETI_CURATE_MAX_CANDIDATES` qualifying
-items (12 by default), in file order, go to one host agent with those hits; it
-reads the checkout and answers per item with `landed` and, when true, a file
+items (12 by default), in file order, go to one host agent with those hits,
+each item's line as the authoring prompt shows it, and the list's preamble as
+the goal they serve; it reads the checkout and answers per item with `landed` and, when true, a file
 and a declaration. The worker ticks the item only if that file of the checkout
 declares that name, and writes the file and name it checked, so the list gains
 nothing else of the model's answer. An item found not landed is not asked about again
-until its description, or a file of main that declares what it names, changes;
+until its line, the preamble, or a file of main that declares what it names
+changes;
 every such file counts, though the agent is shown at most five hits per name. This is the phase's only model
 call, with the worker's authoring model; a look with no qualifying item starts
 no model.

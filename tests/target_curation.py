@@ -454,6 +454,8 @@ class Round(Tmp):
         self.assertEqual(listing["checkout"], str(self.checkout))
         self.assertEqual([row["slug"] for row in listing["candidates"]], ["kolmogorov-zero-one"])
         self.assertEqual(listing["candidates"][0]["milestone"], "tail events have probability 0 or 1")
+        self.assertTrue(listing["goal"].startswith("Goal: the strong law for i.i.d. integrable variables."))
+        self.assertIn("(serves: G2; needs: `borel-cantelli` [x])", listing["candidates"][0]["line"])
         for told in (str(self.checkout), str(self.w.cfg.state / "curate" / "work" / "verdicts.json")):
             self.assertIn(told, prompt)
         self.assertNotIn("__", prompt)
@@ -474,6 +476,15 @@ class Round(Tmp):
         self.assertEqual((len(self.asked), self.path.read_text()), (2, EXAMPLE))
         self.assertEqual(self.curate()[0], None)
         self.assertEqual(len(self.asked), 3)
+
+    def test_a_not_landed_verdict_is_asked_for_again_when_the_goal_changes(self):
+        self.verdicts = {"kolmogorov-zero-one": {"landed": False, "missing": "only for square-integrable"}}
+        self.curate()
+        self.curate()
+        self.path.write_text(EXAMPLE.replace("i.i.d. integrable", "i.i.d. square-integrable"))
+        self.curate()
+        self.assertEqual(len(self.asked), 2)
+        self.assertIn("square-integrable", self.asked[1][1]["goal"])
 
     def test_a_closed_pull_request_is_left_to_the_operator(self):
         self.w.gh = self.github(states={1234: {"state": "CLOSED", "title": "Truncation bounds"}})

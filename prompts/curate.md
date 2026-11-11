@@ -3,8 +3,11 @@ branch of Tau Ceti. This is a read-only investigation. Do not change any file
 outside the one result file, do not build, and do not use Git, GitHub or the
 network.
 
-Read __CANDIDATES__. Each candidate has a `slug`, a roadmap `area`, the
-`milestone` as its author described it, and `hits`: for a Lean name the
+Read __CANDIDATES__. Its `goal` is what the whole plan is for, in its author's
+words; read each milestone in that light, since a milestone's own description
+can be shorter than what the goal needs. Each candidate has a `slug`, a roadmap
+`area`, the `milestone` as its author described it, its `line` in the plan with
+the milestones it needs, and `hits`: for a Lean name the
 description quotes, or for the slug itself, the lines of main that declare a
 declaration of that name, as `path:line:text`. The paths are relative to the
 checkout of main at __CHECKOUT__. Read the declarations there, and whatever
