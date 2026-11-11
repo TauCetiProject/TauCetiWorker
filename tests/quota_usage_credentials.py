@@ -122,6 +122,33 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
+# 0b) A `~/…` value means the operator's home, also after isolation moves $HOME off macOS.
+tmp = Path(tempfile.mkdtemp())
+saved_env = dict(os.environ)
+try:
+    real = tmp / "real"
+    (real / "usage").mkdir(parents=True)
+    (real / "usage" / ".credentials.json").write_text(login("usage-access"))
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "TAUCETI_DATA_HOME"):
+        os.environ.pop(name, None)
+    os.environ.update({"HOME": str(real), VARIABLE: "~/usage"})
+    with (
+        patch.object(sys, "platform", "linux"),
+        patch.object(tc.agents, "_worker_iso_home", lambda wid, _base=None: tmp / "iso"),
+        patch.object(tc.agents, "share_build_caches", lambda wid, home: {}),
+    ):
+        tc.agents.isolate_home("worker1")
+    check("isolation moved $HOME", os.environ["HOME"], str(tmp / "iso"))
+    check(
+        "the usage login still resolves in the operator's home",
+        tc.quota.claude_usage_credentials(),
+        real / "usage" / ".credentials.json",
+    )
+finally:
+    os.environ.clear()
+    os.environ.update(saved_env)
+    shutil.rmtree(tmp, ignore_errors=True)
+
 
 def cases():
     # 1) Usage is read with the login, shared beside it, and the agents' token is neither sent to
