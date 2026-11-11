@@ -477,8 +477,29 @@ class ForgejoHaltTests(unittest.TestCase):
 
         os.environ.update(TAUCETI_WORKER_ID="w1", TAUCETI_WORKER_FORGES="forgejo")
         return worker_sources.activate(
-            worker_sources.native_source(SimpleNamespace(home=self.root)), SimpleNamespace(state=self.root / "native")
+            worker_sources.native_source(SimpleNamespace(home=self.root)),
+            SimpleNamespace(state=self.root.resolve() / "native"),
         )
+
+    def test_git_presents_the_credential_activation_verified(self):
+        from tauceti_worker.source_cli import load_source
+
+        self.serve({"id": 3, "login": "worker"})
+        token = Path(os.environ["TAUCETI_FORGEJO_TOKEN_FILE"])
+        bound = self.activation()  # The source, and its API token, exist before the file changes.
+        token.write_text("forgejo-other-token")
+        with bound:
+            fill = subprocess.run(
+                ["git", "credential", "fill"],
+                input="protocol=https\nhost=forgejo.test\n\n",
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertIn("password=forgejo-test-token\n", fill.stdout, fill.stderr)
+            self.assertEqual(load_source().api._token, "forgejo-test-token")
+            copy = Path(os.environ["TAUCETI_FORGEJO_TOKEN_FILE"])
+        self.assertFalse(copy.exists())
 
     def test_the_executing_actor_is_held_to_the_configured_user(self):
         from tauceti_worker.source_cli import load_source

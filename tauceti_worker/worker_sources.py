@@ -243,7 +243,12 @@ def activate(source, cfg):
         raise halt
     original = dict(os.environ)
     marker = _selected.set(source)
+    token_file = source.token_file
     try:
+        if expected is not None and source.token_file is not None:
+            # Git's helper and source subprocesses read their token file on each use. Give them the
+            # token verified above, so a file replaced during the round is never presented.
+            token_file = _verified_token_copy(cfg.state, source.api._token)
         directory = cfg.state / "bin"
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         real_gh = original.get("TAUCETI_REAL_GH") or shutil.which("gh")
@@ -256,7 +261,7 @@ def activate(source, cfg):
             "#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' -m tauceti_worker.source_claims "$@"\n'
         )
         claim_wrapper.chmod(0o700)
-        env = scoped_git_environment(source.repository.forge, token_file=source.token_file, purpose="workspace")
+        env = scoped_git_environment(source.repository.forge, token_file=token_file, purpose="workspace")
         profile = source.api.request("GET", "user")
         if profile.get("id") != int(actor.principal.native_id):
             raise SourceUnavailable("native commit author changed")
@@ -282,7 +287,7 @@ def activate(source, cfg):
             TAUCETI_SOURCE_CLAIM_NONCE=uuid.uuid4().hex,
             TAUCETI_SOURCE_PYTHON=sys.executable,
             TAUCETI_SOURCE_GH_CONF=str(cfg.state / "gh-project.toml"),
-            TAUCETI_FORGEJO_TOKEN_FILE=str(source.token_file),
+            TAUCETI_FORGEJO_TOKEN_FILE=str(token_file),
             TAUCETI_FORGEJO_ORIGIN=source.repository.forge.url,
             TAUCETI_FORGEJO_USER_ID=actor.principal.native_id,
             TAUCETI_PUSH_REMOTE=source.repository.clone_url,
@@ -299,6 +304,21 @@ def activate(source, cfg):
         os.environ.clear()
         os.environ.update(original)
         _selected.reset(marker)
+        if token_file != source.token_file:
+            token_file.unlink(missing_ok=True)
+
+
+def _verified_token_copy(state, token):
+    directory = state / "credential"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory.chmod(0o700)
+    path = directory / "forgejo-token"
+    staging = directory / f".forgejo-token-{uuid.uuid4().hex}"
+    descriptor = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "w") as stream:
+        stream.write(token)
+    os.replace(staging, path)
+    return path
 
 
 @contextlib.contextmanager
