@@ -10,6 +10,7 @@ dispatch needs are under "Open progress reports" in docs/reference.md.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -31,10 +32,21 @@ from .github import GitHub, GitHubError, _gh_rate_kind, _parse_iso8601, me, run
 from .work_units import progress_reports
 
 LEDGER = "progress/shepherd.json"
+# The roadmap repository whose ledger keeps the name LEDGER; any other gets its own file.
+DEFAULT_ROADMAP = "TauCetiProject/TauCetiRoadmap"
 FIELDS = ["number", "headRefName", "headRefOid", "createdAt", "isDraft", "url"]
 # The opening words of the comment the gate leaves when it refuses a report; its reason follows in
 # a fenced block.
 REFUSAL = "progress gate did not merge"
+
+
+def ledger_path(cfg) -> Path:
+    """The ledger of the configured roadmap repository: LEDGER for DEFAULT_ROADMAP, and
+    `shepherd.<digest>.json` beside it for any other, the digest as in incidents.subject."""
+    key = incidents.repository_ref(ROADMAP).key
+    if key == incidents.repository_ref(DEFAULT_ROADMAP).key:
+        return cfg.state / LEDGER
+    return (cfg.state / LEDGER).with_suffix(f".{hashlib.sha256(key.encode()).hexdigest()[:12]}.json")
 
 
 def _ledger(path: Path) -> dict[str, dict] | None:
@@ -207,7 +219,7 @@ def look(cfg) -> list[dict] | None:
     except GitHubError as exc:
         log(f"progress: could not list this account's open reports ({one_line(str(exc), 120)}); asking about none")
         return None
-    path = cfg.state / LEDGER
+    path = ledger_path(cfg)
     before = _ledger(path)
     if before is None:
         log(f"progress: {path} is unreadable, so no open report is asked about; delete it to start the count again")

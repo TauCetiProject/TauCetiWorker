@@ -85,7 +85,9 @@ class ProgressShepherdTests(unittest.TestCase):
 
         def pr_list(_self, fields, *, author=None, state="open", limit=200):
             self.listings += 1
-            self.assertEqual((_self.repo, fields, author, state), (ROADMAP, shepherd.FIELDS, "fixture", "open"))
+            self.assertEqual(
+                (_self.repo, fields, author, state), (shepherd.ROADMAP, shepherd.FIELDS, "fixture", "open")
+            )
             if self.listing is not None:
                 raise self.listing
             others = [{**report(1000 + n), "headRefName": f"roadmap/unrelated-{n}"} for n in range(self.others)]
@@ -97,7 +99,7 @@ class ProgressShepherdTests(unittest.TestCase):
 
         def run(argv, *, env=None, input_text=None, **_kwargs):
             body = json.loads(input_text)
-            recorded = json.loads(self.ledger.read_text())["reports"][body["inputs"]["pr"]]
+            recorded = json.loads(shepherd.ledger_path(self.cfg).read_text())["reports"][body["inputs"]["pr"]]
             self.dispatches.append((argv, env.get("TAUCETI_OUTBOX_REPLAY"), body, recorded["asks"]))
             result = self.result.pop(0) if isinstance(self.result, list) else self.result
             if isinstance(result, Exception):
@@ -301,6 +303,22 @@ class ProgressShepherdTests(unittest.TestCase):
         self.look(PROGRESS_SHEPHERD_GRACE + 5)
         self.assertEqual(len(self.dispatches), 1)
         self.assertEqual(self.entry()["asks"], 1)
+
+    def test_the_ledger_is_kept_per_roadmap_repository(self):
+        self.assertEqual(shepherd.ledger_path(self.cfg), self.ledger, "the default repository keeps its file")
+        self.ledger.parent.mkdir(parents=True)
+        before = {"version": 1, "reports": {"31": {"stuck": True}, "7": {"asks": 1, "asked_at": T0}}}
+        self.ledger.write_text(json.dumps(before))
+        self.open_reports.append(report(7, area="Other"))
+        with patch.object(shepherd, "ROADMAP", "Example/RoadmapB"), patch.object(wu, "ROADMAP", "Example/RoadmapB"):
+            self.look(PROGRESS_SHEPHERD_GRACE + 5)
+            other = shepherd.ledger_path(self.cfg)
+        self.assertEqual(sorted((d[2]["inputs"]["pr"], d[3]) for d in self.dispatches), [("31", 1), ("7", 1)])
+        self.assertNotEqual(other, self.ledger)
+        self.assertEqual(json.loads(self.ledger.read_text()), before)
+        self.assertEqual(sorted(json.loads(other.read_text())["reports"]), ["31", "7"])
+        self.look(PROGRESS_SHEPHERD_GRACE + 10)
+        self.assertEqual(len(self.dispatches), 2, "back on the default repository, its history holds")
 
     def test_a_failed_record_is_written_again_later(self):
         self.use_incidents()

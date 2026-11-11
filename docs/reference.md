@@ -533,8 +533,11 @@ Each ask is written to `state/progress/shepherd.json` before it is sent and is n
 publication outbox, so a round that dies or loses GitHub's answer does not send it again; that ask
 counts as made. One stopped by a rate limit or an expired login is not counted and is tried again
 half an hour later. An entry leaves the file when its report is no longer open. The file is per
-worker, so of several workers acting as one account each makes its own asks: set the key on one of
-them.
+worker and per roadmap repository: one other than `TauCetiProject/TauCetiRoadmap` has its own
+`state/progress/shepherd.<digest>.json`, the digest computed as for an
+[incident record's key](incidents.md#keys-and-sources), so a report never inherits the asks of
+another repository's report with its number. Being per worker, it lets each of several workers
+acting as one account make its own asks: set the key on one of them.
 
 The pass costs one listing per progress round, which a `threshold` round then also uses for its
 `--progress-max-open` count: up to 1000 of the account's open pull requests in the roadmap
