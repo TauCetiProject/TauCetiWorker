@@ -1036,9 +1036,8 @@ class HeadOperations(QueueFixture):
         self.assertEqual(self.repo.main_sha(), head["tip"])
         self.assertEqual(self.repo.file_at("main", "A.lean"), "a\n", "the accepted head landed, not the later push")
 
-    def test_infrastructure_failures_are_retried_with_backoff_and_bounded(self):
+    def test_infrastructure_failures_retry_with_capped_backoff_until_recovery(self):
         self.github.ci_policy = verdicts("infrastructure", "lost", "no-status", "infrastructure")
-        self.controller.set_setting("infrastructure_retry_limit", 3, "t")
         self.approve(101, {"A.lean": "a\n"})
         self.tick()
         head = self.head()
@@ -1069,15 +1068,15 @@ class HeadOperations(QueueFixture):
         self.run_ci()
         self.clock.advance(8 * backoff + 1)
         reasons = self.tick()
-        self.assertEqual(len(self.github.dispatches), 4, "bounded: the fourth infrastructure failure stops re-dispatch")
-        self.assertIn("retries exhausted", " ".join(reasons))
+        self.assertEqual(len(self.github.dispatches), 4, "the fourth failure was just observed")
+        self.assertNotIn("exhausted", " ".join(reasons))
         self.assertEqual(self.head()["id"], head["id"], "the head waits with its membership intact")
         self.assertEqual(
             self.controller.status()["counters"].get("tasks_repair", 0), 0, "infrastructure never makes a repair task"
         )
-        self.controller.retry_ci(PROJECT, "operator")
+        self.clock.advance(8 * backoff + 1)
         self.tick()
-        self.assertEqual(len(self.github.dispatches), 5)
+        self.assertEqual(len(self.github.dispatches), 5, "retries continue without an operator")
         self.run_ci()
         self.tick(2)
         self.assertEqual(self.repo.main_sha(), head["tip"])
