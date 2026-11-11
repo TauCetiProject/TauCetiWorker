@@ -1386,6 +1386,11 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     if getattr(args, "roadmap_targets", None) is not None:
         chosen = args.roadmap_targets.strip()
         os.environ["TAUCETI_ROADMAP_TARGETS"] = str(Path(chosen).expanduser().resolve()) if chosen else ""
+    if roadmap_targets() is not None and os.environ.get("TAUCETI_NEW_PR_FORGE", "github") != "github":
+        raise Die(
+            "--roadmap-targets authors on GitHub only: its live view reads GitHub pull requests. "
+            "Drop --new-pr-forge forgejo (Forgejo pull requests are still maintained with --forgejo)"
+        )
     if not one_round and roadmap_targets() is not None:
         from .targets import load_targets
 
