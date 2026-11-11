@@ -514,7 +514,7 @@ class ForgejoHaltTests(unittest.TestCase):
 
         tokens = []
         with patch.object(
-            git_credentials, "scoped_git_environment", side_effect=lambda forge, token: tokens.append(token) or {}
+            git_credentials, "scoped_git_environment", side_effect=lambda forge, token, **_: tokens.append(token) or {}
         ):
             github.pin_github_account("alice")
             with shared_github_environment():
