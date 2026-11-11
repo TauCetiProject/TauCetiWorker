@@ -2486,9 +2486,13 @@ PROGRESS_REPORT_SCAN = 1000
 def _progress_reports_held(w) -> str | None:
     """Why the threshold strategy may not plan a report now, or None: the account's open reports
     in the roadmap repository have reached progress_max_open, or could not be counted."""
+    from .github_transport import read_context
+
     limit = progress_max_open()
     try:
-        rows = GitHub(ROADMAP).pr_list(["number", "headRefName"], author=me(), limit=PROGRESS_REPORT_SCAN)
+        # A state mirror or cached listing can predate a report this account opened moments ago.
+        with read_context(fresh=True, direct=True, retry=False):
+            rows = GitHub(ROADMAP).pr_list(["number", "headRefName"], author=me(), limit=PROGRESS_REPORT_SCAN)
     except GitHubError as exc:
         reason = f"could not count this account's open reports ({one_line(str(exc), 120)})"
     else:

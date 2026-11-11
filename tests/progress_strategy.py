@@ -318,6 +318,28 @@ class ProgressStrategyTests(unittest.TestCase):
             f"could not count this account's open reports (more than {wu.PROGRESS_REPORT_SCAN}", self.due()[1]
         )
 
+    def test_threshold_counts_reports_from_github_not_the_state_mirror(self):
+        from tauceti_worker import github_state
+        from tauceti_worker import github_transport as transport
+
+        os.environ["TAUCETI_PROGRESS_STRATEGY"] = "threshold"
+        login = {"author": {"login": "fixture"}}
+        mirror = [{"number": 1, "headRefName": "progress/1/Area", **login}]
+        current = [{"number": n, "headRefName": f"progress/{n}/Area"} for n in (1, 2)]
+
+        def read(_repo, _operation, **_args):
+            return (False, None) if transport.direct_reads() else (True, mirror)
+
+        listing = subprocess.CompletedProcess([], 0, json.dumps(current), "")
+        with (
+            patch.object(github_state, "read", side_effect=read),
+            patch.object(wu.GitHub, "_gh", return_value=listing) as gh,
+            patch.object(wu, "me", return_value="fixture"),
+        ):
+            reason = wu._progress_reports_held(self.worker)
+        self.assertIn("2 report(s) of this account open (#1, #2)", reason or "")
+        self.assertEqual(gh.call_count, 1)
+
     def test_threshold_does_not_plan_when_the_count_is_unknown(self):
         os.environ["TAUCETI_PROGRESS_STRATEGY"] = "threshold"
         self.assertIsNone(self.round(listing=GitHubError("gh pr list failed: HTTP 502")))
