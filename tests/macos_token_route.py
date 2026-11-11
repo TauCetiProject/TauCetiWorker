@@ -42,6 +42,16 @@ OPERATOR = {"claudeAiOauth": {"accessToken": "OPERATOR", "refreshToken": "OPERAT
 USAGE = {"claudeAiOauth": {"accessToken": "USAGE", "refreshToken": "USAGE-R", "expiresAt": YEAR_MS}}
 
 
+def iso8601(delta_s):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + delta_s))
+
+
+USAGE_OK = {
+    "five_hour": {"utilization": 5, "resets_at": iso8601(600)},
+    "seven_day": {"utilization": 5, "resets_at": iso8601(3600)},
+}
+
+
 def setup_token(access):
     return {"claudeAiOauth": {"accessToken": access, "expiresAt": YEAR_MS, "scopes": ["user:inference"]}}
 
@@ -71,6 +81,7 @@ token_file.write_text(json.dumps(setup_token("TOKEN-1")))
 
 saved_env = dict(os.environ)
 saved = tc.subprocess.run, sys.platform, agents._worker_iso_home
+saved_http = tc.quota._http_get_json
 keychain = Keychain()
 try:
     for k in ("CODEX_HOME", "TAUCETI_DATA_HOME", "TAUCETI_AUTO_REFRESH", "TAUCETI_REFRESH_MIRROR"):
@@ -125,9 +136,33 @@ try:
     check("a missing token file stops the bubble launch", str(worker_file) in message, True)
     check("the message does not send the operator to the Keychain", "Keychain" in message, False)
 
+    # 7. The pacer checks the file agents launch from before admitting Claude work: an expired
+    #    setup-token blocks it however healthy the usage login is, and costs no usage request.
+    expired = {"claudeAiOauth": {"accessToken": "TOKEN-4", "expiresAt": int((time.time() - 60) * 1000)}}
+    for f in (token_file, worker_file):
+        f.write_text(json.dumps(expired))
+    requests = []
+
+    def usage_endpoint(url, headers, timeout=15):
+        requests.append(headers["Authorization"])
+        return 200, USAGE_OK, None
+
+    tc.quota._http_get_json = usage_endpoint
+    blocked = tc.Quota(cfg).claude(renew=True)
+    check("an expired token file blocks Claude work", blocked.available, False)
+    check("the error names the worker's token file", str(worker_file) in (blocked.error or ""), True)
+    check("no usage request is made for it", requests, [])
+
     check("the login Keychain was never read", keychain.calls, [])
+
+    # 8. Without a usage login the Keychain is the agents' credential, and the file is not checked.
+    os.environ.pop(VARIABLE)
+    admitted = tc.Quota(cfg).claude(renew=False)
+    check("no usage login: the expired file does not block Claude work", admitted.available, True)
+    check("no usage login: usage is read with the Keychain's token", requests, ["Bearer OPERATOR"])
 finally:
     tc.subprocess.run, sys.platform, agents._worker_iso_home = saved
+    tc.quota._http_get_json = saved_http
     os.environ.clear()
     os.environ.update(saved_env)
     shutil.rmtree(tmp, ignore_errors=True)
