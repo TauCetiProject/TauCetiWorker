@@ -94,7 +94,7 @@ CODEX_REQUIREMENT_FILES = (Path("/etc/codex/requirements.toml"), Path("/etc/code
 CODEX_MANAGED_PREFERENCES = Path("/Library/Managed Preferences")
 # The ChatGPT plans for which Codex fetches no cloud policy (0.160.0 `cloud_config_eligible_auth` in
 # codex-rs/cloud-config/src/service.rs; 0.167.1 `ChatGptSource::auth` in .../chatgpt.rs). That policy
-# can require a non-file store over every local layer and is fetched on demand, so a credential whose
+# can default the store below the user's config.toml and is fetched on demand, so a credential whose
 # plan is neither listed here nor named in $TAUCETI_CODEX_REFRESH_PLANS is never renewed.
 CODEX_NO_CLOUD_POLICY_PLANS = frozenset(
     {
@@ -945,9 +945,9 @@ def _write_json_atomic(path: Path, data: dict) -> None:
         raise
 
 
-def _codex_store_setting(path: Path) -> str | None:
-    """The `cli_auth_credentials_store` one Codex config file sets: None when the file or the key is
-    absent, the value when it is a string, an `unreadable:` reason otherwise."""
+def _codex_toml(path: Path) -> dict | str | None:
+    """One Codex config or requirements file: its table, None when it is absent, or an `unreadable:`
+    reason."""
     try:
         with open(path, "rb") as fh:
             data = tomllib.load(fh)
@@ -955,8 +955,15 @@ def _codex_store_setting(path: Path) -> str | None:
         return None
     except (OSError, tomllib.TOMLDecodeError) as e:
         return f"unreadable:{type(e).__name__}"
+    return data if isinstance(data, dict) else "unreadable:not-a-table"
+
+
+def _codex_store_setting(path: Path) -> str | None:
+    """The `cli_auth_credentials_store` one Codex config file sets: None when the file or the key is
+    absent, the value when it is a string, an `unreadable:` reason otherwise."""
+    data = _codex_toml(path)
     if not isinstance(data, dict):
-        return "unreadable:not-a-table"
+        return data
     if "cli_auth_credentials_store" not in data:
         return None
     value = data["cli_auth_credentials_store"]
@@ -2092,7 +2099,8 @@ class Quota:
     def _codex_effective_store(self, directory: Path | None = None) -> str | None:
         """_codex_credentials_store for a CODEX_HOME, with the administrator layers resolved in
         Codex's order: a requirements file or managed preference overrides the user's config.toml,
-        which overrides the system config. None only when every layer that applies says file or is
+        which overrides the system config. A requirements file that enrolls a `config_server` is a
+        reason in itself. None only when every layer that applies says file or is
         silent; a layer that exists but cannot be read is a reason, as it is for the user's."""
         if _codex_managed_preferences():
             return "managed-preferences"
@@ -2100,6 +2108,11 @@ class Quota:
             value = _codex_store_setting(path)
             if value is not None and value != "file":
                 return value
+            # Codex then fetches configuration from that server for every plan, and its defaults can
+            # set the store; what they say is not known here.
+            data = _codex_toml(path)
+            if isinstance(data, dict) and "config_server" in data:
+                return "config-server"
         if reason := self._codex_credentials_store(directory):
             return reason
         if _codex_store_setting((directory or codex_dir(self.cfg.home)) / "config.toml") is None:

@@ -106,10 +106,12 @@ def usage_seen(*answers):
     return seen, patch.object(tc.quota, "_http_get_json", side_effect=fake)
 
 
-def renews_with(tmp, files, *, expires_in=60, first=(200, USAGE_OK, None)):
+def renews_with(tmp, files, *, expires_in=60, first=(200, USAGE_OK, None), plan="plus", named=None):
     """Write `files` (path relative to tmp -> text), then make one renewing read. Returns how many
     token exchanges it made."""
-    quota, src, mirror, stale = setup(tmp, expires_in=expires_in)
+    quota, src, mirror, stale = setup(tmp, expires_in=expires_in, plan=plan)
+    if named is not None:
+        os.environ["TAUCETI_CODEX_REFRESH_PLANS"] = named
     for rel, text in files.items():
         path = tmp / rel
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -431,6 +433,31 @@ def startup(value):
 
 check("a well-formed setting passes the startup check", startup("edu_pro"), "reached")
 check("a malformed setting stops the command", "TAUCETI_CODEX_REFRESH_PLANS" in startup("edu pro"), True)
+
+
+# 6i) A `config_server` in a local requirements file makes Codex fetch configuration from that server
+#     for any plan, and its defaults can choose the store; nothing is renewed while one is enrolled.
+SERVER = '[config_server]\nbase_url = "https://config.invalid"\n'
+OK, UNAUTHORIZED = (200, USAGE_OK, None), (401, {}, None)
+for name, files, kwargs, want in (
+    ("requirements.toml", {"etc/codex/requirements.toml": SERVER}, {}, 0),
+    (
+        "requirements.toml, 401 path",
+        {"etc/codex/requirements.toml": SERVER},
+        {"expires_in": 5 * DAY, "first": UNAUTHORIZED},
+        0,
+    ),
+    ("managed_config.toml", {"etc/codex/managed_config.toml": SERVER}, {}, 0),
+    ("a named plan", {"etc/codex/requirements.toml": SERVER}, {"plan": "edu_pro", "named": "edu_pro"}, 0),
+    ("control: a named plan without one", {}, {"plan": "edu_pro", "named": "edu_pro"}, 1),
+    ("control: other requirements", {"etc/codex/requirements.toml": "allowed_login_methods = []\n"}, {}, 1),
+):
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        check(f"config server, {name}: exchanges", renews_with(tmp, files, **kwargs), want)
+    finally:
+        os.environ.pop("TAUCETI_CODEX_REFRESH_PLANS", None)
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # 6d) A stop signal that lands while the endpoint answers must not unwind before the answer is
