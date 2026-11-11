@@ -127,6 +127,7 @@ from .targets import (
     landed_pr,
     live_targets,
     load_targets,
+    open_pr,
     overlay_live,
     render_assignment,
     target_markers,
@@ -3044,11 +3045,18 @@ def _target_reads(source):
     return source if native or current() is None else _SharedGitHubReads(source)
 
 
-def _landed_link(item, source) -> str | None:
-    number = landed_pr(item, source)
+def _pull_link(source, number: int | None) -> str | None:
     if number is None:
         return None
     return source.repository.pull_url(number) if getattr(source, "direct_source", False) else f"#{number}"
+
+
+def _landed_link(item, source) -> str | None:
+    return _pull_link(source, landed_pr(item, source))
+
+
+def _open_link(item, source) -> str | None:
+    return _pull_link(source, open_pr(item, source))
 
 
 def assign_target(w, path: Path, only: str, skip: list[str]) -> tuple[Targets, TargetItem]:
@@ -3072,6 +3080,10 @@ def assign_target(w, path: Path, only: str, skip: list[str]) -> tuple[Targets, T
             merged = next((link for source in sources if (link := _landed_link(item, source)) is not None), None)
             if merged is not None:
                 log(f"target {name} landed in {merged}; mark it `[x]` in {path.name} — trying the next")
+                continue
+            opened = next((link for source in sources if (link := _open_link(item, source)) is not None), None)
+            if opened is not None:
+                log(f"target {name} is open in {opened} — trying the next")
                 continue
             rc = claims.begin_target_work(item.area, item.slug) if claims is not None else 2
             if rc == 1:

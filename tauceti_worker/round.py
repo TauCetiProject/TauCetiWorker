@@ -276,8 +276,11 @@ class Claims:
         """Take the authoring claim `author/<area>/<slug>` before the agent launches, so workers that
         share a target list settle who writes what. Returns claim.sh's verdict: 0 held (heartbeat
         running, released with the round), 1 held by another worker, 2 the claim could not be
-        registered. Cooperative only: it sets none of the push-arbiter env, and losing the lease
-        mid-round is logged without stopping the agent."""
+        registered. A claim still held from earlier in the round is released first. Cooperative only:
+        it sets none of the push-arbiter env, and losing the lease mid-round is logged without
+        stopping the agent."""
+        if self.held:
+            self.release()  # a branch claim from a repair that fell through to authoring
         key = f"author/{area}/{slug}"
         claim_repo = claims_repo()
         claim_env = {**os.environ, "CLAIM_REPO": claim_repo}

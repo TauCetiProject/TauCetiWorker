@@ -536,23 +536,97 @@ class ForgejoIdentity(unittest.TestCase):
         self.assertIsNone(claims.lease)
 
 
-class GitHubHistoryLookup(unittest.TestCase):
-    def test_a_full_snapshot_falls_back_to_the_per_item_search(self):
-        newer = [{"number": 500 + i, "body": marker("Algebra", f"x{i}"), "state": "MERGED"} for i in range(200)]
-        gh = SimpleNamespace(
-            target_marker_prs=Mock(return_value=newer),
-            merged_prs=Mock(return_value=[{"number": 1, "body": marker("Algebra", "old")}]),
+class ClaimsBeforeAuthoring(unittest.TestCase):
+    """A round whose repair claimed a branch and then fell through to list authoring."""
+
+    def test_a_held_github_branch_claim_is_released_first(self):
+        cleanups = []
+        claims = tc.Claims(SimpleNamespace(wid="w1"), SimpleNamespace(add_cleanup=cleanups.append))
+        claims.held = ("branch/5", "org/claims")
+        with (
+            patch("tauceti_worker.round.claims_repo", return_value="org/claims"),
+            patch("tauceti_worker.round.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run,
+            patch.object(tc.Claims, "start_heartbeat"),
+            patch.object(tc.Claims, "stop_heartbeat"),
+        ):
+            self.assertEqual(claims.begin_target_work("Algebra", "a"), 0)
+            for cleanup in cleanups:
+                cleanup()
+        self.assertEqual(
+            [c.args[0][1:3] for c in run.call_args_list],
+            [["release", "branch/5"], ["acquire", "author/Algebra/a"], ["release", "author/Algebra/a"]],
         )
+
+    def test_a_held_native_branch_lease_is_released_first(self):
+        from tauceti_worker.source_claims import SourceClaims
+
+        fixture = Forgejo()
+        fixture.setUp()
+        cleanups = []
+        claims = SourceClaims(SimpleNamespace(wid="w1"), SimpleNamespace(add_cleanup=cleanups.append), fixture.source)
+        acquired = Mock()
+        claims.lease, claims.held = acquired, ("branch/5", "forgejo-key")
+        with (
+            patch("tauceti_worker.worker_sources.shared_github_environment", contextlib.nullcontext),
+            patch("tauceti_worker.round.claims_repo", return_value="org/claims"),
+            patch("tauceti_worker.round.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run,
+            patch.object(SourceClaims, "start_heartbeat"),
+            patch.object(SourceClaims, "stop_heartbeat"),
+        ):
+            self.assertEqual(claims.begin_target_work("Algebra", "a"), 0)
+            for cleanup in cleanups:
+                cleanup()
+        acquired.release.assert_called_once_with()
+        self.assertEqual(
+            [c.args[0][1:3] for c in run.call_args_list],
+            [["acquire", "author/Algebra/a"], ["release", "author/Algebra/a"]],
+        )
+        self.assertIsNone(claims.lease)
+        self.assertIsNone(claims.held)
+
+
+class GitHubHistoryLookup(unittest.TestCase):
+    NEWER = [{"number": 500 + i, "body": marker("Algebra", f"x{i}"), "state": "MERGED"} for i in range(200)]
+
+    def reads(self, listing, found=()):
+        """A GitHubMarkerReads over `listing`, whose per-item search finds `found`."""
+        self.gh = SimpleNamespace(
+            target_marker_prs=Mock(side_effect=lambda limit, search="": list(found) if search else listing)
+        )
+        return t.GitHubMarkerReads(self.gh)
+
+    def landed(self, reads, item):
         with patch("tauceti_worker.worker_sources.shared_github_environment", contextlib.nullcontext):
-            reads = t.GitHubMarkerReads(gh)
-            self.assertEqual(t.landed_pr(t.TargetItem("Algebra", "old", "open", "x"), reads), 1)
-            self.assertEqual(t.landed_pr(t.TargetItem("Algebra", "x3", "open", "x"), reads), 503)
-        gh.merged_prs.assert_called_once()
-        gh.target_marker_prs.assert_called_once()
-        short = SimpleNamespace(target_marker_prs=Mock(return_value=newer[:5]), merged_prs=Mock())
+            return t.landed_pr(item, reads)
+
+    def test_a_full_snapshot_falls_back_to_the_per_item_search(self):
+        old = t.TargetItem("Algebra", "old", "open", "x")
+        reads = self.reads(self.NEWER, [{"number": 1, "body": marker("Algebra", "old"), "state": "MERGED"}])
+        self.assertEqual(self.landed(reads, old), 1)
+        self.assertEqual(self.landed(reads, t.TargetItem("Algebra", "x3", "open", "x")), 503)
+        searches = [c.kwargs.get("search", "") for c in self.gh.target_marker_prs.call_args_list]
+        self.assertEqual(len(searches), 2)
+        self.assertIn('"id":"old"', searches[1].replace("\\", ""))
+        self.assertIsNone(self.landed(self.reads(self.NEWER[:5], [{"number": 1, "body": "", "state": "MERGED"}]), old))
+        self.assertEqual(len(self.gh.target_marker_prs.call_args_list), 1)
+
+    def test_a_snapshot_match_that_does_not_complete_the_item_still_falls_back(self):
+        full = {"number": 300, "body": marker("Algebra", "old"), "state": "MERGED"}
+        partial = {"number": 1, "body": marker("Algebra", "old", partial=True), "state": "MERGED"}
+        old = t.TargetItem("Algebra", "old", "open", "x")
+        self.assertEqual(self.landed(self.reads([partial, *self.NEWER[:199]], [partial, full]), old), 300)
+        named = {"number": 1, "body": marker("Algebra", "old"), "state": "MERGED"}
+        excused = t.TargetItem("Algebra", "old", "open", "x", meta=("partial: #1",))
+        self.assertEqual(self.landed(self.reads([named, *self.NEWER[:199]], [named, full]), excused), 300)
+
+    def test_an_open_pull_request_beyond_the_snapshot_is_in_flight(self):
+        old = t.TargetItem("Algebra", "old", "open", "x")
+        reads = self.reads(self.NEWER, [{"number": 2, "body": marker("Algebra", "old"), "state": "OPEN"}])
         with patch("tauceti_worker.worker_sources.shared_github_environment", contextlib.nullcontext):
-            self.assertIsNone(t.landed_pr(t.TargetItem("Algebra", "old", "open", "x"), t.GitHubMarkerReads(short)))
-        short.merged_prs.assert_not_called()
+            self.assertIsNone(t.landed_pr(old, reads))
+            self.assertEqual(t.open_pr(old, reads), 2)
+            self.assertIsNone(t.open_pr(old, self.reads(self.NEWER[:5], [{"number": 2, "state": "OPEN"}])))
+        self.assertEqual(len(self.gh.target_marker_prs.call_args_list), 1)
 
 
 class ForgejoRound(unittest.TestCase):
@@ -571,11 +645,15 @@ class ForgejoRound(unittest.TestCase):
             "- [ ] `third` — c\n"
         )
         self.github_rows = []
+        self.github_found = []  # what a per-item GitHub search finds
         self.github_reads = Mock(side_effect=lambda limit: self.github_rows)
         for item in (
             patch("tauceti_worker.worker_sources.current", return_value=self.forgejo),
             patch("tauceti_worker.worker_sources.shared_github_environment", contextlib.nullcontext),
-            patch("tauceti_worker.github.GitHub.target_marker_prs", lambda _gh, *, limit: self.github_reads(limit)),
+            patch(
+                "tauceti_worker.github.GitHub.target_marker_prs",
+                lambda _gh, *, limit, search="": self.github_found if search else self.github_reads(limit),
+            ),
         ):
             item.start()
             self.addCleanup(item.stop)
@@ -623,6 +701,13 @@ class ForgejoRound(unittest.TestCase):
         self.assertEqual(rows[0]["headRefOid"], "c" * 40)
         self.github_rows = [closed]
         self.assertEqual(t.GitHubMarkerReads()._listing()[0]["headRefOid"], "c" * 40)
+
+    def test_an_older_open_github_pull_request_is_not_assigned_again(self):
+        self.github_rows = GitHubHistoryLookup.NEWER
+        self.github_found = [{"number": 2, "title": "t", "body": marker("Algebra", "first"), "state": "OPEN"}]
+        with patch.object(work, "log") as log:
+            self.assertIn("Your target is assigned: `third` in `Algebra`", self.author())
+        self.assertTrue(any("Algebra/first is open in #2" in c.args[0] for c in log.call_args_list))
 
     def test_a_github_item_in_flight_is_not_assigned_again(self):
         self.github_rows = [{"number": 31, "title": "t", "body": marker("Algebra", "first"), "state": "OPEN"}]
