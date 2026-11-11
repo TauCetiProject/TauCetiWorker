@@ -103,6 +103,7 @@ def retain_plan(source, cfg, number, head, plan_path, *, actor_id=None):
         "threads": threads,
         "ledger": str(cfg.store),
         "round": plan.get("round"),
+        "in_progress": bool(plan.get("in_progress")),
     }
     # The original engine artifacts and outbox remain in their existing source
     # workspace/store. This sidecar holds only its native publication intent.
@@ -254,7 +255,10 @@ def publish(source, publication_path):
     ledger = json.loads(ledger_path.read_text())
     state = ledger["prs"][str(number)]
     state["scoreboard_comment_id"] = exact["id"]
-    state["published_head_sha"] = head
+    if value.get("in_progress"):
+        state.pop("published_head_sha", None)
+    else:
+        state["published_head_sha"] = head
     if state.get("pending_publication_head_sha") == head:
         state.pop("pending_publication_head_sha", None)
     runs = {
@@ -328,7 +332,18 @@ def pending(source, cfg, *, numbers=()):
 
     workspaces = sorted((cfg.state / "review-work").iterdir()) if (cfg.state / "review-work").exists() else []
     for work in workspaces:
+        if work.is_symlink() or not work.is_dir():
+            continue
         path = work / "publication.json"
+        if not path.exists() and not (work / "plan.json").exists() and (work / "review-context.json").is_file():
+            context = json.loads((work / "review-context.json").read_text())
+            if context["source"] != source.identity.record() or context["store"] != str(cfg.store):
+                raise ValueError("retained review workspace belongs to another source or store")
+            from .work_recovery import live_users, owner_stopped
+
+            if owner_stopped(context.get("process")) and not live_users(work):
+                shutil.rmtree(work)
+            continue
         if not path.exists() and (work / "plan.json").is_file() and (work / "review-context.json").is_file():
             context = json.loads((work / "review-context.json").read_text())
             if numbers and context["pr"] not in numbers:

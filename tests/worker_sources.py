@@ -312,6 +312,12 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_toke
         result = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout[-1200:])
         self.assertIs(json.loads((work / "plan.json").read_text())["review_changed"], False)
+        # A saved in-progress engine board cannot complete the local handoff.
+        intent = json.loads(publication.read_text())
+        intent.update(state="prepared", in_progress=True, scoreboard="<!--tauceti-scoreboard--> Initializing.")
+        publication.write_text(json.dumps(intent))
+        self.assertTrue(publish(self.source, publication))
+        self.assertNotIn("published_head_sha", json.loads((store / "ledger.json").read_text())["prs"]["1"])
 
     def test_numeric_target_with_inherited_both_still_defaults_to_github(self):
         with patch.dict(os.environ, {"TAUCETI_WORKER_FORGES": "both"}, clear=True):
@@ -562,6 +568,205 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_toke
                 child = build_parser().parse_args(["_round", *launch.call_args.args[0]])
                 configure(child)
                 self.assertEqual(os.environ["TAUCETI_WORKER_FORGES"], expected)
+
+    def test_dual_source_idle_preserves_actionable_github_discovery_error(self):
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import RoundOpts
+
+        observations = self.observations([], [])
+        observations[0][2].dependency_wait = {"dependency": "github-state", "reason": "auth", "actionable": True}
+        observations[0][2].errors = ["shared state credential rejected"]
+        options = RoundOpts(only=["review"], agent="auto", work_model="codex", sandbox_host=True, dry_run=True)
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            self.assertRaisesRegex(Die, "operator action"),
+        ):
+            run_round(None, options)
+
+    def test_dual_source_idle_preserves_github_wait_deadline(self):
+        from tauceti_worker.config import GitHubUnavailable, SharedStateUnavailable
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import RoundOpts
+
+        observations = self.observations([], [])
+        options = RoundOpts(only=["review"], agent="auto", work_model="codex", sandbox_host=True, dry_run=True)
+        observations[0][2].dependency_wait = {"dependency": "github-state", "reason": "transport", "retry_at": 1234}
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            self.assertRaises(SharedStateUnavailable) as caught,
+        ):
+            run_round(None, options)
+        self.assertEqual(caught.exception.retry_at, 1234)
+        observations[0][2].dependency_wait = None
+        observations[0][2].reviewable.actionable = [Candidate(1, "a" * 40)]
+        wait = GitHubUnavailable("rate limited", retry_at=2345)
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.work_units.run_round", side_effect=wait),
+            self.assertRaises(GitHubUnavailable) as caught,
+        ):
+            run_round(None, options)
+        self.assertIs(caught.exception, wait)
+
+    def test_contest_limit_is_not_reported_as_a_review_error(self):
+        from tauceti_worker.constants import MAX_REVIEW_CONTESTS
+
+        cfg = source_config(self.cfg, self.source)
+        Counters(cfg).write("review-contest-1", MAX_REVIEW_CONTESTS)
+        self.source.open_prs.return_value = [self.row()]
+        rs = Mock()
+        rs.gh_meta.return_value = Meta({"head_sha": "a" * 40, "states": {"style": "blocking_request"}}, "fresh")
+        rs.ledger_blocking.return_value = True
+        rs.newest_contest_reply.return_value = {"id": 5, "rubric": "style"}
+        result = worker_survey(
+            cfg,
+            self.source,
+            rs,
+            Counters(cfg),
+            roadmap="any",
+            skip=[],
+            deep=True,
+            stages=["review"],
+            numbers=(),
+            count_all_roadmaps=True,
+        )
+        self.assertEqual([candidate.pr for candidate in result.reviewable.suppressed], [1])
+        self.assertEqual(result.review_stuck, [])
+
+    def test_failed_native_preparation_releases_generated_inputs(self):
+        from tauceti_worker.source_review import main
+
+        work = self.root / "failed-work"
+        work.mkdir()
+
+        def fail(*args):
+            (work / "code").mkdir()
+            (work / "code/large-source").write_text("generated")
+            raise RuntimeError("preparation unavailable")
+
+        argv = [
+            "review",
+            "--pr",
+            "1",
+            "--head",
+            "a" * 40,
+            "--work",
+            str(work),
+            "--store",
+            str(self.root / "store"),
+            "--reviewer",
+            "codex",
+        ]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("tauceti_worker.source_review.load_source", return_value=self.source),
+            patch("tauceti_worker.source_review.prepare", side_effect=fail),
+        ):
+            self.assertEqual(main(), 83)
+        self.assertFalse(work.exists())
+
+    def test_paid_plan_is_retained_before_failed_review_inputs_are_released(self):
+        from tauceti_worker.source_review import main
+
+        work = self.root / "paid-work"
+        work.mkdir()
+
+        def fail(command, **kwargs):
+            (work / "code").mkdir()
+            (work / "finding.md").write_text("<!--tauceti-rubric:style--> Explain.")
+            (work / "scoreboard.md").write_text("<!--tauceti-scoreboard--> Error.")
+            (work / "plan.json").write_text(
+                json.dumps(
+                    {
+                        "head_sha": "a" * 40,
+                        "scoreboard_body": str(work / "scoreboard.md"),
+                        "threads": [
+                            {
+                                "action": "upsert",
+                                "rubric": "style",
+                                "path": "Proof.lean",
+                                "body": str(work / "finding.md"),
+                            }
+                        ],
+                    }
+                )
+            )
+            return SimpleNamespace(returncode=1)
+
+        argv = [
+            "review",
+            "--pr",
+            "1",
+            "--head",
+            "a" * 40,
+            "--work",
+            str(work),
+            "--store",
+            str(self.root / "store"),
+            "--reviewer",
+            "codex",
+        ]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("tauceti_worker.source_review.load_source", return_value=self.source),
+            patch("tauceti_worker.source_review.prepare", return_value=("b" * 40, "b" * 40)),
+            patch("tauceti_worker.source_review.engine_command", return_value=["fixture"]),
+            patch("tauceti_worker.source_review.subprocess.run", side_effect=fail),
+        ):
+            self.assertEqual(main(), 1)
+        self.assertFalse((work / "code").exists())
+        self.assertEqual(
+            json.loads((work / "publication.json").read_text())["threads"][0]["body"],
+            "<!--tauceti-rubric:style--> Explain.",
+        )
+
+    def test_orphan_cleanup_requires_stopped_owner_and_no_live_users(self):
+        from tauceti_worker.source_publication import pending
+
+        work = self.cfg.state / "review-work/orphan"
+        work.mkdir(parents=True)
+        (work / "code").mkdir()
+        (work / "review-context.json").write_text(
+            json.dumps({"source": self.identity.record(), "store": str(self.cfg.store), "pr": 1, "process": {"pid": 7}})
+        )
+        with patch("tauceti_worker.work_recovery.owner_stopped", return_value=False):
+            self.assertFalse(pending(self.source, self.cfg))
+            self.assertTrue(work.exists())
+        with (
+            patch("tauceti_worker.work_recovery.owner_stopped", return_value=True),
+            patch("tauceti_worker.work_recovery.live_users", return_value=["active reviewer"]),
+        ):
+            self.assertFalse(pending(self.source, self.cfg))
+            self.assertTrue(work.exists())
+        with (
+            patch("tauceti_worker.work_recovery.owner_stopped", return_value=True),
+            patch("tauceti_worker.work_recovery.live_users", return_value=[]),
+        ):
+            self.assertFalse(pending(self.source, self.cfg))
+            self.assertFalse(work.exists())
+
+    def test_native_preparation_uses_shared_mathlib_cache_and_default_roadmap(self):
+        from tauceti_worker.source_review import engine_command
+
+        self.source.issue_comments.return_value = []
+        self.source.review_comments.return_value = []
+        for project in (None, SimpleNamespace(raw={"repositories": {}}, tool_pin=lambda name: None)):
+            work = self.root / ("without-config" if project is None else "without-role")
+            (work / "code").mkdir(parents=True)
+            (work / "code/lake-manifest.json").write_text(
+                json.dumps({"packages": [{"name": "mathlib", "rev": "d" * 40}]})
+            )
+            with (
+                patch("tauceti_tools.project.active", return_value=project),
+                patch("tauceti_worker.source_review.git", return_value=b"") as git,
+                patch("runner.cli.prepare_mathlib_source") as mathlib,
+                patch.dict(os.environ, {"TAUCETI_REVIEW_MATHLIB_CACHE": str(self.root / "shared-mathlib")}),
+            ):
+                engine_command(self.source, 1, "a" * 40, ("b" * 40, "b" * 40), work, self.root / "store", "codex")
+            self.assertEqual(mathlib.call_args.args[2], self.root / "shared-mathlib")
+            self.assertTrue(
+                any("https://github.com/TauCetiProject/TauCetiRoadmap.git" in call.args for call in git.call_args_list)
+            )
 
 
 if __name__ == "__main__":

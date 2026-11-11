@@ -286,6 +286,10 @@ def worker_survey(cfg, source, rs, counters, *, roadmap, skip, deep, stages, num
         for candidate in kind.actionable + kind.suppressed:
             candidate.source_repository = source.repository
             candidate.source_repository_id = source.identity.native_id
-    result.review_stuck = [candidate.pr for candidate in result.reviewable.suppressed]
+    result.review_stuck = [
+        candidate.pr
+        for candidate in result.reviewable.suppressed
+        if counters.read(f"review-err-{candidate.pr}") >= MAX_REVIEW_ERRORS
+    ]
     result.n_reviewable = len(result.reviewable.actionable)
     return result

@@ -19,7 +19,7 @@ tauceti status --forgejo --json
 or disable discovery on each source. Each switch takes effect for the current
 invocation and its loop children. Repeating opposite switches uses the last
 one. Disabling both sources is an error. The switches also work before a
-subcommand, or with the bare dashboard.
+subcommand and select discovery in the bare dashboard.
 
 `--new-pr-forge github|forgejo` independently chooses the destination for new
 PRs. Numeric `--pr` targets require a single selected source, so a native target
@@ -87,7 +87,12 @@ Publication retains the rendered plan before writing. Findings are published
 and read back before the scoreboard. Retrying adopts the same remote markers.
 A changed head supersedes an older publication. Pending publication is reconciled
 before provider selection or another paid review on that head. Repair recovery checks the original
-source repository and native actor IDs.
+source repository and native actor IDs. Failed reviews release generated source
+inputs after retaining any paid plan; crash cleanup requires a stopped owner
+and no surviving users. Reviews reuse the existing shared Mathlib source cache.
+Small publication receipts remain alongside the existing ledger and archive
+outbox. A crashed native claim may wait for its old lease to expire; each round
+keeps a distinct owner nonce so a surviving process cannot be silently replaced.
 
 ## Execution coverage and validation
 

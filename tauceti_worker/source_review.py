@@ -7,6 +7,7 @@ import importlib.metadata
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -80,11 +81,18 @@ def engine_command(source, number, head, comparison, work, store, reviewer):
     git(rubrics, "checkout", "--quiet", "--detach", revision)
     roadmap = work / "roadmap"
     roadmap.mkdir()
-    roadmap_repo = project.repository_ref("roadmap") if project else None
-    if roadmap_repo is not None:
-        git(roadmap, "init", "--quiet")
-        git(roadmap, "fetch", "--no-tags", "--depth=1", roadmap_repo.clone_url, "HEAD")
-        git(roadmap, "checkout", "--quiet", "--detach", "FETCH_HEAD")
+    from tauceti_tools.forge import GITHUB, RepositoryRef
+
+    from .constants import ROADMAP
+
+    roadmap_repo = (
+        project.repository_ref("roadmap")
+        if project and "roadmap" in project.raw["repositories"]
+        else RepositoryRef(GITHUB, ROADMAP)
+    )
+    git(roadmap, "init", "--quiet")
+    git(roadmap, "fetch", "--no-tags", "--depth=1", roadmap_repo.clone_url, "HEAD")
+    git(roadmap, "checkout", "--quiet", "--detach", "FETCH_HEAD")
     store.mkdir(parents=True, exist_ok=True)
     comments = source.issue_comments(number, fresh=True)
     if comments is None:
@@ -119,7 +127,11 @@ def engine_command(source, number, head, comparison, work, store, reviewer):
     mathlib = []
     manifest = work / "code/lake-manifest.json"
     if manifest.is_file():
-        prepare_mathlib_source(manifest, work / "mathlib", work / "dependencies")
+        from .shared_repositories import review_mathlib_cache
+
+        prepare_mathlib_source(
+            manifest, work / "mathlib", Path(review_mathlib_cache()) if review_mathlib_cache() else None
+        )
         if (work / "mathlib/Mathlib").is_dir():
             mathlib = ["--mathlib-path", "mathlib"]
     actor = source.authenticated_actor()
@@ -217,11 +229,14 @@ def main():
     parser.add_argument("--reviewer", required=True)
     args = parser.parse_args()
     inference_started = False
+    source = actor = None
     try:
         source = load_source()
         actor = source.authenticated_actor()
         if actor is None:
             raise RuntimeError("native review publisher unavailable")
+        from .work_recovery import process_owner
+
         atomic_json(
             args.work / "review-context.json",
             {
@@ -230,6 +245,7 @@ def main():
                 "head": args.head,
                 "actor_id": int(actor.principal.native_id),
                 "store": str(args.store / "ledger.json"),
+                "process": process_owner(),
             },
         )
         comparison = prepare(source, args.pr, args.head, args.work)
@@ -266,6 +282,34 @@ def main():
             file=sys.stderr,
         )
         return (85 if (args.work / "plan.json").is_file() else 1) if inference_started else 83
+    finally:
+        # Retain rendered paid output before releasing inputs needed for anchoring.
+        # Small publication receipts and the engine's existing ledger/outbox stay.
+        plan_path = args.work / "plan.json"
+        safe_to_clean = not plan_path.exists() or (args.work / "publication.json").is_file()
+        if plan_path.is_file() and not safe_to_clean and source is not None and actor is not None:
+            try:
+                plan = json.loads(plan_path.read_text())
+                if plan.get("review_changed") is False:
+                    safe_to_clean = True
+                else:
+                    retain_plan(
+                        source,
+                        SimpleNamespace(store=args.store / "ledger.json"),
+                        args.pr,
+                        args.head,
+                        plan_path,
+                        actor_id=int(actor.principal.native_id),
+                    )
+                    safe_to_clean = True
+            except Exception:
+                print("native review inputs retained until the rendered plan can be saved", file=sys.stderr)
+        if safe_to_clean:
+            from .source_publication import cleanup_inputs
+
+            cleanup_inputs(args.work)
+            if not plan_path.exists():
+                shutil.rmtree(args.work, ignore_errors=True)
 
 
 if __name__ == "__main__":

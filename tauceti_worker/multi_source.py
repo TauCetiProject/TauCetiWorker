@@ -135,24 +135,20 @@ def run_round(w, opts, *, use_fleet_focus=True):
         for name, worker, result in observations
         if worker is not None and not result.github_failed and not result.dependency_wait
     ]
-    if not healthy:
-        actionable = next(
-            (
-                value
-                for _, _, value in observations
-                if value.dependency_wait and value.dependency_wait.get("actionable")
-            ),
-            None,
-        )
-        if actionable:
-            raise Die("; ".join(actionable.errors) + " — source configuration requires operator action")
-        waiting = next((value for _, _, value in observations if value.dependency_wait), None)
-        if waiting:
-            from .config import SharedStateUnavailable
+    from .config import SharedStateUnavailable
 
-            raise SharedStateUnavailable(
-                "; ".join(waiting.errors) or "selected sources unavailable", waiting.dependency_wait
-            )
+    waits = []
+    for name, _, result in observations:
+        if result.dependency_wait:
+            if result.dependency_wait.get("actionable"):
+                waits.insert(0, Die("; ".join(result.errors) + " — source configuration requires operator action"))
+            else:
+                waits.append(
+                    SharedStateUnavailable("; ".join(result.errors) or f"{name} unavailable", result.dependency_wait)
+                )
+    if not healthy:
+        if waits:
+            raise waits[0]
         raise NoProgress("all selected source surveys are unavailable")
     executable = [(name, worker, result) for name, worker, result in healthy if name == "github" or opts.sandbox_host]
     if len(executable) != len(healthy):
@@ -183,6 +179,8 @@ def run_round(w, opts, *, use_fleet_focus=True):
             with activate(worker.gh, worker.cfg):
                 return ordinary_round(worker, selected, prepared_survey=result)
         except (ClaimCollision, GitHubUnavailable, SourceUnavailable, NoEligibleWork, ForgeError) as error:
+            if isinstance(error, GitHubUnavailable):
+                waits.append(error)
             collisions |= isinstance(error, ClaimCollision)
             if not isinstance(error, (ClaimCollision, NoEligibleWork)):
                 execution_failed.add(name)
@@ -220,6 +218,8 @@ def run_round(w, opts, *, use_fleet_focus=True):
     ):
         log("Fleet roadmap focus: no available focused work; selecting global maintenance")
         return run_round(w, opts, use_fleet_focus=False)
+    if waits:
+        raise waits[0]
     error = ClaimCollision if collisions else NoEligibleWork
     raise error("no eligible PR work on the selected forges")
 
