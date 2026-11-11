@@ -147,6 +147,8 @@ POLL = int(os.environ.get("TAUCETI_POLL", "300"))  # seconds between quota check
 ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "5400"))  # 90 min hard cap per round
 
 INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
+# A managed worker takes a held definition edit only while its next action is at least this far off.
+RELOAD_MARGIN = 15
 
 EX_DOCUMENTATION_WAIT = 79  # Progress plan/facts deployment churn, without failed-round backoff
 EX_NOPROGRESS = 75  # round did NO productive work (distinct from error=1 / success=0)

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
@@ -268,6 +269,43 @@ try:
     assert not wm._defer_reload(retuned, storage)
     assert wm._defer_reload(retuned, dict(storage, next_action_at=time.time() + 1))
 
+    # After a productive round with a held edit, the loop pauses long enough for the manager to
+    # take it, whatever TAUCETI_INTERROUND is; with nothing held it keeps its own pause.
+    from tauceti_worker import loop
+
+    for held, interround, pause in ((True, 5, 2 * wm.RELOAD_MARGIN), (False, 5, 5), (True, 60, 60)):
+        status = root / f"loop-{held}-{interround}.json"
+        wm.update_status(
+            status,
+            spec_hash=slot.fingerprint(),
+            applied_spec=slot.as_dict(),
+            pending_read_policy=retuned.fingerprint() if held else None,
+        )
+        published = {}
+
+        def settle(seconds, status=status, published=published):
+            published.update(wm.read_json(status), slept=seconds)
+            raise KeyboardInterrupt
+
+        with (
+            patch.dict(os.environ, {"TAUCETI_RUNTIME_STATUS": str(status)}),
+            patch.object(loop, "INTERROUND", interround),
+            patch.object(loop, "api_mode", return_value=False),
+            patch.object(loop, "choose_model", return_value=("codex", {})),
+            patch("tauceti_worker.github_transport.scope", return_value=None),
+            patch.object(loop, "github_budget", return_value=None),
+            patch.object(loop, "run_round_subprocess", return_value=0),
+            patch.object(loop.time, "sleep", side_effect=settle),
+        ):
+            loop.cmd_loop(
+                SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None),
+                SimpleNamespace(wid="slot"),
+                only=["review"],
+                agent="codex",
+            )
+        assert published["state"] == "idle" and published["slept"] == pause, (held, interround, published)
+        assert wm._defer_reload(retuned, published) is (pause < wm.RELOAD_MARGIN), (held, interround)
+
     # Desired fields win over a stale actual status generation in CLI/TUI snapshots.
     wm.update_status(
         wm.status_path("snapshot"),
@@ -490,6 +528,14 @@ worker3 — backing off
     time.sleep(0.3)
     held = wm.runner_status("worker1")
     assert held["wrapper_pid"] == in_round_pid and held["applied_spec"] == streamed.as_dict()
+    # Reverting the edit withdraws it, so the loop stops holding a boundary open for it.
+    wm.save_worker_specs(config, [streamed, *current[1:]])
+    assert wm.manager_request("apply")
+    wait_for(lambda: wm.runner_status("worker1").get("pending_read_policy") is None)
+    assert wm.runner_status("worker1")["wrapper_pid"] == in_round_pid
+    wm.save_worker_specs(config, [retuned, *current[1:]])
+    assert wm.manager_request("apply")
+    wait_for(lambda: wm.runner_status("worker1").get("pending_read_policy") == retuned.fingerprint())
     # On Linux the manager lands a held edit only where it can read the child's process tree.
     if sys.platform != "linux" or Path(f"/proc/{os.getpid()}/task/{os.getpid()}/children").exists():
         wm.update_status(wm.status_path("worker1"), state="idle", next_action_at=time.time() + 3600)

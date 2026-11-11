@@ -244,11 +244,13 @@ without disturbing unchanged workers.
 An edit confined to `agent`, `only`, `author_model`, `author_effort`,
 `max_open_prs`, `github_state_url`, and `github_state_token_file` waits for the
 round in flight. The worker restarts at its next round boundary: when it is
-idle between rounds, backing off, or waiting on quota, budget, or GitHub, with
-its next action at least 15 seconds away, or when it is waiting for fleet
-admission. A worker already parked there restarts at once. Until then its status record carries the waiting definition's
-fingerprint as `pending_read_policy`, and `workers status` reports it as
-`restarting`. An edit that also changes any other field restarts the worker
+idle between rounds, backing off, or waiting on quota, budget, disk headroom, or
+GitHub, with its next action at least 15 seconds away, or when it is waiting for
+fleet admission. A worker already parked there restarts at once, and one that
+finishes a round while an edit is held pauses for at least 30 seconds, whatever
+`TAUCETI_INTERROUND` is, so that it reaches a boundary. Until then its status
+record carries the waiting definition's fingerprint as `pending_read_policy`,
+and `workers status` reports it as `restarting`; reverting the edit clears it. An edit that also changes any other field restarts the worker
 immediately, as does `tauceti workers restart ID`.
 
 `env` exists for running one worker differently from its peers when the

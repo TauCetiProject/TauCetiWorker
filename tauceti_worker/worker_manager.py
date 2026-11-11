@@ -31,7 +31,7 @@ from typing import NoReturn
 
 from . import worker_scopes
 from .config import positive_integer, security_audit_problem, validate_extra_roadmap_prompt
-from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS
+from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS, RELOAD_MARGIN
 from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
 from .quota import parse_pace_curve
@@ -1017,7 +1017,7 @@ def _defer_reload(spec: WorkerSpec, live: dict) -> bool:
             "waiting-storage",
         ):
             return True
-        if (live.get("next_action_at") or 0) - time.time() < 15:
+        if (live.get("next_action_at") or 0) - time.time() < RELOAD_MARGIN:
             return True
     pid = live.get("child_pid")
     if sys.platform == "linux" and isinstance(pid, int):
@@ -1184,6 +1184,8 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     if changed and should_run and wid not in restart_ids and _defer_reload(spec, live):
                         StatusPublisher(status_path(wid, state_dir)).update(pending_read_policy=spec.fingerprint())
                         continue
+                    if is_live and not changed and live.get("pending_read_policy"):
+                        StatusPublisher(status_path(wid, state_dir)).update(pending_read_policy=None)
                     if (
                         is_live
                         and not changed
