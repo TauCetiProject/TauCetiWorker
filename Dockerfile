@@ -38,7 +38,7 @@ RUN curl -fsSL https://elan.lean-lang.org/elan-init.sh | sh -s -- -y \
 # when a pinned client or its service contract stops working. Keep this after Lean so a client-version
 # bump does not invalidate the much larger toolchain layer.
 ARG CLAUDE_CODE_VERSION=2.1.220
-ARG CODEX_VERSION=0.145.0
+ARG CODEX_VERSION=0.160.0
 RUN npm install -g \
     "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     "@openai/codex@${CODEX_VERSION}"
@@ -81,7 +81,10 @@ COPY tauceti_worker ./tauceti_worker
 # The refresher is a symlink, not a copy: it imports the rotation core from tauceti_worker, and
 # resolving its own path back to /opt/tauceti is how it finds the package in an image that runs the
 # worker from a checkout rather than an installed wheel.
-RUN ln -s /opt/tauceti/scripts/oauth_refresh_loop.py /usr/local/bin/tauceti-oauth-refresh \
+# Bare-Python helper entrypoints (including the OAuth refresher) also import the
+# worker package, so install its shared Tools dependency outside the uv-script env.
+RUN uv pip install --system --break-system-packages . \
+    && ln -s /opt/tauceti/scripts/oauth_refresh_loop.py /usr/local/bin/tauceti-oauth-refresh \
     && install -m 0755 scripts/docker-entrypoint /usr/local/bin/tauceti-entrypoint \
     && chmod 0755 tauceti scripts/oauth_refresh_loop.py scripts/claim.sh scripts/gh-safe-pr-create scripts/git-safe-push \
     && ./tauceti --help >/dev/null \

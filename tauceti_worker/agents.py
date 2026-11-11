@@ -3,17 +3,23 @@ argv path and the repo-scoped bubble sandbox path (plus per-worker $HOME isolati
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import functools
 import json
 import os
 import re
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import uuid
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -27,15 +33,19 @@ from .constants import (
     CLAUDE_CMD,
     CODEX_AUTHORING_FALLBACK_MODEL,
     CODEX_MODEL_ACCESS_TTL,
+    EX_CLAIM_COLLISION,
     OPENROUTER_MODELS,
     PI_RUN,
     REVIEW,
-    REVIEW_DAILY_CAP,
+    REVIEW_HEAD_CHANGED_EXIT,
     ROADMAP,
     TAUCETI,
 )
 from .github import me
-from .paths import HERE
+from .paths import HERE, legacy_data_root
+from .processes import PARENT_BOUND_AGENT as _PARENT_BOUND_AGENT
+from .processes import owned_process
+from .processes import run as run_process
 from .quota import (
     Quota,
     _claude_keychain_creds_interactive,
@@ -77,7 +87,10 @@ def _validate_kiro_model_pin(model: str, source: str) -> str:
 def _reject_retired_opus(model: str, source: str) -> None:
     """Keep direct Claude and Kiro dispatches off the replaced Opus generation."""
     if model.lower() in {"claude-opus-4.8", "claude-opus-4-8"}:
-        raise Die(f"Claude Opus 4.8 from {source} is retired; use the exact claude-opus-5 model")
+        raise Die(
+            f"Claude Opus 4.8 from {source} is retired; use a current exact Opus model "
+            "(claude-opus-5-5 for Claude, claude-opus-5 on Kiro)"
+        )
 
 
 def resolve_authoring_profile(
@@ -243,7 +256,7 @@ def _codex_model_probe(cfg: Config, model: str) -> subprocess.CompletedProcess[s
         _CODEX_MODEL_ACCESS_PROMPT,
     ]
     try:
-        return subprocess.run(
+        return run_process(
             command,
             cwd=cfg.state,
             env=env,
@@ -270,7 +283,7 @@ def _codex_probe_failure(model: str, result: subprocess.CompletedProcess[str]) -
 
 
 def resolve_codex_model_access(cfg: Config, profile: AuthoringProfile) -> AuthoringProfile:
-    """Resolve a default Sol profile to Sol or Terra before the real task runs.
+    """Resolve a default Sol profile to Sol or Luna before the real task runs.
 
     Explicit model pins have no fallback and bypass this probe. A confirmed result is cached per worker
     and account; failures that might be transient are never cached and never cause a downgrade.
@@ -432,18 +445,83 @@ def fill_prompt(path: Path, **subs) -> str:
     RENDERED text would let a claim containing any `__WORD__` abort the round — turning a mechanism
     documented as cooperative and fail-open into a way to stop a roadmap worker."""
     path = Path(path)
+    if (
+        path.parent == HERE / "prompts"
+        and os.environ.get("TAUCETI_VERIFY_HELPER", "0") != "1"
+        and (path.parent / "v0" / path.name).is_file()
+    ):
+        path = path.parent / "v0" / path.name
     text = path.read_text()
+    if path.parent in (HERE / "prompts", HERE / "prompts/v0"):
+        from tauceti_tools.project import active
+        from tauceti_tools.templates import render
+
+        if active():
+            text = render(text, active())
     # An unfilled placeholder ships literal `__BIN__/git-safe-push` to the agent, which is the
     # command-not-found failure wrapper_bin exists to end. Fail here instead, but only for the
     # prompts we ship: the progress prompt is served by the pinned TauCetiProgress build (written
     # to a scratch file), and its placeholder set is that repo's business, not ours.
-    if path.parent == HERE / "prompts":
+    if path.parent in (HERE / "prompts", HERE / "prompts/v0"):
         missing = sorted({m.group(0) for m in _PLACEHOLDER_RE.finditer(text)} - {f"__{k}__" for k in subs})
         if missing:
             raise Die(f"{path.name}: unfilled prompt placeholder(s) {', '.join(missing)}")
     # A function replacement is taken literally, so a value containing a backslash escape or a
     # `\g<name>` group reference cannot be reinterpreted either.
     return _PLACEHOLDER_RE.sub(lambda m: str(subs.get(m.group(0)[2:-2], m.group(0))), text)
+
+
+def scope_policy(labels=(), head_ref: str = "", *, bump: bool = False) -> str:
+    """The local audit scope policy for a PR, from labels and branch the survey already holds.
+
+    Mirrors TauCeti's CI: pin bumps, `full-lint`-labelled PRs and `lint-repair/` branches audit the
+    whole library; everything else may scope to the changed modules. Never fetches labels."""
+    if bump:
+        return "bump"
+    if head_ref.startswith("lint-repair/"):
+        return "lint-repair"
+    # CI's lint_scope_policy.py matches comma-delimited components, so a label like `a,full-lint` counts.
+    if any("full-lint" in label.lower().split(",") for label in labels):
+        return "full-lint"
+    return "ordinary"
+
+
+def local_verification(policy: str, bubble: bool = False) -> str:
+    """The shared verification rules and scope recipe every authoring/repair prompt embeds."""
+    if policy not in {"ordinary", "full-lint", "lint-repair", "bump"}:
+        raise Die(f"unknown local verification scope policy {policy!r}")
+    if os.environ.get("TAUCETI_VERIFY_HELPER", "0") != "1":
+        python = "/usr/bin/python3" if bubble else sys.executable
+        return fill_prompt(
+            HERE / "prompts" / "local-verification.md",
+            SCOPE_POLICY=policy,
+            LOCAL_CHECKS=f'"{python}" "{wrapper_bin(bubble)}/tauceti-local-checks"',
+        )
+    python = "/usr/bin/python3" if bubble else sys.executable
+    helper = f'"{python}" "{wrapper_bin(bubble)}/tauceti-verify"'
+    return (
+        "### Local verification\n"
+        f"Run `{helper}` synchronously after the last edit or integration. "
+        f"The worker's local actual-source scope policy is `{policy}`. "
+        "The helper runs cheap source guards, the full `lake build --iofail`, fast changed-file axiom checks, "
+        "module-system, lint and shim-expiry phases. It prints `scope:`, phase exits and a durable receipt path. "
+        "For diagnosis, use `--stage build|axioms|module-system|lint|shim-expiry`; final verification uses all stages. "
+        "Exact-input phase receipts avoid repeated successful work; use `--no-reuse` only to investigate evidence. "
+        "Claude shell commands run in the foreground with a ten-minute limit, or the shorter remaining round. "
+        "If an interrupted helper hands verification to a supervisor continuation, let it finish there. "
+        "If Codex returns an execution session ID, keep waiting on that same session with write_stdin until it exits. "
+        "Write diagnostic logs and module lists outside the checkout (the helper already keeps logs in worker state). "
+        "A failed/incomplete receipt is never green. Keep unfinished edits recoverable at the round deadline. "
+        "On disk-pressure, preserve edits; a pending result with a continuation job belongs to the supervisor. "
+        "An incomplete result without a continuation needs a later invocation in the preserved workspace; do not spin on unchanged checks. "
+        "Do not background tools or wait with `pgrep`, and do not expect a background job to notify or resume you. "
+        "Do not run the old scope recipe, raw final audit/lint commands or `scripts/lint-scope.sh` alongside the helper. "
+        "If piping diagnostic commands, use `set -o pipefail`. In your report quote the `scope:` line, "
+        "phase results and receipt path. Axiom checks read only changed modules' own compiled declarations; "
+        "transitive axiom and global duplicate checks run in CI. No local whole-library audit fallback. "
+        "These are local checks, not full CI.\n"
+        f"```bash\n{helper}\n```\n"
+    )
 
 
 def sync_mathlib_pool(cfg: Config) -> None:
@@ -460,8 +538,13 @@ def sync_mathlib_pool(cfg: Config) -> None:
     if private.resolve() == pool.resolve():
         return  # operator pointed this worker straight at the pool; nothing to exchange
     try:
+        from .cache_storage import initialize
+        from .expanded_cache import root
+
+        if pool == root() / "mathlib":
+            initialize(root())
         promoted, hydrated = build_caches.sync_pool(private, pool)
-    except OSError as e:
+    except (OSError, ValueError) as e:
         log(f"mathlib cache pool: skipped ({e})")
         return
     if promoted or hydrated:
@@ -532,31 +615,137 @@ def clean_lake_cache_after_toolchain_bump(cfg: Config) -> None:
         log(f"Lake artifact cache: cleanup completed but could not update toolchain marker ({e})")
 
 
-def prepare_checkout(cfg: Config) -> bool:
-    """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover."""
+CHECKOUT_URL = f"https://github.com/{TAUCETI}"
+
+
+def _same_repository(url: str, canonical: str) -> bool:
+    """Compare raw remote URLs, ignoring .git, a trailing slash, case, and GitHub's SSH spelling."""
+
+    def norm(value: str) -> str:
+        value = value.strip().rstrip("/").removesuffix(".git")
+        if value.startswith("git@github.com:"):
+            value = "https://github.com/" + value[len("git@github.com:") :]
+        return value.lower()
+
+    return bool(url) and norm(url) == norm(canonical)
+
+
+def _remote_url(co: Path, name: str) -> str:
+    # The raw config value: `git remote get-url` applies insteadOf rewrites (sandbox git proxies).
+    p = subprocess.run(["git", "-C", str(co), "config", "--get", f"remote.{name}.url"], capture_output=True, text=True)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def repair_origin(co: Path) -> bool:
+    """Make `origin` the canonical repository again, keeping any other origin under a new name.
+
+    Everything downstream reads `origin/main` as canonical main: the per-round reset and the
+    main-cache warm-up. A clone whose origin was re-pointed (at a fork, say) silently resets each
+    round to that remote's main, however stale, and searches the cache for its history instead."""
+    current = _remote_url(co, "origin")
+    if _same_repository(current, CHECKOUT_URL):
+        return True
+    if current:
+        spare = next(
+            name
+            for name in ("previous-origin", *(f"previous-origin-{n}" for n in range(2, 1000)))
+            if not _remote_url(co, name)
+        )
+        if subprocess.run(["git", "-C", str(co), "remote", "rename", "origin", spare]).returncode:
+            return False
+        log(f"checkout origin was {current}, not {CHECKOUT_URL}; kept it as remote '{spare}'")
+    return subprocess.run(["git", "-C", str(co), "remote", "add", "origin", CHECKOUT_URL]).returncode == 0
+
+
+def prepare_checkout(
+    cfg: Config, *, work: str | None = None, pr: int | None = None, roadmap: str | None = None
+) -> bool:
+    """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover.
+
+    Leftovers are only dropped after `work_recovery.guard` saves them in a durable recovery record.
+    If the checkout cannot be reset safely (a process still uses it, or saving fails), the guard
+    moves it aside whole and this clones a fresh one, so preparation never waits for a human.
+    `work`/`pr`/`roadmap` name the round that takes the checkout, so a later record can say which
+    round left the source."""
+    from . import work_recovery
+
     sync_mathlib_pool(cfg)
     co = cfg.checkout
-    if not (co / ".git").is_dir():
+
+    def clone(why: str) -> bool:
         co.parent.mkdir(parents=True, exist_ok=True)
-        log(f"cloning {TAUCETI} → {co} (first run)")
-        if subprocess.run(["git", "clone", "-q", f"https://github.com/{TAUCETI}", str(co)]).returncode:
+        try:
+            work_recovery.detach_handoff_owner(cfg)
+        except OSError as error:
+            log(f"checkout ownership detach deferred: {error}")
             return False
+        log(f"cloning {TAUCETI} → {co} ({why})")
+        return subprocess.run(["git", "clone", "-q", CHECKOUT_URL, str(co)]).returncode == 0
+
+    if co.exists() and not (co / ".git").is_dir():
+        # An interrupted clone (or anything else without git metadata) would fail every round.
+        if not work_recovery.retain(cfg, co, "the checkout has no git metadata").ok:
+            return False
+    if not (co / ".git").is_dir() and not clone("first run"):
+        return False
 
     def g(*a) -> int:
         return subprocess.run(["git", "-C", str(co), *a]).returncode
 
+    # Before the fetch, so damaged metadata fails inspection and is moved aside rather than failing
+    # every round; a stale view of the remote only makes the guard save more.
+    decision = work_recovery.guard(cfg, co)
+    if not decision.ok:
+        log(f"checkout preparation refused: {decision.reason}")
+        return False
+    if decision.state == "retained" and not clone("previous checkout moved aside"):
+        return False
+    if not repair_origin(co):
+        log("checkout preparation refused: could not restore the canonical origin remote")
+        return False
     if g("fetch", "-q", "origin"):
+        return False  # usually the network; the next round retries
+    try:
+        work_recovery.detach_handoff_owner(cfg)
+    except OSError as error:
+        log(f"checkout ownership detach deferred: {error}")
         return False
-    # -f discards a prior round's leftover edits and lands us on main in one step; a plain
-    # switch/checkout would refuse on a dirty tree (two noisy errors) and could leave HEAD on
-    # the old branch with only main's content. Bail if even the forced checkout fails.
-    if g("checkout", "-q", "-f", "-B", "main", "origin/main"):
-        return False
+    # -f discards a prior round's leftover edits (now saved) and lands us on main in one step; a plain
+    # switch/checkout would refuse on a dirty tree (two noisy errors) and could leave HEAD on the old
+    # branch with only main's content. A local failure (a stale index.lock, a damaged worktree) moves
+    # the checkout aside and starts again from a fresh clone instead of failing every round.
+    if g(
+        "checkout",
+        "-q",
+        "-f",
+        "-B",
+        os.environ.get("TAUCETI_BASE_BRANCH", "main"),
+        "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main"),
+    ):
+        if not work_recovery.retain(cfg, co, "forced checkout of main failed").ok:
+            return False
+        if not clone("forced checkout failed") or g(
+            "checkout",
+            "-q",
+            "-f",
+            "-B",
+            os.environ.get("TAUCETI_BASE_BRANCH", "main"),
+            "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main"),
+        ):
+            return False
+    from .verification_scope import local_main
+
+    os.environ.pop("TAUCETI_VERIFY_BASE", None)
+    with contextlib.suppress(ValueError, subprocess.CalledProcessError):
+        os.environ["TAUCETI_VERIFY_BASE"] = local_main(co)
+    os.environ["TAUCETI_VERIFY_STATE"] = str(cfg.state.resolve())
     # The checkout is quiescent here: the previous agent has exited and the next one has not started.
     # Compare canonical main, rather than an arbitrary PR branch, and retire old-toolchain artifacts
     # before anything can begin writing this worker's private Lake store again.
     clean_lake_cache_after_toolchain_bump(cfg)
     g("clean", "-fdxq", "-e", ".lake")
+    # Attribution only: a failure is logged by note_owner and never stops the round.
+    work_recovery.note_owner(cfg, work=work, pr=pr, roadmap=roadmap)
     return True
 
 
@@ -582,6 +771,10 @@ def _fetch_shallow(url: str, dir: Path) -> bool:
 
 def fetch_ref(repo: str, dir: Path) -> bool:
     """Worker-owned throwaway shallow mirror of repo's default branch (reset hard, clean)."""
+    if repo in (ROADMAP, REVIEW):
+        from .shared_repositories import attach
+
+        return attach(repo, dir, ttl=3600 if repo == ROADMAP else 900)
     return _fetch_shallow(f"https://github.com/{repo}", dir)
 
 
@@ -590,10 +783,63 @@ def fetch_git_source(url: str, dir: Path) -> bool:
     return _fetch_shallow(url, dir)
 
 
-def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[str], dict]:
+SHELL_LIMIT_SECONDS = 600  # an authoring round's foreground shell limit
+
+
+def _foreground_shell_env(deadline: float, limit_seconds: float | None = None) -> dict[str, str]:
+    # A shell command is not a whole round. Background tasks can retain the CLI
+    # after its final answer and overlap later builds in the same checkout.
+    # ``TAUCETI_SHELL_LIMIT_SECONDS`` lets a launcher with its own budget (the queue's repair task,
+    # whose agent runs whole-library builds in the foreground) lengthen the limit for its agent.
+    if limit_seconds is None:
+        try:
+            limit_seconds = float(os.environ.get("TAUCETI_SHELL_LIMIT_SECONDS") or SHELL_LIMIT_SECONDS)
+        except ValueError:
+            limit_seconds = SHELL_LIMIT_SECONDS
+    limit_ms = max(1000, int(limit_seconds * 1000))
+    remaining_ms = max(1000, int((deadline - time.time()) * 1000))
+    return {
+        "BASH_DEFAULT_TIMEOUT_MS": str(min(limit_ms, remaining_ms)),
+        "BASH_MAX_TIMEOUT_MS": str(min(limit_ms, remaining_ms)),
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+    }
+
+
+# Linux rejects any single argv string above MAX_ARG_STRLEN (128 KiB) with E2BIG, so a prompt longer
+# than this many UTF-8 bytes leaves argv and is written to the agent's stdin instead. Half the kernel
+# limit keeps a wide margin for multi-byte text and for wrapper commands that re-quote their arguments.
+PROMPT_ARGV_LIMIT = 64 * 1024
+
+# Providers whose CLI reads the prompt from stdin when the positional prompt is absent (`claude -p`
+# with no prompt argument) or is `-` (`codex exec -`). Kiro and the Pi runner only take argv.
+_STDIN_PROMPT_PROVIDERS = frozenset({"claude", "codex"})
+
+
+def prompt_on_stdin(prompt: str, profile: AuthoringProfile | str) -> bool:
+    """Whether this prompt must reach the agent on stdin rather than in argv."""
+    provider = _authoring_profile(profile).provider
+    return provider in _STDIN_PROMPT_PROVIDERS and len(prompt.encode("utf-8", errors="replace")) > PROMPT_ARGV_LIMIT
+
+
+def host_agent_launch(prompt: str, profile: AuthoringProfile | str) -> tuple[list[str], dict, str | None]:
+    """``host_agent_argv`` plus the text to write on the agent's stdin: the prompt itself when it is
+    too long for one argv string (``PROMPT_ARGV_LIMIT``), else None and the prompt stays in argv."""
+    on_stdin = prompt_on_stdin(prompt, profile)
+    argv, env = host_agent_argv(prompt, profile, prompt_on_stdin=on_stdin)
+    return argv, env, prompt if on_stdin else None
+
+
+def host_agent_argv(
+    prompt: str, profile: AuthoringProfile | str, *, prompt_on_stdin: bool = False
+) -> tuple[list[str], dict]:
     """The exact argv + env for the host work agent. HERE is on PATH so the agent
-    resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`."""
+    resolves git-safe-push / gh-safe-pr-create / claim.sh; close_fds=True replaces `9>&-`.
+
+    With ``prompt_on_stdin`` the prompt is left out of argv (Claude) or replaced by ``-`` (Codex) and
+    the caller writes it to the process's stdin; see ``host_agent_launch``."""
     env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
+    env["TAUCETI_VERIFY_PYTHON"] = sys.executable
+    env.update(_foreground_shell_env(float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200)))
     profile = _authoring_profile(profile)
     if profile.provider == "codex":
         # Explicit model/effort flags are authoritative while preserving unrelated operator config
@@ -603,7 +849,7 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
         if profile.effort:
             argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
         argv += ["-c", 'model_reasoning_summary="detailed"', "-c", "show_raw_agent_reasoning=false"]
-        argv += ["--sandbox", "danger-full-access", "--skip-git-repo-check", prompt]
+        argv += ["--sandbox", "danger-full-access", "--skip-git-repo-check", "-" if prompt_on_stdin else prompt]
     elif profile.provider == "kiro":
         # --model is mandatory: Kiro's Auto router is never allowed to choose on
         # the worker's behalf. Isolate its platform credential store for API-key
@@ -623,29 +869,142 @@ def host_agent_argv(prompt: str, profile: AuthoringProfile | str) -> tuple[list[
     elif profile.provider in OPENROUTER_MODELS:
         argv = [PI_RUN, "openrouter", profile.model, "--prompt", prompt]
     else:  # claude (Opus); ANTHROPIC_API_KEY unset so it bills the Max plan
-        env.pop("ANTHROPIC_API_KEY", None)
-        base = shlex_split(CLAUDE_CMD) or ["claude"]  # empty / whitespace-only falls back, not a broken argv
-        argv = [*base, "-p", prompt, "--output-format", "stream-json", "--verbose", "--model", profile.model]
+        # The one exception is a launcher that bills the API with the key in its own environment and
+        # no accounting shim (the queue's repair task, `TAUCETI_CLAUDE_BILLING=api` without
+        # `TAUCETI_API_CONTEXT`); the fleet's API mode routes the key through the shim instead and has
+        # already removed it from the environment (claude_api.configure_api).
+        if not (env.get("TAUCETI_CLAUDE_BILLING") == "api" and not os.environ.get("TAUCETI_API_CONTEXT")):
+            env.pop("ANTHROPIC_API_KEY", None)
+        command = (
+            os.environ.get("TAUCETI_CLAUDE_CMD", CLAUDE_CMD) if os.environ.get("TAUCETI_API_CONTEXT") else CLAUDE_CMD
+        )
+        base = shlex_split(command) or ["claude"]  # empty / whitespace-only falls back, not a broken argv
+        argv = [*base, "-p", *([] if prompt_on_stdin else [prompt])]
+        argv += ["--output-format", "stream-json", "--verbose", "--model", profile.model]
         if profile.effort:
             argv += ["--effort", profile.effort]
         argv += ["--dangerously-skip-permissions"]
+        if shell_env := env.get("TAUCETI_REPAIR_CLAUDE_ENV_FILE"):
+            # Queue-owned startup configuration must beat project/user env settings.
+            # Explicit command redirections still override this default Bash stdin.
+            argv += ["--settings", json.dumps({"env": {"CLAUDE_ENV_FILE": shell_env}})]
     return argv, env
 
 
-def run_agent_host(cwd: Path, prompt: str, profile: AuthoringProfile | str, logdir: Path) -> int:
+def run_agent_host(
+    cwd: Path,
+    prompt: str,
+    profile: AuthoringProfile | str,
+    logdir: Path,
+    *,
+    cancel_event=None,
+    resume=None,
+    session_path=None,
+    session_actor=None,
+    session_scope=None,
+    quota_cfg=None,
+    cache_note: bool = True,
+) -> int:
+    """``cache_note=False`` leaves out the build-cache appendix (fetch commands and the
+    ``TAUCETI_PR_CACHE_MISS`` stop rule): the queue's repair worker warms the tree itself and its own
+    prompt tells the agent not to fetch, and a queue head's tip is never in the public cache."""
+    global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
-    argv, env = host_agent_argv(prompt, profile)
+    if (
+        cache_note
+        and TAUCETI_CACHE_SERVICE
+        and any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean"))
+    ):
+        prompt += (
+            "\n\nBuild cache preparation: the worker attempted to warm Mathlib and TauCeti artifacts for this "
+            "checkout and current main. The public `tauceti-public` Lake service remains configured "
+            "during this run. After merging/rebasing, changing the toolchain or dependencies, or "
+            "repairing a malformed workspace, fetch both caches before building:\n"
+            "lake exe cache get\n"
+            f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI} "
+            f"--max-revs={lake_cache_max_revs(os.environ)}\n"
+            "A transport or incomplete-artifact download failure is infrastructure trouble: report "
+            "it instead of falling back to a full source compilation."
+            " If TAUCETI_PR_CACHE_MISS=1, your PR history is uncached: merge/rebase onto current main "
+            "and fetch again before building; if that cannot be done, report the cache miss and stop."
+        )
+    argv, env, stdin_text = host_agent_launch(prompt, profile)
+    if resume:
+        if profile.provider == "codex":
+            # exec resume does not accept the fresh-run sandbox/repo-check flags.
+            argv = [
+                "codex",
+                "exec",
+                "resume",
+                "--json",
+                "--model",
+                profile.model,
+                "--dangerously-bypass-approvals-and-sandbox",
+            ]
+            if profile.effort:
+                argv += ["-c", f'model_reasoning_effort="{profile.effort}"']
+            argv += [resume, "-" if stdin_text is not None else prompt]
+        elif profile.provider == "claude":
+            argv += ["--resume", resume]
+    if env.get("TAUCETI_RECOVERY_CONTINUATION") == "1":
+        env.pop("GH_TOKEN", None)
+        env.pop("GITHUB_TOKEN", None)
+    if session_path:
+        from .repair_recovery import conversation_identity
+        from .runtime_status import atomic_json
+
+        try:
+            atomic_json(
+                session_path,
+                dict(
+                    profile=asdict(profile),
+                    actor=session_actor,
+                    identity=conversation_identity(profile.provider),
+                    scope=session_scope,
+                    session=resume,
+                    cwd=str(cwd),
+                ),
+            )
+        except OSError as error:
+            log(f"provider session identity could not be saved: {error}; starting without resumable identity")
+            session_path = None
+    if not env.get("TAUCETI_VERIFY_BASE") and (cwd / ".git").exists():
+        from .verification_scope import local_main
+
+        with contextlib.suppress(ValueError, subprocess.CalledProcessError):
+            env["TAUCETI_VERIFY_BASE"] = local_main(cwd)
+    env.setdefault(
+        "TAUCETI_VERIFY_STATE", str(legacy_data_root(HERE) / "state" / env.get("TAUCETI_WORKER_ID", "local"))
+    )
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
-    return run_agent_proc(
-        argv,
-        env=env,
-        cwd=cwd,
-        logdir=logdir,
-        label=f"agent-{profile.provider}",
-        provider=profile.provider,
-    )
+    _LAST_AGENT_FAILURE = None
+    with host_build_cache_context(cwd, env, logdir) as prefix:
+        if not cache_note:
+            env.pop("TAUCETI_PR_CACHE_MISS", None)  # the convention belongs to the appendix left out
+        rc = run_agent_proc(
+            [*(prefix or []), *argv],
+            env=env,
+            cwd=cwd,
+            logdir=logdir,
+            label=f"agent-{profile.provider}",
+            provider=profile.provider,
+            cancel_event=cancel_event,
+            session_path=session_path,
+            quota_cfg=quota_cfg,
+            stdin_text=stdin_text,
+        )
+        if env.get("TAUCETI_SHARED_MATHLIB_KEY"):
+            from .shared_mathlib import record_result
+
+            record_result(env, rc)
+    if rc == 75:
+        from .claude_api import blocked_reason
+
+        if reason := blocked_reason():
+            _LAST_AGENT_FAILURE = "local API admission unavailable: " + reason
+    return rc
 
 
 # Provider statuses that mean "the service could not serve this request right now", as opposed to
@@ -708,12 +1067,24 @@ def classify_agent_failure(text: str) -> str | None:
     for m in _API_ERROR_RE.finditer(hay):
         status = int(m.group(1))
     if status is not None:
+        if status == 400 and any(re.fullmatch(r"Credit balance is too low", line, re.I) for line in lines):
+            return "provider credit balance exhausted"
         # A status we DID parse and that is not transient is a definite task-side answer (a bad
         # request, a dead credential). Stop here rather than falling through to the transport
         # patterns, which could otherwise rescue a 401 that happens to mention a socket.
         return f"provider returned {status}" if status in _TRANSIENT_STATUSES else None
     if _TRANSPORT_RE.search(hay):
         return "could not reach the provider"
+    if any(
+        re.search(
+            r"^(?:you(?:'ve| have) hit your (?:session|weekly|monthly|usage) limit\b|"
+            r"claude ai usage limit reached\b)",
+            line,
+            re.I,
+        )
+        for line in lines
+    ):
+        return "provider subscription limit reached"
     return None
 
 
@@ -733,6 +1104,32 @@ def take_last_agent_infra_failure() -> str | None:
     return reason
 
 
+# What the transcript renderer saw of the most recent agent subprocess: whether the agent did any work
+# (a tool call, a tool result, an assistant message), the final structured failure, and the last Claude
+# rate-limit status. A launcher with a chain of providers (the queue's repair task) reads this to tell
+# a provider that refused the request before any work from an agent that worked and failed.
+_LAST_AGENT_RUN: dict | None = None
+
+
+def take_last_agent_run() -> dict | None:
+    """The renderer's record of the last agent subprocess (``provider``, ``rc``, ``saw_work``,
+    ``terminal_failure``, ``rate_limit_status``, ``usage``, the last lines of its ``tail``), or None.
+    Reads AND CLEARS, like ``take_last_agent_infra_failure``."""
+    global _LAST_AGENT_RUN
+    record, _LAST_AGENT_RUN = _LAST_AGENT_RUN, None
+    return record
+
+
+def _feed_stdin(proc: subprocess.Popen, text: str) -> None:
+    """Write ``text`` to ``proc.stdin`` and close it; an agent that exits first just closes the pipe."""
+    assert proc.stdin is not None
+    with contextlib.suppress(OSError, ValueError):
+        proc.stdin.write(text)
+        proc.stdin.flush()
+    with contextlib.suppress(OSError, ValueError):
+        proc.stdin.close()
+
+
 def run_agent_proc(
     argv: list[str],
     *,
@@ -741,20 +1138,42 @@ def run_agent_proc(
     label: str,
     provider: str,
     cwd: Path | None = None,
+    cancel_event=None,
+    session_path=None,
+    quota_cfg=None,
+    stdin_text: str | None = None,
 ) -> int:
     """Run an agent subprocess through its readable transcript renderer.
 
     By default the normalized transcript goes to a timestamped file under logdir. ``--stream`` sends
     the identical content to the terminal instead. On a non-zero exit we always tail the logfile so
-    failures aren't silent.
+    failures aren't silent. ``stdin_text`` (a prompt too long for argv, see ``host_agent_launch``) is
+    written to the process's stdin from a separate thread, so a prompt larger than the pipe buffer
+    cannot deadlock against the transcript being read here, and stdin is closed once it is delivered.
     """
-    global _LAST_AGENT_FAILURE
+    global _LAST_AGENT_FAILURE, _LAST_AGENT_RUN
     _LAST_AGENT_FAILURE = None
+    _LAST_AGENT_RUN = None
+    telemetry_stamp = time.strftime("%Y%m%d-%H%M%S")
     cwds = str(cwd) if cwd is not None else None
-    # Every supported agent receives its prompt in argv. Close stdin explicitly: Bubble reaches the
-    # agent through a non-PTY SSH channel, so an inherited terminal becomes a non-TTY stream there;
-    # Codex then treats it as additional prompt input and waits forever for EOF.
+    # A prompt arrives in argv unless it is too long for one argv string, in which case it is the whole
+    # of stdin. Otherwise close stdin explicitly: Bubble reaches the agent through a non-PTY SSH
+    # channel, so an inherited terminal becomes a non-TTY stream there; Codex then treats it as
+    # additional prompt input and waits forever for EOF.
     renderer = AgentTranscriptRenderer(provider)
+    quota_reader, launch_credential = None, None
+    if (
+        quota_cfg is not None
+        and provider in {"claude", "codex"}
+        and (provider != "claude" or env.get("TAUCETI_CLAUDE_BILLING") != "api")
+    ):
+        from .quota import Quota
+
+        try:
+            quota_reader = Quota(quota_cfg)
+            launch_credential = quota_reader.launch_credential(provider)
+        except Exception:
+            quota_reader = None  # optional failure evidence must never become a launch dependency
     tail: deque[str] = deque(maxlen=20)
 
     def write_rendered(destination, rendered: str) -> None:
@@ -768,30 +1187,112 @@ def run_agent_proc(
         tail.extend(rendered.splitlines())
 
     def run_rendered(destination) -> int:
-        proc = subprocess.Popen(
-            argv,
-            cwd=cwds,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",
-            bufsize=1,
-        )
-        assert proc.stdout is not None
+        if cancel_event is not None and cancel_event.is_set():
+            raise NoProgress("shared lease lost before agent launch")
+        from .fleet_capacity import check_launch_admission
+
+        check_launch_admission()
+        from .shared_mathlib import lease_fds
+
+        stack = contextlib.ExitStack()
         try:
+            proc = stack.enter_context(
+                owned_process(
+                    argv,
+                    cwd=cwds,
+                    env=env,
+                    stdin=subprocess.DEVNULL if stdin_text is None else subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                    bufsize=1,
+                    pass_fds=lease_fds(env),
+                )
+            )
+        except OSError as error:
+            raise AgentLaunchUnavailable(f"Agent process could not start: {error}") from error
+        assert proc.stdout is not None
+        finished = threading.Event()
+        feeder = None
+        if stdin_text is not None:
+            feeder = threading.Thread(target=_feed_stdin, args=(proc, stdin_text), daemon=True)
+            feeder.start()
+
+        def cancel_on_lease_loss():
+            while not finished.wait(0.5):
+                if cancel_event.is_set():
+                    # This agent owns a separate process group, so tools cannot
+                    # outlive a lost lease and continue publishing afterwards.
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    if not finished.wait(2):
+                        with contextlib.suppress(ProcessLookupError):
+                            os.killpg(proc.pid, signal.SIGKILL)
+                    return
+
+        monitor = None
+        try:
+            if cancel_event is not None:
+                thread = threading.Thread(target=cancel_on_lease_loss, daemon=True)
+                thread.start()
+                monitor = thread
             for line in proc.stdout:
+                if session_path:
+                    try:
+                        event = json.loads(line)
+                        session = (
+                            event.get("thread_id")
+                            if event.get("type") == "thread.started"
+                            else event.get("session_id")
+                            if event.get("type") == "system" and event.get("subtype") == "init"
+                            else None
+                        )
+                        if session:
+                            from .runtime_status import atomic_json, read_json
+                            from .work_recovery import _fsync_dir
+
+                            value = read_json(session_path)
+                            value["session"] = session
+                            atomic_json(session_path, value)
+                            _fsync_dir(session_path.parent)
+                    except (ValueError, AttributeError):
+                        pass
+                    except OSError as error:
+                        log(f"provider session identity could not be saved: {error}; source remains recoverable")
                 rendered = renderer.render_line(line)
                 if rendered:
                     write_rendered(destination, rendered)
-        except BaseException:
-            proc.kill()
-            proc.wait()
-            raise
+            rc = proc.wait()
         finally:
-            proc.stdout.close()
-        rc = proc.wait()
+            try:
+                stack.close()
+            finally:
+                finished.set()
+                if monitor is not None:
+                    monitor.join(3)
+                if feeder is not None:
+                    feeder.join(3)
+        from .overlap_support import atomic
+
+        telemetry = {
+            "provider": provider,
+            "compactions": renderer.compactions,
+            "usage": renderer.usage,
+            "usage_note": "Provider totals; cumulative input is not peak context occupancy.",
+        }
+        atomic(logdir / f"{label}-{telemetry_stamp}-telemetry.json", telemetry)
+        atomic(logdir / f"{label}-telemetry.json", telemetry)
+        global _LAST_AGENT_RUN
+        _LAST_AGENT_RUN = {
+            "provider": provider,
+            "rc": rc,
+            "saw_work": renderer.saw_work,
+            "terminal_failure": renderer.terminal_failure_text,
+            "rate_limit_status": renderer.rate_limit_status,
+            "usage": dict(renderer.usage),
+            "tail": list(tail)[-6:],  # the guardian's own traceback when the agent executable is missing
+        }
         if provider in {"codex", "claude"} and not renderer.active:
             write_rendered(destination, f"[warning] no structured {provider} events were recognized\n")
         return rc
@@ -805,7 +1306,15 @@ def run_agent_proc(
         classification_text = "\n".join(tail)
         if renderer.terminal_failure_final and renderer.terminal_failure_text:
             classification_text = renderer.terminal_failure_text
-        return classify_agent_failure(classification_text)
+        reason = classify_agent_failure(classification_text)
+        if reason == "provider credit balance exhausted" and not all(
+            type(renderer.usage.get(key)) is int and renderer.usage[key] == 0
+            for key in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+        ):
+            return None  # Refunding a credit refusal requires explicit zero-token evidence.
+        if reason == "provider subscription limit reached" and quota_reader is not None:
+            quota_reader.note_model_refusal(provider, launch_credential)
+        return reason
 
     if os.environ.get("TAUCETI_STREAM"):
         rc = run_rendered(sys.stdout)
@@ -837,13 +1346,33 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
     detail that belongs in a subsidiary per-review log, not the orchestration stream. TAUCETI_STREAM=1
     streams to the terminal instead. Tails logf to the main log on a non-zero exit so failures aren't
     silent. The caller logs a one-line pointer to logf so the detail is discoverable."""
+    from .claude_api import review_environment
+    from .fleet_capacity import check_launch_admission
+
+    check_launch_admission()
+    api_env = review_environment()
+    if label.startswith("review #"):
+        api_env = {
+            **(os.environ if api_env is None else api_env),
+            "TAUCETI_GITHUB_HISTORY_BRIDGE": "1",
+            "TAUCETI_REVIEW_RESULT_FILE": str(logf.parent / "review-results" / (logf.stem + ".json")),
+        }
+        if "tauceti-review" in argv:
+            from .shared_repositories import review_mathlib_cache
+
+            api_env["TAUCETI_REVIEW_MATHLIB_CACHE"] = review_mathlib_cache()
+            from .github import claims_repo
+            from .paths import CLAIM_SH
+
+            api_env.update(CLAIM_REPO=claims_repo(), TAUCETI_CLAIM_SH=CLAIM_SH)
+    env_kwargs = {"env": api_env} if api_env is not None else {}
     if os.environ.get("TAUCETI_STREAM"):
-        return subprocess.run(argv).returncode
+        return run_process(argv, **env_kwargs).returncode
     logf.parent.mkdir(parents=True, exist_ok=True)
     log(f"  {label}: engine output → {logf}  (run with --stream to watch live)")
     with open(logf, "ab") as f:
-        rc = subprocess.run(argv, stdout=f, stderr=subprocess.STDOUT).returncode
-    if rc != 0:
+        rc = run_process(argv, stdout=f, stderr=subprocess.STDOUT, **env_kwargs).returncode
+    if rc != 0 and not (rc in (EX_CLAIM_COLLISION, REVIEW_HEAD_CHANGED_EXIT) and label.startswith("review #")):
         log(f"{label}: exited {rc}; last lines of {logf.name}:")
         tail: list[str] = []
         try:
@@ -884,11 +1413,334 @@ KIRO_BUBBLE_MIN_VERSION = "0.7.31"
 # `lake cache get` failed and fell through to a from-scratch `lake build` -- silently, because a
 # cache miss is non-fatal here. The custom domain is also what TauCeti's own CI publishes and reads
 # through (the LAKE_CACHE_*_PUBLIC repo variables). Keep the two in step.
-TAUCETI_CACHE_DOMAIN = "cache.taucetiproject.org"
+TAUCETI_CACHE_DOMAIN = os.environ.get("TAUCETI_CACHE_DOMAIN", "cache.taucetiproject.org")
 CACHE_PROBE_USER_AGENT = "tauceti-worker (+https://github.com/kim-em/TauCetiWorker)"
-TAUCETI_CACHE_SERVICE = "tauceti-public"
-TAUCETI_CACHE_ARTIFACT_URL = f"https://{TAUCETI_CACHE_DOMAIN}/artifacts"
-TAUCETI_CACHE_REVISION_URL = f"https://{TAUCETI_CACHE_DOMAIN}/revisions"
+TAUCETI_CACHE_SERVICE = os.environ.get("TAUCETI_CACHE_SERVICE", "tauceti-public")
+TAUCETI_CACHE_ARTIFACT_URL = os.environ.get("TAUCETI_CACHE_ARTIFACT_URL", f"https://{TAUCETI_CACHE_DOMAIN}/artifacts")
+TAUCETI_CACHE_REVISION_URL = os.environ.get("TAUCETI_CACHE_REVISION_URL", f"https://{TAUCETI_CACHE_DOMAIN}/revisions")
+
+
+class BuildCacheUnavailable(NoProgress):
+    """A known pre-agent outage, never chargeable to a PR's attempt budget."""
+
+    def __init__(self, message: str, *, log_file: Path | None = None):
+        super().__init__(message)
+        self.log_file = log_file
+
+
+class AgentLaunchUnavailable(BuildCacheUnavailable):
+    """A process creation failure before the agent existed."""
+
+
+HOST_CACHE_TIMEOUT = 1200
+_LAKE_FALSE = {"0", "false", "no", "off", "n", "f"}
+
+
+def lake_cache_max_revs(env: dict) -> str:
+    value = env.get("LAKE_CACHE_MAX_REVS", "100")
+    if not re.fullmatch(r"[0-9]+", value):
+        raise Die("LAKE_CACHE_MAX_REVS must be a natural number")
+    return value
+
+
+@contextlib.contextmanager
+def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
+    """Keep the public service available through repairs, merges and dependency changes."""
+    if not TAUCETI_CACHE_SERVICE:
+        yield
+        return
+    if not any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
+        yield
+        return
+    with tempfile.TemporaryDirectory(prefix="tauceti-lake-config-") as tmp:
+        config = Path(tmp) / "lake.toml"
+        config.write_text(
+            f'[[cache.service]]\nname = "{TAUCETI_CACHE_SERVICE}"\nkind = "s3"\n'
+            f'artifactEndpoint = "{TAUCETI_CACHE_ARTIFACT_URL}"\n'
+            f'revisionEndpoint = "{TAUCETI_CACHE_REVISION_URL}"\n'
+        )
+        env["LAKE_CONFIG"] = str(config)
+        env.pop("TAUCETI_PR_CACHE_MISS", None)
+        env.setdefault("LAKE_ARTIFACT_CACHE", "1")
+        env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
+        from . import expanded_cache, shared_mathlib
+
+        report = {}
+        mathlib_started = expanded_cache.clock()
+        try:
+            with shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix:
+                expanded_cache.record_phase(report, "mathlib_view", mathlib_started)
+                if prefix:
+                    env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
+                try:
+                    try:
+                        prepare_host_build_caches(cwd, env, logdir, report=report)
+                    except Exception as error:
+                        if prefix:
+                            shared_mathlib.preparation_status(env, error=error)
+                        raise
+                    if prefix:
+                        shared_mathlib.preparation_status(env)
+                    yield prefix
+                finally:
+                    env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)
+        except shared_mathlib.Unavailable as error:
+            raise BuildCacheUnavailable(
+                f"shared Mathlib preparation unavailable: {error}", log_file=logdir / "shared-mathlib-prepare.log"
+            ) from error
+
+
+def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -> None:
+    """Fetch and hydrate shared artifacts before either normal work or recovery verification."""
+    from . import expanded_cache
+
+    prefix = json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]"))
+    with expanded_cache.preparation(
+        cwd,
+        env,
+        report=report,
+        refetch=lambda warm: _cache_fetch(
+            [
+                *prefix,
+                "lake",
+                "cache",
+                "get",
+                "--service",
+                TAUCETI_CACHE_SERVICE,
+                "--repo",
+                TAUCETI,
+                f"--max-revs={lake_cache_max_revs(warm)}",
+            ],
+            cwd,
+            warm,
+            subprocess.DEVNULL,
+            30,
+        ),
+    ) as warm_env:
+        warm_host_build_caches(cwd, warm_env, logdir, report=report)
+
+
+def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float) -> int:
+    """Bind the downloader process group to the worker, including after parent SIGKILL.
+
+    The pipe guardian retains the snapshot lease and kills its process group if
+    the worker disappears. Ordinary timeout/interruption also tears down the group.
+    """
+    from .shared_mathlib import lease_fds
+
+    reader, writer = os.pipe()
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _PARENT_BOUND_AGENT, str(reader), *command],
+            pass_fds=(reader, *lease_fds(env)),
+            cwd=cwd,
+            env=env,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except BaseException:
+        os.close(writer)
+        raise
+    finally:
+        os.close(reader)
+    sweep = True
+    try:
+        try:
+            return proc.wait(timeout=timeout)
+        except BaseException:
+            sweep = False
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+            raise
+    finally:
+        os.close(writer)
+        if sweep:
+            from .round import reap_round_group
+
+            reap_round_group(proc.pid)
+
+
+def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -> None:
+    """Fetch both caches on the selected branch; warm main too for subsequent rebases.
+
+    Genuine workspace errors must reach repair agents. Transport, publication and partial-download
+    failures stop before an agent starts. Lake verifies and atomically installs artifacts, so retries
+    retain successful downloads. All fetches together have one twenty-minute deadline.
+    """
+    prefix = json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]"))
+    max_revs = lake_cache_max_revs(env)
+    logdir.mkdir(parents=True, exist_ok=True)
+    logf = logdir / f"build-cache-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    deadline = time.monotonic() + HOST_CACHE_TIMEOUT
+    log(f"host build caches: warming Mathlib and TauCeti; output → {logf}")
+
+    def unavailable(reason: str):
+        message = f"{reason}; agent not started (see {logf})"
+        log(message)
+        report_failure(message, code=75, log_file=logf)
+        raise BuildCacheUnavailable(message, log_file=logf)
+
+    def fetch(label: str, command: list[str]) -> str:
+        for attempt in range(1, 3):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                unavailable("build cache preparation deadline exceeded")
+            with logf.open("ab") as output:
+                offset = output.tell()
+                output.write(f"{label} cache, attempt {attempt}: {' '.join(command)}\n".encode())
+                output.flush()
+                try:
+                    from .expanded_cache import measured
+
+                    with measured(report, label.lower().replace(" ", "_") + "_fetch"):
+                        rc = _cache_fetch([*prefix, *command], cwd, env, output, remaining)
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    output.write(f"cache command failed: {e}\n".encode())
+                    rc = 1
+            with logf.open("rb") as output:
+                output.seek(offset)
+                detail = output.read().decode(errors="replace")
+            if rc == 0:
+                log(f"host build caches: {label} cache ready")
+                return "ready"
+            if attempt == 1 and re.search(r"(?i)no space left on device|disk quota exceeded|\bENOSPC\b", detail):
+                from .retention import pressure_cleanup
+
+                pressure_cleanup()
+            # Preserve real outages even when Lake also wraps them in a dependency-fetch error.
+            transport_error = re.search(
+                r"(?i)(?:\bHTTP\b|status(?: code)?|response)[^\n]*\b(?:401|403|429|5\d\d)\b|"
+                r"could not resolve host|connection (?:reset|refused|timed out)|"
+                r"SSL certificate|\bTLS\b|authentication failed|network is unreachable",
+                detail,
+            )
+            # These errors precede artifact transfer and can be repaired in the checked-out PR.
+            workspace_error = re.search(
+                r"(?im)^error:.*(?:lakefile\.(?:toml|lean)|lake-manifest\.json|"
+                r"could not resolve revision|unknown revision|invalid manifest|"
+                r"invalid toolchain name|"
+                r"no (?:such release|release found)|could not download nonexistent lean version)|"
+                r"(?im:couldn't find remote ref|unknown package)",
+                detail,
+            )
+            # Lake wraps every failed git fetch with the same dependency error. Only positive
+            # evidence of a missing ref/repository belongs to repair; unknown failures stay outages.
+            missing_dependency = re.search(r"failed to fetch (?:the )?package revision", detail) and re.search(
+                r"(?i)not our ref|unadvertised object|repository ['\"][^\n]*['\"] not found|"
+                r"couldn't find remote ref",
+                detail,
+            )
+            if (workspace_error or missing_dependency) and not transport_error:
+                log(f"warning: {label} cache cannot load this workspace; leaving it to the repair agent")
+                for line in detail.splitlines()[-8:]:
+                    log("  cache: " + line)
+                return "workspace-error"
+            # Lake's CLI emits these only after all revision lookups returned 404 (Main.lean).
+            if label != "Mathlib" and re.search(
+                r"^error:.*(?:no outputs found|outputs not found for revision)", detail, re.M
+            ):
+                return "miss"
+            if attempt == 1:
+                log(f"host build caches: {label} fetch failed; retrying verified downloads")
+                continue
+            for line in detail.splitlines()[-12:]:
+                log("  cache: " + line)
+            unavailable(f"{label} build cache download failed")
+        raise AssertionError("unreachable")
+
+    if fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
+        return
+    # Mathlib itself knows which compressed archives the selected dependency tree
+    # needs. Prune stale private links daily so pool GC can actually release them;
+    # otherwise the old promote/hydrate-all exchange resurrects dead archives forever.
+    from . import expanded_cache
+    from .runtime_status import read_json
+
+    mathlib_private = Path(env.get("MATHLIB_CACHE_DIR", "/nonexistent"))
+    home = Path(env.get("HOME", "/nonexistent"))
+    mathlib_pool = expanded_cache.root(env) / "mathlib"
+    marker = mathlib_private.parent / "mathlib-cleanup.json"
+    if (
+        env.get("TAUCETI_SHARED_ARTIFACTS", "1") != "0"
+        and mathlib_private.is_relative_to(home)
+        and mathlib_private != home
+        and (mathlib_pool.parent / "owner.json").is_file()
+        and time.time() - read_json(marker).get("at", 0) > 86400
+        and deadline - time.monotonic() > 60
+    ):
+        try:
+            # Failed housekeeping retries in an hour, never on every paid round.
+            expanded_cache.atomic_json(marker, dict(at=time.time() - 23 * 3600))
+            with logf.open("ab") as output:
+                rc = _cache_fetch(
+                    [*prefix, "lake", "exe", "cache", "clean"],
+                    cwd,
+                    env,
+                    output,
+                    max(1, min(30, deadline - time.monotonic())),
+                )
+            if rc == 0:
+                build_caches.link_into(mathlib_private, mathlib_pool)
+                for path in mathlib_private.glob("*.ltar"):
+                    pooled = mathlib_pool / path.name
+                    if pooled.is_file() and not pooled.is_symlink():
+                        os.utime(pooled, None)  # Current-tree reuse, not download age.
+                expanded_cache.atomic_json(marker, dict(at=time.time()))
+        except Exception as error:
+            log(f"Mathlib archive housekeeping deferred: {error}")
+    if env.get("LAKE_ARTIFACT_CACHE", "1").lower() in _LAKE_FALSE:
+        log("host build caches: TauCeti artifact caching explicitly disabled by LAKE_ARTIFACT_CACHE")
+        return
+    if not TAUCETI_CACHE_SERVICE:
+        return
+    base = ["lake", "cache", "get", "--service", TAUCETI_CACHE_SERVICE, "--repo", TAUCETI]
+    result = fetch("TauCeti", [*base, f"--max-revs={max_revs}"])
+    if result == "workspace-error":
+        return
+
+    def git(*args: str) -> str:
+        p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+        return p.stdout.strip() if p.returncode == 0 else ""
+
+    base_ref = "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main")
+    main = git("rev-parse", "--verify", base_ref)
+    head = git("rev-parse", "HEAD")
+    if main and main != head:
+        # An explicit toolchain fetch also primes the store for a rebase that changes Lean versions.
+        toolchain = git("show", base_ref + ":lean-toolchain")
+        revisions = git("rev-list", *([] if max_revs == "0" else [f"--max-count={max_revs}"]), base_ref)
+        for revision in revisions.splitlines():
+            status = fetch(
+                "TauCeti main", [*base, "--rev", revision, *(["--toolchain", toolchain] if toolchain else [])]
+            )
+            if status != "miss":
+                if status == "workspace-error":
+                    return
+                break
+        else:
+            origin = git("config", "--get", "remote.origin.url")
+            unavailable(
+                "TauCeti main cache has no published outputs in the requested history"
+                + (
+                    ""
+                    if _same_repository(origin, CHECKOUT_URL)
+                    else f" (checkout origin is {origin}, not {CHECKOUT_URL})"
+                )
+            )
+    elif result == "miss":
+        unavailable("TauCeti main cache has no published outputs in the requested history")
+    if result == "miss":
+        env["TAUCETI_PR_CACHE_MISS"] = "1"
+        log("warning: PR history is uncached; current main artifacts are ready for the rebase")
 
 
 def bubble_cmd() -> list[str]:
@@ -919,6 +1771,11 @@ def bubble_supports_allow_push() -> bool:
     return "--allow-push" in _bubble_open_help()
 
 
+def bubble_supports_github_account() -> bool:
+    """Account selection must reach the shared proxy, not just the Bubble CLI process."""
+    return re.search(r"(?<![\w-])--github-account(?=[\s=,]|$)", _bubble_open_help()) is not None
+
+
 def bubble_supports_lake_cache_service() -> bool:
     """Does the resolved Bubble support its host-global, download-only Lake cache proxy?"""
     import re
@@ -943,6 +1800,8 @@ def tauceti_cache_unreachable_reason() -> str | None:
     import urllib.error
     import urllib.request
 
+    if not TAUCETI_CACHE_REVISION_URL:
+        return None
     url = f"{TAUCETI_CACHE_REVISION_URL}/"
     try:
         # Cloudflare fronts the cache and answers 403 to Python's default `Python-urllib/x.y` user
@@ -1028,6 +1887,8 @@ def _bubble_proxy_endpoint_healthy(*, newer_than: int | None = None, expected_ve
         capabilities = endpoint.get("capabilities")
         if not isinstance(capabilities, list) or "allow-push" not in capabilities:
             return False
+        if os.environ.get("TAUCETI_GITHUB_ACCOUNT") and "github-account" not in capabilities:
+            return False
         if expected_version is not None and endpoint.get("bubble_version") != expected_version:
             return False
         pid = endpoint.get("pid")
@@ -1084,7 +1945,7 @@ def ensure_fork_proxy_current() -> None:
     `gh proxy start`. The refresh is serialized under a host-global file lock so concurrent TauCeti workers
     do not race; Bubble separately serializes all service installers. Fail-CLOSED throughout: if the refresh
     cannot publish a fresh endpoint we Die rather than burn a long round that cannot authenticate. Call this
-    ONLY for rounds that push to a fork — a review-only worker must not be blocked by it."""
+    for fork authoring or an explicitly selected GitHub account, including selected-account reviews."""
     import fcntl
 
     # The lock lives in the always-writable temp dir, per OS user, so acquiring it effectively never fails.
@@ -1101,7 +1962,7 @@ def ensure_fork_proxy_current() -> None:
             if _bubble_proxy_endpoint_healthy():
                 return
             raise Die(
-                "preflight: fork authoring needs Bubble installed at a stable path; the uvx fallback "
+                "preflight: fork authoring and GitHub account selection need Bubble installed at a stable path; the uvx fallback "
                 "cannot safely own a host-global launchd/systemd daemon. Install dev-bubble or set "
                 "$TAUCETI_BUBBLE to a stable Bubble executable, then re-run."
             )
@@ -1115,22 +1976,22 @@ def ensure_fork_proxy_current() -> None:
             detail = (e.stderr or e.stdout or "").strip()[-500:]
             suffix = f"\n  Bubble said: {detail}" if detail else ""
             raise Die(
-                "preflight: bubble's git auth-proxy daemon lacks fork-push support and could not be "
+                "preflight: bubble's git auth-proxy daemon lacks required GitHub capabilities and could not be "
                 f"refreshed: {e}{suffix}"
             ) from e
         except (OSError, subprocess.SubprocessError) as e:
             raise Die(
-                "preflight: bubble's git auth-proxy daemon lacks fork-push support and could not be "
+                "preflight: bubble's git auth-proxy daemon lacks required GitHub capabilities and could not be "
                 f"refreshed: {e}\n"
                 "  Restart it yourself with `bubble gh proxy start`, then re-run."
             ) from e
         if not _wait_bubble_proxy_endpoint_healthy(newer_than=endpoint_mtime, expected_version=version or None):
             raise Die(
                 "preflight: `bubble gh proxy start` returned success but did not publish a reachable "
-                "fresh auth-proxy endpoint with fork-push support. Check ~/.bubble/auth-proxy.log and "
+                "fresh auth-proxy endpoint with the required GitHub capabilities. Check ~/.bubble/auth-proxy.log and "
                 "/tmp/bubble-auth-proxy.log, then re-run."
             )
-        log("bubble auth-proxy: restarted daemon with fork --allow-push support")
+        log("bubble auth-proxy: restarted daemon with the required GitHub capabilities")
     finally:
         if lockf is not None:
             try:
@@ -1295,7 +2156,7 @@ def agent_inner_cmd(profile: AuthoringProfile | str) -> str:
     )
 
 
-def bubble_work_cmd(inner: str) -> str:
+def bubble_work_cmd(inner: str, *, verify_helper=False) -> str:
     """Trusted bootstrap run before the work agent inside Bubble.
 
     Bubble's noninteractive `--command` mode deliberately does not run a hook-generated build, so do
@@ -1312,6 +2173,13 @@ def bubble_work_cmd(inner: str) -> str:
     log to the ordinary case. It printed one `warning: TauCeti Lake cache miss` line and rebuilt the
     library from source, every round, for as long as the endpoint stayed down.
     """
+    preliminary = (
+        '"$TAUCETI_VERIFY_PYTHON" "/opt/round/tauceti-verify" --stage build'
+        if verify_helper
+        else "timeout 1800 lake build"
+    )
+    if not TAUCETI_CACHE_SERVICE:
+        return f"set -e; lake exe cache get || lake exe cache get; {preliminary} || true; exec {inner}"
     fetch = f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI}"
     return (
         "set -e; "
@@ -1334,15 +2202,15 @@ def bubble_work_cmd(inner: str) -> str:
         "fi; "
         "fi; "
         'rm -f "$tc_log"; '
-        "if ! timeout 1800 lake build; then "
+        f"if ! {preliminary}; then "
         "echo 'warning: pre-agent lake build failed or timed out; the agent starts from a red tree' >&2; "
         "fi; "
         f"exec {inner}"
     )
 
 
-def _bubble_pop(cfg: Config, env: dict) -> None:
-    subprocess.run([*bubble_cmd(), "pop", bubble_name(cfg), "-f"], env=env, capture_output=True)
+def _bubble_pop(cfg: Config, env: dict) -> bool:
+    return subprocess.run([*bubble_cmd(), "pop", bubble_name(cfg), "-f"], env=env, capture_output=True).returncode == 0
 
 
 def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
@@ -1403,6 +2271,7 @@ def run_in_bubble(
     inner_cmd: str | None = None,
     cred_model: str | None = None,
     allow_push: str | None = None,
+    cancel_event=None,
 ) -> int:
     """Open a fresh repo-scoped bubble for target, run a command inside it, pop it. By default runs the
     work agent (agent_inner_cmd) seeding the work model's credential; pass inner_cmd / cred_model to run
@@ -1410,6 +2279,13 @@ def run_in_bubble(
     import shlex
 
     cfg, wm = w.cfg, opts.work_model
+    github_account = os.environ.get("TAUCETI_GITHUB_ACCOUNT")
+    if github_account and not os.environ.get("TAUCETI_AGENT_ECHO"):
+        if not bubble_supports_github_account():
+            raise Die(
+                "--github-account with --bubble requires account-aware Bubble; this install has no --github-account"
+            )
+        ensure_fork_proxy_current()
     # Review/probe commands bring their own model policy. Do not let an unrelated authoring override
     # (including a malformed effort value) prevent those isolated commands from running.
     profile = getattr(opts, "authoring_profile", None) or resolve_authoring_profile(wm) if inner_cmd is None else None
@@ -1420,6 +2296,7 @@ def run_in_bubble(
     # replace it in this subprocess env with a private, transient Keychain handoff below; the process-wide
     # value and any operator-owned credential file remain untouched.
     env = ensure_bubble_home(cfg)
+    helper_on = inner_cmd is None and os.environ.get("TAUCETI_VERIFY_HELPER", "0") == "1"
     rounddir = cfg.state / "bubble-round"
 
     shutil.rmtree(rounddir, ignore_errors=True)
@@ -1427,9 +2304,48 @@ def run_in_bubble(
     (rounddir / "prompt.txt").write_text(prompt)
     # Stage the write wrappers (contract §1/§4): mounted read-only at /opt/round and put on PATH inside
     # the container, so the agent's ONLY push path is the branch-CAS git-safe-push.
-    for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh"):
+    for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh", "tauceti-lean"):
         shutil.copy(HERE / "scripts" / f, rounddir / f)
         os.chmod(rounddir / f, 0o755)
+    shutil.copy(HERE / "scripts/tauceti-lean", rounddir / "lean")
+    (rounddir / "lean").chmod(0o755)
+    (rounddir / "tauceti-tools").write_text('#!/bin/sh\nexec python3 -m tauceti_tools "$@"\n')
+    (rounddir / "tauceti-tools").chmod(0o755)
+    # Cheap V0 diagnostics also need these; do not tie them to the helper canary opt-in.
+    from tauceti_tools.templates import ASSETS
+
+    for name, source in {
+        "tauceti-local-axioms": "local_axioms.py",
+        "tauceti-local-lint": "local_lint.py",
+        "LocalAxioms.lean": "LocalAxioms.lean",
+        "LocalLint.lean": "LocalLint.lean",
+    }.items():
+        shutil.copy(ASSETS / "scripts" / source, rounddir / name)
+    shutil.copy(HERE / "scripts/tauceti-local-checks", rounddir / "tauceti-local-checks")
+    # Container-produced executables must never enter the host's checker cache.
+    local_axioms_cache = cfg.state / "bubble-local-axioms"
+    local_axioms_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+    local_lint_cache = cfg.state / "bubble-local-lint"
+    local_lint_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if helper_on:
+        from .verification import cache_root
+        from .verification_storage import root as storage_root
+
+        package = rounddir / "tauceti_worker"
+        shutil.copytree(
+            Path(__file__).parent, package, ignore=shutil.ignore_patterns("__pycache__", "scripts", "prompts")
+        )
+        shutil.copytree(HERE / "scripts", package / "scripts")
+        shutil.copytree(HERE / "prompts", package / "prompts")
+        shutil.copy(HERE / "scripts" / "tauceti-verify", rounddir / "tauceti-verify")
+        (rounddir / "tauceti-verify").chmod(0o755)
+        verify_state = cfg.state / "verification-state"
+        verify_state.mkdir(parents=True, exist_ok=True)
+        verify_storage = storage_root().resolve()
+        verify_storage.mkdir(parents=True, exist_ok=True, mode=0o700)
+        host_cache = None
+        with contextlib.suppress(OSError, ValueError):
+            host_cache = cache_root()
     if wm in OPENROUTER_MODELS:  # OpenRouter key has no proxy — stage it 0600, mounted read-only
         keyf = rounddir / "openrouter.key"
         keyf.write_text(os.environ.get("OPENROUTER_API_KEY", ""))
@@ -1441,9 +2357,69 @@ def run_in_bubble(
 
     _bubble_pop(cfg, env)  # clear any container a SIGKILLed prior round left behind
 
-    mount_flags = ["--mount", f"{rounddir}:/opt/round:ro"]
+    mount_flags = [
+        "--mount",
+        f"{rounddir}:/opt/round:ro",
+        "--mount",
+        f"{local_axioms_cache}:/opt/local-axioms-cache:rw",
+        "--mount",
+        f"{local_lint_cache}:/opt/local-lint-cache:rw",
+    ]
+    if helper_on:
+        mount_flags += [
+            "--mount",
+            f"{verify_state}:/opt/verification-state:rw",
+            "--mount",
+            f"{verify_storage}:{verify_storage}:rw",
+        ]
+        if host_cache is not None:
+            mount_flags += ["--mount", f"{host_cache}:/opt/verification-cache:rw"]
+    api_bridge = os.environ.get("TAUCETI_API_CONTEXT")
+    api_boundary = None
+    if api_bridge and _uses_claude_credentials(cred_model):
+        from .claude_api_client import atomic
+
+        bridge = Path(api_bridge)
+        api_bin = rounddir / "api-bin"
+        api_bin.mkdir(mode=0o700)
+        shutil.copy(Path(__file__).with_name("claude_api_client.py"), api_bin / "claude")
+        for name in ("usage_accounting.py", "usage_lifecycle.py", "prices.json"):
+            shutil.copy(Path(__file__).with_name(name), api_bin / name)
+        (api_bin / "claude").chmod(0o700)
+        keyfile = rounddir / "anthropic.key"
+        keyfile.write_text((bridge / "key").read_text())
+        keyfile.chmod(0o600)
+        w.rc.add_cleanup(lambda: keyfile.unlink(missing_ok=True))
+        settings = json.loads((bridge / "bin/config.json").read_text())
+        usage_dir = settings.get("usage_dir")
+        if not isinstance(usage_dir, str) or not Path(usage_dir).is_absolute():
+            raise Die("API accounting requires an absolute durable usage_dir")
+        from .usage_supervisor import prepare_boundary
+
+        api_boundary = prepare_boundary(bridge)
+        settings.update(
+            command=["claude"], key="/opt/round/anthropic.key", bridge="/opt/api-bridge", boundary=api_boundary
+        )
+        if usage_dir:
+            settings["usage_dir"] = "/opt/api-usage"
+            mount_flags += ["--mount", f"{usage_dir}:/opt/api-usage:rw"]
+        atomic(api_bin / "config.json", settings)
+        mount_flags += [
+            "--mount",
+            f"{api_bin}:/opt/api-bin:ro",
+            "--mount",
+            f"{bridge / 'inbox'}:/opt/api-bridge/inbox:rw",
+            "--mount",
+            f"{bridge / 'outbox'}:/opt/api-bridge/outbox:ro",
+        ]
     for m in mounts or []:
         mount_flags += ["--mount", m]
+    import tauceti_tools
+
+    mount_flags += ["--mount", f"{Path(tauceti_tools.__file__).parent}:/opt/tools/tauceti_tools:ro"]
+    snapshot = os.environ.get("TAUCETI_CONF_SNAPSHOT")
+    if snapshot:
+        mount_flags += ["--mount", f"{snapshot}:/opt/project.toml:ro"]
 
     # Fork-PR write support (kim-em/bubble#320): grant the in-container agent git fetch/push to the
     # contributor's own fork on top of the base-scoped GitHub access, so it can push an authored branch
@@ -1451,12 +2427,26 @@ def run_in_bubble(
     # fork gets git only. (For a PR target, bubble also auto-derives the head fork, so this is belt-and-
     # suspenders for maintenance and the sole grant for authoring, which has no PR to derive from.)
     push_flags = ["--allow-push", allow_push] if allow_push else []
+    account_flags = ["--github-account", github_account] if github_account else []
+    if github_account:
+        account_flags += ["--git-name", os.environ["GIT_AUTHOR_NAME"], "--git-email", os.environ["GIT_AUTHOR_EMAIL"]]
 
     # Push-arbiter env crossing into the container: /opt/round on PATH + the branch-CAS inputs the
     # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
     # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (the claim+heartbeat
     # are host-side; the branch CAS is the [HARD] guarantee and needs no in-container claim).
-    tcenv = "env PATH=/opt/round:$PATH"
+    tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/round:$PATH TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"
+    if api_bridge and _uses_claude_credentials(cred_model):
+        tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/api-bin:/opt/round:$PATH TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"
+        if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
+            tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
+    tcenv += " TAUCETI_LOCAL_LINT_CACHE=/opt/local-lint-cache TAUCETI_VERIFY_PYTHON=/usr/bin/python3"
+    tcenv += " LAKE_OVERRIDE_LEAN=true LEAN=/opt/round/tauceti-lean"
+    if inner_cmd is None:
+        for key, value in _foreground_shell_env(
+            getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)
+        ).items():
+            tcenv += f" {key}={shlex.quote(value)}"
     for var in (
         "TAUCETI_PUSH_REF",
         "TAUCETI_PUSH_EXPECT",
@@ -1467,10 +2457,58 @@ def run_in_bubble(
         val = os.environ.get(var)
         if val:
             tcenv += f" {var}={shlex.quote(val)}"
+    if helper_on:
+        for key, value in {
+            "TAUCETI_VERIFY_STATE": "/opt/verification-state",
+            "TAUCETI_VERIFY_HOST_STATE": str(verify_state.resolve()),
+            "TAUCETI_VERIFY_STORAGE_DIR": str(verify_storage),
+            "TAUCETI_VERIFY_CACHE_DIR": "/opt/verification-cache"
+            if host_cache is not None
+            else "/tmp/verification-cache",
+            "TAUCETI_VERIFY_POLICY": os.environ.get("TAUCETI_VERIFY_POLICY", "ordinary"),
+            "TAUCETI_ROUND_DEADLINE": str(getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)),
+            "TAUCETI_VERIFY_CHECKPOINT_MARGIN": os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600"),
+            "TAUCETI_VERIFY_BUBBLE": "1",
+        }.items():
+            tcenv += f" {key}={shlex.quote(value)}"
+        for name in (
+            "STORAGE_BYTES",
+            "CANDIDATE_BYTES",
+            "SOURCE_CANDIDATE_BYTES",
+            "CHECKPOINT_BYTES",
+            "CHECKPOINT_POOL_BYTES",
+            "MIN_FREE_BYTES",
+            "MIN_FREE_PERCENT",
+            "OWNERSHIP_SECONDS",
+            "COMPLETED_CACHE_SECONDS",
+            "IDLE_CACHE_SECONDS",
+        ):
+            if value := os.environ.get("TAUCETI_VERIFY_" + name):
+                tcenv += f" TAUCETI_VERIFY_{name}={shlex.quote(value)}"
+    if snapshot:
+        tcenv += " TAUCETI_CONF=/opt/project.toml TAUCETI_CONF_SOURCE=/opt/project.toml TAUCETI_CONF_SNAPSHOT=/opt/project.toml"
+        from tauceti_tools.project import active
+
+        for key, value in active().environment().items():
+            tcenv += f" {key}={shlex.quote(value)}"
     command_inner = inner_cmd if inner_cmd is not None else agent_inner_cmd(profile)
     if inner_cmd is None:
-        command_inner = f"bash -c {shlex.quote(bubble_work_cmd(command_inner))}"
-    command = f"{tcenv} {command_inner}"
+        command_inner = f"bash -c {shlex.quote(bubble_work_cmd(command_inner, verify_helper=helper_on))}"
+    if helper_on:
+        # Resolve the canonical local main once after Bubble has checked out the target.
+        setup = (
+            'export TAUCETI_VERIFY_BASE="$(PYTHONPATH=/opt/round python3 -c '
+            + shlex.quote(
+                "from pathlib import Path; from tauceti_worker.verification_scope import local_main; print(local_main(Path.cwd()))"
+            )
+            + ')"; '
+            + tcenv
+            + " "
+            + command_inner
+        )
+        command = "bash -c " + shlex.quote(setup)
+    else:
+        command = f"{tcenv} {command_inner}"
 
     # Only work-agent rounds compile TauCeti. Bubble turns the two immutable public endpoints into
     # capability-scoped routes through its host-global download cache; the upstream host is not exposed
@@ -1482,7 +2520,7 @@ def run_in_bubble(
             TAUCETI_CACHE_ARTIFACT_URL,
             TAUCETI_CACHE_REVISION_URL,
         ]
-        if inner_cmd is None
+        if inner_cmd is None and TAUCETI_CACHE_SERVICE
         else []
     )
 
@@ -1498,15 +2536,21 @@ def run_in_bubble(
         "--github-security",
         "allowlist-write-graphql",
         *push_flags,
+        *account_flags,
         *cache_flags,
         *mount_flags,
-        *agent_cred_flags(cred_model),
+        *(
+            ["--no-claude-credentials", "--no-claude-config", "--no-codex-credentials", "--no-codex-config"]
+            if api_bridge and _uses_claude_credentials(cred_model)
+            else agent_cred_flags(cred_model)
+        ),
         "--command",
         command,
     ]
 
     if os.environ.get("TAUCETI_AGENT_ECHO"):
         print("BUBBLE " + " ".join(_shq(a) for a in argv))
+        (rounddir / "anthropic.key").unlink(missing_ok=True)
         return 0
 
     if allow_push and not _wait_bubble_proxy_endpoint_healthy(timeout=5):
@@ -1530,14 +2574,24 @@ def run_in_bubble(
     # and override only Bubble's subprocess env (done after the echo path so a dry-run never prompts the
     # Keychain). Register cleanup before launch for signals; the normal finally removes it promptly too.
     claude_seed: Path | None = None
-    if _uses_claude_credentials(cred_model):
+    if _uses_claude_credentials(cred_model) and not api_bridge:
         claude_seed = _stage_claude_creds_for_bubble(cfg)
         if claude_seed is not None:
             env = {**env, "CLAUDE_CONFIG_DIR": str(claude_seed)}
             # Register the seed first: RoundContext cleans up LIFO, so the pop registered next runs
             # before the container's credential source disappears.
             w.rc.add_cleanup(lambda p=claude_seed: shutil.rmtree(p, ignore_errors=True))
-    w.rc.add_cleanup(lambda: _bubble_pop(cfg, env))  # pop if we're killed mid-run
+
+    def cleanup_bubble():
+        if _bubble_pop(cfg, env) and api_bridge and api_boundary:
+            from .usage_supervisor import record_boundary_stopped
+
+            try:
+                record_boundary_stopped(api_bridge, api_boundary)
+            except OSError as error:
+                log(f"usage boundary evidence pending: {error}")
+
+    w.rc.add_cleanup(cleanup_bubble)  # pop if we're killed mid-run
     try:
         if inner_cmd is None:  # the work agent — quiet/log it like the host path
             rc = run_agent_proc(
@@ -1545,17 +2599,33 @@ def run_in_bubble(
                 env=env,
                 logdir=cfg.logdir,
                 label=f"agent-{wm}",
+                quota_cfg=cfg,
                 provider=profile.provider,
+                cancel_event=cancel_event,
             )
         else:  # review engine / probe — leave its output inline
+            from .fleet_capacity import check_launch_admission
+
+            check_launch_admission()
             rc = subprocess.run(argv, env=env).returncode
     finally:
         try:
-            _bubble_pop(cfg, env)  # don't rely on --ephemeral alone, and pop even on an exception
+            cleanup_bubble()  # confirm this bridge's container stopped even on an exception
         finally:
             if claude_seed is not None:
                 shutil.rmtree(claude_seed, ignore_errors=True)
+            (rounddir / "anthropic.key").unlink(missing_ok=True)
     return rc
+
+
+def _claude_review_model(reviewers: str) -> str | None:
+    """Pin direct Claude reviews to the shared default unless explicitly overridden."""
+    if "claude" not in [r.strip() for r in reviewers.split(",")]:
+        return None
+    configured = (os.environ.get("TAUCETI_CLAUDE_MODEL") or "").strip()
+    model = configured or AUTHORING_DEFAULTS["claude"][0]
+    _reject_retired_opus(model, "$TAUCETI_CLAUDE_MODEL" if configured else "repository default")
+    return model
 
 
 def _codex_review_model_override(reviewers: str) -> str | None:
@@ -1573,7 +2643,185 @@ def _kiro_review_model(reviewers: str) -> str | None:
     return _validate_kiro_model_pin(model, "$TAUCETI_REVIEW_KIRO_MODEL" if configured else "repository default")
 
 
-def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts) -> int:
+def review_in_bubble(
+    w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts, *, result_file: Path | None = None
+) -> int:
+    """Hold the review lease outside the repo-scoped container, through publication."""
+    from tauceti_tools.claims import GitClaim, record_review_start
+
+    from .github import claims_repo
+
+    nonce = uuid.uuid4().hex
+    claim = GitClaim(claims_repo(), f"review/{TAUCETI.lower()}/{pr}/{head}", f"{w.cfg.wid}-{nonce}")
+    rc = claim.acquire()
+    if rc == 1:
+        return EX_CLAIM_COLLISION
+    if rc == 0:
+        claim.start_heartbeat()
+    else:
+        log("Git review claim unavailable; proceeding (a concurrent duplicate review is possible)")
+    try:
+        try:
+            record_review_start(TAUCETI, pr, head, nonce, git_held=rc == 0)
+        except Exception:
+            pass  # Reporting must not prevent useful work.
+        return _review_in_bubble(w, pr, head, reviewers, opts, result_file=result_file)
+    finally:
+        if rc == 0:
+            claim.release()
+
+
+_REVIEW_SOURCE_STAGING = ".tauceti-source-staging.json"
+
+
+def _prune_review_mathlib_staging(base):
+    """Only marked, unlocked temporary producers; published Bubble mounts stay alone."""
+    from . import retention, work_recovery
+
+    try:
+        candidates = list(base.glob("mathlib-src-tmp-*"))
+    except OSError as error:
+        log(f"review source staging inventory deferred: {error}")
+        return
+    observations = None
+    for path in candidates:
+        try:
+            if path.is_symlink() or not path.is_dir() or path.stat().st_uid != os.getuid():
+                continue
+            marker = path / _REVIEW_SOURCE_STAGING
+            with contextlib.ExitStack() as stack:
+                try:
+                    lease = stack.enter_context(os.fdopen(os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)))
+                except FileNotFoundError:
+                    if not path.name.endswith(".retention-deleting"):
+                        continue
+                    lease = None  # Its validated, released owner already committed disposal.
+                if lease is not None:
+                    if not stat.S_ISREG(os.fstat(lease.fileno()).st_mode):
+                        continue
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if json.load(lease) != dict(version=1, uid=os.getuid()):
+                        continue
+                original = path.stat()
+                if observations is None:
+                    observations = work_recovery.process_references(), retention.mount_points()
+                references, mounts = observations
+                if work_recovery.referenced_users(path, references) or mounts is None:
+                    continue
+                current = path.stat()
+                if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+                    continue
+                if lease is not None:
+                    locked = os.fstat(lease.fileno())
+                    current_lock = marker.lstat()
+                    if (locked.st_dev, locked.st_ino) != (current_lock.st_dev, current_lock.st_ino):
+                        continue
+                report = retention.fresh_report()
+                retention.remove(path, base, report, check_users=False, mounts=mounts)
+                for error in report["errors"]:
+                    log(f"review source staging cleanup deferred: {error}")
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as error:
+            if not isinstance(error, BlockingIOError):
+                log(f"review source staging cleanup deferred for {path}: {error}")
+
+
+@contextlib.contextmanager
+def _review_mathlib_staging(base):
+    staging = Path(tempfile.mkdtemp(prefix="mathlib-src-tmp-", dir=base))
+    try:
+        with (staging / _REVIEW_SOURCE_STAGING).open("x+") as lease:
+            fcntl.flock(lease, fcntl.LOCK_EX)
+            json.dump(dict(version=1, uid=os.getuid()), lease)
+            lease.flush()
+            source = staging / "source"
+            source.mkdir(mode=0o700)
+            yield source, lease.fileno()
+    finally:
+        # Close this producer's descriptor first. A surviving Git child keeps
+        # the inherited lock, so the ordinary prune will defer its staging.
+        _prune_review_mathlib_staging(base)
+
+
+def _review_mathlib_source(cfg: Config, head: str) -> Path | None:
+    """Mathlib source at the reviewed head's pin, for the reviewers' greps. Staged host-side
+    because the bubble's repo-scoped proxy cannot reach mathlib4; one snapshot per revision, the
+    two newest kept. None means the manifest declares no Mathlib dependency; staging failures
+    stop the round before a reviewer can run without required sources."""
+    from .github import gh_run
+
+    got = gh_run(
+        [
+            "gh",
+            "api",
+            f"repos/{TAUCETI}/contents/lake-manifest.json?ref={head}",
+            "-H",
+            "Accept: application/vnd.github.raw",
+        ]
+    )
+    if got.returncode:
+        raise NoProgress("review: could not read the exact-head dependency manifest; no review started")
+    try:
+        packages = json.loads(got.stdout)["packages"]
+        if not isinstance(packages, list) or not all(isinstance(p, dict) for p in packages):
+            raise ValueError("invalid package list")
+        mathlib = next((p for p in packages if p.get("name") == "mathlib"), None)
+        if mathlib is None:
+            return None
+        rev = mathlib["rev"]
+    except (ValueError, KeyError, TypeError) as error:
+        raise NoProgress("review: invalid exact-head dependency manifest; no review started") from error
+    if not isinstance(rev, str) or not re.fullmatch(r"[0-9a-f]{40}", rev):
+        raise NoProgress("review: Mathlib revision is not pinned to a commit; no review started")
+    base = cfg.state / "refs"
+    _prune_review_mathlib_staging(base)
+    src = base / f"mathlib-src-{rev}"
+    if (src / "Mathlib.lean").is_file():
+        return src
+    base.mkdir(parents=True, exist_ok=True)
+    with _review_mathlib_staging(base) as (tmp, lease_fd):
+        steps = (
+            ["git", "init", "-q", str(tmp)],
+            [
+                "git",
+                "-C",
+                str(tmp),
+                "fetch",
+                "-q",
+                "--depth",
+                "1",
+                "https://github.com/leanprover-community/mathlib4",
+                rev,
+            ],
+            ["git", "-C", str(tmp), "checkout", "-q", "FETCH_HEAD"],
+        )
+        try:
+            failed = any(subprocess.run(step, timeout=600, pass_fds=(lease_fd,)).returncode for step in steps)
+        except (OSError, subprocess.TimeoutExpired):
+            failed = True
+        if failed:
+            raise NoProgress("review: could not stage the pinned Mathlib sources; no review started")
+        shutil.rmtree(tmp / ".git", ignore_errors=True)
+        try:
+            tmp.rename(src)
+        except OSError:  # a concurrent worker staged the same revision first
+            pass  # This producer's private staging is removed before releasing its lease.
+    snapshots = sorted(
+        (p for p in base.glob("mathlib-src-*") if not p.name.startswith("mathlib-src-tmp-")),
+        key=lambda p: p.stat().st_mtime,
+    )
+    for old in snapshots[:-2]:
+        if old != src:
+            shutil.rmtree(old, ignore_errors=True)
+    if not (src / "Mathlib.lean").is_file():
+        raise NoProgress("review: the pinned Mathlib source snapshot is incomplete; no review started")
+    return src
+
+
+def _review_in_bubble(
+    w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts, *, result_file: Path | None = None
+) -> int:
     """Run the tauceti-review engine INSIDE bubble — a hard container boundary around an engine that
     reads an untrusted PR diff and runs a model on it (and, once review gains tool use, runs that
     model's tools). The repo-scoped proxy can't reach a second repo, so we pre-stage everything the
@@ -1582,8 +2830,8 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     outbox but NOT push (the bubble can't reach TauCetiData) — do_review drains that outbox to
     TauCetiData host-side afterwards. The only traffic that
     crosses the boundary is the engine's TauCeti code clone + PR API + scoreboard post (all scoped to
-    TauCeti, already allowed by the proxy) and the reviewer model's provider egress. The engine has no
-    Python deps, so we run the mounted source with the image's python3 — no uvx/uv/PyPI.
+    TauCeti, already allowed by the proxy) and the reviewer model's provider egress. The engine and its shared Tools dependency are mounted as source and run with the image's
+    python3 — no package downloads inside the container.
 
     The store is mounted READ-WRITE from the worker's persistent store_dir (not /tmp): it holds the
     scoreboard/thread comment ids the next round edits in place — an ephemeral store would post a
@@ -1593,32 +2841,61 @@ def review_in_bubble(w: Worker, pr: int, head: str, reviewers: str, opts: RoundO
     cfg = w.cfg
     eng = os.environ.get("TAUCETI_REVIEW_ENGINE_DIR")
     engine_dir = Path(eng) if eng else (cfg.state / "refs" / "review-engine")
-    if not eng and not fetch_ref(REVIEW, engine_dir):  # keeps .git (no cross-repo rev fallback)
-        raise Die(f"fetch {REVIEW} failed")
+    if not eng:
+        ref = os.environ.get("TAUCETI_REVIEW_REF")
+        if ref:
+            engine_dir = cfg.state / "refs" / f"review-engine-{ref}"
+            current = subprocess.run(
+                ["git", "-C", str(engine_dir), "rev-parse", "HEAD"], capture_output=True, text=True
+            )
+            if current.returncode or current.stdout.strip() != ref:
+                engine_dir.mkdir(parents=True, exist_ok=True)
+                commands = (
+                    ["git", "init", "-q", str(engine_dir)],
+                    ["git", "-C", str(engine_dir), "fetch", "--depth", "1", f"https://github.com/{REVIEW}", ref],
+                    ["git", "-C", str(engine_dir), "checkout", "--detach", "FETCH_HEAD"],
+                )
+                if any(subprocess.run(command, timeout=120).returncode for command in commands):
+                    raise Die(f"fetch pinned {REVIEW}@{ref} failed")
+        elif not fetch_ref(REVIEW, engine_dir):
+            raise Die(f"fetch {REVIEW} failed")
     roadmap_dir = cfg.state / "refs" / "roadmap"
     if not fetch_ref(ROADMAP, roadmap_dir):
         raise Die(f"fetch {ROADMAP} failed")
     store = cfg.store_dir
     store.mkdir(parents=True, exist_ok=True)
     mounts = [f"{engine_dir}:/opt/engine:ro", f"{roadmap_dir}:/opt/roadmap:ro", f"{store}:/opt/review-store:rw"]
-    # No --rubrics-sha/--shadow (they'd re-fetch TauCetiReview). --no-mathlib for now; wiring
-    # --mathlib-dir at the bubble's vendored .lake/packages/mathlib is the reuse-rubric refinement.
+    if result_file is not None:
+        mounts.append(f"{result_file.parent}:/opt/review-result:rw")
+    # The reuse rubric greps Mathlib, and the merge gate does not count an approval whose judge
+    # says Mathlib was missing from its checkout.
+    mathlib = _review_mathlib_source(cfg, head)
+    if mathlib is not None:
+        mounts.append(f"{mathlib}:/opt/mathlib:ro")
+    mathlib_flag = "--mathlib-dir /opt/mathlib" if mathlib is not None else "--no-mathlib"
+    # No --rubrics-sha/--shadow (they'd re-fetch TauCetiReview).
     # run_in_bubble prefixes `env PATH=… `, so the inner command must start with an executable, not the
     # `cd` shell builtin — carry the engine on PYTHONPATH instead of cwd (cwd is irrelevant: the engine
     # uses --repo-dir for its files and an absolute temp workdir).
     import shlex
 
+    claude_model = _claude_review_model(reviewers)
+    claude_flag = f" --claude-model {shlex.quote(claude_model)}" if claude_model else ""
     cm = _codex_review_model_override(reviewers)
     codex_flag = f" --codex-model {shlex.quote(cm)}" if cm else ""  # operator override; else engine default
     km = _kiro_review_model(reviewers)
     kiro_flag = f" --kiro-model {shlex.quote(km)}" if km else ""
     inner = (
-        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine python3 -m runner.cli "
+        "env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/engine:/opt/tools python3 -m runner.cli "
         f"{pr} --repo {TAUCETI} --repo-dir /opt/engine --roadmap-dir /opt/roadmap "
-        f"--no-mathlib --no-sync --store /opt/review-store --post "
-        f"--max-rounds-per-day {REVIEW_DAILY_CAP} "  # one value drives the survey prefilter + engine
-        f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}{codex_flag}{kiro_flag}"
+        f"{mathlib_flag} --no-sync --no-coordinate --store /opt/review-store --post "
+        f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}"
+        f"{claude_flag}{codex_flag}{kiro_flag}"
     )
+    if result_file is not None:
+        inner = f"env TAUCETI_REVIEW_RESULT_FILE=/opt/review-result/{shlex.quote(result_file.name)} " + inner
+    if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api":
+        inner += " --auth api"
     if km:
         # The review engine creates another clean reviewer HOME. Seed this
         # container's provider-only credential first so that clean-room copy has
@@ -1656,8 +2933,13 @@ def _worker_iso_home(wid: str, _base: Path | None = None) -> Path:
 
     Linux keeps the in-tree location beside the worker's other state. Either way the path must be a pure
     function of wid (no $HOME), so a loop child recomputes the same one its parent isolated to."""
+    from tauceti_tools.project import active
+
+    project = active()
+    if project and not project.legacy:
+        return project.state_root / "workers" / wid / "home"
     if sys.platform != "darwin":
-        return HERE / "state" / wid / "home"
+        return legacy_data_root(HERE) / "state" / wid / "home"
     base = _base
     if base is None:
         try:
@@ -1703,6 +2985,9 @@ def share_build_caches(wid: str, data_home: Path) -> dict[str, str]:
     and resolved through `_host_home()` (pwd, not $HOME) so it computes the same answer either way. An
     operator-supplied value always wins. Returns the resolved mapping, for logging."""
     host = _host_home()
+    from .shared_mathlib import pin_root
+
+    pin_root(os.environ)
     os.environ.setdefault("ELAN_HOME", str(build_caches.elan_pool(host)))
     os.environ.setdefault("MATHLIB_CACHE_DIR", str(data_home / ".cache" / "mathlib"))
     os.environ.setdefault("LAKE_CACHE_DIR", str(data_home / ".cache" / "lake"))

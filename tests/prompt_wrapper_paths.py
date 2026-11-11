@@ -23,10 +23,12 @@ This harness pins the four properties that keep that true:
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import os
 import re
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -40,11 +42,22 @@ WRAPPERS = ("git-safe-push", "gh-safe-pr-create", "claim.sh")
 
 # The keys each call site passes, so a prompt that grows a placeholder without a substitution fails
 # here rather than reaching an agent. Mirrors work_units._do_fixlike / do_roadmap.
+VERIFY = dict(LOCAL_VERIFICATION="(local verification rules)")
+FIXLIKE = dict(PR=123, AGENT="Claude Code", BIN="/bin", SCOPE_POLICY="ordinary", **VERIFY)
 CALL_SITES = {
-    "fix.md": dict(PR=123, AGENT="Claude Code", BIN="/bin"),
-    "fix-ci.md": dict(PR=123, AGENT="Claude Code", BIN="/bin"),
-    "rebase.md": dict(PR=123, AGENT="Claude Code", BIN="/bin"),
-    "bump.md": dict(PR=123, AGENT="Claude Code", BIN="/bin"),
+    "pr-outcome.md": dict(
+        PR=123,
+        HEAD="a" * 40,
+        CLOSE_AUTHORITY="Closure authority is pinned by the worker.",
+    ),
+    "overlap-scan.md": dict(BATCH="/tmp/batch.json", RESULT="/tmp/result.json"),
+    "overlap-fix.md": dict(ISSUE=123, BODY="Evidence", FORK="alice/TauCeti", FORK_OWNER="alice", BIN="/bin", **VERIFY),
+    "fix.md": FIXLIKE,
+    "fix-ci.md": FIXLIKE,
+    "rebase.md": FIXLIKE,
+    "bump.md": dict(FIXLIKE, SCOPE_POLICY="bump"),
+    "lint-repair.md": dict(FIXLIKE, SCOPE_POLICY="lint-repair"),
+    "local-verification.md": dict(SCOPE_POLICY="ordinary", LOCAL_CHECKS="/bin/tauceti-local-checks"),
     "roadmap.md": dict(
         ONLY="CFSGStatement",
         SKIP="none",
@@ -56,9 +69,12 @@ CALL_SITES = {
         REVIEW_DIR="/opt/review",
         RUBRICS="/opt/rubrics/rubrics.md",
         SOURCE_GUIDANCE="",
+        EXTRA_ROADMAP_PROMPT="",
         BIN="/bin",
+        **VERIFY,
     ),
 }
+NO_WRAPPER = {"overlap-scan.md", "pr-outcome.md", "local-verification.md"}
 
 fails = 0
 
@@ -98,39 +114,43 @@ def main():
         left = sorted(set(re.findall(r"__[A-Z][A-Z0-9_]*__", out)))
         check(f"{name}: renders with no placeholder left", not left)
         invocations = [ln.strip() for ln in out.splitlines() if any(f"/{w}" in ln for w in WRAPPERS)]
-        check(f"{name}: at least one wrapper invocation", bool(invocations))
+        check(
+            f"{name}: expected write-wrapper usage",
+            bool(invocations) == (name not in NO_WRAPPER),
+        )
         # Quoted, so an install directory containing a space stays one word.
         check(
             f"{name}: every wrapper invocation is absolute and quoted",
-            all(ln.startswith(f'"{subs["BIN"]}/') for ln in invocations),
+            all(ln.startswith(f'"{subs.get("BIN")}/') for ln in invocations),
         )
     check("every bundled prompt has a call site", {p.name for p in PROMPTS.glob("*.md")} == set(CALL_SITES))
 
+    # Rollback selects the unchanged standalone V0 templates, while retaining literal substitutions.
+    with patch.dict(os.environ, TAUCETI_VERIFY_HELPER="0"):
+        for name in ("roadmap.md", "fix.md", "fix-ci.md", "rebase.md", "bump.md", "lint-repair.md", "overlap-fix.md"):
+            substitutions = dict(CALL_SITES[name])
+            substitutions["LOCAL_VERIFICATION"] = tc.agents.local_verification(
+                substitutions.get("SCOPE_POLICY", "ordinary")
+            )
+            text = fill_prompt(PROMPTS / name, **substitutions)
+            check(
+                f"{name}: default prompts use shared local checks",
+                "/tauceti-local-checks" in text and "/tauceti-verify" not in text,
+            )
+
     # 4) Shim expiry is an autonomous repair input, not a notification-only dead end. Both workers
     # reproduce and verify the gate, and both know the registry is part of the source-only fix.
-    shim_command = "python3 scripts/check-expired-mathlib-shims.py"
     for name in ("bump.md", "fix-ci.md"):
         prompt = (PROMPTS / name).read_text()
-        check(f"{name}: reproduces and verifies shim expiry", prompt.count(shim_command) == 2)
-        check(f"{name}: uses strict shim expiry mode", prompt.count("--fail-on-available") == 2)
-        check(f"{name}: validates the base registry ratchet", prompt.count("--base-manifest") == 2)
-        check(f"{name}: refreshes the base ref", prompt.count("git fetch -q origin main") == 2)
+        check(f"{name}: reproduces shim expiry with helper", '"__BIN__/tauceti-verify" --stage shim-expiry' in prompt)
+        check(
+            f"{name}: describes strict shim ratchet",
+            "--fail-on-available" in prompt and "--base-manifest" in prompt and "--base-root" in prompt,
+        )
+        check(f"{name}: no verification fetch", "git fetch -q origin main" not in prompt)
         check(f"{name}: migrates the AI-owned registry", "TauCeti/mathlib-shims.json" in prompt)
         check(f"{name}: forbids weakening exact targets", "never make the check green" in prompt)
-    check(
-        "fix-ci.md: source PRs probe only changed obligations",
-        (PROMPTS / "fix-ci.md").read_text().count("--only-new") == 2,
-    )
-    for name in ("bump.md", "fix-ci.md"):
-        prompt = (PROMPTS / name).read_text()
-        check(
-            f"{name}: shim baseline is the PR merge base",
-            prompt.count('git show "$base_ref":TauCeti/mathlib-shims.json') == 2,
-        )
-        check(
-            f"{name}: shim ratchet reads merge-base sources",
-            prompt.count('--base-root "$base_root"') == 2,
-        )
+    check("fix-ci.md: source PRs probe only changed obligations", "--only-new" in (PROMPTS / "fix-ci.md").read_text())
 
     # 5) Substituted VALUES are not templates and are not validated. `__CLAIMED__` carries text
     # copied from other contributors' intention issues, which is untrusted and documented as

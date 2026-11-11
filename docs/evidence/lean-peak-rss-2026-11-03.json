@@ -1,0 +1,18 @@
+{
+  "measured_on": "2026-11-03",
+  "repository": "TauCetiProject/TauCeti",
+  "revision": "10418ac7acb3f4b098d7c7835f516fe651614f02",
+  "toolchain": "leanprover/lean4:v4.36.0-rc2",
+  "method": "Linux wait4 ru_maxrss * 1024 for each individual Lean compiler invocation",
+  "command": "LAKE_OVERRIDE_LEAN=true LEAN=<measurement-toolchain>/bin/lean LAKE_ARTIFACT_CACHE=false LAKE_NO_CACHE=true lake build TauCeti",
+  "build_completed": true,
+  "build_jobs": 61976,
+  "source_files_measured": 23622,
+  "failed_compiler_invocations": 0,
+  "peak_rss_bytes": 9431461888,
+  "peak_rss_gib": 8.783733367919922,
+  "worst_file": "TauCeti/RepresentationTheory/CharacterTable/Dixon/ClassData/Alternating/Five.lean",
+  "worst_file_seconds": 77.72713255882263,
+  "measurement_concurrency": "24 initially, then 48; starts waited below 16 GiB MemAvailable",
+  "full_measurement_logs": "/home/kim/.local/state/tauceti/lean-pressure/measurement-20261103"
+}

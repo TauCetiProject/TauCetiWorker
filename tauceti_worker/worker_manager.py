@@ -29,17 +29,26 @@ import uuid
 from pathlib import Path
 from typing import NoReturn
 
-from .constants import AGENTS, ALLOWED_TASKS
+from . import worker_scopes
+from .config import positive_integer, security_audit_problem, validate_extra_roadmap_prompt
+from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS
+from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
 from .quota import parse_pace_curve
 from .round import signal_group
-from .runtime_status import STATUS_ENV, read_json, update_status
+from .runtime_status import STATUS_ENV, StatusPublisher, read_json
+from .runtime_status import update_status as update_status
 
 CONFIG_VERSION = 1
 DEFAULT_INTERVAL = 2.0
 TMUX_SESSION = "tauceti-workers"
 _WORKER_KEYS = {
+    "conf",
+    "max_open_prs",
+    "github_state_url",
+    "github_state_token_file",
     "id",
+    "github_account",
     "enabled",
     "agent",
     "only",
@@ -50,6 +59,7 @@ _WORKER_KEYS = {
     "roadmap_skip",
     "roadmap_extra_identities",
     "respect_claims",
+    "extra_roadmap_prompt",
     "source",
     "author_model",
     "author_effort",
@@ -58,6 +68,9 @@ _WORKER_KEYS = {
     "isolate_home",
     "restart",
     "env",
+    "claude_billing",
+    "budget",
+    "anthropic_api_key_file",
 }
 
 WORKERS_EPILOG = """\
@@ -89,7 +102,7 @@ configuration (first that is set wins):
   tauceti workers import workers.conf         import the legacy line-oriented format once
 
 full reference:
-  https://github.com/kim-em/TauCetiWorker/blob/main/docs/workers.md
+  https://github.com/TauCetiProject/TauCetiWorker/blob/main/docs/workers.md
 """
 
 
@@ -178,6 +191,18 @@ def _strings(value, where: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _extra_roadmap_prompt(value, where: str) -> str | None:
+    """Operator guidance for roadmap rounds, checked at the configuration boundary like `pace`: a blank
+    or oversized value is a bad line in workers.toml, not a worker that dies on launch."""
+    text = _string(value, where, optional=True)
+    if text is None:
+        return None
+    try:
+        return validate_extra_roadmap_prompt(text)
+    except ValueError as e:
+        raise WorkersError(f"{where}: {e}") from None
+
+
 def _pace(value, where: str) -> str | None:
     """A pacing curve, checked here at the CONFIGURATION boundary. Without this a typo passes `workers
     apply --check`, and the manager discovers it only by launching a worker that rejects its own --pace
@@ -241,16 +266,25 @@ def _env_pairs(value, where: str) -> tuple[tuple[str, str], ...]:
 @dataclasses.dataclass(frozen=True)
 class WorkerSpec:
     id: str
+    conf: str | None = None
+    max_open_prs: int = MAX_OPEN_PRS
+    github_state_url: str | None = None
+    github_state_token_file: str | None = None
+    github_account: str | None = None
     enabled: bool = True
     agent: str = "auto"
     only: tuple[str, ...] = ()
     sandbox: str = "host"
     ignore_quota: bool = False
     auto_refresh: bool = False
+    claude_billing: str = "subscription"
+    budget: bool = False
+    anthropic_api_key_file: str | None = None
     roadmap_only: str | None = None
     roadmap_skip: tuple[str, ...] = ()
     roadmap_extra_identities: tuple[str, ...] = ()
     respect_claims: bool = True
+    extra_roadmap_prompt: str | None = None
     source: str | None = None
     author_model: str | None = None
     author_effort: str | None = None
@@ -278,7 +312,7 @@ class WorkerSpec:
         if agent not in AGENTS:
             raise WorkersError(f"workers[{index}].agent must be one of: {', '.join(AGENTS)}")
         only = _strings(raw.get("only", []), f"workers[{index}].only")
-        bad_tasks = [task for task in only if task not in ALLOWED_TASKS]
+        bad_tasks = [task for task in only if task not in (*ALLOWED_TASKS, *EXPLICIT_TASKS)]
         if bad_tasks:
             raise WorkersError(f"workers[{index}].only has unknown task(s): {', '.join(bad_tasks)}")
         sandbox = _string(raw.get("sandbox", "host"), f"workers[{index}].sandbox")
@@ -287,20 +321,41 @@ class WorkerSpec:
         restart = _string(raw.get("restart", "always"), f"workers[{index}].restart")
         if restart not in ("always", "on-failure", "never"):
             raise WorkersError(f"workers[{index}].restart must be 'always', 'on-failure', or 'never'")
+        try:
+            cutoff = positive_integer(raw.get("max_open_prs", MAX_OPEN_PRS))
+        except ValueError as error:
+            raise WorkersError(f"workers[{index}].max_open_prs {error}") from None
+        if not isinstance(raw.get("max_open_prs", MAX_OPEN_PRS), int):
+            raise WorkersError(f"workers[{index}].max_open_prs must be an integer")
         spec = WorkerSpec(
             id=wid,
+            conf=_string(raw.get("conf"), f"workers[{index}].conf", optional=True),
+            max_open_prs=cutoff,
+            github_state_url=_string(raw.get("github_state_url"), f"workers[{index}].github_state_url", optional=True),
+            github_state_token_file=_string(
+                raw.get("github_state_token_file"), f"workers[{index}].github_state_token_file", optional=True
+            ),
             enabled=enabled,
             agent=agent,
+            github_account=_string(raw.get("github_account"), f"workers[{index}].github_account", optional=True),
             only=only,
             sandbox=sandbox,
             ignore_quota=_boolean(raw.get("ignore_quota", False), f"workers[{index}].ignore_quota"),
             auto_refresh=_boolean(raw.get("auto_refresh", False), f"workers[{index}].auto_refresh"),
+            claude_billing=_string(raw.get("claude_billing", "subscription"), f"workers[{index}].claude_billing"),
+            budget=_boolean(raw.get("budget", False), f"workers[{index}].budget"),
+            anthropic_api_key_file=_string(
+                raw.get("anthropic_api_key_file"), f"workers[{index}].anthropic_api_key_file", optional=True
+            ),
             roadmap_only=_string(raw.get("roadmap_only"), f"workers[{index}].roadmap_only", optional=True),
             roadmap_skip=_strings(raw.get("roadmap_skip", []), f"workers[{index}].roadmap_skip"),
             roadmap_extra_identities=_strings(
                 raw.get("roadmap_extra_identities", []), f"workers[{index}].roadmap_extra_identities"
             ),
             respect_claims=_boolean(raw.get("respect_claims", True), f"workers[{index}].respect_claims"),
+            extra_roadmap_prompt=_extra_roadmap_prompt(
+                raw.get("extra_roadmap_prompt"), f"workers[{index}].extra_roadmap_prompt"
+            ),
             source=_string(raw.get("source"), f"workers[{index}].source", optional=True),
             author_model=_string(raw.get("author_model"), f"workers[{index}].author_model", optional=True),
             author_effort=_string(raw.get("author_effort"), f"workers[{index}].author_effort", optional=True),
@@ -310,14 +365,37 @@ class WorkerSpec:
             restart=restart,
             env=_env_pairs(raw.get("env", {}), f"workers[{index}].env"),
         )
+        if spec.github_account is not None:
+            try:
+                validate_github_account(spec.github_account)
+            except ValueError as e:
+                raise WorkersError(f"workers[{index}].github_account: {e}") from None
         if spec.source is not None and ("roadmap" not in spec.only or not spec.roadmap_only):
             raise WorkersError(f"workers[{index}].source requires only to include roadmap and a non-empty roadmap_only")
         if (spec.author_model or spec.author_effort) and spec.agent == "auto":
             raise WorkersError(f"workers[{index}] author_model/author_effort require an explicit agent")
+        if spec.claude_billing not in ("subscription", "api"):
+            raise WorkersError("claude_billing must be subscription or api")
+        if spec.claude_billing == "api":
+            if spec.agent != "claude" or spec.ignore_quota or spec.auto_refresh or spec.pace:
+                raise WorkersError("Claude API workers require agent=claude and no subscription quota overrides")
+        elif spec.budget or spec.anthropic_api_key_file:
+            raise WorkersError("budget and anthropic_api_key_file require claude_billing=api")
+        # The same static checks `tauceti work` applies, so `apply --check` rejects what a worker would.
+        problem = security_audit_problem(
+            spec.only,
+            agent=spec.agent,
+            author_override=bool(spec.author_model or spec.author_effort),
+            api=spec.claude_billing == "api",
+        )
+        if problem:
+            raise WorkersError(f"workers[{index}]: {problem}")
         return spec
 
     def as_dict(self) -> dict:
         value: dict = {"id": self.id, "enabled": self.enabled}
+        if self.max_open_prs != MAX_OPEN_PRS:
+            value["max_open_prs"] = self.max_open_prs
         if self.agent != "auto":
             value["agent"] = self.agent
         if self.only:
@@ -328,6 +406,12 @@ class WorkerSpec:
             value["ignore_quota"] = True
         if self.auto_refresh:
             value["auto_refresh"] = True
+        if self.claude_billing != "subscription":
+            value["claude_billing"] = self.claude_billing
+        if self.budget:
+            value["budget"] = True
+        if self.anthropic_api_key_file:
+            value["anthropic_api_key_file"] = self.anthropic_api_key_file
         if self.roadmap_only is not None:
             value["roadmap_only"] = self.roadmap_only
         if self.roadmap_skip:
@@ -336,7 +420,17 @@ class WorkerSpec:
             value["roadmap_extra_identities"] = list(self.roadmap_extra_identities)
         if not self.respect_claims:
             value["respect_claims"] = False
-        for name in ("source", "author_model", "author_effort", "pace"):
+        for name in (
+            "github_account",
+            "conf",
+            "github_state_url",
+            "github_state_token_file",
+            "extra_roadmap_prompt",
+            "source",
+            "author_model",
+            "author_effort",
+            "pace",
+        ):
             item = getattr(self, name)
             if item is not None:
                 value[name] = item
@@ -358,6 +452,15 @@ class WorkerSpec:
 
     def work_argv(self) -> list[str]:
         argv = self_argv("work", "--loop", "--worker-id", self.id)
+        if self.conf:
+            argv += ["--conf", self.conf]
+        argv += ["--max-open-prs", str(self.max_open_prs)]
+        if self.claude_billing == "api":
+            argv += ["--claude-billing", "api"]
+        if self.budget:
+            argv.append("--budget")
+        if self.anthropic_api_key_file:
+            argv += ["--anthropic-api-key-file", str(Path(self.anthropic_api_key_file).expanduser().resolve())]
         if self.only:
             argv += ["--only", ",".join(self.only)]
         if self.agent != "auto":
@@ -377,6 +480,9 @@ class WorkerSpec:
         if not self.respect_claims:
             argv.append("--ignore-claims")
         for field, flag in (
+            (self.github_account, "--github-account"),
+            (self.github_state_url, "--github-state-url"),
+            (self.github_state_token_file, "--github-state-token-file"),
             (self.source, "--source"),
             (self.author_model, "--author-model"),
             (self.author_effort, "--author-effort"),
@@ -384,6 +490,9 @@ class WorkerSpec:
         ):
             if field is not None:
                 argv += [flag, field]
+        if self.extra_roadmap_prompt is not None:
+            # One argument: free text may begin with `-`, which argparse would otherwise read as a flag.
+            argv.append(f"--extra-roadmap-prompt={self.extra_roadmap_prompt}")
         if self.stream:
             argv.append("--stream")
         if self.isolate_home:
@@ -420,10 +529,14 @@ def load_worker_specs(path: Path) -> list[WorkerSpec]:
 def _toml_value(value) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False)
     if isinstance(value, list):
         return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(_toml_value(key) + " = " + _toml_value(item) for key, item in value.items()) + " }"
     raise WorkersError(f"cannot encode TOML value of type {type(value).__name__}")
 
 
@@ -629,7 +742,26 @@ def _serve_one(server: socket.socket, handler) -> None:
             pass
 
 
+def raise_oom_score(env=None, path=Path("/proc/self/oom_score_adj")) -> None:
+    """Apply TAUCETI_WORKER_OOM_SCORE_ADJ before the wrapper starts any child.
+
+    A supervisor can then keep a low score itself while its expendable workers
+    remain preferred kernel OOM victims. Only raises: an unprivileged process
+    cannot lower its score, and a supervisor's own higher score is kept.
+    """
+    raw = (os.environ if env is None else env).get("TAUCETI_WORKER_OOM_SCORE_ADJ")
+    if not raw:
+        return
+    try:
+        wanted = int(raw)
+        if -1000 <= wanted <= 1000 and wanted > int(path.read_text()):
+            path.write_text(f"{wanted}\n")
+    except (OSError, ValueError):
+        pass
+
+
 def cmd_managed_runner(args) -> int:
+    raise_oom_score()
     spec = _decode_spec(args.spec)
     state_dir = Path(args.state_dir)
     runtime_dir = Path(args.runtime_dir)
@@ -642,6 +774,7 @@ def cmd_managed_runner(args) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 73
+        isolation = worker_scopes.enter(spec.id, runtime_dir)
         server = _bind_socket(sock_path)
         stopping = False
         child: subprocess.Popen | None = None
@@ -649,9 +782,9 @@ def cmd_managed_runner(args) -> int:
         parent_pipe_write: int | None = None
         started = time.time()
         prior = read_json(state)
+        publisher = StatusPublisher(state)
         restart_count = int(prior.get("restart_count", 0)) + 1 if prior.get("spec_hash") == spec.fingerprint() else 0
         log_dir = state_dir / "logs" / spec.id
-        log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"work-{time.strftime('%Y%m%d-%H%M%S')}.log"
 
         def stop(_signum=None, _frame=None) -> None:
@@ -666,14 +799,33 @@ def cmd_managed_runner(args) -> int:
             # that discovery while the PYTHONPATH the child needs to import itself is still prepended
             # rather than replaced. The manager's own variables are assigned last and are reserved, so
             # nothing here can shadow them.
-            env = self_env({**os.environ, **dict(spec.env)})
+            env = self_env(unselected_github_env({**unselected_github_env(), **dict(spec.env)}))
+            # A new managed worker starts a new configuration lifetime. Its round
+            # children inherit the snapshot created by that worker, not the manager's.
+            env.pop("TAUCETI_CONF_SNAPSHOT", None)
+            env.pop("TAUCETI_CONF_SOURCE", None)
+            if spec.conf:
+                env["TAUCETI_CONF"] = spec.conf
+            else:
+                from tauceti_tools.project import active
+
+                if active():
+                    for key in active().environment():
+                        env.pop(key, None)
+                env.pop("TAUCETI_CONF", None)
             env[STATUS_ENV] = str(state)
             env["TAUCETI_MANAGED"] = "1"
             # stderr is already the durable console log; suppress the second log() copy.
             env["TAUCETI_LOG_FILE"] = os.devnull
-            logf = log_path.open("ab", buffering=0)
-            update_status(
-                state,
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+                logf = log_path.open("ab", buffering=0)
+                env["TAUCETI_CONSOLE_LOG_FILE"] = str(log_path.resolve())
+                env["TAUCETI_CONSOLE_LOG_DAY"] = time.strftime("%Y%m%d")
+                env["TAUCETI_WORKERS_STATE_DIR"] = str(state_dir.resolve())
+            except OSError:
+                logf = sys.stderr  # Retain console/journal output if file logging fails.
+            publisher.update(
                 id=spec.id,
                 state="starting",
                 alive=True,
@@ -683,16 +835,21 @@ def cmd_managed_runner(args) -> int:
                 process_group=None,
                 instance=uuid.uuid4().hex,
                 spec_hash=spec.fingerprint(),
+                applied_spec=spec.as_dict(),
+                max_open_prs=spec.max_open_prs,
+                pending_read_policy=None,
                 agent=spec.agent,
+                github_account=spec.github_account,
                 only=list(spec.only),
                 sandbox=spec.sandbox,
-                log_file=str(log_path),
+                log_file=str(log_path) if logf is not sys.stderr else None,
                 started_at=started,
                 heartbeat_at=time.time(),
                 activity_at=started,
                 restart_count=restart_count,
                 exit_code=None,
                 stopped_at=None,
+                **isolation,
             )
             test_command = os.environ.get("TAUCETI_MANAGER_TEST_COMMAND")
             child_argv = shlex.split(test_command) if test_command else spec.work_argv()
@@ -710,15 +867,17 @@ def cmd_managed_runner(args) -> int:
                 start_new_session=True,
                 pass_fds=(parent_pipe_read,),
             )
+            if logf is not sys.stderr:
+                logf.close()  # Only the loop owns the stream now; rotation can release the old inode.
             os.close(parent_pipe_read)
             parent_pipe_read = None
-            update_status(state, child_pid=child.pid, process_group=child.pid)
+            publisher.update(child_pid=child.pid, process_group=child.pid)
 
             def request(req: dict) -> dict:
                 nonlocal stopping
                 action = req.get("action")
                 if action == "status":
-                    return read_json(state)
+                    return publisher.snapshot()
                 if action == "stop":
                     stopping = True
                     return {"ok": True}
@@ -730,10 +889,10 @@ def cmd_managed_runner(args) -> int:
                 if ready:
                     _serve_one(server, request)
                 if time.monotonic() - last_heartbeat >= 2:
-                    update_status(state, alive=True, heartbeat_at=time.time(), child_pid=child.pid)
+                    publisher.update(alive=True, heartbeat_at=time.time(), child_pid=child.pid)
                     last_heartbeat = time.monotonic()
             if stopping and child.poll() is None:
-                update_status(state, state="stopping", activity_at=time.time())
+                publisher.update(state="stopping", activity_at=time.time())
                 signal_group(child.pid, signal.SIGTERM)
                 deadline = time.monotonic() + 20
                 while child.poll() is None and time.monotonic() < deadline:
@@ -745,8 +904,8 @@ def cmd_managed_runner(args) -> int:
                     child.wait()
             rc = child.wait()
             final = "stopped" if stopping else ("exited" if rc == 0 else "failed")
-            update_status(
-                state,
+            publisher.update(
+                timeout=1,
                 state=final,
                 alive=False,
                 heartbeat_at=time.time(),
@@ -790,11 +949,62 @@ def _launch_runner(spec: WorkerSpec, state_dir: Path, runtime_dir: Path) -> subp
             runtime_dir,
         ),
         cwd=HERE,
-        env=self_env(),
+        env=self_env(unselected_github_env()),
         stdin=subprocess.DEVNULL,
         stdout=None,
         stderr=None,
     )
+
+
+def _detached_usage_supervisor(pid: int) -> bool:
+    """Recognize the registered supervisor that survives worker process-group teardown."""
+    from .usage_lifecycle import identity
+
+    try:
+        process = Path(f"/proc/{pid}")
+        argv = (process / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+        if len(argv) != 4 or argv[1:3] != [b"-m", b"tauceti_worker.usage_supervisor"]:
+            return False
+        directory = process / "cwd" / os.fsdecode(argv[3])
+        owner = read_json(directory / "usage-supervisor.json").get("owner")
+        return owner == identity(pid) and os.getsid(pid) == pid and os.getpgid(pid) == pid
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def _defer_read_policy_reload(spec: WorkerSpec, live: dict) -> bool:
+    """These read-policy edits can wait for a round boundary instead of killing paid work."""
+    applied = live.get("applied_spec")
+    if not isinstance(applied, dict):
+        # Older runners persisted only a hash. Recognize the default read policy by its
+        # actual fingerprint; unknown generations are deferred conservatively.
+        previous = dataclasses.replace(
+            spec, max_open_prs=MAX_OPEN_PRS, github_state_url=None, github_state_token_file=None
+        )
+        if previous.fingerprint() != live.get("spec_hash"):
+            # No trustworthy previous definition: use the same conservative idle/child checks.
+            applied = spec.as_dict()
+        else:
+            applied = previous.as_dict()
+    old = dict(applied)
+    desired = spec.as_dict()
+    for field in ("max_open_prs", "github_state_url", "github_state_token_file"):
+        old.pop(field, None)
+        desired.pop(field, None)
+    if old != desired:
+        return False
+    if live.get("state") not in ("idle", "backoff", "waiting-github", "waiting-budget", "waiting-quota"):
+        return True
+    if (live.get("next_action_at") or 0) - time.time() < 15:
+        return True
+    pid = live.get("child_pid")
+    if sys.platform == "linux" and isinstance(pid, int):
+        try:
+            children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+            return any(not _detached_usage_supervisor(int(child)) for child in children)
+        except OSError:
+            return True
+    return False
 
 
 def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
@@ -808,20 +1018,46 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             workers_die("another worker manager is already running")
+        from .activity import root as activity_root
+        from .retention import install_timer
+
+        if read_json(activity_root() / "cleanup-service.json").get("installed"):
+            try:
+                install_timer()
+            except Exception as error:
+                print(f"warning: cleanup unit refresh deferred: {error}", file=sys.stderr)
         server_path = manager_socket(runtime_dir)
         server = _bind_socket(server_path)
         exiting = False
         stop_workers = False
         restart_ids: set[str] = set()
+        enable_ids: set[str] = set()
         children: dict[str, subprocess.Popen] = {}
+        child_generations: dict[str, str] = {}
+        exit_outcomes: dict[str, tuple[str, int]] = {}
         launch_failures: dict[str, tuple[str, int, float]] = {}
+        stopping_workers: dict[str, float] = {}
+        observed_workers: dict[str, dict] = {}
+        scopes = worker_scopes.Scopes(runtime_dir)
         last_good: list[WorkerSpec] | None = None
         last_error: str | None = None
 
         def stop(signum=None, frame=None) -> None:
             nonlocal exiting, stop_workers
             exiting = True
-            stop_workers = True
+            # Fleet's manager service is replaceable independently of its scopes.
+            # Explicit shutdown RPC still selects whether workers should stop.
+            stop_workers = stop_workers or not worker_scopes.enabled()
+
+        def unreported_exit(wid: str, fingerprint: str) -> None:
+            previous = launch_failures.get(wid)
+            failures = previous[1] + 1 if previous and previous[0] == fingerprint else 1
+            delay = min(5 * (2 ** min(failures - 1, 6)), 300)
+            launch_failures[wid] = (fingerprint, failures, time.time() + delay)
+            print(
+                f"tauceti workers: wrapper {wid} exited before publishing terminal state; failure backoff {delay}s",
+                file=sys.stderr,
+            )
 
         old_term = signal.signal(signal.SIGTERM, stop)
         old_int = signal.signal(signal.SIGINT, stop)
@@ -836,6 +1072,15 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                 if not isinstance(wid, str):
                     return {"ok": False, "error": "restart requires id"}
                 restart_ids.add(wid)
+                launch_failures.pop(wid, None)
+                return {"ok": True}
+            if action == "enable":
+                wid = req.get("id")
+                if not isinstance(wid, str):
+                    return {"ok": False, "error": "enable requires id"}
+                enable_ids.add(wid)
+                exit_outcomes.pop(wid, None)
+                launch_failures.pop(wid, None)
                 return {"ok": True}
             if action == "shutdown":
                 exiting = True
@@ -844,6 +1089,9 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
             return {"ok": False, "error": f"unknown action: {action}"}
 
         print(f"tauceti workers: managing {config} every {interval:g}s", flush=True)
+        from .activity import start_collector
+
+        activity_stopping = start_collector(config)
         try:
             while not exiting:
                 try:
@@ -870,46 +1118,65 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                 for wid, process in list(children.items()):
                     if process.poll() is not None:
                         children.pop(wid, None)
+                        generation = child_generations.pop(wid)
+                        exit_outcomes[wid] = (generation, process.returncode)
                         status = read_json(status_path(wid, state_dir))
                         terminal = (
                             status.get("wrapper_pid") == process.pid
                             and not status.get("alive")
                             and status.get("stopped_at") is not None
                         )
-                        if not terminal:
+                        if not terminal and process.returncode != 0:
                             spec = wanted.get(wid)
                             fingerprint = spec.fingerprint() if spec else "removed"
-                            previous = launch_failures.get(wid)
-                            failures = previous[1] + 1 if previous and previous[0] == fingerprint else 1
-                            delay = min(5 * (2 ** min(failures - 1, 6)), 300)
-                            launch_failures[wid] = (fingerprint, failures, time.time() + delay)
-                            print(
-                                f"tauceti workers: wrapper {wid} exited before publishing terminal state; "
-                                f"retrying in {delay}s",
-                                file=sys.stderr,
-                            )
+                            unreported_exit(wid, fingerprint)
                 known_ids = set(wanted)
                 try:
                     known_ids.update(path.stem for path in state_dir.glob("*.json"))
                 except OSError:
                     pass
+                scopes.cleanup_unknown(known_ids)
                 for wid in sorted(known_ids):
+                    # Reconciliation can outlast the control client's deadline on
+                    # busy hosts. Serve commands between workers, not only once
+                    # after scanning the whole fleet.
+                    ready, _, _ = select.select([server], [], [], 0)
+                    if ready:
+                        _serve_one(server, handle)
+                    if exiting:
+                        break
                     spec = wanted.get(wid)
                     live = runner_status(wid, state_dir, runtime_dir)
                     is_live = bool(live.get("alive"))
+                    observed = observed_workers.pop(wid, None)
+                    if is_live:
+                        observed_workers[wid] = {**(observed or {}), **live}
+                    if not is_live:
+                        stopping_workers.pop(wid, None)
+                        if wid not in children:
+                            scopes.cleanup(wid)
                     should_run = bool(spec and spec.enabled)
+                    if is_live or not should_run:
+                        enable_ids.discard(wid)
                     changed = bool(is_live and spec and live.get("spec_hash") != spec.fingerprint())
+                    if changed and should_run and wid not in restart_ids and _defer_read_policy_reload(spec, live):
+                        StatusPublisher(status_path(wid, state_dir)).update(pending_read_policy=spec.fingerprint())
+                        continue
                     if (
                         is_live
                         and not changed
                         and int(live.get("restart_count", 0))
                         and time.time() - float(live.get("started_at") or time.time()) >= 300
                     ):
-                        update_status(status_path(wid, state_dir), restart_count=0)
+                        StatusPublisher(status_path(wid, state_dir)).update(restart_count=0)
                         launch_failures.pop(wid, None)
                     if is_live and (not should_run or changed or wid in restart_ids):
                         _stop_runner(wid, runtime_dir)
+                        began = stopping_workers.setdefault(wid, time.monotonic())
+                        if time.monotonic() - began >= 25:
+                            scopes.cleanup(wid, force=True)
                         continue
+                    stopping_workers.pop(wid, None)
                     if is_live or not should_run or wid in children:
                         if not is_live and spec is None and live.get("managed"):
                             for stale in (
@@ -922,9 +1189,28 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                                     pass
                         continue
                     prior = read_json(status_path(wid, state_dir))
-                    forced = wid in restart_ids
+                    if observed and (
+                        prior.get("wrapper_pid") != observed.get("wrapper_pid") or prior.get("stopped_at") is None
+                    ):
+                        prior = observed
+                    forced = wid in restart_ids or wid in enable_ids
+                    # Adopted wrappers are not Popen children. A missing terminal
+                    # receipt must still honor their restart policy and backoff.
+                    if (
+                        wid not in exit_outcomes
+                        and prior.get("wrapper_pid")
+                        and prior.get("spec_hash") == spec.fingerprint()
+                        and prior.get("stopped_at") is None
+                    ):
+                        exit_outcomes[wid] = (spec.fingerprint(), 1)
+                        unreported_exit(wid, spec.fingerprint())
+                    outcome = exit_outcomes.get(wid)
+                    if not forced and outcome and outcome[0] == spec.fingerprint():
+                        if spec.restart == "never" or spec.restart == "on-failure" and outcome[1] == 0:
+                            continue  # Parent-observed exits remain authoritative if reporting fails.
                     if (
                         not forced
+                        and not (outcome and outcome[0] == spec.fingerprint())
                         and spec.restart == "never"
                         and prior.get("spec_hash") == spec.fingerprint()
                         and prior.get("stopped_at")
@@ -937,6 +1223,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     # could never be reconfigured without an explicit restart.
                     if (
                         not forced
+                        and not (outcome and outcome[0] == spec.fingerprint())
                         and spec.restart == "on-failure"
                         and prior.get("spec_hash") == spec.fingerprint()
                         and prior.get("exit_code") == 0
@@ -948,10 +1235,20 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     manager_retry_at = (
                         manager_failure[2] if manager_failure and manager_failure[0] == spec.fingerprint() else 0
                     )
-                    if not forced and max(float(prior.get("stopped_at") or 0) + delay, manager_retry_at) > time.time():
+                    if manager_retry_at > time.time() or (
+                        not forced and float(prior.get("stopped_at") or 0) + delay > time.time()
+                    ):
                         continue
-                    children[wid] = _launch_runner(spec, state_dir, runtime_dir)
+                    try:
+                        children[wid] = _launch_runner(spec, state_dir, runtime_dir)
+                    except OSError as exc:
+                        print(f"tauceti workers: cannot launch {wid}: {exc}", file=sys.stderr)
+                        unreported_exit(wid, spec.fingerprint())
+                        continue
+                    child_generations[wid] = spec.fingerprint()
+                    exit_outcomes.pop(wid, None)
                     restart_ids.discard(wid)
+                    enable_ids.discard(wid)
                 ready, _, _ = select.select([server], [], [], max(0.1, interval))
                 if ready:
                     _serve_one(server, handle)
@@ -964,8 +1261,11 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     runner_status(wid, state_dir, runtime_dir).get("alive") for wid in live_ids
                 ):
                     time.sleep(0.1)
+                for wid in live_ids:
+                    scopes.cleanup(wid, force=True)
             return 0
         finally:
+            activity_stopping.set()
             signal.signal(signal.SIGTERM, old_term)
             signal.signal(signal.SIGINT, old_int)
             server.close()
@@ -1007,7 +1307,7 @@ def ensure_manager(config: Path) -> bool:
                     spawned = subprocess.Popen(
                         self_argv("workers", "--config", config, "manager"),
                         cwd=HERE,
-                        env=self_env(),
+                        env=self_env(unselected_github_env()),
                         stdin=subprocess.DEVNULL,
                         stdout=log,
                         stderr=subprocess.STDOUT,
@@ -1164,6 +1464,17 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
     agent = str(spec.get("agent") or item.get("agent") or "auto")
     sandbox = str(spec.get("sandbox") or item.get("sandbox") or "host")
     lines.extend(_status_field("agent", [f"{agent} · {sandbox} sandbox"], width))
+    if spec.get("claude_billing") == "api":
+        lines.extend(
+            _status_field(
+                "billing",
+                ["Claude API · " + ("shared local grants" if spec.get("budget") else "no local budget")],
+                width,
+            )
+        )
+    github_account = spec.get("github_account") or item.get("github_account")
+    if github_account:
+        lines.extend(_status_field("github", [str(github_account)], width))
 
     pacing = "ignored (--ignore-quota; hard limits still apply)" if spec.get("ignore_quota") else "normal"
     if spec.get("pace"):
@@ -1187,6 +1498,11 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
         if spec.get("respect_claims", True) is False:
             roadmap_values.append("claims: ignored")
         lines.extend(_status_field("roadmap", roadmap_values, width))
+    if spec.get("extra_roadmap_prompt"):
+        guidance = " ".join(str(spec["extra_roadmap_prompt"]).split())
+        if "roadmap" not in phases:
+            guidance += " (unused: the roadmap phase is not enabled)"
+        lines.extend(_status_field("guidance", [guidance], width))
 
     if spec.get("source"):
         lines.extend(_status_field("source", [str(spec["source"])], width))
@@ -1256,23 +1572,44 @@ def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, w
             if state == "running":
                 detail_values = [_runtime_summary(part) for part in detail_values]
             lines.extend(_status_field(label, detail_values, width))
+        if state == "waiting-github" and item.get("wait_dependency"):
+            cause = str(item.get("wait_reason") or "unavailable")
+            if item.get("wait_detail"):
+                cause += f" ({item['wait_detail']})"
+            lines.extend(_status_field("waiting", [f"{item['wait_dependency']}: {cause}"], width))
         if item.get("next_action_at") and state in {"backoff", "waiting-github", "waiting-quota"}:
             label = "retry" if state == "backoff" else "recheck"
             lines.extend(_status_field(label, [_format_until(item["next_action_at"])], width))
+        if budget := item.get("budget"):
+            lines.extend(
+                _status_field(
+                    "budget",
+                    [
+                        f"${float(budget['balance']):.2f} balance · "
+                        f"${float(budget['pending']):.2f} pending · ${float(budget['grant_rate']):.2f}/hour"
+                    ],
+                    width,
+                )
+            )
         if state == "backoff":
             lines.extend(_status_field("logs", [f"tauceti workers logs {item['id']}"], width))
     return lines
 
 
 def print_worker_status(config: Path, *, as_json: bool = False) -> bool:
+    from .activity import cached, display
+
     specs = load_worker_specs(config)
     snapshots = worker_snapshots(specs)
     online = manager_request("ping")
     if as_json:
-        print(json.dumps({"manager": online, "config": str(config), "workers": snapshots}, indent=2))
+        print(
+            json.dumps({"manager": online, "config": str(config), "workers": snapshots, "activity": cached()}, indent=2)
+        )
     else:
         width = shutil.get_terminal_size(fallback=(100, 24)).columns
         print("\n".join(_worker_status_lines(config, snapshots, bool(online), width=width)))
+        display(cached())
     healthy = bool(online) and all(item["desired"] == "stopped" or item.get("alive") for item in snapshots)
     return healthy
 
@@ -1288,12 +1625,14 @@ def _mutate_enabled(config: Path, wid: str, enabled: bool) -> None:
     if enabled:
         # Re-enabling is an explicit request to run, even for restart="never" or after a clean
         # on-failure exit. Clear the terminal policy record after persisting desired state.
-        update_status(status_path(wid), stopped_at=None, exit_code=None, state="queued")
+        StatusPublisher(status_path(wid)).update(stopped_at=None, exit_code=None, state="queued")
 
 
 def set_worker_enabled(config: Path, wid: str, enabled: bool) -> None:
     _mutate_enabled(config, wid, enabled)
     ensure_manager(config)
+    if enabled:
+        manager_request("enable", id=wid)
 
 
 def restart_worker(config: Path, wid: str) -> None:
@@ -1315,7 +1654,15 @@ def _remove_spec(config: Path, wid: str) -> None:
 
 
 def add_dashboard_worker(
-    config: Path, *, only: str | None, agent: str, bubble: bool, roadmap_only: str | None, roadmap_skip: str | None
+    config: Path,
+    *,
+    only: str | None,
+    agent: str,
+    bubble: bool,
+    roadmap_only: str | None,
+    roadmap_skip: str | None,
+    github_account: str | None = None,
+    extra_roadmap_prompt: str | None = None,
 ) -> WorkerSpec:
     with _config_lock(config):
         try:
@@ -1326,11 +1673,13 @@ def add_dashboard_worker(
             specs = []
         spec = WorkerSpec(
             id=next_worker_id(specs),
+            github_account=github_account,
             agent=agent,
             only=(only,) if only else (),
             sandbox="bubble" if bubble else "host",
             roadmap_only=roadmap_only,
             roadmap_skip=tuple(part.strip() for part in (roadmap_skip or "").split(",") if part.strip()),
+            extra_roadmap_prompt=extra_roadmap_prompt,
         )
         _write_worker_specs(config, [*specs, spec])
     ensure_manager(config)
@@ -1576,6 +1925,13 @@ def service_action(action: str, config: Path) -> int:
         path.write_text(_systemd_unit(config))
         subprocess.run([systemctl, "--user", "daemon-reload"], check=True)
         subprocess.run([systemctl, "--user", "enable", "--now", path.name], check=True)
+        from .config import Die
+        from .retention import install_timer
+
+        try:
+            install_timer()
+        except (Die, OSError, subprocess.SubprocessError) as error:
+            print(f"warning: worker service started; cleanup timer unavailable: {error}", file=sys.stderr)
         print(f"installed and started {path}")
         return 0
     if action == "uninstall":
@@ -1599,7 +1955,10 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        argv = shlex.split(line)
+        try:
+            argv = shlex.split(line)
+        except ValueError as exc:
+            raise WorkersError(f"{path}:{number}: {exc} (a value spanning several lines cannot be imported)") from None
         if len(argv) < 3 or Path(argv[0]).name != "tauceti" or argv[1] != "work" or "--loop" not in argv:
             raise WorkersError(f"{path}:{number}: expected a `tauceti work --loop` command")
         values: dict = {"only": []}
@@ -1621,17 +1980,25 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
             if token == "--ignore-claims":
                 values["respect_claims"] = False
                 continue
-            try:
-                value = next(flags)
-            except StopIteration:
-                raise WorkersError(f"{path}:{number}: {token} needs a value") from None
+            if token.startswith("--") and "=" in token:
+                token, value = token.split("=", 1)
+            else:
+                try:
+                    value = next(flags)
+                except StopIteration:
+                    raise WorkersError(f"{path}:{number}: {token} needs a value") from None
             key = {
                 "--worker-id": "id",
                 "--agent": "agent",
+                "--github-account": "github_account",
+                "--github-state-url": "github_state_url",
+                "--github-state-token-file": "github_state_token_file",
+                "--max-open-prs": "max_open_prs",
                 "--only": "only",
                 "--roadmap-only": "roadmap_only",
                 "--roadmap-skip": "roadmap_skip",
                 "--roadmap-extra-identities": "roadmap_extra_identities",
+                "--extra-roadmap-prompt": "extra_roadmap_prompt",
                 "--source": "source",
                 "--author-model": "author_model",
                 "--author-effort": "author_effort",
@@ -1639,7 +2006,11 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
             }.get(token)
             if key is None:
                 raise WorkersError(f"{path}:{number}: unsupported legacy argument {token}")
-            values[key] = value.split(",") if key in ("only", "roadmap_skip", "roadmap_extra_identities") else value
+            values[key] = (
+                value.split(",")
+                if key in ("only", "roadmap_skip", "roadmap_extra_identities")
+                else (positive_integer(value) if key == "max_open_prs" else value)
+            )
         if not values.get("id"):
             raise WorkersError(f"{path}:{number}: persistent workers need an explicit --worker-id")
         if values.pop("bubble", False):
@@ -1679,8 +2050,19 @@ def add_workers_parser(subparsers) -> None:
         item = actions.add_parser(action, help=descriptions[action])
         item.add_argument("worker_id", help="worker id")
     add = actions.add_parser("add", help="add an enabled persistent worker definition")
+    add.add_argument("--claude-billing", choices=["subscription", "api"], default="subscription")
+    add.add_argument("--budget", action="store_true")
+    add.add_argument("--anthropic-api-key-file")
     add.add_argument("worker_id", nargs="?", help="stable id (default: next free workerN)")
     add.add_argument("--agent", choices=AGENTS, default="auto", help="agent for each round (default: auto)")
+    add.add_argument("--max-open-prs", type=positive_integer, default=MAX_OPEN_PRS)
+    add.add_argument("--github-state-url")
+    add.add_argument("--github-state-token-file")
+    add.add_argument(
+        "--github-account",
+        default=argparse.SUPPRESS,
+        help="GitHub login for this worker (independent of its agent account)",
+    )
     add.add_argument("--only", default="", help="comma-separated work phases (default: full cascade)")
     add.add_argument(
         "--sandbox", choices=("host", "bubble"), default="host", help="where eligible phases run (default: host)"
@@ -1699,6 +2081,7 @@ def add_workers_parser(subparsers) -> None:
     )
     add.add_argument("--roadmap-only", help="pin roadmap rounds to one area")
     add.add_argument("--roadmap-skip", default="", help="comma-separated roadmap areas to exclude")
+    add.add_argument("--extra-roadmap-prompt", help="extra guidance for roadmap rounds, appended to the agent's prompt")
     add.add_argument("--source", help="source repository; requires roadmap in --only and one pinned roadmap area")
     add.add_argument("--author-model", help="exact authoring model; needs an explicit --agent")
     add.add_argument("--author-effort", help="reasoning effort for an explicit codex/claude/kiro agent")
@@ -1761,8 +2144,7 @@ def cmd_workers(args) -> int:
                 ensure_manager(config)
             return 0
         if action in ("enable", "disable"):
-            _mutate_enabled(config, args.worker_id, action == "enable")
-            ensure_manager(config)
+            set_worker_enabled(config, args.worker_id, action == "enable")
             return 0
         if action == "add":
             with _config_lock(config):
@@ -1777,6 +2159,7 @@ def cmd_workers(args) -> int:
                     raise WorkersError(f"worker already exists: {wid}")
                 raw = {
                     "id": wid,
+                    "max_open_prs": args.max_open_prs,
                     "agent": args.agent,
                     "only": [item for item in args.only.split(",") if item],
                     "sandbox": args.sandbox,
@@ -1785,9 +2168,24 @@ def cmd_workers(args) -> int:
                     "roadmap_skip": [item for item in args.roadmap_skip.split(",") if item],
                     "stream": args.stream,
                     "isolate_home": args.isolate_home,
+                    "claude_billing": args.claude_billing,
+                    "budget": args.budget,
+                    "anthropic_api_key_file": str(Path(args.anthropic_api_key_file).expanduser().resolve())
+                    if args.anthropic_api_key_file
+                    else None,
                 }
-                for key in ("roadmap_only", "source", "author_model", "author_effort", "pace"):
-                    value = getattr(args, key)
+                for key in (
+                    "github_account",
+                    "github_state_url",
+                    "github_state_token_file",
+                    "roadmap_only",
+                    "extra_roadmap_prompt",
+                    "source",
+                    "author_model",
+                    "author_effort",
+                    "pace",
+                ):
+                    value = getattr(args, key, None)
                     if value is not None:
                         raw[key] = value
                 spec = WorkerSpec.from_dict(raw, len(specs))

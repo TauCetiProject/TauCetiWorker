@@ -5,7 +5,8 @@ the driver loop); `tauceti status` prints the read-only survey.
 
 The worker acts on TauCetiProject/TauCeti as the authenticated `gh` account, and treats that
 account's own PRs as the ones it tends. Each round does exactly ONE unit of work, chosen in
-priority order: rebase -> bump -> progress -> fix-ci -> fix -> review -> roadmap.
+priority order: rebase -> bump -> lint-repair -> progress -> fix-ci -> fix -> review -> roadmap.
+Work of any of those kinds on an automatic Mathlib bump PR comes before all other work.
 
 This package was split from a single-file script for navigability. The split is behaviour-
 preserving. For both the test harness (which reaches `tauceti_worker.<NAME>`) and the historical
@@ -13,8 +14,35 @@ single-module API, every submodule's top-level name is flattened into the packag
 the submodules themselves stay importable (e.g. `tauceti_worker.github`) so a test can monkeypatch
 a function on the module that actually looks it up.
 """
+# ruff: noqa: E402
 
 from __future__ import annotations
+
+from tauceti_tools.project import bootstrap as _bootstrap_project
+
+
+def _bootstrap_worker_project():
+    project = _bootstrap_project()
+    if project is None:
+        return
+    # Tools may enable other consumers before Worker's remaining adapters are
+    # ready. Keep this consumer's activation decision in Worker as well.
+    from tauceti_tools.forge import GITHUB, resolve_repository
+
+    references = list(project.raw["repositories"].values())
+    references += [tool["repo"] for tool in project.raw.get("tools", {}).values()]
+    references += [upstream["repo"] for upstream in project.raw.get("upstreams", [])]
+    if any(resolve_repository(value, project.raw.get("forges")).forge != GITHUB for value in references):
+        raise ValueError("Worker Forgejo activation requires the remaining source and CI adapters")
+
+
+try:
+    _bootstrap_worker_project()
+except (ValueError, OSError) as _configuration_error:
+    import sys
+
+    print(f"tauceti: {_configuration_error}", file=sys.stderr)
+    raise SystemExit(2) from None
 
 # stdlib re-exports for the historical single-module surface (a few tests read tc.json, tc.time, …).
 import json  # noqa: F401

@@ -1,0 +1,13 @@
+[Unit]
+Description=Observe live merge-queue repair phases
+
+[Service]
+WorkingDirectory=%h/TauCetiQueue
+ExecStart=%h/TauCetiQueue/.venv/bin/python -m tauceti_queue.task_activity --root %h/TauCetiQueue-data/repair --root %h/TauCetiQueue-data/repair-2 --root %h/TauCetiQueue-data/repair-3 --follow
+Restart=on-failure
+RestartSec=5
+Nice=10
+UMask=0077
+
+[Install]
+WantedBy=default.target

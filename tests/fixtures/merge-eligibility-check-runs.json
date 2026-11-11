@@ -1,0 +1,141 @@
+{
+ "description": "TauCetiReview's `merge eligibility` check runs on PR 24557 of TauCetiProject/TauCeti, head 4287c5d0ace1cc568f5b3fd5e80b38707dd5b22e, as read on 2026-11-04: `rest` is `GET /repos/.../commits/<head>/check-runs?check_name=merge eligibility&filter=all` (fields the queue reads), `graphql` is the pull request node of `github_adapter.OPEN_PULLS_QUERY` read with the queue App's installation token, where the review App's check suite comes back with `app: null`.",
+ "repo": "TauCetiProject/TauCeti",
+ "review_app_id": 3947238,
+ "rest": [
+  {
+   "id": 125149712005,
+   "name": "merge eligibility",
+   "app": {
+    "id": 3947238,
+    "slug": "tauceti-review-bot"
+   },
+   "head_sha": "4287c5d0ace1cc568f5b3fd5e80b38707dd5b22e",
+   "status": "completed",
+   "conclusion": "success",
+   "external_id": "{\"eligible\":true,\"merge_base_sha\":\"93af5b549b7d9ed44291d6ceb093a8013dda00f8\",\"pr\":24557,\"repo\":\"TauCetiProject/TauCeti\",\"review_safe\":true,\"schema\":\"tauceti-merge.eligibility/v1\",\"single\":false}",
+   "completed_at": "2026-11-02T07:28:30Z",
+   "html_url": "https://github.com/TauCetiProject/TauCeti/runs/125149712005",
+   "output": {
+    "title": "Eligible for automatic merge",
+    "summary": "all rubrics green on 4287c5d; TauCeti/+root only"
+   }
+  },
+  {
+   "id": 124955640840,
+   "name": "merge eligibility",
+   "app": {
+    "id": 3947238,
+    "slug": "tauceti-review-bot"
+   },
+   "head_sha": "4287c5d0ace1cc568f5b3fd5e80b38707dd5b22e",
+   "status": "completed",
+   "conclusion": "failure",
+   "external_id": "{\"eligible\":false,\"merge_base_sha\":null,\"pr\":24557,\"repo\":\"TauCetiProject/TauCeti\",\"review_safe\":false,\"schema\":\"tauceti-merge.eligibility/v1\",\"single\":false}",
+   "completed_at": "2026-11-01T19:36:50Z",
+   "html_url": "https://github.com/TauCetiProject/TauCeti/runs/124955640840",
+   "output": {
+    "title": "Review unsafe \u2014 approval withdrawn",
+    "summary": "no scoreboard comment for the current head; refusing"
+   }
+  }
+ ],
+ "graphql": {
+  "data": {
+   "rateLimit": {
+    "cost": 3,
+    "remaining": 6299,
+    "resetAt": "2026-11-04T14:16:30Z"
+   },
+   "repository": {
+    "pullRequests": {
+     "pageInfo": {
+      "hasNextPage": false,
+      "endCursor": "Y3Vyc29yOnYyOpHOAX2Yyg=="
+     },
+     "nodes": [
+      {
+       "number": 24557,
+       "isDraft": false,
+       "baseRefName": "main",
+       "headRefOid": "4287c5d0ace1cc568f5b3fd5e80b38707dd5b22e",
+       "commits": {
+        "nodes": [
+         {
+          "commit": {
+           "oid": "4287c5d0ace1cc568f5b3fd5e80b38707dd5b22e",
+           "checkSuites": {
+            "nodes": [
+             {
+              "app": null,
+              "checkRuns": {
+               "nodes": [
+                {
+                 "databaseId": 124955640840,
+                 "name": "merge eligibility",
+                 "status": "COMPLETED",
+                 "conclusion": "FAILURE",
+                 "externalId": "{\"eligible\":false,\"merge_base_sha\":null,\"pr\":24557,\"repo\":\"TauCetiProject/TauCeti\",\"review_safe\":false,\"schema\":\"tauceti-merge.eligibility/v1\",\"single\":false}",
+                 "completedAt": "2026-11-01T19:36:50Z",
+                 "permalink": "https://github.com/TauCetiProject/TauCeti/runs/124955640840"
+                },
+                {
+                 "databaseId": 125149712005,
+                 "name": "merge eligibility",
+                 "status": "COMPLETED",
+                 "conclusion": "SUCCESS",
+                 "externalId": "{\"eligible\":true,\"merge_base_sha\":\"93af5b549b7d9ed44291d6ceb093a8013dda00f8\",\"pr\":24557,\"repo\":\"TauCetiProject/TauCeti\",\"review_safe\":true,\"schema\":\"tauceti-merge.eligibility/v1\",\"single\":false}",
+                 "completedAt": "2026-11-02T07:28:30Z",
+                 "permalink": "https://github.com/TauCetiProject/TauCeti/runs/125149712005"
+                }
+               ]
+              }
+             }
+            ]
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "number": 9268,
+       "isDraft": false,
+       "baseRefName": "main",
+       "headRefOid": "fe6cd7ca23a8cbeb82be17288c4716dc6cc09439",
+       "commits": {
+        "nodes": [
+         {
+          "commit": {
+           "oid": "fe6cd7ca23a8cbeb82be17288c4716dc6cc09439",
+           "checkSuites": {
+            "nodes": [
+             {
+              "app": null,
+              "checkRuns": {
+               "nodes": [
+                {
+                 "databaseId": 116646991486,
+                 "name": "merge eligibility",
+                 "status": "COMPLETED",
+                 "conclusion": "FAILURE",
+                 "externalId": "{\"eligible\":false,\"merge_base_sha\":null,\"pr\":9268,\"repo\":\"TauCetiProject/TauCeti\",\"review_safe\":false,\"schema\":\"tauceti-merge.eligibility/v1\",\"single\":false}",
+                 "completedAt": "2026-10-15T20:13:39Z",
+                 "permalink": "https://github.com/TauCetiProject/TauCeti/runs/116646991486"
+                }
+               ]
+              }
+             }
+            ]
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    }
+   }
+  }
+ }
+}

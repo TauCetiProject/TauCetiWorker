@@ -139,6 +139,7 @@ def test_fixlike():
     w = types.SimpleNamespace(
         claims=types.SimpleNamespace(begin_branch_work=lambda *a: True),
         rs=types.SimpleNamespace(bust=lambda *a: None),
+        gh=types.SimpleNamespace(pr_progress_state=lambda _: None, pr_view=lambda *_: None),
     )
     tc.work_units._do_fixlike(w, sv, c, opts, True, prompt_file="fix.md", label="fix")
     check("fixlike: fork head -> allow_push=owner/repo", cap.get("allow_push") == "alice/TauCeti")
@@ -155,7 +156,7 @@ def test_roadmap():
     os.environ.pop("TAUCETI_PUSH_EXPECT", None)
     os.environ["TAUCETI_PUSH_EXPECT"] = "stale"  # must be popped by do_roadmap (create-only on the fork)
     tc.work_units.ensure_fork = lambda: FORK
-    tc.work_units.administrative_hold_avoid_list = lambda *_args: "none"
+    tc.work_units.avoid_list = lambda *_args: "none"
 
     # A real review checkout, so the round exercises the BUNDLED path rather than the fallback:
     # stage_rubrics only produces a bundle when it finds rubrics to concatenate.
@@ -199,8 +200,8 @@ def test_roadmap():
     )
     check("roadmap: prompt encourages cross-roadmap prerequisites", "Follow prerequisites across roadmaps" in prompt)
     check(
-        "roadmap: switched target checks its own intention board",
-        '--label "roadmap/<target-roadmap>"' in prompt,
+        "roadmap: switched target checks its own intention board by name, not by area label",
+        r'test("\\b<target-roadmap>\\b")' in prompt and '--label "roadmap/<target-roadmap>"' not in prompt,
     )
     check("roadmap: claim follows the actual target", "author/<target-roadmap>/<slug>" in prompt)
     check("roadmap: marker follows the actual target", '"focus":"<target-roadmap>"' in prompt)
@@ -238,8 +239,8 @@ def test_roadmap():
 
     host_cap = {}
     tc.work_units.fetch_git_source = fake_fetch_source
-    tc.work_units.prepare_checkout = lambda cfg: True
-    tc.work_units.run_agent_host = lambda cwd, prompt, model, logdir: host_cap.update(prompt=prompt) or 0
+    tc.work_units.prepare_checkout = lambda cfg, **_: True
+    tc.work_units.run_agent_host = lambda cwd, prompt, model, logdir, **_kwargs: host_cap.update(prompt=prompt) or 0
     opts.source = str(source)
     tc.work_units.do_roadmap(w, None, c, opts, bubble=False)
     host_prompt = host_cap.get("prompt", "")

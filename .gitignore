@@ -20,3 +20,6 @@ __pycache__/
 
 # uv lockfile — generated for the single-file script, not source.
 /uv.lock
+
+# Revision baked by services/queue/install.sh for the running service (tauceti_queue/runtime.py).
+/tauceti_queue/_revision.py

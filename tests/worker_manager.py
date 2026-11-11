@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -35,6 +36,13 @@ import tauceti_worker.paths as worker_paths
 import tauceti_worker.worker_manager as wm
 from tauceti_worker.cli import build_parser
 from tauceti_worker.runtime_status import report_failure, report_runtime
+
+# A wrapper raises its own OOM score from the environment, but never lowers it.
+score = root / "oom_score_adj"
+for current, wanted, expected in (("0", "500", "500"), ("700", "500", "700"), ("0", "", "0"), ("0", "x", "0")):
+    score.write_text(current + "\n")
+    wm.raise_oom_score({"TAUCETI_WORKER_OOM_SCORE_ADJ": wanted}, score)
+    assert score.read_text().strip() == expected, (current, wanted, score.read_text())
 
 
 def wait_for(predicate, timeout=10):
@@ -77,6 +85,47 @@ specs = [
 ]
 manager = None
 try:
+    if sys.platform == "linux":
+        supervisor_dir = root / "supervisor-budget"
+        supervisor_dir.mkdir()
+        supervisor = subprocess.Popen(
+            [sys.executable, "-m", "tauceti_worker.usage_supervisor", str(supervisor_dir)],
+            cwd=REPO,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        round_process = None
+        try:
+            ready = supervisor_dir / "usage-supervisor.json"
+            wait_for(lambda: wm.read_json(ready).get("owner", {}).get("pid") == supervisor.pid)
+            old_policy = wm.WorkerSpec("policy-reload", max_open_prs=512)
+            new_policy = dataclasses.replace(old_policy, max_open_prs=1024)
+            idle = dict(
+                applied_spec=old_policy.as_dict(),
+                state="idle",
+                child_pid=os.getpid(),
+                next_action_at=time.time() + 60,
+            )
+            assert wm._detached_usage_supervisor(supervisor.pid)
+            assert not wm._defer_read_policy_reload(new_policy, idle), "the supervisor must not strand a reload"
+            assert wm._defer_read_policy_reload(new_policy, dict(idle, state="running"))
+            assert wm._defer_read_policy_reload(new_policy, dict(idle, next_action_at=time.time() + 1))
+            registered = wm.read_json(ready)
+            stale = {**registered, "owner": {**registered["owner"], "start": "stale"}}
+            with patch.object(wm, "read_json", return_value=stale):
+                assert wm._defer_read_policy_reload(new_policy, idle), "the registered birth identity must match"
+            with patch.object(wm.os, "getsid", return_value=os.getsid(0)):
+                assert wm._defer_read_policy_reload(new_policy, idle), "the supervisor must have its own session"
+            round_process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            assert wm._defer_read_policy_reload(new_policy, idle), "an ordinary child must still block the reload"
+        finally:
+            if round_process is not None:
+                round_process.terminate()
+                round_process.wait(5)
+            supervisor.terminate()
+            supervisor.wait(5)
+
     wm.save_worker_specs(config, specs)
     assert wm.load_worker_specs(config) == specs
 
@@ -118,6 +167,7 @@ try:
         roadmap_skip=("Algebra",),
         roadmap_extra_identities=("Maintainer",),
         respect_claims=False,
+        extra_roadmap_prompt="Work on the material relevant to Higher Topos Theory",
         source="https://example.invalid/source",
         author_model="gpt-5",
         author_effort="high",
@@ -172,12 +222,23 @@ try:
         # The whole spec travels as one command-line argument, so an unbounded table becomes E2BIG.
         ({"env": {"BIG": "x" * (16 * 1024 + 1)}}, "oversized table"),
         ({"env": ["A=b"]}, "array instead of a table"),
+        # `apply --check` must reject what `tauceti work` would refuse at launch.
+        ({"only": ["security-audit"], "agent": "kiro"}, "security-audit on an unsupported agent"),
+        (
+            {"only": ["security-audit"], "agent": "codex", "author_model": "gpt"},
+            "security-audit with an authoring override",
+        ),
+        ({"only": ["bump", "security-audit"], "agent": "claude", "claude_billing": "api"}, "security-audit on API"),
     ):
         try:
             wm.WorkerSpec.from_dict({"id": "exp", **bad}, 0)
             raise AssertionError(f"{why} should have been rejected: {bad}")
         except wm.WorkersError:
             pass
+
+    # security-audit may accompany any other phases.
+    mixed = ["bump", "progress", "security-audit", "overlap-scan", "overlap-fix", "review"]
+    assert wm.WorkerSpec.from_dict({"id": "audit", "agent": "codex", "only": mixed}, 0).only == tuple(mixed)
 
     # Desired fields win over a stale actual status generation in CLI/TUI snapshots.
     wm.update_status(
@@ -244,6 +305,7 @@ try:
                         "roadmap_skip": ["Algebra"],
                         "roadmap_extra_identities": ["maintainer"],
                         "respect_claims": False,
+                        "extra_roadmap_prompt": "Work on the material relevant to Higher Topos Theory",
                         "source": "https://example.invalid/source",
                         "author_model": "claude-opus-5",
                         "author_effort": "high",
@@ -266,7 +328,8 @@ try:
 config:  /tmp/workers.toml
 
 worker1 — waiting for quota
-  phases:   rebase, review, fix-ci, fix, bump, progress, roadmap
+  phases:   rebase, review, fix-ci, fix, bump, progress, roadmap, lint-repair,
+            overlap-scan, overlap-fix
   agent:    auto · host sandbox
   pacing:   normal
   roadmap:  auto (random each round)
@@ -292,6 +355,7 @@ worker3 — backing off
             skip: Algebra
             also treat as self: maintainer
             claims: ignored
+  guidance: Work on the material relevant to Higher Topos Theory
   source:   https://example.invalid/source
   author:   model claude-opus-5 · high effort
   options:  stream output
@@ -392,7 +456,11 @@ worker3 — backing off
 
     # A malformed generation is rejected wholesale; the last good fleet remains alive.
     worker1_pid = wm.runner_status("worker1").get("wrapper_pid")
-    config.write_text("version = 1\n[[workers]]\nid = 42\n")
+    # Replace the file atomically, as real writers do: a truncate-then-write lets a manager poll
+    # read the valid prefix "version = 1", an empty fleet, and stop every worker.
+    malformed = config.with_name(config.name + ".tmp")
+    malformed.write_text("version = 1\n[[workers]]\nid = 42\n")
+    os.replace(malformed, config)
     time.sleep(0.3)
     assert wm.runner_status("worker1").get("wrapper_pid") == worker1_pid
     response = wm.manager_request("ping")
@@ -486,6 +554,41 @@ worker3 — backing off
         except subprocess.TimeoutExpired:
             runner.kill()
             runner.wait(timeout=10)
+
+    # Twenty slow status reads must not keep control requests queued until the
+    # whole reconciliation finishes. This uses disabled fixture workers only.
+    latency_config = root / "latency-workers.toml"
+    wm.save_worker_specs(latency_config, [wm.WorkerSpec(id=f"slow{n}", enabled=False) for n in range(20)])
+    latency_run, latency_state = root / "latency-run", root / "latency-state"
+    entered = root / "latency-entered"
+    code = """
+import sys,time
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from tauceti_worker import worker_manager as w
+def slow(*args,**kwargs):
+    Path(sys.argv[3]).touch()
+    time.sleep(.08)
+    return {}
+w.runner_status=slow
+raise SystemExit(w.run_manager(Path(sys.argv[2]),interval=.05))
+"""
+    probe = subprocess.Popen(
+        [sys.executable, "-c", code, str(REPO), str(latency_config), str(entered)],
+        env=dict(os.environ, TAUCETI_RUNTIME_DIR=str(latency_run), TAUCETI_WORKERS_STATE_DIR=str(latency_state)),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        wait_for(entered.exists)
+        reply = wm._socket_request(latency_run / "manager.sock", {"action": "ping"}, timeout=0.5)
+        assert reply and reply.get("ok"), "control request waited behind a fleet-wide status scan"
+        assert wm._socket_request(latency_run / "manager.sock", {"action": "shutdown"}, timeout=2)
+        probe.wait(5)
+    finally:
+        if probe.poll() is None:
+            probe.terminate()
+            probe.wait(5)
 
     print("worker manager: OK")
 finally:

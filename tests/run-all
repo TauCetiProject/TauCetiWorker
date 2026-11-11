@@ -3,65 +3,205 @@
 #
 # The tests are standalone scripts (not pytest): each loads the `tauceti` program and exits 0/1.
 # This runner knows how each one wants to be invoked, and which one to skip in a plain CI box:
-#   - most are stdlib-only         -> `uv run python <file>`
+#   - most are stdlib-only         -> the project interpreter
 #   - parity_selectors needs a snapshot, not the network -> pass the bundled fixture as its arg
-#   - dashboard has a PEP 723 header (rich/textual)      -> `uv run --script`
+#   - dashboard uses the project's rich/textual/Tools dependencies -> the project interpreter
 #   - docker_entrypoint/lifecycle are bash; lifecycle resolves its own python3
 #   - egress needs the bubble sandbox/proxy              -> skipped here
 # The Python version is taken from $UV_PYTHON when set (uv honours it), so CI can matrix over versions.
 #
-# Usage: tests/run-all [--fail-fast]
+# Usage: tests/run-all [--fail-fast] [-j N] [--group all|portable|native|docs]
+#   -j N      run up to N modules at once (default 1). Every module gets its own activity, fleet-event,
+#             cache and verification-storage directories, so modules never share state, in any mode.
+#   --group   which modules to run (default all):
+#             native    the modules whose fixtures need a native filesystem (see NATIVE_FS)
+#             portable  everything else; runs on any Linux box, including Namespace runners
+#             docs      only the modules that assert on README.md, docs/*.md and workers.toml.example,
+#                       which is all a documentation-only change can break (see DOCS_CONTRACT)
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-FAIL_FAST=0
-[ "${1:-}" = "--fail-fast" ] && FAIL_FAST=1
+# Unit fixtures use their mocked transport, never the public production mirror.
+# Service tests explicitly override this; default-resolution tests remove it.
+export TAUCETI_GITHUB_STATE_URL=""
 
-# stdlib-only python tests, run with the uv-provided interpreter
+FAIL_FAST=0
+JOBS=1
+GROUP=all
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --fail-fast) FAIL_FAST=1 ;;
+    -j) JOBS="$2"; shift ;;
+    -j*) JOBS="${1#-j}" ;;
+    --group) GROUP="$2"; shift ;;
+    --group=*) GROUP="${1#--group=}" ;;
+    *) echo "usage: tests/run-all [--fail-fast] [-j N] [--group all|portable|native|docs]" >&2; exit 2 ;;
+  esac
+  shift
+done
+case "$JOBS" in ''|*[!0-9]*|0) echo "run-all: -j wants a positive integer, got '$JOBS'" >&2; exit 2 ;; esac
+
+# Tests must keep receipts, usage history and legacy migration fixtures out of the operator's
+# real activity store. Legacy containment markers are ignored by current workers.
+# Each module gets its own subtree (see run_one), so concurrent modules cannot see each other's
+# activity, fleet events, caches or verification storage.
+RUN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/tauceti-test-run-XXXXXX")"
+trap 'rm -rf "$RUN_ROOT"' EXIT
+
+# stdlib-only python tests, run with the project interpreter
 RUN_STDLIB=(
+  activity.py
+  activity_git.py
+  activity_costs.py
+  activity_incremental.py
+  activity_live.py
+  api_budget.py
+  budget_projection.py
+  budget_recovery.py
+  usage_accounting.py
+  usage_supervisor.py
+  worker_sizing.py
+  queue_repair_experiment.py
+  queue_repair_task.py
+  queue_repair_locks.py
+  queue_repair_cleanup.py
+  queue_repair_cache.py
+  queue_claude_stdin.py
+  expanded_cache.py
+  cache_storage.py
+  local_lint.py
+  lean_pressure.py
+  repair_pressure.py
+  repair_parallel_fold.py
+  shared_mathlib.py
   agent_cmds.py
   agent_transcript.py
   auto_stage_priority.py
+  automatic_bump.py
+  bump_attestation.py
   authoring_profiles.py
   bubble_cache.py
   cache_probe_user_agent.py
   bubble_version.py
   branch_claim_repo.py
   build_status_rollup.py
+  bump_integration.py
   claude_config_dir.py
   claude_keychain.py
   claims_repo.py
   codex_account.py
   codex_fallback.py
   contest_claim.py
+  compact_surveys.py
+  cost_model.py
   dispatch_revalidation.py
   fix_diagnostic.py
   fork_authoring.py
+  fleet_capacity.py
+  forge_inventory.py
+  forge_contracts.py
+  forgejo_reads.py
+  github_accounts.py
   github_failure_reason.py
   github_ratelimit.py
+  github_shared_transport.py
+  github_cli_metadata.py
+  github_throughput.py
+  github_state.py
+  github_state_retention.py
+  github_state_rollout.py
+  github_state_reconciliation.py
+  github_outbox.py
+  github_forks.py
+  global_maintenance.py
+  shared_state_outage.py
+  github_pause.py
   host_agent_preflight.py
+  host_build_cache.py
   ignore_quota_hardblock.py
+  quota_outage_autonomy.py
   infra_failure_budget.py
-  inflight_review.py
   isolate_home_macos.py
   isolate_home_paths.py
+  legacy_data_root.py
   kiro.py
+  local_verification_scope.py
+  local_axioms.py
+  verification.py
+  verification_audit.py
+  verification_storage.py
   ledger_blocking.py
   loop_sigterm.py
   mirror_creds.py
   mirror_creds_macos.py
   oauth_refresh_loop.py
+  observability_failures.py
   open_pr_pages.py
+  overlaps.py
   pace_curve.py
   pr_targeting.py
   preflight_review_lake.py
+  prices.py
   progress_tool_failure_log.py
+  progress_generation_retry.py
+  progress_publication.py
+  process_cleanup.py
   prompt_wrapper_paths.py
   provider_usage.py
   quota_auto_refresh.py
   quota_cache_fp.py
   quota_loop_refresh.py
+  quota_wakeups.py
+  quota_shared_usage.py
+  queue_chain.py
+  queue_commands.py
+  queue_github_adapter.py
+  queue_feeds.py
+  queue_landing_receipts.py
+  queue_server.py
+  queue_eligibility.py
+  queue_diagnostics.py
+  queue_controller.py
+  queue_sealed_successor.py
+  queue_head_capacity.py
+  queue_webhook_load.py
+  queue_execution.py
+  queue_ci_requests.py
+  queue_forgejo_git.py
+  queue_forgejo_source.py
+  queue_ci_execution.py
+  queue_workflow_token.py
+  queue_source_ci.py
+  queue_stage1.py
+  queue_stage1_mirror.py
+  queue_source_authority.py
+  queue_task_identity.py
+  queue_task_transport.py
+  queue_control_policy_file.py
+  queue_native_bootstrap.py
+  queue_native_launch.py
+  queue_operator_token.py
+  queue_forgejo_webhook.py
+  queue_monitoring.py
+  queue_task_activity.py
+  queue_task_progress.py
+  queue_monitoring_protocol.py
+  queue_monitoring_history.py
+  queue_admission_planning.py
+  queue_fixture.py
+  queue_store.py
+  queue_statistics.py
+  queue_admission_state.py
+  queue_admission.py
+  queue_admission_adapter.py
+  queue_config.py
+  queue_cli.py
+  queue_rehearsal.py
+  queue_bors_import.py
+  queue_approval_poll.py
   rebase_handoff.py
+  scoped_repair_route.py
+  rebase_budget.py
   review_sync_failure.py
   quota_claude_bootstrap.py
   quota_claude_windows.py
@@ -69,9 +209,13 @@ RUN_STDLIB=(
   quota_codex_windows.py
   quota_reason.py
   review_codex_model.py
-  review_daily_cap.py
+  review_mathlib_source.py
+  review_source_cache.py
   review_diagnostics.py
   review_provider_down.py
+  review_outcomes.py
+  review_unchanged_memo.py
+  synchronous_state_repair.py
   review_scheduling.py
   review_state_freshness.py
   review_throttles.py
@@ -79,45 +223,57 @@ RUN_STDLIB=(
   roadmap_claims.py
   round_file_changes.py
   round_group_sweep.py
+  resources.py
+  retention.py
   rubric_bundle.py
   safe_exists.py
   scoreboard_trust.py
+  security_audit.py
+  security_audit_served.py
   shared_build_caches.py
+  shared_repositories.py
   source_argument.py
+  source_identity.py
+  source_survey.py
+  extra_roadmap_prompt.py
   spread_candidates.py
   ssl_cert_file.py
+  staging_journal_report.py
   status_labels.py
   tend_bot_permissions.py
   worker_claude_config.py
   worker_manager.py
+  worker_scopes.py
+  workflow_backstop.py
+  recovery_maintenance.py
+  work_recovery.py
+  repair_recovery.py
 )
-# special-cased python tests (handled explicitly below)
+# special-cased python tests (handled explicitly in run_one)
 RUN_SPECIAL=(parity_selectors.py dashboard.py)
 # bash tests
 RUN_SH=(docker_entrypoint.sh lifecycle.sh)
-# deliberately not run here (needs the bubble sandbox/proxy)
-SKIP=(egress.sh)
+# Deliberate manual checks: egress needs the bubble sandbox/proxy; the cross-repo
+# repair fixture needs Lean, Elixir and a bors checkout (see its module docstring).
+# The source-read fixture starts a disposable Forgejo given FORGEJO_BINARY.
+SKIP=(egress.sh integration_repair_fixture.py integration_forgejo_reads.py integration_forgejo_git.py integration_forgejo_source.py integration_forgejo_bootstrap.py integration_forgejo_native_launch.py)
+
+# Modules whose storage fixtures compare inode/device identity and sweep real directories. They
+# failed on Namespace runners' filesystem (#409) and run on GitHub's native ubuntu-24.04 image in
+# CI; everything else is the `portable` group and runs anywhere.
+NATIVE_FS=(queue_repair_cache.py cache_storage.py shared_mathlib.py verification_storage.py retention.py)
+# Modules that read README.md, docs/*.md or workers.toml.example and assert on their contents. A
+# change that touches only documentation can break these and nothing else, so CI runs just this
+# group for it. The guard below keeps the list honest.
+DOCS_CONTRACT=(pr_targeting.py review_throttles.py forge_contracts.py)
 
 pass=0; fail=0; failed=()
 
-# run <label> <cmd...> : run a test, tally the result, honour --fail-fast
-run() {
-  local label="$1"; shift
-  echo "== $label =="
-  if "$@"; then
-    echo "  [PASS] $label"; pass=$((pass + 1))
-  else
-    echo "  [FAIL] $label (rc=$?)"; fail=$((fail + 1)); failed+=("$label")
-    [ "$FAIL_FAST" = 1 ] && { summary; exit 1; }
-  fi
-  echo
-}
-
 summary() {
   echo "================================================================"
-  echo "run-all: $pass passed, $fail failed"
+  echo "run-all: $pass passed, $fail failed (group: $GROUP, jobs: $JOBS)"
   ((${#failed[@]})) && printf '  failed: %s\n' "${failed[@]}"
-  ((${#SKIP[@]}))   && printf '  skipped (needs sandbox): %s\n' "${SKIP[@]}"
+  ((${#SKIP[@]}))   && printf '  skipped (requires external tooling): %s\n' "${SKIP[@]}"
 }
 
 # --- inventory guard: every tests/*.py and tests/*.sh must be classified --------------------------
@@ -134,22 +290,99 @@ if ((${#unclassified[@]})); then
   printf '  - %s\n' "${unclassified[@]}" >&2
   exit 2
 fi
+for t in "${NATIVE_FS[@]}" "${DOCS_CONTRACT[@]}"; do
+  [[ "${known[*]}" == *" $t "* ]] || { echo "ERROR: $t is in NATIVE_FS/DOCS_CONTRACT but not a known test" >&2; exit 2; }
+done
+# A test that asserts on the repository's documentation must be in DOCS_CONTRACT, or a docs-only
+# change could break it without CI running it.
+docs_contract=(" ${DOCS_CONTRACT[*]} ")
+undeclared=()
+for f in $(grep -lE 'REPO / "(README\.md|docs|workers\.toml\.example)"' tests/*.py); do
+  base=$(basename "$f")
+  [[ "${docs_contract[*]}" == *" $base "* ]] || undeclared+=("$base")
+done
+if ((${#undeclared[@]})); then
+  echo "ERROR: test file(s) read README.md/docs/workers.toml.example but are not in DOCS_CONTRACT in tests/run-all:" >&2
+  printf '  - %s\n' "${undeclared[@]}" >&2
+  exit 2
+fi
+
+# --- select the group -----------------------------------------------------------------------------
+in_list() { local needle="$1"; shift; [[ " $* " == *" $needle "* ]]; }
+selected=()
+for t in "${RUN_STDLIB[@]}" "${RUN_SPECIAL[@]}" "${RUN_SH[@]}"; do
+  case "$GROUP" in
+    all) selected+=("$t") ;;
+    native) in_list "$t" "${NATIVE_FS[@]}" && selected+=("$t") ;;
+    portable) in_list "$t" "${NATIVE_FS[@]}" || selected+=("$t") ;;
+    docs) in_list "$t" "${DOCS_CONTRACT[@]}" && selected+=("$t") ;;
+    *) echo "run-all: unknown group '$GROUP' (all|portable|native|docs)" >&2; exit 2 ;;
+  esac
+done
+
+# --- resolve the interpreter once -----------------------------------------------------------------
+# `uv run` syncs the environment on every call; resolving it once and running the modules with the
+# environment's own interpreter saves that per-module cost and the lock contention between parallel
+# modules. The environment's bin/ goes on PATH as `uv run` would arrange.
+PY="$(uv run python -c 'import sys; print(sys.executable)')" || exit 1
+VIRTUAL_ENV="$(dirname "$(dirname "$PY")")"
+export PY VIRTUAL_ENV
+export PATH="$VIRTUAL_ENV/bin:$PATH"
+
+# run_one <module>: run one module in its own activity subtree, record its result and output.
+# Prints one line per module as it finishes; the full output of failed modules is printed at the end
+# so parallel modules never interleave. With --fail-fast, a failure stops new modules from starting
+# (running ones finish). Exit status is the module's.
+run_one() {
+  local t="$1" d rc start end
+  d="$RUN_ROOT/${t%.*}"
+  mkdir -p "$d/activity"
+  [ -e "$RUN_ROOT/stop" ] && exit 0
+  export TAUCETI_ACTIVITY_DIR="$d/activity"
+  export TAUCETI_FLEET_EVENTS="$d/activity/worker-events.jsonl"
+  export TAUCETI_SHARED_MATHLIB_ROOT="$d/activity/mathlib-builds"
+  export TAUCETI_BUILD_CACHE_ROOT="$d/activity/builds"
+  export TAUCETI_REVIEW_MATHLIB_CACHE="$d/activity/review-sources"
+  export TAUCETI_VERIFY_STORAGE_DIR="$d/activity/verification-storage"
+  start=$SECONDS
+  case "$t" in
+    parity_selectors.py) "$PY" tests/parity_selectors.py tests/fixtures/pr_selectors.json >"$d/output" 2>&1 ;;
+    *.sh) bash "tests/$t" >"$d/output" 2>&1 ;;
+    *) "$PY" "tests/$t" >"$d/output" 2>&1 ;;
+  esac
+  rc=$?
+  end=$SECONDS
+  echo "$rc" >"$d/rc"
+  if [ "$rc" -eq 0 ]; then
+    echo "  [PASS] $t ($((end - start))s)"
+  else
+    echo "  [FAIL] $t (rc=$rc, $((end - start))s)"
+    [ "$FAIL_FAST" = 1 ] && touch "$RUN_ROOT/stop"
+  fi
+  return "$rc"
+}
+export -f run_one
+export RUN_ROOT FAIL_FAST
 
 # --- run ------------------------------------------------------------------------------------------
-for t in "${RUN_STDLIB[@]}"; do
-  run "$t" uv run python "tests/$t"
+echo "run-all: ${#selected[@]} modules, group $GROUP, $JOBS at a time, python $PY"
+printf '%s\n' "${selected[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_one "$1"' _ {}
+
+for t in "${selected[@]}"; do
+  d="$RUN_ROOT/${t%.*}"
+  if [ ! -e "$d/rc" ]; then
+    # Not started: --fail-fast stopped the run before this module.
+    continue
+  fi
+  if [ "$(cat "$d/rc")" -eq 0 ]; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1)); failed+=("$t")
+    echo
+    echo "== $t == (rc=$(cat "$d/rc"))"
+    cat "$d/output"
+  fi
 done
-
-run parity_selectors.py uv run python tests/parity_selectors.py tests/fixtures/pr_selectors.json
-run dashboard.py uv run --script tests/dashboard.py
-
-# lifecycle.sh resolves its own python; hand it the uv-selected interpreter so the matrix
-# actually covers it (otherwise it would always use the runner's default python3).
-PY="$(uv run python -c 'import sys; print(sys.executable)')"
-export PY
-for t in "${RUN_SH[@]}"; do
-  run "$t" bash "tests/$t"
-done
-
+echo
 summary
 [ "$fail" -eq 0 ]
