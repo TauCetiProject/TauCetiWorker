@@ -4756,6 +4756,16 @@ class WorkerAudits(Fixture):
         with patch.object(repair_audit, "check", side_effect=AssertionError("duplicate helper checks")):
             self.assertEqual(repair_audit.helper_checks(self.content.clone), 0)
 
+    def test_delivery_receipt_distinguishes_compilation_from_full_checks(self):
+        task = repair_task.Task.from_json(self.service.task_record(1, self.service.preclaim(1, "token", "worker")))
+        cfg = self.config()
+        full = repair_task.delivery_identity(cfg, task, task.tip)
+        task.extra["checks_owner"] = "staging"
+        compilation = repair_task.delivery_identity(cfg, task, task.tip)
+        self.assertNotEqual(full, compilation)
+        self.assertTrue(full["full_checks"])
+        self.assertFalse(compilation["full_checks"])
+
     def test_staging_pre_rebase_retains_build_receipt_without_full_check_claim(self):
         self.service.tasks[1].update(kind="pre_rebase")
         self.service.tasks[1]["extra"]["checks_owner"] = "staging"

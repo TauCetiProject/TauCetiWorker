@@ -1796,6 +1796,7 @@ def delivery_identity(cfg: RunnerConfig, task: Task, tip: str) -> dict:
         "tip": tip,
         "base": task.validation_base,
         "audits": cfg.worker_audits,
+        "full_checks": cfg.worker_audits and not repair_audit.staging_checks(task),
         "lake": list(cfg.lake),
         "checker": hashlib.sha256(
             Path(repair_audit.__file__).read_bytes() + Path(repair_sandbox.__file__).read_bytes()
@@ -2394,9 +2395,11 @@ def _run_task(
                     log(f"attempt {attempt} not acceptable; retrying once with the report")
                     continue
                 return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
-            verified = (outcome.get("parallel") or {}).get(
-                "verified_tip"
-            ) == tip or pending_delivery == delivery_identity(cfg, task, tip)
+            parallel = outcome.get("parallel") or {}
+            verified = (
+                parallel.get("verified_tip") == tip
+                and (staging_checks or (parallel.get("checks") or {}).get("status") == "passed")
+            ) or pending_delivery == delivery_identity(cfg, task, tip)
             artifacts_cold = bool((outcome.get("artifacts") or state.record.get("artifacts") or {}).get("cold"))
             if cfg.worker_audits and (not artifacts_cold or continuation) and not verified:
                 outcome.pop("repair_checkpoint", None)
