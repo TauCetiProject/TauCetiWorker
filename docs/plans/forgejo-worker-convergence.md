@@ -80,6 +80,14 @@ Each implementation PR should identify the shared entrypoint, the old paths it
 removes, and any remaining forge-specific branches with their concrete reason.
 Reject new parallel orchestration even if both copies currently pass tests.
 
+Before declaring convergence complete, trace both sources through each stage
+and audit the remaining source-kind checks in those paths. A backend check in
+workflow code should become an adapter operation or capability unless there is
+a documented reason it cannot. Keep abstractions small: share the existing
+implementation first, and introduce a new interface only for a concrete
+difference. The final inventory should make every remaining difference easy to
+find and explain without reading two versions of the workflow.
+
 ## Implementation order
 
 ### 1. Share runtime setup, tool resolution, and archive delivery
@@ -117,6 +125,11 @@ Validation: use a fresh partial dependency clone, a clean PEP 723 script
 environment, and a clean wheel installation. Exercise archive failure followed
 by retry. Verify operation-appropriate credentials and Git settings, successful
 dependency checkout, and preservation of unpublished records.
+
+Local repair verification must also receive the exact canonical base already
+validated during shared checkout preparation. Do not make agents discover or
+override a base differently for each forge. Preserve conservative standalone
+verification when no worker source has established that base.
 
 ### 2. Use one review preparation and execution pipeline
 
@@ -251,3 +264,13 @@ boundaries.
   script are prepared there as well. Final Review/Worker merges, managed-runtime
   update and deployed-entrypoint verification remain outstanding. No fleet
   drain, admission change or upstream Lean/Lake patch was used.
+- A second real cycle on [Forgejo PR #5](https://git.taucetiproject.org/TauCetiProject/TauCeti/pulls/5)
+  exercised the merged credential helper: blocking correctness, automatic safe
+  push to `847dee347eddbc63ff20b29e839ea81333f779ad`, green correctness on
+  re-review, twelve archived records and closure without merge. The smoke also
+  exposed standalone verification's GitHub-only canonical-remote discovery.
+  Shared checkout preparation now passes its already-validated exact main
+  commit to verification for every source. Authenticated HTTPS preparation and
+  canonical-origin recovery tests cover that handoff without a forge-specific
+  agent recipe. Evidence is in
+  `~/.local/state/tauceti/forgejo-convergence-final-20261111/acceptance.json`.

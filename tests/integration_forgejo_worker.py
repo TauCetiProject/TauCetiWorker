@@ -96,6 +96,14 @@ class NativeWorker(unittest.TestCase):
             ):
                 encoded = base64.b64encode(("x-access-token:" + grant["sha1"]).encode()).decode()
                 self.assertFalse(any(grant["sha1"] in value or encoded in value for value in os.environ.values()))
+                from tauceti_worker import agents
+
+                with patch.object(agents, "sync_mathlib_pool"):
+                    self.assertTrue(agents.prepare_checkout(cfg, work="fix"))
+                self.assertEqual(
+                    os.environ.get("TAUCETI_VERIFY_BASE"),
+                    api.request("GET", endpoint + "/branches/main")["commit"]["id"],
+                )
                 # Exercise an actual worker-authored Git commit and safe push;
                 # API file writes do not verify process-local commit attribution.
                 checkout = root / "author-checkout"

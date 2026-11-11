@@ -749,11 +749,14 @@ def prepare_checkout(
             "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main"),
         ):
             return False
-    from .verification_scope import local_main
-
+    # Origin was validated and fetched above, and HEAD is now its main commit.
+    # Carry that exact base into verification rather than asking the standalone
+    # verifier to rediscover a canonical remote (which defaults to GitHub).
     os.environ.pop("TAUCETI_VERIFY_BASE", None)
-    with contextlib.suppress(ValueError, subprocess.CalledProcessError):
-        os.environ["TAUCETI_VERIFY_BASE"] = local_main(co)
+    with contextlib.suppress(subprocess.CalledProcessError):
+        os.environ["TAUCETI_VERIFY_BASE"] = subprocess.check_output(
+            ["git", "-C", str(co), "rev-parse", "--verify", "HEAD^{commit}"], text=True
+        ).strip()
     os.environ["TAUCETI_VERIFY_STATE"] = str(cfg.state.resolve())
     # The checkout is quiescent here: the previous agent has exited and the next one has not started.
     # Compare canonical main, rather than an arbitrary PR branch, and retire old-toolchain artifacts
