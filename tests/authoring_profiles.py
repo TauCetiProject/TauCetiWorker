@@ -38,20 +38,20 @@ try:
     codex = tc.resolve_authoring_profile("codex")
     claude = tc.resolve_authoring_profile("claude")
     kiro = tc.resolve_authoring_profile("kiro")
-    check("committed Codex default", (codex.model, codex.effort), ("gpt-5.6-sol", "high"))
-    check("committed Codex fallback", codex.fallback_model, "gpt-5.6-terra")
-    check("committed Claude default is exact", (claude.model, claude.effort), ("claude-opus-5", "high"))
+    check("committed Codex default", (codex.model, codex.effort), ("gpt-6.1-sol", "high"))
+    check("committed Codex fallback", codex.fallback_model, "gpt-6-luna")
+    check("committed Claude default is exact", (claude.model, claude.effort), ("claude-opus-5-5", "high"))
     check("committed Kiro default is exact Sol", (kiro.model, kiro.effort), ("gpt-5.6-sol", "high"))
     default_host, _ = tc.host_agent_argv("PROMPT", codex)
     default_bubble = tc.agent_inner_cmd(codex)
     default_claude_host, _ = tc.host_agent_argv("PROMPT", claude)
     default_claude_bubble = tc.agent_inner_cmd(claude)
     check("default Codex host launch is direct", default_host[:4], ["codex", "exec", "--json", "--model"])
-    check("default Codex host launch prefers Sol", "gpt-5.6-sol" in default_host, True)
-    check("default Codex host launch carries one model", "gpt-5.6-terra" in default_host, False)
+    check("default Codex host launch prefers Sol", "gpt-6.1-sol" in default_host, True)
+    check("default Codex host launch carries one model", "gpt-6-luna" in default_host, False)
     check("default Codex bubble launch is direct", "codex exec" in default_bubble, True)
-    check("default Codex bubble launch prefers Sol", "--model gpt-5.6-sol" in default_bubble, True)
-    check("default Codex bubble launch carries one model", "gpt-5.6-terra" in default_bubble, False)
+    check("default Codex bubble launch prefers Sol", "--model gpt-6.1-sol" in default_bubble, True)
+    check("default Codex bubble launch carries one model", "gpt-6-luna" in default_bubble, False)
     check(
         "Codex host requests detailed reasoning summaries", 'model_reasoning_summary="detailed"' in default_host, True
     )
@@ -203,6 +203,29 @@ try:
         ["--author-model", "claude-custom", "--author-effort", "max"],
     )
 
+    # Audit workers reject authoring overrides before dispatch, including defaults
+    # injected by the loop. Exercise the real loop-to-child argument construction.
+    for only in (["security-audit"], ["bump", "progress", "security-audit"]):
+        for provider in ("claude", "codex"):
+            captured.clear()
+            tc.loop.choose_model = lambda *_a, _provider=provider, **_k: (_provider, {})
+            tc.loop.github_budget = lambda: {}
+            tc.loop.run_round_subprocess = capture
+            try:
+                args = SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None, source=None)
+                tc.loop.cmd_loop(args, SimpleNamespace(wid="test"), only=only, agent=provider)
+            finally:
+                tc.loop.choose_model = saved_choose
+                tc.loop.github_budget = saved_budget
+                tc.loop.run_round_subprocess = saved_round
+            check("audit child retains phase selection", captured[captured.index("--only") + 1], ",".join(only))
+            check("audit child retains provider", captured[captured.index("--agent") + 1], provider)
+            check("audit child has no authoring model override", "--author-model" in captured, False)
+            check("audit child has no authoring effort override", "--author-effort" in captured, False)
+            check(
+                "audit child has no authoring fallback override", "--resolved-author-fallback-model" in captured, False
+            )
+
     # The default Codex profile remains fallback-eligible after the loop parent pins Sol into its child.
     captured.clear()
     tc.loop.choose_model = lambda *_a, **_k: ("codex", {})
@@ -225,12 +248,10 @@ try:
     check(
         "loop child retains default Codex fallback provenance",
         captured[captured.index("--resolved-author-fallback-model") - 2 :],
-        ["--author-effort", "high", "--resolved-author-fallback-model", "gpt-5.6-terra"],
+        ["--author-effort", "high", "--resolved-author-fallback-model", "gpt-6-luna"],
     )
-    child_profile = tc.resolve_authoring_profile(
-        "codex", cli_model="gpt-5.6-sol", resolved_fallback_model="gpt-5.6-terra"
-    )
-    check("loop child restores fallback eligibility", child_profile.fallback_model, "gpt-5.6-terra")
+    child_profile = tc.resolve_authoring_profile("codex", cli_model="gpt-6.1-sol", resolved_fallback_model="gpt-6-luna")
+    check("loop child restores fallback eligibility", child_profile.fallback_model, "gpt-6-luna")
 finally:
     for key, value in saved_env.items():
         if value is None:

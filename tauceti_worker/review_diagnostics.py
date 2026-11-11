@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import re
 from pathlib import Path
 
@@ -308,6 +309,57 @@ def record_review_failure(
 
 def clear_review_failure(state: Path, pr: int) -> None:
     _path(state, pr).unlink(missing_ok=True)
+
+
+def refund_stale_head_errors(state: Path, counters) -> None:
+    """Refund proved stale selections before survey suppression, once across crashes.
+
+    Only the retained attempts are evidence. A small receipt in the same file
+    makes the two existing atomic file writes restart-idempotent.
+    """
+    for path in state.glob("review-failure-*.json"):
+        try:
+            pr = int(path.stem.removeprefix("review-failure-"))
+            value = read_review_failure(state, pr)
+            attempts = value.get("attempts", [])
+            if not isinstance(attempts, list):
+                continue
+
+            def proved_stale(attempt, pr=pr):
+                if not isinstance(attempt, dict) or attempt.get("code") != 1 or attempt.get("category") != "stale-head":
+                    return False
+                match = re.match(
+                    rf"(?:review #{pr} exited with status 1: )?"
+                    rf"tauceti-review: PR #{pr} head is ([0-9a-f]{{7,40}}), expected ([0-9a-f]{{7,40}})\b",
+                    str(attempt.get("summary", "")),
+                )
+                return bool(match and match[1] != match[2])
+
+            pending = value.get("stale_head_refund")
+            if not isinstance(pending, dict):
+                count = sum(proved_stale(a) for a in attempts)
+                if not count:
+                    continue
+                before = counters.read(f"review-err-{pr}")
+                pending = {"before": before, "after": max(0, before - count)}
+                value["stale_head_refund"] = pending
+                atomic_json(path, value)
+                directory = os.open(state, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            before, after = pending.get("before"), pending.get("after")
+            if type(before) is not int or type(after) is not int or not 0 <= after <= before:
+                continue
+            if counters.read(f"review-err-{pr}") == before:
+                counters.write(f"review-err-{pr}", after)
+            value["attempts"] = [a for a in attempts if not proved_stale(a)]
+            value.pop("stale_head_refund", None)
+            atomic_json(path, value)
+        except (OSError, ValueError, TypeError):
+            # A later ordinary round retries. No unrelated work depends on this.
+            continue
 
 
 def public_review_failure(value: dict) -> str:

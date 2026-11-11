@@ -9,18 +9,20 @@ list is in `tauceti work -h`. For persistent workers, see
 | Flag | What it does |
 | --- | --- |
 | `--loop` | Run the driver: keep doing rounds, pacing against quota between them, instead of one. |
-| `--only TASKS` | Restrict the round to a comma list of `rebase,bump,progress,fix-ci,fix,review,roadmap` (default: the whole cascade). |
+| `--only TASKS` | Restrict the round to a comma list of `rebase,bump,progress,fix-ci,fix,review,roadmap,lint-repair` (default: the whole cascade). |
 | `--skip TASKS` | Drop a comma list of tasks from the cascade. Combines with `--only` by subtraction. |
-| `--pr N[,N...]` | Work only on these pull requests (comma list or repeated flag; a leading `#` is accepted). A filter over what the round would already have done: it can never make a PR actionable that the survey passed over, and never bypasses branch claims, attempt budgets, the daily review cap, or a peer's in-progress review. Intersects with `--only`; `progress` and `roadmap` name no existing PR, so a targeted round drops them rather than falling through to unrelated work, and it makes no GitHub writes about PRs you did not name. When none of the named PRs are actionable the round reports why for each one and exits without progress. An empty or unreadable value (`--pr ""`, `--pr ,,`) is an error rather than silently no targeting. |
+| `--pr N[,N...]` | Work only on these pull requests (comma list or repeated flag; a leading `#` is accepted). A filter over what the round would already have done: it can never make a PR actionable that the survey passed over, and never bypasses branch claims, attempt budgets or a peer's in-progress review. Intersects with `--only`; `progress` and `roadmap` name no existing PR, so a targeted round drops them rather than falling through to unrelated work, and it makes no GitHub writes about PRs you did not name. When none of the named PRs are actionable the round reports why for each one and exits without progress. An empty or unreadable value (`--pr ""`, `--pr ,,`) is an error rather than silently no targeting. |
 | `--agent AGENT` | `auto` (default), `codex`, `claude`, `kiro`, `deepseek`, or `minimax`. Kiro and OpenRouter providers are explicit-only and unpaced. |
 | `--author-model MODEL` | Exact authoring model for an explicit provider (CLI > provider environment > committed default). |
 | `--author-effort EFFORT` | Authoring reasoning effort for an explicit Codex, Claude, or Kiro provider. |
 | `--account EMAIL_OR_ID` | Require the Codex credential to be this account (email, or the workspace UUID `tauceti doctor` prints) and refuse to run otherwise. Checks only; never switches. Needs an explicit `--agent codex`. |
+| `--github-account LOGIN` | Select the GitHub login for this process and its children; verifies the credential before work and leaves gh's active account unchanged. Also accepted by the dashboard, `status`, and `doctor`. |
 | `--bubble` | Run code and review agents inside the Bubble sandbox instead of directly on the host. The outer survey and coordination, plus all progress-report rounds, remain on the host. |
 | `--host` | Deprecated no-op: the host is now the default. It only warns; pass `--bubble` for the sandbox. |
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
 | `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
 | `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
+| `--extra-roadmap-prompt TEXT` | Operator guidance rendered into the roadmap prompt as its own section, steering the choice of target within the designated roadmap (and of area under `--roadmap-only ""`; an unpinned worker still draws its area at random first). It cannot override `--roadmap-skip`, others' claims, or the repository's rules; other phases ignore it. At most 4096 characters, not blank. |
 | `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. A shallow snapshot is stored in worker state, refreshed on later rounds, and mounted read-only in Bubble mode. Requires the roadmap phase to be enabled and one specific `--roadmap-only AREA`; other enabled phases ignore it, and the roadmap and review quality remain authoritative. |
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
 | `--ignore-claims` | Don't avoid targets others have claimed on the intentions board (claim-respect is on by default). |
@@ -42,6 +44,12 @@ limit. An open roadmap PR whose area is temporarily unknown counts conservativel
 in every scope until its area label resolves.
 
 ## The claim namespace
+
+Mathlib overlap phases require the canonical shared namespace and never use its
+private-fork fallback. See [Mathlib overlaps](mathlib-overlaps.md). Initialize with
+`tauceti overlap init --mathlib-commit SHA`; select `overlap-scan` or `overlap-fix`
+with `--only`. `--overlap-batch-commits N` / `TAUCETI_OVERLAP_BATCH_COMMITS`
+controls commits per investigation session.
 
 Two workers must not spend two subscriptions writing the same report or fixing
 the same PR. They avoid it by taking a lease before they start: a custom git ref
@@ -81,9 +89,12 @@ statement of intent rather than a per-task lock.
 
 Within an area, roadmap workers respect finer-grained claims registered by other
 contributors on the [intentions board](https://github.com/leanprover-community/intentions):
-an open issue in the roadmap repo labelled `intention` + `roadmap/<area>` that
-someone has claimed is treated as theirs, and the worker is told not to author
-it. "You" is your own `gh auth` identity. If you run workers under several
+an open issue in the roadmap repo labelled `intention` that someone has claimed
+is treated as theirs, and the worker is told not to author it. An intention
+belongs to an area when it carries the `roadmap/<area>` label or names the area,
+or one of its sub-roadmaps, in its form's "Roadmap area" answer (in its title or
+body when that answer is missing). "You" is your own `gh auth` identity. If you
+run workers under several
 accounts, or coordinate with someone whose intentions you are fulfilling, list
 those logins with `--roadmap-extra-identities` so the worker does not avoid your
 own side's claims. This is cooperative and fail-open;
@@ -97,10 +108,10 @@ the hold becomes inactive.
 
 ## Codex model selection
 
-The committed Codex authoring profile defaults to `gpt-5.6-sol`. Before the real
+The committed Codex authoring profile defaults to `gpt-6.1-sol`. Before the real
 authoring task, the worker makes a tiny read-only Sol access probe and caches the
 result for one hour for that worker and ChatGPT account. It selects
-`gpt-5.6-terra` only after two consecutive structured 400, 403, or 404 rejections
+`gpt-6-luna` only after two consecutive structured 400, 403, or 404 rejections
 that identify a model-access problem. Rate limits, server errors, context errors,
 malformed output, and ordinary failures pause the round without downgrading. Both
 probes are read-only, and the real authoring prompt is always executed exactly
@@ -138,6 +149,186 @@ Kiro usage comes from the CLI's ACP extension and retains fractional credit
 values. OpenRouter's inference key reports key usage/limits; an optional
 `OPENROUTER_MANAGEMENT_KEY` adds account-wide purchased-credit telemetry.
 
+## GitHub accounts
+
+Use `--github-account LOGIN` or `TAUCETI_GITHUB_ACCOUNT` to bind a worker to one
+GitHub account. With neither set, existing `gh` authentication behavior is
+unchanged. Selection occurs before per-worker HOME isolation. TauCeti reads
+`gh auth token --hostname github.com --user LOGIN` with inherited token overrides
+removed, then verifies the resulting credential against GitHub's `/user` API.
+When no named credential is stored, an inherited `GH_TOKEN` or `GITHUB_TOKEN`
+may be used, with the same identity check. Missing, rejected, or mismatched
+credentials stop the command; TauCeti never switches to another account.
+
+The selected token lives in the worker's environment and is inherited by loop
+rounds, review tools, host agents, and Git's `gh auth git-credential` helper.
+Tokens are absent from command arguments, logs, and `workers.toml`. Git helper
+selection and author/committer name and noreply email are process-local;
+your global Git configuration is unchanged. Signing remains configured as before;
+ensure your signing key covers the selected account's noreply email if you require
+verified signed commits. GitHub SSH URLs are routed through
+HTTPS. SSH Git transport is disabled in the selected worker, so conflicting
+operator URL rewrites fail closed instead of choosing an unrelated SSH key.
+
+Each worker tends its selected account's PRs and resolves that account's fork.
+`TAUCETI_FORK` and `CLAIM_REPO` remain explicit overrides. Workers using different
+forks coordinate only if all accounts can write the same claim repository.
+`--roadmap-extra-identities` affects intentions ownership, not authentication
+or PR maintenance. The GitHub login is independent of the agent's subscription
+account selected or checked through provider credentials and `--account`.
+
+The dashboard displays the selected login and includes it in copied launch
+commands and persistent worker definitions. Choose it when opening the dashboard,
+for example `tauceti --github-account alice`. In `workers.toml`, set
+`github_account = "alice"` per worker; changing it changes the worker definition
+fingerprint and causes the manager to restart the worker. The shared manager
+removes dashboard account selection before spawning workers; a worker with no
+`github_account` uses the original host credentials. This also applies when the
+manager is started from a shell with `TAUCETI_GITHUB_ACCOUNT` set.
+
+Bubble mode requires `--github-account` support in Bubble's `open` command and
+the `github-account` capability in its running proxy. The companion implementation
+binds each scoped container token to its selected credential in the host's private
+proxy registry. The real GitHub token stays on the host. Old installations fail
+before an agent starts. After credential rotation or revocation, restart the
+worker to obtain a replacement; a running worker never falls back to the active
+`gh` account.
+
+## Cost model
+
+`tauceti cost-model` is a read-only analysis of the agent logs and provider
+transcripts already under `logs/` and `state/`. It reports distributions of
+Lean/cache tool time by provider and phase, and exploratory author-orientation
+times from session start to the target claim and first edit. `--json` emits the
+same measurements for notebooks or dashboards; `--limit N` samples the newest
+sessions (`0`, the default, means all available sessions). A limited sample cannot
+measure revision sessions per reviewed PR, so it reports phase distributions but
+omits the combined LOC headline unless `--ai-usd-per-changed-loc` is supplied.
+
+The AI section is measured from token counters rather than supplied as a dollar
+constant. Claude rows are de-duplicated by message id (one assistant message is
+normally repeated once per content block), and delegated Claude sessions are
+charged to their parent. Codex is priced request-by-request so its long-context
+tier is applied to the requests that actually cross the threshold. Prompt-cache
+reads and Claude's 5-minute/1-hour cache writes use their distinct displayed
+rates. Those rates come from `tauceti_worker/prices.json`, a byte-identical copy of
+the review engine's own dated table (TauCetiProject/TauCetiReview `runner/prices.json`):
+rates are edited there and re-vendored here, CI fails when the copy drifts, and the
+report stamps the copy's digest as `pricing.prices_sha` so a figure stays traceable to
+the rates behind it. The default review source is the local canonical TauCetiData checkout at
+`~/.cache/tauceti-review/data/TauCetiData`; use `--review-data-dir` to point at a
+different checkout. Production review records are de-duplicated by their durable
+key, with shadow experiments excluded.
+
+The text report separates preparation and revision costs by exact model ID,
+including session counts and pricing coverage. It gives the observed mix and
+per-model cost scenarios. Each combines
+preparation-attempt cost amortized over observed opened PRs, the review archive's
+observed rubric runs per PR, and measured revision sessions per reviewed PR.
+The per-model scenarios use the shared observed review and revision rates;
+they are accounting comparisons, not measured model performance. `--ai-family`
+chooses which observed or family scenario feeds the LOC model.
+`--ai-usd-per-changed-loc` remains available only as an explicit override; it has
+no default. Token counts are measurements, while dollar figures are
+API-equivalent conversions of subscription activity at the dated rates printed
+in JSON. Model choice is not randomized, so differences between the Sol and Opus
+samples are descriptive rather than causal.
+
+The CI and R2 model uses the current repository size, defaulting to 2.7 million
+LOC. The baseline follows `--current-repo-loc`; an explicit
+`--reference-repo-loc` selects a different baseline for a growth scenario.
+The CI headline and component breakdown show the estimate at the current size.
+
+The CI and R2 sections are a model, not billing telemetry. Their measured
+defaults are dated snapshots and every important assumption is an overridable
+flag: builds per PR, runner minutes and comparison prices, cache object count,
+compressed transfer size, and retained storage. Run `tauceti cost-model -h` for
+the full list. In particular, the displayed runner price is a public GitHub
+runner equivalent, not a claim about a private Namespace contract, and R2
+request costs are gross marginal costs before the account-wide monthly free
+tier.
+
+The LOC section combines those infrastructure estimates with the measured
+API-equivalent preparation/review/revision scenario. It reports changed LOC and
+net retained LOC separately, using the observed churn ratio, and prints both the
+marginal changed-LOC model `C(N)` and the churn-adjusted retained-growth model
+`T_retained(N)` in dollars and scientific notation. The cumulative table labels
+the unadjusted integral as a no-churn baseline rather than treating changed LOC
+as repository size. By default it projects to `1e6`, `1e7`, and `1e8` retained
+LOC; repeat `--projection-loc N` to choose other targets.
+
+The scaling coefficient is explicitly a scenario rather than a forecast. The
+default decomposition uses a 2026-09-18 sample of 40 PR jobs and 20 post-merge
+jobs to classify runner time as fixed/setup, touched-code, or repository-wide.
+In a separate 97-run cross-check, total PR-build wall time had Pearson
+correlations of only `0.06` with changed LOC and `0.04` with changed-file count,
+so the touched-code bucket is an accounting proxy rather than a fitted
+touched-files slope.
+Only the repository-wide component and complete-cache R2 reads grow with `N`;
+the other components stay constant per changed LOC. The six decomposition
+values are relative weights (the preferred flags end in `-weight`; the
+`-minutes` spellings remain aliases), while `--changed-loc-per-pr`,
+`--changed-per-net-loc`, `--reference-repo-loc`, `--current-repo-loc`, and
+`--ai-family` expose the conversion assumptions. JSON output also
+contains a pessimistic comparison in which all current infrastructure cost
+scales with repository size. Operational improvements and changing PR shape can
+dominate repository growth, so long-range totals, especially `1e8`, should not be
+read as predictions.
+
+## GitHub request accounting and shared reads
+
+Tau Ceti workers use the public GitHub state mirror by default, without a URL or
+client token. Complete surveys and mirrored histories come from that service;
+unavailable coverage retains direct fallback. `--github-state-url` overrides the
+service, and an empty URL explicitly selects direct reads. Custom and private
+services use `--github-state-token-file`; downstream project policies take precedence.
+
+Workers account for actual `gh` HTTP requests, including pagination and retries, in
+`state/github-shared/requests.jsonl`. Records contain worker, phase, endpoint, method, status,
+and rate-limit headers; tokens, query parameters, bodies and raw debug traces are excluded.
+Inspect the retained trailing hour with:
+
+```sh
+python3 tauceti_worker/github_transport.py --hours 1
+```
+
+Counts measure requests, not GraphQL point charges. Host engine and agent calls are instrumented
+through an inherited `gh` wrapper. Commands bypassing that PATH, direct HTTP clients, and Bubble's
+separate proxy are outside this accounting. The current science fleet runs on the host.
+The log rotates at 64 MiB and retains one previous file.
+
+Complete open-PR inventories share a 15-second cache; comment histories and permission reads
+share a 30-second cache. Keys include credential fingerprints and PR revision hints. Per-key
+file locks coalesce concurrent misses. Failed or incomplete histories never enter the cache.
+Writes invalidate cached reads. Dispatch checks, progress checks, engine ownership/claim checks,
+and reaction leases remain live. Child rounds reuse verified identity for up to an hour under
+the same credential; fresh named selection still verifies the token.
+
+Issue comments, inline thread histories and reaction reads use paginated GraphQL, preserving
+REST comment IDs, bot logins and reply links. Host review-engine complete-history REST commands are
+translated for its known projections (`.[]`, `.[] | @json`, and the scoreboard ownership filter, with local `jq`);
+unsupported forms pass through unchanged. Cold reaction callers carrying only a REST numeric
+ID may need one REST lookup for its immutable GraphQL node ID. Publishing writes remain REST.
+
+Observed response headers override optimistic `/rate_limit` readings. A live zero reading also
+blocks optimistic responses with contradictory reset windows until the observed exhaustion resets.
+GraphQL logical failures with HTTP 200 are attributed to quota too, and failure attribution survives
+a reset that occurs while an engine is exiting. An exhausted bucket
+blocks further requests until reset while allowing direct reads from the other bucket. Secondary
+cooldowns are shared too. Loop startup waits during exhausted identity verification. Host child
+calls wait at most 900 seconds; longer waits return a quota error so the loop can pause before
+another paid round. Ambiguous writes are never automatically replayed. GitHub exhaustion during
+checkout, review, repair, or progress publishing is a machine-wide pause and does not consume
+that stage's PR attempt allowance. Already settled provider costs remain settled costs.
+
+Selective surveys should retain the complete lightweight inventory, inspect changed heads or
+`updatedAt` values first, and reconcile unchanged PRs on a bounded rotation. Recheck expiring
+claims independently of GitHub's update clock, and always revalidate the selected candidate live.
+Keep scanning merge-ready PRs for new contests. Validate a selective picker against the existing
+picker in shadow mode before changing selection; track missed candidates, time to selection,
+oldest uninspected PR and requests per productive round. This bounds discovery delays without
+turning a missing/deleted comment or a stale cache into permission to spend.
+
 ## Codex accounts
 
 `--account EMAIL_OR_ID` (or `TAUCETI_ACCOUNT`) requires the Codex credential to
@@ -168,11 +359,13 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | --- | --- | --- |
 | `TAUCETI_AGENT` | `auto` | Default for `--agent`. |
 | `TAUCETI_ACCOUNT` | _(unset)_ | Default for `--account`. |
+| `TAUCETI_GITHUB_ACCOUNT` | _(unset)_ | GitHub login to select and verify for the dashboard, status, doctor, and work commands. |
 | `CODEX_HOME` | `~/.codex` | Codex config/credential source. Point it at a private directory to give TauCeti its own Codex account without disturbing the one your interactive `codex` uses. |
 | `TAUCETI_WORKER_ID` | _(unset)_ | Pin the id; when unset, `work` takes the lowest free `workerN`. |
 | `TAUCETI_FORK` | auto-created | Point at an existing fork instead of the one the worker creates. |
 | `TAUCETI_ROADMAP_ONLY` | _(unset)_ | The single roadmap area for `--roadmap-only`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
 | `TAUCETI_ROADMAP_SKIP` | _(unset)_ | Comma-separated roadmap areas to exclude, for `--roadmap-skip`. |
+| `TAUCETI_EXTRA_ROADMAP_PROMPT` | _(unset)_ | Operator guidance for roadmap rounds, for `--extra-roadmap-prompt`. |
 | `TAUCETI_ROADMAP_EXTRA_IDENTITIES` | _(unset)_ | Comma-separated extra GitHub logins whose claimed intentions count as the worker's own. |
 | `TAUCETI_RESPECT_CLAIMS` | `true` | Whether roadmap workers avoid others' claimed intentions; `false` is the same as `--ignore-claims`. |
 | `TAUCETI_PR` | _(unset)_ | Comma-separated pull request numbers for `--pr`. |
@@ -180,17 +373,24 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_AUTO_REFRESH` | _(unset)_ | `1` is the same as `--auto-refresh`. |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = `60:40`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
+| `TAUCETI_VERIFY_CHECKPOINT_MARGIN` | `600` | Seconds reserved before the round deadline for checkpointing; verification returns incomplete at this boundary. |
+| `TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS` | unset | JSON mapping of absolute resolved installation paths to publisher provenance tokens. Only validated read-only installations use compact cached identities; writable inputs retain full validation. See [verification](verification.md). |
+| `TAUCETI_VERIFY_CONTINUATION` | `1` | Set `0` to pause new mechanical verification continuations, preserving pending jobs and active helpers. |
+| `TAUCETI_VERIFY_HELPER` | `0` | V0 dispatch remains the default. Set `1` only for an opt-in natural canary; helper CLI and receipts are available independently. Dispatch changes preserve running helpers and recovery jobs. |
+| `TAUCETI_VERIFY_CACHE_DIR` | actual host identity under `/tmp` | Shared immutable-installation identity cache; no verification admission limit. Bubble mounts it automatically. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
 | `ELAN_HOME` | login user's `~/.elan` | Lean toolchains, shared by every worker: an install takes a lock and lands by rename. |
 | `MATHLIB_CACHE_DIR` | `<worker state>/.cache/mathlib` | Where this worker downloads Mathlib artifacts. Private, because `lake exe cache get` takes no lock; finished files are exchanged with the machine pool by hardlink before each round. |
 | `TAUCETI_MATHLIB_POOL` | `$XDG_CACHE_HOME/mathlib`, else login user's `~/.cache/mathlib` | The pool those hardlinks go to and come from. |
 | `LAKE_CACHE_DIR` | `<worker state>/.cache/lake` | Lake's own build-output cache. Per-worker: unlike a toolchain install it is written throughout a build. |
+| `LAKE_CACHE_MAX_REVS` | `100` | Maximum revision history searched for published TauCeti artifacts; `0` searches all history. Host coding rounds warm both their selected branch and current main. |
 | `LAKE_ARTIFACT_CACHE` | `1` | Keep local build outputs in Lake's artifact store so later rounds can reuse them. |
 | `LAKE_RESTORE_ARTIFACTS` | `1` | Copy artifact-store hits into the build directory for TauCeti's post-build audits. |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds; split as a shell word list, the usual flags appended. |
 | `TAUCETI_INHERIT_CLAUDE_CONFIG` | _(unset)_ | `1` gives an isolated worker your own `CLAUDE.md`, `settings.json`, and skills instead of its own. Off by default: a round should not depend on whose config dir it ran from, and personal instructions can contradict the task prompt. |
-| `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-5.6-sol` (Terra fallback) / `high` | Codex authoring profile. An explicit model disables automatic fallback; unrelated host configuration remains available. |
-| `TAUCETI_AUTHORING_CLAUDE_MODEL` / `TAUCETI_AUTHORING_CLAUDE_EFFORT` | `claude-opus-5` / `high` | Claude authoring profile; the default is an exact model rather than the moving `opus` alias. |
+| `TAUCETI_AUTHORING_CODEX_MODEL` / `TAUCETI_AUTHORING_CODEX_EFFORT` | `gpt-6.1-sol` (Luna fallback) / `high` | Codex authoring profile. An explicit model disables automatic fallback; unrelated host configuration remains available. |
+| `TAUCETI_AUTHORING_CLAUDE_MODEL` / `TAUCETI_AUTHORING_CLAUDE_EFFORT` | `claude-opus-5-5` / `high` | Claude authoring profile; the default is an exact model rather than the moving `opus` alias. |
+| `TAUCETI_CLAUDE_MODEL` | `claude-opus-5-5` | Claude review-model override. Host and Bubble reviews explicitly pass the same default model as authoring; authoring overrides remain independent. |
 | `TAUCETI_AUTHORING_KIRO_MODEL` / `TAUCETI_AUTHORING_KIRO_EFFORT` | `gpt-5.6-sol` / `high` | Exact Kiro authoring profile. `claude-opus-5` selects Opus; Kiro Auto is never used. |
 | `TAUCETI_REVIEW_CODEX_MODEL` | engine policy | Optional Codex review-model pin, independent of the authoring model. Unset preserves the review engine's own default and fallback. |
 | `TAUCETI_REVIEW_KIRO_MODEL` | `gpt-5.6-sol` | Exact Kiro review-model pin, independent of authoring. |
@@ -209,9 +409,13 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_ROUND_TIMEOUT` | `5400` | Hard cap per round (seconds). |
 | `TAUCETI_INTERROUND` | `20` | Minimum gap after a productive round (seconds). |
 | `TAUCETI_BACKOFF_BASE` / `TAUCETI_BACKOFF_MAX` | `30` / `900` | The escalating no-progress back-off (seconds). |
-| `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress-report attempts (seconds; eight hours by default). |
-| `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. |
+| `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress prose attempts (seconds; eight hours by default). Mechanical documentation retries do not spend this window. |
+| `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. A loop dedicated to `overlap-scan` requires only REST core. |
+| `TAUCETI_OVERLAP_BATCH_COMMITS` | `160` | First-parent Mathlib commits examined per overlap-scan conversation; `--overlap-batch-commits` overrides it. Calibrated with Codex `gpt-6.1-sol` at high effort. |
 | `TAUCETI_GH_INROUND_WAIT` | `900` | Cap on how long a single `gh` call waits in place for a secondary rate limit to clear (seconds). Primary limits return immediately so the loop can wait for them before another round. |
+| `TAUCETI_GH_PROXY_WAIT` | `900` | Maximum host child `gh` quota wait, capped at 900 seconds to preserve the round deadline. |
+| `TAUCETI_GITHUB_SHARED_DIR` | `state/github-shared` | Stable cross-worker cache, quota state, host gh wrapper and HTTP accounting directory. |
+| `TAUCETI_GITHUB_CACHE_BYPASS` | _(unset)_ | Set to `1` to bypass shared cached reads for diagnosis. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
 | `CLAIM_REPO` | automatic | The repository holding this worker's cooperative claim leases. Without an override it is the shared namespace `TauCetiProject/tauceti-claims` once your account can push there, and your own fork until then. See [the claim namespace](#the-claim-namespace). |
 | `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `1500` / `300` | Branch-claim lease TTL and heartbeat interval (seconds). |
@@ -219,3 +423,55 @@ Flags win over these. Most are tuning knobs with sane defaults.
 Worker configuration paths (`TAUCETI_WORKERS_CONFIG`, `TAUCETI_CONFIG_HOME`,
 `TAUCETI_WORKERS_STATE_DIR`, `TAUCETI_RUNTIME_DIR`) are documented in
 [the workers documentation](workers.md).
+
+## Claude API billing and grants
+
+`work --agent claude --claude-billing api` selects API-key authentication instead
+of subscription quota pacing. Supply `ANTHROPIC_API_KEY` or
+`--anthropic-api-key-file PATH`. Add `--budget` to consult the user-level grant
+ledger immediately before each paid Claude invocation. These settings are
+propagated through loop children, managed workers, reviewers, and Bubble.
+
+`tauceti budget --grant USD` adds credit; `--set-grant USD` sets the current
+balance through an adjustment; `--grant-rate USD_PER_HOUR` changes automatic
+replenishment. `budget` queries current state, `--json` emits structured state,
+and `--log` shows accounting history. Corrections use
+`--reconcile INVOCATION --cost USD --note TEXT`.
+
+Grants never interrupt active sessions. Completed costs may create a deficit,
+and estimated pending costs reduce the amount available for new admissions.
+A missing receipt stays unresolved with its existing estimate reserved for later
+reconciliation; it does not independently block funded workers or replacement
+calibration sessions. Cold-model reservations use at least $1 or the largest
+of the last 20 recorded costs across all models. An unsettled resumed invocation
+pauses only explicit resumption of that same provider session. Recover its
+cumulative receipt before resuming; cost-only reconciliation does not restore
+its cumulative accounting baseline.
+See [the complete budget design](api-budget-plan.md) for state paths, recovery,
+and estimated-cost semantics.
+
+### Progress documentation deployment waits
+
+Before launching a progress writer, the worker runs `plan` and `facts` together up to three times.
+Each attempt uses a fresh isolated documentation cache. A typed generation-change result (tool exit
+76), or an older facts diagnostic naming two different builds, retries only these mechanical stages.
+Persistent churn reports `waiting-documentation` (worker exit 79) and defers progress for 60 seconds,
+then 5, 15 and at most 30 minutes on repeated churn, without
+advancing the report attempt timestamp, spending PR repair allowances, or escalating failure backoff.
+The scheduler can select other work during this cooldown. Other plan/facts/prompt errors remain specific
+failures with a separate mechanical retry delay preserving the existing eight-hour error spacing.
+A not-due recheck suppresses planning for the ordinary due-cache TTL; a parked window uses the
+existing eight-hour attempt spacing. The published cursor changes only through normal
+report publication, so the next ordinary replan covers the same unadvanced history.
+
+Every completed plan, facts, prompt and apply command keeps labelled stdout/stderr in private
+`progress-<stage>-*.log` files beside the round logs. Mechanical attempt plans/facts live under
+`state/progress/mechanical/attempt-*`; a failed attempt does not overwrite coherent artifacts or prose.
+Recent mechanical traces are bounded to 20 directories; archives containing prepared inputs or prose are retained.
+When a new coherent plan/facts identity changes, previous inputs and prose are archived there before
+prose is invalidated. Each writer uses fresh output paths under `state/progress/writing/`; existing prose
+cannot satisfy a new writer launch. Mechanical tool timeouts fit the remaining round deadline. Deadline exhaustion reports
+`waiting-progress-preparation` without increasing the churn or error counters, and no paid writer
+starts with less than five minutes remaining. A durable writing marker prevents older fork intents
+from adopting retained bodies from an unsuccessful fresh writer attempt. Prepared publication receipts resume apply with their existing prose and version.
+Rolling back the tool pin preserves these artifacts and the published cursor.

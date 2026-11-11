@@ -1,0 +1,15 @@
+# Daily online backup of the queue database; started by tauceti-queue-backup.timer
+# (docs/queue/operations.md, "Backups").
+
+[Unit]
+Description=Back up the Tau Ceti AI merge queue database
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/TauCetiQueue
+Environment=PATH=%h/.local/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+Environment=UV_NO_SYNC=1
+ExecStart=/usr/bin/env bash %h/TauCetiQueue/services/queue/backup.sh
+UMask=0077
+Nice=10
+IOSchedulingClass=idle

@@ -184,6 +184,11 @@ class AgentTranscriptRenderer:
         self.saw_work = False
         self.terminal_failure_text: str | None = None
         self.terminal_failure_final = False
+        self.compactions = 0
+        self.usage: dict[str, int] = {}
+        # The `status` of Claude Code's latest `rate_limit_event` (`allowed`, `allowed_warning`, or a
+        # refusal such as `rejected`); None until one is seen. Codex has no equivalent event.
+        self.rate_limit_status: str | None = None
 
     def render_line(self, raw: str) -> str:
         if self.provider not in {"codex", "claude"}:
@@ -197,6 +202,29 @@ class AgentTranscriptRenderer:
             return raw
         if not isinstance(event, dict):
             return raw
+
+        kind, subtype = event.get("type"), event.get("subtype")
+        if kind in {"context.compacted", "context_compacted", "thread.compacted"} or (
+            kind == "system" and subtype == "compact_boundary"
+        ):
+            self.active = True
+            self.compactions += 1
+            return _line("compaction", f"{self.provider}; count={self.compactions}")
+        if kind in {"turn.completed", "result"} and isinstance(event.get("usage"), dict):
+            self.usage = {
+                key: value
+                for key, value in event["usage"].items()
+                if key
+                in {
+                    "input_tokens",
+                    "output_tokens",
+                    "cached_input_tokens",
+                    "reasoning_output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                }
+                and type(value) is int
+            }
 
         try:
             rendered = self._render_codex(event) if self.provider == "codex" else self._render_claude(event)
@@ -402,6 +430,8 @@ class AgentTranscriptRenderer:
         if kind == "rate_limit_event":
             self.active = True
             info = event.get("rate_limit_info") if isinstance(event.get("rate_limit_info"), dict) else {}
+            if info.get("status") is not None:
+                self.rate_limit_status = str(info["status"])
             details = [
                 f"{label}={info[key]}"
                 for key, label in (("status", "status"), ("rateLimitType", "type"), ("resetsAt", "resets"))
@@ -433,6 +463,17 @@ class AgentTranscriptRenderer:
 
     def _claude_assistant(self, event: dict[str, Any]) -> str:
         message = event["message"]
+        # Claude emits provider refusals as synthetic assistant messages. They
+        # are diagnostics, even when followed by a result subtype of "success".
+        usage = message.get("usage") or {}
+        synthetic_error = (
+            event.get("is_api_error_message") is True
+            and message.get("model") == "<synthetic>"
+            and all(
+                type(usage.get(key)) is int and usage[key] == 0
+                for key in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+            )
+        )
         content = message.get("content")
         blocks = content if isinstance(content, list) else [content]
         parent = event.get("parent_tool_use_id")
@@ -448,7 +489,8 @@ class AgentTranscriptRenderer:
             else:
                 continue
             if block_kind == "text" and isinstance(text, str) and text.strip():
-                self.saw_work = True
+                if not synthetic_error:
+                    self.saw_work = True
                 emitted_text = True
                 if not parent:
                     self._last_assistant = text
@@ -499,6 +541,8 @@ class AgentTranscriptRenderer:
         if isinstance(duration, int):
             detail += f"; duration={duration}ms"
         rendered = [_line("result", detail)]
+        if self.usage:
+            rendered.append(_line("usage", "; ".join(f"{key}={value}" for key, value in self.usage.items())))
 
         result = event.get("result")
         if isinstance(result, str) and result.strip() and result.strip() != (self._last_assistant or "").strip():

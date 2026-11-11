@@ -222,21 +222,14 @@ with tempfile.TemporaryDirectory() as tmp:
     rs2._comments.clear()
     check("a blank updated_at is unobserved, not a match", rs2.gh_meta(1).provenance, "assumed")
 
-# --- markers: cached, but expiry is still judged against the clock ---------------------------------
+# --- old coordination comments do not enter sidecar facts ---------------------------------------
 with tempfile.TemporaryDirectory() as tmp:
-    soon = int(time.time()) + 60
-    gh = FakeGH(issue=[board("abc123"), marker("abc123", "codex", soon)])
+    gh = FakeGH(issue=[board("abc123"), marker("abc123", "codex", int(time.time()) + 60)])
     rs = state(gh, tmp)
     rs.observe([pr()])
-    rs.gh_meta(1)  # the same fetch that reads the board distils the markers
-    rs._comments.clear()
-    check("a cached marker still holds the head", rs.inflight_review(1, "abc123"), {"codex"})
-    check("...without a second fetch", gh.n_issue, 1)
-    check("a cached marker does not hold a different head", rs.inflight_review(1, "def456"), set())
+    rs.gh_meta(1)
     sc = json.loads((rs.sbcache / "1.key.json").read_text())
-    sc["markers"] = [{**sc["markers"][0], "expires_at": int(time.time()) - 1}]
-    (rs.sbcache / "1.key.json").write_text(json.dumps(sc))
-    check("an expired cached marker releases the head on its own", rs.inflight_review(1, "abc123"), set())
+    check("old markers are not cached", "markers" in sc, False)
 
 # --- the contest reply gets the same treatment (it had no cache at all) ----------------------------
 with tempfile.TemporaryDirectory() as tmp:

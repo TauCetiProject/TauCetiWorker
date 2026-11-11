@@ -1,0 +1,46 @@
+{
+  "schema": "tauceti.forge-contract-pins/v1",
+  "scope": "Selected declared source inputs. The runtime-marker receipt is an operator observation, not independent verification of installed artifacts or running processes. Dependency declarations are verified against immutable Git blobs.",
+  "pins": [
+    {
+      "repository": "TauCetiWorker",
+      "revision": "f1bbc941696791028fdc523df5cb4e8a10ac25b6",
+      "provenance": {
+        "kind": "runtime_marker",
+        "observation": {
+          "observed_at": "2026-11-07T04:05:43.412454+00:00",
+          "target": "selected configured remote runtime marker (host omitted)",
+          "field": "configured_remote.worker_runtime_marker_revision",
+          "revision": "f1bbc941696791028fdc523df5cb4e8a10ac25b6",
+          "running_processes_verified": false,
+          "parent_observation_sha256": "98a21c1a09ba1c3d54770008c02be6f0f7a1af55334be918236bd86fe56340cf"
+        },
+        "observation_sha256": "70c9a8c31d5a545b11f225878f3c8385d2529767b21b74d2dbc681700bd3d84c"
+      }
+    },
+    {
+      "repository": "TauCetiTools",
+      "revision": "b97c515e4a9a10018cc0d785e9ab19fcea76db5f",
+      "provenance": {
+        "kind": "git_dependency",
+        "repository": "TauCetiWorker",
+        "revision": "f1bbc941696791028fdc523df5cb4e8a10ac25b6",
+        "path": "pyproject.toml",
+        "blob": "a41a544bae1f6e2ade86bda421c2a43964547b68",
+        "dependency": "tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@b97c515e4a9a10018cc0d785e9ab19fcea76db5f"
+      }
+    },
+    {
+      "repository": "TauCetiReview",
+      "revision": "7fd3a39e02c5a16cf7be65508a7ffb2c336dcada",
+      "provenance": {
+        "kind": "git_dependency",
+        "repository": "TauCetiWorker",
+        "revision": "f1bbc941696791028fdc523df5cb4e8a10ac25b6",
+        "path": "pyproject.toml",
+        "blob": "a41a544bae1f6e2ade86bda421c2a43964547b68",
+        "dependency": "tauceti-review @ git+https://github.com/TauCetiProject/TauCetiReview@7fd3a39e02c5a16cf7be65508a7ffb2c336dcada"
+      }
+    }
+  ]
+}

@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 from .config import Config, Die, log
@@ -32,11 +33,16 @@ class RoundContext:
     """Holds the per-worker round lock for the life of a round, runs cleanup on any exit, and routes
     SIGTERM→143 / SIGINT→130 through that cleanup (so a loop-sent SIGTERM still releases the lease)."""
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, *, record_activity=True):
         self.cfg = cfg
+        self.deadline = float(os.environ.get("TAUCETI_ROUND_DEADLINE") or (time.time() + ROUND_TIMEOUT))
+        os.environ["TAUCETI_ROUND_DEADLINE"] = str(self.deadline)
         self._fd: int | None = None
         self._cleanups: list = []
         self._done = False
+        self.interrupted = False
+        self.activity = None
+        self.record_activity = record_activity
 
     def __enter__(self) -> RoundContext:
         self.cfg.state.mkdir(parents=True, exist_ok=True)
@@ -54,6 +60,36 @@ class RoundContext:
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
         atexit.register(self._cleanup)
+        if self.record_activity:
+            from .retention import recycle
+
+            try:
+                result = recycle(self.cfg)
+                for error in result["errors"]:
+                    log(f"retention: {error}")
+                if result["removed"]:
+                    log(f"retention: recycled {result.get('removed_count', len(result['removed']))} generated paths")
+            except Exception as error:
+                log(f"retention: cache recycling deferred: {error}")
+        if self.record_activity:
+            from .cache_storage import admit
+
+            try:
+                admit(self.cfg)
+            except BaseException:
+                self._cleanup()
+                raise
+            from .activity import Round
+
+            self.activity = Round(self.cfg.wid)
+        # Register first: LIFO cleanup records resources after claim/build teardown.
+        try:
+            from .resources import RoundResources
+
+            monitor = RoundResources(self.cfg).start()
+            self.add_cleanup(monitor.finish)
+        except Exception as error:
+            log(f"resources: could not start sampling ({type(error).__name__}: {error})")
         return self
 
     def add_cleanup(self, fn) -> None:
@@ -63,6 +99,8 @@ class RoundContext:
         if self._done:
             return
         self._done = True
+        if self.activity:
+            self.activity.finish()
         for fn in reversed(self._cleanups):  # LIFO: stop heartbeat, pop bubble, release claim
             try:
                 fn()
@@ -70,6 +108,11 @@ class RoundContext:
                 log(f"cleanup step failed: {e}")
         if self._fd is not None:
             try:
+                if self.record_activity:
+                    try:
+                        os.utime(self._fd, None)  # last use, without another lifecycle record
+                    except OSError as error:
+                        log(f"retention: could not record checkout use: {error}")
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
                 os.close(self._fd)
             except OSError:
@@ -77,16 +120,21 @@ class RoundContext:
             self._fd = None
 
     def __exit__(self, *exc) -> bool:
+        self.interrupted = exc[0] in (SystemExit, KeyboardInterrupt)
+        if self.activity:
+            self.activity.finish(exc[1])
         self._cleanup()
         return False
 
 
-def spawn_round(argv_tail: list[str]) -> subprocess.Popen:
+def spawn_round(argv_tail: list[str], *, timeout: int = ROUND_TIMEOUT) -> subprocess.Popen:
     """Spawn one round as a child in its OWN session (so the loop can kill the whole group). Invokes
     the current interpreter directly on this file (NOT via the uv shebang) to avoid a uv wrapper
     process between the loop and the round — sys.executable is already the uv-resolved interpreter."""
     cmd = self_argv("_round", *argv_tail)
-    return subprocess.Popen(cmd, start_new_session=True, env=self_env())
+    env = self_env()
+    env["TAUCETI_ROUND_DEADLINE"] = str(time.time() + timeout)
+    return subprocess.Popen(cmd, start_new_session=True, env=env)
 
 
 def signal_group(pgid: int, sig: int) -> str:
@@ -181,6 +229,11 @@ class Claims:
         self.held: tuple[str, str] | None = None
         self._hb: subprocess.Popen | None = None
         self._hb_wfd: int | None = None
+        # Set when the heartbeat reports the lease lost; branch work passes it to the agent as its
+        # cancellation event, so a lost claim cancels the owned agent process group.
+        self.lost = threading.Event()
+        self._stopped = threading.Event()
+        self.collisions = 0
 
     def begin_branch_work(self, pr: int, head: str, refname: str, owner: str, repo: str) -> bool:
         """Take the branch claim and set the push-arbiter env. Returns False if claimed elsewhere
@@ -195,6 +248,7 @@ class Claims:
         claim_env = {**os.environ, "CLAIM_REPO": claim_repo}
         rc = subprocess.run([CLAIM_SH, "acquire", key, str(CLAIM_TTL_S)], capture_output=True, env=claim_env).returncode
         if rc == 1:
+            self.collisions += 1
             log(f"branch #{pr} claimed by another worker — skipping (COOP dedup)")
             return False
         os.environ["TAUCETI_PUSH_REF"] = refname
@@ -234,8 +288,19 @@ class Claims:
         os.close(rfd)  # parent keeps only the write end; its closure (or death) is the EOF signal
         self._hb_wfd = wfd
         self.ctx.add_cleanup(self.stop_heartbeat)
+        # Each heartbeat has its own lost/stopped state, so one claim's loss never cancels the next.
+        self.lost = lost = threading.Event()
+        self._stopped = stopped = threading.Event()
+
+        def watch(hb=self._hb):
+            if hb.wait(None) == HEARTBEAT_LOST and not stopped.is_set():
+                log(f"claim {key}: lease lost; cancelling the branch work that depends on it")
+                lost.set()
+
+        threading.Thread(target=watch, daemon=True).start()
 
     def stop_heartbeat(self) -> None:
+        self._stopped.set()
         if self._hb_wfd is not None:
             try:
                 os.close(self._hb_wfd)  # EOF → the heartbeat child exits on its own
@@ -261,6 +326,9 @@ class Claims:
             os.environ.pop("TAUCETI_CLAIM_REPO", None)
 
 
+HEARTBEAT_LOST = 3
+
+
 def cmd_heartbeat(args) -> int:
     """Internal: renew a claim lease every CLAIM_HEARTBEAT_S until the parent dies (pipe EOF) or the
     lease is lost. Never runs the round's cleanup (default signal disposition, no RoundContext)."""
@@ -280,22 +348,36 @@ def cmd_heartbeat(args) -> int:
         else:
             time.sleep(CLAIM_HEARTBEAT_S)
         if subprocess.run([CLAIM_SH, "renew", key], capture_output=True).returncode != 0:
-            return 0  # lease lost → stop renewing so it can expire
+            return HEARTBEAT_LOST  # stop renewing so it can expire, and tell the round
 
 
 def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> int:
     """Run one round as a child under a hard timeout; tear down the group on expiry. Used by the loop.
     Maps a timed-out round to rc 124, a SIGKILL-after-grace to 137 (matching the shell's `timeout`)."""
-    p = spawn_round(argv_tail)
+    from .budget import budget_dir, process_identity
+    from .claude_api import api_mode
+    from .usage_supervisor import ensure_supervisor, record_round_end
+
+    accounting = api_mode()
+    if accounting:
+        try:
+            ensure_supervisor(budget_dir())
+        except Exception as error:
+            log(f"usage supervisor startup pending: {error}")
+    p = spawn_round(argv_tail, timeout=timeout)
+    owner = process_identity(p.pid) if accounting else None
+    ending = "exit"
     pgid = p.pid  # spawn_round's start_new_session ⇒ the round leads its own group; pgid == leader pid
     try:
         return p.wait(timeout)
     except subprocess.TimeoutExpired:
+        ending = "timeout"
         log(f"round timed out after {timeout}s — tearing down")
         kill_round_group(p)
         rc = p.returncode
         return 137 if rc is not None and rc < 0 and -rc == signal.SIGKILL else 124
     except KeyboardInterrupt:
+        ending = "signal"
         kill_round_group(p)
         raise
     finally:
@@ -305,7 +387,17 @@ def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> 
         # Unlike kill_round_group (which signals while the leader PID is still live), p.wait() has already
         # reaped the leader here, so the group is held open only by stragglers. The lone wrong-kill window
         # — the freed leader PID being reused AND the reuser making itself a group leader before this line
-        # — is microseconds wide and needs a deliberate setsid; we accept it. (One-shot `tauceti work`
-        # runs the round in-process, not through here, so it is not swept; only the unbounded --loop leak
-        # is operationally damaging, so that scope gap is acceptable.)
+        # — is microseconds wide and needs a deliberate setsid; we accept it. Host agents and
+        # supervised tools also sweep their own groups, including in one-shot rounds.
         reap_round_group(pgid)
+        if accounting:
+            try:
+                record_round_end(
+                    budget_dir(),
+                    owner,
+                    "signal" if ending == "exit" and p.returncode is not None and p.returncode < 0 else ending,
+                    p.returncode,
+                )
+                ensure_supervisor(budget_dir())
+            except Exception as error:
+                log(f"usage supervisor recovery pending: {error}")

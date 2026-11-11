@@ -13,7 +13,9 @@ cache (32 GB) and 22 toolchain installs covering 6 distinct toolchains (63 GB).
 
 `--link` only ever ADDS names to the pool, and a hardlink is atomic, so it is safe alongside a live
 fleet. `--prune` is not: it deletes, and it must not race a round that is reading or writing what it
-deletes. Stop the fleet first (`tauceti workers stop --all`).
+deletes. On a live fleet use `--link` alone: the cache collector already reclaims unused private
+copies at ordinary round boundaries, so there is no need to stop workers to prune. Run `--prune`
+only when no worker rounds are running anyway.
 
 What `--prune` will delete is decided per file, never per tree:
 
