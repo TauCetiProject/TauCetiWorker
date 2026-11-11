@@ -196,10 +196,10 @@ def refresh_pr(repo: str, number: int, expected: str, observed: str = "") -> dic
         url = _url()
         if not url or not re.fullmatch(r"[a-f0-9]{40}", expected):
             return unavailable
+        # Public repositories accept anonymous refreshes, as they accept anonymous reads; a
+        # configured client token is still sent, and private repositories still require one.
         token_file = os.environ.get("TAUCETI_GITHUB_STATE_TOKEN_FILE")
-        if not token_file:
-            return {**unavailable, "reason": "refresh_auth_required"}
-        token = Path(token_file).expanduser().read_text().strip()
+        token = Path(token_file).expanduser().read_text().strip() if token_file else ""
         body = dict(repository=repo, number=number, expected_head=expected)
         if re.fullmatch(r"[a-f0-9]{40}", observed):
             body["observed_head"] = observed
@@ -208,7 +208,7 @@ def refresh_pr(repo: str, number: int, expected: str, observed: str = "") -> dic
             url + "/v1/refresh-pr",
             data=json.dumps(body).encode(),
             headers={
-                "Authorization": "Bearer " + token,
+                **({"Authorization": "Bearer " + token} if token else {}),
                 "Content-Type": "application/json",
                 "User-Agent": "TauCetiWorker/1.0",
             },
