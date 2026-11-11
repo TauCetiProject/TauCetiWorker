@@ -234,6 +234,7 @@ RUN_STDLIB=(
   source_argument.py
   source_identity.py
   source_survey.py
+  worker_sources.py
   extra_roadmap_prompt.py
   spread_candidates.py
   ssl_cert_file.py
@@ -255,7 +256,7 @@ RUN_SH=(docker_entrypoint.sh lifecycle.sh)
 # Deliberate manual checks: egress needs the bubble sandbox/proxy; the cross-repo
 # repair fixture needs Lean, Elixir and a bors checkout (see its module docstring).
 # The source-read fixture starts a disposable Forgejo given FORGEJO_BINARY.
-SKIP=(egress.sh integration_repair_fixture.py integration_forgejo_reads.py integration_forgejo_git.py integration_forgejo_source.py integration_forgejo_bootstrap.py integration_forgejo_native_launch.py)
+SKIP=(integration_forgejo_worker.py egress.sh integration_repair_fixture.py integration_forgejo_reads.py integration_forgejo_git.py integration_forgejo_source.py integration_forgejo_bootstrap.py integration_forgejo_native_launch.py)
 
 # Modules whose storage fixtures compare inode/device identity and sweep real directories. They
 # failed on Namespace runners' filesystem (#409) and run on GitHub's native ubuntu-24.04 image in
