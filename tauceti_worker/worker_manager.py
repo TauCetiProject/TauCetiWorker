@@ -827,7 +827,7 @@ def cmd_managed_runner(args) -> int:
                 from tauceti_tools.project import active
 
                 if active():
-                    for key in active().environment():
+                    for key in active().qualified_environment():
                         env.pop(key, None)
                 env.pop("TAUCETI_CONF", None)
             env[STATUS_ENV] = str(state)
@@ -973,6 +973,22 @@ def _launch_runner(spec: WorkerSpec, state_dir: Path, runtime_dir: Path) -> subp
     )
 
 
+def _detached_usage_supervisor(pid: int) -> bool:
+    """Recognize the registered supervisor that survives worker process-group teardown."""
+    from .usage_lifecycle import identity
+
+    try:
+        process = Path(f"/proc/{pid}")
+        argv = (process / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+        if len(argv) != 4 or argv[1:3] != [b"-m", b"tauceti_worker.usage_supervisor"]:
+            return False
+        directory = process / "cwd" / os.fsdecode(argv[3])
+        owner = read_json(directory / "usage-supervisor.json").get("owner")
+        return owner == identity(pid) and os.getsid(pid) == pid and os.getpgid(pid) == pid
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 def _defer_read_policy_reload(spec: WorkerSpec, live: dict) -> bool:
     """These read-policy edits can wait for a round boundary instead of killing paid work."""
     applied = live.get("applied_spec")
@@ -1001,7 +1017,8 @@ def _defer_read_policy_reload(spec: WorkerSpec, live: dict) -> bool:
     pid = live.get("child_pid")
     if sys.platform == "linux" and isinstance(pid, int):
         try:
-            return bool(Path(f"/proc/{pid}/task/{pid}/children").read_text().strip())
+            children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+            return any(not _detached_usage_supervisor(int(child)) for child in children)
         except OSError:
             return True
     return False

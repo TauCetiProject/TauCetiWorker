@@ -39,7 +39,11 @@ class Claim:
 def own_identities() -> set[str]:
     """The set of logins whose claims this worker will NOT avoid: its own `gh auth` identity plus
     any operator-configured extras. Lowercased for case-insensitive comparison."""
-    return {me().lower()} | set(roadmap_extra_identities())
+    from .worker_sources import current
+
+    source = current()
+    login = source.shared_github_login() if source is not None else me()
+    return {login.lower()} | set(roadmap_extra_identities())
 
 
 # GitHub issue forms render each field as a `### <label>` section; pull the "Items in scope" one.
