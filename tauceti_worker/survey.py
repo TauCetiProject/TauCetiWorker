@@ -1321,7 +1321,8 @@ def survey(
                         budget=MAX_FIX_ATTEMPTS,
                         partial_history=True,
                     )
-                    c.final_resolution = c.attempts >= c.budget - 1 and sv.owns(p) and not p.automatic_bump
+                    completed = completed_attempts(counters, f"fix-{p.number}-{p.head_oid[:12]}")
+                    c.final_resolution = completed >= c.budget - 1 and sv.owns(p) and not p.automatic_bump
                     (
                         sv.needs_fix.suppressed
                         if c.attempts >= c.budget and not c.final_resolution
@@ -1355,7 +1356,10 @@ def survey(
                     "blocking review at head",
                     attempts=per_head,
                     budget=MAX_FIX_ATTEMPTS,
-                    final_resolution=per_head >= MAX_FIX_ATTEMPTS - 1 and sv.owns(p) and not p.automatic_bump,
+                    final_resolution=completed_attempts(counters, f"fix-{p.number}-{p.head_oid[:12]}")
+                    >= MAX_FIX_ATTEMPTS - 1
+                    and sv.owns(p)
+                    and not p.automatic_bump,
                 )
                 sv.needs_fix.actionable.append(c)
                 continue

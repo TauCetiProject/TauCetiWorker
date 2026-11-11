@@ -302,6 +302,55 @@ class SharedAttemptsTests(unittest.TestCase):
         survey_mod.settle_counters(private, survey_mod.checkpoint_counters(private, (FIX,)))
         self.assertEqual(sorted(path.name for path in (self.root / "private").iterdir()), [FIX])
 
+    def test_the_last_attempt_instruction_counts_only_completed_attempts(self):
+        first, second = self.counters("first"), self.counters("second")
+        saved = first.checkpoint((FIX,))
+        first.charge({FIX: None})
+        first.settle(saved)
+        # A peer's reservation makes this look like the last attempt when the candidate is chosen.
+        first.charge({FIX: None})
+        pr = SimpleNamespace(number=7, head_ref="feature", head_owner="me", head_repo="TauCeti")
+        sv = SimpleNamespace(open_prs=[pr])
+        candidate = SimpleNamespace(pr=7, head=HEAD, foreign_repair_base="", final_resolution=True)
+        claims = SimpleNamespace(begin_branch_work=lambda *_args: True, held=("branch/7", "claims"))
+        seen = []
+
+        def snapshot(_w, c):
+            seen.append(c.final_resolution)
+            raise NoProgress("stop after the claim")
+
+        with patch.object(work_units, "_progress_snapshot", side_effect=snapshot), self.assertRaises(NoProgress):
+            self.assertTrue(second.charge({FIX: survey_mod.MAX_FIX_ATTEMPTS}))
+            first.write(FIX, max(0, first.read(FIX) - 1))
+            work_units._do_fixlike(
+                SimpleNamespace(counters=second, claims=claims),
+                sv,
+                candidate,
+                None,
+                False,
+                prompt_file="fix.md",
+                label="fix",
+                charged=(FIX,),
+            )
+        self.assertEqual(seen, [False])
+
+        private = self.counters("private", shared=False)
+        private.write(FIX, survey_mod.MAX_FIX_ATTEMPTS - 1)
+        private.incr(FIX)
+        candidate.final_resolution = True
+        with patch.object(work_units, "_progress_snapshot", side_effect=snapshot), self.assertRaises(NoProgress):
+            work_units._do_fixlike(
+                SimpleNamespace(counters=private, claims=claims),
+                sv,
+                candidate,
+                None,
+                False,
+                prompt_file="fix.md",
+                label="fix",
+                charged=(FIX,),
+            )
+        self.assertEqual(seen, [False, True])
+
     def test_the_helpers_need_only_read_and_write(self):
         values = {}
         counters = SimpleNamespace(read=lambda key: values.get(key, 0), write=values.__setitem__)

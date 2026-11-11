@@ -1134,7 +1134,9 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) ->
             unlimited=getattr(p, "automatic_bump", False),
         )
         c.final_resolution = (
-            attempts >= MAX_FIX_ATTEMPTS - 1 and owns_pr(sv, p) and not getattr(p, "automatic_bump", False)
+            completed_attempts(w.counters, f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS - 1
+            and owns_pr(sv, p)
+            and not getattr(p, "automatic_bump", False)
         )
         if disp != "actionable" and not (disp == "exhausted" and c.final_resolution):
             log(f"  fix #{c.pr}: not actionable on a fresh read ({why or disp}) — skipping")
@@ -1870,6 +1872,9 @@ def _do_fixlike(
         for key in charged:
             w.counters.write(key, max(0, w.counters.read(key) - 1))
         return None
+    if label == "fix" and getattr(c, "final_resolution", False):
+        # Under the claim, a peer's reservation is about to be refunded; only completed attempts are spent.
+        c.final_resolution = completed_attempts(w.counters, f"fix-{pr}-{head[:12]}") >= MAX_FIX_ATTEMPTS - 1
 
     def decline_repair():
         # Dispatch can immediately try another candidate. Stop/release only the

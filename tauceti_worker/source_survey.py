@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from tauceti_tools.forge import Incomplete, RepositoryRef
 
 from .source_identity import SourceActor
-from .survey import PRInfo, Survey, bucket_status_labels, roadmap_open_count
+from .survey import PRInfo, Survey, bucket_status_labels, completed_attempts, roadmap_open_count
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -250,7 +250,8 @@ def worker_survey(cfg, source, rs, counters, *, roadmap, skip, deep, stages, num
                 "current source review requests changes",
                 attempts=counters.read(f"fix-{pr.number}-{pr.head_oid[:12]}"),
                 budget=MAX_FIX_ATTEMPTS,
-                final_resolution=counters.read(f"fix-{pr.number}-{pr.head_oid[:12]}") >= MAX_FIX_ATTEMPTS - 1,
+                final_resolution=completed_attempts(counters, f"fix-{pr.number}-{pr.head_oid[:12]}")
+                >= MAX_FIX_ATTEMPTS - 1,
             )
             bucket = (
                 result.needs_fix.suppressed if candidate.attempts >= candidate.budget else result.needs_fix.actionable
