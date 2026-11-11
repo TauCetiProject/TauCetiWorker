@@ -1705,21 +1705,21 @@ def _sync_review_outbox(w: Worker, pr: int) -> int:
     archive_repo = os.environ.get("TAUCETI_DATA_REPO", "TauCetiProject/TauCetiData")
     if not archive_repo:
         return 0
-    if can_push(archive_repo) is False:
-        log(
-            f"  review #{pr}: no write access to TauCetiData — review posted and counts for "
-            f"auto-merge; analytics/provenance records kept in {outbox}"
-        )
-        return 0
     from .review_runtime import resolve
     from .worker_sources import shared_github_environment
 
-    runtime = getattr(w, "review_runtime", None) or resolve(w.cfg)
-    argv = runtime.command(pr, "--sync-only", "--store", w.cfg.store_dir)
-    # The sync echoes a full `$ …python …/archive.py sync --store … --data-dir …` command line and a
-    # "synced N file(s)" line. Capture it so that noise stays out of the main log, surfacing only a
-    # one-line summary; keep the detail in a subsidiary file only when the sync FAILS (the diagnosable case).
-    with shared_github_environment():
+    # Archive permissions belong to the archive's forge. A selected content
+    # source must not redirect this check to a same-named native repository.
+    with shared_github_environment(required=False):
+        if can_push(archive_repo) is False:
+            log(
+                f"  review #{pr}: no write access to TauCetiData — review posted and counts for "
+                f"auto-merge; analytics/provenance records kept in {outbox}"
+            )
+            return 0
+        runtime = getattr(w, "review_runtime", None) or resolve(w.cfg)
+        argv = runtime.command(pr, "--sync-only", "--store", w.cfg.store_dir)
+        # Capture sync details; keep a diagnostic log on failure.
         if os.environ.get("TAUCETI_STREAM"):
             return subprocess.run(argv).returncode
         p = subprocess.run(argv, capture_output=True, text=True)

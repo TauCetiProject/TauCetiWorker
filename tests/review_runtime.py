@@ -111,6 +111,48 @@ class ReviewRuntime(unittest.TestCase):
                 (work / name).write_text(json.dumps(dict(head_sha="a" * 40, review_changed=False)))
                 self.assertEqual(review_runtime.pending_reviews(cfg), set())
 
+    def test_archive_permission_check_uses_shared_forge_context(self):
+        import contextlib
+
+        from tauceti_worker import worker_sources
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outbox = root / "outbox"
+            outbox.mkdir()
+            (outbox / "record.json").write_text("{}")
+            worker = SimpleNamespace(cfg=SimpleNamespace(store_dir=root))
+            selected = SimpleNamespace(
+                validate_binding=lambda: (_ for _ in ()).throw(
+                    AssertionError("archive permission queried on content source")
+                )
+            )
+            marker = worker_sources._selected.set(selected)
+            try:
+
+                @contextlib.contextmanager
+                def shared(**kwargs):
+                    self.assertFalse(kwargs["required"])
+                    unselect = worker_sources._selected.set(None)
+                    try:
+                        yield
+                    finally:
+                        worker_sources._selected.reset(unselect)
+
+                def permission(repo):
+                    self.assertIsNone(worker_sources.current())
+                    return False
+
+                with (
+                    patch.object(worker_sources, "shared_github_environment", shared),
+                    patch.object(work_units, "can_push", side_effect=permission),
+                ):
+                    self.assertEqual(work_units._sync_review_outbox(worker, 7), 0)
+                self.assertIs(worker_sources.current(), selected)
+                self.assertTrue((outbox / "record.json").exists())
+            finally:
+                worker_sources._selected.reset(marker)
+
 
 if __name__ == "__main__":
     unittest.main()

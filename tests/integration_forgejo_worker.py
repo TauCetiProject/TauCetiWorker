@@ -148,6 +148,12 @@ class NativeWorker(unittest.TestCase):
                 self.assertEqual(candidate.source_repository, repository)
                 self.assertEqual(candidate.source_repository_id, row["id"])
                 self.assertFalse(sv.open_prs[0].build_success)
+                from types import SimpleNamespace
+
+                from tauceti_worker.work_units import _still_actionable
+
+                worker = SimpleNamespace(cfg=cfg, gh=source, rs=rs, counters=counters)
+                self.assertTrue(_still_actionable("review", worker, sv, candidate))
 
                 work = cfg.state / "review-work/test"
                 work.mkdir(parents=True)
@@ -266,6 +272,7 @@ class NativeWorker(unittest.TestCase):
                 rs.bust(pr)
                 fixed = survey(cfg, source, rs, counters, deep=True, stages=["fix"], selected_roadmap="any")
                 self.assertEqual([candidate.pr for candidate in fixed.needs_fix.actionable], [pr], fixed.errors)
+                self.assertTrue(_still_actionable("fix", worker, fixed, fixed.needs_fix.actionable[0]))
 
                 api.request(
                     "POST",

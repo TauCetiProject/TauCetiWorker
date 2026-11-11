@@ -232,10 +232,10 @@ def shared_github_environment(*, required=True):
     from tauceti_tools.git_credentials import scoped_git_environment
 
     gh = os.environ.get("TAUCETI_REAL_GH") or shutil.which("gh")
-    if not gh:
+    if not gh and required:
         raise SourceUnavailable("shared GitHub credentials unavailable")
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    if not token:
+    if not token and gh:
         credential = subprocess.run([gh, "auth", "token", "--hostname", "github.com"], capture_output=True, text=True)
         if (credential.returncode or not credential.stdout.strip()) and required:
             raise SourceUnavailable("shared GitHub credentials unavailable")

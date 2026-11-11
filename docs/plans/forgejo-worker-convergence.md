@@ -219,5 +219,25 @@ boundaries.
   scenarios. An installed Worker wheel resolves and launches the engine without
   a Review distribution. The source launcher retains its existing dependency
   surface, updating only its existing Tools reference.
-- Worker full-suite validation, fresh real PR automatic repair/re-review,
-  archive delivery, closure and managed-runtime update remain outstanding.
+- Worker draft [PR #709](https://github.com/TauCetiProject/TauCetiWorker/pull/709)
+  removes the native orchestration and shares scheduling/freshness, runtime,
+  publication recovery and archive policy. The local suite ran 204 modules:
+  198 passed, five shallow-survey fixture failures were fixed and passed on
+  rerun. The remaining optional saved queue snapshot fails identically on the
+  starting commit `4e746ffe1`; it is outside this change.
+- Fresh real [Forgejo PR #4](https://git.taucetiproject.org/TauCetiProject/TauCeti/pulls/4)
+  completed blocking review, automatic repair, re-review, archive delivery and
+  closure without merge using the ordinary PEP 723 launcher and stock
+  `leanprover/lean4:v4.36.0-rc2`. Correctness changed from blocking to green on
+  `fae824155ed117c713b85e52198727bd29d1d71a`. The remaining reuse block judges
+  the deliberately duplicate smoke API; it is not a workflow failure.
+- Review Git preparation took 10.5s initially and 1.4s on the repaired head.
+  Cache pack bytes grew from 95,865,945 to 95,868,741 (2,796 bytes added).
+  Archive delivery synced five then seven records and left an empty outbox.
+  The missing diff/comments/checks commands passed live on both forges;
+  Forgejo checks correctly retained pending execution evidence (exit 8).
+- Evidence is retained in
+  `~/.local/state/tauceti/forgejo-convergence-acceptance-20261111/acceptance.json`
+  and adjacent review/repair logs. Final Review/Worker merges, managed-runtime
+  update and deployed-entrypoint verification remain outstanding. No fleet
+  drain, admission change or upstream Lean/Lake patch was used.
