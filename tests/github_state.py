@@ -260,7 +260,7 @@ with (
     clock = [0.0]
 
     def healthy_slow_read(request, timeout):
-        assert 4.9 <= timeout <= 5.0
+        assert timeout == state.READ_PAGE_SECONDS
         clock[0] += 3.6
         return Response(payload)
 
@@ -280,8 +280,8 @@ with (
         patch.object(state.urllib.request, "urlopen", side_effect=stalled_read) as fetch,
     ):
         assert state.read("org/repo", "issue_comments", number=7) == (False, None)
-        assert fetch.call_count == 1, "a stalled read must exhaust the same five-second budget"
-        assert clock[0] == 8.6
+        assert fetch.call_count == 1, "a stalled read must exhaust the page budget, not retry with a fresh one"
+        assert clock[0] == 3.6 + state.READ_PAGE_SECONDS
     with patch.object(state.urllib.request, "urlopen", return_value=Response(payload)) as fetch:
         available, rows = state.read("org/repo", "issue_comments", number=7)
         assert available and rows[0]["id"] == 123 and fetch.call_count == 1
@@ -344,7 +344,7 @@ with (
     Path(tmp + "/token").write_text("malformed-json-client")
     with patch.object(state.urllib.request, "urlopen", side_effect=lambda *_a, **_kw: Response([])):
         assert state.read("org/repo", "issue_comments", number=7) == (False, None)
-    # A cold survey snapshot takes 5-6s to build; its first page gets a longer budget than other reads.
+    # A cold survey snapshot takes 5-6s to build its first page; that is a success, not an outage.
     clock = [0.0]
     budgets = []
 
@@ -359,6 +359,6 @@ with (
         patch.object(state.urllib.request, "urlopen", side_effect=cold_survey),
     ):
         assert state.read("org/repo", "survey")[0]
-        assert budgets == [state.SURVEY_FIRST_PAGE_SECONDS]
-    assert state._first_page_seconds("issue_comments") == 5
+        assert budgets == [state.READ_PAGE_SECONDS]
+    assert state.PROBE_LEASE > state.READ_PAGE_SECONDS, "a recovery probe must outlive the page it covers"
 print("PASS: shared-state freshness, fallback, conditional reads and configurable cutoff")
