@@ -159,12 +159,13 @@ def apply(text: str, changes: Iterable[Change]) -> str:
 
 def observe(targets: Targets, gh) -> Seen:
     """Read what `settle` needs: one search for merged markers, the open pull requests, one view per
-    `in flight:` clause, and one per pull request a `declined` record names as replacing a closed
-    one. A replacement counts only when every pull request the record names has merged. Raises
+    `in flight:` clause, and one per pull request a `declined` record at a closed one's last head
+    names as replacing it. A replacement counts only when every pull request the record names has
+    merged. Raises
     GitHubError when a listing fails."""
 
     def view(number: int) -> dict:
-        return normalize_merged(gh.pr_view(number, ["state", "title", "body"]) or {})
+        return normalize_merged(gh.pr_view(number, ["state", "title", "body", "headRefOid"]) or {})
 
     merged = gh.merged_prs(f"{MERGED_SEARCH} sort:updated-desc", limit=MERGED_LIMIT)
     open_keys: set[Key] = set()
@@ -174,7 +175,7 @@ def observe(targets: Targets, gh) -> Seen:
     pulls = {n: view(n) for n in sorted(named)}
     subsumed = {}
     for n, pull in pulls.items():
-        by = incidents.subsumed_by(n) if pull.get("state") == "CLOSED" else []
+        by = incidents.subsumed_by(n, pull.get("headRefOid") or "") if pull.get("state") == "CLOSED" else []
         if by and all(view(m).get("state") == "MERGED" for m in by):
             subsumed[n] = by
     return Seen(merged, pulls, subsumed, open_keys)

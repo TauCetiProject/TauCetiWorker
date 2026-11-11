@@ -191,10 +191,11 @@ class Records(Tmp):
     def test_a_replacement_counts_once_every_named_pull_request_merged(self):
         incidents.record_declined("rebase", 1234, "a" * 40, message="Main has it.\nSubsumed-by: #398 #401")
         incidents.record_declined("fix", 1234, "a" * 40, message="Nothing to do.\nSubsumed-by: none")
-        self.assertEqual(incidents.subsumed_by(1234), [398, 401])
-        self.assertEqual(incidents.subsumed_by(1235), [])
+        self.assertEqual(incidents.subsumed_by(1234, "a" * 40), [398, 401])
+        self.assertEqual(incidents.subsumed_by(1234, "b" * 40), [])
+        self.assertEqual(incidents.subsumed_by(1235, "a" * 40), [])
         states = {
-            1234: {"state": "CLOSED", "title": "Truncation bounds"},
+            1234: {"state": "CLOSED", "title": "Truncation bounds", "headRefOid": "a" * 40},
             398: {"state": "MERGED", "title": "x"},
             401: {"state": "CLOSED", "title": "[Merged by Bors] - y"},
         }
@@ -204,6 +205,9 @@ class Records(Tmp):
         self.assertEqual(observed.open_keys, {("Probability", "strong-law")})
         self.assertEqual((observed.merged[0]["limit"], views), (curate.MERGED_LIMIT, [1234, 398, 401]))
         self.assertIn("sort:updated-desc", observed.merged[0]["search"])
+        states[1234]["headRefOid"] = "b" * 40
+        self.assertEqual(curate.observe(t.parse_targets(EXAMPLE), self.github(states)[0]).subsumed, {})
+        states[1234]["headRefOid"] = "a" * 40
         states[401]["title"] = "y"
         self.assertEqual(curate.observe(t.parse_targets(EXAMPLE), self.github(states)[0]).subsumed, {})
         gh, views = self.github({})
@@ -224,7 +228,7 @@ class Records(Tmp):
         self.assertEqual([v["count"] for _, v in incidents.records(incidents.TARGET_CLOSED)], [1])
         with patch.dict(os.environ, {"TAUCETI_INCIDENTS_DIR": ""}):
             incidents.note_target_closed(path, "Probability", "strong-law", 5)
-            self.assertEqual(incidents.subsumed_by(1234), [])
+            self.assertEqual(incidents.subsumed_by(1234, "a" * 40), [])
         self.assertEqual(len(incidents.records()), 1)
 
 

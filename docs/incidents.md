@@ -162,6 +162,6 @@ the list.
 | `records(kind="", acked=True)` | Every readable record with its path, live ones first |
 | `record_declined(...)`, `note_budget_spent(...)`, `note_target_closed(...)` | The three kinds above |
 | `declined(stage, pr, head)` | Whether the hold applies |
-| `subsumed_by(pr)` | The pull requests the latest `declined` record about `pr` names on its `Subsumed-by:` line |
+| `subsumed_by(pr, head)` | The pull requests the latest `declined` record about `pr` at `head` names on its `Subsumed-by:` line |
 
 A new kind needs only a name and a key that is unique within it.

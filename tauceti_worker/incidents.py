@@ -164,13 +164,18 @@ def note_budget_spent(stage: str, pr: int, head: str, detail: str) -> None:
     record(BUDGET_SPENT, f"{stage}-{pr}", repository=TAUCETI, stage=stage, pr=pr, head=head, detail=detail)
 
 
-def subsumed_by(pr: int) -> list[int]:
-    """The pull requests that the latest `declined` record about `pr` with a `Subsumed-by:` line
-    names on it, whichever stage wrote the record and whether or not it is acknowledged."""
+def subsumed_by(pr: int, head: str) -> list[int]:
+    """The pull requests that the latest `declined` record about `pr` at `head` with a
+    `Subsumed-by:` line names on it, whichever stage wrote the record and whether or not it is
+    acknowledged."""
     named = [
         value
         for _, value in records(DECLINED)
-        if value.get("pr") == pr and isinstance(value.get("subsumed_by"), list) and value["subsumed_by"]
+        if value.get("pr") == pr
+        and head
+        and value.get("head") == head
+        and isinstance(value.get("subsumed_by"), list)
+        and value["subsumed_by"]
     ]
     latest = max(named, key=lambda value: str(value.get("last_at") or ""), default={})
     return [n for n in latest.get("subsumed_by", []) if type(n) is int]
