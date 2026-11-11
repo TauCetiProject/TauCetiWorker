@@ -120,7 +120,9 @@ def _may_retry(incident: dict) -> bool:
 
 
 def _record(incident: dict, ruling: str, by: str, **fields) -> Path | None:
-    """Write the ruling on `incident` and acknowledge the incident. `by` is `model` or `recheck`."""
+    """Write the ruling on `incident` and acknowledge the incident, unless its record has been
+    rewritten since it was read: the newer one stays live for a ruling of its own. `by` is `model`
+    or `recheck`."""
     case = case_id(incident)
     retried = _retried(case) + ([incident["head"]] if ruling == RETRY else [])
     path = incidents.record(
@@ -137,8 +139,9 @@ def _record(incident: dict, ruling: str, by: str, **fields) -> Path | None:
         retried=retried[-5:],
         **fields,
     )
-    if path is not None:
-        incidents.acknowledge(incident["kind"], incident["key"])
+    if path is not None and not incidents.acknowledge(incident["kind"], incident["key"], incident):
+        if next(iter(incidents.find(incident["kind"], incident["key"])), incident) != incident:
+            log(f"decide: #{incident['pr']}: its {incident['kind']} record was rewritten meanwhile; it stays live")
     return path
 
 
@@ -347,7 +350,7 @@ def _settle(rd: _Round) -> None:
         if live is None or (live.get("state") == "OPEN" and live.get("headRefOid") == value.get("head")):
             continue
         why = "has a new head" if live.get("state") == "OPEN" else "is no longer open"
-        if incidents.acknowledge(value["kind"], str(value.get("key"))):
+        if incidents.acknowledge(value["kind"], str(value.get("key")), value):
             log(f"decide: {path.name}: acknowledged, #{pr} {why}")
 
 

@@ -60,7 +60,9 @@ directory holds a live incident or a live ruling. It then:
    is left for a person, and one whose branch another worker has claimed is
    left for a later round.
 4. Writes those cases to a file, runs the model on it, and checks the answer.
-5. Applies each ruling, writes its record, and acknowledges the incident.
+5. Applies each ruling, writes its record, and acknowledges the incident. An
+   incident whose record a repair round rewrote while the model was out stays
+   live, and is put to the model in its own right on a later round.
 
 ## The rulings
 

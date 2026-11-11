@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,13 +135,15 @@ class Claims:
         self.held = None
 
 
-def rounds(tmp, hub, answer=None, *, rc=0, claimed=(), claims=None):
-    """One `decide.run`; `answer` is the answer file's parsed contents. Returns the run's result
-    as `rc`, and the packet when the model was asked."""
+def rounds(tmp, hub, answer=None, *, rc=0, claimed=(), claims=None, meanwhile=None):
+    """One `decide.run`; `answer` is the answer file's parsed contents, and `meanwhile` runs while
+    the model is out. Returns the run's result as `rc`, and the packet when the model was asked."""
     seen = {}
 
     def ask(_w, _opts, packet):
         seen.update(packet=packet)
+        if meanwhile:
+            meanwhile()
         return rc, answer
 
     def fetch(_repo, checkout):
@@ -372,6 +375,56 @@ def test_rounds(tmp):
         )
         hub.listing, hub.unreadable = None, set()
         check("the listing catches up: it is ruled on", len(rounds(tmp, hub, {"rulings": []})["packet"]["cases"]), 2)
+
+    root = tmp / "rewritten"
+    with settings(root):
+        declined(1, 2)
+        hub = Hub(p1={}, p2={})
+
+        def push_and_decline():
+            hub.prs[1]["head"] = "head-1b"
+            incidents.record_declined("fix", 1, "head-1b", message="declined at the new head")
+            later()
+            declined(2)
+
+        rounds(tmp, hub, answer((1, "retry", {}), (2, "retry", {})), meanwhile=push_and_decline)
+        check(
+            "an incident rewritten while the model ruled stays live: a new head, a same-head refresh",
+            [where(root, f"declined-fix-{n}.json") for n in (1, 2)],
+            [["live"]] * 2,
+        )
+        check(
+            "…and stays held",
+            (incidents.declined("fix", 1, "head-1b"), incidents.declined("fix", 2, "head-2")),
+            (True, True),
+        )
+        seen = rounds(tmp, hub, {"rulings": []})
+        check(
+            "…until it is ruled on in its own right",
+            [(c["case"], c["head"]) for c in seen["packet"]["cases"]],
+            [("declined-fix-1", "head-1b"), ("declined-fix-2", "head-2")],
+        )
+
+    root = tmp / "locked"
+    with settings(root):
+        declined(1)
+        version = incidents.find(incidents.DECLINED, "fix-1")[0]
+        fd = os.open(root / incidents.LOCK, os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        moved = []
+        acker = threading.Thread(target=lambda: moved.append(incidents.acknowledge("declined", "fix-1", version)))
+        acker.start()
+        time.sleep(0.2)
+        check("acknowledging waits for a writer's lock", moved, [])
+        later()
+        incidents._write(root, incidents.DECLINED, "fix-1", {"head": "head-1", "pr": 1})
+        os.close(fd)
+        acker.join(5)
+        check(
+            "…and then leaves the record written under it",
+            (moved, where(root, "declined-fix-1.json")),
+            ([False], ["live"]),
+        )
 
     root = tmp / "cap"
     with settings(root, TAUCETI_DECIDE_MAX_CASES="2"):

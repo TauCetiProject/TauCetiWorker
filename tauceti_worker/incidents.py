@@ -7,6 +7,7 @@ format, the directory layout and what a reader may do to a record are in docs/in
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import re
@@ -26,6 +27,7 @@ RULING = "ruling"  # written by decide.py; a `retry` one lifts the hold below
 # The stages whose rounds leave these records: the ones that repair an existing pull request head.
 STAGES = ("rebase", "fix", "fix-ci")
 HELD = "an earlier round declined at this head; waiting for a new head"
+LOCK = ".records.lock"
 MAX_SUMMARY = 2000
 
 PROMPT = (
@@ -88,12 +90,35 @@ def records(kind: str = "", *, acked: bool = True) -> list[tuple[Path, dict]]:
     return out
 
 
+@contextlib.contextmanager
+def _locked(root: Path):
+    """Hold the directory's record lock: `record` takes it to replace a live record, and
+    `acknowledge` to compare one before moving it. Where the lock cannot be opened, the caller goes
+    on without it and meets the same error in its own write."""
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(root / LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        yield
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def record(kind: str, key: str, **fields) -> Path | None:
     """Write or refresh the live record `<kind>-<key>.json` and return its path. None when the
     directory is not configured or the write failed: a record is a report, never a step of the round."""
     root = directory()
     if root is None:
         return None
+    with _locked(root):
+        return _write(root, kind, key, fields)
+
+
+def _write(root: Path, kind: str, key: str, fields: dict) -> Path | None:
     path = root / _name(kind, key)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     previous = _load(path) or {}
@@ -120,21 +145,25 @@ def record(kind: str, key: str, **fields) -> Path | None:
     return path
 
 
-def acknowledge(kind: str, key: str) -> bool:
+def acknowledge(kind: str, key: str, version: dict | None = None) -> bool:
     """Move the live record `<kind>-<key>` into `acked/`, over an older acknowledged one of that
-    name. False when there is no live record or the move failed."""
+    name; with `version`, only while the live record is exactly that one, as read earlier. False
+    when there is no such live record or the move failed."""
     root = directory()
     if root is None:
         return False
     name = _name(kind, key)
-    try:
-        (root / ACKED).mkdir(mode=0o700, exist_ok=True)
-        os.replace(root / name, root / ACKED / name)
-    except FileNotFoundError:
-        return False
-    except OSError as error:
-        log(f"incident {name} could not be acknowledged under {root}: {error}")
-        return False
+    with _locked(root):
+        if version is not None and _load(root / name) != version:
+            return False
+        try:
+            (root / ACKED).mkdir(mode=0o700, exist_ok=True)
+            os.replace(root / name, root / ACKED / name)
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            log(f"incident {name} could not be acknowledged under {root}: {error}")
+            return False
     return True
 
 
