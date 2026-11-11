@@ -647,6 +647,10 @@ class ForgejoLists(Tmp):
             pr_view=lambda number, fields: dict(states.get(number) or {"state": "OPEN"}),
         )
 
+    def test_a_look_on_a_forgejo_source_is_not_declined_for_want_of_a_pull_request(self):
+        w = SimpleNamespace(gh=self.forgejo)
+        self.assertIs(work._still_actionable("curate", w, tc.Survey(worker_id="test"), tc.Candidate(0, "", "")), True)
+
     def test_a_forgejo_only_worker_settles_what_landed_on_forgejo(self):
         url = self.repo.pull_url(12)
         self.path.write_text(EXAMPLE.replace("in flight: #1234", f"in flight: {url}"))
