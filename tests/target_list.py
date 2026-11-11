@@ -284,6 +284,14 @@ class Round(unittest.TestCase):
         }
         self.assertEqual(list(verdicts.values()), [0, 0, 1])
 
+    def test_a_round_that_also_maintains_forgejo_authors_from_the_list(self):
+        self.w.cross_source_targets = [{"source": "forgejo", "pr": 5, "head": "a" * 40, "targets": []}]
+        with patch.dict(os.environ, {"TAUCETI_WORKER_FORGES": "both", "TAUCETI_NEW_PR_FORGE": "github"}):
+            prompt = self.author()
+        self.assertIn("Your target is assigned: `kolmogorov-zero-one` in `MeasureTheory`", prompt)
+        self.assertIn("source-targets.json", prompt)
+        self.claims.begin_target_work.assert_called_once_with("MeasureTheory", "kolmogorov-zero-one")
+
     def test_live_statuses_reach_the_prompt(self):
         self.w.gh = github(merged=[(7, marker("Probability", "truncation-bounds"))])
         prompt = self.author("Probability")
@@ -491,6 +499,33 @@ class Wiring(unittest.TestCase):
             self.assertEqual(claims.held, ("author/Algebra/a", "org/claims"))
             heartbeat.assert_called_once_with("author/Algebra/a", "org/claims")
             self.assertEqual(cleanups, [claims.release])
+
+    def test_lists_author_on_github_alone(self):
+        """Startup refuses a list whose new pull requests would go to Forgejo; a worker that also
+        maintains Forgejo pull requests but authors on GitHub keeps its list."""
+        cli = importlib.import_module("tauceti_worker.cli")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "targets.md"
+            path.write_text(EXAMPLE)
+            common = ["work", "--roadmap-targets", str(path), "--only", "roadmap", "--agent", "claude"]
+            outcomes = []
+            for flags in (["--forgejo", "--new-pr-forge", "forgejo"], ["--no-github", "--forgejo"], ["--forgejo"], []):
+                with (
+                    patch.dict(os.environ),
+                    patch.object(cli, "configure_api"),
+                    patch.object(cli, "resolve_review_throttle", side_effect=RuntimeError("past the checks")),
+                ):
+                    for name in ("TAUCETI_WORKER_FORGES", "TAUCETI_NEW_PR_FORGE", "TAUCETI_ROADMAP_TARGETS"):
+                        os.environ.pop(name, None)
+                    try:
+                        cli.main(common + flags)
+                    except (tc.Die, RuntimeError) as e:
+                        outcomes.append((os.environ["TAUCETI_NEW_PR_FORGE"], type(e).__name__, str(e)))
+        self.assertEqual(
+            [o[:2] for o in outcomes],
+            [("forgejo", "Die"), ("github", "RuntimeError"), ("github", "RuntimeError"), ("github", "RuntimeError")],
+        )
+        self.assertIn("--roadmap-targets authors on GitHub only", outcomes[0][2])
 
     def test_workers_toml_key(self):
         spec = wm.WorkerSpec.from_dict({"id": "w", "only": ["roadmap"], "roadmap_targets": "/srv/targets.md"}, 0)

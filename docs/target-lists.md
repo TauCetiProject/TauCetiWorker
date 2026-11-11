@@ -9,6 +9,10 @@ whose prerequisites have landed, claims it, and hands the agent that item.
 Turn it on with `--roadmap-targets FILE`, `TAUCETI_ROADMAP_TARGETS`, or the
 `roadmap_targets` key in `workers.toml`. Several workers, on one host or many,
 may be given copies of the same list. Without the setting nothing changes.
+A list authors on GitHub: its live view reads GitHub pull requests, so a worker
+whose new pull requests go to Forgejo (`--new-pr-forge forgejo`) refuses to
+start with one; `--forgejo` alone, which also maintains Forgejo pull requests
+while authoring on GitHub, keeps it.
 
 ## The file
 
