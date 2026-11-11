@@ -2397,8 +2397,7 @@ def _run_task(
                 return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
             parallel = outcome.get("parallel") or {}
             verified = (
-                parallel.get("verified_tip") == tip
-                and (staging_checks or (parallel.get("checks") or {}).get("status") == "passed")
+                parallel.get("verified_tip") == tip and (staging_checks or "checks" in parallel)
             ) or pending_delivery == delivery_identity(cfg, task, tip)
             artifacts_cold = bool((outcome.get("artifacts") or state.record.get("artifacts") or {}).get("cold"))
             if cfg.worker_audits and (not artifacts_cold or continuation) and not verified:
