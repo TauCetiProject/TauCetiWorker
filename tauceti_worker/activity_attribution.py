@@ -392,7 +392,11 @@ def prepare_reviews(db, now, priority=()):
                 ((p, repo, number) for p in stale),
             )
         db.execute(
-            "INSERT OR REPLACE INTO review_archive_checks VALUES (?,?,?,?,?)",
+            "UPDATE review_archive_checks SET checked=?,complete=?,fingerprint=? WHERE repo=? AND number=?",
+            (checked_at if complete else now, complete, fingerprint, repo, number),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO review_archive_checks VALUES (?,?,?,?,?)",
             (repo, number, checked_at if complete else now, complete, fingerprint),
         )
         if remaining <= 0 or time.monotonic() >= deadline:

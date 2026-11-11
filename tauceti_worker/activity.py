@@ -562,17 +562,22 @@ def _refresh_prs(db, config, now, errors):
                         and math.isfinite(stamp)
                         and stamp >= 0
                     )
+                    counter_values = (
+                        p.get("head_sha"),
+                        count if valid else None,
+                        stamp / 1000 if valid else None,
+                        now,
+                        "scoreboard-round-counters" if valid else "unavailable",
+                        repo,
+                        p["number"],
+                    )
                     db.execute(
-                        "INSERT INTO pr_review_counts VALUES (?,?,?,?,?,?,?) ON CONFLICT(repo,number) DO UPDATE SET head=excluded.head,count=excluded.count,observed=excluded.observed,checked=excluded.checked,basis=excluded.basis",
-                        (
-                            repo,
-                            p["number"],
-                            p.get("head_sha"),
-                            count if valid else None,
-                            stamp / 1000 if valid else None,
-                            now,
-                            "scoreboard-round-counters" if valid else "unavailable",
-                        ),
+                        "UPDATE pr_review_counts SET head=?,count=?,observed=?,checked=?,basis=? WHERE repo=? AND number=?",
+                        counter_values,
+                    )
+                    db.execute(
+                        "INSERT OR IGNORE INTO pr_review_counts VALUES (?,?,?,?,?,?,?)",
+                        (*counter_values[-2:], *counter_values[:-2]),
                     )
                     loc = p.get("lean_loc") or git_locs.get(p["number"]) or stored_locs.get(p["number"])
                     if loc is not None:
@@ -581,7 +586,11 @@ def _refresh_prs(db, config, now, errors):
                         ):
                             raise ValueError("invalid LOC observation")
                         db.execute(
-                            "INSERT OR REPLACE INTO pr_loc VALUES (?,?,?,?,?,?)",
+                            "UPDATE pr_loc SET head=?,added=?,deleted=?,observed=? WHERE repo=? AND number=?",
+                            (loc["head_sha"], loc["added"], loc["deleted"], p["observed_at"] / 1000, repo, p["number"]),
+                        )
+                        db.execute(
+                            "INSERT OR IGNORE INTO pr_loc VALUES (?,?,?,?,?,?)",
                             (repo, p["number"], loc["head_sha"], loc["added"], loc["deleted"], p["observed_at"] / 1000),
                         )
                     else:
