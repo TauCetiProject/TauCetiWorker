@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import activity_ci, activity_costs, activity_git, activity_summary
+from . import activity_attribution, activity_ci, activity_costs, activity_git, activity_summary
 from .constants import WORK_TASKS
 from .runtime_status import atomic_json, read_json
 
@@ -103,7 +103,16 @@ class Round:
     def select(self, kind):
         self.kind = kind
         self.observation = None
-        emit("round_selected", key=self.id + ":select", round_id=self.id, worker=self.worker, round_type=kind)
+        emit(
+            "round_selected",
+            key=self.id + ":select",
+            round_id=self.id,
+            worker=self.worker,
+            round_type=kind,
+            review_archive=str(activity_attribution.archive_root()) if kind == "review" else None,
+            review_outbox=str(activity_attribution.archive_outbox(self.worker)) if kind == "review" else None,
+            **{k: v for k, v in activity_attribution.invocation_context(kind).items() if k != "round_id"},
+        )
 
     def finish(self, exc=None):
         global _round
@@ -236,6 +245,7 @@ def _connect():
     from .activity_rollup_sources import install as install_rollups
 
     install_rollups(db)
+    activity_attribution.install(db)
     return db
 
 
@@ -248,6 +258,7 @@ def _ingest(db, e):
     if cutoff and e["at"] < cutoff[0] and e.get("kind") != "pr_created":
         return
     kind, worker, scope = e["kind"], e.get("worker", "unknown"), e.get("group", e.get("machine_id", "local"))
+    activity_attribution.ingest(db, e)
     if kind == "pr_created":
         # Replays must restore PRs removed by older collectors even when the
         # event's deduplication tombstone already exists.
@@ -670,6 +681,12 @@ def _summary(db, now, column=None, identity=None):
         )
         row["loc_basis"] = "landed_at"
         row.update(activity_summary.loc_estimate(row))
+    for window, attribution in activity_attribution.summarize(db, now, activity_costs.COST_WINDOWS, column, identity):
+        row = costs["windows"][window]
+        attribution["attribution_missing_prs"] += max(
+            0, row["landed_prs"] - attribution.get("attribution_authored_prs", 0)
+        )
+        row.update(attribution)
     raw_observed = minimum("prs", "observed")
     raw_checked = minimum("prs", "checked")
     unresolved = "landed IS NULL AND state IS NOT 'CLOSED'"
@@ -767,6 +784,14 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                     errors.append("Conversation cost preparation failed; retaining last-known budget data")
                 _refresh_prs(db, config, now, errors)
                 _bors(db, errors)
+                try:
+                    activity_attribution.prepare(db, now)
+                except (OSError, ValueError, KeyError, sqlite3.Error) as error:
+                    errors.append(
+                        "Local attribution preparation failed; retaining last-known summary ("
+                        + type(error).__name__
+                        + ")"
+                    )
             from . import expanded_cache, shared_mathlib, work_recovery
 
             try:

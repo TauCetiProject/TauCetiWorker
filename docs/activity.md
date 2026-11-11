@@ -114,6 +114,80 @@ versions. Status never relabels the old figures or fetches replacement data.
 Cost preparation runs in the existing background collector;
 `activity` and `workers status` still only read small JSON summaries.
 
+### Credit for reviewing and fixing other contributors' PRs
+
+The raw authored-LOC figures remain visible. `Attributed landed Lean LOC` also credits
+review and fix work on other contributors' landed PRs, and reduces our credit when other
+contributors review ours. There is no fixed author/reviewer split. For each landed PR:
+
+```text
+outside review cost = outside review passes × our measured cost per review pass
+outside production cost = 0 for our PRs
+                        = max(0, measured production $/LOC × LOC − our fixes) otherwise
+credited LOC = LOC × our PR cost / (our PR cost + outside costs)
+```
+
+Our PR cost includes authoring, reviews and fixes (`fix`, `fix-ci`, `rebase`,
+`lint-repair`, `overlap-fix`, and recovery continuations), accumulated through landing.
+Only completed rounds enter contribution shares or calibration; failed attempts remain
+fully charged in the spending numerator. Review passes are completed native work rounds,
+counting a pass once even when it launches several model conversations. Every recorded
+review pass counts equally; no verdict or review dimension changes its weight. Total
+observed passes come from production round records already present in the normal
+TauCetiData archive sync's local checkout. Copies of the same record in multiple local
+checkouts count once. Model-free carry/repair records and shadow experiments supply no
+review credit. If the archive contains fewer passes than our recorded completed paid
+passes, attribution stays incomplete until the normal sync catches up. Existing worker
+outboxes are included so unpushed local records are counted, with duplicate pass
+identities removed.
+
+We use the PR's own measured local cost per review pass where possible. When we did none
+of its reviews, the fallback is our measured average per paid review pass over the last
+seven days, falling back to retained history. The production rate likewise uses local
+authoring plus fixes on measured, locally authored landed PRs from the last seven days,
+with a retained-history fallback. Other contributors' review costs and production costs
+are estimates based on these local measurements, not their actual bills. Archive
+observations may lag until the existing review sync next runs; reporting never fetches
+missing records. Existing Git fetch/HEAD metadata must show a consistent archive
+snapshot fetched at least one minute after landing. Older copies stay explicitly
+incomplete, even when they already contain some reviews. Settled archive measurements
+are parked; new local reviews reopen their PR's measurement.
+
+`Estimated $ / attributed LOC` divides **all** accrued spending by summed credited LOC.
+Unsuccessful work, open/unmerged PRs, unlinked costs, and spending on `bump`,
+`progress`, and other maintenance remain fully charged in this numerator. They are
+amortized across all credited output; we do not estimate whether other contributors paid
+their share of this overhead. Costs used to estimate a landed PR's share include earlier
+windows, but exclude work after landing. The spending numerator retains the displayed
+time window, so daily rates still fluctuate with landing delays.
+
+`Landed PRs with attribution data` reports coverage. Missing exact LOC, review records,
+cost links or calibration samples supply no attributed output. With no covered PRs the
+attributed rate is unavailable; partial output is shown with its coverage rather than
+silently assuming there was no outside work. Rates using incomplete output are labelled
+`partial`; an all-missing rate is unavailable. Unpriced completed local review passes
+also make coverage incomplete. Older hosts cannot supply attribution until their
+collectors are updated. Fleet reporting pools dollars and locally estimated credit
+before dividing. Worker and group summaries share host-wide measured rates and per-PR
+denominators, so their credited output adds to the host total. Cross-host production
+assists may overlap; this report does not reconcile global contribution ownership.
+
+Existing admission receipts now retain the round and selected PR identities. The
+collector preserves round links from existing PR receipts and can recover historical
+links from an unambiguous PR receipt inside a worker's recorded round interval.
+Ambiguous links remain unknown; no transcript parsing is used. Archive reads stay in the
+existing collector, with at most 32 tracked PRs, 256 small round records and a
+one-second archive work budget per pass. Session links and PR facts use a separate
+one-second budget with at most 1,024 changed/backfill sessions and 128 keys per fact
+stage. Backfill progress is explicit. Quiet passes read cached reports and do not scan
+billing history. Current measured rates are recomputed from compact prepared PR facts
+when evidence or time-window boundaries change; rates are not frozen per PR. Unchanged
+archive directories require no enumeration or record reads. The default source is the
+review runner's existing cache; previously recorded worker cache paths are also reused.
+`TAUCETI_ACTIVITY_REVIEW_ARCHIVES` can select already-existing archive checkouts
+(separated by the platform path separator). No new process, clone, archive sync, GitHub
+request or shared-server request is introduced.
+
 Local [work recovery](work-recovery.md) counts come from each worker's
 `state/<worker>/recovery` directory: saved, checkouts moved aside, incomplete and
 corrupt records, with reasons. The background collector prepares them.
