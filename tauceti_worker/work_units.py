@@ -107,11 +107,13 @@ from .survey import (
     bump_prs,
     bust_progress_cache,
     cascade,
+    checkpoint_counters,
     fix_disposition,
     owns_author,
     owns_pr,
     prioritize_review_candidates,
     progress_argv,
+    restore_counters,
     spread_candidates,
     survey,
 )
@@ -1116,9 +1118,9 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
         "lint-repair": (f"lint-repair-{pr}-{head}", f"lint-repair-pr-{pr}"),
         "progress": (PROGRESS_ERROR_KEY,),
     }.get(stage, ())
-    before = {key: w.counters.read(key) for key in keys}
+    before = checkpoint_counters(w.counters, keys)
     admission_keys = (*keys, "progress-attempt-ts") if stage == "progress" else keys
-    admission_before = {key: w.counters.read(key) for key in admission_keys}
+    admission_before = checkpoint_counters(w.counters, admission_keys)
     foreign_receipt = (
         w.cfg.state / f"rebase-foreign-launch-{pr}.json"
         if stage == "rebase" and getattr(c, "foreign_repair_base", "")
@@ -1134,8 +1136,7 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
 
         if (CURRENT_CONTEXT is not None and CURRENT_CONTEXT.launched) or unit_admitted():
             return
-        for key, value in admission_before.items():
-            w.counters.write(key, min(value, w.counters.read(key)))
+        restore_counters(w.counters, admission_before)
         if (
             foreign_receipt is not None
             and not had_foreign_receipt
@@ -1144,9 +1145,8 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
             foreign_receipt.unlink(missing_ok=True)
 
     def pause():
-        for key, value in before.items():
-            # Another infrastructure handler may already have refunded this attempt.
-            w.counters.write(key, min(value, w.counters.read(key)))
+        # Another infrastructure handler may already have refunded this attempt.
+        restore_counters(w.counters, before)
         event = blocking_event_since(started) or {}
         raise GitHubUnavailable(
             f"{stage}: GitHub API exhausted — waiting for reset, not charged to the PR", retry_at=event.get("reset")
@@ -1159,8 +1159,7 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
         refund_admission()
         raise
     except GitHubUnavailable as error:
-        for key, value in before.items():
-            w.counters.write(key, min(value, w.counters.read(key)))
+        restore_counters(w.counters, before)
         raise error
     except NoProgress as error:
         # Preserve verification, lease/cache, and other independently typed pauses.

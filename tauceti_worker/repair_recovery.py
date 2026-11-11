@@ -23,6 +23,7 @@ from . import work_recovery as saved
 from .config import log
 from .constants import BASE_BRANCH
 from .runtime_status import atomic_json, read_json, report_runtime
+from .survey import checkpoint_counters, restore_counters
 
 STATES = {"retained", "eligible", "resuming", "verified", "publication-pending", "published", "obsolete", "blocked"}
 TERMINAL = {"published", "obsolete"}
@@ -1392,15 +1393,14 @@ class WorkerBackend:
             "reverify the complete resulting source and publish through the original branch CAS. "
             f"If no safe repair is possible, leave source in the checkout and structured diagnostics under {record / 'diagnostics'}, outside the source tree."
         )
-        before_counts = {key: self.w.counters.read(key) for key in keys}
+        before_counts = checkpoint_counters(self.w.counters, keys)
         before_content = j.get("content_attempts", 0)
         api = None
 
         def refund_content(*, known_no_launch=False):
             if not known_no_launch and ((api is not None and api.launched) or unit_admitted()):
                 return False
-            for key, value in before_counts.items():
-                self.w.counters.write(key, min(value, self.w.counters.read(key)))
+            restore_counters(self.w.counters, before_counts)
             write(record, j, "resuming", content_attempts=before_content, content_started=None)
             return True
 

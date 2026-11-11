@@ -76,6 +76,21 @@ SHARED_ATTEMPT_RE = re.compile(
 UNCHANGED_REVIEW_TTL = 6 * 3600
 
 
+def checkpoint_counters(counters, names) -> dict[str, tuple[int, int]]:
+    take = getattr(counters, "checkpoint", None)
+    return take(names) if take else {name: (counters.read(name), 0) for name in names}
+
+
+def restore_counters(counters, saved: dict[str, tuple[int, int]]) -> None:
+    """Undo the attempts charged since `checkpoint_counters`, leaving a refund already made in place."""
+    restore = getattr(counters, "restore", None)
+    if restore:
+        restore(saved)
+        return
+    for name, (value, _added) in saved.items():
+        counters.write(name, min(value, counters.read(name)))
+
+
 class Counters:
     """Integer files in the worker's state directory.
 
@@ -133,14 +148,33 @@ class Counters:
             return value
         with self._locked():
             stored = self._read(name)
-            change = value - self._seen.get(name, stored)
-            if change < 0:
-                change = -min(-change, stored, self._added.get(name, 0))
+            stored = self._apply(name, stored, value - self._seen.get(name, stored))
+        self._seen[name] = value
+        return stored
+
+    def _apply(self, name: str, stored: int, change: int) -> int:
+        if change < 0:
+            change = -min(-change, stored, self._added.get(name, 0))
+        if change:
             self._added[name] = self._added.get(name, 0) + change
             stored += change
             self._atomic_write(name, str(stored))
-        self._seen[name] = value
         return stored
+
+    def checkpoint(self, names) -> dict[str, tuple[int, int]]:
+        """Each counter's value and this process's net charge to it, for `restore`."""
+        return {name: (self.read(name), self._added.get(name, 0)) for name in names}
+
+    def restore(self, saved: dict[str, tuple[int, int]]) -> None:
+        """Hand back what this process charged since `checkpoint`; a private counter returns to at most
+        its checkpoint value, and a shared one keeps whatever peers charged or refunded meanwhile."""
+        for name, (value, added) in saved.items():
+            if self._store(name) is self.state:
+                self.write(name, min(value, self.read(name)))
+                continue
+            with self._locked():
+                stored = self._apply(name, self._read(name), min(0, added - self._added.get(name, 0)))
+            self._seen[name] = stored
 
     def _atomic_write(self, name: str, text: str) -> None:
         store = self._store(name)

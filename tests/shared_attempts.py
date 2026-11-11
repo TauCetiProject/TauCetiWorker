@@ -193,6 +193,37 @@ class SharedAttemptsTests(unittest.TestCase):
             )
         self.assertEqual(second.read(FIX), 2)
 
+    def test_a_github_pause_refunds_its_charge_when_a_peer_refunds_meanwhile(self):
+        first, second = self.counters("first"), self.counters("second")
+        second.incr(FIX)
+        candidate = SimpleNamespace(pr=7, head=HEAD)
+
+        def interrupted(*_args):
+            first.incr(FIX)
+            second.write(FIX, max(0, second.read(FIX) - 1))
+            raise GitHubUnavailable("paused")
+
+        with (
+            patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": str(self.root / "github")}),
+            self.assertRaises(GitHubUnavailable),
+        ):
+            work_units._run_github_stage(
+                "fix", interrupted, SimpleNamespace(counters=first, cfg=None), None, candidate, None, False
+            )
+        self.assertEqual(second.read(FIX), 0)
+
+    def test_restore_keeps_the_private_arithmetic(self):
+        counters = self.counters("first", shared=False)
+        counters.incr(FIX)
+        saved = survey_mod.checkpoint_counters(counters, (FIX,))
+        counters.incr(FIX)
+        counters.incr(FIX)
+        survey_mod.restore_counters(counters, saved)
+        self.assertEqual(counters.read(FIX), 1)
+        counters.write(FIX, 0)
+        survey_mod.restore_counters(counters, saved)
+        self.assertEqual(counters.read(FIX), 0)
+
     def test_the_outage_refund_allowance_is_shared(self):
         first, second = self.counters("first"), self.counters("second")
         candidate = SimpleNamespace(pr=7, head=HEAD)
