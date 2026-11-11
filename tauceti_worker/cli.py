@@ -994,7 +994,11 @@ def main(argv: list[str] | None = None) -> int:
         raise Die(f"TAUCETI_MAX_OPEN_PRS {error}") from None
 
     if cmd == "_fleet-protocol":
-        print(json.dumps({"version": 1, "admission": True, "events": True, "activity": 1, "roadmap_focus": 1}))
+        print(
+            json.dumps(
+                {"version": 1, "admission": True, "events": True, "activity": 1, "roadmap_focus": 1, "forges": 1}
+            )
+        )
         return 0
     if cmd == "budget":
         try:
