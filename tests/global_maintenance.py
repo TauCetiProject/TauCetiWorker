@@ -8,7 +8,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker.config import ClaimCollision, NoProgress
@@ -535,7 +535,9 @@ class GlobalMaintenance(unittest.TestCase):
             self.run_round(rows)
             (backlog,) = reported(runtime)
             self.assertGreaterEqual(backlog.pop("survey_at"), began)
-            self.assertEqual(backlog, {"mine_open": 3, "mine_awaiting_author": 2, "mine_needs_fix": 3})
+            counts = {"mine_open": 3, "mine_awaiting_author": 2, "mine_needs_fix": 3}
+            self.assertEqual(backlog.pop("backlog_by_forge"), {"github": {**counts, "survey_at": ANY}})
+            self.assertEqual(backlog, counts)
             # A retained snapshot is older than the round, named PRs are a subset of the scope,
             # and a failed survey holds no inventory.
             runtime.reset_mock()

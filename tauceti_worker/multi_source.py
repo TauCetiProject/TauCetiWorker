@@ -160,11 +160,15 @@ def deduplicate(observations):
 def run_round(w, opts, *, use_fleet_focus=True):
     import os
 
-    from .work_units import NoEligibleWork, want
+    from .work_units import NoEligibleWork, backlog_current, publish_backlog, want
     from .work_units import run_round as ordinary_round
 
     observations = collect(w, opts, use_fleet_focus=use_fleet_focus)
     deduplicate(observations)
+    if not opts.prs and not any(getattr(value, "_round_scope", (False, False))[1] for _, _, value in observations):
+        current = {name: value for name, worker, value in observations if worker is not None and backlog_current(value)}
+        if current:
+            publish_backlog(current, complete=len(current) == len(observations))
     for name, _, result in observations:
         if result.github_failed or result.dependency_wait:
             log(f"{name}: unavailable; " + "; ".join(result.errors))

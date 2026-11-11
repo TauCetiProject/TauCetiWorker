@@ -603,7 +603,7 @@ the path to its logfile. That is what `tauceti workers status` and the
 dashboard's workers view read.
 
 After each survey of its configured roadmap scope, a worker also records its
-GitHub account's backlog in that file, where `workers status --json` shows it:
+accounts' backlog in that file, where `workers status --json` shows it:
 
 | Field | Value |
 | --- | --- |
@@ -611,11 +611,19 @@ GitHub account's backlog in that file, where `workers status --json` shows it:
 | `mine_awaiting_author` | The account's non-draft PRs in that scope labelled `awaiting-author` |
 | `mine_needs_fix` | Those labelled `awaiting-author` or `ci-failed`, each PR counted once |
 | `survey_at` | When that survey ran, in seconds since the epoch |
+| `backlog_by_forge` | The same four fields for each forge, keyed `github` or `forgejo` |
 
-The counts come from the inventory the survey already holds and cost no GitHub
-request. A round that surveys named PRs or a Fleet focus area, or that reads a
-retained snapshot while shared GitHub state is unavailable, leaves all four
-fields as they were, so `survey_at` gives their age. Each managed start resets
+The counts come from the inventory the survey already holds and cost no forge
+request. On Forgejo they count the PRs the worker's Forgejo account authored,
+with labels read from Forgejo. A worker that reads both forges publishes the sum
+of the two accounts' counts as the totals, the same sum its authoring limit uses,
+and only when both forges were surveyed in that round; while one forge is
+unavailable, only the other's entry in `backlog_by_forge` is updated. Anonymous
+Forgejo discovery has no account and publishes nothing.
+
+A round that surveys named PRs or a Fleet focus area, or that reads a retained
+snapshot while shared GitHub state is unavailable, leaves all these fields as
+they were, so each `survey_at` gives its counts' age. Each managed start resets
 them to `null` until that start's first such survey, so they never describe an
 account or scope the worker had before.
 

@@ -516,6 +516,7 @@ worker3 — backing off
     # A backlog surveyed under an earlier configuration of this worker ID describes another account
     # or scope; the new start must not publish it beside the new account.
     backlog = {"mine_open": 42, "mine_awaiting_author": 7, "mine_needs_fix": 11, "survey_at": time.time()}
+    backlog["backlog_by_forge"] = {"github": dict(backlog)}
     wm.status_path(probe_spec.id, probe_state).write_text(
         json.dumps({"github_account": "previous", "spec_hash": "previous", **backlog})
     )
