@@ -1303,6 +1303,7 @@ def prompt_context(
         artifacts_reason=(artifacts or {}).get("unavailable_reason") if cold else None,
         check_findings_known=known_check_failures(task),
         worker_verifies=worker_verifies and not cold,
+        staging_checks=repair_audit.staging_checks(task),
         listings_path=listings,
         shell_limit=shell_limit,
         pre_rebased=pre_rebased(task) is not None,
@@ -1795,6 +1796,7 @@ def delivery_identity(cfg: RunnerConfig, task: Task, tip: str) -> dict:
         "tip": tip,
         "base": task.validation_base,
         "audits": cfg.worker_audits,
+        "full_checks": cfg.worker_audits and not repair_audit.staging_checks(task),
         "lake": list(cfg.lake),
         "checker": hashlib.sha256(
             Path(repair_audit.__file__).read_bytes() + Path(repair_sandbox.__file__).read_bytes()
@@ -1944,6 +1946,10 @@ def _run_task(
     """
     require_task_execution(cfg=cfg, task=task)
     state_dir = cfg.tasks_dir / task.task_id
+    staging_checks = repair_audit.staging_checks(task)
+    if staging_checks and cfg.publish.when == "before":
+        # Reuse the existing asynchronous publisher so staging setup overlaps the upload.
+        cfg = dataclasses.replace(cfg, publish=dataclasses.replace(cfg.publish, when="after"))
     logdir = state_dir / "logs"
     state = resume_state or TaskState(state_dir, task)
     pending_delivery = state.record.get("delivery") if state.state in IN_FLIGHT_STATES else None
@@ -2160,7 +2166,12 @@ def _run_task(
         )
         if cfg.worker_audits:
             repair_audit.write_settings(
-                worktree, base=task.validation_base, tools_root=tools_root, lake=tuple(cfg.lake), logdir=logdir
+                worktree,
+                base=task.validation_base,
+                tools_root=tools_root,
+                lake=tuple(cfg.lake),
+                logdir=logdir,
+                checks_owner="staging" if staging_checks else "worker",
             )
         if streaming and (outcome.get("artifacts") or {}).get("available"):
             stream = repair_stream.start_build(
@@ -2182,7 +2193,7 @@ def _run_task(
                     lake=tuple(cfg.lake),
                     timeout=cfg.build_timeout,
                 )
-                if cfg.worker_audits
+                if cfg.worker_audits and not staging_checks
                 else None,
             )
             if not stream.wait_for_agent(cancel):
@@ -2384,14 +2395,15 @@ def _run_task(
                     log(f"attempt {attempt} not acceptable; retrying once with the report")
                     continue
                 return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
-            verified = (outcome.get("parallel") or {}).get(
-                "verified_tip"
-            ) == tip or pending_delivery == delivery_identity(cfg, task, tip)
+            parallel = outcome.get("parallel") or {}
+            verified = (
+                parallel.get("verified_tip") == tip and (staging_checks or "checks" in parallel)
+            ) or pending_delivery == delivery_identity(cfg, task, tip)
             artifacts_cold = bool((outcome.get("artifacts") or state.record.get("artifacts") or {}).get("cold"))
             if cfg.worker_audits and (not artifacts_cold or continuation) and not verified:
                 outcome.pop("repair_checkpoint", None)
-                # The worker's own verdict before anything is submitted: the whole-library build, then CI's
-                # audits and full-library lint. A finding goes back to the agent as a diagnostic.
+                # Compile the final chain and capture its native output map. New tasks
+                # leave full checks to staging; older tasks retain their assigned checks.
                 state.write("verifying", attempt=attempt, tip=tip)
                 verification = repair_audit.verify(
                     worktree,
@@ -2401,6 +2413,7 @@ def _run_task(
                     logdir=logdir,
                     lake=tuple(cfg.lake),
                     timeout=cfg.build_timeout,
+                    audits=not staging_checks,
                 )
                 outcome.setdefault("verification", []).append(
                     {k: v for k, v in verification.items() if k != "diagnostics"}
@@ -2491,11 +2504,24 @@ def _run_task(
             if task.kind == "pre_rebase":
                 for result in reversed(outcome.get("verification", [])):
                     checks = result.get("checks") or {}
-                    if result.get("tip") == tip and result.get("ok") is True and checks.get("status") == "passed":
+                    build_only = staging_checks and result.get("build", {}).get("rc") == 0
+                    if (
+                        result.get("tip") == tip
+                        and result.get("ok") is True
+                        and (build_only or checks.get("status") == "passed")
+                    ):
+                        tools = checks.get("tools")
+                        if build_only:
+                            try:
+                                repo, ref = repair_audit.tools_pin(worktree)
+                                tools = f"{repo}@{ref}"
+                            except repair_audit.Unavailable:
+                                break
                         notes["pre_rebase_verification"] = {
                             "tip": tip,
                             "base": task.validation_base,
-                            "tools": checks.get("tools"),
+                            "tools": tools,
+                            "scope": "build" if build_only else "full",
                         }
                         break
             if task.kind == "prepare":

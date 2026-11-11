@@ -1327,7 +1327,8 @@ class PreRebase(ControllerCase):
         )
         task = agent.claim(self.controller)
         tip = agent.produce(task)
-        evidence = {"tip": tip, "base": task.onto, "tools": f"org/Tools@{ref}"}
+        self.assertEqual(task.extra["checks_owner"], "staging")
+        evidence = {"tip": tip, "base": task.onto, "tools": f"org/Tools@{ref}", "scope": "build"}
         row = self.controller.store.row("tasks", {"id": task.task_id})
         for stale in ({"tip": task.tip}, {"base": task.base}, {"tools": "org/Tools@" + "b" * 40}):
             notes = json.dumps({"pre_rebase_verification": dict(evidence, **stale)})

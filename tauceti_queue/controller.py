@@ -2249,7 +2249,11 @@ class Controller:
                 )
             )
         refs = [self.batch_ref(batch["id"], task["batch_version"])] + [m.retained_ref for m in members]
-        extra: dict[str, Any] = {"canonical_branch": self.canonical_branch, "claim_id": claim_id}
+        extra: dict[str, Any] = {
+            "canonical_branch": self.canonical_branch,
+            "claim_id": claim_id,
+            "checks_owner": "staging",
+        }
         warm_revs = self._warm_revs(task, batch)
         if self._can_checkpoint_repair(task):
             extra["can_checkpoint_repair"] = True
