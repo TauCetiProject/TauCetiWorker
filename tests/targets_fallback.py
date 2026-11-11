@@ -3,6 +3,7 @@
 its cap file, the count of pull requests outside the list, the per-host slots, the round and the
 wiring, without GitHub or model access."""
 
+import contextlib
 import importlib
 import json
 import os
@@ -13,6 +14,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from tauceti_tools.forge import Forge, PrincipalRef, RepositoryRef
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 import tauceti_worker as tc
@@ -21,6 +24,7 @@ from tauceti_worker import targets_fallback as tf
 from tauceti_worker import worker_manager as wm
 
 work = importlib.import_module("tauceti_worker.work_units")
+FORGE = Forge("forgejo", "https://git.example.org")
 LIST = """<!-- tauceti-targets:v1 -->
 ## Algebra
 - [x] `a` — landed
@@ -36,8 +40,9 @@ def marker(area, slug):
     return f"<!--tauceti-target:v1 {json.dumps({'focus': area, 'id': slug})}-->"
 
 
-def pr(number, body="", login="alice", draft=False):
-    return {"number": number, "body": body, "author": {"login": login}, "isDraft": draft}
+def pr(number, body="", login="alice", draft=False, actor=None):
+    author = {"login": login} if actor is None else {"login": login, "id": f"{FORGE.key}/users/{actor}"}
+    return {"number": number, "body": body, "author": author, "isDraft": draft}
 
 
 def github(*open_prs, merged_prs=lambda search, limit: []):
@@ -84,7 +89,8 @@ class Count(unittest.TestCase):
             pr(6, draft=True),
             {"number": 7, "body": None, "author": None},
         )
-        self.assertEqual(tf.outside_list(t.parse_targets(LIST), gh, "alice"), [1, 3])
+        alice = lambda author: (author or {}).get("login") == "alice"  # noqa: E731
+        self.assertEqual(tf.outside_list(t.parse_targets(LIST), gh.open_prs(), alice), [1, 3])
 
 
 class Slots(unittest.TestCase):
@@ -231,6 +237,83 @@ class Round(unittest.TestCase):
         self.assertIn("Your target is assigned: `c` in `Topology`", self.author("Topology", gh=github(pr(1), pr(3))))
         self.assertEqual((self.runtime()["roadmap_work"], self.runtime()["roadmap_target"]), ("list", "Topology/c"))
         self.assertFalse(self.slots.exists())
+
+
+def forgejo_source(*open_prs, actor=2):
+    """A ForgejoWorkerSource over a mocked native API, as upstream's Forgejo tests build one, acting as
+    `alice` (native id `actor`)."""
+    from tauceti_tools.ci_candidate import RepositoryIdentity
+
+    from tauceti_worker.forgejo_worker import ForgejoWorkerSource
+    from tauceti_worker.source_identity import SourceActor
+
+    repo = RepositoryRef(FORGE, "one/project")
+    api = Mock(forge=FORGE, _token="fixture-token", max_bytes=1024 * 1024, max_pages=100)
+    api.pulls.return_value = []
+    api.pages.side_effect = lambda *a, **k: iter([])
+    source = ForgejoWorkerSource(RepositoryIdentity(repo, 7), api, token_file=None)
+    source.open_prs = Mock(return_value=list(open_prs))
+    source.authenticated_actor = Mock(return_value=SourceActor(PrincipalRef(FORGE, str(actor)), "alice"))
+    return source
+
+
+class ForgejoRound(unittest.TestCase):
+    """New pull requests go to Forgejo, alone and beside GitHub, or to GitHub beside Forgejo."""
+
+    runtime = Round.runtime
+
+    def setUp(self):
+        Round.setUp(self)
+        self.forgejo = forgejo_source(pr(1, actor=2), pr(2, marker("Topology", "c"), actor=2), pr(5, actor=3))
+        self.sv = SimpleNamespace(me_login="alice")
+        self.forgejo_slots = self.tmp / "shared" / "targets-fallback" / "forgejo:git.example.org" / "alice"
+        for item in (
+            patch("tauceti_worker.worker_sources.current", return_value=self.forgejo),
+            patch("tauceti_worker.worker_sources.shared_github_environment", contextlib.nullcontext),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
+
+    def author_on(self, gh, others=(), wid="worker3"):
+        cfg = SimpleNamespace(state=self.tmp, wid=wid, checkout=self.tmp / "checkout", logdir=self.tmp / "logs")
+        rc = SimpleNamespace(add_cleanup=self.cleanups.append)
+        w = SimpleNamespace(cfg=cfg, gh=gh, claims=self.claims, rc=rc, target_sources=list(others))
+        opts = SimpleNamespace(agent_name="Claude Code", work_model="claude", source=None)
+        work.do_roadmap(w, self.sv, SimpleNamespace(reason="Algebra", pr=0, head=""), opts, bubble=False)
+        return self.prompts[-1]
+
+    def test_a_forgejo_only_worker_authors_outside_the_list(self):
+        with patch.object(tf, "me", side_effect=AssertionError("GitHub identity")), patch.object(tf, "log") as log:
+            prompt = self.author_on(self.forgejo)
+        self.assertNotIn("Your target is assigned", prompt)
+        self.assertIn("(1 open outside it, cutoff 2)", log.call_args.args[0])
+        self.assertEqual(self.runtime()["roadmap_work"], "outside-list")
+        self.assertEqual(len(list(self.forgejo_slots.glob("worker3.*.slot"))), 1)
+        self.assertFalse(self.slots.exists())
+        with self.assertRaisesRegex(tc.NoProgress, r"\(1 open outside it \+ 1 being authored, cutoff 2\)$"):
+            self.author_on(self.forgejo, wid="worker4")
+
+    def test_a_mixed_worker_counts_both_forges(self):
+        github_side = github(pr(7), pr(8, login="bob"))
+        with self.assertRaisesRegex(tc.NoProgress, r"either \(2 open outside it, cutoff 2\)$"):
+            self.author_on(self.forgejo, [github_side])
+        os.environ["TAUCETI_TARGETS_FALLBACK_MAX_OPEN"] = "3"
+        self.author_on(self.forgejo, [github_side])
+        self.assertEqual(len(list(self.forgejo_slots.glob("*.slot"))), 1)
+        with patch("tauceti_worker.worker_sources.current", return_value=None):
+            self.author_on(github_side, [self.forgejo])
+        self.assertEqual(len(list(self.slots.glob("*.slot"))), 1)
+        self.assertEqual(len(self.prompts), 2)
+
+    def test_an_unreadable_forgejo_account_authors_nothing(self):
+        self.forgejo.authenticated_actor.return_value = None
+        with self.assertRaisesRegex(tc.NoProgress, NOTHING + r"; cannot count .* account of https://git"):
+            self.author_on(self.forgejo)
+        self.forgejo.authenticated_actor.return_value = Mock()
+        self.forgejo.open_prs.side_effect = [[], None]
+        with self.assertRaisesRegex(tc.NoProgress, NOTHING + r"; cannot count .*open pull requests are unavailable"):
+            self.author_on(self.forgejo)
+        self.assertEqual(self.prompts, [])
 
 
 class Wiring(unittest.TestCase):

@@ -117,12 +117,16 @@ list.
 Such a round runs only while these two together number fewer than N:
 
 - the account's open, non-draft pull requests whose body carries no target
-  marker naming an item of the list, whoever opened them, plus
-- the rounds on this host that are authoring outside the list now. Each holds a
-  slot, a locked file under `targets-fallback/<login>/` in
-  `TAUCETI_GITHUB_SHARED_DIR`, from this check until it ends, so workers that
-  reach the check together do not all pass it. A worker on another host is
-  counted once its pull request is open.
+  marker naming an item of the list, whoever opened them. A worker with a
+  Forgejo source counts them on every source the round reads: on GitHub by its
+  login, on Forgejo by the account its token authenticates as. Plus
+- the rounds on this host that are authoring outside the list now, on the same
+  forge as the same account. Each holds a slot, a locked file in
+  `TAUCETI_GITHUB_SHARED_DIR` under `targets-fallback/<login>/` for GitHub and
+  `targets-fallback/forgejo:<host>/<login>/` for Forgejo, from this check until
+  it ends, so workers that reach the check together do not all pass it. A
+  worker on another host, or authoring on the other forge, is counted once its
+  pull request is open.
 
 `--targets-fallback-cap-file FILE` (`TAUCETI_TARGETS_FALLBACK_CAP_FILE`,
 `targets_fallback_cap_file`) names a file holding one non-negative integer. A
@@ -133,8 +137,8 @@ round logs why. The file does nothing without `--targets-fallback-max-open`.
 
 When there is no room, or the open pull requests cannot be counted, the round
 ends without progress, giving the list's reason and this one. The check costs
-one more read of the open pull request listing, which workers share, and takes
-no claim. `--max-open-prs` still stops every roadmap round, list or not, before
+one more read of each source's open pull request listing, and on Forgejo one
+read of the token's account, and takes no claim. `--max-open-prs` still stops every roadmap round, list or not, before
 any of this.
 
 ## What the agent sees
