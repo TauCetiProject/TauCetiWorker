@@ -13,6 +13,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from fixtures.review_runtime_stub import install_runtime_stub
+install_runtime_stub()
+
 from tauceti_worker import github_state as state
 from tauceti_worker import github_transport as transport
 from tauceti_worker import review_diagnostics as diagnostics
@@ -35,7 +38,7 @@ class StateRepair(unittest.TestCase):
         self.w = SimpleNamespace(
             cfg=self.cfg,
             counters=self.counters,
-            gh=SimpleNamespace(),
+            gh=SimpleNamespace(repo=TAUCETI),
             claims=None,
             rs=SimpleNamespace(bust=Mock(), review_rounds=lambda *_: 1),
         )

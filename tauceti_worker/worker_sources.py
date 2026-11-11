@@ -179,7 +179,7 @@ def activate(source, cfg):
             "#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' -m tauceti_worker.source_claims "$@"\n'
         )
         claim_wrapper.chmod(0o700)
-        env = scoped_git_environment(source.repository.forge, source.api._token)
+        env = scoped_git_environment(source.repository.forge, source.api._token, purpose="workspace")
         profile = source.api.request("GET", "user")
         if profile.get("id") != int(actor.principal.native_id):
             raise SourceUnavailable("native commit author changed")
@@ -225,7 +225,7 @@ def activate(source, cfg):
 
 
 @contextlib.contextmanager
-def shared_github_environment():
+def shared_github_environment(*, required=True):
     """Use existing GitHub credentials only for shared GitHub coordination/tools."""
     import subprocess
 
@@ -234,15 +234,30 @@ def shared_github_environment():
     gh = os.environ.get("TAUCETI_REAL_GH") or shutil.which("gh")
     if not gh:
         raise SourceUnavailable("shared GitHub credentials unavailable")
-    credential = subprocess.run([gh, "auth", "token", "--hostname", "github.com"], capture_output=True, text=True)
-    if credential.returncode or not credential.stdout.strip():
-        raise SourceUnavailable("shared GitHub credentials unavailable")
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        credential = subprocess.run([gh, "auth", "token", "--hostname", "github.com"], capture_output=True, text=True)
+        if (credential.returncode or not credential.stdout.strip()) and required:
+            raise SourceUnavailable("shared GitHub credentials unavailable")
+        token = credential.stdout.strip() if credential.returncode == 0 else ""
     original = dict(os.environ)
     marker = _selected.set(None)
     try:
-        env = scoped_git_environment(GITHUB, credential.stdout.strip())
+        env = (
+            scoped_git_environment(GITHUB, token, purpose="workspace")
+            if token
+            else {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_NO_LAZY_FETCH": "0",
+            }
+        )
         for key in list(os.environ):
-            if key.startswith("GIT_CONFIG_") or key in ("TAUCETI_SOURCE_BINDING", "GH_REPO", "TAUCETI_CLAIM_SH"):
+            if key.startswith(("GIT_CONFIG_", "TAUCETI_SOURCE_", "TAUCETI_FORGEJO_")) or key in (
+                "GH_REPO",
+                "TAUCETI_CLAIM_SH",
+            ):
                 os.environ.pop(key, None)
         os.environ.update(env)
         # The real GitHub CLI must also be used by subprocesses.

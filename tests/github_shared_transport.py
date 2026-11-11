@@ -14,6 +14,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from fixtures.review_runtime_stub import install_runtime_stub
+install_runtime_stub()
+
 from tauceti_worker import github_transport as tr
 
 for kind in ("code", "commits", "issues", "prs", "repos"):
@@ -366,7 +369,7 @@ gh: API rate limit exceeded
         cfg=SimpleNamespace(state=Path(tmp), logdir=Path(tmp), store_dir=Path(tmp), wid="test"),
         counters=counters,
         rs=SimpleNamespace(review_rounds=lambda *a: 0),
-        gh=SimpleNamespace(),
+        gh=SimpleNamespace(repo="TauCetiProject/TauCeti"),
     )
     candidate = SimpleNamespace(pr=7, head="abc", contest=None, contest_reply_id=None, rebase_budget_key="rebase-pr-7")
 

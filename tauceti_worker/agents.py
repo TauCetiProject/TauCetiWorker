@@ -2852,26 +2852,10 @@ def _review_in_bubble(
     cross-repo `gh api` for its own rev. TAUCETI_REVIEW_ENGINE_DIR pins a local engine checkout
     (operator override / pre-merge testing); otherwise a shallow REVIEW clone is staged."""
     cfg = w.cfg
-    eng = os.environ.get("TAUCETI_REVIEW_ENGINE_DIR")
-    engine_dir = Path(eng) if eng else (cfg.state / "refs" / "review-engine")
-    if not eng:
-        ref = os.environ.get("TAUCETI_REVIEW_REF")
-        if ref:
-            engine_dir = cfg.state / "refs" / f"review-engine-{ref}"
-            current = subprocess.run(
-                ["git", "-C", str(engine_dir), "rev-parse", "HEAD"], capture_output=True, text=True
-            )
-            if current.returncode or current.stdout.strip() != ref:
-                engine_dir.mkdir(parents=True, exist_ok=True)
-                commands = (
-                    ["git", "init", "-q", str(engine_dir)],
-                    ["git", "-C", str(engine_dir), "fetch", "--depth", "1", f"https://github.com/{REVIEW}", ref],
-                    ["git", "-C", str(engine_dir), "checkout", "--detach", "FETCH_HEAD"],
-                )
-                if any(subprocess.run(command, timeout=120).returncode for command in commands):
-                    raise Die(f"fetch pinned {REVIEW}@{ref} failed")
-        elif not fetch_ref(REVIEW, engine_dir):
-            raise Die(f"fetch {REVIEW} failed")
+    from .review_runtime import resolve
+
+    runtime = getattr(w, "review_runtime", None) or resolve(cfg)
+    engine_dir = runtime.directory
     roadmap_dir = cfg.state / "refs" / "roadmap"
     if not fetch_ref(ROADMAP, roadmap_dir):
         raise Die(f"fetch {ROADMAP} failed")

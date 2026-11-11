@@ -76,8 +76,11 @@ agents.me = lambda: "tester"  # no gh call
 agents._review_mathlib_source = lambda cfg, head: None  # no dependency in this fixture
 
 tmp = Path(tempfile.mkdtemp())
+(tmp / "engine/runner").mkdir(parents=True)
+(tmp / "engine/runner/cli.py").touch()
+(tmp / "engine/rubrics").mkdir()
 os.environ["TAUCETI_REVIEW_ENGINE_DIR"] = str(tmp / "engine")  # skip the engine fetch
-w = types.SimpleNamespace(cfg=types.SimpleNamespace(state=tmp / "state", store_dir=tmp / "store"))
+w = types.SimpleNamespace(gh=types.SimpleNamespace(repo="TauCetiProject/TauCeti"), cfg=types.SimpleNamespace(state=tmp / "state", store_dir=tmp / "store"))
 opts = types.SimpleNamespace()
 
 os.environ.pop("TAUCETI_REVIEW_CODEX_MODEL", None)

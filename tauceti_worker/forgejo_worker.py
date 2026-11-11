@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from pathlib import Path
 
 from tauceti_tools.forge import ForgeError, Incomplete, RepositoryRef
@@ -14,6 +13,11 @@ from .forgejo_reads import ForgejoReadSource
 
 class ForgejoWorkerSource(ForgejoReadSource):
     worker_capable = True
+    supports_review_sandbox = False
+
+    @property
+    def review_repository(self):
+        return self.repository.key
 
     def __init__(self, identity, api, *, token_file, cache=None):
         super().__init__(identity.repository, api, cache=cache)
@@ -32,6 +36,18 @@ class ForgejoWorkerSource(ForgejoReadSource):
         ):
             raise Incomplete("the Forgejo worker repository binding changed")
         return row
+
+    def authorize_candidate(self, candidate, *, require_writer=False):
+        if candidate.source_repository != self.repository or candidate.source_repository_id != self.identity.native_id:
+            return False
+        self.validate_binding()
+        if not require_writer:
+            return True
+        actor = self.authenticated_actor()
+        row = self.live_pull(candidate.pr)
+        if row is None:
+            return None
+        return actor is not None and row["user"]["id"] == int(actor.principal.native_id)
 
     def writable_repository(self):
         """Use an explicit writable fork, or authorized same-repository branches."""
@@ -144,56 +160,12 @@ class ForgejoWorkerSource(ForgejoReadSource):
 
     def review_comments(self, number, *, fresh=False):
         def fetch():
-            comments = []
-            for review in self.api.reviews(self.repository, number):
-                rows = self.api.review_comments(self.repository, number, review["id"])
-                for row in rows:
-                    row = dict(row)
-                    row["pull_request_review_id"] = review["id"]
-                    # Forgejo's code comment commit_id names the last change to
-                    # that line. The containing review records the reviewed head.
-                    reviewed_head = review.get("commit_id")
-                    if not isinstance(reviewed_head, str) or not re.fullmatch(r"[0-9a-f]{40}", reviewed_head):
-                        raise Incomplete("native review commit identity unavailable")
-                    row["line_commit_id"] = row.get("commit_id")
-                    row["commit_id"] = reviewed_head
-                    comments.append(row)
+            from tauceti_tools.review_source import review_comments
+
             conversation = self.issue_comments(number, fresh=fresh)
             if conversation is None:
                 raise Incomplete("native review conversation unavailable")
-            for row in conversation:
-                body = row.get("body", "")
-                head = re.search(r"<!--tauceti-source-head:([0-9a-f]{40})-->", body)
-                reply = re.search(r"<!--tauceti-source-reply:root:([1-9][0-9]*)-->", body)
-                if head or reply:
-                    row = dict(row, thread_kind="issue-comment", path="")
-                    if head:
-                        row["commit_id"] = head[1]
-                    if reply:
-                        row["in_reply_to_id"] = int(reply[1])
-                    comments.append(row)
-            for row in comments:
-                reply = re.search(r"<!--tauceti-source-reply:root:([1-9][0-9]*)-->", row.get("body", ""))
-                if reply:
-                    row["in_reply_to_id"] = int(reply[1])
-            roots = [row for row in comments if "<!--tauceti-rubric:" in row.get("body", "")]
-            for row in comments:
-                if row in roots or row.get("in_reply_to_id") or row.get("thread_kind") == "issue-comment":
-                    continue
-                parents = [
-                    root
-                    for root in roots
-                    if root["id"] < row["id"]
-                    and root.get("pull_request_review_id") == row.get("pull_request_review_id")
-                    and root.get("path") == row.get("path")
-                    and root.get("position") == row.get("position")
-                    and root.get("original_position") == row.get("original_position")
-                ]
-                if len(parents) == 1:
-                    row["in_reply_to_id"] = parents[0]["id"]
-                elif parents:
-                    raise Incomplete("ambiguous native review reply parent")
-            return comments
+            return review_comments(self.api, self.repository, number, conversation=conversation)
 
         return self._read("review_comments", [number], fetch, number=number, fresh=fresh)
 

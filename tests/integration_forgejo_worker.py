@@ -20,7 +20,25 @@ from tauceti_tools.ci_candidate import RepositoryIdentity
 from tauceti_worker.config import Config
 from tauceti_worker.forgejo_worker import ForgejoWorkerSource
 from tauceti_worker.review_state import ReviewState
-from tauceti_worker.source_publication import pending, publish, retain_plan
+from tauceti_worker.source_publication import pending
+from runner import cli as review_cli, publication as shared_publication
+
+
+def retain_plan(source, cfg, number, head, path, *, actor_id):
+    assert json.loads(path.read_text())["head_sha"] == head
+    return shared_publication.retain(
+        source.repository.key, number, path, cfg.store, actor=source.repository.forge.key + "/users/" + str(actor_id)
+    )
+
+
+def publish(source, path):
+    value = json.loads(path.read_text())
+    status = shared_publication.publish(source.repository.key, path, Path(value["ledger"]))
+    if status == 0:
+        source.invalidate(value["pr"])
+    return status == 0
+
+
 from tauceti_worker.survey import Counters, survey
 from tauceti_worker.worker_sources import activate, source_config
 
@@ -65,7 +83,13 @@ class NativeWorker(unittest.TestCase):
                     "content": base64.b64encode(b"theorem example_proof : True := trivial\n").decode(),
                 },
             )
-            with activate(source, cfg):
+            with (
+                activate(source, cfg),
+                patch.object(review_cli, "CACHE_DIR", root / "review-cache"),
+                patch.dict(
+                    os.environ, {"TAUCETI_REVIEW_ENGINE_DIR": str(Path(review_cli.__file__).resolve().parent.parent)}
+                ),
+            ):
                 # Exercise an actual worker-authored Git commit and safe push;
                 # API file writes do not verify process-local commit attribution.
                 checkout = root / "author-checkout"
@@ -127,9 +151,10 @@ class NativeWorker(unittest.TestCase):
                 work = cfg.state / "review-work/test"
                 work.mkdir(parents=True)
                 from tauceti_worker.source_claims import lease
-                from tauceti_worker.source_review import prepare
 
-                comparison = prepare(source, pr, head, work)
+                _, base = review_cli.pr_ref_oids(repository.key, pr)
+                comparison = review_cli.merge_base_sha(repository.key, base, head, pr)
+                review_cli.prepare_review_source(repository.key, head, comparison, work)
                 self.assertIsNotNone(comparison)
                 first_claim = lease(source, cfg, f"review/{pr}/{head}")
                 peer_cfg = dataclasses.replace(cfg, wid="other-worker")
@@ -177,6 +202,7 @@ class NativeWorker(unittest.TestCase):
                     "pr": pr,
                     "head": head,
                     "actor_id": actor_id,
+                    "lifecycle": 2,
                     "store": str(cfg.store),
                 }
                 (work / "review-context.json").write_text(json.dumps(context))
