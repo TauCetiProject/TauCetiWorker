@@ -78,28 +78,14 @@ reason_cases = [
     # The states the redesigned Claude reader distinguishes. Each is a HARD block that says what
     # actually happened — "usage unknown" would send an operator looking for the wrong problem.
     (
-        "a reset window awaiting its first request",
-        prov(
-            W("session", None, None, "idle", "window reset; awaiting initialization"),
-            W("weekly", 20.0, 80.0, "under-pace"),
-        ),
-        (False, "session window reset; awaiting initialization"),
+        "idle with weekly over pace is a soft wait",
+        prov(W("session", None, None, "idle", "no active window reported"), W("weekly", 60.0, 40.0, "over-pace")),
+        (True, "weekly ahead of pace, 40% left"),
     ),
     (
-        "a bootstrap request that has been made but not yet reflected",
-        prov(
-            W("session", None, None, "idle", "bootstrap attempted; awaiting fresh usage"),
-            W("weekly", 20.0, 80.0, "under-pace"),
-        ),
-        (False, "session bootstrap attempted; awaiting fresh usage"),
-    ),
-    (
-        "a bootstrap request that failed",
-        prov(
-            W("session", None, None, "idle", "bootstrap failed: claude exited 1"),
-            W("weekly", 20.0, 80.0, "under-pace"),
-        ),
-        (False, "session bootstrap failed: claude exited 1"),
+        "explicit zero-start policy remains hard",
+        prov(W("session", None, None, "idle-blocked", "pace budget stays 0% through 90% of the window")),
+        (False, "session pace budget stays 0% through 90% of the window"),
     ),
     (
         "a window missing from the response",
@@ -134,6 +120,34 @@ for name, p, expected in reason_cases:
     print(f"[{'OK ' if ok else 'XX '}] {name}: got={got} want={expected}")
     fails += not ok
 
+# --- the pace parenthetical explains itself ---------------------------------
+# An operator reads this beside their own usage readout, where every number is used% against elapsed%.
+# Without the elapsed fraction and the word `pace`, the budget looks like a second usage figure that
+# disagrees with theirs. And rounding both sides to whole percents printed a real `used > budget` as
+# `used 8% > 8% budget`: the pair below is over by 0.0017 points, about nine seconds of clock.
+pace_text_cases = [
+    (
+        "the block names how far into the window it is",
+        W("session", 44.0, 61.5, "over-pace", budget=42.2),
+        "session ahead of pace (62% elapsed: used 44% > 42% pace budget), 56% left",
+    ),
+    (
+        "a hair over the budget still reads as over",
+        W("weekly", 8.0, 12.0, "over-pace", budget=7.998347),
+        "weekly ahead of pace (12% elapsed: used 8.000% > 7.998% pace budget), 92% left",
+    ),
+    (
+        "an unmeasurable budget drops the parenthetical rather than inventing one",
+        W("session", 36.0, 23.0, "over-pace"),
+        "session ahead of pace, 64% left",
+    ),
+]
+for name, window, expected in pace_text_cases:
+    got = tc._pace_reason(window)
+    ok = got == expected
+    print(f"[{'OK ' if ok else 'XX '}] {name}: got={got!r} want={expected!r}")
+    fails += not ok
+
 # --- quota_line: glyph + honest reason end-to-end ---------------------------
 soft = {
     "codex": tc.Provider(
@@ -162,15 +176,14 @@ for want in ("[red]✗[/]", "session exhausted"):
 
 # --- loop waiting display: report the immediate pacing bottleneck without changing control --------
 idle_paced = prov(
-    W("session", None, 0.0, "idle", "window reset; awaiting initialization", budget=0.0),
+    W("session", None, None, "idle", "no active window reported"),
     W("weekly", 38.0, 33.0, "over-pace", budget=33.0),
 )
 codex_paced = tc.Provider("codex", False, None, [W("weekly", 32.0, 20.0, "over-pace", budget=20.0)])
-line = tc._wait_quota_line({"codex": codex_paced, "claude": idle_paced})
+line = tc.quota_line({"codex": codex_paced, "claude": idle_paced})
 for want in (
     "claude [yellow]~[/]",
-    "weekly ahead of pace (used 38% > 33% budget), 62% left",
-    "session window reset — initialization deferred until pacing permits",
+    "weekly ahead of pace (33% elapsed: used 38% > 33% pace budget), 62% left",
 ):
     ok = want in line
     print(f"[{'OK ' if ok else 'XX '}] wait line contains {want!r}: {line!r}")
@@ -179,19 +192,16 @@ for want in (
 # The yellow display is descriptive only: launch control must continue treating the unopened session
 # as a hard block, so --ignore-quota cannot accidentally run a full round through it.
 got = tc._ignore_quota_verdict(None, idle_paced)
-ok = got == "wait"
-print(f"[{'OK ' if ok else 'XX '}] idle+pacing display leaves control hard: got={got!r} want='wait'")
+ok = got == "over-pace"
+print(f"[{'OK ' if ok else 'XX '}] idle+pacing has one soft verdict: got={got!r} want='over-pace'")
 fails += not ok
 
 idle_at_budget = prov(
-    W("session", None, 0.0, "idle", "window reset; awaiting initialization", budget=0.0),
+    W("session", None, None, "idle", "no active window reported"),
     W("weekly", 33.0, 33.0, "at-budget", budget=33.0),
 )
-line = tc._wait_quota_line({"claude": idle_at_budget})
-for want in (
-    "weekly at budget (used 33% = 33% budget), 67% left",
-    "session window reset — initialization deferred until pacing permits",
-):
+line = tc.quota_line({"claude": idle_at_budget})
+for want in ("weekly at budget (33% elapsed: used 33% = 33% pace budget), 67% left",):
     ok = want in line
     print(f"[{'OK ' if ok else 'XX '}] at-budget wait line contains {want!r}: {line!r}")
     fails += not ok
@@ -202,7 +212,7 @@ malformed_and_paced = prov(
     W("weekly", 38.0, 33.0, "over-pace", budget=33.0),
 )
 plain = tc.quota_line({"claude": malformed_and_paced})
-displayed = tc._wait_quota_line({"claude": malformed_and_paced})
+displayed = tc.quota_line({"claude": malformed_and_paced})
 ok = displayed == plain and "[red]✗[/]" in displayed
 print(f"[{'OK ' if ok else 'XX '}] genuine hard failure is unchanged: {displayed!r}")
 fails += not ok
@@ -224,8 +234,8 @@ for label, snap in (
     print(f"[{'OK ' if ok else 'XX '}] quota_line {label} drops only the glyph wrapper: {bare!r}")
     fails += not ok
 
-bare_wait = tc._wait_quota_line({"codex": codex_paced, "claude": idle_paced}, markup=False)
-for want in ("claude ~ (", "codex ~ (", "session window reset — initialization deferred until pacing permits"):
+bare_wait = tc.quota_line({"codex": codex_paced, "claude": idle_paced}, markup=False)
+for want in ("claude ~ (", "codex ~ ("):
     ok = want in bare_wait
     print(f"[{'OK ' if ok else 'XX '}] plain wait line contains {want!r}: {bare_wait!r}")
     fails += not ok

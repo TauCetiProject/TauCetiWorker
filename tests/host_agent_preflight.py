@@ -11,6 +11,7 @@ raises before any stage work. Exit 0 = every case agrees; 1 = a mismatch.
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -59,6 +60,7 @@ tc.agents.CLAUDE_CMD = _saved_cmd
 
 # --- dispatch() preflight -----------------------------------------------------------------------
 CAND = tc.Candidate(726, "deadbeef", "test")
+WORKER = SimpleNamespace(counters=SimpleNamespace(read=lambda key: 0, write=lambda *args: None))
 
 
 def opts(work_model="codex", sandbox_host=True):
@@ -98,6 +100,9 @@ try:
     # 1) host + binary MISSING -> pause as NoProgress, do NOT run the stage (no per-PR counter bump).
     wu._bubble = lambda stage, o: False
     wu.shutil.which = lambda name: None
+    # The pre-launch re-read of the candidate is a separate concern (see dispatch_revalidation); these
+    # cases pass no Worker at all because the PATH check is what they are about.
+    wu._still_actionable = lambda *a: True
     reset()
     raised, msg = False, ""
     try:
@@ -122,7 +127,7 @@ try:
     # 2) host + binary PRESENT -> proceeds to the stage, no warning.
     wu.shutil.which = lambda name: f"/usr/bin/{name}"
     reset()
-    rc = wu.dispatch("review", None, None, CAND, opts())
+    rc = wu.dispatch("review", WORKER, None, CAND, opts())
     check("present codex -> stage runs", runs["n"], 1)
     check("present codex -> rc from stage", rc, 0)
     check("present codex -> no red warning", len(warns), 0)
@@ -132,7 +137,7 @@ try:
     wu._bubble = lambda stage, o: True
     wu.shutil.which = lambda name: None
     reset()
-    rc = wu.dispatch("review", None, None, CAND, opts(sandbox_host=False))
+    rc = wu.dispatch("review", WORKER, None, CAND, opts(sandbox_host=False))
     check("bubble -> host preflight skipped, stage runs", runs["n"], 1)
     check("bubble -> no red warning", len(warns), 0)
 

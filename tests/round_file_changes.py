@@ -21,11 +21,15 @@ Pinned here:
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import contextlib
+import json
+import os
 import subprocess
 import sys
 import tempfile
 import types
 from pathlib import Path
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -73,6 +77,242 @@ def main():
         root = Path(tmp)
         repo = fresh_repo(root)
         head = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+        candidate = tc.Candidate(1, head)
+        cfg = types.SimpleNamespace(checkout=repo)
+        check(
+            "an unchanged candidate can yield to other work",
+            tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+        )
+        check(
+            "roadmap work is never discarded as a declined PR",
+            not tc.work_units._candidate_checkout_unchanged(cfg, tc.Candidate(0, head)),
+        )
+        (repo / "unpublished.txt").write_text("retained work\n")
+        check(
+            "uncommitted work prevents declining the candidate",
+            not tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+        )
+        git(repo, "add", "unpublished.txt")
+        git(repo, "commit", "-qm", "retained publication")
+        check(
+            "unpublished commits prevent declining the candidate",
+            not tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+        )
+        git(repo, "reset", "--hard", head)
+
+        # Exercise the actual dispatch/cascade: a paid no-change fix consumes
+        # its target allowance but does not stop another actionable PR.
+        cfg.wid, cfg.logdir, cfg.state = "test", root / "logs", root / "state"
+        counts, attempts = {}, []
+        counters = types.SimpleNamespace(
+            read=lambda key: counts.get(key, 0),
+            write=lambda key, value: counts.__setitem__(key, value),
+        )
+        worker = types.SimpleNamespace(cfg=cfg, counters=counters, gh=None, rs=None)
+        survey = tc.Survey(worker_id="test")
+        survey.needs_fix.actionable = [candidate, tc.Candidate(2, head)]
+        opts = tc.RoundOpts(only=["fix"], agent="claude", work_model="claude", sandbox_host=True, dry_run=False)
+
+        def fake_fix(_w, _sv, c, _opts, _bubble):
+            attempts.append(c.pr)
+            key = f"fix-{c.pr}-{c.head[:12]}"
+            counters.write(key, counters.read(key) + 1)
+            return 0
+
+        with (
+            patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": str(root / "shared")}),
+            patch.object(tc.work_units, "mirror_creds"),
+            patch.object(tc.work_units, "survey", return_value=survey),
+            patch.object(tc.work_units, "spread_candidates", side_effect=lambda cs: cs),
+            patch.object(tc.work_units, "_still_actionable", return_value=True),
+            patch.object(tc.work_units, "_host_agent_binary", return_value="python3"),
+            patch.object(tc.work_units, "_progress_snapshot", return_value={}),
+            patch.object(tc.work_units, "_progressed", side_effect=lambda _w, c, _pre: c.pr == 2),
+            patch.object(tc.work_units, "do_fix", side_effect=fake_fix),
+            patch("tauceti_worker.github_transport.observed_budget", return_value={}),
+            patch("tauceti_worker.claude_api.api_mode", return_value=False),
+            patch("tauceti_worker.claude_api.api_context", side_effect=lambda *_a, **_k: contextlib.nullcontext()),
+        ):
+            check(
+                "no-change target falls through to another actionable target",
+                tc.work_units.run_round(worker, opts) == 0 and attempts == [1, 2],
+            )
+            check("the no-change target attempt stays charged", counters.read(f"fix-1-{head[:12]}") == 1)
+            # Retain unfinished local edits instead of switching checkouts.
+            (repo / "retained.txt").write_text("unfinished\n")
+            try:
+                tc.work_units.dispatch("fix", worker, survey, candidate, opts)
+            except tc.NoProgress:
+                check("unpublished edits retain the recovery path", True)
+            else:
+                check("unpublished edits retain the recovery path", False)
+            (repo / "retained.txt").unlink()
+            from tauceti_worker.github_outbox import directory
+
+            pending = directory() / "retained.json"
+            pending.parent.mkdir(parents=True, exist_ok=True)
+            pending.write_text("{}")
+            check(
+                "pending publications prevent declining the candidate",
+                not tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+            )
+            pending.unlink()
+            # A roadmap-fork intent has no unpublished work for this PR. It
+            # must not strand a clean maintenance checkout in global backoff.
+            pending.write_text(json.dumps({"argv": ["repo", "fork", "TauCetiProject/TauCetiRoadmap"]}))
+            check(
+                "unrelated publication permits other PR work",
+                tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+            )
+            pending.write_text(json.dumps({"argv": ["pr", "comment", "1", "--repo", "TauCetiProject/TauCeti"]}))
+            check(
+                "same-PR publication retains its recovery path",
+                not tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+            )
+            pending.write_text(json.dumps({"argv": ["pr", "comment", "2", "--repo", "TauCetiProject/TauCeti"]}))
+            check(
+                "another PR publication does not stall this checkout",
+                tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+            )
+            pending.write_text(json.dumps({"argv": ["pr", "comment", "--body", "pending"], "context": {"pr": "1"}}))
+            check(
+                "same-PR branch-relative publication is retained",
+                not tc.work_units._candidate_checkout_unchanged(cfg, candidate),
+            )
+            pending.unlink()
+
+        # Closing a superseded PR is progress even without a push/comment;
+        # a stale merged/closed snapshot is not a new state transition.
+        for before, after, expected in (
+            ("OPEN", "CLOSED", True),
+            ("OPEN", "MERGED", True),
+            ("OPEN", "OPEN", False),
+            ("CLOSED", "CLOSED", False),
+        ):
+            gh = types.SimpleNamespace(
+                pr_progress_state=lambda _, after=after: {"head": head, "ncomments": 0, "state": after}
+            )
+            pre = {"head": head, "ncomments": 0, "state": before}
+            with patch.object(tc.work_units, "_round_mutated", return_value="closure" if expected else None):
+                check(
+                    "PR transition " + before + " -> " + after,
+                    tc.work_units._progressed_direct(types.SimpleNamespace(gh=gh), candidate, pre) == expected,
+                )
+
+        for state, changed_head, expected in (("OPEN", head, False), ("CLOSED", head, True), ("OPEN", "b" * 40, True)):
+            gh = types.SimpleNamespace(
+                pr_progress_state=lambda _, state=state, changed_head=changed_head: {
+                    "head": changed_head,
+                    "ncomments": 1,
+                    "state": state,
+                }
+            )
+            pre = {"head": head, "ncomments": 0, "state": "OPEN", "require_push": True}
+            if changed_head != head:
+                pre["published"] = changed_head
+            with patch.object(
+                tc.work_units, "_round_mutated", return_value="closure" if state == "CLOSED" else "reply"
+            ):
+                check(
+                    "final resolution requires push or closure: " + state,
+                    tc.work_units._progressed_direct(types.SimpleNamespace(gh=gh), candidate, pre) == expected,
+                )
+
+        from tauceti_worker import github_transport as transport
+
+        gh = types.SimpleNamespace(
+            pr_progress_state=lambda _: {
+                "head": "b" * 40 if transport.direct_reads() else head,
+                "ncomments": 0,
+                "state": "OPEN",
+            }
+        )
+        baseline = tc.work_units._progress_snapshot(types.SimpleNamespace(gh=gh), candidate)
+        check("baseline bypasses the stale mirror", baseline["head"] == "b" * 40)
+        check(
+            "an earlier push is not this round's progress",
+            tc.work_units._progressed(types.SimpleNamespace(gh=gh), candidate, baseline) is False,
+        )
+        check(
+            "an unattributed head change stays unknown",
+            tc.work_units._progressed(
+                types.SimpleNamespace(gh=gh), candidate, {"head": head, "ncomments": 0, "state": "OPEN"}
+            )
+            is None,
+        )
+        journal = root / "mutations.jsonl"
+        journal.write_text("")
+        with patch.dict(os.environ, TAUCETI_FLEET_EVENTS=str(journal), TAUCETI_FLEET_MACHINE_ID="test"):
+            baseline = {
+                "head": "b" * 40,
+                "ncomments": 0,
+                "state": "OPEN",
+                "round_id": "this-round",
+                "mutation_cursor": tc.work_units._mutation_cursor(),
+            }
+            from tauceti_worker import fleet_events
+
+            command = {"argv": ["pr", "comment", "1", "--repo", "TauCetiProject/TauCeti"], "created": 1}
+            with patch.dict(os.environ, TAUCETI_ACTIVITY_ROUND_ID="other-round"):
+                fleet_events.mutation(command, types.SimpleNamespace(stdout=""))
+            check("a peer's reply is not attributed", tc.work_units._round_mutated(candidate, baseline) is None)
+            with patch.dict(os.environ, TAUCETI_ACTIVITY_ROUND_ID="this-round"):
+                fleet_events.mutation(
+                    command
+                    | {
+                        "created": 2,
+                        "argv": [
+                            "api",
+                            "-X",
+                            "POST",
+                            "repos/TauCetiProject/TauCeti/pulls/1/comments/42/replies",
+                            "--repo",
+                            "TauCetiProject/TauCeti",
+                        ],
+                    },
+                    types.SimpleNamespace(stdout=""),
+                )
+            check("this round's reply is attributed", tc.work_units._round_mutated(candidate, baseline) == "reply")
+            check(
+                "a confirmed reply remains useful",
+                tc.work_units._progressed(types.SimpleNamespace(gh=gh), candidate, baseline) is True,
+            )
+            baseline["mutation_cursor"] = tc.work_units._mutation_cursor()
+            for method in ("DELETE", "PATCH"):
+                with patch.dict(os.environ, TAUCETI_ACTIVITY_ROUND_ID="this-round"):
+                    fleet_events.mutation(
+                        command
+                        | {
+                            "created": method,
+                            "argv": [
+                                "api",
+                                "-X",
+                                method,
+                                "repos/TauCetiProject/TauCeti/pulls/1/comments/42",
+                                "--repo",
+                                "TauCetiProject/TauCeti",
+                            ],
+                        },
+                        types.SimpleNamespace(stdout=""),
+                    )
+                check(method + " is not a new reply", tc.work_units._round_mutated(candidate, baseline) is None)
+            journal.unlink()
+            check(
+                "missing journal leaves observation unknown", tc.work_units._round_mutated(candidate, baseline) is None
+            )
+            journal.write_text("[]\n")
+            baseline["mutation_cursor"] = (str(journal), journal.stat().st_ino, 0)
+            check("malformed journal stays nonblocking", tc.work_units._round_mutated(candidate, baseline) is None)
+        check(
+            "claimed bubble uses its current direct baseline",
+            tc.work_units._progressed(
+                types.SimpleNamespace(gh=gh),
+                candidate,
+                {"head": head, "ncomments": 0, "state": "OPEN", "claimed_bubble": True},
+            )
+            is True,
+        )
 
         # 4) a round that changed nothing is silent.
         check("a clean round logs nothing", run(repo, head) == "")
@@ -139,7 +379,7 @@ def main():
     check("progress is not in scope", "progress" not in tc.work_units.FILE_CHANGE_STAGES)
     check(
         "roadmap and the fix-likes are",
-        {"roadmap", "fix", "fix-ci", "rebase", "bump"} == tc.work_units.FILE_CHANGE_STAGES,
+        {"roadmap", "fix", "fix-ci", "rebase", "bump", "lint-repair"} == tc.work_units.FILE_CHANGE_STAGES,
     )
     check("a bubble round is skipped", "stage in FILE_CHANGE_STAGES and not bubble" in src)
 

@@ -163,7 +163,11 @@ p = q._claude_from_payload(at)
 check("used == budget ⇒ at-budget, not under-pace", [w.status for w in p.windows], ["at-budget", "under-pace"])
 check("used == budget ⇒ no task", (p.available, p.model), (False, None))
 check("used == budget is a SOFT pacing block", tc._unavail_reason(p)[0], True)
-check("...and reports the equality", tc._unavail_reason(p)[1], "session at budget (used 50% = 50% budget), 50% left")
+check(
+    "...and reports the equality",
+    tc._unavail_reason(p)[1],
+    "session at budget (20% elapsed: used 50% = 50% pace budget), 50% left",
+)
 under = {**at, "five_hour": {"utilization": 49.5, "resets_at": SESSION_LIVE}}
 check("used < budget ⇒ available", q._claude_from_payload(under).available, True)
 over = {**at, "five_hour": {"utilization": 50.5, "resets_at": SESSION_LIVE}}
@@ -183,7 +187,7 @@ check(
     [(w.name, w.status) for w in p.windows],
     [("session", tc.STATE_IDLE), ("weekly", "over-pace")],
 )
-check("session reset, weekly active: not available", p.available, False)
+check("session idle retains weekly pacing", p.available, False)
 
 p = q._claude_from_payload({"five_hour": {"utilization": 0, "resets_at": SESSION_LIVE}, "seven_day": None})
 check(
@@ -191,12 +195,12 @@ check(
     [(w.name, w.status) for w in p.windows],
     [("session", "under-pace"), ("weekly", tc.STATE_IDLE)],
 )
-check("weekly reset, session active: not available", p.available, False)
+check("weekly idle permits work with session headroom", p.available, True)
 
-# An idle window NEVER grants availability, even when the sibling is comfortably under pace: missing
-# telemetry is not permission to spend.
+# Recognized idle permits useful work when its sibling has headroom.
+# Both observations remain available to status and constraint handling.
 p = q._claude_from_payload({"five_hour": None, "seven_day": live_weekly()})
-check("idle session + healthy weekly ⇒ still blocked", (p.available, p.model), (False, None))
+check("idle session + healthy weekly permits work", (p.available, p.model), (True, "opus"))
 check("idle session stays in the gating set", len(p.windows), 2)
 
 # --- source precedence: `limits` is authoritative per window ---------------------------------------
@@ -219,7 +223,7 @@ idle_limits = {
 }
 p = q._claude_from_payload(idle_limits)
 check("idle limits record + active flat ⇒ idle", p.windows[0].status, tc.STATE_IDLE)
-check("idle limits record + active flat ⇒ never available", p.available, False)
+check("idle limits record + active flat permits work", p.available, True)
 
 disagree = {
     "limits": [
@@ -327,7 +331,11 @@ over = {
 }
 soft, why = tc._unavail_reason(q._claude_from_payload(over))
 check("over the pace line ⇒ SOFT block", soft, True)
-check("over-pace reason keeps its detail", why, "session ahead of pace (used 80% > 20% budget), 20% left")
+check(
+    "over-pace reason keeps its detail",
+    why,
+    "session ahead of pace (20% elapsed: used 80% > 20% pace budget), 20% left",
+)
 
 # --- the top-level response must be an object ------------------------------------------------------
 # .get() on a list/string/number would raise inside the pacer, and an exception is not a quota verdict.
@@ -340,7 +348,6 @@ check("a real object passes the type check", tc._claude_payload_problem(flat), N
 
 # --- diagnosis: name the condition, never a bare "usage unknown" -----------------------------------
 diagnoses = [
-    ("session window reset; awaiting initialization", {"five_hour": None, "seven_day": live_weekly()}),
     ("weekly limit missing from usage response", {"five_hour": {"utilization": 0, "resets_at": SESSION_LIVE}}),
     (
         "session reset timestamp invalid (five_hour)",
@@ -404,7 +411,11 @@ for renamed in ("five_hour_v2", "session"):
     check(f"renaming five_hour→{renamed} ⇒ blocked", p.available, False)
 for key in ("utilization", "resets_at"):
     degraded = {**healthy, "five_hour": {k: v for k, v in healthy["five_hour"].items() if k != key}}
-    check(f"dropping five_hour.{key} ⇒ never available", q._claude_from_payload(degraded).available, False)
+    check(
+        f"dropping five_hour.{key} follows parsed constraint",
+        q._claude_from_payload(degraded).available,
+        key == "resets_at",
+    )
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

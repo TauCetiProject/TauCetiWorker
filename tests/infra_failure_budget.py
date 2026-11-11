@@ -40,10 +40,32 @@ cases = [
     ("529 overloaded", "API Error: 529 Overloaded", "provider returned 529"),
     ("503 unavailable", "API Error: 503 Service Unavailable", "provider returned 503"),
     ("429 rate limit", "API Error: 429 Too Many Requests", "provider returned 429"),
+    (
+        "Claude session limit",
+        "You've hit your session limit · resets 9:30pm (UTC)",
+        "provider subscription limit reached",
+    ),
+    ("Claude weekly limit", "You've hit your weekly limit", "provider subscription limit reached"),
+    ("Codex usage limit", "You've hit your usage limit. Try again later.", "provider subscription limit reached"),
+    ("Claude usage limit", "Claude AI usage limit reached", "provider subscription limit reached"),
+    (
+        "limit followed by help",
+        "You've hit your usage limit\nRun /upgrade for more",
+        "provider subscription limit reached",
+    ),
+    ("quoted usage limit", "The test asserts: You've hit your usage limit", None),
     ("500 server error", "API Error: 500 Internal Server Error", "provider returned 500"),
     ("401 stays charged", "Failed to authenticate. API Error: 401 Invalid authentication credentials", None),
     ("403 stays charged", "API Error: 403 Forbidden", None),
     ("400 stays charged", "API Error: 400 Bad Request", None),
+    (
+        "credit refusal",
+        "Credit balance is too low\nAPI Error: 400",
+        "provider credit balance exhausted",
+    ),
+    ("quoted credit refusal", "The test asserts: Credit balance is too low\nAPI Error: 400", None),
+    ("credit text without provider status", "Credit balance is too low", None),
+    ("credit text followed by auth failure", "Credit balance is too low\nAPI Error: 400\nAPI Error: 401", None),
     ("404 stays charged", "API Error: 404 model not found", None),
     ("transport reset", "Error: read ECONNRESET", "could not reach the provider"),
     ("socket hang up", "request failed: socket hang up", "could not reach the provider"),
@@ -161,6 +183,28 @@ with tempfile.TemporaryDirectory() as state:
         charged_again = True  # returned without raising ⇒ the cap fired
     check("cap survives a moving head", charged_again, True)
     check("cap leaves the attempt charged", w.counters.read(KEYS[0]), 3)
+
+for refusal in ("provider credit balance exhausted", "provider subscription limit reached"):
+    with tempfile.TemporaryDirectory() as state:
+        w = fresh(state)
+        for _ in range(wu.MAX_INFRA_REFUNDS + 3):
+            w.counters.write(KEYS[0], 1)
+            agents._LAST_AGENT_FAILURE = refusal
+            try:
+                wu._refund_infra_failure(w, CAND, "fix", KEYS)
+            except NoProgress:
+                pass
+            else:
+                check(f"{refusal} always stops the round", False, True)
+        check(f"{refusal} cannot exhaust a PR's allowance", w.counters.read(KEYS[0]), 0)
+        check(f"{refusal} leaves the ambiguous-refund allowance intact", w.counters.read(f"infra-fix-{CAND.pr}"), 0)
+        w.counters.write(KEYS[0], 1)
+        agents._LAST_AGENT_FAILURE = "provider returned 529"
+        try:
+            wu._refund_infra_failure(w, CAND, "fix", KEYS)
+        except NoProgress:
+            pass
+        check("a later genuine 529 still gets its refund", w.counters.read(KEYS[0]), 0)
 
 agents._LAST_AGENT_FAILURE = None
 print("\nFAIL" if fails else "\nall infra-failure budget checks passed")

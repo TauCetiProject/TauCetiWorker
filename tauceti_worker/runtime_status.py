@@ -7,11 +7,14 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 STATUS_ENV = "TAUCETI_RUNTIME_STATUS"
 _RICH_STYLE_RE = re.compile(r"\[(?:/?(?:bold|red|yellow|green|dim)(?: [^]]+)?|/)\]")
+_PENDING_RUNTIME = {}
+_RUNTIME_LOCK = threading.Lock()
 
 
 def read_json(path: Path) -> dict:
@@ -22,7 +25,8 @@ def read_json(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def atomic_json(path: Path, value: dict) -> None:
+def atomic_json(path: Path, value: dict, *, durable: bool = True) -> None:
+    """Replace atomically; durable writes sync content, as before, not the rename's directory."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, raw = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     tmp = Path(raw)
@@ -31,7 +35,8 @@ def atomic_json(path: Path, value: dict) -> None:
             json.dump(value, out, indent=2, sort_keys=True)
             out.write("\n")
             out.flush()
-            os.fsync(out.fileno())
+            if durable:
+                os.fsync(out.fileno())
         os.replace(tmp, path)
     finally:
         try:
@@ -40,17 +45,56 @@ def atomic_json(path: Path, value: dict) -> None:
             pass
 
 
-def update_status(path: Path, **changes) -> dict:
+def update_status(path: Path, *, wait: bool = True, timeout: float | None = None, **changes) -> dict:
     """Merge changes into a status file under a sibling flock and replace it atomically."""
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(path.suffix + ".lock")
     with lock_path.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        deadline = time.monotonic() + (timeout or 0) if timeout is not None or not wait else None
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | (fcntl.LOCK_NB if deadline is not None else 0))
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(0.01, remaining))
         value = read_json(path)
         value.update(changes)
         value["status_updated_at"] = time.time()
-        atomic_json(path, value)
+        # Status also records restart policy. Keep lifecycle changes and all
+        # never/on-failure (or unknown) records durable; only ordinary always-
+        # restarting worker observations can be rebuilt without that barrier.
+        spec = value.get("applied_spec")
+        durable = (
+            not isinstance(spec, dict)
+            or spec.get("restart", "always") != "always"
+            or value.get("stopped_at") is not None
+            or bool(changes.keys() & {"spec_hash", "stopped_at", "exit_code", "restart_count"})
+        )
+        atomic_json(path, value, durable=durable)
         return value
+
+
+class StatusPublisher:
+    """Keep supervisor identity available over its socket if status storage fails."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.last = read_json(path)
+        self.pending = {}
+
+    def update(self, *, timeout: float = 0, **changes):
+        self.pending.update(changes)
+        try:
+            self.last = update_status(self.path, timeout=timeout, **self.pending)
+            self.pending.clear()
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def snapshot(self):
+        return {**self.last, **read_json(self.path), **self.pending}
 
 
 def report_runtime(state: str | None = None, **changes) -> None:
@@ -67,10 +111,21 @@ def report_runtime(state: str | None = None, **changes) -> None:
     if isinstance(changes.get("detail"), str):
         changes["detail"] = _RICH_STYLE_RE.sub("", changes["detail"])
     changes["activity_at"] = time.time()
+    pending = _PENDING_RUNTIME.setdefault(raw, {})
+    pending.update(changes)
+    if not _RUNTIME_LOCK.acquire(timeout=0.05):
+        return
     try:
-        update_status(Path(raw), **changes)
-    except Exception:
-        pass
+        sent = dict(pending)
+        try:
+            update_status(Path(raw), timeout=0.5, **sent)
+        except Exception:
+            return
+        for key, value in sent.items():
+            if pending.get(key) == value:
+                pending.pop(key, None)
+    finally:
+        _RUNTIME_LOCK.release()
 
 
 def runtime_snapshot() -> dict:

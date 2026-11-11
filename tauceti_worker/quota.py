@@ -9,8 +9,8 @@ import hashlib
 import json
 import math
 import os
+import random
 import shlex
-import shutil
 import subprocess
 import sys
 import textwrap
@@ -19,13 +19,21 @@ import tomllib
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from email.utils import parsedate_to_datetime
+from http.client import HTTPException
 from pathlib import Path
+from uuid import uuid4
 
 from . import oauth as credential_refresh
 from .config import Config, log
-from .constants import CLAUDE_CMD
-from .github import GitHubError, _parse_retry_after
+from .constants import POLL
+from .github import GitHubError
+
+
+class LocalUsageUnavailable(Exception):
+    """An explicitly cache-only selection needs its ordinary scheduled refresh."""
+
 
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
@@ -39,18 +47,27 @@ WEEK_WINDOW_S = 7 * 24 * 3600
 
 QUOTA_TTL = {"codex": 600, "claude": 3600}
 
+# Poll Claude's usage endpoint independently of model requests. A loop's request to refresh means
+# "refresh if older than this", shared across workers, rather than once per round.
+CLAUDE_USAGE_REFRESH_S = 20 * 60
+
+# Headerless failures use bounded backoff. An explicit Retry-After is authoritative for
+# telemetry requests; it does not prohibit model work under --ignore-quota.
+RATE_LIMIT_RECHECK_MAX_S = 15 * 60
+_TRANSIENT_USAGE_STATUSES = frozenset({408, 429, 500, 502, 503, 504, 529})
+# An implausible header or corrupt local deadline must not park unattended workers
+# indefinitely. Real usage-endpoint cooldowns up to one day are honored in full.
+USAGE_RETRY_AFTER_SANITY_S = 24 * 3600
+
+# This process's copy of every cooldown it started, keyed (cache dir, provider, account key) and holding
+# {until, wait, code}. The on-disk record is what other callers see; this keeps the protection when the
+# cache directory cannot be written.
+_COOLDOWNS: dict[tuple[str, str, str], dict] = {}
+
 # Tolerance on a Claude reset clock that reads as already elapsed. Inside it we still treat the window
 # as live (it is about to roll); beyond it the endpoint is describing a window that has already ended,
 # so its usage figure no longer paces the current one (see _claude_record_state).
 CLAUDE_RESET_SKEW_S = 60
-
-# How long ONE recorded bootstrap attempt suppresses further attempts for the same window. A window
-# that comes back `active` clears its record immediately, so in the healthy case this never expires;
-# it exists only so a permanently idle-reporting endpoint is retried at a bounded rate (once an hour)
-# instead of either hammering the provider or wedging forever.
-CLAUDE_BOOTSTRAP_RETRY_S = 3600
-
-CLAUDE_BOOTSTRAP_TIMEOUT_S = 120
 
 # How early the pacer rotates its own Claude access token, and how often it may contact the token
 # endpoint about one credential. An unattended `work --loop` otherwise stalls indefinitely once the
@@ -60,40 +77,8 @@ CLAUDE_BOOTSTRAP_TIMEOUT_S = 120
 CLAUDE_REFRESH_SKEW_S = 5400
 CLAUDE_REFRESH_RETRY_S = 600
 
-# How long past its timeout an in-progress reservation is still believed. Covers a request that is
-# slower than the timeout we gave it plus clock skew between workers, so a crashed worker's claim
-# expires but a live one's is never stolen.
-CLAUDE_BOOTSTRAP_STALE_MARGIN_S = 300
-
-# The bootstrap request itself: the smallest useful `claude -p` turn. Its only job is to make ONE real
-# request so the provider opens the window its usage endpoint says has reset.
-CLAUDE_BOOTSTRAP_PROMPT = "Reply with the single word: ok"
-
-CLAUDE_BOOTSTRAP_FILE = "bootstrap.json"
-
-# Where the shared bootstrap reservation lives, relative to the credential source: every worker
-# measuring this account contends for the same file, whatever its worker id or checkout.
+# Shared TauCeti usage observations live beside the credential source.
 CLAUDE_QUOTA_DIRNAME = ".tauceti-quota"
-
-# Environment the bootstrap request must NOT inherit. Every one of these can route a `claude -p` turn
-# to different credentials or a different backend than the one whose quota we just measured — an API
-# key, a second OAuth token, a proxy, or Bedrock/Vertex/Foundry — which would make the request bill
-# something other than the window we are trying to open. CLAUDECODE/CLAUDE_CODE_ENTRYPOINT are dropped
-# so the turn does not present as a nested session of whatever launched the worker.
-CLAUDE_BOOTSTRAP_DROP_ENV = frozenset(
-    {
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_MODEL",
-        "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_USE_VERTEX",
-        "CLAUDE_CODE_USE_FOUNDRY",
-        "CLAUDECODE",
-        "CLAUDE_CODE_ENTRYPOINT",
-    }
-)
 
 
 # --- pacing curve --------------------------------------------------------------------------------
@@ -234,10 +219,8 @@ def pace_zero_plateau(curve: list[tuple[float, float]]) -> float:
         0:10,100:100    → 0    (10% allowed immediately)
         0:0,90:0,100:95 → 90   (nothing may be spent until 90% of the window has elapsed)
 
-    This is what decides whether a just-reset window may be INITIALIZED: a bootstrap request spends,
-    and the operator's curve may say that a window this fresh has no budget at all. See
-    _idle_init_block — with τ₀ > 0 we cannot even wait it out, because an uninitialized window has no
-    reset clock to measure elapsed time against."""
+    An idle window has no measured start. Preserve an explicit zero-spend
+    startup interval without inventing a clock to override that policy."""
     plateau = 0.0
     for t, b in curve:
         if b != 0:
@@ -257,17 +240,8 @@ def pace_zero_plateau(curve: list[tuple[float, float]]) -> float:
 PACE_EASE_S = 180
 
 
-def _idle_init_block(curve: list[tuple[float, float]] | None = None) -> str | None:
-    """None when the pace curve permits initializing an idle window right now; otherwise the reason it
-    does not, phrased for the status line.
-
-    An idle window is interpreted for PACING as the synthetic reading used=0 at elapsed=0. If the budget
-    there is positive (or becomes positive immediately after 0) a bootstrap request is within the
-    operator's policy. If the curve holds the budget at 0 for a stretch (τ₀ > 0), spending anything on
-    this window is against that policy, and TauCeti cannot wait the plateau out either: the window has
-    not opened, so there is no clock saying when τ₀% of it will have elapsed. It stays blocked until
-    something else initializes the window, the operator changes the curve, or real telemetry appears.
-    We do NOT quietly initialize the window to manufacture a clock."""
+def _idle_spend_block(curve: list[tuple[float, float]] | None = None) -> str | None:
+    """Preserve deliberate zero-spend startup policy without inventing an idle clock."""
     tau0 = pace_zero_plateau(pace_curve() if curve is None else curve)
     if tau0 <= 0:
         return None
@@ -281,8 +255,7 @@ def _idle_init_block(curve: list[tuple[float, float]] | None = None) -> str | No
 #   active     a finite usage% AND a valid, not-yet-elapsed reset clock. The ONLY state that paces.
 #   idle       a RECOGNIZED post-reset representation: the window rolled and nothing has opened the
 #              next cycle yet (Anthropic reports the window as null, or with an explicit null usage /
-#              null reset, in the gap). Never grants availability — it authorizes at most ONE bounded
-#              bootstrap request (see _claude_bootstrap_request).
+#              null reset, in the gap). Permits ordinary work if startup-spend policy allows it.
 #   absent     the payload carries no record for this window at all (schema drift, a truncated body).
 #   malformed  a record exists but is contradictory, non-finite, invalid, or unrecognized.
 #
@@ -315,7 +288,7 @@ STATUS_EXHAUSTED = "exhausted"
 # against. `unknown` is the generic fail-closed status the codex reader still emits.
 SOFT_STATUSES = (STATUS_AT_BUDGET, STATUS_OVER_PACE)
 
-HARD_STATUSES = (STATUS_EXHAUSTED, STATE_IDLE, STATE_ABSENT, STATE_MALFORMED, "unknown")
+HARD_STATUSES = (STATUS_EXHAUSTED, "idle-blocked", STATE_ABSENT, STATE_MALFORMED, "unknown")
 
 # How a single JSON field read: omitted, explicitly null, a usable value, or garbage. Collapsing these
 # is what let an invalid reset timestamp read the same as an explicit null (⇒ "fresh window").
@@ -348,7 +321,7 @@ class Window:
     used: float | None  # percent 0..100 (None = unknown)
     elapsed: float | None  # percent 0..100 (None = unknown)
     resets_at: float | None  # epoch seconds
-    status: str  # under-pace | over-pace | exhausted | idle | absent | malformed | unknown
+    status: str  # under-pace | over-pace | exhausted | idle | idle-blocked | absent | malformed | unknown
     budget: float | None = None  # pace budget (max allowed used%) at this window's elapsed%, if computed
     detail: str | None = None  # why a non-pacing status happened, phrased to follow the window name
 
@@ -356,7 +329,7 @@ class Window:
 @dataclass
 class Provider:
     name: str  # codex | claude
-    available: bool  # all windows under pace (and a usable model)
+    available: bool  # every actual constraint permits work (and a usable model)
     model: str | None  # gpt-5 | opus | None
     windows: list[Window] = field(default_factory=list)
     error: str | None = None
@@ -364,12 +337,13 @@ class Provider:
     # against the curve, an exhausted one at its reset); see Quota._next_eligible
     retry_after: float | None = None  # seconds the endpoint asked us to back off (HTTP 429); NOT a
     # quota reset — must not be classified as exhausted/next_eligible
-    # The launch-stage bootstrap decision, computed PURELY (see Quota._claude_provider). True only when
-    # the sole thing between this provider and a launch is one or more recognized idle windows that the
-    # operator's pace curve permits initializing, with every other window active and holding headroom.
-    # Nothing acts on it except the explicit launch-stage call; reads never spend.
-    bootstrap_eligible: bool = False
-    pending_bootstrap: list[str] = field(default_factory=list)  # the idle windows a bootstrap would open
+    # The usage endpoint answered HTTP 429 (or we are still in the cooldown one started). Set whether the
+    # verdict came from a cached reading or not, so the latest fetch's outcome is never lost to the cache.
+    rate_limited: bool = False
+    # A transient telemetry failure, not evidence that the model cannot serve work.
+    # Only --ignore-quota may proceed without a usable reading.
+    telemetry_unavailable: bool = False
+    model_refusal: bool = False  # actual model refusal; bounded retry independent of usage polling
 
 
 def _finite_num(x: object) -> bool:
@@ -621,18 +595,20 @@ def _claude_readings(payload: dict, now: float | None = None) -> list[Reading]:
     return [_claude_window_reading(payload, w, now) for w in ("session", "weekly")]
 
 
-def _claude_valid_until(readings: list[Reading]) -> float | None:
-    """The instant a payload stops describing reality — the EARLIEST reset clock among its windows —
-    or None when the payload is not fully resolved (any window not `active`).
+def _claude_valid_until(readings: list[Reading], observed_at: float) -> float | None:
+    """Share well-formed active/idle observations until TTL or an original active reset.
 
-    This is the whole cache rule: a response may be reused only while it is both fully and safely
-    interpretable AND the wall clock has not yet passed a reset it represents. A fixed TTL alone let a
-    complete response survive across its own 5-hour reset, after which the worker paced the NEW window
-    against the OLD window's usage; and an idle/absent/malformed payload must never be pinned at all,
-    because re-reading it is the only thing that can resolve it."""
-    if any(r.state != STATE_ACTIVE or r.resets_at is None for r in readings):
+    Classify at the fetch time, including on cache reads: an old active window
+    must never become a fresh idle observation just because its reset passed.
+    """
+    if any(r.state not in (STATE_ACTIVE, STATE_IDLE) for r in readings):
         return None
-    return min(r.resets_at for r in readings)
+    return min(
+        [
+            observed_at + QUOTA_TTL["claude"],
+            *[r.resets_at for r in readings if r.state == STATE_ACTIVE and r.resets_at is not None],
+        ]
+    )
 
 
 def _codex_clocks(w: object) -> tuple[float, float] | None:
@@ -677,61 +653,104 @@ def _codex_valid_until(payload: dict, observed_at: float) -> float | None:
     return min(resets) if resets else None
 
 
-def _idle_phrase(r: Reading) -> str:
-    """The default account of an idle window: it reset, and nothing has opened the next cycle yet —
-    plus, when the operator's pace curve is what forbids initializing it, that reason instead of the
-    raw telemetry note. An operator seeing this needs to know whether TauCeti is waiting on the
-    provider or on their own curve."""
-    blocked = _idle_init_block()
-    why = blocked or r.detail
-    return "window reset; awaiting initialization" + (f" ({why})" if why else "")
-
-
-def _window_from_reading(r: Reading, note: str | None = None, now: float | None = None) -> Window:
-    """Apply pacing to an `active` reading; carry every other state through verbatim so the caller can
-    say what actually happened instead of a generic "usage unknown". Elapsed is derived from the fixed
-    window length, since the endpoint gives a reset clock rather than an elapsed fraction.
-
-    `now` is the instant the usage figure describes, which for a CACHED payload is when it was fetched,
-    not the present — see _claude_pass."""
+def _window_from_reading(r: Reading, now: float | None = None) -> Window:
+    """Pace active data at its observation time; idle supplies no invented clock."""
     if r.state == STATE_ACTIVE:
         window_s = _WINDOW_S[r.window]
         elapsed = (window_s - (r.resets_at - (time.time() if now is None else now))) / window_s * 100
         return _classify_window(r.window, r.used, elapsed, r.resets_at, False)
-    detail = note or (_idle_phrase(r) if r.state == STATE_IDLE else r.detail)
-    # An idle window is interpreted for PACING as the synthetic reading used=0 at elapsed=0 — recorded
-    # on the Window so the status output and the bootstrap policy agree about what budget applies. The
-    # STATE stays `idle`: this is a policy interpretation, not telemetry we were given.
-    budget = pace_budget(pace_curve(), 0.0) if r.state == STATE_IDLE else None
-    return Window(r.window, r.used, 0.0 if r.state == STATE_IDLE else None, r.resets_at, r.state, budget, detail)
+    if r.state == STATE_IDLE:
+        blocked = _idle_spend_block()
+        return Window(
+            r.window,
+            None,
+            None,
+            None,
+            "idle-blocked" if blocked else STATE_IDLE,
+            detail=blocked or "no active window reported",
+        )
+    return Window(r.window, r.used, None, r.resets_at, r.state, detail=r.detail)
 
 
-def _tail_detail(out: str | None, limit: int = 120) -> str:
-    """The last non-empty line of a subprocess's output, trimmed to one short single-line clause — the
-    status line is one line, and an agent CLI's failure output is not."""
-    lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
-    if not lines:
-        return ""
-    tail = lines[-1]
-    return ": " + (tail if len(tail) <= limit else tail[: limit - 1] + "…")
+class UsageTransportError(GitHubError):
+    """The usage service could not be reached; no quota or authentication verdict."""
 
 
-def _http_get_json(url: str, headers: dict, timeout: int = 15) -> tuple[int, dict, float | None]:
+@dataclass
+class _UsageResponse:
+    code: int
+    payload: dict
+    retry_after: float | None
+    retry_after_raw: str | None = None
+    request_id: str | None = None
+
+    def __iter__(self):
+        # Preserve the three-value interface used by quota readers and endpoint fixtures.
+        return iter((self.code, self.payload, self.retry_after))
+
+
+def _usage_retry_after(raw: str | None) -> float | None:
+    """Unlike GitHub's retry policy, do not shorten a usage server's requested pause."""
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        try:
+            seconds = parsedate_to_datetime(raw).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return max(0.0, seconds) if math.isfinite(seconds) and seconds <= USAGE_RETRY_AFTER_SANITY_S else None
+
+
+def _usage_response(code: int, payload: dict, headers) -> _UsageResponse:
+    raw = headers.get("Retry-After")
+    request_id = headers.get("request-id") or headers.get("x-request-id")
+    return _UsageResponse(
+        code, payload, _usage_retry_after(raw), (raw or "")[:256] or None, (request_id or "")[:256] or None
+    )
+
+
+def _http_get_json(url: str, headers: dict, timeout: int = 15) -> _UsageResponse:
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read().decode()), None
+            return _usage_response(r.status, json.loads(r.read().decode()), r.headers)
     except urllib.error.HTTPError as e:
-        return e.code, {}, _parse_retry_after(e.headers.get("Retry-After"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
-        raise GitHubError(f"usage fetch failed: {e}") from e
+        return _usage_response(e.code, {}, e.headers)
+    except (urllib.error.URLError, TimeoutError, OSError, HTTPException) as e:
+        raise UsageTransportError(f"usage fetch failed: {e}") from e
+    except (json.JSONDecodeError, UnicodeError) as e:
+        raise GitHubError("usage response is not valid JSON") from e
 
 
 def _read_json_file(path: Path) -> dict | None:
     try:
         return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeError):
         return None
+
+
+def _cooldown_left(record: object) -> tuple[float, int | None]:
+    """(seconds left, the HTTP status that started it) for one usage-endpoint cooldown record, or
+    (0, None) for an expired, absent or corrupt one."""
+    if not isinstance(record, dict):
+        return 0.0, None
+    until, wait, code = record.get("until"), record.get("wait"), record.get("code")
+    if not (_finite_num(until) and _finite_num(wait) and 0 < wait <= USAGE_RETRY_AFTER_SANITY_S):
+        return 0.0, None  # corrupt: never let it park us
+    if not isinstance(code, int) or isinstance(code, bool) or code == 401 or not (code == 0 or 100 <= code <= 599):
+        return 0.0, None
+    # A wall clock stepped backwards makes the remainder look longer than the wait itself; that is still
+    # a cooldown, just one we can only bound by its own length.
+    left = min(until - time.time(), wait)
+    return (left, code if isinstance(code, int) else None) if left > 0 else (0.0, None)
+
+
+def _outlasts(record: object, until: float) -> bool:
+    """Whether a live cooldown record already runs to `until` or beyond. Deadline against deadline, so
+    the answer does not depend on how long the caller took to get here."""
+    return time.time() + _cooldown_left(record)[0] >= until
 
 
 def _safe_exists(path: Path) -> bool:
@@ -879,8 +898,10 @@ def _write_json_atomic(path: Path, data: dict) -> None:
 
 def _read_marker(p: Path) -> str | None:
     try:
-        return p.read_text().strip() or None
-    except OSError:
+        with p.open() as stream:
+            value = stream.read(4097).strip()
+        return value if value and len(value) <= 4096 else None
+    except (OSError, UnicodeError):
         return None
 
 
@@ -1109,10 +1130,7 @@ class CodexAccount:
 
 
 class Quota:
-    """The pacer. Every read here is pure: it may fetch usage and cache it, but it never spends quota.
-    Breaking a post-reset deadlock costs a real request, so it lives behind one explicit method —
-    authorize_claude_launch — that a caller invokes only once it has actual work to run. A dashboard
-    refresh, `tauceti status`, or an `auto` selection that lands on codex must never spend."""
+    """Read and share subscription usage; observation never sends a model request."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -1125,12 +1143,261 @@ class Quota:
         raw = "|".join(p for p in parts if p)
         return hashlib.sha256(raw.encode()).hexdigest()[:16] if raw else None
 
+    def _usage_dir(self, provider: str) -> Path:
+        if provider == "claude" and getattr(self, "cfg", None) is not None:
+            # The existing credential-source marker follows isolation back to the login user's
+            # source. It works across worker ids, checkouts and projects without a service or setup.
+            return getattr(self, "_claude_usage_directory", None) or (
+                self._claude_creds_source() / CLAUDE_QUOTA_DIRNAME / "usage"
+            )
+        return self.cache_dir
+
+    def _raw_path(self, provider: str, fp: str | None = None) -> Path:
+        directory = self._usage_dir(provider)
+        # Keep accounts separate when the operator switches the active credential. Only a hash,
+        # never a credential, is included in the filename or the cached payload.
+        suffix = f"-{self._fingerprint(fp) or 'none'}" if directory != self.cache_dir else ""
+        return directory / f"quota-{provider}{suffix}.json"
+
+    def _fetch_usage(self, provider: str, url: str, headers: dict, fp: str | None):
+        if getattr(self, "_cache_only", False):
+            raise LocalUsageUnavailable
+        self._usage_attempted = getattr(self, "_usage_attempted", set()) | {provider}
+        from .quota_audit import record
+
+        self._usage_token_fps = getattr(self, "_usage_token_fps", {})
+        self._usage_token_fps[provider] = self._fingerprint(headers.get("Authorization", "").removeprefix("Bearer "))
+        cfg = getattr(self, "cfg", None)
+        state = getattr(cfg, "state", None)
+        directory = (Path(state).parent if state is not None else self.cache_dir) / "quota-requests"
+        entry = _read_json_file(self._raw_path(provider, fp))
+        at = entry.get("fetched_at") if isinstance(entry, dict) else None
+        metadata = dict(
+            request=uuid4().hex,
+            worker=getattr(cfg, "wid", None),
+            provider=provider,
+            credential_fp=self._fingerprint(fp),
+            cache_age_s=max(0, time.time() - at) if _finite_num(at) else None,
+        )
+        # These are actual attempts, not status reads. A killed request can retain a start
+        # without a finish. No raw URL, credential, request headers, or response body is recorded.
+        record(directory, event="request", **metadata)
+        start = time.monotonic()
+        try:
+            response = _http_get_json(url, headers)
+        except GitHubError as error:
+            record(
+                directory,
+                event="response",
+                duration_s=time.monotonic() - start,
+                error_type=type(error).__name__,
+                **metadata,
+            )
+            raise
+        code, _payload, retry_after = response
+        if getattr(response, "retry_after_raw", None) and retry_after is None:
+            log(f"{provider} quota: ignoring invalid or excessive Retry-After (over 24 hours); using bounded backoff")
+        record(
+            directory,
+            event="response",
+            duration_s=time.monotonic() - start,
+            status=code,
+            retry_after_s=retry_after,
+            retry_after_raw=getattr(response, "retry_after_raw", None),
+            server_request_id=getattr(response, "request_id", None),
+            **metadata,
+        )
+        # A subsequent telemetry outage must not erase a known credential rejection.
+        refusal = self._auth_refusal_path(provider, fp)
+        try:
+            if code == 401:
+                refusal.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                _write_json_atomic(refusal, {"code": code})
+                self._raw_path(provider, fp).unlink(missing_ok=True)
+            elif code == 200:
+                refusal.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return response
+
+    def _auth_refusal_path(self, provider: str, fp: str | None) -> Path:
+        credential = getattr(self, "_usage_token_fps", {}).get(provider, fp)
+        return self._usage_dir(provider) / f"auth-refusal-{provider}-{self._fingerprint(credential) or 'none'}.json"
+
+    def launch_credential(self, provider: str) -> str | None:
+        """Freeze identity BEFORE launch, so a later account switch cannot receive its refusal."""
+        try:
+            if provider == "claude":
+                oauth, _ = self._claude_creds()
+                token = (oauth or {}).get("accessToken")
+            else:
+                token = ((self._codex_creds() or {}).get("tokens") or {}).get("access_token")
+            return self._fingerprint(token)
+        except Exception:
+            return None  # unavailable identity must never prevent a launch
+
+    def local_credentials(self, provider: str, reader, known: dict):
+        """Canonical source for local wake hints, without mirroring or Keychain calls.
+
+        The reader supplies bounded JSON reads. Normal launch accessors still
+        own credential synchronization and verification of the identity used.
+        """
+        if provider == "claude":
+            source = self._claude_creds_source()
+            value = (
+                known.get(provider)
+                if sys.platform == "darwin"
+                else _as_dict(reader(source / ".credentials.json")).get("claudeAiOauth")
+            )
+        else:
+            source = self._codex_creds_source()
+            value = reader(source / "auth.json")
+        return source, value
+
+    def _model_refusal_path(self, provider: str, credential: str) -> Path:
+        return self._usage_dir(provider) / f"model-refusal-{provider}-{self._fingerprint(credential)}.json"
+
+    def _claude_usage_fallback(self) -> Path:
+        source = self._fingerprint(str(self._claude_creds_source()))
+        return self.cache_dir.parent.parent / ".quota-usage" / source
+
+    def _model_refusal_paths(self, provider: str, credential: str) -> list[Path]:
+        primary = self._model_refusal_path(provider, credential)
+        paths = [primary]
+        if provider == "claude" and getattr(self, "cfg", None) is not None:
+            paths += [
+                self._claude_creds_source() / CLAUDE_QUOTA_DIRNAME / "usage" / primary.name,
+                self._claude_usage_fallback() / primary.name,
+            ]
+        return list(dict.fromkeys(paths))
+
+    def note_model_refusal(self, provider: str, credential: str | None) -> None:
+        if not credential:
+            return
+        at = time.time()
+        for path in self._model_refusal_paths(provider, credential):
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                _write_json_atomic(path, {"at": at, "until": at + RATE_LIMIT_RECHECK_MAX_S})
+                return
+            except OSError:
+                pass  # try the same state fallback as the pacer, without acquiring its fetch lock
+
+    def _model_refusal(self, provider: str) -> Provider | None:
+        credential = getattr(self, "_usage_token_fps", {}).get(provider)
+        if not credential:
+            return None
+        now, left = time.time(), 0
+        for path in self._model_refusal_paths(provider, credential):
+            record = _read_json_file(path)
+            if not isinstance(record, dict):
+                continue
+            at, until = record.get("at"), record.get("until")
+            if _finite_num(at) and _finite_num(until) and at <= now < until <= at + RATE_LIMIT_RECHECK_MAX_S:
+                left = max(left, until - now)
+        if not left:
+            return None
+        return Provider(
+            provider,
+            False,
+            None,
+            error=f"{provider} model reported a subscription limit; retrying later",
+            retry_after=left,
+            model_refusal=True,
+        )
+
+    def _with_model_refusal(self, provider: str, result: Provider) -> Provider:
+        # Preserve stronger evidence and authentication recovery, rather than hiding
+        # a real 401 or an exhausted quota window behind the short model retry.
+        if result.available or result.telemetry_unavailable or _unavail_reason(result)[0]:
+            return self._model_refusal(provider) or result
+        return result
+
+    def _telemetry_failure(self, provider: str, fp: str | None, error: str, *, code=None, retry_after=None) -> Provider:
+        rejection = _read_json_file(self._auth_refusal_path(provider, fp))
+        if isinstance(rejection, dict) and rejection.get("code") == 401:
+            return Provider(
+                provider, False, None, error=f"{provider} usage HTTP {rejection['code']} (credential rejected)"
+            )
+        # Old positive readings never authorize launches after expiry. An observed exhaustion
+        # remains a negative fact until THAT window resets, even if the ordinary TTL expired.
+        exhausted = []
+        entry = _read_json_file(self._raw_path(provider, fp))
+        if isinstance(entry, dict) and entry.get("fp") == fp:
+            at, payload = entry.get("fetched_at"), entry.get("payload")
+            if _finite_num(at) and at <= time.time() and isinstance(payload, dict):
+                if provider == "claude":
+                    previous, _ = self._from_cached_claude((payload, at))
+                else:
+                    previous = self._codex_from_payload(payload, at)
+                exhausted = [
+                    w
+                    for w in previous.windows
+                    if w.status == "exhausted" and _finite_num(w.resets_at) and w.resets_at > time.time()
+                ]
+        return Provider(
+            provider,
+            False,
+            None,
+            windows=exhausted,
+            error=error,
+            next_eligible=min((w.resets_at for w in exhausted), default=None),
+            retry_after=retry_after,
+            rate_limited=code == 429,
+            telemetry_unavailable=True,
+        )
+
+    @contextmanager
+    def _usage_lock(self, account: str, fp: str | None = None):
+        directory = self._usage_dir("claude")
+        fd = None
+        acquired = True
+        try:
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(directory / f"fetch-{self._fingerprint(account)}.lock", os.O_CREAT | os.O_WRONLY, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                cached = self._cached_claude(fp)
+                reusable = False
+                if cached is not None:
+                    prov, _ = self._from_cached_claude(cached)
+                    now = time.time()
+                    reusable = now - cached[1] < CLAUDE_USAGE_REFRESH_S and (
+                        prov.available or (prov.next_eligible or 0) > now
+                    )
+                if reusable:
+                    acquired = False  # use existing headroom while the sibling refreshes
+                else:
+                    # At the pace-recovery boundary, wait for the sibling's fresh verdict.
+                    # Returning the old refusal would put every lock loser back to sleep.
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            if fd is not None:
+                os.close(fd)
+                fd = None
+            if getattr(self, "cfg", None) is not None and not hasattr(self, "_claude_usage_directory"):
+                # Container credentials are commonly mounted read-only. Use the shared worker-state
+                # root in that case, rather than losing caching or requiring a writable credential.
+                self._claude_usage_directory = self._claude_usage_fallback()
+                with self._usage_lock(account, fp) as acquired:
+                    yield acquired
+                return
+            # Keep the in-process cooldown and any readable cache when sharing is unavailable.
+            # Failure to write diagnostics must not prevent a usable provider from running.
+            pass
+        try:
+            yield acquired
+        finally:
+            if fd is not None:
+                os.close(fd)
+
     def _cached_entry(self, provider: str, fp: str | None) -> dict | None:
         """The whole validated cache entry — {payload, fetched_at, ...} — for a caller that needs to know
         WHEN the payload was true, not just what it says. See _cached_raw for the payload alone."""
-        p = self.cache_dir / f"quota-{provider}.json"
-        d = _read_json_file(p)
-        if not d:
+        p = self._raw_path(provider, fp)
+        d = getattr(self, "_cache_reader", _read_json_file)(p)
+        if not isinstance(d, dict):
             return None
         # A cache entry is only valid for the SAME account it was fetched under. When the operator rotates
         # to a different account (or an external refresh swaps the token), fp changes ⇒ the stale entry is
@@ -1170,17 +1437,142 @@ class Quota:
     ) -> None:
         # `fetched_at` is the instant the caller OBSERVED this payload, kept whole (not truncated to the
         # second) so that re-reading the entry reproduces the verdict the caller already acted on.
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        path = self._raw_path(provider, fp)
         entry = {"fetched_at": time.time() if fetched_at is None else fetched_at, "fp": fp, "payload": payload}
         if valid_until is not None:
             entry["valid_until"] = valid_until
-        (self.cache_dir / f"quota-{provider}.json").write_text(json.dumps(entry))
-
-    def _forget_raw(self, provider: str) -> None:
-        """Drop a provider's cached payload so the next read must go to the network. Used after a
-        bootstrap request: whatever we hold predates the request that was meant to change it."""
         try:
-            (self.cache_dir / f"quota-{provider}.json").unlink()
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _write_json_atomic(path, entry)
+        except OSError:
+            pass  # the successfully fetched reading is still usable by this caller
+
+    def _cooldown_path(self, provider: str, key: str | None) -> Path:
+        return self._usage_dir(provider) / f"ratelimit-{provider}-{self._fingerprint(key) or 'none'}.json"
+
+    def _scope_cooldown(self, record, provider, key, fp):
+        if (
+            provider == "claude"
+            and str(key).startswith("creds:")
+            and fp
+            and isinstance(record, dict)
+            and record.get("fp") != fp
+        ):
+            # A path cannot prove a changed token belongs to the same account. Keep an
+            # anti-storm pause from the ORIGINAL refusal without transferring an hours-long ban.
+            until, wait = record.get("until"), record.get("wait")
+            if _finite_num(until) and _finite_num(wait) and 0 < wait <= USAGE_RETRY_AFTER_SANITY_S:
+                record = {
+                    **record,
+                    "until": min(until, until - wait + RATE_LIMIT_RECHECK_MAX_S),
+                    "wait": min(wait, RATE_LIMIT_RECHECK_MAX_S),
+                }
+        return record
+
+    def _cooldown(self, provider: str, key: str | None, fp: str | None = None) -> tuple[float, int | None]:
+        """(seconds until this account's usage endpoint may be asked again, the HTTP status that started
+        the wait), or (0, None) when nothing holds it back.
+
+        Kept on disk beside the cache, one record per account, so it binds every caller sharing this
+        cache: an `auto` loop re-reads both providers before each round, and without this a healthy
+        codex kept the loop busy while it re-asked a rate-limited Claude endpoint after every round."""
+
+        memory = self._scope_cooldown(
+            _COOLDOWNS.get((str(self._usage_dir(provider)), provider, key or "")), provider, key, fp
+        )
+        disk = self._scope_cooldown(_read_json_file(self._cooldown_path(provider, key)), provider, key, fp)
+        memory, disk = _cooldown_left(memory), _cooldown_left(disk)
+        specific = (0.0, None)
+        if provider == "claude" and str(key).startswith("creds:") and fp:
+            specific = self._cooldown(provider, f"{key}|credential:{fp}")
+        forbidden = (0.0, None)
+        credential = getattr(self, "_usage_token_fps", {}).get(provider)
+        if credential and not str(key).startswith("forbidden:"):
+            forbidden = self._cooldown(provider, f"forbidden:{credential}")
+        return max(memory, disk, specific, forbidden, key=lambda left_code: left_code[0])
+
+    def _start_cooldown(
+        self, provider: str, key: str | None, code: int, retry_after: float | None, fp: str | None = None
+    ) -> None:
+        """Honor a plausible Retry-After; headerless transient failures use bounded backoff.
+        Never shortens a longer cooldown already running.
+
+        Never after a 401: that rejects the credential, which a wait does not fix, and a cooldown would
+        let a cached reading taken under the rejected credential answer for it again."""
+        if code == 401:
+            return
+        if code == 403 and not str(key).startswith("forbidden:"):
+            # An edge challenge's Retry-After still binds these requests, but must
+            # not transfer a forbidden token's pause to a newly selected credential.
+            credential = getattr(self, "_usage_token_fps", {}).get(provider)
+            if credential:
+                self._start_cooldown(provider, f"forbidden:{credential}", code, retry_after)
+            return
+        if provider == "claude" and str(key).startswith("creds:") and fp:
+            # Keep the original credential's complete deadline even if another account
+            # subsequently replaces the source-wide anti-storm record.
+            self._start_cooldown(provider, f"{key}|credential:{fp}", code, retry_after)
+        path = self._cooldown_path(provider, key)
+        mem = (str(self._usage_dir(provider)), provider, key or "")
+        prior = _read_json_file(path) or _COOLDOWNS.get(mem) or {}
+        failures = prior.get("failures", 0) if isinstance(prior, dict) else 0
+        failures = min(failures, 6) if isinstance(failures, int) and failures >= 0 else 0
+        if code in _TRANSIENT_USAGE_STATUSES or code == 0:  # 0 is a transport failure, not an HTTP status
+            default = max(60, POLL) * 2**failures * random.uniform(1.0, 1.1)
+            wait = (
+                retry_after
+                if _finite_num(retry_after) and 0 < retry_after <= USAGE_RETRY_AFTER_SANITY_S
+                else min(default, RATE_LIMIT_RECHECK_MAX_S)
+            )
+        elif _finite_num(retry_after) and 0 < retry_after <= USAGE_RETRY_AFTER_SANITY_S:
+            wait = retry_after
+        else:
+            return
+        if wait <= 0:
+            return
+        record = {"until": time.time() + wait, "wait": wait, "code": code, "failures": failures + 1, "fp": fp}
+        if not _outlasts(self._scope_cooldown(_COOLDOWNS.get(mem), provider, key, fp), record["until"]):
+            _COOLDOWNS[mem] = record
+        fd = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # Re-check and write under a lock, so two callers answering at once cannot replace a longer
+            # cooldown with a shorter one; write-then-rename, so a reader never sees a truncated record.
+            fd = os.open(path.with_name(path.name + ".lock"), os.O_CREAT | os.O_WRONLY, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            if _outlasts(self._scope_cooldown(_read_json_file(path), provider, key, fp), record["until"]):
+                return
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(record))
+            os.replace(tmp, path)
+        except OSError as e:
+            log(f"{provider} quota: could not record the usage endpoint's cooldown ({e}); this process still honors it")
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def _cooling_provider(self, provider: str, left: float, code: int | None, fp: str | None = None) -> Provider:
+        """The verdict while a cooldown holds and no usable cached reading exists: the status that
+        started it, and how long remains."""
+        err = f"{provider} usage HTTP {code or 429}" if code != 0 else f"{provider} usage service unreachable"
+        if code == 429 and provider == "claude":
+            err += " (usage endpoint rate-limited; cooling down)"
+        else:
+            err += " (cooling down)"
+        if code in _TRANSIENT_USAGE_STATUSES or code == 0:
+            return self._telemetry_failure(provider, fp, err, code=code, retry_after=left)
+        return Provider(provider, False, None, error=err, retry_after=left, rate_limited=code == 429)
+
+    def _clear_cooldown(self, provider: str, key: str | None, fp: str | None = None) -> None:
+        if provider == "claude" and str(key).startswith("creds:") and fp:
+            self._clear_cooldown(provider, f"{key}|credential:{fp}")
+        _COOLDOWNS.pop((str(self._usage_dir(provider)), provider, key or ""), None)
+        try:
+            self._cooldown_path(provider, key).unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -1443,7 +1835,12 @@ class Quota:
         return self._fingerprint(self._codex_account_id(auth) or tok.get("access_token"))
 
     def codex(self, *, refresh: bool = False) -> Provider:
-        mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
+        result = self._codex_pass(refresh=refresh)
+        return self._with_model_refusal("codex", result)
+
+    def _codex_pass(self, *, refresh: bool = False) -> Provider:
+        if not getattr(self, "_cache_only", False):
+            mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
         # The pacer reads auth.json for the token it measures usage with, so it inherits the same
         # assumption --account does: that auth.json is the credential codex uses. Under a non-file
         # store it is not, and a leftover file would have us fetch and CACHE one account's usage while
@@ -1458,14 +1855,20 @@ class Quota:
                 error=f"codex credential store is not verifiably the file TauCeti paces against ({store})",
             )
         auth = self._codex_creds()
+        self._wait_identities = getattr(self, "_wait_identities", {}) | {"codex": auth}
         if not auth:
             return Provider("codex", False, None, error="no ~/.codex/auth.json")
         # Prefer the stable account id so a same-account token refresh keeps the cache; fall back to the
         # token itself when no id is available.
         fp = self._codex_account_id(auth) or self._fingerprint((auth.get("tokens") or {}).get("access_token"))
+        self._usage_token_fps = getattr(self, "_usage_token_fps", {})
+        self._usage_token_fps["codex"] = self._fingerprint((auth.get("tokens") or {}).get("access_token"))
         cached = self._cached_codex(fp)
-        if cached is not None and not refresh:
-            return self._codex_from_payload(*cached)
+        left, cooled_by = self._cooldown("codex", fp)
+        if cached is not None and (left or not refresh):
+            return replace(self._codex_from_payload(*cached), rate_limited=cooled_by == 429)
+        if left:
+            return self._cooling_provider("codex", left, cooled_by, fp)
         tok = (auth.get("tokens") or {}).get("access_token")
         if not tok:
             return Provider("codex", False, None, error="no codex access_token")
@@ -1479,24 +1882,35 @@ class Quota:
         # the same expiry bug in miniature. Anchoring early can only expire the entry sooner than it must.
         observed_at = time.time()
         try:
-            code, payload, retry_after = _http_get_json(CODEX_USAGE_URL, headers)
+            code, payload, retry_after = self._fetch_usage("codex", CODEX_USAGE_URL, headers, fp)
         except GitHubError as e:
+            if isinstance(e, UsageTransportError):
+                self._start_cooldown("codex", fp, 0, None)
             # Re-read the entry rather than reusing the tuple from before the request: a usage fetch can
             # block for its whole timeout, and an entry that was live when we set out may have passed its
             # window's reset while we waited.
             still = self._cached_codex(fp)
             if still is not None:
                 return self._codex_from_payload(*still)
+            if isinstance(e, UsageTransportError):
+                return self._telemetry_failure("codex", fp, str(e), retry_after=self._cooldown("codex", fp)[0])
             return Provider("codex", False, None, error=str(e))
         # The worker never refreshes (the operator owns the single-use refresh token). On expiry the
         # access token simply reads as unavailable until the operator's external refresher rotates it
         # and mirror_creds picks it up next cycle.
         if code != 200 or not payload:
+            self._start_cooldown("codex", fp, code, retry_after)
+            retry_after = retry_after or self._cooldown("codex", fp)[0] or None
+            if code == 401:
+                retry_after = None
             still = self._cached_codex(fp) if code != 401 else None
             if still is not None:
-                return self._codex_from_payload(*still)
+                return replace(self._codex_from_payload(*still), rate_limited=code == 429)
             err = "codex token expired; refresh left to the operator" if code == 401 else f"codex usage HTTP {code}"
-            return Provider("codex", False, None, error=err, retry_after=retry_after)
+            if code in _TRANSIENT_USAGE_STATUSES:
+                return self._telemetry_failure("codex", fp, err, code=code, retry_after=retry_after)
+            return Provider("codex", False, None, error=err, retry_after=retry_after, rate_limited=code == 429)
+        self._clear_cooldown("codex", fp)
         # Cache ONLY a payload whose windows say when they roll, and only until the first of those. The
         # endpoint reports time REMAINING, so re-reading an entry later would otherwise re-anchor every
         # window to the new present: the reset slides away, and past its real reset the entry describes a
@@ -1666,16 +2080,16 @@ class Quota:
                                    budget counts as launchable; sitting on the budget is a soft block.
           absent / malformed     → HARD block naming the window and the offending condition. An
                                    unreadable quota constraint is not the same as no constraint.
-          idle (recognized       → HARD block, and possibly `bootstrap_eligible`: the one condition a
-          post-reset gap)          controlled side effect can clear. Acting on it is the caller's
-                                   explicit decision (authorize_claude_launch), never a read's.
+          idle                   → ordinary work may start if the other limits and startup pace allow it.
         """
         # Renew before reading, then mirror, so a rotation reaches an isolated worker's copy in the same
         # call that performed it.
-        if renew:
+        if renew and not getattr(self, "_cache_only", False):
             self._refresh_claude_credential()
-        mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
+        if not getattr(self, "_cache_only", False):
+            mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
         oauth, _from_keychain = self._claude_creds()
+        self._wait_identities = getattr(self, "_wait_identities", {}) | {"claude": oauth}
         if not oauth:
             err = f"no {claude_dir(self.cfg.home) / '.credentials.json'}"
             if sys.platform == "darwin":
@@ -1683,9 +2097,10 @@ class Quota:
             return Provider("claude", False, None, error=err)
         # The cache is keyed by the access token: a rotation to a different account changes it (forcing a
         # re-fetch); an external same-account refresh also changes it, costing one harmless extra fetch.
-        # The bootstrap RESERVATION deliberately does not use this — see _claude_account_key.
+        # Account cooldown identity is deliberately stable across token refreshes.
         fp = self._fingerprint(oauth.get("accessToken"))
-        prov, _readings = self._claude_pass(fp, oauth.get("accessToken"), refresh=refresh)
+        account = self._claude_account_key(oauth)  # from the same snapshot as the token it fetches with
+        prov, _readings = self._claude_pass(fp, oauth.get("accessToken"), refresh=refresh, account=account)
         if renew and _claude_unauthorized(prov):
             # The stored expiry said the token was live and the endpoint disagreed — a clock skew, a
             # server-side revocation, or a credential rotated behind our back. Believe the endpoint over
@@ -1695,45 +2110,38 @@ class Quota:
                 oauth, _from_keychain = self._claude_creds()
                 if oauth:
                     fp = self._fingerprint(oauth.get("accessToken"))
-                    prov, _readings = self._claude_pass(fp, oauth.get("accessToken"), refresh=True)
+                    prov, _readings = self._claude_pass(
+                        fp, oauth.get("accessToken"), refresh=True, account=self._claude_account_key(oauth)
+                    )
         return prov
 
-    def authorize_claude_launch(self) -> Provider:
-        """The launch stage: the ONLY place a Claude request may be spent on initializing a window.
-
-        Callers must have established, before calling, that there is concrete work to do, that the
-        non-model preflight passes, and that Claude is the provider selected for that work. This
-        method enforces what remains — that the sole unresolved condition is one or more recognized
-        idle windows, that every other window is active WITH headroom, and that the operator's pace
-        curve permits initializing a fresh window at all.
-
-        The request is taken under a durable, cross-worker reservation, so a crash between the request
-        and its outcome cannot license a second one. Afterwards the cache is dropped and a FRESH usage
-        response decides: a bootstrap never grants availability by itself."""
-        prov = self.claude(renew=True)  # about to spend a request: the token must be live
-        if prov.available or not prov.bootstrap_eligible:
-            return prov  # nothing to do, or something other than an initializable idle window blocks
-        windows = list(prov.pending_bootstrap)
-        # Freeze the identity across reserve/request/settle. A request can cross a wall-clock period
-        # boundary (or credential lookup can transiently fail); recomputing would orphan the original
-        # in-progress claim and record its outcome against a different episode.
-        episode_keys = [self._episode_key(w) for w in windows]
-        held, why = self._reserve_bootstrap(episode_keys)
-        if not held:
-            return self._reannotate(prov, windows, why)
-        log(
-            f"claude quota: {'/'.join(windows)} window reset and not yet initialized — sending one small "
-            f"bootstrap request to open it"
-        )
-        ok, detail = self._claude_bootstrap_request()
-        self._settle_bootstrap(episode_keys, ok, detail)
-        self._forget_raw("claude")  # whatever we cached predates the request meant to change it
-        if not ok:
-            log(f"claude quota: bootstrap request failed ({detail}) — claude stays unavailable")
-        return self.claude(renew=True)  # the fresh telemetry decides, including whether there is headroom to spend
-
     def _claude_pass(
-        self, fp: str | None, tok: str | None, *, refresh: bool = False
+        self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None
+    ) -> tuple[Provider, list[Reading] | None]:
+        result = self._claude_usage(fp, tok, refresh=refresh, account=account)
+        verdict = self._with_model_refusal("claude", result[0])
+        return (verdict, None) if verdict.model_refusal else result
+
+    def _claude_usage(
+        self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None
+    ) -> tuple[Provider, list[Reading] | None]:
+        self._usage_token_fps = getattr(self, "_usage_token_fps", {})
+        self._usage_token_fps["claude"] = self._fingerprint(tok)
+        if getattr(self, "_cache_only", False):
+            return self._claude_pass_locked(fp, tok, refresh=False, account=account)
+        # Re-read under the fetch lock: a sibling may have fetched or received a Retry-After while
+        # we waited. The lock covers the network call as well as the cache/cooldown publication.
+        with self._usage_lock(account or fp or "none", fp) as acquired:
+            if not acquired:
+                cached = self._cached_claude(fp)
+                if cached is not None:
+                    prov, readings = self._from_cached_claude(cached)
+                    return replace(prov, rate_limited=self._cooldown("claude", account or fp, fp)[1] == 429), readings
+                return Provider("claude", False, None, error="claude usage refresh in progress", retry_after=POLL), None
+            return self._claude_pass_locked(fp, tok, refresh=refresh, account=account)
+
+    def _claude_pass_locked(
+        self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None
     ) -> tuple[Provider, list[Reading] | None]:
         """One read of the usage endpoint (cache-aware) turned into a Provider. Returns readings=None
         when no payload was obtained at all, so the caller can tell "the endpoint would not answer"
@@ -1743,22 +2151,38 @@ class Quota:
         Usage only rises inside a window, so a stale figure is a lower bound; pacing it against a budget
         that has meanwhile climbed would let a reading that was over pace when taken authorize a launch
         purely because time passed, with nothing fresh to say the quota is still there."""
+        # The cooldown belongs to the ACCOUNT (see _claude_account_key), not the token the cache is keyed
+        # by: renewing the token must not license asking a rate-limited endpoint again.
+        account = account or fp
         cached = self._cached_claude(fp)
-        if cached is not None and not refresh:
-            return self._from_cached_claude(cached)
+        left, cooled_by = self._cooldown("claude", account, fp)
+        if cached is not None:
+            prov, readings = self._from_cached_claude(cached)
+            recent = time.time() - cached[1] < CLAUDE_USAGE_REFRESH_S
+            reusable = recent and (prov.available or (prov.next_eligible or 0) > time.time())
+            if left or not refresh or reusable:
+                return replace(prov, rate_limited=cooled_by == 429), readings
+        if left:
+            return self._cooling_provider("claude", left, cooled_by, fp), None
         if not tok:
             return Provider("claude", False, None, error="no claude accessToken"), None
         headers = {"Authorization": f"Bearer {tok}", "anthropic-beta": CLAUDE_BETA, "User-Agent": "claude-code/2.1"}
         try:
-            code, payload, retry_after = _http_get_json(CLAUDE_USAGE_URL, headers)
+            code, payload, retry_after = self._fetch_usage("claude", CLAUDE_USAGE_URL, headers, fp)
             observed_at = time.time()  # ONE instant for this response: parsed, paced and stored against it
         except GitHubError as e:
+            if isinstance(e, UsageTransportError):
+                self._start_cooldown("claude", account, 0, None, fp)
             # Re-read rather than reusing the tuple from before the request: a usage fetch can block for
             # its whole timeout, and an entry that was live when we set out may have passed a reset it
             # describes while we waited.
             still = self._cached_claude(fp)
             if still is not None:
                 return self._from_cached_claude(still)
+            if isinstance(e, UsageTransportError):
+                return self._telemetry_failure(
+                    "claude", fp, str(e), retry_after=self._cooldown("claude", account, fp)[0]
+                ), None
             return Provider("claude", False, None, error=str(e)), None
         # A 401 here is the endpoint refusing the access token. `claude()` answers it by rotating the
         # credential once and re-reading, where the token is this worker's to rotate — see
@@ -1766,9 +2190,20 @@ class Quota:
         # survives into. Always name the status code: an auth failure, a rate-limited endpoint and a
         # server error are different problems with different fixes, and none of them is "usage unknown".
         if code != 200 or not payload:
+            self._start_cooldown("claude", account, code, retry_after, fp)
+            retry_after = retry_after or self._cooldown("claude", account, fp)[0] or None
+            if code == 401:
+                retry_after = None
+            if code == 401:
+                # A rejected token must not get its old permissive sample back on the next read.
+                try:
+                    self._raw_path("claude", fp).unlink(missing_ok=True)
+                except OSError:
+                    pass
             still = self._cached_claude(fp) if code != 401 else None
             if still is not None:
-                return self._from_cached_claude(still)
+                prov, readings = self._from_cached_claude(still)
+                return replace(prov, rate_limited=code == 429), readings
             err = f"claude usage HTTP {code}"
             if code == 401:
                 err += " (access token expired or rejected; log in again)"
@@ -1776,21 +2211,23 @@ class Quota:
                 err += " (usage endpoint rate-limited)"
             elif code == 200:
                 err = "claude usage response empty"
-            return Provider("claude", False, None, error=err, retry_after=retry_after), None
+            if code in _TRANSIENT_USAGE_STATUSES:
+                return self._telemetry_failure("claude", fp, err, code=code, retry_after=retry_after), None
+            return Provider("claude", False, None, error=err, retry_after=retry_after, rate_limited=code == 429), None
         # A response that is not a JSON object is not a quota verdict — and .get() on it would raise
         # inside the pacer. Name it and fail closed.
         problem = _claude_payload_problem(payload)
         if problem:
             return Provider("claude", False, None, error=problem, retry_after=retry_after), None
         readings = _claude_readings(payload, observed_at)
-        # Cache ONLY a payload that is fully resolved, and only until the first reset it describes.
-        # An idle/absent/malformed payload is never pinned: re-reading it is the only thing that can
-        # resolve it, and one extra fetch per poll is the cheapest part of this system.
-        valid_until = _claude_valid_until(readings)
+        # Successful telemetry ends the failure streak. It does not change the quota windows.
+        self._clear_cooldown("claude", account, fp)
+        # Share recognized active/idle observations; malformed or absent constraints stay uncacheable.
+        # TTL and the earliest original active reset still bound every reusable observation.
+        valid_until = _claude_valid_until(readings, observed_at)
         if valid_until is not None:
             self._store_raw("claude", payload, fp, valid_until, observed_at)
-        notes, bootstrap_recorded = self._idle_notes(readings)
-        return self._claude_provider(readings, notes, bootstrap_recorded=bootstrap_recorded, now=observed_at), readings
+        return self._claude_provider(readings, now=observed_at), readings
 
     def _from_cached_claude(self, cached: tuple[dict, float]) -> tuple[Provider, list[Reading]]:
         """A cached payload turned into a Provider AS OF ITS FETCH TIME. Both the readings and the pacing
@@ -1800,12 +2237,11 @@ class Quota:
         What this does NOT do is re-examine a verdict that was already permissive: an entry that was under
         pace when fetched still reads that way, even though its usage figure is only a lower bound and a
         sibling worker may have spent since. That is the deliberate availability trade behind the cache —
-        an endpoint blip should not stop a fleet — and it is bounded by the TTL and by the loop forcing a
-        read every cycle. The rule here is narrower and absolute: time alone never buys permission."""
+        an endpoint blip should not stop a fleet — bounded by the TTL, reset boundaries and the shared
+        refresh interval. Time alone never turns an over-budget reading into permission."""
         payload, at = cached
         readings = _claude_readings(payload, at)
-        notes, bootstrap_recorded = self._idle_notes(readings)
-        return self._claude_provider(readings, notes, bootstrap_recorded=bootstrap_recorded, now=at), readings
+        return self._claude_provider(readings, now=at), readings
 
     def _cached_claude(self, fp: str | None) -> tuple[dict, float] | None:
         """A cached usage payload WITH the instant it describes, or None when it must not be served.
@@ -1830,100 +2266,27 @@ class Quota:
         # enforces whatever expiry was stored, but an entry written before that rule carries none — and a
         # reading stays `active` for CLAUDE_RESET_SKEW_S past its reset, so "still parses" is not "still
         # describes this window".
-        valid_until = _claude_valid_until(_claude_readings(payload))
+        valid_until = _claude_valid_until(_claude_readings(payload, float(fetched_at)), float(fetched_at))
         if valid_until is None or time.time() >= valid_until:
             return None
         return payload, float(fetched_at)
 
-    def _claude_provider(
-        self,
-        readings: list[Reading],
-        notes: dict[str, str] | None = None,
-        *,
-        bootstrap_recorded: bool = False,
-        now: float | None = None,
-    ) -> Provider:
-        """Both windows always gate: a window we cannot read blocks exactly as hard as one that is
-        exhausted. `notes` supplies the bootstrap phase for idle windows, and `now` the instant the
-        readings describe (a cached payload's fetch time, not the present — see _claude_pass).
-
-        `bootstrap_eligible` is decided here, purely, so that every caller sees the same verdict and
-        none of them has to act on it. It requires ALL of: at least one idle window; every non-idle
-        window active with positive headroom (a sibling at budget, over pace, exhausted, absent or
-        malformed forbids it — we would be spending against a constraint we cannot honour or cannot
-        read); and a pace curve under which a fresh window has budget at all."""
-        notes = notes or {}
-        wins = [_window_from_reading(r, notes.get(r.window), now) for r in readings]
+    def _claude_provider(self, readings: list[Reading], *, now: float | None = None) -> Provider:
+        """Recognized idle permits useful work; every active constraint still applies."""
+        wins = [_window_from_reading(r, now) for r in readings]
         err = None
         if wins and all(w.status == STATE_ABSENT for w in wins):
-            # Not one recognizable record in the whole body: this is not a quota reading at all — the
-            # schema moved, or we were handed something that isn't the usage response.
             err = "claude usage response schema unsupported (no session or weekly record)"
-        avail = bool(wins) and all(w.status == STATUS_UNDER_PACE for w in wins)
-        idle = [w.name for w in wins if w.status == STATE_IDLE]
-        others_ok = all(w.status == STATUS_UNDER_PACE for w in wins if w.status != STATE_IDLE)
-        # A live ledger record means this episode already has a request in flight or completed. Keep
-        # the parent loop asleep as well as refusing the launch-stage reservation: otherwise it would
-        # repeatedly pay for a deep GitHub survey only to discover the same reservation again.
-        eligible = bool(idle) and others_ok and not bootstrap_recorded and _idle_init_block() is None
-        return Provider(
-            "claude",
-            avail,
-            "opus" if avail else None,
-            wins,
-            err,
-            self._next_eligible(wins, now),
-            None,
-            eligible,
-            idle if eligible else [],
-        )
+        avail = bool(wins) and all(w.status in (STATUS_UNDER_PACE, STATE_IDLE) for w in wins)
+        return Provider("claude", avail, "opus" if avail else None, wins, err, self._next_eligible(wins, now))
 
     def _claude_from_payload(self, payload: dict) -> Provider:
-        """Provider straight from a payload, with no cache, reservation or bootstrap — the pure parse.
+        """Provider straight from a payload, without side effects — the pure parse.
         One instant for the parse and the pacing, as everywhere else: two readings of the clock would let
         the windows and the schedule disagree about when 'now' was."""
         now = time.time()
         return self._claude_provider(_claude_readings(payload, now), now=now)
 
-    def _reannotate(self, prov: Provider, windows: list[str], note: str) -> Provider:
-        """Re-render `prov` with a different account of its idle windows (e.g. why a reservation was
-        refused), leaving every other window untouched."""
-        wins = [
-            Window(w.name, w.used, w.elapsed, w.resets_at, w.status, w.budget, note)
-            if (w.name in windows and w.status == STATE_IDLE)
-            else w
-            for w in prov.windows
-        ]
-        return Provider("claude", False, None, wins, prov.error, prov.next_eligible, prov.retry_after, False, [])
-
-    # --- the bounded post-reset bootstrap -----------------------------------
-    def _idle_notes(self, readings: list[Reading]) -> tuple[dict[str, str], bool]:
-        """What to say about each idle window, given what the shared ledger remembers about this idle
-        episode. These are the states an operator needs to tell apart: nothing tried yet (and whether
-        their own pace curve is what forbids trying), a request that went through but whose window
-        still isn't reporting, and a request that failed outright."""
-        notes = {}
-        recorded = False
-        ledger = self._read_bootstrap_ledger()
-        for r in readings:
-            if r.state != STATE_IDLE:
-                continue
-            rec = ledger.get(self._episode_key(r.window))
-            if not isinstance(rec, dict):
-                notes[r.window] = _idle_phrase(r)
-                continue
-            recorded = True
-            if rec.get("state") == "in-progress":
-                notes[r.window] = "bootstrap in progress (another worker holds the reservation)"
-            elif rec.get("ok"):
-                notes[r.window] = "bootstrap attempted; awaiting fresh usage"
-            else:
-                notes[r.window] = f"bootstrap failed: {rec.get('detail') or 'unknown error'}"
-        return notes, recorded
-
-    # The reservation lives beside the CREDENTIALS, not under state/<worker-id>/: every worker measuring
-    # the same Claude account must contend for the same record, including workers with isolated $HOMEs
-    # (which record where their credentials were seeded from) and workers from other checkouts.
     def _claude_creds_source(self) -> Path:
         """The canonical credential location this worker is measuring — the operator's real claude dir
         even when running under an isolated $HOME (isolate_home leaves a .tauceti-creds-source marker)."""
@@ -1931,17 +2294,14 @@ class Quota:
         src = _read_marker(d / ".tauceti-creds-source")
         return Path(src) if src else d
 
-    def _claude_account_key(self) -> str:
-        """A stable identity for the Claude ACCOUNT, used to scope the shared bootstrap reservation.
+    def _claude_account_key(self, oauth: dict | None = None) -> str:
+        """Stable account identity for shared usage polling and cooldowns.
 
-        Deliberately NOT the access-token fingerprint the cache uses: an ordinary token refresh rotates
-        that without changing either the account or the reset episode, which would silently hand every
-        worker a fresh bootstrap allowance. We prefer a real account identifier when the credential
-        exposes one; Claude Code's oauth blob usually does not, in which case we fall back to the
-        canonical credential-source PATH. LIMITATION of that fallback: it serializes workers that share
-        a credential file (the fleet case this exists for), but two hosts with separate copies of the
-        same account cannot see each other's reservations and may each spend one bootstrap request."""
-        oauth, _kc = self._claude_creds()
+        Prefer a provider account identifier; otherwise share by canonical credential
+        source. Separate credential copies on separate hosts do not coordinate.
+        """
+        if oauth is None:
+            oauth, _kc = self._claude_creds()
         for key in ("accountUuid", "account_uuid", "accountId", "organizationUuid", "emailAddress"):
             val = (oauth or {}).get(key)
             if isinstance(val, str) and val:
@@ -1953,166 +2313,6 @@ class Quota:
                     if isinstance(blk.get(sub), str) and blk[sub]:
                         return f"account:{blk[sub]}"
         return f"creds:{self._claude_creds_source()}"
-
-    def _episode_key(self, window: str) -> str:
-        """Identify the idle EPISODE a reservation covers: the account, the window kind, and which
-        window-length period of the clock we are in.
-
-        An idle window reports no reset clock, so it cannot name its own episode; the period index is
-        derived from the window's own fixed length, which is the same figure every worker computes.
-        What this buys, honestly stated: at most one bootstrap request per account per window-length
-        period, across workers and across crashes. An idle window straddling a period boundary can cost
-        a second request — bounded, and far from the unbounded per-poll spend a request-then-record
-        sequence allows."""
-        period = int(time.time() // _WINDOW_S[window])
-        return f"{self._claude_account_key()}|{window}|{period}"
-
-    def _bootstrap_paths(self) -> tuple[Path, Path]:
-        """(ledger, lock) for the shared reservation."""
-        d = self._claude_creds_source() / CLAUDE_QUOTA_DIRNAME
-        return d / CLAUDE_BOOTSTRAP_FILE, d / "bootstrap.lock"
-
-    @contextmanager
-    def _bootstrap_lock(self):
-        """Exclusive, cross-process hold on the shared reservation, or None when it cannot be taken.
-        A lock we cannot take or a directory we cannot create yields None and the caller FAILS CLOSED:
-        an unenforceable reservation must not license a request."""
-        ledger, lockpath = self._bootstrap_paths()
-        fd = None
-        try:
-            ledger.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(lockpath, os.O_CREAT | os.O_WRONLY, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except OSError:
-            yield None
-            return
-        try:
-            yield ledger
-        finally:
-            if fd is not None:
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                    os.close(fd)
-                except OSError:
-                    pass
-
-    def _read_bootstrap_ledger(self) -> dict:
-        """The shared ledger's live records (stale in-progress reservations dropped). Read without the
-        lock: a torn read degrades to 'no record', and every decision that MATTERS re-reads under it."""
-        ledger, _lock = self._bootstrap_paths()
-        d = _read_json_file(ledger)
-        if not isinstance(d, dict):
-            return {}
-        now = time.time()
-        live = {}
-        for key, rec in d.items():
-            if not isinstance(rec, dict):
-                continue
-            age = now - (rec.get("at") or 0)
-            if rec.get("state") == "in-progress":
-                # A worker that died mid-request leaves this behind; let it expire, generously, so the
-                # window is retried eventually but never while a real request may still be in flight.
-                if age < CLAUDE_BOOTSTRAP_TIMEOUT_S + CLAUDE_BOOTSTRAP_STALE_MARGIN_S:
-                    live[key] = rec
-            elif age < CLAUDE_BOOTSTRAP_RETRY_S:
-                live[key] = rec
-        return live
-
-    def _reserve_bootstrap(self, episode_keys: list[str]) -> tuple[bool, str]:
-        """Claim the right to make ONE bootstrap request for these windows, BEFORE making it.
-
-        The reservation is written and fsynced under an exclusive lock, so a crash between the claim and
-        the request cannot be mistaken for 'nobody has tried' — the opposite ordering (request first,
-        record after) cannot bound anything, because the request is the part that survives the crash.
-        Returns (held, why-not)."""
-        with self._bootstrap_lock() as ledger:
-            if ledger is None:
-                return False, "bootstrap reservation unavailable (cannot lock the shared ledger)"
-            live = self._read_bootstrap_ledger()
-            for key in episode_keys:
-                rec = live.get(key)
-                if isinstance(rec, dict):
-                    if rec.get("state") == "in-progress":
-                        return False, "bootstrap in progress (another worker holds the reservation)"
-                    if rec.get("ok"):
-                        return False, "bootstrap attempted; awaiting fresh usage"
-                    return False, f"bootstrap failed: {rec.get('detail') or 'unknown error'}"
-            claimed = dict(live)
-            for key in episode_keys:
-                claimed[key] = {"state": "in-progress", "at": int(time.time())}
-            try:
-                _write_json_atomic(ledger, claimed)  # temp file + fsync + atomic rename
-            except OSError as e:
-                return False, f"bootstrap reservation unavailable (cannot record it: {e})"
-        return True, ""
-
-    def _settle_bootstrap(self, episode_keys: list[str], ok: bool, detail: str) -> None:
-        """Replace the in-progress reservation with its outcome."""
-        with self._bootstrap_lock() as ledger:
-            if ledger is None:
-                return  # the reservation expires on its own; we never re-request while it is live
-            records = self._read_bootstrap_ledger()
-            for key in episode_keys:
-                records[key] = {
-                    "state": "done",
-                    "at": int(time.time()),
-                    "ok": bool(ok),
-                    "detail": detail,
-                }
-            try:
-                _write_json_atomic(ledger, records)
-            except OSError:
-                pass
-
-    def _bootstrap_spec(self) -> tuple[list[str], dict, str]:
-        """(argv, env, cwd) for the bootstrap request — built separately from running it so the
-        isolation it depends on is directly testable.
-
-        cwd is a genuine throwaway temp directory OUTSIDE any checkout: the working directory is what
-        decides which CLAUDE.md, settings, hooks and MCP config a `claude` turn loads, and the point of
-        this request is to be one minimal subscription-authenticated turn and nothing else.
-
-        The environment keeps exactly what identifies the account being measured — $HOME and
-        $CLAUDE_CONFIG_DIR, so the request bills the same credentials the pacer just read — and drops
-        every alternative authentication or provider route. Measuring one account while spending
-        another (or an API key, or Bedrock/Vertex/Foundry) would make the whole reading meaningless."""
-        import shlex
-        import tempfile
-
-        argv = [*(shlex.split(CLAUDE_CMD) or ["claude"]), "-p", CLAUDE_BOOTSTRAP_PROMPT]
-        env = {k: v for k, v in os.environ.items() if k not in CLAUDE_BOOTSTRAP_DROP_ENV}
-        return argv, env, tempfile.mkdtemp(prefix="tauceti-quota-bootstrap-")
-
-    def _claude_bootstrap_request(self) -> tuple[bool, str]:
-        """ONE small `claude -p` turn, purely to open a window the endpoint reports as reset but not
-        yet initialized. Deliberately the smallest real request we can make, not a round: a round is
-        unbounded spend against a quota window we currently cannot read.
-
-        It doubles as a safety check — if the window has NOT actually reset, this request is refused by
-        the provider, we record the failure and stay blocked. So the bootstrap can never unlock
-        spending by itself; it can only produce telemetry, and the fresh telemetry decides."""
-        argv, env, cwd = self._bootstrap_spec()
-        try:
-            p = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=CLAUDE_BOOTSTRAP_TIMEOUT_S,
-                cwd=cwd,
-                stdin=subprocess.DEVNULL,
-                env=env,
-            )
-        except subprocess.TimeoutExpired:
-            return False, f"{argv[0]} timed out after {CLAUDE_BOOTSTRAP_TIMEOUT_S}s"
-        except FileNotFoundError:
-            return False, f"{argv[0]} not found on PATH"
-        except OSError as e:
-            return False, f"could not run {argv[0]}: {e}"
-        finally:
-            shutil.rmtree(cwd, ignore_errors=True)
-        if p.returncode != 0:
-            return False, f"{argv[0]} exited {p.returncode}{_tail_detail(p.stderr or p.stdout)}"
-        return True, "ok"
 
     @staticmethod
     def _next_eligible(windows: list[Window], now: float | None = None) -> float | None:
@@ -2136,7 +2336,17 @@ class Quota:
         return min(blocked) if blocked else None
 
     # --- selection ---------------------------------------------------------
-    def choose(self, forced: str | None, *, refresh: bool = False, renew: bool = False) -> tuple[str | None, dict]:
+    def choose(
+        self,
+        forced: str | None,
+        *,
+        refresh: bool = False,
+        renew: bool = False,
+        inspect: set[str] | None = None,
+        fetch: set[str] | None = None,
+        previous: dict | None = None,
+        refresh_providers: set[str] | None = None,
+    ) -> tuple[str | None, dict]:
         """Return (agent_to_run_now or None, {codex: Provider, claude: Provider}).
 
         forced in {codex, claude}: only that provider counts. None/'auto': codex preferred, opus
@@ -2144,12 +2354,46 @@ class Quota:
 
         `renew` is passed through to Quota.claude: a caller that is about to act on the answer may
         renew an expiring access token, an inspection command may not.
+
+        The loop's wait episode can inspect only changed/due providers, permit
+        HTTP only for `fetch`, and force refresh only for `refresh_providers`.
+        Uninspected siblings retain blocked verdicts from `previous`. A cache-only
+        miss is unknown, never a synthetic telemetry outage that grants autonomy.
+        Other callers retain the ordinary selection behaviour.
         """
         snap = {}
-        if forced in (None, "auto", "codex"):
-            snap["codex"] = self.codex(refresh=refresh)
-        if forced in (None, "auto", "claude"):
-            snap["claude"] = self.claude(refresh=refresh, renew=renew)
+        for provider in ("codex", "claude") if forced in (None, "auto") else (forced,):
+            if provider not in ("codex", "claude"):
+                continue
+            if inspect is not None and provider not in inspect:
+                # A wait starts with blocked verdicts only. Reusing a restriction
+                # cannot manufacture headroom when the sibling's cache expires.
+                old = (previous or {}).get(provider)
+                snap[provider] = (
+                    old
+                    if old is not None and not old.available
+                    else Provider(provider, False, None, error="local usage unavailable; awaiting scheduled refresh")
+                )
+                continue
+            self._cache_only = fetch is not None and provider not in fetch
+            force = refresh and (refresh_providers is None or provider in refresh_providers)
+            if provider == "claude":
+                if not self._cache_only and fetch is not None:
+                    self.__dict__.pop("_claude_usage_directory", None)
+                elif hasattr(self, "_wait_cache_directory"):
+                    self._claude_usage_directory = self._wait_cache_directory
+            try:
+                snap[provider] = (
+                    self.codex(refresh=force)
+                    if provider == "codex"
+                    else self.claude(refresh=force, renew=renew and not self._cache_only)
+                )
+            except LocalUsageUnavailable:
+                snap[provider] = Provider(
+                    provider, False, None, error="local usage unavailable; awaiting scheduled refresh"
+                )
+            finally:
+                self._cache_only = False
         codex_ok = snap.get("codex") and snap["codex"].available
         opus_ok = snap.get("claude") and snap["claude"].available
         if forced == "codex":
@@ -2163,21 +2407,46 @@ class Quota:
         return None, snap
 
 
+def _pace_pcts(used: float, budget: float) -> tuple[str, str]:
+    """`used` and `budget` at the fewest decimals (0..3) that keeps them apart, for the strict
+    inequality of an over-pace window.
+
+    Rounding both to whole percents printed a true `used > budget` as `used 8% > 8% budget`, which
+    reads as a bug in the pacer rather than as what it was: 8.000 against a budget of 7.998, over by
+    a few seconds of clock. Show enough precision that the relation the sentence states is visible in
+    the numbers beside it."""
+    for places in (0, 1, 2):
+        u, b = f"{used:.{places}f}", f"{budget:.{places}f}"
+        if u != b:
+            return u, b
+    return f"{used:.3f}", f"{budget:.3f}"
+
+
 def _pace_reason(w: Window) -> str:
-    """A soft pacing block, with the budget it met or exceeded (so a custom --pace is observable) and
-    the quota still in hand. `at budget` and `ahead of pace` are different situations: the first is
-    waiting for the budget line to rise, the second for usage to fall behind it again."""
-    vs = "" if (w.used is None or w.budget is None) else f" (used {round(w.used)}% {{}} {round(w.budget)}% budget)"
+    """A soft pacing block: which window is holding us, how far into that window we are, the budget
+    the curve allows THERE (so a custom --pace is observable), and the quota still in hand.
+
+    The elapsed fraction is what makes the budget legible — `used 44% > 42% pace budget` is arbitrary
+    until you know it is 62% of the way through the session window, and an operator comparing this
+    against their own usage readout otherwise has no way to tell that the second number is a pace line
+    and not a quota one. `at budget` and `ahead of pace` are different situations: the first is waiting
+    for the budget line to rise, the second for usage to fall behind it again."""
+    at_budget = w.status == STATUS_AT_BUDGET
+    if w.used is None or w.budget is None:
+        detail = ""
+    else:
+        # at-budget is exact equality by construction (see _classify_window), so it needs no widening.
+        u, b = (f"{w.used:.0f}", f"{w.budget:.0f}") if at_budget else _pace_pcts(w.used, w.budget)
+        where = "" if w.elapsed is None else f"{round(w.elapsed)}% elapsed: "
+        detail = f" ({where}used {u}% {'=' if at_budget else '>'} {b}% pace budget)"
     left = "" if w.used is None else f", {max(0, round(100 - w.used))}% left"
-    if w.status == STATUS_AT_BUDGET:
-        return f"{w.name} at budget{vs.format('=')}{left}"
-    return f"{w.name} ahead of pace{vs.format('>')}{left}"
+    return f"{w.name} {'at budget' if at_budget else 'ahead of pace'}{detail}{left}"
 
 
 def _window_reason(w: Window) -> str:
     """One window's blocking condition, phrased to follow its name. Prefers the specific diagnosis the
     reader recorded ("weekly limit missing from usage response", "session reset timestamp invalid",
-    "session window reset; awaiting initialization") over the generic fallback — an operator cannot act
+    "no active window reported") over the generic fallback — an operator cannot act
     on "usage unknown", and the failures it used to cover need completely different responses."""
     if w.status == "exhausted":
         return f"{w.name} exhausted"
@@ -2188,7 +2457,7 @@ def _unavail_reason(prov: Provider) -> tuple[bool, str]:
     """Why an unavailable provider can't be used, and whether the block is *soft*.
 
     A soft block means there is real quota left and we're only pausing to pace the burn (over-pace) —
-    distinct from a hard block where a window is exhausted, reset-but-uninitialized, missing or
+    distinct from a hard block where a window is exhausted, deliberately startup-blocked, missing or
     unreadable (all fail-closed). Returns (soft, reason)."""
     gating = prov.windows or []
     # Every hard condition is reported, and hard dominates a co-occurring over-pace window: we cannot
@@ -2222,7 +2491,16 @@ def quota_line(snap: dict, *, markup: bool = True) -> str:
         if prov.error:
             parts.append(f"{name} {_glyph('?', 'yellow', markup)} ({prov.error})")
         elif prov.available:
-            parts.append(f"{name} {_glyph('✓', 'green', markup)} {prov.model}")
+            detail = []
+            if any(w.status == STATE_IDLE for w in prov.windows):
+                for w in prov.windows:
+                    if w.status == STATE_IDLE:
+                        detail.append(f"{w.name} no active window reported")
+                    elif w.used is not None and w.budget is not None:
+                        used, budget = _pace_pcts(w.used, w.budget)
+                        detail.append(f"{w.name} used {used}% < {budget}% pace budget")
+            suffix = " (" + "; ".join(detail) + ")" if detail else ""
+            parts.append(f"{name} {_glyph('✓', 'green', markup)} {prov.model}{suffix}")
         else:
             soft, why = _unavail_reason(prov)
             glyph = _glyph("~", "yellow", markup) if soft else _glyph("✗", "red", markup)

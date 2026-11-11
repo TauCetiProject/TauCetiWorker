@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+"""Exact receipts, failure propagation and concurrent execution with local Git/fake Lean fixtures only."""
+
+import contextlib
+import io
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import venv
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from process_cleanup import running
+
+from tauceti_worker import verification_tools
+from tauceti_worker.verification import (
+    Verification,
+    _HashCache,
+    atomic,
+    inventory,
+)
+from tauceti_worker.verification_scope import local_main, scope
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+def git(root, *args):
+    return subprocess.check_output(["git", "-C", str(root), *args], stderr=subprocess.DEVNULL).decode().strip()
+
+
+def write(root, path, value):
+    p = root / path
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(value)
+    return p
+
+
+class Receipts(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.root = self.home / "source"
+        self.root.mkdir()
+        git(self.root, "init", "-q")
+        git(self.root, "config", "user.name", "Fixture")
+        git(self.root, "config", "user.email", "fixture@example.org")
+        for name in (
+            "TauCeti.lean",
+            "TauCeti/A.lean",
+            "TauCeti/B.lean",
+            "lean-toolchain",
+            "lake-manifest.json",
+            "lakefile.toml",
+        ):
+            write(self.root, name, "fixture\n")
+        write(self.root, ".gitignore", ".lake/\nTauCeti/Ignored.lean\n")
+        write(self.root, "scripts/lint-env.sh", 'echo "LINT-ENV: PASS"\n')
+        write(self.root, "scripts/lint-style.sh", 'echo "LINT-STYLE: PASS"\n')
+        write(self.root, ".lake/packages/batteries/Batteries/Tactic/Lint.lean", "fixture\n")
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "base")
+        self.base = git(self.root, "rev-parse", "HEAD")
+        git(self.root, "remote", "add", "origin", "https://github.com/TauCetiProject/TauCeti.git")
+        git(self.root, "update-ref", "refs/remotes/origin/main", self.base)
+        self.prefix = self.home / "toolchain"
+        lean = write(
+            self.prefix,
+            "bin/lean",
+            f"""#!{sys.executable}
+import sys
+from pathlib import Path
+if sys.argv[1:] == ['--print-prefix']: print({str(self.prefix)!r})
+elif '--run' in sys.argv:
+    import json
+    text = sys.stdin.read()
+    if text: print(json.dumps(dict(checked=len(json.loads(text)),problems=[])))
+else: Path('Main.c').write_text('fixture compiler output')
+""",
+        )
+        lean.chmod(0o755)
+        leanc = write(
+            self.prefix,
+            "bin/leanc",
+            f"""#!{sys.executable}
+import sys
+from pathlib import Path
+Path(sys.argv[sys.argv.index('-o') + 1]).write_text({f"#!{sys.executable}"!r} + '\\nimport sys\\nfrom pathlib import Path\\nprint("local-axioms: fixture")\\nsys.exit(1 if Path(".lake/axiom-invalid").exists() else 0)\\n')
+Path(sys.argv[sys.argv.index('-o') + 1]).chmod(0o755)
+""",
+        )
+        leanc.chmod(0o755)
+        self.bin = self.home / "bin"
+        local_lint_checker = (
+            "#!"
+            + sys.executable
+            + "\nimport sys,json\nfrom pathlib import Path\nmods=Path(sys.argv[1]).read_text().splitlines()\nprint(Path(sys.argv[2]).read_text() + ' ' + json.dumps(dict(modules=len(mods),declarations=0,doc_scanned=0,linters=1,nolints=[],findings=[])))\n"
+        )
+        fake = write(
+            self.bin,
+            "lake",
+            f"""#!{sys.executable}
+import os, sys, time, subprocess
+from pathlib import Path
+args = sys.argv[1:]
+if '--version' in args or '--print-prefix' in args:
+    warning = os.environ.get('FIXTURE_PROBE_WARNING')
+    if os.environ.get('FIXTURE_PROBE_WARNING_ONCE'):
+        marker = Path('.lake/probe-warning-' + '-'.join(args))
+        warning = not marker.exists()
+        marker.parent.mkdir(exist_ok=True)
+        marker.touch()
+    if warning:
+        print('warning: batteries: repository has local changes:')
+        print('  ' + str(Path.cwd() / '.lake/packages/batteries'))
+        print('stderr package diagnostic', file=sys.stderr)
+if args == ['--version'] or '--version' in args:
+    print('fixture Lean/Lake version 1'); sys.exit(0)
+if '--print-prefix' in args:
+    print(os.environ.get('FIXTURE_PROBE_PREFIX', {str(self.prefix)!r}))
+    if os.environ.get('FIXTURE_PROBE_TRAILER'): print('not a toolchain prefix')
+    sys.exit(0)
+p = Path('.lake'); p.mkdir(exist_ok=True)
+with (p/'calls').open('a') as f: f.write(' '.join(args)+' AXIOMS='+os.environ.get('AXIOMS_ONLY_MODULES','')+'\\n')
+mode = os.environ.get('FIXTURE_MODE', '')
+if mode == 'fail': sys.exit(23)
+if args == ['build', 'local-lint']:
+    target = p/'build/bin/local-lint'
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text({local_lint_checker!r})
+    target.chmod(0o755)
+    sys.exit(0)
+if len(args) > 1 and args[0] == 'env' and Path(args[1]).is_file() and Path(args[1]).name not in ('lean','python3'):
+    sys.exit(subprocess.run(args[1:]).returncode)
+
+if mode == 'bad-axiom-after-build' and args[0] == 'build': (p/'axiom-invalid').touch()
+if mode == 'widget-generated-hash' and args[0] == 'build':
+    (p/'packages/proofwidgets/widget/package-lock.json.hash').write_text('restored Lake digest')
+if mode == 'widget-source-mutation' and args[0] == 'build':
+    (p/'packages/proofwidgets/widget/package-lock.json').write_text('changed source')
+if mode == 'mutation':
+    source = Path('TauCeti/A.lean'); before = source.read_text(); source.write_text('changed'); source.write_text(before)
+if mode == 'sleep':
+    (p/'tool.pid').write_text(str(os.getpid()))
+    time.sleep(float(os.environ.get('FIXTURE_SLEEP', '1.5')))
+if mode == 'storage-growth':
+    (p/'build').mkdir(exist_ok=True)
+    with (p/'build/oversized').open('wb') as out: out.truncate(int(os.environ['FIXTURE_GROW_BYTES']))
+    time.sleep(float(os.environ.get('FIXTURE_SLEEP', '5')))
+if mode == 'barrier':
+    barrier = Path(os.environ['FIXTURE_BARRIER'])
+    (barrier / ('ready-' + Path(os.environ['TAUCETI_VERIFY_STATE']).name)).touch()
+    deadline = time.monotonic() + 40
+    while not (barrier / 'release').exists():
+        if time.monotonic() > deadline: sys.exit(98)
+        time.sleep(0.02)
+if os.environ.get('AUDIT_PHASES_FILE'):
+    Path(os.environ['AUDIT_PHASES_FILE']).write_text('audit-import\\t1\\naudit-duplicates\\t2\\naudit-axioms\\t3\\n')
+print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True)
+""",
+        )
+        fake.chmod(0o755)
+        for name in ("gh",):
+            p = write(self.bin, name, "#!/bin/sh\nexit 97\n")
+            p.chmod(0o755)
+        (self.bin / "lean").symlink_to(lean)
+        self.state = self.home / "state"
+        self.env = dict(
+            os.environ,
+            PATH=f"{self.bin}:{os.environ['PATH']}",
+            TAUCETI_ACTIVITY_DIR=str(self.home / "activity"),
+            TAUCETI_FLEET_EVENTS=str(self.home / "worker-events.jsonl"),
+            TAUCETI_VERIFY_HELPER="1",
+            TAUCETI_PROCESS_CONTAINMENT="invalid-old-policy",
+            TAUCETI_VERIFY_STATE=str(self.state),
+            TAUCETI_LOCAL_LINT_CACHE=str(self.home / "local-lint-cache"),
+            TAUCETI_VERIFY_MIN_FREE_PERCENT="0",
+            TAUCETI_VERIFY_STORAGE_DIR=str(self.home / "verification-storage"),
+            TAUCETI_VERIFY_STORAGE_BYTES=str(512 * 1024**2),
+            TAUCETI_VERIFY_CANDIDATE_BYTES=str(64 * 1024**2),
+            TAUCETI_VERIFY_MIN_FREE_BYTES="1",
+            TAUCETI_VERIFY_CACHE_DIR=str(self.home / "cache"),
+            TAUCETI_VERIFY_BASE=self.base,
+            TAUCETI_VERIFY_CHECKPOINT_MARGIN="0",
+            TAUCETI_LOCAL_AXIOMS_CACHE=str(self.home / "local-axioms-cache"),
+        )
+        self.environ = patch.dict(os.environ, self.env, clear=True)
+        self.environ.start()
+        self.addCleanup(self.environ.stop)
+
+    def verify(self, **kwargs):
+        with contextlib.redirect_stderr(io.StringIO()):
+            result = Verification(self.root, self.state, **kwargs).run()
+        return result
+
+    def calls(self):
+        return (self.root / ".lake/calls").read_text().splitlines()
+
+    def spawn(self, *, root=None, **updates):
+        return subprocess.Popen(
+            [sys.executable, str(REPO / "scripts/tauceti-verify"), "--stage", "build", "--json"],
+            cwd=root or self.root,
+            env={**self.env, **updates},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+
+    def wait_calls(self, p):
+        limit = time.monotonic() + 10
+        while not (self.root / ".lake/calls").exists():
+            self.assertIsNone(p.poll())
+            self.assertLess(time.monotonic(), limit)
+            time.sleep(0.02)
+
+    def test_package_warnings_preserve_prefix_and_probe_logs(self):
+        os.environ["FIXTURE_PROBE_WARNING"] = "1"
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "success", result.get("error"))
+        probe = next(c for c in result["commands"] if c["argv"][-1] == "--print-prefix")
+        self.assertEqual(probe["exit"], 0)
+        self.assertIn("stderr package diagnostic", Path(probe["log"]).read_text())
+        stdout = Path(probe["stdout_log"]).read_text()
+        self.assertIn("warning: batteries", stdout)
+        self.assertEqual(stdout.splitlines()[-1], str(self.prefix))
+        inputs = json.loads(Path(result["inputs"]["path"]).read_text())
+        self.assertEqual(inputs["toolchain"]["lake env lean --print-prefix"], str(self.prefix))
+        self.assertEqual(self.verify(stage="build")["phases"]["build"]["reused_from"], result["receipt"])
+
+    def test_changing_probe_diagnostics_do_not_change_inputs(self):
+        os.environ["FIXTURE_PROBE_WARNING_ONCE"] = "1"
+        first = self.verify(stage="build")
+        self.assertEqual(first["status"], "success", first.get("error"))
+        probes = [c for c in first["commands"] if c["argv"][-1] == "--print-prefix"]
+        self.assertIn("warning:", Path(probes[0]["stdout_log"]).read_text())
+        self.assertNotIn("warning:", Path(probes[-1]["stdout_log"]).read_text())
+        again = self.verify(stage="build")
+        self.assertEqual(again["phases"]["build"]["reused_from"], first["receipt"])
+        self.assertEqual(again["fingerprint"], first["fingerprint"])
+
+    def test_unrelated_absolute_directory_is_not_an_installed_prefix(self):
+        unrelated = self.home / "unrelated-prefix"
+        unrelated.mkdir()
+        os.environ["FIXTURE_PROBE_PREFIX"] = str(unrelated)
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+        self.assertFalse((self.root / ".lake/calls").exists())
+
+    def test_prefix_probe_rejects_trailing_nonpath_output(self):
+        os.environ["FIXTURE_PROBE_TRAILER"] = "1"
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+        self.assertNotIn("build", result["phases"])
+        self.assertFalse((self.root / ".lake/calls").exists())
+
+    def test_success_reuse_and_phase_reuse(self):
+        first = self.verify(stage="build")
+        self.assertEqual(first["status"], "success", first.get("error"))
+        second = self.verify(stage="all")
+        self.assertEqual(second["status"], "success", second.get("error"))
+        self.assertIn("reused_from", second["phases"]["build"])
+        self.assertEqual(sum(c.startswith("build") for c in self.calls()), 1)
+        self.assertTrue(any(e["audit_timings"] for e in second["commands"]))
+        self.assertEqual(second["audit_phase_timings"], [])  # No imported environment in local checks.
+        audit = next(c for c in second["commands"] if c["phase"] == "axioms")
+        self.assertTrue(audit["argv"][1].endswith("scripts/tauceti-local-axioms"))
+        third = self.verify(stage="all")
+        for name, phase in third["phases"].items():
+            self.assertEqual("reused_from" in phase, name not in {"axioms", "module-system"})
+        fourth = self.verify(stage="build", reuse=False)
+        self.assertNotIn("reused_from", fourth["phases"]["build"])
+
+    def test_failure_and_pipeline(self):
+        os.environ["FIXTURE_MODE"] = "fail"
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["commands"][-1]["exit"], 23)
+        os.environ.pop("FIXTURE_MODE")
+        # Candidate-owned style scripts cannot replace the shared implementation.
+        write(self.root, "scripts/lint-style.sh", "false | cat\n")
+        result = self.verify(stage="lint")
+        self.assertEqual(result["status"], "success", result.get("error"))
+
+    def test_local_axioms_never_initialize_lake_or_fall_back_to_full(self):
+        write(self.root, "TauCeti/A.lean", "changed")
+        write(self.root, "lean-toolchain", "changed pin")
+        result = self.verify(stage="axioms", policy="bump")
+        self.assertEqual(result["status"], "success", result.get("error"))
+        self.assertEqual(result["scope"]["mode"], "full")  # Full CI requirement, never full local import.
+        audit = next(c for c in result["commands"] if c["phase"] == "axioms")
+        self.assertIn("tauceti-local-axioms", audit["argv"][1])
+        self.assertFalse((self.root / ".lake/calls").exists())  # Not even Lake startup on this path.
+        self.assertNotIn("queue_wait_seconds", result)
+        write(self.root, ".git/shallow", self.base + "\n")
+        result = self.verify(stage="axioms")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn("changed modules unknown", result["error"])
+        self.assertFalse(any(c["phase"] == "axioms" for c in result["commands"]))
+
+    def test_stage_only_axiom_success_cannot_hide_new_build_artifacts(self):
+        write(self.root, "TauCeti/A.lean", "custom axiom added after the previous build")
+        os.environ["FIXTURE_MODE"] = "bad-axiom-after-build"
+        initial = self.verify(stage="axioms")
+        self.assertEqual(initial["status"], "success", initial.get("error"))
+        final = self.verify(stage="all")
+        self.assertEqual(final["status"], "failed", final.get("error"))
+        self.assertEqual(final["phases"]["build"]["status"], "success")
+        self.assertNotIn("reused_from", final["phases"]["axioms"])
+        self.assertEqual(final["commands"][-1]["exit"], 1)
+
+    def test_local_checker_compile_failure_is_incomplete_not_a_source_violation(self):
+        write(self.root, "TauCeti/A.lean", "changed")
+        compiler = self.prefix / "bin/leanc"
+        compiler.write_text(compiler.read_text().replace("import sys", "import sys; sys.exit(23)"))
+        result = self.verify(stage="axioms")
+        self.assertEqual(result["status"], "incomplete", result.get("error"))
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+        self.assertEqual(result["commands"][-1]["exit"], 75)
+
+    def test_change_then_restore_during_execution(self):
+        os.environ["FIXTURE_MODE"] = "mutation"
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn("mutat", result["error"])
+
+    def test_proofwidgets_generated_digest_does_not_invalidate_success(self):
+        write(self.root, ".lake/packages/proofwidgets/widget/package-lock.json", "source lockfile")
+        os.environ["FIXTURE_MODE"] = "widget-generated-hash"
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "success", result.get("error"))
+        # Replacing an existing digest is also an output change, not a source change.
+        write(self.root, ".lake/packages/proofwidgets/widget/package-lock.json.hash", "old digest")
+        result = self.verify(stage="build", reuse=False)
+        self.assertEqual(result["status"], "success", result.get("error"))
+
+    def test_proofwidgets_source_lockfile_mutation_is_still_rejected(self):
+        write(self.root, ".lake/packages/proofwidgets/widget/package-lock.json", "source lockfile")
+        os.environ["FIXTURE_MODE"] = "widget-source-mutation"
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn("mutat", result["error"])
+
+    def test_source_pin_base_and_toolchain_invalidate(self):
+        self.assertEqual(self.verify(stage="build")["status"], "success")
+        for path in ("TauCeti/A.lean", "lake-manifest.json", "lean-toolchain", "lakefile.toml"):
+            write(self.root, path, "changed\n")
+            result = self.verify(stage="build")
+            self.assertEqual(result["status"], "success", result.get("error"))
+            self.assertNotIn("reused_from", result["phases"]["build"])
+        write(self.prefix, "bin/lean", "new toolchain bytes")
+        self.assertNotIn("reused_from", self.verify(stage="build")["phases"]["build"])
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "new base")
+        new_base = git(self.root, "rev-parse", "HEAD")
+        result = self.verify(stage="build", base=new_base)
+        self.assertNotIn("reused_from", result["phases"]["build"])
+        write(self.root, ".lake/packages/mathlib/Mathlib/A.lean", "dependency")
+        self.assertNotIn("reused_from", self.verify(stage="build", base=new_base)["phases"]["build"])
+
+    def test_deletion_rename_untracked_ignored(self):
+        original = inventory(self.root, self.base)
+        (self.root / "TauCeti/A.lean").unlink()
+        self.assertEqual(scope(self.root, self.base, "ordinary")["mode"], "full")
+        self.assertEqual(inventory(self.root, self.base)["TauCeti/A.lean"]["kind"], "missing")
+        (self.root / "TauCeti/B.lean").rename(self.root / "TauCeti/New.lean")
+        write(self.root, "TauCeti/Ignored.lean", "ignored source")
+        current = inventory(self.root, self.base)
+        self.assertNotEqual(original, current)
+        self.assertIn("TauCeti/New.lean", current)
+        self.assertIn("TauCeti/Ignored.lean", current)
+        self.assertIn("TauCeti.New", scope(self.root, self.base, "ordinary")["modules"])
+        self.assertEqual(local_main(self.root), self.base)
+
+    def test_owner_death_leaves_incomplete_receipt_and_recoverable_job(self):
+        p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="60")
+        try:
+            self.wait_calls(p)
+            limit = time.monotonic() + 10
+            while not (self.root / ".lake/tool.pid").exists():
+                self.assertIsNone(p.poll())
+                self.assertLess(time.monotonic(), limit)
+                time.sleep(0.02)
+            owned_tool = int((self.root / ".lake/tool.pid").read_text())
+            p.kill()
+            p.communicate(timeout=10)
+            limit = time.monotonic() + 5
+            while running(owned_tool) and time.monotonic() < limit:
+                time.sleep(0.02)
+            self.assertFalse(running(owned_tool), "verification tool survived its owner")
+            receipt = json.loads(next(self.state.glob("verification/*/receipt.json")).read_text())
+            self.assertEqual(receipt["status"], "incomplete")
+            self.assertEqual(len(list((self.state / "verification-pending").glob("*.json"))), 1)
+            q = self.spawn(TAUCETI_VERIFY_STATE=str(self.home / "worker2"))
+            out, _ = q.communicate(timeout=10)
+            self.assertEqual(q.returncode, 0, out)
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.communicate(timeout=10)
+
+    def test_deadline_interrupts_child_and_sigterm(self):
+        p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="10", TAUCETI_ROUND_DEADLINE=str(time.time() + 2))
+        out, _ = p.communicate(timeout=10)
+        result = json.loads(out)
+        self.assertEqual(result["status"], "incomplete")
+        self.assertLess(result["commands"][-1]["exit"], 0)
+        (self.root / ".lake/calls").unlink()
+        p = self.spawn(FIXTURE_MODE="sleep", TAUCETI_VERIFY_STATE=str(self.home / "sigterm-state"))
+        self.wait_calls(p)
+        p.send_signal(signal.SIGTERM)
+        out, _ = p.communicate(timeout=10)
+        self.assertEqual(json.loads(out)["status"], "incomplete")
+
+    def test_verifier_and_executable_invalidation(self):
+        self.assertEqual(self.verify(stage="build")["status"], "success")
+        with patch("tauceti_worker.verification.POLICY_VERSION", 999):
+            result = self.verify(stage="build")
+            self.assertNotIn("reused_from", result["phases"]["build"])
+        lake = self.bin / "lake"
+        lake.write_text(lake.read_text() + "\n# executable changed\n")
+        result = self.verify(stage="build")
+        self.assertNotIn("reused_from", result["phases"]["build"])
+
+    def test_twenty_independent_verifiers_enter_build_together_despite_old_slot(self):
+        import fcntl
+        import shutil
+
+        barrier = self.home / "barrier"
+        barrier.mkdir()
+        old_queue = self.home / "obsolete-queue"
+        old_queue.mkdir()
+        processes = []
+        with (old_queue / "slot-0.lock").open("a+") as owner:
+            fcntl.flock(owner, fcntl.LOCK_EX)
+            try:
+                for index in range(20):
+                    root = self.home / f"source-{index}"
+                    shutil.copytree(self.root, root)
+                    state = self.home / f"worker-{index}"
+                    # Old deployment variables and stale waits cannot throttle new verification.
+                    atomic(state / "verification-capacity.json", dict(waiting=True, interrupted=True))
+                    processes.append(
+                        self.spawn(
+                            root=root,
+                            TAUCETI_VERIFY_STATE=str(state),
+                            TAUCETI_VERIFY_HOST_QUEUE=str(old_queue),
+                            TAUCETI_VERIFY_HEAVY_SLOTS="1",
+                            FIXTURE_MODE="barrier",
+                            FIXTURE_BARRIER=str(barrier),
+                        )
+                    )
+                limit = time.monotonic() + 30
+                while len(list(barrier.glob("ready-*"))) != len(processes):
+                    self.assertTrue(all(p.poll() is None for p in processes))
+                    self.assertLess(time.monotonic(), limit, "independent builds were serialized")
+                    time.sleep(0.02)
+                (barrier / "release").touch()
+                for p in processes:
+                    out, _ = p.communicate(timeout=20)
+                    self.assertEqual(p.returncode, 0, out)
+                    result = json.loads(out)
+                    self.assertEqual(result["status"], "success")
+                    self.assertNotIn("queue_wait_seconds", result)
+                    self.assertNotIn("waiting_for_capacity", result)
+                self.assertFalse(list(old_queue.glob("wait-*")))
+            finally:
+                (barrier / "release").touch()
+                for p in processes:
+                    if p.poll() is None:
+                        p.kill()
+                    p.communicate(timeout=10)
+
+    def test_shim_ratchet_and_one_json_result(self):
+        write(self.root, "TauCeti/mathlib-shims.json", "{}")
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "registry")
+        base = git(self.root, "rev-parse", "HEAD")
+        write(
+            self.root,
+            "scripts/check-expired-mathlib-shims.py",
+            "import json, sys\nfrom pathlib import Path\nPath('.lake').mkdir(exist_ok=True)\nPath('.lake/shim-args').write_text(json.dumps(sys.argv[1:]))\n",
+        )
+        result = self.verify(stage="shim-expiry", base=base)
+        self.assertEqual(result["status"], "success", result.get("error"))
+        args = json.loads((self.root / ".lake/shim-args").read_text())
+        for expected in ("--fail-on-available", "--base-manifest", "--base-root", "--only-new"):
+            self.assertIn(expected, args)
+        write(self.root, "lean-toolchain", "pin change")
+        self.verify(stage="shim-expiry", base=base)
+        self.assertNotIn("--only-new", json.loads((self.root / ".lake/shim-args").read_text()))
+
+    def test_shim_wrapper_uses_worker_python_and_preserves_nested_sibling_imports(self):
+        os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+        bare = self.home / "bare-python"
+        venv.EnvBuilder(with_pip=False, symlinks=True).create(bare)
+        os.environ["PATH"] = f"{self.bin}:{bare / 'bin'}:{os.environ['PATH']}"
+        script = write(
+            self.root,
+            "scripts/check-expired-mathlib-shims.py",
+            "import sys\nfrom pathlib import Path\n"
+            "from tauceti_tools.templates import run_script\n"
+            "import tauceti_tools.templates as templates\n"
+            "templates.ASSETS = Path(__file__).parent / 'shared'\n"
+            "templates.bootstrap = lambda args: None\n"
+            "Path('.lake').mkdir(exist_ok=True)\n"
+            "Path('.lake/shim-python').write_text(sys.executable)\n"
+            "raise SystemExit(run_script('shim.py', sys.argv[1:]))\n",
+        )
+        write(self.root, "scripts/shared/scripts/sibling.py", "VALUE = 'nested checker completed'\n")
+        write(
+            self.root,
+            "scripts/shared/scripts/shim.py",
+            "from pathlib import Path\nfrom sibling import VALUE\nPath('.lake/nested-shim').write_text(VALUE)\n",
+        )
+        old = subprocess.run(["python3", str(script)], cwd=self.root, capture_output=True, text=True)
+        self.assertNotEqual(old.returncode, 0)
+        self.assertIn("No module named 'tauceti_tools'", old.stderr)
+        result = self.verify(stage="shim-expiry")
+        self.assertEqual(result["status"], "success", result.get("error"))
+        self.assertEqual((self.root / ".lake/shim-python").read_text(), sys.executable)
+        self.assertEqual((self.root / ".lake/nested-shim").read_text(), "nested checker completed")
+
+    def test_missing_tools_is_incomplete_before_lake_and_recovers_without_latch(self):
+        write(self.root, "scripts/check-expired-mathlib-shims.py", "from tauceti_tools import templates\n")
+        with patch.object(verification_tools, "check", side_effect=verification_tools.Unavailable("missing Tools")):
+            for stage in ("shim-expiry", "lint"):
+                result = self.verify(stage=stage)
+                self.assertEqual(result["status"], "incomplete")
+                self.assertEqual(result["incomplete_reason"], "tool-missing")
+                self.assertEqual(result["commands"], [])
+        self.assertEqual(self.verify(stage="shim-expiry")["status"], "success")
+
+    def test_early_source_checker_unavailable_is_incomplete_before_build(self):
+        actual = Verification.command
+
+        def unavailable(verifier, phase, argv, **kwargs):
+            if phase == "lint" and "sources" in argv:
+                raise subprocess.CalledProcessError(75, argv)
+            return actual(verifier, phase, argv, **kwargs)
+
+        with patch.object(Verification, "command", unavailable):
+            result = self.verify(stage="all")
+        self.assertEqual(result["status"], "incomplete", result.get("error"))
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+        self.assertNotIn("build", result["phases"])
+
+    def test_module_system_does_not_require_changed_module_scope(self):
+        write(self.root, ".git/shallow", self.base + "\n")
+        result = self.verify(stage="module-system")
+        self.assertEqual(result["scope"]["mode"], "unknown")
+        self.assertEqual(result["status"], "success", result.get("error"))
+
+    def test_probe_preserves_mounted_pythonpath_and_observes_package_repair(self):
+        bare = self.home / "mounted-python"
+        venv.EnvBuilder(with_pip=False, symlinks=True).create(bare)
+        mounted = self.home / "mounted-tools"
+        write(self.root, "scripts/check-expired-mathlib-shims.py", "from tauceti_tools import templates\n")
+        env = dict(os.environ, PYTHONPATH=str(mounted))
+        with patch.object(sys, "executable", str(bare / "bin/python")):
+            with self.assertRaises(verification_tools.Unavailable):
+                verification_tools.check(self.root, env=env)
+            write(mounted, "tauceti_tools/__init__.py", "")
+            write(mounted, "tauceti_tools/templates.py", "# repaired mounted package\n")
+            verification_tools.check(self.root, env=env)
+
+    def test_tools_disappearing_after_preflight_are_incomplete(self):
+        write(
+            self.root,
+            "scripts/check-expired-mathlib-shims.py",
+            "from tauceti_tools import templates\nraise SystemExit(1)\n",
+        )
+        with patch.object(
+            verification_tools, "check", side_effect=[None, None, verification_tools.Unavailable("Tools removed")]
+        ):
+            result = self.verify(stage="shim-expiry")
+        self.assertEqual(result["status"], "incomplete", result.get("error"))
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+
+    def test_temporary_probe_failures_are_retryable_not_blocked_tools(self):
+        write(self.root, "scripts/check-expired-mathlib-shims.py", "from tauceti_tools import templates\n")
+        for failure in (OSError("temporary process exhaustion"), subprocess.TimeoutExpired("probe", 30)):
+            with patch("tauceti_worker.processes.run", side_effect=failure):
+                result = self.verify(stage="shim-expiry")
+            self.assertEqual(result["status"], "incomplete")
+            self.assertEqual(result["incomplete_reason"], "verification-busy")
+        self.assertEqual(self.verify(stage="shim-expiry")["status"], "success")
+
+    def test_candidate_import_shadowing_is_source_failure_not_missing_worker_tools(self):
+        write(self.root, "scripts/ast.py", "raise RuntimeError('candidate module shadow')\n")
+        write(
+            self.root,
+            "scripts/check-expired-mathlib-shims.py",
+            "from tauceti_tools import templates\nimport ast\n",
+        )
+        result = self.verify(stage="shim-expiry")
+        self.assertEqual(result["status"], "failed", result.get("error"))
+
+    def test_missing_parent_tools_do_not_crash_identity_readiness_or_json_receipt(self):
+        from tauceti_worker.verification_jobs import tool_readiness
+
+        with patch.object(verification_tools, "root", side_effect=verification_tools.Unavailable("Tools removed")):
+            self.assertIsInstance(verification_tools.identity(), str)
+            self.assertIsInstance(tool_readiness({}), str)
+            result = self.verify(stage="build")
+        self.assertEqual(result["status"], "incomplete", result.get("error"))
+        self.assertEqual(result["incomplete_reason"], "tool-missing")
+
+    def test_recovery_tool_identity_ignores_runtime_and_config_snapshot_paths(self):
+        import shutil
+
+        first = self.home / "runtime-one"
+        second = self.home / "runtime-two"
+        write(first, "tools/templates.py", "# identical installed Tools\n")
+        write(first, "snapshot-one.toml", "# identical project policy\n")
+        executable = first / "bin/python"
+        executable.parent.mkdir()
+        shutil.copy2(Path(sys.executable).resolve(), executable)
+        shutil.copytree(first, second)
+        (second / "snapshot-one.toml").rename(second / "snapshot-two.toml")
+        identities = []
+        for runtime, snapshot in ((first, "snapshot-one.toml"), (second, "snapshot-two.toml")):
+            with (
+                patch.object(verification_tools, "root", return_value=runtime / "tools"),
+                patch.object(sys, "executable", str(runtime / "bin/python")),
+                patch.dict(os.environ, TAUCETI_CONF_SNAPSHOT=str(runtime / snapshot)),
+            ):
+                identities.append(verification_tools.identity())
+        self.assertEqual(*identities)
+
+    def test_shim_failure_codes_remain_source_failures_with_working_tools(self):
+        for code in (1, 2, 3, 75):
+            write(
+                self.root,
+                "scripts/check-expired-mathlib-shims.py",
+                f"from tauceti_tools import templates\nraise SystemExit({code})\n",
+            )
+            result = self.verify(stage="shim-expiry", reuse=False)
+            self.assertEqual(result["status"], "failed", (code, result.get("error")))
+
+    def test_tools_changes_invalidate_receipts_and_readiness(self):
+        from tauceti_worker.verification_jobs import tool_readiness
+
+        tools = self.home / "installed-tools"
+        marker = write(tools, "checker.py", "# installed Tools revision one\n")
+        with patch.object(verification_tools, "root", return_value=tools):
+            first = self.verify(stage="build")
+            before = tool_readiness({})
+            marker.write_text("# installed Tools revision two\n")
+            second = self.verify(stage="build")
+            self.assertNotEqual(before, tool_readiness({}))
+        self.assertEqual(first["status"], "success", first.get("error"))
+        self.assertEqual(second["status"], "success", second.get("error"))
+        self.assertNotEqual(first["fingerprint"], second["fingerprint"])
+
+    def test_old_cleanup_markers_do_not_block_verification(self):
+        markers = self.home / "activity/containment-unconfirmed"
+        markers.mkdir(parents=True)
+        (markers / "malformed.json").write_text("{broken")
+        (markers / "stale.json").write_text('{"pid_namespace": 42, "boundary": "old"}')
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "quiescence.json").write_text("not json")
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "success", result.get("error"))
+        self.assertTrue(all("containment" not in command for command in result["commands"]))
+        self.assertEqual((markers / "malformed.json").read_text(), "{broken")
+        self.assertEqual((self.state / "quiescence.json").read_text(), "not json")
+
+    def test_explicit_lint_modules_are_bound_inputs(self):
+        modules = write(self.home, "lint-modules.txt", "TauCeti.B\n")
+        write(self.root, "scripts/lint-env.sh", 'cat "$LINT_ONLY_MODULES"\n')
+        result = self.verify(stage="lint", lint_modules=modules)
+        self.assertEqual(result["status"], "success", result.get("error"))
+        lint = next(c for c in result["commands"] if "environment" in c["argv"])
+        self.assertIn("TauCeti.B", Path(lint["argv"][-1]).read_text())
+        self.assertFalse(any("scripts/lint-env.sh" in c["argv"] for c in result["commands"]))
+        modules.write_text("TauCeti.A\n")
+        result = self.verify(stage="lint", lint_modules=modules)
+        self.assertNotIn("reused_from", result["phases"]["lint"])
+
+    def test_bubble_checkpoint_survives_incomplete_verification(self):
+        write(self.root, "TauCeti/A.lean", "candidate edit\n")
+        write(self.root, "TauCeti/Untracked.lean", "untracked edit\n")
+        with patch.dict(os.environ, TAUCETI_VERIFY_BUBBLE="1", TAUCETI_VERIFY_CHECKPOINT_MARGIN="10"):
+            result = self.verify(stage="build", deadline=time.time() + 1)
+        self.assertEqual(result["status"], "incomplete")
+        checkpoint = Path(result["source_checkpoint"])
+        self.assertTrue(checkpoint.is_file())
+        self.assertIn("candidate edit", checkpoint.with_name("source.patch").read_text())
+        import tarfile
+
+        with tarfile.open(checkpoint.with_name("untracked.tar")) as archive:
+            self.assertEqual(archive.extractfile("TauCeti/Untracked.lean").read(), b"untracked edit\n")
+
+    def test_content_cache_rechecks_changed_ctime(self):
+        self.verify(stage="build")
+        before = sum(
+            map(
+                len,
+                _HashCache.directories(json.loads((self.state / "verification-hashes-v2.json").read_text())).values(),
+            )
+        )
+        write(self.root, "TauCeti/A.lean", "changed input\n")
+        result = self.verify(stage="build")
+        after = sum(
+            map(
+                len,
+                _HashCache.directories(json.loads((self.state / "verification-hashes-v2.json").read_text())).values(),
+            )
+        )
+        self.assertGreater(after, before)
+        self.assertNotIn("reused_from", result["phases"]["build"])
+        self.assertIn("path", result["inputs"])
+
+    def test_bubble_wrapper_layout_in_python_safe_path_mode(self):
+        import shutil
+
+        layout = self.home / "round"
+        layout.mkdir()
+        shutil.copy(REPO / "scripts/tauceti-verify", layout / "tauceti-verify")
+        shutil.copytree(
+            REPO / "tauceti_worker", layout / "tauceti_worker", ignore=shutil.ignore_patterns("__pycache__")
+        )
+        result = subprocess.run(
+            [sys.executable, "-P", str(layout / "tauceti-verify"), "--help"],
+            cwd=self.home,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--lint-modules", result.stdout)
+
+    def test_host_wrapper_keeps_shell_work_foreground_and_bounds_each_command(self):
+        from tauceti_worker.agents import host_agent_argv, local_verification
+
+        with patch.dict(os.environ, TAUCETI_ROUND_DEADLINE=str(time.time() + 1800)):
+            _, env = host_agent_argv("fixture prompt", "claude")
+        self.assertEqual(env["TAUCETI_VERIFY_PYTHON"], sys.executable)
+        self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], "600000")
+        self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "600000")
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
+        self.assertIn(sys.executable, local_verification("ordinary"))
+
+        with (
+            patch("tauceti_worker.agents.time.time", return_value=1000),
+            patch.dict(os.environ, TAUCETI_ROUND_DEADLINE="1030"),
+        ):
+            _, env = host_agent_argv("fixture prompt", "claude")
+        self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], "30000")
+        self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "30000")
+
+    def test_installed_wrapper_permission(self):
+        from tauceti_worker import cli
+
+        package = self.home / "installed"
+        wrapper = write(package, "scripts/tauceti-verify", "fixture")
+        wrapper.chmod(0o644)
+        with patch.object(cli, "HERE", package):
+            cli._ensure_scripts_executable()
+        self.assertTrue(os.access(wrapper, os.X_OK))
+
+    def test_deleted_renamed_and_untracked_sources_invalidate_reuse(self):
+        self.assertEqual(self.verify(stage="build")["status"], "success")
+        (self.root / "TauCeti/A.lean").unlink()
+        for change in (
+            lambda: None,
+            lambda: (self.root / "TauCeti/B.lean").rename(self.root / "TauCeti/Renamed.lean"),
+            lambda: write(self.root, "TauCeti/New.lean", "new"),
+            lambda: write(self.root, "TauCeti/Ignored.lean", "ignored"),
+        ):
+            change()
+            result = self.verify(stage="build")
+            self.assertEqual(result["status"], "success", result.get("error"))
+            self.assertNotIn("reused_from", result["phases"]["build"])
+
+    def test_unknown_scope_and_missing_checker_fail_closed(self):
+        write(self.root, ".git/shallow", self.base + "\n")
+        build = self.verify(stage="build")
+        self.assertEqual(build["status"], "success", build.get("error"))
+        self.assertEqual(build["scope"]["mode"], "unknown")
+        result = self.verify(stage="all")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn("reused_from", result["phases"]["build"])
+        (self.root / ".git/shallow").unlink()
+        write(self.root, "TauCeti/mathlib-shims.json", "{}")
+        result = self.verify(stage="shim-expiry")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn("checker is missing", result["error"])
+
+    def test_obsolete_slot_settings_do_not_restrict_or_reject_verification(self):
+        for value in ("1", "0", "invalid"):
+            with patch.dict(os.environ, TAUCETI_VERIFY_HEAVY_SLOTS=value):
+                result = self.verify(stage="build", reuse=False)
+            self.assertEqual(result["status"], "success", result.get("error"))
+        self.assertFalse((self.state / "verification-capacity.json").exists())
+        self.assertFalse((self.state / "verification-attempt.json").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

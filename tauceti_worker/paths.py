@@ -18,8 +18,44 @@ from pathlib import Path
 _pkg = Path(__file__).resolve().parent  # …/tauceti_worker
 HERE = _pkg if (_pkg / "prompts").is_dir() else _pkg.parent
 
+
+def legacy_data_root(default: Path | None = None) -> Path:
+    """Keep existing worker data when changing the installed code revision.
+
+    Assets stay beside the code. An explicit data root is inherited by round,
+    verification and cleanup subprocesses, including isolated worker homes.
+    """
+    raw = os.environ.get("TAUCETI_LEGACY_DATA_ROOT")
+    if not raw:
+        return HERE if default is None else default
+    root = Path(raw).expanduser()
+    if not root.is_absolute():
+        raise ValueError("TAUCETI_LEGACY_DATA_ROOT must be an absolute path")
+    return root.resolve()
+
+
 # The branch-lease helper the agents run on PATH inside a round. Overridable for tests.
 CLAIM_SH = os.environ.get("TAUCETI_CLAIM_SH") or str(HERE / "scripts" / "claim.sh")
+
+
+def canonical_candidate(path: Path) -> Path:
+    """Resolve only the managed candidate, using the kernel's spelling on Darwin."""
+    result = Path(os.path.realpath(path))
+    if sys.platform == "darwin":
+        import fcntl
+
+        command = getattr(fcntl, "F_GETPATH", None)
+        if command is not None:
+            descriptor = os.open(result, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                raw = fcntl.fcntl(descriptor, command, b"\0" * 1024).split(b"\0", 1)[0]
+                if not raw.startswith(b"/"):
+                    raise OSError("candidate kernel path unavailable")
+                result = Path(os.fsdecode(raw))
+            finally:
+                os.close(descriptor)
+    return result
+
 
 # CPython builds do not agree on the default CA-bundle path. In particular, uv's standalone
 # CPython uses OpenSSL's /etc/ssl/cert.pem default on NixOS, while NixOS exposes the system bundle

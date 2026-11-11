@@ -21,19 +21,20 @@ For each finding, judge whether it is actually correct:
 
 ## Rules of the repo (hard constraints)
 - Code goes under `TauCeti/`. Do NOT edit the root `TauCeti.lean`: it is intentionally empty, and the lakefile's glob (`TauCeti.*`) builds every module under `TauCeti/`, so there is no need to touch it (if a reviewer claims your API is not reachable from the root, the glob already covers it). Do NOT touch `Scripts/`, `.github/`, the lakefile (`lakefile.toml`/`lakefile.lean`), or the Lake pins (`lake-manifest.json`/`lean-toolchain`) — the lakefile is human-owned, and forward Mathlib/toolchain bumps are a separate dedicated flow; keep this PR to `TauCeti/`.
-- Everything under `namespace TauCeti`.
-- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`; creating or changing a roadmap needs human attention. If a finding means the PR's target is not on any roadmap, say so in your report and stop.
+- Use `namespace TauCeti` by default. For dot-notation APIs whose first explicit argument has an
+  existing Lean or Mathlib type, put declarations in that type's existing namespace (e.g. root
+  `Set` or `RingEquiv`), as required by the naming rubric; do not nest it under `TauCeti`.
+- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`. Resolve roadmap scope findings using the PR outcome instructions below: adapt to an existing target or close your own PR with an explanation.
 - Must stay green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), no `maxHeartbeats` overrides, and **never silence a linter** (e.g. with `set_option ... false`) to force a change through — that is itself a reason to push back on the finding.
 
-## Verify before pushing (all three MUST pass)
-```
-lake exe cache get
-lake build
-lake exe axioms
-```
-Iterate until green. Never push red.
+## Verify before pushing (all MUST pass)
+__LOCAL_VERIFICATION__
+While fixing, use the helper's `--stage build` for diagnosis. After all source edits,
+run the helper with its default all stages. Exact-input receipts reuse successful phases.
+Never describe failed or incomplete verification as green. If every finding was contested
+and no inputs changed, existing exact-input evidence remains reusable. Never push red.
 
-**Do this synchronously, in this one turn.** Run these commands in the FOREGROUND and wait for each to finish — do NOT background the build and then end your turn expecting to be resumed. You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
+**Do this synchronously, in this one turn.** You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
 ## Submit
 - Commit the fixes (message `<type>: <subject>`, imperative present; end the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
@@ -45,4 +46,4 @@ Iterate until green. Never push red.
 - Do NOT open a new PR; do NOT touch other files.
 
 ## Report
-End with a concise summary: which findings you fixed (and how you verified each), which you contested (and the evidence), and the exact `lake build` / `lake exe axioms` result lines proving green + axiom-clean. Do not claim green unless you saw it.
+End with a concise summary: which findings you fixed (and how you verified each), which you contested (and the evidence), and the exact `scope:`, `lake build` and `local-axioms:` result lines proving your local checks green + axiom-clean, labelled as local changed-file checks rather than CI. Do not claim green unless you saw it.

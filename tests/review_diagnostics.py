@@ -2,6 +2,7 @@
 """Review-command failures retain useful public-safe diagnostics and enrich stuck issues."""
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -9,9 +10,11 @@ from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+from tauceti_worker import agents
 from tauceti_worker import github as gh_mod
 from tauceti_worker.review_diagnostics import (
     clear_review_failure,
+    failure_summary,
     public_review_failure,
     read_review_failure,
     record_review_failure,
@@ -46,6 +49,121 @@ with tempfile.TemporaryDirectory() as raw:
     check("log tail classified", attempt["category"], "reviewer-auth")
     check("log path reduced to basename", attempt["log"], "review.log")
     check("public diagnostic names provider", "via `claude`" in public_review_failure(value), True)
+
+    # The CLI appends a long, generic command failure AFTER the useful error.
+    # Cleanup chatter can follow that too; the final line is not the diagnosis.
+    log.write_text(
+        "setup\nOSError: [Errno 7] Argument list too long: 'codex'\n"
+        + "tauceti-review: command failed (1): python runner/review.py "
+        + "--option " * 200
+        + "\ncleanup finished\n"
+    )
+    value = record_review_failure(
+        state,
+        worker="w",
+        pr=42,
+        head="a" * 40,
+        provider="codex",
+        code=1,
+        reason="review #42 exited with status 1: cleanup finished",
+        log_file=log,
+    )
+    check("wrapper does not hide E2BIG", "Argument list too long" in value["attempts"][-1]["summary"], True)
+    check("public E2BIG survives wrapper", "OS argument limit" in public_review_failure(value), True)
+    log.write_text("gh: API rate limit exceeded for user\ntauceti-review: command failed (1): gh pr diff 42\n")
+    value = record_review_failure(state, worker="w", pr=42, head="a" * 40, provider="codex", code=1, log_file=log)
+    check(
+        "GitHub failure is distinguished from provider quota", value["attempts"][-1]["category"], "checkout-or-network"
+    )
+    check("GitHub diagnosis is publishable", "GitHub API rate limit" in public_review_failure(value), True)
+    log.write_text(
+        "OSError: Argument list too long\n" + "ordinary output\n" * 20000 + "fatal: connection reset\ncleanup\n"
+    )
+    check("bounded tail excludes ancient errors", failure_summary(log), "fatal: connection reset")
+    check("missing log preserves reason", failure_summary(state / "missing", "Not logged in"), "Not logged in")
+
+    generic = "tauceti-review: command failed (1): python runner/review.py"
+    for prefix in (
+        "$ git clone -q https://github.com/TauCetiProject/TauCeti /tmp/code\n",
+        "git clone completed successfully\n",
+        "[correctness]   ! Request timed out\n",
+        "=" * 72 + "\nThe model is not available and github has a rate limit\n" + "=" * 72 + "\n",
+        "gh: API rate limit exceeded\n$ python runner/post.py\n",
+    ):
+        log.write_text(prefix + generic + "\n")
+        check("non-terminal output is not the diagnosis", failure_summary(log), generic)
+    for error, detail in (
+        ("gh: Resource not accessible by integration (HTTP 403)", "lack of permission"),
+        ("Error: unknown model", "reviewer model is unavailable"),
+        ("OSError: No space left on device", "disk space"),
+        ("subprocess.TimeoutExpired: command exceeded limit", "timed out"),
+        ("OSError: Argument list too long: " + "x" * 1000, "OS argument limit"),
+    ):
+        log.write_text(error + "\n" + generic + "\ncleanup\n")
+        value = record_review_failure(state, worker="w", pr=43, head="a" * 40, provider="codex", code=1, log_file=log)
+        check("specific failure survives wrapper and truncation", detail in public_review_failure(value), True)
+
+    # Redirected stdout is buffered: post.py's stderr lands inside the scoreboard
+    # dump, whose remaining prose flushes only after the terminal CLI diagnostic.
+    log.write_text(
+        "=" * 72 + "\nReview prose: unknown model\n"
+        "$ python runner/post.py\n"
+        "gh: Resource not accessible by integration (HTTP 403)\n"
+        "tauceti-review: command failed (1): python runner/post.py\n"
+        "More prose: No space left on device\n" + "=" * 72 + "\n"
+    )
+    value = record_review_failure(state, worker="w", pr=44, head="a" * 40, provider="codex", code=1, log_file=log)
+    check(
+        "interleaved post failure retains permission diagnosis",
+        "lack of permission" in public_review_failure(value),
+        True,
+    )
+    for error in (
+        "review-root lookup failed: GitHub rejected the request (HTTP 403)",
+        "gh api POST /repos/o/r/pulls/1/comments FAILED: gh: Validation Failed (HTTP 422)",
+    ):
+        log.write_text("=" * 72 + "\nprose\n$ python runner/post.py\n" + error + "\n" + generic + "\n" + "=" * 72)
+        value = record_review_failure(state, worker="w", pr=46, head="a" * 40, provider="codex", code=1, log_file=log)
+        check(
+            "post-layer HTTP failures retain their category", value["attempts"][-1]["category"], "checkout-or-network"
+        )
+    log.write_text("=" * 72 + "\nunknown model\ntauceti-review: review step wrote no post plan\n" + "=" * 72)
+    check(
+        "missing post plan excludes buffered prose",
+        failure_summary(log),
+        "tauceti-review: review step wrote no post plan",
+    )
+    value = record_review_failure(
+        state,
+        worker="w",
+        pr=45,
+        head="a" * 40,
+        provider="codex",
+        code=1,
+        reason="review #45 exited with status 1: gh: You have exceeded a secondary rate limit",
+    )
+    check(
+        "bubble reason retains GitHub rate-limit diagnosis",
+        "GitHub API rate limit" in public_review_failure(value),
+        True,
+    )
+
+    # Exercise the actual subprocess path, not just the extraction helper.
+    reports = []
+    original_report = agents.report_failure
+    stream_setting = os.environ.pop("TAUCETI_STREAM", None)
+    agents.report_failure = lambda reason, **kwargs: reports.append(reason)
+    try:
+        agents.run_to_logfile(
+            [sys.executable, "-c", "print('OSError: [Errno 7] Argument list too long'); print('cleanup'); exit(1)"],
+            state / "subprocess.log",
+            "review #42",
+        )
+    finally:
+        agents.report_failure = original_report
+        if stream_setting is not None:
+            os.environ["TAUCETI_STREAM"] = stream_setting
+    check("subprocess report retains operative error", "Argument list too long" in reports[-1], True)
 
     for i in range(4):
         record_review_failure(
@@ -139,7 +257,7 @@ class FakeGitHub(gh_mod.GitHub):
         return SimpleNamespace(returncode=0, stdout="")
 
 
-diagnostic = "- 2026-07-30T18:55:00Z: `reviewer-auth` via `claude` (exit 1): Not logged in"
+diagnostic = "- 2026-07-30T18:55:00Z: `reviewer-auth` via `claude` (exit 1): reviewer authentication failed"
 client = FakeGitHub()
 client.ensure_stuck_issue(1388, "its review errored", diagnostic)
 check("missing issue is created", client.calls[-1][:2], ["issue", "create"])
@@ -162,6 +280,17 @@ existing_body = gh_mod.GitHub._stuck_issue_body(1388, "its review errored", diag
 client = FakeGitHub([{"number": 1504, "title": "Review stuck: PR #1388", "body": existing_body}])
 client.ensure_stuck_issue(1388, "its review errored again", other_diagnostic)
 check("peer diagnostic does not clobber existing evidence", len(client.calls), 1)
+
+generic_body = gh_mod.GitHub._stuck_issue_body(1388, "its review errored", other_diagnostic)
+client = FakeGitHub([{"number": 1504, "title": "Review stuck: PR #1388", "body": generic_body}])
+client.ensure_stuck_issue(1388, "its review errored", diagnostic)
+check("specific diagnosis replaces generic issue", client.calls[-1][:2], ["issue", "edit"])
+client = FakeGitHub([{"number": 1504, "title": "Review stuck: PR #1388", "body": generic_body}])
+client.ensure_stuck_issue(1388, "another peer failed", other_diagnostic.replace("codex", "claude"))
+check("equally generic peers do not churn", len(client.calls), 1)
+client = FakeGitHub([{"number": 1504, "title": "Review stuck: PR #1388", "body": existing_body}])
+client.ensure_stuck_issue(1388, "another peer failed", diagnostic.replace("claude", "codex"))
+check("equally specific peers do not churn", len(client.calls), 1)
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

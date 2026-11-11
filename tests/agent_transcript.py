@@ -24,6 +24,20 @@ def event(renderer, value):
     return renderer.render_line(json.dumps(value, ensure_ascii=False) + "\n")
 
 
+# Captured from Claude 2.1.316 against a local API returning a credit-balance 400.
+# The assistant is synthetic and the final subtype says "success", despite exit 1.
+credit = tc.AgentTranscriptRenderer("claude")
+credit_out = "".join(
+    credit.render_line(line)
+    for line in (REPO / "tests/fixtures/claude_credit_refusal_2_1_316.jsonl").read_text().splitlines(keepends=True)
+)
+check("synthetic credit refusal remains visible", "Credit balance is too low" in credit_out)
+check("synthetic refusal is not structured work", not credit.saw_work)
+check(
+    "credit refusal has terminal HTTP evidence", credit.terminal_failure_final and "400" in credit.terminal_failure_text
+)
+
+
 # Captured from a real Codex 0.146 `exec --json` smoke call. Replaying the provider output guards the
 # top-level envelope as well as the individual hand-built edge cases below.
 captured_codex = tc.AgentTranscriptRenderer("codex")

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "fields": {
+    "pr": "number title body state isDraft mergeable updatedAt createdAt headRefOid headRefName baseRefName baseRefOid url additions deletions changedFiles headRepositoryOwner{login} headRepository{name} author{login __typename} labels(first:100){totalCount nodes{name}}",
+    "comment": "id fullDatabaseId body createdAt updatedAt authorAssociation author{login __typename}",
+    "review_comment": "id fullDatabaseId body createdAt updatedAt authorAssociation author{login __typename} replyTo{fullDatabaseId} path line originalLine diffHunk commit{oid} originalCommit{oid}",
+    "reaction": "databaseId content createdAt user{login}"
+  },
+  "paths": {
+    "issue_comments": "/issues/{number}/comments",
+    "review_comments": "/pulls/{number}/comments",
+    "reactions": "/pulls/comments/{id}/reactions"
+  },
+  "batch_limits": {"issue_comments": 100, "review_threads": 10, "statuses": 100, "reactions": 100},
+  "measured_costs": {"issue_comments_batch_100": 1, "review_threads_batch_10": 1, "statuses_batch_100": 1, "reactions_batch_100": 1},
+  "measurement_note": "2026-10-12 live samples: 100 issue histories, status reads, or reaction reads cost 1 point; 10 PRs with first 10 threads and first 20 comments cost 1 point, versus 2 with first 20 threads. Charges vary with density and overflow; always record rateLimit.cost."
+}

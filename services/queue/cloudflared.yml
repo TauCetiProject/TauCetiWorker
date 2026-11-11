@@ -1,0 +1,13 @@
+# cloudflared tunnel configuration for queue.taucetiproject.org: ~/.cloudflared/config.yml on the
+# service host (docs/queue/operations.md, "Public endpoint"). Replace TUNNEL_ID with the UUID
+# that `cloudflared tunnel create tauceti-queue` prints; the credentials file it writes stays
+# under ~/.cloudflared/ with mode 0600.
+tunnel: TUNNEL_ID
+credentials-file: /home/operator/.cloudflared/TUNNEL_ID.json
+ingress:
+  - hostname: queue.taucetiproject.org
+    service: http://127.0.0.1:8780
+    originRequest:
+      connectTimeout: 10s
+      noTLSVerify: false
+  - service: http_status:404

@@ -12,12 +12,52 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Reuse existing Namespace profiles. Leaving priority unspecified keeps these
+# checks behind Bors control (priority 0) and compilation (priority 1).
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  # Classify the change so documentation-only pull requests skip the jobs that cannot observe them.
+  # Only tests/run-all's DOCS_CONTRACT modules read README.md, docs/ or workers.toml.example, so a
+  # change confined to docs/ and Markdown (outside prompts/ and tests/, which the suite and the
+  # wheel bundle) runs just those; pushes and the schedule always run everything.
+  changes:
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-2x4-with-features
+      - namespace-features:github.run-id=${{ github.run_id }}
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+      - id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          docs_only=false
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            git fetch --quiet --depth=1 origin "$BASE_SHA"
+            changed="$(git diff --name-only "$BASE_SHA" HEAD)"
+            printf 'changed files:\n%s\n' "$changed"
+            if [ -n "$changed" ] && ! printf '%s\n' "$changed" | grep -vE '^docs/|\.md$' | grep -q . \
+               && ! printf '%s\n' "$changed" | grep -qE '^(prompts|tests)/'; then
+              docs_only=true
+            fi
+          fi
+          echo "docs_only=$docs_only"
+          echo "docs_only=$docs_only" >>"$GITHUB_OUTPUT"
+
+  # The suite is split by filesystem needs, not size: tests/run-all --group portable runs every
+  # module whose fixtures do not depend on native inode/device metadata, in parallel on an existing
+  # Namespace profile (the one the docker job already uses), while --group native runs the few that
+  # do on GitHub's ubuntu-24.04 image. The `test` job below folds both into the one required check.
+  test-portable:
+    name: test (portable)
+    needs: changes
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-8x16-with-features
+      - namespace-features:github.run-id=${{ github.run_id }}
     env:
-      # The worker is stdlib-only (bar the TUI's rich/textual), so test on one interpreter — the
-      # latest uv ships — rather than a per-version matrix. requires-python >=3.11 is a declaration.
+      # Test on the latest interpreter uv ships; macOS observations have their own native job.
+      # requires-python >=3.11 is a declaration rather than a per-version matrix.
       UV_PYTHON: "3.14"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -25,11 +65,100 @@ jobs:
         with:
           enable-cache: true
           cache-suffix: test
-      - name: Run the test suite
-        run: ./tests/run-all
+      - name: Run the portable test modules
+        if: needs.changes.outputs.docs_only != 'true'
+        run: ./tests/run-all -j "$(nproc)" --group portable
+      - name: Run the modules that assert on the documentation
+        if: needs.changes.outputs.docs_only == 'true'
+        run: ./tests/run-all -j "$(nproc)" --group docs
+
+  test-native:
+    name: test (native)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    # Storage fixtures require native, consistent inode/device metadata.
+    runs-on: ubuntu-24.04
+    env:
+      UV_PYTHON: "3.14"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-suffix: test
+      - name: Run the native-filesystem test modules
+        run: ./tests/run-all -j "$(nproc)" --group native
+
+  # Branch protection requires a check called `test`; this job is that check, and it is green only
+  # when the classification ran and every shard it called for succeeded.
+  test:
+    needs: [changes, test-portable, test-native]
+    if: ${{ !cancelled() }}
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-2x4-with-features
+      - namespace-features:github.run-id=${{ github.run_id }}
+    steps:
+      - name: Require every test shard
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          PORTABLE: ${{ needs.test-portable.result }}
+          NATIVE: ${{ needs.test-native.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+        run: |
+          echo "changes=$CHANGES portable=$PORTABLE native=$NATIVE docs_only=$DOCS_ONLY"
+          test "$CHANGES" = success
+          test "$PORTABLE" = success
+          if [ "$DOCS_ONLY" = true ]; then
+            test "$NATIVE" = skipped
+          else
+            test "$NATIVE" = success
+          fi
+
+  macos-recovery:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: Check the source-checkout launcher environment
+        run: ./tauceti --help
+      - name: Check native macOS recovery observations and cleanup
+        run: >-
+          uv run python tests/recovery_maintenance.py
+          RecoveryMaintenance.test_darwin_process_references_protect_cwd_files_and_session
+          RecoveryMaintenance.test_darwin_missing_psutil_defers_cleanup_and_launchers_declare_it
+          RecoveryMaintenance.test_darwin_candidate_uses_kernel_spelling_for_live_references_and_mounts
+          RecoveryMaintenance.test_darwin_owner_session_survives_leader_exit_but_not_pid_reuse_or_reboot
+          RecoveryMaintenance.test_darwin_cleanup_and_record_retirement_without_procfs
+          RecoveryMaintenance.test_native_darwin_process_references_and_owner_birth
+          RecoveryMaintenance.test_native_darwin_session_survives_leader_exit
+
+  prices:
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-2x4-with-features
+      - namespace-features:github.run-id=${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out the review engine's price table
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: TauCetiProject/TauCetiReview
+          path: .review-engine
+          sparse-checkout: runner/prices.json
+          sparse-checkout-cone-mode: false
+      # tauceti_worker/prices.json is a vendored copy, not a second table: the review engine owns
+      # the rates, and two editable copies of a price table is how the cost model and the engine
+      # came to disagree. Report the command that re-vendors it rather than a diff to hand-apply.
+      - name: Compare the vendored price table with its source
+        run: |
+          if ! diff -u .review-engine/runner/prices.json tauceti_worker/prices.json; then
+            echo "::error file=tauceti_worker/prices.json::Vendored price table has drifted from TauCetiProject/TauCetiReview runner/prices.json. Change rates there, then re-vendor: cp .review-engine/runner/prices.json tauceti_worker/prices.json"
+            exit 1
+          fi
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-2x4-with-features
+      - namespace-features:github.run-id=${{ github.run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -46,10 +175,14 @@ jobs:
       # --severity=warning: skip the info/style notes on the deliberate `A && B || C` test idiom
       # (where B, an echo, always succeeds), while still failing on real warnings and errors.
       - name: ShellCheck
-        run: shellcheck --severity=warning scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/docker-entrypoint tests/*.sh tests/run-all
+        run: shellcheck --severity=warning scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/docker-entrypoint services/queue/*.sh tests/*.sh tests/run-all
 
   build:
-    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-2x4-with-features
+      - namespace-features:github.run-id=${{ github.run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -73,11 +206,17 @@ jobs:
           base = pathlib.Path(m.__file__).parent
           assert (base / "prompts").is_dir(), "prompts/ missing from the installed wheel"
           assert (base / "scripts").is_dir(), "scripts/ missing from the installed wheel"
-          print("bundled prompts/ and scripts/ present")
+          from tauceti_worker.cost_model import AI_PRICES
+          assert AI_PRICES, "prices.json missing from the installed wheel"
+          print("bundled prompts/, scripts/ and prices.json present")
           PY
 
   docker:
-    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on:
+      - nscloud-ubuntu-24.04-amd64-8x16-with-features
+      - namespace-features:github.run-id=${{ github.run_id }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -120,6 +259,14 @@ jobs:
             set -e
             ! printf "%s\n" "$claude_output" | grep -F "cannot be used with root/sudo privileges"
           '
+      # Exercise the pinned native CLI through the queue launcher, with a local
+      # scripted API and an isolated home: no model calls or credentials needed.
+      - name: Queue Claude stdin regression
+        run: |
+          docker run --rm --entrypoint python3 \
+            -v "$PWD:/workspace:ro" -w /workspace \
+            -e TAUCETI_TEST_CLAUDE=claude \
+            tauceti-worker:ci tests/queue_claude_stdin.py
       - name: Smoke-test configurable worker options
         run: |
           TAUCETI_WORKER_ARGS=--help docker compose run --rm --no-deps tauceti 2>&1 |

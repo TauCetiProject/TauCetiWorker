@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Shared local verification from the worker's pinned TauCetiTools installation."""
+
+import sys
+
+from tauceti_tools.templates import import_shared, run_script
+
+if __name__ == "__main__":
+    raise SystemExit(run_script("local_axioms.py", sys.argv[1:]))
+else:
+    implementation = import_shared("local_axioms.py", __name__)
+    globals().update(vars(implementation))
+    sys.modules[__name__] = implementation
