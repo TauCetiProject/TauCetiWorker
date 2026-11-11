@@ -175,13 +175,14 @@ def _is_partial(clause: str) -> bool:
     return clause.partition(":")[0].strip().lower() == "partial"
 
 
-def inflight_pr(item: TargetItem) -> int | None:
-    """The pull request an item's `in flight: #N` clause names."""
+def inflight_ref(item: TargetItem) -> str | None:
+    """The pull request an item's `in flight:` clause names, as written: `#N` for a GitHub one, the
+    URL of a Forgejo one."""
     for clause in item.meta:
         key, _, value = clause.partition(":")
-        number = re.search(r"#(\d+)", value)
-        if key.strip().lower() == "in flight" and number:
-            return int(number.group(1))
+        found = re.search(r"https?://[^\s,;]+|#\d+", value)
+        if key.strip().lower() == "in flight" and found:
+            return found.group(0)
     return None
 
 

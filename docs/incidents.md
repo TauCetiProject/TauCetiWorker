@@ -74,7 +74,7 @@ Every record has:
 | --- | --- | --- |
 | `schema` | string | `tauceti-incident/v1` |
 | `kind` | string | `declined`, `budget-spent` or `target-closed` |
-| `key` | string | `<stage>-<pr>`, or `<stage>-<pr>.<digest>` for another source (see above); `<slug>-<pr>` for `target-closed`, which is only about the configured GitHub repository |
+| `key` | string | `<stage>-<pr>`, or `<stage>-<pr>.<digest>` for another source (see above); `<slug>-<pr>` for `target-closed`, with the same digest suffix for another source |
 | `worker` | string | Id of the worker that wrote the file last |
 | `first_at`, `last_at` | string | UTC times of the first and the latest write, `YYYY-MM-DDTHH:MM:SSZ` |
 | `count` | integer | Number of times the live file has been written |
@@ -156,7 +156,7 @@ per worker, so the record is the first worker's; another worker may still have
 attempts for that head. `--dry-run` writes nothing.
 
 **`target-closed`.** By the [`curate` phase](target-lists.md#curation), for a
-`[~]` item whose `in flight: #N` pull request closed without merging, unless a
+`[~]` item whose `in flight:` pull request closed without merging, unless a
 `declined` record about that pull request names replacements that have all
 merged; the item is then marked done instead. One write per item and pull
 request: a record that exists, live or acknowledged, is left alone. Settle it
@@ -198,8 +198,8 @@ the list.
 | `source_of(gh)` | The repository a worker's forge client serves, for `subject` |
 | `find(kind, key)` | The live and the acknowledged record of that name, where they exist |
 | `records(kind="", acked=True)` | Every readable record with its path, live ones first |
-| `record_declined(...)`, `note_budget_spent(...)`, `note_target_closed(...)` | The three kinds above; the first two take `repository=` and `repository_id=` |
+| `record_declined(...)`, `note_budget_spent(...)`, `note_target_closed(...)` | The three kinds above; the first two take `repository=` and `repository_id=`, the third `repository` |
 | `declined(stage, pr, head, repository=None)` | Whether the hold applies |
-| `subsumed_by(pr, head)` | The pull requests the latest `declined` record about `pr` of the configured GitHub repository at `head` names on its `Subsumed-by:` line |
+| `subsumed_by(pr, head, repository=None)` | The pull requests of `repository` the latest `declined` record about its `pr` at `head` names on its `Subsumed-by:` line |
 
 A new kind needs only a name and a key that is unique within it.

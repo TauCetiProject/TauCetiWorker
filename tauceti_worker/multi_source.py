@@ -195,17 +195,21 @@ def run_round(w, opts, *, use_fleet_focus=True):
             raise waits[0]
         raise NoProgress("all selected source surveys are unavailable")
     if want(opts.only, "curate") and not getattr(opts, "prs", ()):
-        # The target list is curated against GitHub, once a round and ahead of any source's work.
-        github = next(((worker, result) for name, worker, result in healthy if name == "github"), None)
-        if github is not None:
-            try:
-                return ordinary_round(github[0], dataclasses.replace(opts, only=["curate"]), prepared_survey=github[1])
-            except NoProgress as error:
-                if opts.only == ["curate"]:
-                    raise
-                log(f"{error}; going on to the other selected work")
-        elif opts.only == ["curate"]:
-            raise NoProgress("curate: GitHub was not surveyed this round, and the target list is curated against it")
+        # Once a round and ahead of any source's work, curation reads every healthy source. It runs
+        # in GitHub's round when GitHub was surveyed, otherwise in the new-PR forge's.
+        destination = os.environ.get("TAUCETI_NEW_PR_FORGE", "github")
+        name, worker, result = min(healthy, key=lambda row: (row[0] != "github", row[0] != destination))
+        worker.target_sources = [other.gh for _, other, _ in healthy if other is not worker]
+        selected = dataclasses.replace(opts, only=["curate"])
+        try:
+            if name == "github":
+                return ordinary_round(worker, selected, prepared_survey=result)
+            with activate(worker.gh, worker.cfg):
+                return ordinary_round(worker, selected, prepared_survey=result)
+        except NoProgress as error:
+            if opts.only == ["curate"]:
+                raise
+            log(f"{error}; going on to the other selected work")
         opts = dataclasses.replace(opts, only=[task for task in opts.only if task != "curate"])
     executable = [(name, worker, result) for name, worker, result in healthy if name == "github" or opts.sandbox_host]
     if len(executable) != len(healthy):

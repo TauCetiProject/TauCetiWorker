@@ -15,11 +15,11 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
-from tauceti_tools.forge import Forge, RepositoryRef
+from tauceti_tools.forge import GITHUB, Forge, RepositoryRef
 
 import tauceti_worker as tc
 from tauceti_worker import curate, incidents
@@ -42,9 +42,23 @@ def marker(area, slug, **extra):
     return f"<!--tauceti-target:v1 {json.dumps({'focus': area, 'id': slug, **extra})}-->"
 
 
+def ref(n):
+    return n if isinstance(n, str) else f"#{n}"
+
+
 def seen(merged=(), pulls=None, subsumed=None, open_keys=()):
-    rows = [{"number": n, "body": body} for n, body in merged]
-    return curate.Seen(rows, pulls or {}, subsumed or {}, set(open_keys))
+    """A GitHub pull request is given by number, any other by URL; a merged one by URL has a `url`."""
+    rows = [
+        {"number": int(str(n).rsplit("/", 1)[-1]), "body": body, **({"url": n} if isinstance(n, str) else {})}
+        for n, body in merged
+    ]
+    pulls = {ref(n): d for n, d in (pulls or {}).items()}
+    subsumed = {ref(n): [ref(m) for m in by] for n, by in (subsumed or {}).items()}
+    return curate.Seen(rows, pulls, subsumed, set(open_keys))
+
+
+def on_github(gh):
+    return [curate.Source(gh, RepositoryRef(GITHUB, "TauCetiProject/TauCeti"))]
 
 
 def settled(text, observed):
@@ -108,8 +122,8 @@ class Rewrite(unittest.TestCase):
         out = t.rewrite_item(EXAMPLE, law, "inflight", drop=("serves", "needs"))
         self.assertIn("- [~] `strong-law` — the strong law\n", out)
         self.assertEqual(t.rewrite_item(EXAMPLE, law, "open"), EXAMPLE)
-        self.assertEqual(t.inflight_pr(bounds), 1234)
-        self.assertIsNone(t.inflight_pr(law))
+        self.assertEqual(t.inflight_ref(bounds), "#1234")
+        self.assertIsNone(t.inflight_ref(law))
 
     def test_an_item_the_file_no_longer_has_changes_nothing(self):
         notes = t.TargetItem("Probability", "second-moment-route", "open", "")
@@ -155,7 +169,7 @@ class Settle(unittest.TestCase):
         out, stranded = settled(EXAMPLE, seen(pulls=closed, subsumed={1234: [398, 401]}))
         self.assertIn("(needs: none; subsumed by: #398, #401; closed: #1234)", out)
         self.assertEqual((t.parse_targets(out).find("truncation-bounds").status, stranded), ("done", []))
-        self.assertEqual(settled(EXAMPLE, seen(pulls=closed)), (EXAMPLE, [("truncation-bounds", 1234)]))
+        self.assertEqual(settled(EXAMPLE, seen(pulls=closed)), (EXAMPLE, [("truncation-bounds", "#1234")]))
 
     def test_a_partial_pull_request_closed_and_replaced_opens_its_item_again(self):
         body = marker("Probability", "truncation-bounds", partial=True)
@@ -205,18 +219,20 @@ class Records(Tmp):
             401: {"state": "CLOSED", "title": "[Merged by Bors] - y"},
         }
         gh, views = self.github(states)
-        observed = curate.observe(t.parse_targets(EXAMPLE), gh)
-        self.assertEqual(observed.subsumed, {1234: [398, 401]})
+        observed = curate.observe(t.parse_targets(EXAMPLE), on_github(gh))
+        self.assertEqual(observed.subsumed, {"#1234": ["#398", "#401"]})
         self.assertEqual(observed.open_keys, {("Probability", "strong-law")})
         self.assertEqual((observed.merged[0]["limit"], views), (curate.MERGED_LIMIT, [1234, 398, 401]))
         self.assertIn("sort:updated-desc", observed.merged[0]["search"])
         states[1234]["headRefOid"] = "b" * 40
-        self.assertEqual(curate.observe(t.parse_targets(EXAMPLE), self.github(states)[0]).subsumed, {})
+        self.assertEqual(curate.observe(t.parse_targets(EXAMPLE), on_github(self.github(states)[0])).subsumed, {})
         states[1234]["headRefOid"] = "a" * 40
         states[401]["title"] = "y"
-        self.assertEqual(curate.observe(t.parse_targets(EXAMPLE), self.github(states)[0]).subsumed, {})
+        self.assertEqual(curate.observe(t.parse_targets(EXAMPLE), on_github(self.github(states)[0])).subsumed, {})
         gh, views = self.github({})
-        self.assertEqual((curate.observe(t.parse_targets(EXAMPLE), gh).pulls, views), ({1234: {}}, [1234]))
+        self.assertEqual(
+            (curate.observe(t.parse_targets(EXAMPLE), on_github(gh)).pulls, views), ({"#1234": {}}, [1234])
+        )
 
     def test_a_closed_pull_request_without_one_is_recorded_once(self):
         path = self.tmp / "targets.md"
@@ -555,6 +571,94 @@ class Round(Tmp):
         self.assertTrue(curate.due(tc.Counters(SimpleNamespace(state=self.tmp / "other")))[0])
 
 
+class ForgejoLists(Tmp):
+    """Curation over a Forgejo source, built as upstream's Forgejo tests build one: a real
+    ForgejoWorkerSource over a mocked native API."""
+
+    def setUp(self):
+        super().setUp()
+        from tauceti_tools.ci_candidate import RepositoryIdentity
+
+        from tauceti_worker.forgejo_worker import ForgejoWorkerSource
+
+        self.repo = RepositoryRef(Forge("forgejo", "https://git.example.org"), "TauCetiProject/TauCeti")
+        api = Mock(forge=self.repo.forge, _token="fixture-token", max_bytes=1024 * 1024, max_pages=100)
+        self.forgejo = ForgejoWorkerSource(RepositoryIdentity(self.repo, 7), api, token_file=None)
+        api.pulls.return_value = [
+            {"number": 3, "body": marker("MeasureTheory", "kolmogorov-zero-one"), "state": "closed", "merged": True}
+        ]
+        self.forgejo.open_prs = Mock(return_value=[])
+        self.states = {}
+        self.forgejo.pr_view = Mock(side_effect=lambda number, fields: dict(self.states.get(number, {"state": "OPEN"})))
+        self.path = self.tmp / "targets.md"
+        env = {"TAUCETI_ROADMAP_TARGETS": str(self.path), "TAUCETI_INCIDENTS_DIR": str(self.tmp / "incidents")}
+        for item in (patch.dict(os.environ, env), patch.object(curate, "_main_checkout", return_value=None)):
+            item.start()
+            self.addCleanup(item.stop)
+        cfg = SimpleNamespace(state=self.tmp / "state", logdir=self.tmp / "logs", wid="worker3")
+        cfg.state.mkdir()
+        self.counters = tc.Counters(cfg)
+        self.cfg = cfg
+
+    def curate(self, gh, others=()):
+        w = SimpleNamespace(cfg=self.cfg, counters=self.counters, gh=gh, target_sources=list(others))
+        lock = self.path.with_name(".targets.md.lock")
+        if lock.exists():
+            os.utime(lock, (0, 0))
+        c = tc.Candidate(0, "", "")
+        return curate.run(w, c, "claude"), c.reason
+
+    def github(self, states):
+        return SimpleNamespace(
+            repo="TauCetiProject/TauCeti",
+            merged_prs=lambda search, limit: [],
+            open_prs=lambda: [],
+            pr_view=lambda number, fields: dict(states.get(number) or {"state": "OPEN"}),
+        )
+
+    def test_a_forgejo_only_worker_settles_what_landed_on_forgejo(self):
+        url = self.repo.pull_url(12)
+        self.path.write_text(EXAMPLE.replace("in flight: #1234", f"in flight: {url}"))
+        self.states = {12: {"state": "MERGED", "body": "", "headRefOid": "a" * 40}}
+        self.assertEqual(self.curate(self.forgejo), (0, ""))
+        text = self.path.read_text()
+        self.assertIn(f"(needs: none; landed: {url})", text)
+        self.assertIn(f"needs: `borel-cantelli`; landed: {self.repo.pull_url(3)})", text)
+        self.forgejo.pr_view.assert_called_once_with(12, ["state", "title", "body", "headRefOid"])
+
+    def test_a_mixed_worker_settles_items_from_both_forges(self):
+        self.path.write_text(EXAMPLE)
+        github = self.github({1234: {"state": "MERGED", "body": ""}})
+        self.assertEqual(self.curate(github, [self.forgejo]), (0, ""))
+        text = self.path.read_text()
+        self.assertIn("(needs: none; landed: #1234)", text)
+        self.assertIn(f"landed: {self.repo.pull_url(3)})", text)
+        self.forgejo.pr_view.assert_not_called()
+
+    def test_the_same_number_on_the_other_forge_is_not_taken_for_it(self):
+        self.forgejo.api.pulls.return_value = []
+        self.path.write_text(EXAMPLE.replace("in flight: #1234", "in flight: #12"))
+        self.states = {12: {"state": "MERGED", "body": ""}, 398: {"state": "MERGED", "body": ""}}
+        incidents.record_declined("fix", 12, "a" * 40, message="Subsumed-by: #398", repository=self.repo)
+        github = self.github({12: {"state": "CLOSED", "body": "", "headRefOid": "a" * 40}})
+        rc, reason = self.curate(github, [self.forgejo])
+        self.assertEqual((rc, self.path.read_text()), (None, EXAMPLE.replace("in flight: #1234", "in flight: #12")))
+        self.assertIn("1 in-flight item(s) name a closed pull request", reason)
+        ((file, value),) = incidents.records(incidents.TARGET_CLOSED)
+        self.assertEqual((file.name, value["forge"]["kind"]), ("target-closed-truncation-bounds-12.json", "github"))
+        url = self.repo.pull_url(12)
+        self.path.write_text(EXAMPLE.replace("in flight: #1234", f"in flight: {url}"))
+        self.states[12] = {"state": "CLOSED", "body": "", "headRefOid": "a" * 40}
+        self.assertEqual(self.curate(github, [self.forgejo])[0], 0)
+        self.assertIn(f"(needs: none; subsumed by: {self.repo.pull_url(398)}; closed: {url})", self.path.read_text())
+        self.path.write_text(EXAMPLE.replace("in flight: #1234", f"in flight: {self.repo.pull_url(13)}"))
+        self.states[13] = {"state": "CLOSED", "body": "", "headRefOid": "b" * 40}
+        self.curate(github, [self.forgejo])
+        names = sorted(file.name for file, _ in incidents.records(incidents.TARGET_CLOSED))
+        self.assertEqual(len(names), 2)
+        self.assertRegex(names[1], r"^target-closed-truncation-bounds-13\.[0-9a-f]{12}\.json$")
+
+
 class Wiring(Tmp):
     def round(self, only, *, due=(True, "the target list is due a look"), outcome=0, **opts):
         seen = []
@@ -590,46 +694,46 @@ class Wiring(Tmp):
         self.assertEqual(self.round(["curate"], outcome=None), (["curate", "curate: the target list is current"], 1))
         self.assertEqual(self.round(["curate"], due=(False, "looked at 1.0h ago")), (["curate: looked at 1.0h ago"], 1))
 
-    def test_a_round_over_several_sources_curates_against_github_first(self):
+    def test_a_round_over_several_sources_curates_once_reading_every_source(self):
         import contextlib
 
         from tauceti_worker import multi_source
 
-        github = SimpleNamespace(cfg=SimpleNamespace(wid="test"))
+        github = SimpleNamespace(cfg=SimpleNamespace(wid="test"), gh=SimpleNamespace(repo="TauCetiProject/TauCeti"))
+        forgejo = SimpleNamespace(cfg=SimpleNamespace(wid="test"), gh=SimpleNamespace(direct_source=True))
 
         def observed(*sources):
             return [(name, worker, tc.Survey(worker_id="test")) for name, worker in sources]
 
-        def ran(only, observations, outcomes):
+        def ran(only, observations, outcomes, destination="github"):
             opts = work.RoundOpts(only=only, agent="auto", work_model="auto", sandbox_host=True, dry_run=True)
             with (
-                patch.dict(os.environ, {"TAUCETI_NEW_PR_FORGE": "github"}),
+                patch.dict(os.environ, {"TAUCETI_NEW_PR_FORGE": destination}),
                 patch.object(multi_source, "log"),
                 patch.object(multi_source, "collect", return_value=observations),
                 patch.object(multi_source, "deduplicate"),
-                patch.object(multi_source, "activate", return_value=contextlib.nullcontext()),
+                patch.object(multi_source, "activate", return_value=contextlib.nullcontext()) as activated,
                 patch.object(work, "run_round", side_effect=outcomes) as execute,
             ):
                 try:
                     result = multi_source.run_round(None, opts)
                 except tc.NoProgress as error:
                     result = str(error)
-            return result, [
+            calls = [
                 (call.args[0], call.args[1].only, call.kwargs["prepared_survey"]) for call in execute.call_args_list
             ]
+            return result, calls, activated.call_count
 
-        both = observed(("github", github), ("forgejo", SimpleNamespace()))
-        self.assertEqual(ran(["curate"], both, [0]), (0, [(github, ["curate"], both[0][2])]))
+        both = observed(("github", github), ("forgejo", forgejo))
+        self.assertEqual(ran(["curate"], both, [0]), (0, [(github, ["curate"], both[0][2])], 0))
+        self.assertEqual(github.target_sources, [forgejo.gh])
         current = tc.NoProgress("curate: the target list is current")
-        result, calls = ran(["roadmap", "curate"], both, [current, 0])
+        result, calls, _ = ran(["roadmap", "curate"], both, [current, 0])
         self.assertEqual((result, [only for _, only, _ in calls]), (0, [["curate"], ["roadmap"]]))
-        self.assertEqual(ran(["curate"], both, [current]), ("curate: the target list is current", calls[:1]))
-        alone = observed(("forgejo", SimpleNamespace()))
-        result, calls = ran(["curate"], alone, [])
-        self.assertEqual(
-            (result, calls),
-            ("curate: GitHub was not surveyed this round, and the target list is curated against it", []),
-        )
+        self.assertEqual(ran(["curate"], both, [current])[:2], ("curate: the target list is current", calls[:1]))
+        alone = observed(("forgejo", forgejo))
+        self.assertEqual(ran(["curate"], alone, [0], "forgejo"), (0, [(forgejo, ["curate"], alone[0][2])], 1))
+        self.assertEqual(forgejo.target_sources, [])
 
     def test_the_task_is_explicit_and_runs_on_the_host(self):
         self.assertEqual((work.want([], "curate"), work.want(["curate"], "curate")), (False, True))

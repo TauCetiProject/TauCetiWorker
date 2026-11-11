@@ -45,11 +45,11 @@ first `## ` heading is shown to the agent with the items of its area.
   once work has started.
 - A trailing parenthesised group holds `key: value` clauses separated by `;`,
   with no parentheses inside. `needs:` is a comma list of slugs from any area,
-  or `none`. `partial: #N, #M` names merged GitHub pull requests that did not
-  complete the item; a Forgejo pull request is named by its URL. `in flight: #N`
-  on a `[~]` item names the pull request it waits on, which is how
-  [curation](#curation) follows it. Every other clause is passed to the agent as
-  written.
+  or `none`. `partial: #N, #M` names merged pull requests that did not complete
+  the item. `in flight: #N` on a `[~]` item names the pull request it waits on,
+  which is how [curation](#curation) follows it. A GitHub pull request is named
+  `#N` in these clauses and a Forgejo one by its URL. Every other clause is
+  passed to the agent as written.
 - An item line that does not parse is logged and skipped. A `needs:` slug the
   file never defines is logged and blocks nothing.
 
@@ -115,16 +115,18 @@ looks at the list first when a look is due, which is once every
 `TAUCETI_CURATE_GAP` seconds (six hours by default) for all the workers that
 share the file on one host. A look that changes the file is the round's work;
 after one that changes nothing the round goes on to its other phases. A round
-given `--pr` does not curate. One worker per list is enough. A worker that also
-works a Forgejo source curates against GitHub, ahead of either source's work;
-in a round where GitHub could not be surveyed it does not curate.
+given `--pr` does not curate. One worker per list is enough. In a round over
+several sources the look runs once, ahead of either source's work, and reads
+every source surveyed that round: in GitHub's round when GitHub was surveyed,
+otherwise in the round of the forge new pull requests go to. A clause that
+names a pull request of a source the round did not read is left as it is.
 
 A look makes these edits, each to one item line; every other line stays as it
 was:
 
 | What it finds | The item becomes |
 | --- | --- |
-| A merged pull request completes the item by its marker, under the rules of [Live statuses](#live-statuses) | `[x]`, with `landed: #N` |
+| A merged pull request completes the item by its marker, under the rules of [Live statuses](#live-statuses) | `[x]`, with `landed: #N` (on Forgejo, its URL; likewise below) |
 | The pull request a `[~]` item names in `in flight: #N` merged | `[x]`, with `landed: #N` |
 | That pull request merged, but its marker for the item says `"partial":true` | `[ ]`, with `#N` added to `partial:` |
 | That pull request closed unmerged, and a `declined` [incident record](incidents.md) about it at its last head names the pull requests that replaced it, all of them merged | `[x]`, with `subsumed by: #M; closed: #N` |
@@ -132,11 +134,16 @@ was:
 | That pull request closed unmerged, with no such record | unchanged; a `target-closed` incident record asks the operator to mark it `[ ]` or `[x]` |
 | A model confirms that main already has an eligible item (below) | `[x]`, with `landed elsewhere: <file> <declaration>` |
 
-An `in flight:` clause is removed when its item is settled. The merged side
-reads the 1000 most recently updated closed pull requests that carry a marker.
+An `in flight:` clause is removed when its item is settled. A record about a
+closed pull request is looked up for that pull request's own repository, and
+the replacements it names are pull requests of the same one. The merged side
+reads, on each forge, the 1000 most recent merged pull requests that carry a
+marker (on GitHub the most recently updated, on Forgejo the most recently
+created).
 
 **Landed elsewhere.** A milestone can land without any pull request naming it.
-For each eligible item, the worker searches a fresh shallow checkout of main
+For each eligible item, the worker searches a fresh shallow checkout of main,
+which every forge's landings reach,
 for declarations of the Lean names the description quotes in backticks (dotted,
 capitalised or with an underscore), and of the slug's words in any case with or
 without underscores between them. An item qualifies when every quoted name is
@@ -177,8 +184,9 @@ next look. A
 branch that tracks nothing is committed and not pushed. Add the lock file to
 `.gitignore`.
 
-A look costs one search for merged markers, one listing of open pull requests,
-one read per `in flight:` clause and per replacement a record names, and, when
+A look costs, on each forge it reads, one search for merged markers and one
+listing of open pull requests, plus one read per `in flight:` clause and per
+replacement a record names, and, when
 an item is eligible, a shallow fetch of main and one `git grep` per quoted name
 and per slug.
 

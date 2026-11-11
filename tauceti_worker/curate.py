@@ -28,11 +28,13 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from tauceti_tools.forge import GITHUB, RepositoryRef
+
 from . import incidents
-from .config import Die, log, one_line, roadmap_targets
+from .config import Die, SourceUnavailable, log, one_line, roadmap_targets
 from .constants import TAUCETI
 from .github import GitHubError, normalize_merged
 from .paths import HERE
@@ -42,7 +44,7 @@ from .targets import (
     TargetItem,
     Targets,
     eligible_items,
-    inflight_pr,
+    inflight_ref,
     landed,
     marker_keys,
     overlay_live,
@@ -79,13 +81,69 @@ class Change:
 
 
 @dataclass(frozen=True)
-class Seen:
-    """What one curation read from GitHub and the incident records."""
+class Source:
+    """One forge's pull requests as curation reads them. The list names a GitHub pull request `#N`
+    and any other by its URL, as the roadmap round does."""
 
-    merged: list[dict]  # merged pull requests that carry a target marker
-    pulls: dict[int, dict]  # the pull request each `in flight: #N` clause names
-    subsumed: dict[int, list[int]]  # a closed one of those -> the merged pull requests replacing it
+    reads: object  # the GitHub client or the Forgejo worker source
+    repository: RepositoryRef
+    native: bool = False
+    shared: bool = False  # GitHub read from inside another source's round
+
+    def ref(self, number: int) -> str:
+        return self.repository.pull_url(number) if self.native else f"#{number}"
+
+    def number(self, ref: str) -> int | None:
+        found = re.fullmatch(r"https?://\S*?(\d+)" if self.native else r"#(\d+)", ref)
+        if found is None or (self.native and self.repository.pull_url(int(found.group(1))) != ref):
+            return None
+        return int(found.group(1))
+
+    def _read(self, method: str, *args, **kwargs):
+        if not self.shared:
+            return getattr(self.reads, method)(*args, **kwargs)
+        from .worker_sources import shared_github_environment
+
+        with shared_github_environment():
+            return getattr(self.reads, method)(*args, **kwargs)
+
+    def open_prs(self) -> list[dict]:
+        rows = self._read("open_prs")
+        if rows is None:
+            raise SourceUnavailable(f"open pull requests of {self.repository.name} are unavailable")
+        return rows
+
+    def merged_prs(self) -> list[dict]:
+        return self._read("merged_prs", f"{MERGED_SEARCH} sort:updated-desc", limit=MERGED_LIMIT)
+
+    def view(self, number: int) -> dict:
+        row = self._read("pr_view", number, ["state", "title", "body", "headRefOid"]) or {}
+        return row if self.native else normalize_merged(row)
+
+
+def sources(w) -> list[Source]:
+    """The worker's own source and the others a multi-source round hands it (`target_sources`)."""
+    from .worker_sources import current
+
+    found = []
+    for gh in (w.gh, *getattr(w, "target_sources", ())):
+        if getattr(gh, "direct_source", False):
+            found.append(Source(gh, gh.repository, native=True))
+        else:
+            found.append(Source(gh, RepositoryRef(GITHUB, getattr(gh, "repo", TAUCETI)), shared=current() is not None))
+    return found
+
+
+@dataclass(frozen=True)
+class Seen:
+    """What one curation read from the forges and the incident records. A pull request is named as
+    the list names it (`Source.ref`)."""
+
+    merged: list[dict]  # merged pull requests that carry a target marker; a Forgejo one has a `url`
+    pulls: dict[str, dict]  # the pull request each `in flight:` clause names
+    subsumed: dict[str, list[str]]  # a closed one of those -> the merged pull requests replacing it
     open_keys: set[Key]  # the items an open pull request's marker names
+    where: dict[str, tuple[RepositoryRef, int]] = field(default_factory=dict)  # a viewed one's repository and number
 
 
 def _lock_path(path: Path) -> Path:
@@ -107,11 +165,17 @@ def due(counters) -> tuple[bool, str]:
     return True, "the target list is due a look"
 
 
-def _refs(numbers: Iterable[int]) -> str:
-    return ", ".join(f"#{n}" for n in numbers)
+def _refs(refs: Iterable[str]) -> str:
+    """GitHub `#N` references in number order, then URLs."""
+    return ", ".join(sorted(set(refs), key=lambda ref: (0, int(ref[1:]), "") if ref.startswith("#") else (1, 0, ref)))
 
 
-def settle(targets: Targets, seen: Seen) -> tuple[list[Change], list[tuple[TargetItem, int]]]:
+def _partial_refs(item: TargetItem) -> set[str]:
+    clauses = " ".join(c.partition(":")[2] for c in item.meta if c.partition(":")[0].strip().lower() == "partial")
+    return {f"#{n}" for n in partial_prs(item)} | set(re.findall(r"https?://[^\s,;]+", clauses))
+
+
+def settle(targets: Targets, seen: Seen) -> tuple[list[Change], list[tuple[TargetItem, str]]]:
     """The edits that `seen` implies for the items not yet done, and the in-flight items it leaves
     to the operator, each with the closed pull request it names.
 
@@ -121,32 +185,35 @@ def settle(targets: Targets, seen: Seen) -> tuple[list[Change], list[tuple[Targe
     the item and joins its `partial:` clause; one that was partial and closed reopens it with its
     replacements in that clause instead."""
     pending = [it for it in targets.items() if it.status != "done"]
-    by_marker = landed(pending, seen.merged)
+    by_marker: dict[Key, str] = {}
+    for row in seen.merged:
+        for key, number in landed(pending, [row]).items():
+            by_marker.setdefault(key, row.get("url") or f"#{number}")
     changes: list[Change] = []
-    stranded: list[tuple[TargetItem, int]] = []
+    stranded: list[tuple[TargetItem, str]] = []
     for it in pending:
         key = (it.area, it.slug)
-        named = inflight_pr(it) if it.status == "inflight" else None
+        named = inflight_ref(it) if it.status == "inflight" else None
         pull = seen.pulls.get(named) or {}
-        partial = key in marker_keys(pull.get("body"))[1] or named in partial_prs(it)
+        partial = key in marker_keys(pull.get("body"))[1] or named in _partial_refs(it)
         if key in by_marker:
-            n = by_marker[key]
-            changes.append(Change(it, "done", f"#{n} merged", ("in flight",), (f"landed: #{n}",)))
+            ref = by_marker[key]
+            changes.append(Change(it, "done", f"{ref} merged", ("in flight",), (f"landed: {ref}",)))
         elif pull.get("state") == "MERGED" and partial:
-            clause = "partial: " + _refs(sorted(partial_prs(it) | {named}))
-            note = f"#{named} merged without completing it; open again"
+            clause = "partial: " + _refs(_partial_refs(it) | {named})
+            note = f"{named} merged without completing it; open again"
             changes.append(Change(it, "open", note, ("in flight", "partial"), (clause,)))
         elif pull.get("state") == "MERGED":
-            changes.append(Change(it, "done", f"#{named} merged", ("in flight",), (f"landed: #{named}",)))
+            changes.append(Change(it, "done", f"{named} merged", ("in flight",), (f"landed: {named}",)))
         elif pull.get("state") == "CLOSED" and named in seen.subsumed and partial:
             replaced = seen.subsumed[named]
-            clauses = ("partial: " + _refs(sorted(partial_prs(it) | set(replaced))), f"closed: #{named}")
-            note = f"#{named} closed without completing it, subsumed by {_refs(replaced)}; open again"
+            clauses = ("partial: " + _refs(_partial_refs(it) | set(replaced)), f"closed: {named}")
+            note = f"{named} closed without completing it, subsumed by {_refs(replaced)}; open again"
             changes.append(Change(it, "open", note, ("in flight", "partial"), clauses))
         elif pull.get("state") == "CLOSED" and named in seen.subsumed:
             by = _refs(seen.subsumed[named])
-            clauses = (f"subsumed by: {by}", f"closed: #{named}")
-            changes.append(Change(it, "done", f"#{named} closed, subsumed by {by}", ("in flight",), clauses))
+            clauses = (f"subsumed by: {by}", f"closed: {named}")
+            changes.append(Change(it, "done", f"{named} closed, subsumed by {by}", ("in flight",), clauses))
         elif pull.get("state") == "CLOSED":
             stranded.append((it, named))
     return changes, stranded
@@ -158,28 +225,32 @@ def apply(text: str, changes: Iterable[Change]) -> str:
     return text
 
 
-def observe(targets: Targets, gh) -> Seen:
-    """Read what `settle` needs: one search for merged markers, the open pull requests, one view per
-    `in flight:` clause, and one per pull request a `declined` record at a closed one's last head
-    names as replacing it. A replacement counts only when every pull request the record names has
-    merged. Raises
-    GitHubError when a listing fails."""
-
-    def view(number: int) -> dict:
-        return normalize_merged(gh.pr_view(number, ["state", "title", "body", "headRefOid"]) or {})
-
-    merged = gh.merged_prs(f"{MERGED_SEARCH} sort:updated-desc", limit=MERGED_LIMIT)
+def observe(targets: Targets, read: list[Source]) -> Seen:
+    """Read what `settle` needs from each source: its merged pull requests that carry a marker, its
+    open ones, one view per `in flight:` clause that names one of its pull requests, and one per
+    pull request a `declined` record about a closed one at its last head names as replacing it. A
+    replacement counts only when every pull request the record names has merged. A clause naming a
+    pull request of no source in `read` is not looked at. Raises GitHubError or SourceUnavailable
+    when a listing fails."""
+    merged: list[dict] = []
     open_keys: set[Key] = set()
-    for d in gh.open_prs():
-        open_keys |= marker_keys(d.get("body"))[0]
-    named = {inflight_pr(it) for it in targets.items() if it.status == "inflight"} - {None}
-    pulls = {n: view(n) for n in sorted(named)}
-    subsumed = {}
-    for n, pull in pulls.items():
-        by = incidents.subsumed_by(n, pull.get("headRefOid") or "") if pull.get("state") == "CLOSED" else []
-        if by and all(view(m).get("state") == "MERGED" for m in by):
-            subsumed[n] = by
-    return Seen(merged, pulls, subsumed, open_keys)
+    for source in read:
+        merged += source.merged_prs()
+        for d in source.open_prs():
+            open_keys |= marker_keys(d.get("body"))[0]
+    named = {inflight_ref(it) for it in targets.items() if it.status == "inflight"} - {None}
+    pulls, subsumed, where = {}, {}, {}
+    for ref in sorted(named):
+        source = next((s for s in read if s.number(ref) is not None), None)
+        if source is None:
+            continue
+        number = source.number(ref)
+        pulls[ref], where[ref] = source.view(number), (source.repository, number)
+        head = pulls[ref].get("headRefOid") or ""
+        by = incidents.subsumed_by(number, head, source.repository) if pulls[ref].get("state") == "CLOSED" else []
+        if by and all(source.view(m).get("state") == "MERGED" for m in by):
+            subsumed[ref] = [source.ref(m) for m in by]
+    return Seen(merged, pulls, subsumed, open_keys, where)
 
 
 def identifiers(text: str) -> list[str]:
@@ -480,15 +551,16 @@ def _curate(w, c, path: Path, profile) -> int | None:
         raise Die(f"roadmap targets: {path}: {getattr(error, 'strerror', None) or error}") from None
     targets = _parsed(path, text)
     try:
-        seen = observe(targets, w.gh)
-    except GitHubError as error:
+        seen = observe(targets, sources(w))
+    except (GitHubError, SourceUnavailable) as error:
         c.reason = f"pull requests could not be read ({one_line(str(error))})"
         log(f"curate: {c.reason}; the target list is left as it is")
         return None
     changes, stranded = settle(targets, seen)
-    for it, pr in stranded:
-        log(f"curate: `{it.slug}` is in flight on #{pr}, which closed unmerged; left for the operator")
-        incidents.note_target_closed(path, it.area, it.slug, pr)
+    for it, ref in stranded:
+        log(f"curate: `{it.slug}` is in flight on {ref}, which closed unmerged; left for the operator")
+        repository, number = seen.where[ref]
+        incidents.note_target_closed(path, it.area, it.slug, number, repository)
     written = 0
     for tier in (1, 2):
         if tier == 2:

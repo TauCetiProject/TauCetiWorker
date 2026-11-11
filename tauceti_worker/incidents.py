@@ -233,26 +233,31 @@ def note_budget_spent(
     )
 
 
-def subsumed_by(pr: int, head: str) -> list[int]:
-    """The pull requests that the latest `declined` record about `pr` of the GitHub repository
-    TAUCETI at `head` with a `Subsumed-by:` line names on it, whichever stage wrote the record and
-    whether or not it is acknowledged."""
+def subsumed_by(pr: int, head: str, repository: RepositoryRef | str | None = None) -> list[int]:
+    """The pull requests that the latest `declined` record about `pr` of `repository` at `head` with
+    a `Subsumed-by:` line names on it, whichever stage wrote the record and whether or not it is
+    acknowledged. They are pull requests of the same repository."""
     named = [
         value
         for stage in STAGES
-        for value in find(DECLINED, subject(stage, pr))
+        for value in find(DECLINED, subject(stage, pr, repository))
         if head and value.get("head") == head and isinstance(value.get("subsumed_by"), list) and value["subsumed_by"]
     ]
     latest = max(named, key=lambda value: str(value.get("last_at") or ""), default={})
     return [n for n in latest.get("subsumed_by", []) if type(n) is int]
 
 
-def note_target_closed(path: Path, area: str, slug: str, pr: int) -> None:
-    """Record that the target list at `path` shows `slug` in flight on `pr` of the GitHub repository
-    TAUCETI, which closed unmerged with nothing on record replacing it. One write per item and pull
-    request, as for a spent budget."""
-    key = f"{slug}-{pr}"
+def note_target_closed(
+    path: Path, area: str, slug: str, pr: int, repository: RepositoryRef | str | None = None
+) -> None:
+    """Record that the target list at `path` shows `slug` in flight on `pr` of `repository`, which
+    closed unmerged with nothing on record replacing it. One write per item and pull request, as
+    for a spent budget; the key is `subject(slug, pr, repository)`."""
+    key = subject(slug, pr, repository)
     if find(TARGET_CLOSED, key):
         return
-    detail = f"`{slug}` is in flight on #{pr}, which closed without merging; mark it `[ ]` to author it again or `[x]` if it is done"
-    record(TARGET_CLOSED, key, **_identity(None, None), pr=pr, list=str(path), area=area, slug=slug, detail=detail)
+    named = f"#{pr}" if key == f"{slug}-{pr}" else repository_ref(repository).pull_url(pr)
+    detail = f"`{slug}` is in flight on {named}, which closed without merging; mark it `[ ]` to author it again or `[x]` if it is done"
+    record(
+        TARGET_CLOSED, key, **_identity(repository, None), pr=pr, list=str(path), area=area, slug=slug, detail=detail
+    )

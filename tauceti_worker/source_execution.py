@@ -12,7 +12,7 @@ from .constants import REVIEW_PREPARATION_WAIT_EXIT, REVIEW_PROVIDER_DOWN_EXIT
 
 def still_actionable(stage, w, sv, candidate):
     if not candidate.pr:
-        return stage == "roadmap"
+        return stage in ("roadmap", "curate")
     if candidate.source_repository != w.gh.repository or candidate.source_repository_id != w.gh.identity.native_id:
         return False
     w.gh.validate_binding()
