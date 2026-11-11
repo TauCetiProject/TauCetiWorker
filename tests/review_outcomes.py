@@ -22,6 +22,7 @@ def drive(directory, result, *, bubble=False):
     values = {"review-err-42": 2}
     busted, synced, events = [], [], []
     w = SimpleNamespace(
+        gh=SimpleNamespace(repo="org/project"),
         cfg=SimpleNamespace(state=directory, logdir=directory, store_dir=directory / "store", wid="w"),
         counters=SimpleNamespace(read=lambda k: values.get(k, 0), write=lambda k, v: values.update({k: v})),
         rs=SimpleNamespace(review_rounds=lambda *_: 1, bust=busted.append),
@@ -41,6 +42,7 @@ def drive(directory, result, *, bubble=False):
 
     with (
         patch.object(wu.time, "strftime", return_value="fixed"),
+        patch("tauceti_worker.review_runtime.resolve", return_value=SimpleNamespace(command=lambda: ["engine"])),
         patch.object(wu, "run_to_logfile", side_effect=engine),
         patch.object(wu, "review_in_bubble", side_effect=engine),
         patch.object(wu, "me", return_value="tester"),

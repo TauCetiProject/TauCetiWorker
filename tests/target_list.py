@@ -808,6 +808,22 @@ class ForgejoRound(unittest.TestCase):
             self.assertIn("Your target is assigned: `first` in `Algebra`", self.author())
         self.github_reads.assert_not_called()
 
+    def test_the_common_dispatch_takes_a_roadmap_round_on_forgejo(self):
+        """dispatch → _still_actionable → the Forgejo adapter's candidate authorization → do_roadmap.
+        A roadmap candidate has no pull request, so there is nothing for the adapter to authorize."""
+        self.forgejo.validate_binding = Mock()
+        self.forgejo.pr_list = Mock(return_value=[])  # the progress guard's open-PR snapshot
+        opts = work.RoundOpts(only=["roadmap"], agent="claude", work_model="claude", sandbox_host=True, dry_run=False)
+        with (
+            patch.object(work.shutil, "which", return_value="/usr/bin/claude"),
+            patch.object(work, "_check_stage_read_quota"),
+            patch("tauceti_worker.activity.select"),
+        ):
+            # The stub agent opens no pull request, so the progress guard ends the round afterwards.
+            with self.assertRaisesRegex(tc.NoProgress, "nothing landed"):
+                work.dispatch("roadmap", self.w, tc.Survey(worker_id="w"), tc.Candidate(0, "", "auto"), opts)
+        self.assertIn("Your target is assigned: `first` in `Algebra`", self.prompts[-1])
+
     def test_an_unavailable_forgejo_listing_authors_nothing(self):
         self.forgejo.open_prs.return_value = None
         with self.assertRaisesRegex(tc.NoProgress, "cannot read pull requests for the target list"):
