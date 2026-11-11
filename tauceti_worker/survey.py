@@ -98,7 +98,7 @@ def charge_attempts(counters, limits: dict[str, int | None]) -> bool:
     if charge:
         return charge(limits)
     for name in limits:
-        counters.incr(name)
+        counters.write(name, counters.read(name) + 1)
     return True
 
 
