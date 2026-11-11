@@ -501,6 +501,23 @@ class ForgejoHaltTests(unittest.TestCase):
             copy = Path(os.environ["TAUCETI_FORGEJO_TOKEN_FILE"])
         self.assertFalse(copy.exists())
 
+    def test_the_verified_copy_is_readable_under_group_writable_worker_state(self):
+        from tauceti_worker import worker_sources
+        from tauceti_worker.source_cli import load_source
+
+        self.serve({"id": 3, "login": "worker"})
+        shared = self.root.resolve() / "shared"
+        shared.mkdir()
+        shared.chmod(0o775)
+        previous = os.umask(0o002)
+        try:
+            os.environ.update(TAUCETI_WORKER_ID="w1", TAUCETI_WORKER_FORGES="forgejo")
+            source = worker_sources.native_source(SimpleNamespace(home=self.root))
+            with worker_sources.activate(source, SimpleNamespace(state=shared / "workers" / "w1")):
+                self.assertEqual(load_source().api._token, "forgejo-test-token")
+        finally:
+            os.umask(previous)
+
     def test_the_executing_actor_is_held_to_the_configured_user(self):
         from tauceti_worker.source_cli import load_source
         from tauceti_worker.worker_sources import verify_forgejo_identity

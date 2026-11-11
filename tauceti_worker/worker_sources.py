@@ -248,7 +248,7 @@ def activate(source, cfg):
         if expected is not None and source.token_file is not None:
             # Git's helper and source subprocesses read their token file on each use. Give them the
             # token verified above, so a file replaced during the round is never presented.
-            token_file = _verified_token_copy(cfg.state, source.api._token)
+            token_file = _verified_token_copy(source.token_file, source.api._token)
         directory = cfg.state / "bin"
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         real_gh = original.get("TAUCETI_REAL_GH") or shutil.which("gh")
@@ -308,16 +308,13 @@ def activate(source, cfg):
             token_file.unlink(missing_ok=True)
 
 
-def _verified_token_copy(state, token):
-    directory = state / "credential"
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    directory.chmod(0o700)
-    path = directory / "forgejo-token"
-    staging = directory / f".forgejo-token-{uuid.uuid4().hex}"
-    descriptor = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+def _verified_token_copy(original, token):
+    # Beside the original: native_source already read it through the reader that source
+    # subprocesses use, which requires a private parent and no untrusted-writable ancestor.
+    path = original.parent / f".{original.name}.round-{uuid.uuid4().hex}"
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "w") as stream:
         stream.write(token)
-    os.replace(staging, path)
     return path
 
 
