@@ -122,8 +122,14 @@ retry recovery, repair selection, replies, and stale-head refusal.
 
 ```sh
 python tests/worker_sources.py
-FORGEJO_BINARY=/path/to/forgejo python tests/integration_forgejo_worker.py
+TAUCETI_REVIEW_ENGINE_DIR=/path/to/TauCetiReview \
+  FORGEJO_BINARY=/path/to/forgejo python tests/integration_forgejo_worker.py
 ```
+
+The native fixture uses the selected Review checkout for its recovery subprocess;
+an installed Review wheel supplies Python modules but does not bundle rubrics.
+An editable Review checkout is detected automatically. Normal worker rounds
+resolve their engine through the shared on-demand resolver.
 
 Finding roots retain their reviewed head; a new head receives new roots. Native
 UI reply recognition uses the containing review and line location. Replies

@@ -47,6 +47,11 @@ from tauceti_worker.worker_sources import activate, source_config
 @unittest.skipUnless(os.environ.get("FORGEJO_BINARY"), "set FORGEJO_BINARY for disposable native worker")
 class NativeWorker(unittest.TestCase):
     def test_native_branch_pr_schedule_publication_and_recovery(self):
+        engine = Path(os.environ.get("TAUCETI_REVIEW_ENGINE_DIR") or Path(review_cli.__file__).resolve().parent.parent)
+        self.assertTrue(
+            (engine / "runner/cli.py").is_file() and (engine / "rubrics").is_dir(),
+            "Set TAUCETI_REVIEW_ENGINE_DIR to a Review checkout when using an installed Review wheel",
+        )
         with source_fixture() as (root, api, repository, row, tokens):
             from tauceti_tools.forge import Forgejo
 
@@ -87,9 +92,7 @@ class NativeWorker(unittest.TestCase):
             with (
                 activate(source, cfg),
                 patch.object(review_cli, "CACHE_DIR", root / "review-cache"),
-                patch.dict(
-                    os.environ, {"TAUCETI_REVIEW_ENGINE_DIR": str(Path(review_cli.__file__).resolve().parent.parent)}
-                ),
+                patch.dict(os.environ, {"TAUCETI_REVIEW_ENGINE_DIR": str(engine)}),
             ):
                 encoded = base64.b64encode(("x-access-token:" + grant["sha1"]).encode()).decode()
                 self.assertFalse(any(grant["sha1"] in value or encoded in value for value in os.environ.values()))
