@@ -288,7 +288,7 @@ class WorkerSpec:
     roadmap_extra_identities: tuple[str, ...] = ()
     respect_claims: bool = True
     progress_strategy: str | None = None
-    progress_max_open: int = PROGRESS_MAX_OPEN
+    progress_max_open: int | None = None
     progress_skip: tuple[str, ...] = ()
     extra_roadmap_prompt: str | None = None
     source: str | None = None
@@ -336,8 +336,8 @@ class WorkerSpec:
         strategy = _string(raw.get("progress_strategy"), f"workers[{index}].progress_strategy", optional=True)
         if strategy is not None and strategy not in PROGRESS_STRATEGIES:
             raise WorkersError(f"workers[{index}].progress_strategy must be one of: {', '.join(PROGRESS_STRATEGIES)}")
-        reports = raw.get("progress_max_open", PROGRESS_MAX_OPEN)
-        if isinstance(reports, bool) or not isinstance(reports, int) or reports < 1:
+        reports = raw.get("progress_max_open")
+        if reports is not None and (isinstance(reports, bool) or not isinstance(reports, int) or reports < 1):
             raise WorkersError(f"workers[{index}].progress_max_open must be a positive integer")
         spec = WorkerSpec(
             id=wid,
@@ -435,7 +435,7 @@ class WorkerSpec:
             value["roadmap_extra_identities"] = list(self.roadmap_extra_identities)
         if not self.respect_claims:
             value["respect_claims"] = False
-        if self.progress_max_open != PROGRESS_MAX_OPEN:
+        if self.progress_max_open is not None:
             value["progress_max_open"] = self.progress_max_open
         if self.progress_skip:
             value["progress_skip"] = list(self.progress_skip)
@@ -501,7 +501,7 @@ class WorkerSpec:
             argv.append("--ignore-claims")
         if self.progress_strategy is not None:
             argv += ["--progress-strategy", self.progress_strategy]
-        if self.progress_max_open != PROGRESS_MAX_OPEN:
+        if self.progress_max_open is not None:
             argv += ["--progress-max-open", str(self.progress_max_open)]
         if self.progress_skip:
             # One argument: an area list is operator text and must not read as a flag.

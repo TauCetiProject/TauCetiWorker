@@ -149,6 +149,10 @@ try:
     assert not [key for key in wm.WorkerSpec(id="plain").as_dict() if key.startswith("progress")]
     reporting = {"id": "reports", "progress_strategy": "threshold", "progress_max_open": 3, "progress_skip": ["Beta"]}
     assert wm.WorkerSpec.from_dict(reporting, 0).as_dict() == {**reporting, "enabled": True}
+    # An explicit default must still reach the worker over an inherited TAUCETI_PROGRESS_MAX_OPEN.
+    default_cap = wm.WorkerSpec.from_dict({"id": "reports", "progress_max_open": 2}, 0)
+    assert default_cap.work_argv()[-2:] == ["--progress-max-open", "2"], default_cap.work_argv()
+    assert default_cap.fingerprint() != wm.WorkerSpec.from_dict({"id": "reports"}, 0).fingerprint()
     for field, bad in (("progress_strategy", "busiest"), ("progress_max_open", 0), ("progress_max_open", "2")):
         try:
             wm.WorkerSpec.from_dict({"id": "reports", field: bad}, 0)
