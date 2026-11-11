@@ -56,18 +56,29 @@ def enabled(environ: dict | None = None) -> bool:
     return value not in ("0", "false", "no", "off")
 
 
+def staging_checks(task) -> bool:
+    """The controller assigns full checks to staging; older task records keep their policy."""
+    return task.extra.get("checks_owner") == "staging"
+
+
 # ----------------------------------------------------------------------------------------------
 # Settings for the agent's build script
 
 
 def write_settings(
-    worktree: Path, *, base: str, tools_root: Path, lake: tuple[str, ...] = ("lake",), logdir: Path | None = None
+    worktree: Path,
+    *,
+    base: str,
+    tools_root: Path,
+    lake: tuple[str, ...] = ("lake",),
+    logdir: Path | None = None,
+    checks_owner: str = "worker",
 ) -> Path:
     """``.tauceti-repair/audit.json``: the base the lint scope is taken against, where the TauCetiTools
     checkouts live and the Lake command, for ``.tauceti-repair/build``."""
     path = worktree / repair_tools.TOOLS_DIR / SETTINGS_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    settings = {"base": base, "tools_root": str(tools_root), "lake": list(lake)}
+    settings = {"base": base, "tools_root": str(tools_root), "lake": list(lake), "checks_owner": checks_owner}
     if logdir is not None:
         settings["logdir"] = str(logdir)
     path.write_text(json.dumps(settings))
@@ -579,6 +590,9 @@ def helper_checks(root: Path) -> int:
     settings = read_settings(root)
     if settings is None:
         print("audits: not configured in this worktree (.tauceti-repair/audit.json is missing); skipped", flush=True)
+        return 0
+    if settings.get("checks_owner") == "staging":
+        print("audits: full checks run in staging; use check-findings for located findings", flush=True)
         return 0
     logdir = (
         Path(settings["logdir"]) / ("helper-audit-" + str(time.time_ns()))

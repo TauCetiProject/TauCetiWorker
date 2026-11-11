@@ -2871,6 +2871,24 @@ class PublishOutputs(Fixture):
         self.assertEqual(len(records), 1, records)
         return records[0]
 
+    def test_staging_submission_precedes_configured_before_upload(self):
+        self.service.tasks[1]["extra"]["checks_owner"] = "staging"
+        gate = self.stub_dir / "staged-upload-gate"
+        gate.touch()
+        self.addCleanup(lambda: gate.unlink(missing_ok=True))
+        cfg = self.config(publish=self.settings(when="before"))
+        try:
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+            self.assertEqual(outcome["status"], "adopted", outcome)
+            self.assertEqual(len(self.service.results), 1)
+            self.assertTrue(outcome["publish"]["background"])
+            self.assertTrue(gate.exists(), "submission did not wait for the upload")
+            self.assertEqual(cfg.publish.when, "before", "the per-task choice leaves shared configuration intact")
+        finally:
+            gate.unlink(missing_ok=True)
+        self.assertTrue(self.published()["published"])
+        self.assertFalse((cfg.root / "worktrees/task-1").exists())
+
     def test_a_green_repair_submits_and_then_publishes_the_tip(self):
         submitted: list[float] = []
         submit = self.service.submit_task
@@ -3189,6 +3207,18 @@ class ParallelRepair(Fixture):
 
     def group_worktree(self, number: int) -> Path:
         return self.root / "state" / "worktrees" / f"task-1-group-{number}"
+
+    def test_staging_parallel_build_satisfies_final_worker_verification(self):
+        self.service.tasks[1]["extra"]["checks_owner"] = "staging"
+        cfg = self.config(parallel_agents=3)
+        with (
+            patch.object(repair_audit, "verify", side_effect=AssertionError("duplicate final build")),
+            patch.object(repair_audit, "check", side_effect=AssertionError("duplicate full checks")),
+        ):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(outcome["parallel"]["verified_tip"], outcome["tip"])
+        self.assertNotIn("checks", outcome["parallel"])
 
     def assert_two_groups_folded(self, outcome: dict) -> None:
         parallel = outcome["parallel"]
@@ -4687,6 +4717,72 @@ class WorkerAudits(Fixture):
         path = self.root / "state" / "worktrees" / "task-1" / ".tauceti-repair" / "errors.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()]
 
+    def test_staging_owns_full_checks_but_worker_still_compiles(self):
+        self.service.tasks[1]["extra"]["checks_owner"] = "staging"
+        self.findings("lint-findings-always", "simpNF: unrelated declaration")
+        cfg = self.config()
+        with patch.object(repair_audit, "check", side_effect=AssertionError("duplicate full checks")):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(outcome["verification"][-1]["build"]["rc"], 0)
+        self.assertNotIn("checks", outcome["verification"][-1])
+        self.assertFalse((self.stub_dir / "audit-runs.log").exists())
+        self.assertFalse((self.stub_dir / "lint-runs.jsonl").exists())
+        self.assertEqual(len(self.service.results), 1)
+
+    def test_staging_ownership_still_rejects_a_failed_final_build(self):
+        self.service.tasks[1]["extra"]["checks_owner"] = "staging"
+        cfg = self.config(verify_retries=0)
+        run = repair_audit._sandboxed
+
+        def fail_build(argv, *args, **kwargs):
+            if "build" in argv:
+                return {"rc": 1, "output": "TauCeti/Two.lean:1:1: error: final build failed"}
+            return run(argv, *args, **kwargs)
+
+        with patch.object(repair_audit, "_sandboxed", side_effect=fail_build):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["reason"], "agent_failed", outcome)
+        self.assertEqual(self.service.results, [])
+
+    def test_staging_helper_keeps_targeted_settings_and_skips_full_checks(self):
+        path = repair_audit.write_settings(
+            self.content.clone,
+            base=self.content.base,
+            tools_root=self.root / "tools",
+            checks_owner="staging",
+        )
+        self.assertEqual(json.loads(path.read_text())["checks_owner"], "staging")
+        with patch.object(repair_audit, "check", side_effect=AssertionError("duplicate helper checks")):
+            self.assertEqual(repair_audit.helper_checks(self.content.clone), 0)
+
+    def test_staging_pre_rebase_retains_build_receipt_without_full_check_claim(self):
+        self.service.tasks[1].update(kind="pre_rebase")
+        self.service.tasks[1]["extra"]["checks_owner"] = "staging"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        notes = json.loads(self.service.results[0]["worker_notes"])
+        receipt = notes["pre_rebase_verification"]
+        self.assertEqual(
+            receipt,
+            {
+                "tip": outcome["tip"],
+                "base": self.content.base,
+                "tools": f"TauCetiProject/TauCetiTools@{TOOLS_REF}",
+                "scope": "build",
+            },
+        )
+
+    def test_staging_preparation_stream_does_not_run_full_checks(self):
+        self.service.tasks[1].update(kind="prepare")
+        self.service.tasks[1]["extra"]["checks_owner"] = "staging"
+        cfg = self.config()
+        with patch.object(repair_audit, "check", side_effect=AssertionError("duplicate discovery checks")):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(outcome["verification"][-1]["build"]["rc"], 0)
+
     def test_lint_checkpoint_survives_lost_receipt_and_continues_on_a_new_claim(self):
         self.service.tasks[1].setdefault("extra", {})["can_checkpoint_repair"] = True
         cfg = self.config(poll_seconds=0, verify_retries=0)
@@ -5035,6 +5131,13 @@ class TargetedRepairChecks(Fixture):
         return subprocess.run([str(script)], cwd=self.worktree, env=env, capture_output=True, text=True)
 
     def test_targeted_helper_builds_finding_and_repair_delta_then_only_reported_linter(self):
+        repair_audit.write_settings(
+            self.worktree,
+            base=self.content.base,
+            tools_root=self.root / "tools",
+            logdir=self.telemetry,
+            checks_owner="staging",
+        )
         result = self.command()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("build --iofail TauCeti.One TauCeti.Two", self.lake_calls())
