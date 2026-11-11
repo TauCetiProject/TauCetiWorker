@@ -481,6 +481,66 @@ class MaintenanceOrder(unittest.TestCase):
             self.assertEqual(self.offered(gh), (self.BASE, []))
             gh.open_prs.assert_not_called()
 
+    def test_a_forgejo_source_offers_its_listed_pull_requests_first(self):
+        """A Forgejo source's survey, as a multi-source round hands it over, with markers read through
+        the source's own open-PR listing."""
+        import dataclasses
+
+        from tauceti_tools.forge import PrincipalRef
+
+        from tauceti_worker.source_identity import SourceActor
+        from tauceti_worker.source_survey import SourcePRInfo, SourceSurvey
+
+        fixture = Forgejo()
+        fixture.setUp()
+        source, repo = fixture.source, fixture.repo
+        science, bob = (
+            SourceActor(PrincipalRef(repo.forge, "2"), "science"),
+            SourceActor(PrincipalRef(repo.forge, "3"), "bob"),
+        )
+        github_sv = self.survey()
+        sv = SourceSurvey(worker_id="worker3", source_repository=repo, source_actor=science)
+        sv.open_prs = [
+            SourcePRInfo(
+                **dataclasses.asdict(pr),
+                source_repository=repo,
+                source_author=science if pr.author == "science" else bob,
+                source_head_repository=repo,
+            )
+            for pr in github_sv.open_prs
+            if pr.number != 9
+        ]
+        sv.rebaseable.actionable = [c for c in github_sv.rebaseable.actionable if c.pr != 9]
+        sv.needs_fix.actionable = github_sv.needs_fix.actionable
+        sv.reviewable.actionable = github_sv.reviewable.actionable
+        bodies = {2: marker("Probability", "strong-law"), 4: marker("MeasureTheory", "borel-cantelli", partial=True)}
+        source.open_prs.return_value = [{"number": n, "body": bodies.get(n, "")} for n in (1, 2, 3, 4, 50, 60)]
+        seen = []
+        w = SimpleNamespace(cfg=SimpleNamespace(wid="worker3"), gh=source, rs=None, counters=None)
+
+        def offered(only):
+            seen.clear()
+            opts = work.RoundOpts(only=only, agent="claude", work_model="claude", sandbox_host=True, dry_run=True)
+            with (
+                patch.object(work, "spread_candidates", side_effect=list),
+                patch.object(work, "prioritize_review_candidates", side_effect=lambda q, *a, **k: (list(q), [])),
+                patch.object(work, "dispatch", side_effect=lambda stage, _w, _sv, c, _o: seen.append((stage, c))),
+                patch.object(work, "log"),
+                self.assertRaisesRegex(tc.NoProgress, "no eligible work"),
+            ):
+                work.run_round(w, opts, prepared_survey=sv)
+            return self.order(seen)
+
+        with tempfile.TemporaryDirectory(prefix="target-list-") as tmp, patch.dict(os.environ):
+            os.environ["TAUCETI_ROADMAP_TARGETS"] = str(Path(tmp, "targets.md"))
+            Path(tmp, "targets.md").write_text(EXAMPLE)
+            self.assertEqual(
+                offered(["rebase", "fix", "review"]),
+                "fix 4, rebase 1, fix 3, review 50, review 4, review 60, review 2, review 1",
+            )
+            self.assertEqual(offered(["review"]), "review 50, review 4, review 60, review 2, review 1")
+            source.open_prs.return_value = None
+            self.assertEqual(offered(["review"]), "review 50, review 1, review 60, review 4, review 2")
 
 
 class Forgejo(unittest.TestCase):

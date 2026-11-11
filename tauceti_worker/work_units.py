@@ -422,9 +422,15 @@ def target_list_prs(w, sv, stages) -> set[int]:
     actionable = {c.pr for stage in stages for c in sv.kind(stage).actionable} & own
     if path is None or len(actionable) < 2:
         return set()
+    from .config import SourceUnavailable
+
     try:
-        listed = marked_prs(load_targets(path), w.gh.open_prs()) & actionable
-    except (Die, GitHubError, ForgeError) as e:
+        targets = load_targets(path)
+        rows = w.gh.open_prs()
+        if rows is None:
+            raise SourceUnavailable("open pull requests are unavailable")
+        listed = marked_prs(targets, rows) & actionable
+    except (Die, GitHubError, ForgeError, SourceUnavailable) as e:
         log(f"target list: maintenance keeps its usual order this round ({e})")
         return set()
     if listed and listed != actionable:
