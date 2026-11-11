@@ -866,14 +866,17 @@ def _closable(gh, pr: int, head: str, login: str) -> str:
     return ""
 
 
-def close_subsumed(gh, pr: int, head: str, subsumed_by: list[int], comment: str, *, login: str) -> tuple[bool, str]:
+def close_subsumed(
+    gh, pr: int, head: str, subsumed_by: list[int], comment: str, *, login: str, lost=None
+) -> tuple[bool, str]:
     """Close `pr`, one of `login`'s own, as subsumed by the merged pull requests `subsumed_by`.
 
     (True, the evidence posted with the closure) or (False, the check that refused). Nothing is
     closed unless closing is switched on, today's limit is not used up, the pull request is open at
     `head`, not a draft, authored by `login` and under no hold label, every subsuming pull request
     has merged, and between them their diffs add every non-private declaration this one's adds. The
-    pull request itself is read again once the diffs are in, immediately before closing."""
+    pull request itself is read again once the diffs are in, immediately before closing. `lost`, the
+    branch claim's loss event where one is held, stops the closure once it is set."""
     if not close_enabled():
         return False, f"{CLOSE_ENV} is not on"
     try:
@@ -900,6 +903,8 @@ def close_subsumed(gh, pr: int, head: str, subsumed_by: list[int], comment: str,
     with read_context(fresh=True, direct=True):
         if refused := _closable(gh, pr, head, login):
             return False, refused
+    if lost is not None and lost.is_set():
+        return False, "its branch claim was lost"
     evidence = f"{named} merged and add all {len(own)} declaration(s) this pull request adds"
     body = (
         f"{comment.strip()}\n\nChecked before closing: {evidence}.\n\n"
@@ -908,6 +913,8 @@ def close_subsumed(gh, pr: int, head: str, subsumed_by: list[int], comment: str,
     )
     if refused := _reserve_closure(pull_ref(incidents.source_of(gh), pr), head):
         return False, refused
+    if lost is not None and lost.is_set():
+        return False, "its branch claim was lost"
     if not gh.close_pr(pr, body):
         return False, "the closure could not be confirmed"
     return True, evidence
@@ -936,7 +943,13 @@ def _close(rd: _Round, incident: dict, answer: dict) -> tuple[str, dict]:
         return "its branch claim could not be taken", {}
     try:
         closed, detail = close_subsumed(
-            rd.gh, pr, incident["head"], answer["subsumed_by"], answer["comment"], login=rd.login
+            rd.gh,
+            pr,
+            incident["head"],
+            answer["subsumed_by"],
+            answer["comment"],
+            login=rd.login,
+            lost=getattr(claims, "lost", None),
         )
     finally:
         claims.stop_heartbeat()

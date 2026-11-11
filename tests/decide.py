@@ -156,6 +156,7 @@ class Claims:
     def __init__(self, elsewhere=(), unregistered=()):
         self.elsewhere, self.unregistered = set(elsewhere), set(unregistered)
         self.taken, self.released, self.held = [], [], None
+        self.lost = threading.Event()
 
     def begin_branch_work(self, pr, head, refname, owner, repo):
         if pr in self.elsewhere:
@@ -1032,6 +1033,18 @@ def test_close(tmp):
         check(
             "a branch another worker claims is not closed",
             (5 in [n for n, _ in hub.closed], "branch claim" in ruling(root, "declined-fix-5")["note"]),
+            (False, True),
+        )
+        hub.prs[7] = {}
+        declined(7)
+        losing = Claims()
+        hub.on_diff = lambda n: n == 41 and losing.lost.set()
+        with patch.dict(os.environ, {"TAUCETI_DECIDE_MAX_CLOSES_PER_DAY": "99"}):
+            rounds(tmp, hub, answer((7, "close", {"subsumed_by": [41], "comment": comment})), claims=losing)
+        hub.on_diff = lambda n: None
+        check(
+            "…nor one whose claim is lost while the diffs are read",
+            (7 in [n for n, _ in hub.closed], "claim was lost" in ruling(root, "declined-fix-7")["note"]),
             (False, True),
         )
         hub.prs[6] = {}

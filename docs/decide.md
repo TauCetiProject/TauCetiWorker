@@ -231,6 +231,8 @@ all of these hold at the moment of closing:
 - The worker holds the pull request's branch claim: the GitHub claim on GitHub,
   the source's Git lease on Forgejo. Where the claim cannot be registered at
   all, a repair round on GitHub goes on unclaimed; a closure does not.
+  A claim whose heartbeat reports it lost while the diffs are read stops the
+  closure; that is checked again immediately before closing.
 - A fresh read shows the pull request open, not a draft, at the head the
   incident names, authored by the worker's own account on that source (the
   GitHub login, or the Forgejo source's authenticated actor), and under none of the
