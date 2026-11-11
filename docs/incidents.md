@@ -147,6 +147,8 @@ current head. The survey lists the pull request as suppressed with the reason
 `an earlier round declined at this head; waiting for a new head`, and dispatch
 checks again before spending and once more after taking the branch claim, for a
 record written after the survey or by a peer that just released the claim.
+Recovery of a repair round's retained source waits on a held head too, after
+reconciling any push that round already made and before it launches an agent.
 
 The hold ends when the head moves, or when the record is deleted from both
 folders. It covers every action of the stage at that head, including the final

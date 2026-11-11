@@ -464,6 +464,32 @@ def test_multi_source_budgets(root):
         check("an unscoped round records the spent budget", (round_over(), load(name)["head"]), ("no work", "head-7"))
 
 
+def test_recovery_hold(root):
+    """Retained-source recovery waits on a declined head before it reconciles nothing new or pays."""
+    from tauceti_worker import repair_recovery
+
+    backend = repair_recovery.WorkerBackend(SimpleNamespace(gh=SimpleNamespace(repo=tc.TAUCETI)), SimpleNamespace())
+    m = {"pr": 11, "work": "fix"}
+
+    def policy(head):
+        facts = {"state": "OPEN", "draft": False, "labels": [], "head": head, "base": None}
+        try:
+            backend.policy(m, facts)
+        except repair_recovery.Wait as error:
+            return error.code
+        return None
+
+    with settings(root, hold=True):
+        incidents.record_declined("fix", 11, "head-11", message="declined")
+        check(
+            "held at the declined head; past the hold at a new one",
+            (policy("head-11"), policy("head-12")),
+            ("declined-hold", "base-policy"),
+        )
+    with settings(root):
+        check("without the hold, recovery is unchanged", policy("head-11"), "base-policy")
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -474,6 +500,7 @@ def main():
         test_claim_race(tmp / "race")
         test_sources(tmp / "sources")
         test_multi_source_budgets(tmp / "multi")
+        test_recovery_hold(tmp / "recovery")
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
     return 1 if fails else 0
 
