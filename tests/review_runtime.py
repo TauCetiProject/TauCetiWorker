@@ -108,6 +108,9 @@ class ReviewRuntime(unittest.TestCase):
                 (work / "review-context.json").write_text(json.dumps(dict(pr=7, head="a" * 40)))
                 (work / name).write_text(json.dumps(dict(head_sha="a" * 40)))
                 self.assertEqual(review_runtime.pending_reviews(cfg), {(7, "a" * 40)})
+                (work / "publication.json").write_text("{unreadable")
+                self.assertEqual(review_runtime.pending_reviews(cfg), {(7, "a" * 40)})
+                (work / "publication.json").unlink()
                 (work / name).write_text(json.dumps(dict(head_sha="a" * 40, review_changed=False)))
                 self.assertEqual(review_runtime.pending_reviews(cfg), set())
 
@@ -152,6 +155,40 @@ class ReviewRuntime(unittest.TestCase):
                 self.assertTrue((outbox / "record.json").exists())
             finally:
                 worker_sources._selected.reset(marker)
+
+    def test_recovery_processes_good_work_before_deferring_an_unreadable_receipt(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cfg = SimpleNamespace(state=root, store=root / "ledger.json", store_dir=root)
+            worker = SimpleNamespace(cfg=cfg, gh=SimpleNamespace(repo="team/project"))
+            bad = root / "review-work/a-unreadable"
+            good = bad.with_name("z-good")
+            bad.mkdir(parents=True)
+            good.mkdir()
+            (bad / "publication.json").write_text("{invalid")
+            (good / "publication.json").write_text(
+                json.dumps(
+                    dict(
+                        source=dict(forge=dict(kind="github", url="https://github.com"), name="team/project"),
+                        ledger=str(cfg.store),
+                        state="prepared",
+                        pr=7,
+                        head="a" * 40,
+                    )
+                )
+            )
+            (good / "review-context.json").write_text(json.dumps(dict(lifecycle=2)))
+            runtime = review_runtime.ReviewRuntime(root / "engine", "a" * 40)
+            with (
+                patch.object(review_runtime, "resolve", return_value=runtime),
+                patch("subprocess.run", return_value=SimpleNamespace(returncode=86)) as run,
+            ):
+                self.assertFalse(review_runtime.recover(worker))
+            self.assertIn("z-good", run.call_args.args[0])
+            self.assertNotIn("a-unreadable", run.call_args.args[0])
+            self.assertEqual((bad / "publication.json").read_text(), "{invalid")
 
 
 if __name__ == "__main__":

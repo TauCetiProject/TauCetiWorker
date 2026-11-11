@@ -1586,8 +1586,9 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         if rc == EX_CLAIM_COLLISION:  # Review engine: another run already owns this head; no inference or verdict.
             log(f"  review #{pr}: claimed by a peer — selecting other work")
             return None
-        if rc == 85:
-            raise NoProgress(f"review #{pr}: rendered output retained for publication retry — no new inference")
+        if rc in (85, 86):
+            reason = "publisher/record repair" if rc == 86 else "publication retry"
+            raise NoProgress(f"review #{pr}: rendered output retained for {reason} — no new inference")
         if rc == REVIEW_PREPARATION_WAIT_EXIT:
             # A fetch/host outage is not a defect in the selected PR. Refresh
             # discovery on the next ordinary attempt, including a changed head.

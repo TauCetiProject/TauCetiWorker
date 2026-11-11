@@ -100,7 +100,7 @@ def pending_reviews(cfg):
         context = read_json(work / "review-context.json")
         if receipt.get("state") == "prepared":
             pending.add((receipt.get("pr"), receipt.get("head")))
-        elif not (work / "publication.json").exists() and context and not context.get("complete"):
+        elif not receipt and context and not context.get("complete"):
             for name in ("post_plan.json", "plan.json"):
                 plan = work / name
                 if plan.is_file() and read_json(plan).get("review_changed") is not False:
@@ -122,7 +122,7 @@ def recover(worker, *, numbers=()):
         return False
     identity = getattr(worker.gh, "identity", None)
     expected = identity.record() if identity else dict(forge=dict(kind="github", url=GITHUB.url), name=worker.gh.repo)
-    eligible = []
+    eligible, unreadable = [], False
     for work in sorted(root.iterdir()):
         if work.is_symlink() or not work.is_dir():
             continue
@@ -131,7 +131,8 @@ def recover(worker, *, numbers=()):
                 context = read_json(work / "review-context.json")
                 receipt = read_json(work / "publication.json")
                 if (work / "publication.json").exists() and not receipt:
-                    raise NoProgress("retained review publication record is unreadable; preserving workspace")
+                    unreadable = True
+                    continue
                 record = receipt or context
                 if not record:
                     continue
@@ -139,7 +140,10 @@ def recover(worker, *, numbers=()):
                     record.get("source") != expected
                     or Path(record.get("ledger", record.get("store", ""))).resolve() != worker.cfg.store.resolve()
                 ):
-                    raise ValueError("retained review belongs to another source/store")
+                    from .config import log
+
+                    log(f"review recovery: preserving {work.name}, which belongs to another source/store")
+                    continue
                 if numbers and record.get("pr") not in numbers:
                     continue
                 owner = read_json(work / "owner.json")
@@ -160,6 +164,8 @@ def recover(worker, *, numbers=()):
         except (BlockingIOError, FileNotFoundError):
             continue
     if not eligible:
+        if unreadable:
+            raise NoProgress("retained review publication record is unreadable; preserving workspace")
         return False
     runtime = worker.review_runtime = resolve(worker.cfg)
     command = runtime.command(
@@ -176,6 +182,6 @@ def recover(worker, *, numbers=()):
     result = subprocess.run(command)
     if result.returncode == 0:
         return True
-    if result.returncode not in (82, 84):
+    if result.returncode not in (82, 84, 86):
         raise NoProgress("rendered review output remains retained for publication retry")
     return False
