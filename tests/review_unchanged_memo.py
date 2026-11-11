@@ -11,6 +11,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from fixtures.review_runtime_stub import install_runtime_stub
+
+install_runtime_stub()
+
 from tauceti_worker import activity
 from tauceti_worker import work_units as wu
 from tauceti_worker.activity import Round
@@ -44,6 +48,7 @@ with tempfile.TemporaryDirectory() as tmp:
     recorded = []
     values = {}
     w = SimpleNamespace(
+        gh=SimpleNamespace(repo="TauCetiProject/TauCeti"),
         cfg=SimpleNamespace(state=directory, logdir=directory, store_dir=directory / "store", wid="w"),
         counters=SimpleNamespace(
             read=lambda k: values.get(k, 0),

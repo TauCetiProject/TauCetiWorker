@@ -276,6 +276,18 @@ def collect_review_scratch(cfg, report, *, dry=False):
                 ):
                     note(report, "protected", str(path))
                     continue
+                publication = read_json(path / "publication.json")
+                if (
+                    (path / "publication.json").exists() and publication.get("state") not in {"published", "superseded"}
+                ) or (
+                    not publication
+                    and any(
+                        (path / name).is_file() and read_json(path / name).get("review_changed") is not False
+                        for name in ("post_plan.json", "plan.json")
+                    )
+                ):
+                    note(report, "protected", f"{path}: rendered review output awaits reconciliation")
+                    continue
                 mounts = mount_points()
                 if mounts is None or any(p == path.resolve() or p.is_relative_to(path.resolve()) for p in mounts):
                     note(report, "protected", str(path))
