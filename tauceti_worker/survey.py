@@ -836,8 +836,18 @@ def survey(
     if count_all_roadmaps:
         # The compact survey's per-author totals carry no branch names, so a branch scope counts
         # from the open-PR listing.
-        counts = None if own else getattr(compact, "author_counts", None)
-        all_prs = prs if not available else ([] if counts is not None else [PRInfo.from_json(d) for d in gh.open_prs()])
+        totals = getattr(compact, "author_counts", None)
+        counts = None if own else totals
+        all_prs = prs if not available else []
+        if available and counts is None:
+            try:
+                all_prs = [PRInfo.from_json(d) for d in gh.open_prs()]
+            except GitHubError as e:
+                if not own:
+                    raise
+                # The login's unscoped total bounds the scoped count; with neither, author nothing.
+                counts = {me(): totals.get(me(), 0) if totals is not None else sv.max_open_prs}
+                log(f"Open-PR listing unavailable; bounding the branch-scoped authoring count ({e})")
         sv._automatic_open_count = (
             counts.get(me(), 0)
             if counts is not None

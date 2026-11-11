@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 survey_mod = importlib.import_module("tauceti_worker.survey")
+from tauceti_worker.github import GitHubError
 from tauceti_worker.github_state import SurveyRows
 
 
@@ -78,6 +79,34 @@ def automatic_open_count(pattern):
         ).n_mine_open
 
 
+def listing_outage(pattern, totals, *, cached=False):
+    """The open-PR listing fails while the compact survey offers the conflicting #3 for rebase."""
+    review = {"issue_complete": True, "review_complete": True, "rebase_heads": []}
+    rows = SurveyRows([{"pr": RAW[2], "review": review}], totals, cached=cached)
+
+    def fail():
+        raise GitHubError("open PR query failed: HTTP 504")
+
+    with (
+        scope(pattern),
+        patch.object(survey_mod, "me", lambda: "me"),
+        patch("tauceti_worker.github_state.read_survey", return_value=(True, rows)),
+    ):
+        try:
+            sv = survey_mod.survey(
+                SimpleNamespace(wid="test"),
+                SimpleNamespace(open_prs=fail, repo="TauCetiProject/TauCeti"),
+                None,
+                Counters(),
+                stages=["rebase"],
+                count_all_roadmaps=True,
+                cached_only=cached,
+            )
+        except GitHubError as e:
+            return f"raised: {e}"
+    return {"rebase": [c.pr for c in sv.rebaseable.actionable], "open": sv.n_mine_open, "max": sv.max_open_prs}
+
+
 def main():
     def no_query(_repo):
         raise AssertionError("unexpected permission query")
@@ -100,6 +129,26 @@ def main():
         ),
         ("unset: the automatic cap reads the compact per-author total", automatic_open_count(None), 140),
         ("set: the automatic cap counts matching branches from the listing", automatic_open_count("-alpha$"), 2),
+        (
+            "unset: a failing listing is never read when the compact total is known",
+            listing_outage(None, {"me": 1}),
+            {"rebase": [3], "open": 1, "max": survey_mod.configured_max_open_prs()},
+        ),
+        (
+            "set, listing fails: maintenance kept, the unscoped total bounds the cap",
+            listing_outage("-alpha$", {"me": 1}),
+            {"rebase": [3], "open": 1, "max": survey_mod.configured_max_open_prs()},
+        ),
+        (
+            "set, listing fails on a cached snapshot: maintenance kept, the unscoped total bounds the cap",
+            listing_outage("-alpha$", {"me": 1}, cached=True),
+            {"rebase": [3], "open": 1, "max": survey_mod.configured_max_open_prs()},
+        ),
+        (
+            "set, listing fails with no total: maintenance kept, authoring held at the cap",
+            listing_outage("-alpha$", None),
+            {"rebase": [3], "open": survey_mod.configured_max_open_prs(), "max": survey_mod.configured_max_open_prs()},
+        ),
     ]
     failures = 0
     for name, got, want in checks:
