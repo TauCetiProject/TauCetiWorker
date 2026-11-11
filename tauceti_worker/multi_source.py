@@ -192,6 +192,20 @@ def run_round(w, opts, *, use_fleet_focus=True):
         if waits:
             raise waits[0]
         raise NoProgress("all selected source surveys are unavailable")
+    if "decide" in opts.only:
+        # Incident records are about GitHub pull requests, so the phase runs on the GitHub source,
+        # once a round and ahead of any source's work; a hold it lifts is gone from the next survey.
+        github = next(((worker, result) for name, worker, result in healthy if name == "github"), None)
+        if github is not None:
+            try:
+                return ordinary_round(github[0], dataclasses.replace(opts, only=["decide"]), prepared_survey=github[1])
+            except NoProgress as error:
+                if opts.only == ["decide"]:
+                    raise
+                log(f"{error}; going on to the other selected work")
+        elif opts.only == ["decide"]:
+            raise NoProgress("decide: GitHub was not surveyed this round, and incident records are about it")
+        opts = dataclasses.replace(opts, only=[task for task in opts.only if task != "decide"])
     executable = [(name, worker, result) for name, worker, result in healthy if name == "github" or opts.sandbox_host]
     if len(executable) != len(healthy):
         log("Forgejo agent rounds currently require host mode")

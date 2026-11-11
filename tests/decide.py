@@ -9,6 +9,7 @@ later look at a ruling that waits; what the model process is given; and each sid
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import contextlib
 import fcntl
 import json
 import os
@@ -45,7 +46,14 @@ def later():
 
 
 def settings(root=None, **env):
-    drop = (incidents.ENV, incidents.HOLD_ENV, "TAUCETI_ROADMAP_TARGETS", "GH_TOKEN")
+    drop = (
+        incidents.ENV,
+        incidents.HOLD_ENV,
+        "TAUCETI_ROADMAP_TARGETS",
+        "GH_TOKEN",
+        "TAUCETI_WORKER_FORGES",
+        "TAUCETI_NEW_PR_FORGE",
+    )
     base = {k: v for k, v in os.environ.items() if k not in drop and not k.startswith("TAUCETI_DECIDE_")}
     if root is not None:
         base.update({incidents.ENV: str(root), incidents.HOLD_ENV: "1"})
@@ -237,6 +245,58 @@ def test_selection(root, tmp):
         check("…and passes", decide.due(now=time.time() + decide.gap() + 1)[0], True)
     with settings(root, TAUCETI_DECIDE_GAP="0"):
         check("TAUCETI_DECIDE_GAP sets it", decide.due()[0], True)
+    test_several_sources(root, go, ran)
+
+
+def test_several_sources(root, go, decided):
+    """With a Forgejo source enabled, the phase runs on the GitHub source ahead of either source's work."""
+    from tauceti_worker import multi_source, worker_sources
+
+    github = SimpleNamespace(cfg=SimpleNamespace(wid="w1", state=root.parent / "state"))
+
+    def observed(*names):
+        return [(name, github if name == "github" else SimpleNamespace(), tc.Survey("w1")) for name in names]
+
+    def ran(only, observations, outcomes):
+        opts = tc.RoundOpts(only=only, agent="auto", work_model="auto", sandbox_host=True, dry_run=True)
+        with (
+            settings(root, TAUCETI_NEW_PR_FORGE="github"),
+            patch.object(multi_source, "log"),
+            patch.object(multi_source, "collect", return_value=observations),
+            patch.object(multi_source, "deduplicate"),
+            patch.object(multi_source, "activate", return_value=contextlib.nullcontext()),
+            patch.object(work_units, "run_round", side_effect=outcomes) as execute,
+        ):
+            try:
+                result = multi_source.run_round(None, opts)
+            except tc.NoProgress as error:
+                result = str(error)
+        calls = [(c.args[0], c.args[1].only, c.kwargs["prepared_survey"]) for c in execute.call_args_list]
+        return result, calls
+
+    both = observed("github", "forgejo")
+    check("decide alone: one GitHub round for it", ran(["decide"], both, [0]), (0, [(github, ["decide"], both[0][2])]))
+    nothing = tc.NoProgress("decide: no live incident or ruling")
+    result, calls = ran(["decide", "fix"], both, [nothing, 0])
+    check(
+        "…with other work, that work follows when it ruled nothing",
+        (result, [c[1] for c in calls]),
+        ("no eligible PR work on the selected forges", [["decide"]]),
+    )
+    check("…and a decide-only round says why", ran(["decide"], both, [nothing]), (str(nothing), calls[:1]))
+    check(
+        "without a GitHub survey it does not run",
+        ran(["decide"], observed("forgejo"), []),
+        ("decide: GitHub was not surveyed this round, and incident records are about it", []),
+    )
+    with (
+        settings(root, TAUCETI_DECIDE_GAP="0"),
+        patch.object(worker_sources, "enabled", return_value=True),
+        patch.object(multi_source, "collect", side_effect=lambda w, *a, **k: [("github", w, tc.Survey("w1"))]),
+        patch.object(multi_source, "deduplicate"),
+    ):
+        declined(9)
+        check("through the worker's round: the phase is reached", (go(["decide"]), decided), (0, ["decide"]))
 
 
 def verdict(row, allowed=None):

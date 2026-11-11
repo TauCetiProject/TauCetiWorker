@@ -64,6 +64,12 @@ directory holds a live incident or a live ruling. It then:
    incident whose record a repair round rewrote while the model was out stays
    live, and is put to the model in its own right on a later round.
 
+With a Forgejo source enabled as well, the phase runs on the GitHub source after
+both sources are surveyed and ahead of either source's work, so a hold it lifts
+is gone from the next round's survey rather than this one's. Incident records
+are about GitHub pull requests; a round in which GitHub could not be surveyed
+does not rule.
+
 ## The rulings
 
 | Ruling | Meaning | What the worker does |
