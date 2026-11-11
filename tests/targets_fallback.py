@@ -293,6 +293,27 @@ class ForgejoRound(unittest.TestCase):
         with self.assertRaisesRegex(tc.NoProgress, r"\(1 open outside it \+ 1 being authored, cutoff 2\)$"):
             self.author_on(self.forgejo, wid="worker4")
 
+    def test_the_common_dispatch_authors_outside_the_list_on_forgejo(self):
+        """dispatch → _still_actionable → do_roadmap on a Forgejo-only worker the list offers nothing."""
+        self.forgejo.validate_binding = Mock()
+        self.forgejo.pr_list = Mock(return_value=[])  # the progress guard's open-PR snapshot
+        cfg = SimpleNamespace(state=self.tmp, wid="worker3", checkout=self.tmp / "checkout", logdir=self.tmp / "logs")
+        rc = SimpleNamespace(add_cleanup=self.cleanups.append)
+        w = SimpleNamespace(cfg=cfg, gh=self.forgejo, claims=self.claims, rc=rc, rs=Mock(), counters=Mock())
+        opts = work.RoundOpts(only=["roadmap"], agent="claude", work_model="claude", sandbox_host=True, dry_run=False)
+        with (
+            patch.object(work.shutil, "which", return_value="/usr/bin/claude"),
+            patch.object(work, "_check_stage_read_quota"),
+            patch("tauceti_worker.activity.select"),
+            patch.object(tf, "me", side_effect=AssertionError("GitHub identity")),
+            self.assertRaisesRegex(tc.NoProgress, "nothing landed"),
+        ):
+            work.dispatch("roadmap", w, tc.Survey(worker_id="worker3"), tc.Candidate(0, "", "Algebra"), opts)
+        self.assertIn("Start with `Algebra`", self.prompts[-1])
+        self.assertNotIn("Your target is assigned", self.prompts[-1])
+        self.assertEqual(self.runtime()["roadmap_work"], "outside-list")
+        self.assertEqual(len(list(self.forgejo_slots.glob("worker3.*.slot"))), 1)
+
     def test_a_mixed_worker_counts_both_forges(self):
         github_side = github(pr(7), pr(8, login="bob"))
         with self.assertRaisesRegex(tc.NoProgress, r"either \(2 open outside it, cutoff 2\)$"):

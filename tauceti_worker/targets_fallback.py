@@ -118,13 +118,14 @@ def _account(source, sv):
 def count_outside(targets: Targets, w, sv) -> tuple[str, int]:
     """The login the round authors as, and how many open pull requests outside the list the account
     holds across the round's sources: its own and, in a multi-source round, the others."""
+    from .work_units import _target_reads
+
     authoring = None
     n_open = 0
     for source in (w.gh, *getattr(w, "target_sources", ())):
         login, owns = _account(source, sv if authoring is None else None)
         authoring = authoring or login
-        with contextlib.nullcontext() if getattr(source, "direct_source", False) else _shared_github():
-            rows = source.open_prs()
+        rows = _target_reads(source).open_prs()
         if rows is None:
             raise SourceUnavailable("open pull requests are unavailable")
         n_open += len(outside_list(targets, rows, owns))
