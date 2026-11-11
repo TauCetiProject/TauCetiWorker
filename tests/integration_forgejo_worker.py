@@ -91,6 +91,8 @@ class NativeWorker(unittest.TestCase):
                     os.environ, {"TAUCETI_REVIEW_ENGINE_DIR": str(Path(review_cli.__file__).resolve().parent.parent)}
                 ),
             ):
+                encoded = base64.b64encode(("x-access-token:" + grant["sha1"]).encode()).decode()
+                self.assertFalse(any(grant["sha1"] in value or encoded in value for value in os.environ.values()))
                 # Exercise an actual worker-authored Git commit and safe push;
                 # API file writes do not verify process-local commit attribution.
                 checkout = root / "author-checkout"

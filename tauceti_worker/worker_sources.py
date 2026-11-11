@@ -179,7 +179,7 @@ def activate(source, cfg):
             "#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' -m tauceti_worker.source_claims "$@"\n'
         )
         claim_wrapper.chmod(0o700)
-        env = scoped_git_environment(source.repository.forge, source.api._token, purpose="workspace")
+        env = scoped_git_environment(source.repository.forge, token_file=source.token_file, purpose="workspace")
         profile = source.api.request("GET", "user")
         if profile.get("id") != int(actor.principal.native_id):
             raise SourceUnavailable("native commit author changed")

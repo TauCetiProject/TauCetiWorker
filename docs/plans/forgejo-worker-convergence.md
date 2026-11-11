@@ -205,13 +205,22 @@ boundaries.
 - Tools [PR #235](https://github.com/TauCetiProject/TauCetiTools/pull/235)
   merged at `67a371b8dc3568e811257483d16fcb728c0261cc`, with all hosted
   package, stock Lean, workflow-identity and state-service checks passing.
+- Tools [PR #236](https://github.com/TauCetiProject/TauCetiTools/pull/236)
+  merged at `3d77522999a1babe2a5fa853479c5e8d16192a86`. Workspace Git reads
+  its private credential file only for the exact configured origin, through an
+  isolated helper; activated process environments contain no native token bytes.
+  Real Git protocol tests, a clean PEP 723 fixture and the authenticated HTTPS
+  Worker fixture pass. All five hosted jobs passed. Immutable source operations
+  retain strict transport settings, and optional GitHub archive attribution
+  retains its installation-token behavior.
 - Review [PR #229](https://github.com/TauCetiProject/TauCetiReview/pull/229)
   contains the shared lifecycle and passes all 36 standalone modules locally and
   in CI. Merge requires a code-owner approval. Worker's existing dependency
   reference temporarily names its reviewed head; replace it with the merge
   commit before landing Worker.
-- Shared engine scenarios cover initial/unchanged/changed-head review for both
-  adapters. Publication covers lost responses, live locks, original identity,
+- Shared engine scenarios cover initial/unchanged/changed-head review, contest
+  replies, adjudicated-contest retries without inference, failed preparation and
+  normal preparation retry for both adapters. Publication covers lost responses, live locks, original identity,
   legacy native receipts, conversation edits and archive retention. A disposable
   stock HTTPS Forgejo passed claims, shared preparation/publication, recovery,
   contests, replies and stale-head refusal.
@@ -238,6 +247,7 @@ boundaries.
   Forgejo checks correctly retained pending execution evidence (exit 8).
 - Evidence is retained in
   `~/.local/state/tauceti/forgejo-convergence-acceptance-20261111/acceptance.json`
-  and adjacent review/repair logs. Final Review/Worker merges, managed-runtime
+  and adjacent review/repair logs. The managed-update preflight and rollback
+  script are prepared there as well. Final Review/Worker merges, managed-runtime
   update and deployed-entrypoint verification remain outstanding. No fleet
   drain, admission change or upstream Lean/Lake patch was used.
