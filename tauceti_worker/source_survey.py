@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 
 from tauceti_tools.forge import Incomplete, RepositoryRef
 
+from . import incidents
 from .source_identity import SourceActor
 from .survey import PRInfo, Survey, bucket_status_labels, roadmap_open_count
 
@@ -228,8 +229,12 @@ def worker_survey(cfg, source, rs, counters, *, roadmap, skip, deep, stages, num
                 budget=MAX_REBASE_ATTEMPTS,
                 rebase_budget_key=key,
             )
+            if held := incidents.declined("rebase", pr.number, pr.head_oid, source.repository):
+                candidate.reason = incidents.HELD
             bucket = (
-                result.rebaseable.suppressed if candidate.attempts >= candidate.budget else result.rebaseable.actionable
+                result.rebaseable.suppressed
+                if held or candidate.attempts >= candidate.budget
+                else result.rebaseable.actionable
             )
             bucket.append(candidate)
             continue
@@ -252,8 +257,12 @@ def worker_survey(cfg, source, rs, counters, *, roadmap, skip, deep, stages, num
                 budget=MAX_FIX_ATTEMPTS,
                 final_resolution=counters.read(f"fix-{pr.number}-{pr.head_oid[:12]}") >= MAX_FIX_ATTEMPTS - 1,
             )
+            if held := incidents.declined("fix", pr.number, pr.head_oid, source.repository):
+                candidate.reason, candidate.final_resolution = incidents.HELD, False
             bucket = (
-                result.needs_fix.suppressed if candidate.attempts >= candidate.budget else result.needs_fix.actionable
+                result.needs_fix.suppressed
+                if held or candidate.attempts >= candidate.budget
+                else result.needs_fix.actionable
             )
             bucket.append(candidate)
         if (
