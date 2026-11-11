@@ -914,7 +914,7 @@ def test_prerequisite(tmp):
 
 
 def test_roadmap(tmp):
-    incident = {"pr": 7, "head": "a" * 40, "repository": TAUCETI}
+    incident = {"kind": "declined", "key": "fix-7", "pr": 7, "head": "a" * 40, "repository": TAUCETI}
     check(
         "a draft that cannot be written is reported, not raised",
         decide.write_draft(tmp / "absent", incident, "Probability", "T", "P"),
@@ -933,7 +933,7 @@ def test_roadmap(tmp):
         check(
             "roadmap: a draft file, named in the ruling",
             (value["ruling"], value["area"], value["draft"]),
-            ("roadmap", "Probability", str(root / "drafts" / "roadmap-5.md")),
+            ("roadmap", "Probability", str(root / "drafts" / "roadmap-declined-fix-5.md")),
         )
         text = Path(value["draft"]).read_text()
         parts = ("# Add the zero-one law", "`Probability`", "/pull/5", "Nothing has been opened", proposal.strip())
@@ -941,8 +941,19 @@ def test_roadmap(tmp):
         refused = ruling(root, "declined-fix-6")
         check(
             "an unknown roadmap escalates and drafts nothing",
-            (refused["ruling"], refused["recommend"], (root / "drafts" / "roadmap-6.md").exists()),
+            (refused["ruling"], refused["recommend"], (root / "drafts" / "roadmap-declined-fix-6.md").exists()),
             ("escalate", "roadmap", False),
+        )
+        incidents.record_declined("rebase", 5, "head-5", message="#5 cannot rebase")
+        rebase = {**change, "title": "Split the strong law", "proposal": proposal + "Split the strong law in two."}
+        both = answer((5, "roadmap", change))
+        both["rulings"].append({"case": "declined-rebase-5", "ruling": "roadmap", "note": "n", **rebase})
+        rounds(tmp, Hub(p5={}), both)
+        drafts = [Path(ruling(root, case)["draft"]) for case in ("declined-fix-5", "declined-rebase-5")]
+        check(
+            "two stages' cases on one pull request get a draft each",
+            ([path.name for path in drafts], ["Split the strong law" in path.read_text() for path in drafts]),
+            (["roadmap-declined-fix-5.md", "roadmap-declined-rebase-5.md"], [False, True]),
         )
 
 

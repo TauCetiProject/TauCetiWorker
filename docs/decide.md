@@ -210,9 +210,11 @@ and does not remove an item once the pull request it unblocks has gone.
 
 ## Roadmap drafts
 
-A `roadmap` ruling writes `drafts/roadmap-<pr>.md` under the incident
-directory (`roadmap-<pr>.<digest>.md` for a repository other than the GitHub
-one TAUCETI): the title, the roadmap, the pull request it would unblock, and the
+A `roadmap` ruling writes `drafts/roadmap-<incident kind>-<incident key>.md`
+under the incident directory, named as its ruling record is (for example
+`roadmap-declined-fix-412.md`, or `roadmap-declined-fix-412.<digest>.md` for a
+repository other than the GitHub one TAUCETI), so each stage's case on a pull
+request has its own: the title, the roadmap, the pull request it would unblock, and the
 proposed change in the model's words. The worker opens nothing in the roadmap
 repository; a person reads the draft and files the change, or does not.
 

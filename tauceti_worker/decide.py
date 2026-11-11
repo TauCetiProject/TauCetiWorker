@@ -757,11 +757,11 @@ def _source_of_record(value: dict):
 
 
 def write_draft(root: Path, incident: dict, area: str, title: str, proposal: str) -> Path | None:
-    """Write a proposed roadmap change as `drafts/roadmap-<pr>.md` under `root` (with the key suffix
-    of a repository other than the GitHub one TAUCETI), for a person to review and file. Nothing is
-    opened anywhere. None when the file could not be written."""
+    """Write a proposed roadmap change as `drafts/roadmap-<case>.md` under `root`, where `<case>` is
+    the incident's `case_id` (so each stage's incident on a pull request has its own draft), for a
+    person to review and file. Nothing is opened anywhere. None when the file could not be written."""
     source = _source_of_record(incident)
-    path = root / DRAFTS / f"roadmap-{incident['pr']}{_suffix(source)}.md"
+    path = root / DRAFTS / f"roadmap-{case_id(incident)}.md"
     text = (
         f"# {title.strip()}\n\n"
         f"- Roadmap: `{area}` in {ROADMAP}\n"
