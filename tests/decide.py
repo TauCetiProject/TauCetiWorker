@@ -615,6 +615,19 @@ def test_prerequisite(tmp):
         True,
     )
 
+    check(
+        "an item that needs itself is refused",
+        decide.prerequisite_lines([item("zero-one", needs=["zero-one"])], 7, targets, areas)[2],
+        "`zero-one` needs itself",
+    )
+    check(
+        "…and so is one that needs an item later in the ruling",
+        "does not have"
+        in decide.prerequisite_lines(
+            [item("a-b-c", needs=["d-e-f"]), item("d-e-f", needs=["a-b-c"])], 7, targets, areas
+        )[2],
+        True,
+    )
     check("the list is written", decide.add_prerequisites(path, lines), ["zero-one", "nets"])
     check("…under its lock", (tmp / ".targets.md.lock").exists(), True)
     after = parse_targets(path.read_text())

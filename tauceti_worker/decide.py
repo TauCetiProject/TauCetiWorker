@@ -591,7 +591,8 @@ def prerequisite_lines(
 ) -> tuple[list[tuple[str, str, str]], list[str], str]:
     """Check a `prerequisite` ruling's items against the list. Returns the (area, slug, line) to add,
     every slug the pull request then waits on, and "" or the reason the ruling cannot be applied.
-    An item the list already has, not yet done, adds nothing and is waited on."""
+    An item the list already has, not yet done, adds nothing and is waited on. A new item may need
+    only items already on the list or earlier in the ruling, so the items added form no cycle."""
     lines: list[tuple[str, str, str]] = []
     slugs: list[str] = []
     for item in items:
@@ -604,6 +605,8 @@ def prerequisite_lines(
             continue
         if area not in areas:
             return [], [], f"there is no roadmap `{area}`"
+        if slug in item["needs"]:
+            return [], [], f"`{slug}` needs itself"
         if unknown := [s for s in item["needs"] if targets.find(s) is None and s not in slugs]:
             return [], [], f"`{slug}` needs `{unknown[0]}`, which the target list does not have"
         needs = ", ".join(f"`{s}`" for s in item["needs"]) or "none"
