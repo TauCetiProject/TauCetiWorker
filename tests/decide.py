@@ -63,6 +63,8 @@ class Hub:
     def __init__(self, **prs):
         self.prs = {int(k[1:]): v for k, v in prs.items()}
         self.closed = []
+        self.listing = None  # a stale listing: open_prs returns these rows, pr_view the live ones
+        self.unreadable = set()
 
     def _row(self, n):
         v = self.prs[n]
@@ -78,10 +80,12 @@ class Hub:
         }
 
     def open_prs(self):
+        if self.listing is not None:
+            return self.listing
         return [self._row(n) for n, v in self.prs.items() if v.get("state", "OPEN") == "OPEN"]
 
     def pr_view(self, n, fields):
-        return self._row(n) if n in self.prs else None
+        return self._row(n) if n in self.prs and n not in self.unreadable else None
 
     def issue_comments(self, n):
         return [{"user": {"login": "reviewer"}, "created_at": "t", "body": "x" * 5000}] * 9
@@ -353,6 +357,21 @@ def test_rounds(tmp):
             ruling(root, "declined-fix-5")["note"],
             "No ruling: the answer leaves this case out.",
         )
+
+    root = tmp / "stale"
+    with settings(root):
+        declined(1, 2)
+        hub = Hub(p1={}, p2={})
+        hub.listing = [{**hub._row(1), "headRefOid": "older"}]
+        hub.unreadable = {2}
+        check("a stale listing: nothing to rule on this round", rounds(tmp, hub), {"rc": None})
+        check(
+            "…and an incident the fresh read confirms, or cannot read, stays live",
+            [where(root, f"declined-fix-{n}.json") for n in (1, 2)],
+            [["live"]] * 2,
+        )
+        hub.listing, hub.unreadable = None, set()
+        check("the listing catches up: it is ruled on", len(rounds(tmp, hub, {"rulings": []})["packet"]["cases"]), 2)
 
     root = tmp / "cap"
     with settings(root, TAUCETI_DECIDE_MAX_CASES="2"):

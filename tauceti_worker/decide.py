@@ -27,7 +27,7 @@ from functools import cached_property
 from pathlib import Path
 
 from . import incidents
-from .config import Die, NoProgress, log, roadmap_targets
+from .config import Die, GitHubUnavailable, NoProgress, log, roadmap_targets
 from .constants import ROADMAP, ROADMAP_DIR
 from .github import GitHubError, normalize_merged
 from .github_transport import read_context
@@ -332,14 +332,32 @@ def run(w, opts) -> int | None:
 
 
 def _settle(rd: _Round) -> None:
-    """Acknowledge each live incident and ruling whose pull request has closed or left that head."""
+    """Acknowledge each live incident and ruling whose pull request has closed or left that head.
+    The listing may be a mirror or a cached copy, so what it shows is confirmed by a fresh read; a
+    record whose pull request cannot be read stays live."""
+    confirmed: dict[int, dict | None] = {}
     for path, value in incidents.records(acked=False):
         ruling = value.get("kind") == incidents.RULING and type(value.get("pr")) is int
         if value.get("repository") != rd.gh.repo or not (ruling or _usable(value)) or rd.at_head(value):
             continue
-        why = "has a new head" if value["pr"] in rd.open_prs else "is no longer open"
+        pr = value["pr"]
+        if pr not in confirmed:
+            confirmed[pr] = _fresh(rd.gh, pr)
+        live = confirmed[pr]
+        if live is None or (live.get("state") == "OPEN" and live.get("headRefOid") == value.get("head")):
+            continue
+        why = "has a new head" if live.get("state") == "OPEN" else "is no longer open"
         if incidents.acknowledge(value["kind"], str(value.get("key"))):
-            log(f"decide: {path.name}: acknowledged, #{value['pr']} {why}")
+            log(f"decide: {path.name}: acknowledged, #{pr} {why}")
+
+
+def _fresh(gh, pr: int) -> dict | None:
+    try:
+        with read_context(fresh=True, direct=True, retry=False):
+            row = gh.pr_view(pr, ["state", "headRefOid"])
+    except (GitHubError, GitHubUnavailable, OSError):
+        return None
+    return row if row and row.get("state") else None
 
 
 def _blockers(rd: _Round, ruling: dict) -> tuple[list[str] | None, str]:

@@ -51,7 +51,9 @@ directory holds a live incident or a live ruling. It then:
 
 1. Lists the open pull requests and acknowledges every live incident and ruling
    whose pull request has closed, merged, or moved to another head. No model is
-   involved.
+   involved. The listing may come from a mirror or a short-lived cache, so a
+   record it shows off its head is acknowledged only once a fresh read of that
+   pull request agrees; one that cannot be read stays live.
 2. Looks again at each live ruling that waits on something (see below).
 3. Takes the live incidents, oldest first, up to the limit. One whose pull
    request carries `keep`, `hold`, `wip`, `human`, `on-hold` or `do-not-close`
