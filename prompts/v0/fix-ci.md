@@ -8,12 +8,14 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   `The runner has received a shutdown signal` (exit code 143), the build may have run out of memory.
   A shutdown alone does not show that: runners are also stopped when a job is cancelled or its machine
   is reclaimed. Measure before you decide. Once a changed file's imports are built,
-  `python3 -c 'import resource, subprocess, sys; subprocess.run(sys.argv[1:]); print(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)' lake lean <path/to/File.lean>`
-  recompiles the file and prints its peak memory (kilobytes on Linux); a `lake build` of an
-  already-built module measures only Lake. Compare it with the runner's memory: the log's `Set up job`
-  step names the machine, and the GitHub and Namespace runners a PR build can land on have 16 GB. If a
-  changed file comes anywhere near that, bring it well under, typically by restructuring a large
-  `decide` over a finite type so that the kernel checks less at once.
+  `python3 -c 'import resource, subprocess, sys; subprocess.run(sys.argv[1:], check=True); print(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)' lake lean <path/to/File.lean>`
+  recompiles the file and prints its peak memory (kilobytes on Linux). It fails instead of printing if
+  the compile fails or is killed; a measurement counts only from a compile that succeeded, since a killed
+  one stops below what the file needs. A `lake build` of an already-built module measures only Lake.
+  Compare the number with the runner's memory: the log's `Set up job` step names the machine, and the
+  GitHub and Namespace runners a PR build can land on have 16 GB. If a changed file comes anywhere near
+  that, bring it well under, typically by restructuring a large `decide` over a finite type so that the
+  kernel checks less at once.
 - The `build` check includes source guards, `lake build --iofail`, shim checks,
   the audit driver (global duplicate declarations, then axioms), the module-system audit, the
   environment lint (`lint-env`) and the source style lint (`lint-style`). Find the stage that failed
