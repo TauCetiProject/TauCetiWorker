@@ -11,12 +11,11 @@ from __future__ import annotations
 import json
 from urllib.parse import urlsplit
 
-from tauceti_tools.ci_candidate import RepositoryIdentity, digest
-from tauceti_tools.forge import Forge, RepositoryRef
-
 
 class SourceNumber(int):
     def __new__(cls, number, source):
+        from tauceti_tools.ci_candidate import RepositoryIdentity
+
         if type(number) is not int or not 0 < number < 2**63 or not isinstance(source, RepositoryIdentity):
             raise ValueError("a native pull requires its repository identity and positive number")
         if source.repository.forge.kind != "forgejo":
@@ -49,6 +48,8 @@ class SourceNumber(int):
 
     @property
     def ref_key(self):
+        from tauceti_tools.ci_candidate import digest
+
         return digest(self.source.record()) + "/" + str(int(self))
 
     @property
@@ -62,6 +63,9 @@ class SourceNumber(int):
 def from_source_pr(value):
     if not isinstance(value, str) or not value.startswith("forgejo:") or "@" not in value:
         return int(value.rsplit("#", 1)[1])
+    from tauceti_tools.ci_candidate import RepositoryIdentity
+    from tauceti_tools.forge import Forge, RepositoryRef
+
     location, number = value.rsplit("#", 1)
     url, identifier = location.removeprefix("forgejo:").rsplit("@", 1)
     parsed = urlsplit(url)
@@ -82,6 +86,8 @@ def source_record(number):
 def qualify_record(row):
     """Decode only an explicit durable column; never guess from a display login."""
     if row.get("source_identity") and type(row.get("number")) is int:
+        from tauceti_tools.ci_candidate import RepositoryIdentity
+
         raw = row["source_identity"]
         identity = RepositoryIdentity.parse(json.loads(raw) if isinstance(raw, str) else raw)
         row["number"] = SourceNumber(row["number"], identity)
@@ -100,6 +106,8 @@ def encode(value):
 
 def decode(value):
     if isinstance(value, dict) and set(value) == {"__tauceti_queue_pull__", "number"}:
+        from tauceti_tools.ci_candidate import RepositoryIdentity
+
         return SourceNumber(value["number"], RepositoryIdentity.parse(value["__tauceti_queue_pull__"]))
     return value
 
