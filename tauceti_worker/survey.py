@@ -460,8 +460,14 @@ class Survey:
     def backlog_counts(self) -> dict[str, int]:
         """This identity's backlog as the runtime status publishes it: the open-PR count the authoring
         limit is compared with, how many of its surveyed non-draft PRs carry `awaiting-author`, and how
-        many carry that or `ci-failed` (a PR with both counts once)."""
-        waiting = [{"awaiting-author", "ci-failed"} & set(p.labels) for p in self._mine_open_prs]
+        many carry that or `ci-failed` (a PR with both counts once). Only PRs in the surveyed scope
+        count: a source survey keeps its unscoped list of owned PRs for the authoring limit."""
+        scoped = {(p.number, p.head_oid) for p in self.open_prs}
+        waiting = [
+            {"awaiting-author", "ci-failed"} & set(p.labels)
+            for p in self._mine_open_prs
+            if (p.number, p.head_oid) in scoped
+        ]
         return {
             "mine_open": self.n_mine_open,
             "mine_awaiting_author": sum("awaiting-author" in labels for labels in waiting),

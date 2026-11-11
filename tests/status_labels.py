@@ -104,6 +104,7 @@ def main():
         prinfo(3, ME, ["ci-failed", "awaiting-author"]),
         prinfo(4, ME, ["awaiting-review"]),
     ]
+    backlog.open_prs = list(backlog._mine_open_prs)
     check(
         backlog.backlog_counts() == {"mine_open": 7, "mine_awaiting_author": 2, "mine_needs_fix": 3},
         "backlog: authoring count passed through; awaiting-author plus ci-failed is one PR to fix",

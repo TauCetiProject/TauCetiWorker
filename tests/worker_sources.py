@@ -67,7 +67,7 @@ class Sources(unittest.TestCase):
             "updatedAt": "2026-11-11T00:00:00Z",
         }
 
-    def native_survey(self, rows, *, blocking=False, metadata=None):
+    def native_survey(self, rows, *, blocking=False, metadata=None, roadmap="any", skip=()):
         self.source.open_prs.return_value = rows
         rs = Mock()
         if metadata is None and blocking:
@@ -82,8 +82,8 @@ class Sources(unittest.TestCase):
             self.source,
             rs,
             Counters(cfg),
-            roadmap="any",
-            skip=[],
+            roadmap=roadmap,
+            skip=list(skip),
             deep=True,
             stages=["review", "fix", "rebase"],
             numbers=(),
@@ -478,6 +478,7 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_toke
         github = Survey(worker_id="test", me_login="worker")
         mine = PRInfo(9, "d" * 40, "work", "one", "project", False, "MERGEABLE", "worker", True, False)
         github._mine_open_prs, github.n_mine_open = [replace(mine, labels=("awaiting-author",))], 1
+        github.open_prs = list(github._mine_open_prs)
         return [
             ("github", SimpleNamespace(gh=SimpleNamespace(repo="one/project")), github),
             ("forgejo", SimpleNamespace(gh=self.source), native),
@@ -504,6 +505,18 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_toke
         for _, _, value in focused:
             value._round_scope = (False, True)
         self.assertEqual(self.published_backlog(focused), [])
+
+    def test_native_backlog_labels_follow_the_roadmap_scope(self):
+        rows = [self.row(1, head="a" * 40), self.row(2, head="b" * 40), self.row(3, head="c" * 40)]
+        for row, labels in zip(
+            rows,
+            (["roadmap/Algebra"], ["roadmap/Topology", "awaiting-author"], ["roadmap/Topology", "ci-failed"]),
+            strict=True,
+        ):
+            row["labels"] = [{"name": label} for label in labels]
+        for roadmap, skip in (("Algebra", ()), ("auto", ("Topology",))):
+            counts = self.native_survey(rows, roadmap=roadmap, skip=skip).backlog_counts()
+            self.assertEqual((counts["mine_awaiting_author"], counts["mine_needs_fix"]), (0, 0), roadmap)
 
     def test_unavailable_forge_keeps_totals_and_its_last_breakdown(self):
         earlier = {"mine_open": 5, "mine_awaiting_author": 0, "mine_needs_fix": 0, "survey_at": 1.0}
