@@ -10,6 +10,7 @@ the worker uses:
     candidates(targets, only, skip)    the eligible items, in the order a worker tries to claim them
     landed_pr(item, gh)                the merged pull request that completed an item, at any age
     marked_prs(targets, prs)           the pull requests among `prs` whose marker names an item
+    open_pr(item, gh)                  an open pull request for an item that a bounded listing missed
     GitHubMarkerReads()                the GitHub repository's marked pull requests, for a round
                                        whose sources do not include GitHub
     render_assignment(targets, item)   the roadmap prompt's bullet assigning one item
@@ -39,6 +40,7 @@ MARKER_TAG = "tauceti-target:v1"
 MERGED_SEARCH = f'"{MARKER_TAG}" in:body'
 MERGED_LIMIT = 200
 _ID_PHRASE = re.compile(r'"id":"(.*)"')
+_ID_TERM = '\\"id\\":\\"{}\\"'
 _AREA_RE = re.compile(r"[A-Za-z0-9_-]+")
 _HEADING_RE = re.compile(r"^##\s+(.*?)\s*$")
 _ITEM_RE = re.compile(r"^\s*-\s*\[([ xX~])\]\s*(.*?)\s*$")
@@ -272,17 +274,19 @@ def github_history_enabled() -> bool:
 
 
 class GitHubMarkerReads:
-    """A source for `live_targets` and `landed_pr` made of the GitHub content repository's
-    marker-bearing pull requests, for a round whose sources do not include GitHub (a list carried
-    over from GitHub). One listing (`GitHub.target_marker_prs`) serves the open side, the merged
-    side and every item's landing search it can answer. A failed read is logged and counts as no
-    pull requests, which leaves the list's own marks."""
+    """A source for `live_targets`, `landed_pr` and `open_pr` made of the GitHub content
+    repository's marker-bearing pull requests, for a round whose sources do not include GitHub (a
+    list carried over from GitHub). One listing (`GitHub.target_marker_prs`) serves the open and
+    merged sides. While that listing is full, and so may not reach back far enough, each candidate
+    it does not settle gets one search of its own, in any state. A failed read is logged and counts
+    as no pull requests, which leaves the list's own marks."""
 
     def __init__(self, gh=None):
         from .github import GitHub
 
         self.gh = gh if gh is not None else GitHub()
         self._rows: list[dict] | None = None
+        self._items: dict[str, list[dict]] = {}
 
     def _read(self, fetch) -> list[dict]:
         from .config import GitHubUnavailable
@@ -301,26 +305,53 @@ class GitHubMarkerReads:
             self._rows = self._read(lambda: self.gh.target_marker_prs(limit=MERGED_LIMIT))
         return self._rows
 
+    def _beyond(self, search: str, state: str) -> list[dict]:
+        phrases = search_phrases(search)
+        ident = search_id(phrases)
+        if ident is None or len(self._listing()) < MERGED_LIMIT:
+            return []
+        if ident not in self._items:
+            term = '"' + _ID_TERM.format(ident) + '"'
+            self._items[ident] = self._read(lambda: self.gh.target_marker_prs(limit=30, search=term))
+        return [d for d in self._items[ident] if d.get("state") == state and body_matches(d.get("body") or "", phrases)]
+
     def open_prs(self) -> list[dict]:
         return [d for d in self._listing() if d.get("state") == "OPEN"]
 
     def merged_prs(self, search: str, *, limit: int = MERGED_LIMIT) -> list[dict]:
-        """The listing's merged rows matching `search`. One item's search (`landed_pr`) that the
-        listing cannot answer, because it holds MERGED_LIMIT rows and so may not reach back far
-        enough, goes to GitHub as `GitHub.merged_prs`."""
         phrases = search_phrases(search)
-        listing = self._listing()
-        rows = [d for d in listing if d.get("state") == "MERGED" and body_matches(d.get("body") or "", phrases)]
-        if rows or search_id(phrases) is None or len(listing) < MERGED_LIMIT:
-            return rows[:limit]
-        return self._read(lambda: self.gh.merged_prs(search, limit=limit))
+        rows = [d for d in self._listing() if d.get("state") == "MERGED"]
+        return [d for d in rows if body_matches(d.get("body") or "", phrases)][:limit]
+
+    def merged_beyond_listing(self, search: str, *, limit: int) -> list[dict]:
+        return self._beyond(search, "MERGED")[:limit]
+
+    def open_beyond_listing(self, search: str) -> list[dict]:
+        return self._beyond(search, "OPEN")
+
+
+def _item_search(item: TargetItem) -> str:
+    return '"' + _ID_TERM.format(item.slug.replace('"', "")) + f'" {MERGED_SEARCH}'
 
 
 def landed_pr(item: TargetItem, gh) -> int | None:
     """The merged pull request that completed `item`, however long ago: one search for its id
-    among the closed pull requests that carry a marker. Raises GitHubError when it fails."""
-    ident = '\\"id\\":\\"' + item.slug.replace('"', "") + '\\"'
-    return landed([item], gh.merged_prs(f'"{ident}" {MERGED_SEARCH}', limit=30)).get((item.area, item.slug))
+    among the closed pull requests that carry a marker, then, when that does not settle it and the
+    source can look further (`merged_beyond_listing`), that. Raises GitHubError when it fails."""
+    key, search = (item.area, item.slug), _item_search(item)
+    found = landed([item], gh.merged_prs(search, limit=30)).get(key)
+    beyond = getattr(gh, "merged_beyond_listing", None)
+    if found is None and beyond is not None:
+        found = landed([item], beyond(search, limit=30)).get(key)
+    return found
+
+
+def open_pr(item: TargetItem, gh) -> int | None:
+    """An open pull request for `item` that the source's open listing may not have held
+    (`open_beyond_listing`); None when there is none or the source's open listing is complete."""
+    beyond = getattr(gh, "open_beyond_listing", None)
+    rows = beyond(_item_search(item)) if beyond is not None else []
+    return next((d.get("number") for d in rows if (item.area, item.slug) in marker_keys(d.get("body"))[0]), None)
 
 
 def marked_prs(targets: Targets, prs: Iterable[dict]) -> set[int]:
