@@ -1560,7 +1560,7 @@ class Controller:
 
     def task_check_policy(self, task_id: int) -> dict:
         """Refresh optional check priority over the existing authenticated claim renewal."""
-        with self._lock:
+        with self._lock.priority():
             task = self.store.row("tasks", {"id": task_id})
             if task is None:
                 return {}
