@@ -490,7 +490,17 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             (False, "it takes no --pr") if getattr(opts, "prs", ()) else decide.due(source=incidents.source_of(w.gh))
         )
         if ready:
-            rc = dispatch("decide", w, Survey(worker_id=w.cfg.wid), Candidate(0, "", why), opts)
+            # The phase rules on the records of the source it runs on, so it is bound to that source
+            # as a pull request candidate is, and passes the source's own authorization.
+            identity = getattr(w.gh, "identity", None)
+            candidate = Candidate(
+                0,
+                "",
+                why,
+                source_repository=incidents.repository_ref(incidents.source_of(w.gh)),
+                source_repository_id=getattr(identity, "native_id", None),
+            )
+            rc = dispatch("decide", w, Survey(worker_id=w.cfg.wid), candidate, opts)
             if rc is not None:
                 return rc
             why = "nothing to put to the model this round"

@@ -235,9 +235,9 @@ def test_selection(root, tmp):
 
     ran, surveyed, asked = [], [], []
     real_due = decide.due
-    worker = SimpleNamespace(cfg=SimpleNamespace(wid="w1", state=tmp / "state"), counters=None, gh=None, rs=None)
+    worker = SimpleNamespace(cfg=SimpleNamespace(wid="w1", state=tmp / "state"), counters=None, gh=Hub(), rs=None)
 
-    def go(only, prs=(), dry_run=False):
+    def go(only, prs=(), dry_run=False, on=None, prepared=None):
         ran.clear(), surveyed.clear(), asked.clear()
         opts = tc.RoundOpts(only=only, agent="claude", work_model="claude", sandbox_host=True, dry_run=dry_run, prs=prs)
         survey = patch.object(
@@ -254,7 +254,7 @@ def test_selection(root, tmp):
             patch("tauceti_worker.claude_api.api_mode", return_value=False),
         ):
             try:
-                return work_units.run_round(worker, opts)
+                return work_units.run_round(on or worker, opts, prepared_survey=prepared)
             except tc.NoProgress as error:
                 return str(error)
 
@@ -278,6 +278,33 @@ def test_selection(root, tmp):
     with settings(root, TAUCETI_DECIDE_GAP="0"):
         check("TAUCETI_DECIDE_GAP sets it", decide.due()[0], True)
     test_several_sources(root, go, ran)
+
+    from tauceti_tools.ci_candidate import RepositoryIdentity
+
+    from tauceti_worker.forgejo_worker import ForgejoWorkerSource
+
+    class Native(ForgejoHub):
+        """A Forgejo source with the real adapter's candidate authorization."""
+
+        identity = RepositoryIdentity(FORGEJO, 7)
+        authorize_candidate = ForgejoWorkerSource.authorize_candidate
+
+        def validate_binding(self):
+            return {}
+
+    native = SimpleNamespace(
+        cfg=SimpleNamespace(wid="w1", state=tmp / "native-state"), counters=None, gh=Native(p3={}), rs=None
+    )
+    with (
+        settings(root, TAUCETI_DECIDE_GAP="0"),
+        patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": str(tmp / "shared")}),
+    ):
+        incidents.record_declined("fix", 3, "head-3", message="declined on Forgejo", repository=FORGEJO)
+        check(
+            "a Forgejo source's round passes the adapter's authorization to the phase",
+            (go(["decide"], on=native, prepared=tc.Survey("w1")), ran),
+            (0, ["decide"]),
+        )
 
 
 def test_several_sources(root, go, decided):
