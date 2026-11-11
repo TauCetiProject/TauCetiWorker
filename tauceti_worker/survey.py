@@ -15,6 +15,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from tauceti_tools.forge import RepositoryRef
+
 from .config import Config, log, roadmap_only, roadmap_skip
 from .config import max_open_prs as configured_max_open_prs
 from .constants import (
@@ -215,6 +217,23 @@ def target_marker_focuses(body: str) -> tuple[str, ...]:
     return tuple(target_focuses(body))
 
 
+def work_target_keys(body):
+    result = set()
+    for match in TARGET_MARKER_RE.finditer(body):
+        try:
+            target = json.loads(match[1])
+        except ValueError:
+            continue
+        if all(isinstance(target.get(key), str) and target[key] for key in ("focus", "id")):
+            result.add(json.dumps([target["focus"], target["id"]], separators=(",", ":")))
+    return tuple(sorted(result))
+
+
+def origin_pr_url(body):
+    match = re.search(r"^Origin-PR:\s*(https?://[^\s]+)\s*$", body, re.M | re.I)
+    return match[1].rstrip("/") if match else ""
+
+
 @dataclass(frozen=True)
 class PRInfo:
     number: int
@@ -242,6 +261,8 @@ class PRInfo:
     updated_at: str = ""
     bump_integration_failed: bool = False
     self_tested: bool = False
+    work_targets: tuple[str, ...] = ()
+    origin_pr: str = ""
 
     @property
     def review_ready(self) -> bool:
@@ -304,6 +325,8 @@ class PRInfo:
             build_status_at=max([t for t in posted if t is not None], default=None),
             updated_at=str(d.get("updatedAt") or ""),
             self_tested=local,
+            work_targets=work_target_keys(d.get("body", "")),
+            origin_pr=origin_pr_url(d.get("body", "")),
             bump_integration_failed=any(
                 c.get("context") == "bump-integration" and c.get("state") in BUILD_FAIL for c in rollup
             ),
@@ -326,6 +349,8 @@ class Candidate:
     bump_integration_failure: bool = False
     final_resolution: bool = False  # existing own-PR fix budget is spent; resolve or close
     partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
+    source_repository: RepositoryRef | None = None
+    source_repository_id: int | None = None
     progress: dict | None = field(
         default=None, repr=False, compare=False
     )  # current claimed-PR baseline; never persisted
@@ -791,9 +816,11 @@ def survey(
         roadmap_skip=roadmap_skip(),
     )
     if getattr(gh, "direct_source", False) is True:
-        from .source_survey import inventory_survey
+        from .source_survey import inventory_survey, worker_survey
 
-        return inventory_survey(
+        consumer = worker_survey if getattr(gh, "worker_capable", False) is True else inventory_survey
+        runtime = {"rs": rs, "counters": counters} if consumer is worker_survey else {}
+        return consumer(
             cfg,
             gh,
             roadmap=sv.roadmap_only,
@@ -802,6 +829,7 @@ def survey(
             stages=enabled,
             numbers=numbers,
             count_all_roadmaps=count_all_roadmaps,
+            **runtime,
         )
     compact = []
     if seed := getattr(rs, "seed_survey", None):
@@ -879,6 +907,54 @@ def survey(
     # reads no review state at all and its callers need not supply one.
     if rs is not None:
         rs.observe(prs)
+    classify_survey(cfg, gh, rs, counters, sv, enabled=enabled, deep=deep, compact=compact, cached_only=cached_only)
+    if deep:
+        from .github_transport import event
+
+        event(
+            {
+                "kind": "survey_result",
+                "source": "compact" if available else "direct",
+                "roadmap": sv.roadmap_only,
+                "prs": len(prs),
+                "inventory_prs": len(raw),
+                "elapsed_ms": round((time.monotonic() - began) * 1000),
+                "issue_gaps": sum(not row["review"]["issue_complete"] for row in compact or []),
+                "review_gaps": sum(not row["review"]["review_complete"] for row in compact or []),
+            }
+        )
+    return sv
+
+
+def classify_survey(
+    cfg,
+    gh,
+    rs,
+    counters,
+    sv,
+    *,
+    enabled,
+    deep=True,
+    compact=(),
+    cached_only=False,
+    review_without_ci=False,
+    supports_external_repair=True,
+    pending=None,
+):
+    """One scheduling policy over normalized inventory and source capabilities.
+
+    Review admission can precede execution evidence on an explicitly configured
+    source; this never sets build_success or grants queue/CI authority.
+    """
+    from .review_runtime import pending_reviews
+
+    enabled = set(enabled)
+    pending = (pending_reviews(cfg) if deep else set()) if pending is None else pending
+    prs = sv.open_prs
+
+    def review_ready(pr):
+        return pr.review_ready or review_without_ci
+
     nondraft = [
         p
         for p in prs
@@ -888,19 +964,19 @@ def survey(
             and {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
         )
     ]
-    me_login = me()
+    me_login = sv.me_login or me()
     sv.me_login = me_login
-    mine = [p for p in nondraft if p.author == me_login]
+    mine = [p for p in nondraft if sv.owns(p)]
     # Tend our own PRs, plus bot PRs hosted on canonical when this identity can push there. Only query
     # that permission while such a bot PR is open; an unknown result skips optional bot work this round.
     bot_on_canonical = bool(enabled & {"rebase", "fix", "fix-ci", "bump", "lint-repair"}) and any(
         p.author_is_bot and p.head_owner == TAUCETI_OWNER for p in nondraft
     )
-    tend_bot = bot_on_canonical and can_push(TAUCETI) is True
+    tend_bot = supports_external_repair and bot_on_canonical and can_push(TAUCETI) is True
     tended = [
         p
         for p in nondraft
-        if (p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER))
+        if (sv.owns(p) or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER))
         and not {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
     ]
     facts = {row["pr"]["number"]: row["review"] for row in compact or []}
@@ -916,12 +992,12 @@ def survey(
         return ready
 
     sv.n_open_nondraft = len(nondraft)
-    sv.n_reviewable = sum(1 for p in nondraft if p.review_ready)
+    sv.n_reviewable = sum(1 for p in nondraft if review_ready(p))
     sv._mine_open_prs = mine
     sv.rescope_roadmap()
     # Bucket open non-draft PRs by the STATUS_LABELS pipeline (fixed order), pairing each label's
     # total with the subset this identity authored, for the per-round "open PRs" line.
-    sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login)
+    sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login, owns=sv.owns)
 
     # 1) rebase: tended (ours or bot-authored), conflicting or a sweep handoff for
     #    this exact head, under the per-PR budget since last verified progress.
@@ -929,7 +1005,7 @@ def survey(
     #    exists, so rebase owns the git conflict on those too. No review-round gate: a conflicting PR
     #    is rebased until it merges or CI retires it.
     foreign_repairs = []
-    if "rebase" in enabled:
+    if "rebase" in enabled and supports_external_repair:
         from .repair_route import authorize, target
 
         scope = target()
@@ -1014,7 +1090,9 @@ def survey(
     for p in nondraft if "review" in enabled else []:
         if {label.lower() for label in p.labels} & {"hold", "wip", "human", "on-hold"}:
             continue
-        if not p.review_ready:
+        if not review_ready(p) or (p.number, p.head_oid) in pending:
+            continue
+        if _unchanged_review_recent(counters, p.number, p.head_oid):
             continue
         if not deep:
             sv.reviewable.actionable.append(
@@ -1044,6 +1122,9 @@ def survey(
                 (sv.reviewable.suppressed if c.attempts >= c.budget else sv.reviewable.actionable).append(c)
             continue
         m = rs.gh_meta(p.number)
+        if m.provenance in {"stale", "fetch_failed"}:
+            gaps.add(p.number)
+            continue
         if rs.ledger_clean_head(p.number) != p.head_oid:
             # normal review path: the head moved or the last round errored.
             c = Candidate(
@@ -1116,7 +1197,7 @@ def survey(
             if not history_ready(p):
                 # Preserve the existing fallback for build-green PRs with
                 # incomplete history; a label alone is not a current finding.
-                if p.review_ready and "awaiting-author" in p.labels:
+                if review_ready(p) and "awaiting-author" in p.labels:
                     c = Candidate(
                         p.number,
                         p.head_oid,
@@ -1144,7 +1225,7 @@ def survey(
             disp, why = fix_disposition(
                 meta,
                 p.head_oid,
-                p.review_ready,
+                review_ready(p),
                 blocking,
                 per_head,
                 pending_contest=pending_contest,
@@ -1269,21 +1350,6 @@ def survey(
     sv.discovery_gaps = len(gaps)
     sv.discovery_gap_prs = sorted(gaps)
     sv.next_auto_stage = _next_auto_stage(sv)
-    if deep:
-        from .github_transport import event
-
-        event(
-            {
-                "kind": "survey_result",
-                "source": "compact" if available else "direct",
-                "roadmap": sv.roadmap_only,
-                "prs": len(prs),
-                "inventory_prs": len(raw),
-                "elapsed_ms": round((time.monotonic() - began) * 1000),
-                "issue_gaps": sum(not row["review"]["issue_complete"] for row in compact or []),
-                "review_gaps": sum(not row["review"]["review_complete"] for row in compact or []),
-            }
-        )
     return sv
 
 
