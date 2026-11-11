@@ -2129,6 +2129,9 @@ class Quota:
             elif sys.platform == "darwin":
                 err += ' (and no "Claude Code-credentials" Keychain entry)'
             return Provider("claude", False, None, error=err)
+        unusable = self._claude_launch_credential_unusable()
+        if unusable:
+            return Provider("claude", False, None, error=unusable)
         # The cache is keyed by the access token: a rotation to a different account changes it (forcing a
         # re-fetch); an external same-account refresh also changes it, costing one harmless extra fetch.
         # Account cooldown identity is deliberately stable across token refreshes.
@@ -2152,6 +2155,22 @@ class Quota:
                         fp, oauth.get("accessToken"), refresh=True, account=self._claude_account_key(oauth)
                     )
         return prov
+
+    def _claude_launch_credential_unusable(self) -> str | None:
+        """Why the agents cannot launch, when a usage login answers for them and their own credential
+        is known to be unusable: the file in $CLAUDE_CONFIG_DIR is missing, or it holds a token past
+        its expiry with no refresh token. None otherwise, and always off this route or on macOS, where
+        agents read the Keychain first."""
+        if claude_usage_credentials() is None or sys.platform == "darwin":
+            return None
+        path = claude_dir(self.cfg.home) / ".credentials.json"
+        oauth = _as_dict(_as_dict(_read_json_file(path)).get("claudeAiOauth"))
+        if not oauth.get("accessToken"):
+            return f"no {path} (the credential agents launch from)"
+        expires = oauth.get("expiresAt")
+        if not oauth.get("refreshToken") and _finite_num(expires) and expires <= time.time() * 1000:
+            return f"the token agents launch from in {path} has expired; replace it with a new `claude setup-token`"
+        return None
 
     def _claude_pass(
         self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None
