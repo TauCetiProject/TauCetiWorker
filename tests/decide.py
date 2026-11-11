@@ -963,6 +963,24 @@ def test_close(tmp):
     clock[0] += 86400
     check("…and starts again the next day", attempt(TAUCETI_DECIDE_MAX_CLOSES_PER_DAY="1")[0], True)
 
+    shared = tmp / "close-shared"
+    native = ForgejoHub(p8={}, p41={"state": "MERGED"})
+    racing = Hub(p1={}, p41={"state": "MERGED"})
+    other = []
+
+    def peer_closes(n):
+        if n == 41 and not other:
+            other.append(decide.close_subsumed(native, 8, "head-8", [41], comment, login="me"))
+
+    racing.on_diff = peer_closes
+    with settings(shared, TAUCETI_DECIDE_CLOSE="1", TAUCETI_DECIDE_MAX_CLOSES_PER_DAY="1"):
+        mine = decide.close_subsumed(racing, 1, "head-1", [41], comment, login="me")
+    check(
+        "two sources' rounds share the daily allowance: the one that reserves second does not close",
+        (other[0][0], mine, [n for n, _ in native.closed], racing.closed),
+        (True, (False, "today's limit of 1 closure(s) is used"), [8], []),
+    )
+
     root = tmp / "close-round"
     asked = answer(
         (1, "close", {"subsumed_by": [41], "comment": comment}), (2, "close", {"subsumed_by": [42], "comment": comment})

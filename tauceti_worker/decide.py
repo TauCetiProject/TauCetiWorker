@@ -828,20 +828,27 @@ def closes_today() -> int:
     return sum(line.startswith(today) for line in lines)
 
 
-def _log_closure(pr: str, head: str) -> bool:
-    """Append one line to the closure log, which nothing rewrites, so the daily limit counts every
-    attempt however the ruling records are later replaced or acknowledged."""
+def _reserve_closure(pr: str, head: str) -> str:
+    """Take one of today's closures: under an exclusive `flock` on the closure log, which every
+    source's round shares, count today's lines and append one. "" once reserved, else why not. The
+    log is never rewritten, so the limit counts every attempt however the ruling records are later
+    replaced or acknowledged."""
     root = incidents.directory()
     if root is None:
-        return False
+        return "the closure could not be logged for the daily limit"
+    today = time.strftime("%Y-%m-%d", time.gmtime())
     try:
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with open(root / CLOSURES, "a") as log_file:
+        with open(root / CLOSURES, "a+") as log_file:
+            fcntl.flock(log_file, fcntl.LOCK_EX)
+            log_file.seek(0)
+            if sum(line.startswith(today) for line in log_file.read().splitlines()) >= max_closes():
+                return f"today's limit of {max_closes()} closure(s) is used"
             log_file.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {pr} {head}\n")
-    except OSError as error:
+    except (OSError, UnicodeDecodeError) as error:
         log(f"decide: the closure log under {root} was not written: {error}")
-        return False
-    return True
+        return "the closure could not be logged for the daily limit"
+    return ""
 
 
 def _closable(gh, pr: int, head: str, login: str) -> str:
@@ -899,8 +906,8 @@ def close_subsumed(gh, pr: int, head: str, subsumed_by: list[int], comment: str,
         f"Closed by an automated worker's decide phase, ruling on this pull request at `{head[:12]}`. "
         "Reopen it if this is wrong."
     )
-    if not _log_closure(pull_ref(incidents.source_of(gh), pr), head):
-        return False, "the closure could not be logged for the daily limit"
+    if refused := _reserve_closure(pull_ref(incidents.source_of(gh), pr), head):
+        return False, refused
     if not gh.close_pr(pr, body):
         return False, "the closure could not be confirmed"
     return True, evidence

@@ -223,10 +223,11 @@ all of these hold at the moment of closing:
 
 - `TAUCETI_DECIDE_CLOSE` is on, and fewer than
   `TAUCETI_DECIDE_MAX_CLOSES_PER_DAY` closures were attempted today (UTC),
-  counted from `closures.log` in the incident directory. Each attempt appends
-  one line (time, pull request as `#N` on GitHub or its URL elsewhere, head)
-  before the pull request is closed, on every forge; a log
-  that cannot be read or written refuses the closure.
+  counted from `closures.log` in the incident directory, which every source's
+  rounds share. Immediately before closing, under an exclusive `flock` on that
+  file, the count is taken again and one line appended (time, pull request as
+  `#N` on GitHub or its URL elsewhere, head), so two rounds cannot both take the
+  last closure. A log that cannot be read or written refuses the closure.
 - The worker holds the pull request's branch claim: the GitHub claim on GitHub,
   the source's Git lease on Forgejo. Where the claim cannot be registered at
   all, a repair round on GitHub goes on unclaimed; a closure does not.
