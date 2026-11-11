@@ -94,9 +94,10 @@ class ProgressShepherdTests(unittest.TestCase):
             body = json.loads(input_text)
             recorded = json.loads(self.ledger.read_text())["reports"][body["inputs"]["pr"]]
             self.dispatches.append((argv, env.get("TAUCETI_OUTBOX_REPLAY"), body, recorded["asks"]))
-            if isinstance(self.result, Exception):
-                raise self.result
-            return self.result
+            result = self.result.pop(0) if isinstance(self.result, list) else self.result
+            if isinstance(result, Exception):
+                raise result
+            return result
 
         for target, attribute, value in (
             (shepherd.GitHub, "pr_list", pr_list),
@@ -163,13 +164,27 @@ class ProgressShepherdTests(unittest.TestCase):
                 f"repos/{ROADMAP}/actions/workflows/{PROGRESS_MERGE_WORKFLOW}/dispatches",
             ],
         )
-        self.assertEqual((replay, body, recorded), ("1", {"ref": "main", "inputs": {"pr": "31"}}, 1))
+        self.assertEqual(
+            (replay, body, recorded), ("1", {"ref": "main", "inputs": {"pr": "31", "wait_for_queue": True}}, 1)
+        )
         self.assertIn("asked the merge gate about report #31 (Area) again (1/2)", self.logged[-1])
         self.look(PROGRESS_SHEPHERD_GRACE + PROGRESS_SHEPHERD_INTERVAL - 5)
         self.assertEqual(len(self.dispatches), 1)
         self.look(PROGRESS_SHEPHERD_GRACE + PROGRESS_SHEPHERD_INTERVAL + 10)
         self.assertEqual([d[3] for d in self.dispatches], [1, 2])
         self.assertIn("created=%3E%3D2027-01-15T09%3A59%3A05Z", self.run_reads[-1], "runs since the previous ask")
+
+    def test_a_gate_without_the_queue_input_is_asked_without_it(self):
+        self.result = [
+            answer(1, 'gh: Unexpected inputs provided: ["wait_for_queue"] (HTTP 422)', statuses=[422]),
+            answer(),
+        ]
+        self.look(PROGRESS_SHEPHERD_GRACE + 5)
+        self.assertEqual(
+            [d[2]["inputs"] for d in self.dispatches], [{"pr": "31", "wait_for_queue": True}, {"pr": "31"}]
+        )
+        self.assertEqual((self.entry()["asks"], self.warned), (1, []))
+        self.assertIn("asked the merge gate about report #31 (Area) again (1/2)", self.logged[-1])
 
     def test_a_round_that_died_while_asking_does_not_ask_again(self):
         self.result = OSError("gh went away")

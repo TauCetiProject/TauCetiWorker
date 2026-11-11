@@ -497,9 +497,12 @@ deleted. With all three settings unset the progress phase runs exactly as before
 
 The roadmap repository's merge gate (`progress-merge.yml`) considers a report when its pull request
 is opened, reopened, pushed to or marked ready, and when the workflow is dispatched with the pull
-request's number. It runs on no schedule, so a report it refused for a reason that has since passed,
-or whose run was lost, stays open, and without this setting the worker does nothing to a report once
-it is open.
+request's number. The gate TauCetiProgress installs runs on no schedule. A roadmap repository may
+add one: TauCetiRoadmap's runs every twenty minutes, offers again each report it held while the
+merge queue was busy, and offers a report it refused again once that refusal is a day old. Either
+way a report refused for a reason that has since passed, or whose run was lost, can stay open for
+hours or indefinitely, and without this setting the worker does nothing to a report once it is
+open. The setting bounds that wait instead: it asks twice and then hands the report to a person.
 
 With `--progress-shepherd` (`progress_shepherd = true` in `workers.toml`), every progress round
 first lists the open pull requests of its GitHub account in the roadmap repository whose head
@@ -518,7 +521,10 @@ branch starts with `progress/`, and for each one that is not a draft:
    the directory, is not asked about.
 
 The dispatch is `POST /repos/<roadmap repository>/actions/workflows/progress-merge.yml/dispatches`
-on `main`. It needs write access to the roadmap repository and a token with the fine-grained
+on `main` with the inputs `pr` and `wait_for_queue: true`, so that the gate holds the report while
+the merge queue is busy as it does on its own runs rather than landing it as a dispatch by hand
+would. A workflow that does not declare `wait_for_queue` (the TauCetiProgress template) has no such
+hold and refuses the input; the dispatch is then sent once more with `pr` alone. It needs write access to the roadmap repository and a token with the fine-grained
 permission "Actions: write" there (the `repo` scope of a classic token). A dispatch that GitHub
 rejects for want of that, or because the workflow has no dispatch trigger, is not repeated: the
 report goes to step 3 at once, with GitHub's answer as the reason.

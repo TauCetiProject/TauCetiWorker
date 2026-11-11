@@ -1,7 +1,8 @@
 """Asking the merge gate again about a progress report it has left open.
 
-The roadmap repository's gate considers a report on an event of its pull request and when its
-workflow is dispatched, never on a schedule. With progress_shepherd on, each progress round
+The roadmap repository's gate considers a report on an event of its pull request, when its
+workflow is dispatched and, where the repository gives it one, on a schedule that retries reports
+held for the merge queue. With progress_shepherd on, each progress round
 dispatches that workflow for a report of this account that is still open, a bounded number of
 times, and then records the report for a person. The timings, the ledger and the permission the
 dispatch needs are under "Open progress reports" in docs/reference.md.
@@ -77,12 +78,8 @@ def _last_refusal(roadmap: GitHub, number: int) -> str:
     return ""
 
 
-def _ask(number: int) -> tuple[str, str]:
-    """Dispatch the gate for one report: ("sent" | "unsent" | "rejected" | "unknown", gh's error).
-
-    `unsent` is a request that a rate limit or an expired login stopped, `rejected` one GitHub will
-    not accept from this account or for this workflow, and `unknown` one whose answer was lost."""
-    result = run(
+def _dispatch(inputs: dict[str, object]):
+    return run(
         [
             "gh",
             "api",
@@ -95,8 +92,21 @@ def _ask(number: int) -> tuple[str, str]:
         # The ledger entry written before this call is what keeps a retried round from asking
         # twice, so the outbox must not keep the request to replay it.
         env={**os.environ, "TAUCETI_OUTBOX_REPLAY": "1"},
-        input_text=json.dumps({"ref": "main", "inputs": {"pr": str(number)}}),
+        input_text=json.dumps({"ref": "main", "inputs": inputs}),
     )
+
+
+def _ask(number: int) -> tuple[str, str]:
+    """Dispatch the gate for one report: ("sent" | "unsent" | "rejected" | "unknown", gh's error).
+
+    `unsent` is a request that a rate limit or an expired login stopped, `rejected` one GitHub will
+    not accept from this account or for this workflow, and `unknown` one whose answer was lost."""
+    # A dispatch counts as one by hand, which lands the report past a busy merge queue unless it
+    # asks to wait. GitHub refuses an input the workflow does not declare, and a gate without this
+    # one has no queue hold to keep, so it is asked again without it.
+    result = _dispatch({"pr": str(number), "wait_for_queue": True})
+    if result.returncode != 0 and "Unexpected inputs" in f"{result.stderr or ''}\n{result.stdout or ''}":
+        result = _dispatch({"pr": str(number)})
     if result.returncode == 0:
         return "sent", ""
     error = one_line(result.stderr or result.stdout or f"gh exited {result.returncode}", 200)
