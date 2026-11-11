@@ -227,10 +227,9 @@ boundaries.
   retain strict transport settings, and optional GitHub archive attribution
   retains its installation-token behavior.
 - Review [PR #229](https://github.com/TauCetiProject/TauCetiReview/pull/229)
-  contains the shared lifecycle and passes all 36 standalone modules locally and
-  in CI. Merge requires a code-owner approval. Worker's existing dependency
-  reference temporarily names its reviewed head; replace it with the merge
-  commit before landing Worker.
+  merged at `b10925f02bf48d7624fc958cf7e067bc1efb79cd`. All 36 standalone
+  modules pass locally and in hosted CI. Worker now references this merge commit
+  through its existing dependency declaration.
 - Shared engine scenarios cover initial/unchanged/changed-head review, contest
   replies, adjudicated-contest retries without inference, failed preparation and
   normal preparation retry for both adapters. Publication covers lost responses, live locks, original identity,
@@ -241,7 +240,7 @@ boundaries.
   scenarios. An installed Worker wheel resolves and launches the engine without
   a Review distribution. The source launcher retains its existing dependency
   surface, updating only its existing Tools reference.
-- Worker draft [PR #709](https://github.com/TauCetiProject/TauCetiWorker/pull/709)
+- Worker [PR #709](https://github.com/TauCetiProject/TauCetiWorker/pull/709)
   removes the native orchestration and shares scheduling/freshness, runtime,
   publication recovery and archive policy. The local suite ran 204 modules:
   198 passed, five shallow-survey fixture failures were fixed and passed on
@@ -261,8 +260,8 @@ boundaries.
 - Evidence is retained in
   `~/.local/state/tauceti/forgejo-convergence-acceptance-20261111/acceptance.json`
   and adjacent review/repair logs. The managed-update preflight and rollback
-  script are prepared there as well. Final Review/Worker merges, managed-runtime
-  update and deployed-entrypoint verification remain outstanding. No fleet
+  script are prepared there as well. Final Worker merge, managed-runtime update and deployed-entrypoint
+  verification remain outstanding. No fleet
   drain, admission change or upstream Lean/Lake patch was used.
 - A second real cycle on [Forgejo PR #5](https://git.taucetiproject.org/TauCetiProject/TauCeti/pulls/5)
   exercised the merged credential helper: blocking correctness, automatic safe
@@ -274,3 +273,15 @@ boundaries.
   canonical-origin recovery tests cover that handoff without a forge-specific
   agent recipe. Evidence is in
   `~/.local/state/tauceti/forgejo-convergence-final-20261111/acceptance.json`.
+
+- Tools [PR #239](https://github.com/TauCetiProject/TauCetiTools/pull/239)
+  merged at `7a565ff35a63599e715611e4fecfb2f5c74d698d`, preserving operator proxy
+  settings through the shared Git environment allowlist. All five hosted jobs
+  passed, including PostgreSQL and the real CONNECT-proxy regression.
+- The shared engine preserves trusted project snapshots for rubric rendering
+  while keeping config paths out of model subprocesses. Recovery continues past
+  malformed or foreign-actor paid output, preserves original source/store/actor
+  requirements, retires stale receipts before requiring the former publisher,
+  and distinguishes publication retry from identity/record repair without
+  charging PR inference errors. Both publication adapters inherit a neutral
+  common base; freshness policy and best-effort duplicate cleanup remain shared.

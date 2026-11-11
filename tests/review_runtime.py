@@ -180,6 +180,11 @@ class ReviewRuntime(unittest.TestCase):
                 )
             )
             (good / "review-context.json").write_text(json.dumps(dict(lifecycle=2)))
+            foreign = bad.with_name("a-foreign")
+            foreign.mkdir()
+            record = json.loads((good / "publication.json").read_text())
+            record["source"]["name"] = "other/repository"
+            (foreign / "publication.json").write_text(json.dumps(record))
             runtime = review_runtime.ReviewRuntime(root / "engine", "a" * 40)
             with (
                 patch.object(review_runtime, "resolve", return_value=runtime),
@@ -188,6 +193,7 @@ class ReviewRuntime(unittest.TestCase):
                 self.assertFalse(review_runtime.recover(worker))
             self.assertIn("z-good", run.call_args.args[0])
             self.assertNotIn("a-unreadable", run.call_args.args[0])
+            self.assertNotIn("a-foreign", run.call_args.args[0])
             self.assertEqual((bad / "publication.json").read_text(), "{invalid")
 
 

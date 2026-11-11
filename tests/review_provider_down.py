@@ -142,6 +142,16 @@ def main():
                     bust.assert_called_once_with(42)
         check("preparation outages preserve existing error allowance in both launchers", True)
 
+        for code in (85, 86):
+            with patch.object(tc.work_units, "record_review_failure") as record:
+                retained, deferred, _ = drive(code, state)
+                check(f"publication status {code} defers without new inference", deferred is not None)
+                check(
+                    f"publication status {code} preserves the PR error allowance",
+                    retained.counters.read("review-err-42") == 0,
+                )
+                record.assert_not_called()
+
         # 2) an ordinary engine failure keeps the existing behaviour.
         w2, raised2, out2 = drive(1, state)
         check("an ordinary failure does not raise", raised2 is None)
