@@ -521,8 +521,11 @@ so several workers can use one host without sharing a checkout. Branch,
 roadmap-target, and progress claims all live in the worker's
 [claim namespace](reference.md#the-claim-namespace), never in the canonical
 repository, so every worker that resolves the same namespace contends for the
-same leases. Review markers, claims, and compare-and-swap push and PR helpers
-keep workers from overwriting one another when they select the same target.
+same leases. A Bubble round may push only to its own fork, so an authoring
+agent's target claim registers there only when the namespace is that fork; with
+the shared namespace it exits 2 and the round proceeds unclaimed. Review
+markers, claims, and compare-and-swap push and PR helpers keep workers from
+overwriting one another when they select the same target.
 
 Every id other than `default` also enables credential isolation. On Linux and
 other non-macOS hosts, the worker gets a private `$HOME` containing private
