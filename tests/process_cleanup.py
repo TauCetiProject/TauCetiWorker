@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tauceti_worker import agents, processes
+from tauceti_worker import process_guard as guard
 
 
 def running(pid):
@@ -56,17 +57,19 @@ class Cleanup(unittest.TestCase):
             with contextlib.suppress(ProcessLookupError):
                 os.kill(int(self.pidfile.read_text()), signal.SIGKILL)
 
-    def command(self, *, hang=False, inherit_output=False):
+    def command(self, *, hang=False, inherit_output=False, detached=False, double_fork=False):
         # The background child remains in its parent's group and ignores TERM so
         # successful cleanup has to reach KILL. Some cases deliberately inherit pipes.
         code = (
             "import os,signal,sys,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
-            "open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(60)"
+            + ("exec('if os.fork(): os._exit(0)'); " if double_fork else "")
+            + "open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(60)"
         )
         parent = (
             "import subprocess,sys,time; from pathlib import Path; "
             f"child=subprocess.Popen([sys.executable,'-c',{code!r},{str(self.pidfile)!r}]"
             + ("" if inherit_output else ",stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL")
+            + (",start_new_session=True" if detached else "")
             + "); "
             f"p=Path({str(self.pidfile)!r}); "
             "exec('while not p.exists(): time.sleep(.01)'); "
@@ -77,7 +80,7 @@ class Cleanup(unittest.TestCase):
     def assert_cleaned(self):
         self.assertTrue(self.pidfile.exists())
         pid = int(self.pidfile.read_text())
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 5  # Two-second TERM grace plus scheduling/reaping time.
         while running(pid) and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertFalse(running(pid))
@@ -102,6 +105,121 @@ class Cleanup(unittest.TestCase):
             processes.run(self.command(hang=True), env=self.env, capture_output=True, timeout=1)
         self.assertIn(b"ready", error.exception.output)
         self.assert_cleaned()
+
+    @unittest.skipUnless(sys.platform == "linux", "kernel child subreaping is Linux-specific")
+    def test_detached_double_fork_is_reaped_on_normal_tool_exit(self):
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        try:
+            result = processes.run(
+                self.command(detached=True, double_fork=True, inherit_output=True),
+                env=self.env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assert_cleaned()
+            self.assertIsNone(unrelated.poll())
+        finally:
+            unrelated.kill()
+            unrelated.wait()
+
+    @unittest.skipUnless(sys.platform == "linux", "kernel child subreaping is Linux-specific")
+    def test_timeout_reaps_detached_child(self):
+        with self.assertRaises(subprocess.TimeoutExpired):
+            processes.run(self.command(hang=True, detached=True), env=self.env, capture_output=True, timeout=1)
+        self.assert_cleaned()
+
+    @unittest.skipUnless(sys.platform == "linux", "kernel child subreaping is Linux-specific")
+    def test_detached_orphans_are_reaped_while_the_tool_is_still_running(self):
+        orphan = "import os,sys; open(sys.argv[1], 'w').write(str(os.getpid()))"
+        intermediary = (
+            f"import subprocess,sys; subprocess.Popen([sys.executable,'-c',{orphan!r},{str(self.pidfile)!r}], "
+            "start_new_session=True)"
+        )
+        parent = f"import subprocess,sys,time; subprocess.run([sys.executable,'-c',{intermediary!r}]); time.sleep(60)"
+        with processes.owned_process([sys.executable, "-c", parent], env=self.env) as process:
+            deadline = time.monotonic() + 5
+            while not self.pidfile.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(self.pidfile.exists())
+            path = Path(f"/proc/{self.pidfile.read_text()}")
+            while path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(path.exists(), "orphan zombie retained until session exit")
+            self.assertIsNone(process.poll())
+
+    def test_guard_keeps_git_maintenance_in_the_tool_lifetime(self):
+        result = processes.run(
+            ["git", "config", "--get", "gc.autoDetach"], env=self.env, capture_output=True, text=True
+        )
+        self.assertEqual(result.stdout.strip(), "false")
+        self.assertEqual(result.returncode, 0)
+
+    def test_cleanup_does_not_stop_sweeping_after_a_permission_failure(self):
+        with (
+            patch.object(guard.Path, "read_text", return_value="101 102"),
+            patch.object(guard.os, "kill", side_effect=[PermissionError(), None]) as kill,
+            patch.object(guard, "reap_exited", return_value=True),
+            contextlib.redirect_stderr(__import__("io").StringIO()),
+        ):
+            self.assertTrue(guard.reap_children(grace=0))
+        self.assertEqual([call.args[0] for call in kill.call_args_list], [101, 102])
+
+    def test_cleanup_waits_for_slow_exit_after_one_second(self):
+        with (
+            patch.object(guard.Path, "read_text", return_value="101"),
+            patch.object(guard.os, "kill"),
+            patch.object(guard, "reap_exited", side_effect=[False, True]),
+            patch.object(guard.time, "monotonic", side_effect=[0, 0.1, 1.2, 1.3]),
+            patch.object(guard.time, "sleep"),
+        ):
+            self.assertTrue(guard.reap_children(grace=0))
+
+    def test_cancellation_gives_the_tool_time_to_flush(self):
+        self.flush_on_cancel()
+
+    def test_group_fallback_also_gives_the_tool_time_to_flush(self):
+        with patch.object(
+            processes,
+            "PARENT_BOUND_AGENT",
+            processes.PARENT_BOUND_AGENT.replace("subreaper = enable_subreaper()", "subreaper = False"),
+        ):
+            self.flush_on_cancel()
+
+    def flush_on_cancel(self):
+        flushed = self.root / "flushed"
+        code = (
+            "import signal,sys,time; from pathlib import Path; "
+            f"signal.signal(signal.SIGTERM,lambda *_: (time.sleep(.15),Path({str(flushed)!r}).write_text('done'),sys.exit(0))); "
+            f"Path({str(self.pidfile)!r}).write_text(str(__import__('os').getpid())); time.sleep(60)"
+        )
+        with processes.owned_process([sys.executable, "-c", code], env=self.env) as process:
+            deadline = time.monotonic() + 5
+            while not self.pidfile.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(self.pidfile.exists())
+            process.terminate()
+            self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)
+        self.assertEqual(flushed.read_text(), "done")
+
+    @unittest.skipUnless(sys.platform == "linux", "kernel child subreaping is Linux-specific")
+    def test_sigkilled_owner_reaps_detached_double_fork(self):
+        command = self.command(hang=True, detached=True, double_fork=True)
+        code = f"from tauceti_worker.processes import run; run({command!r}, capture_output=True, timeout=60)"
+        owner = subprocess.Popen([sys.executable, "-c", code], env=self.env)
+        try:
+            deadline = time.monotonic() + 10
+            while not self.pidfile.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(self.pidfile.exists())
+            owner.kill()
+            owner.wait(timeout=5)
+            self.assert_cleaned()
+        finally:
+            if owner.poll() is None:
+                owner.kill()
+            owner.wait(timeout=5)
 
     def test_tool_leader_exit_cleans_children_that_inherit_output_pipes(self):
         result = processes.run(
@@ -195,7 +313,7 @@ class Cleanup(unittest.TestCase):
         watcher.start()
         try:
             rc = agents.run_agent_proc(
-                self.command(hang=True),
+                self.command(hang=True, detached=sys.platform == "linux", double_fork=sys.platform == "linux"),
                 env=self.env,
                 cwd=self.root,
                 logdir=self.root / "logs",
