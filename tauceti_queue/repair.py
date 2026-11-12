@@ -1889,7 +1889,9 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
             path = error.get("path") or ""
             if path:
                 owners = owners_of(clone, chain, path)
-                lines.append(f"- `{path}:{error.get('line', 0)}:{error.get('column', 0)}` ({_owner_text(owners, chain)})")
+                lines.append(
+                    f"- `{path}:{error.get('line', 0)}:{error.get('column', 0)}` ({_owner_text(owners, chain)})"
+                )
             else:
                 lines.append("- Build/verification diagnostic (no file path):")
             for text in str(error.get("message", "")).splitlines():
