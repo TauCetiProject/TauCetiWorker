@@ -34,7 +34,6 @@ class MixedCandidateCI(SourceCandidateCI):
         if not isinstance(profile, dict) or set(profile) != {
             "configuration_file",
             "policy_file",
-            "workflow_revision",
             "credentials_dir",
         }:
             raise ValueError("mixed admission requires explicit source execution inputs")
@@ -49,14 +48,6 @@ class MixedCandidateCI(SourceCandidateCI):
             or policy.base_branch != controller.canonical_branch
         ):
             raise ValueError("mixed execution policy differs from the enrolled source identities")
-        ledger = RequestLedger(
-            controller.store,
-            controller.clone,
-            policy,
-            configuration,
-            workflow_revision=profile["workflow_revision"],
-            mixed_sources=True,
-        )
         if execution is None:
             credentials = load_execution_credentials(Path(profile["credentials_dir"]))
             tokens = InstallationTokenSource(
@@ -66,6 +57,15 @@ class MixedCandidateCI(SourceCandidateCI):
                 permissions={"contents": "write", "actions": "write"},
             )
             execution = GitHubSourceExecution(tokens)
+        revision, policy, configuration = execution.caller(policy)
+        ledger = RequestLedger(
+            controller.store,
+            controller.clone,
+            policy,
+            configuration,
+            workflow_revision=revision,
+            mixed_sources=True,
+        )
         return cls(ledger, execution, registry, controller, clock=controller.clock)
 
     def accepted(self, members):
@@ -81,25 +81,8 @@ class MixedCandidateCI(SourceCandidateCI):
         return tuple(accepted)
 
     def prepare(self, head, members, request_id, *, fetch_missing=None):
-        # The execution repository may also be the moving GitHub content main.
-        # Pin each new request to its current immutable caller, allowing ordinary
-        # content landings only while trusted execution controls remain identical.
-        profile = self.registry.profile.raw.get("execution")
-        if profile is not None and self.ledger.policy.execution == self.registry.profile.github:
-            from . import chain
-            from .stage1_mirror import MainMirror
-
-            self.registry.check_github()
-            ref = "refs/tauceti-queue/execution-main"
-            self.registry.github.fetch_refs(
-                self.registry.repository, [f"+refs/heads/{self.ledger.policy.execution_branch}:{ref}"]
-            )
-            current = chain.resolve_commit(self.controller.clone, ref)
-            approved = profile["workflow_revision"]
-            if not chain.object_exists(self.controller.clone, approved):
-                self.registry.github.fetch_refs(self.registry.repository, [approved])
-            MainMirror.check_controls(self.controller.clone, approved, current)
-            self.ledger.workflow_revision = current
+        revision, policy, configuration = self.execution.caller(self.ledger.policy)
+        self.ledger.workflow_revision, self.ledger.policy, self.ledger.configuration = revision, policy, configuration
 
         # The inherited helper only has a native number. Resolve missing members
         # using the qualified source before any fetch.

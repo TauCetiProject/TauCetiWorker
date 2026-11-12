@@ -132,6 +132,19 @@ class NativePoller:
         self._discovery_at = 0
         self.wake()
 
+    def admission_changed(self):
+        """Discard observations for new work, keeping existing acceptance live."""
+        for row in self.controller.store.rows("admission_work", {"repository": self.state.repository}):
+            current = self.controller._input_for(self.registry.number(row["number"]))
+            if (
+                current
+                and current["head_sha"] == row["head_sha"]
+                and current["state"] in {"waiting", "reserved", "inserted", "landed"}
+            ):
+                continue
+            self.state.dirty(row["number"], urgent=True)
+        self.request_discovery()
+
     def is_current(self, number, head):
         work = self.state.get(int(number))
         decision = loads(work["decision"], {}) if work else {}
@@ -310,6 +323,8 @@ class NativePoller:
                         disposition = current["state"]
                     elif self._cancelled(work, snapshot, authorization, comment, meta):
                         disposition = "withdrawn"
+                    elif not controller.setting("forgejo_admission_enabled"):
+                        disposition = "admission-paused"
                     else:
                         accepted = controller.approve(
                             registry.profile.forgejo.repository.key,
@@ -323,6 +338,7 @@ class NativePoller:
                         if (
                             not accepted["accepted"]
                             and disposition != "member"
+                            and disposition != "admission-paused"
                             and not disposition.startswith("blocked-label:")
                         ):
                             raise RuntimeError("native admission could not retain its exact head")

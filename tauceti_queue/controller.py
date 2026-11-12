@@ -83,6 +83,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "background_start_limit": 2,
     "stall_interval_seconds": 900,
     "publication_enabled": False,
+    "forgejo_admission_enabled": True,
     "claim_ttl_seconds": 900,
     "dispatch_timeout_seconds": 600,
     # An in-progress run counts as lost only when neither its jobs nor GitHub's direct read of the run
@@ -542,6 +543,8 @@ class Controller:
                 self.store.journal(now, "setting", key=key, value=value, actor=actor)
                 if key == "publication_enabled" and value and not previous:
                     self._republish_retained_refs(now)
+                if key == "forgejo_admission_enabled" and self.mixed is not None and self.mixed.poller is not None:
+                    self.mixed.poller.admission_changed()
             self._wake.set()
             self._refresh_snapshot()
             return self.effective_settings()
@@ -879,6 +882,8 @@ class Controller:
                     return {"accepted": True, "reason": "already-approved", "input": self._input_for(pr)}
                 if existing["state"] == INPUT_INSERTED:
                     return {"accepted": False, "reason": "member", "input": existing}
+            if isinstance(pr, SourceNumber) and not self.setting("forgejo_admission_enabled"):
+                return {"accepted": False, "reason": "admission-paused", "input": None}
             if pull is None or pull.head_sha != head_sha:
                 pull, reason = self.validate_pull(repo, pr, head_sha)
                 if reason is not None:
@@ -2865,9 +2870,7 @@ class Controller:
                         raise ControllerError(
                             "github-primary-required", "land pending human control-file changes on GitHub first"
                         )
-                    self.mixed.mirror.preflight(
-                        self.mixed.native, current[target], current[target], self.mixed.approved_caller
-                    )
+                    self.mixed.mirror.preflight(self.mixed.native, current[target], current[target], current["github"])
             if current["github"] != current["forgejo"]:
                 raise ControllerError(
                     "main-tips-differ", "synchronize both protected main tips before changing primary"

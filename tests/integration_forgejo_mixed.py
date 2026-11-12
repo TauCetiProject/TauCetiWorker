@@ -116,6 +116,7 @@ class MixedNativeIntegration(unittest.TestCase):
                 initial.store, repo.clone, trusted, configuration, workflow_revision="b" * 40, mixed_sources=True
             )
             execution = VerifiedExecution()
+            execution.caller_snapshot = ("b" * 40, trusted, configuration)
             registry.ci = controller.mixed_ci = MixedCandidateCI(ledger, execution, registry, controller, clock=clock)
             controller.set_setting("publication_enabled", True, "fixture")
             name = repository.name

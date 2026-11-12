@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -32,7 +31,6 @@ def configure(registry):
         "forgejo_token_file",
         "forgejo_writer_id",
         "github_credentials_dir",
-        "approved_caller",
     }:
         raise ValueError("mixed admission requires separate main writer and mirror roles")
     writer = value["forgejo_writer_id"]
@@ -45,11 +43,8 @@ def configure(registry):
     for key in ("forgejo_token_file", "github_credentials_dir"):
         if not isinstance(value[key], str) or not Path(value[key]).is_absolute():
             raise ValueError("mirror credentials require explicit absolute paths")
-    if not isinstance(value["approved_caller"], str) or not re.fullmatch(r"[0-9a-f]{40}", value["approved_caller"]):
-        raise ValueError("mirror requires its approved immutable caller revision")
     if registry.branch != "main":
         raise ValueError("mixed primary changes currently require protected main on both hosts")
-    registry.approved_caller = value["approved_caller"]
     registry.native_main = MainWriter(registry.profile.forgejo, registry.clone, value["forgejo_token_file"], writer)
     registry.mirror = MainMirror(
         replace(registry.ci.ledger.policy, execution=registry.profile.github, execution_branch="main"),
@@ -82,7 +77,7 @@ def preflight(registry, expected, candidate):
         current = tips(registry)
         if current != {"github": expected, "forgejo": expected}:
             raise ValueError("repair main synchronization before the next Forgejo-primary landing")
-        registry.mirror.preflight(registry.native, expected, candidate, registry.approved_caller)
+        registry.mirror.preflight(registry.native, expected, candidate, current["github"])
 
 
 def synchronize(registry):
@@ -92,7 +87,7 @@ def synchronize(registry):
     current = tips(registry)
     primary = current[registry.primary]
     if registry.primary == "forgejo":
-        registry.mirror.publish(registry.native, primary, registry.approved_caller)
+        registry.mirror.publish(registry.native, primary, current["github"])
     elif current["forgejo"] != primary:
         old = current["forgejo"]
         if not chain.is_ancestor(registry.clone, old, primary):

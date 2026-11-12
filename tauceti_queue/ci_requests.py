@@ -80,13 +80,7 @@ class RequestLedger:
             or workflow_revision == "0" * 40
         ):
             raise ValueError("CI caller requires an immutable revision")
-        project = parse(configuration)
-        if (project.repository_ref("content"), project.ci_repository_ref(), project.branch) != (
-            policy.source.repository,
-            policy.execution.repository,
-            policy.base_branch,
-        ):
-            raise ValueError("project source/execution differs from the CI policy")
+        self.check_configuration(policy, configuration)
         self.policy, self.configuration, self.workflow_revision = policy, configuration, workflow_revision
         self.git = shutil.which("git")
         if not self.git:
@@ -114,6 +108,16 @@ class RequestLedger:
             self.epoch = store.get_setting(self.epoch_key)
             if not isinstance(self.epoch, str) or not re.fullmatch(r"[0-9a-f]{32}", self.epoch):
                 raise ValueError("source CI epoch is unavailable")
+
+    @staticmethod
+    def check_configuration(policy, configuration):
+        project = parse(configuration)
+        if (project.repository_ref("content"), project.ci_repository_ref(), project.branch) != (
+            policy.source.repository,
+            policy.execution.repository,
+            policy.base_branch,
+        ):
+            raise ValueError("project source/execution differs from the CI policy")
 
     @staticmethod
     def binding(policy):

@@ -9,6 +9,8 @@ canonical_branch = ""
 # See docs/queue/mixed-sources.md before enabling observe or admit.
 forgejo_mode = "disabled"
 forgejo_profile = ""
+# Runtime intake switch: false keeps existing native work processing in admit mode.
+forgejo_admission_enabled = true
 # The host this service runs on, as reported in status; empty means this machine's host name.
 host = ""
 # The cutover flag. false is shadow mode: the service observes, builds batches and reports what

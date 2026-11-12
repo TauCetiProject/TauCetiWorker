@@ -3,6 +3,7 @@
 
 import copy
 import dataclasses
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -158,6 +159,56 @@ class Mixed(MixedFixture, unittest.TestCase):
                 for name, _ in self.native.calls
             )
         )
+
+    def test_paused_admission_observes_new_work_and_resumes_with_fresh_heads(self):
+        registry = self.registry()
+        poller = registry.poller = NativePoller(registry, self.controller)
+        self.controller.set_setting("forgejo_admission_enabled", False, "operator")
+        old = self.native.create_pr(1, {"Native.lean": "old\n"})
+        self.assertEqual(poller.run_once()["approved"], 0)
+        self.assertEqual(self.controller.store.count("inputs"), 0)
+        self.assertEqual(poller.state.get(1)["disposition"], "admission-paused")
+        self.assertEqual(
+            self.controller.approve(self.native_id.repository.key, 1, old, "manual")["reason"], "admission-paused"
+        )
+        fresh = self.native.create_pr(1, {"Native.lean": "fresh\n"})
+        self.controller.set_setting("forgejo_admission_enabled", True, "operator")
+        self.assertEqual(poller.run_once()["approved"], 1)
+        self.assertEqual(self.controller.input_for(self.native_id.repository.key, 1)["head_sha"], fresh)
+
+    def test_pause_resume_invalidates_an_inflight_new_admission_snapshot(self):
+        import threading
+
+        registry = self.registry()
+        poller = registry.poller = NativePoller(registry, self.controller)
+        self.native.create_pr(1, {"Native.lean": "old\n"})
+        entered, release = threading.Event(), threading.Event()
+        snapshot = self.native.admission_snapshot
+
+        def slow(*args):
+            value = snapshot(*args)
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test release not delivered")
+            return value
+
+        with patch.object(self.native, "admission_snapshot", side_effect=slow):
+            thread = threading.Thread(target=poller.run_once)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                self.controller.set_setting("forgejo_admission_enabled", False, "operator")
+                self.controller.set_setting("forgejo_admission_enabled", True, "operator")
+                fresh = self.native.create_pr(1, {"Native.lean": "new head\n"})
+                poller.stopping.set()
+            finally:
+                release.set()
+                thread.join(5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(self.controller.store.count("inputs"), 0)
+        poller.stopping.clear()
+        self.assertEqual(poller.run_once()["approved"], 1)
+        self.assertEqual(self.controller.input_for(self.native_id.repository.key, 1)["head_sha"], fresh)
 
     def test_observation_keeps_the_existing_github_main_writer(self):
         from tauceti_queue.controller import Controller
@@ -434,6 +485,7 @@ class MixedExecution(MixedFixture, unittest.TestCase):
             mixed_sources=True,
         )
         self.execution = VerifiedExecution()
+        self.execution.caller_snapshot = ("b" * 40, trusted, configuration)
         self.ci = MixedCandidateCI(self.ledger, self.execution, self.registry_value, self.controller, clock=self.clock)
         self.registry_value.ci = self.controller.mixed_ci = self.ci
         native_policy = NativePoller(self.registry_value, self.controller)
@@ -481,6 +533,79 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         self.assertEqual(self.controller.store.rows("batches")[0]["state"], "landed")
         self.assertTrue(any(comment["number"] == 17 for comment in self.github.comments))
         self.assertTrue(any(comment["number"] == 17 for comment in self.native.comments))
+
+    def test_admission_pause_keeps_accepted_waiting_inputs_and_lands_running_mixed_work(self):
+        # Accept an input before pausing, including its pre-batch waiting state.
+        native = self.native.create_pr(17, {"Native.lean": "native\n"})
+        self.controller.approve(self.native_id.repository.key, 17, native, "fixture")
+        self.controller.set_setting("forgejo_admission_enabled", False, "operator")
+        github = self.github.create_pr(17, {"Github.lean": "github\n"})
+        self.assertTrue(self.controller.approve(self.controller.repository, 17, github, "fixture")["accepted"])
+        rejected = self.native.create_pr(18, {"Later.lean": "later\n"})
+        self.assertEqual(
+            self.controller.approve(self.native_id.repository.key, 18, rejected, "fixture")["reason"],
+            "admission-paused",
+        )
+        self.controller.tick()
+        batch = self.controller._head()
+        self.assertEqual(len(self.controller._members(batch["id"])), 2)
+        frozen = self.ledger.load(self.controller._current_attempt(batch)["id"])
+        self.execution.add(frozen, classification="passed")
+        self.clock.advance(60)
+        self.controller.tick()
+        self.controller.tick()
+        self.assertEqual(self.repo.main_sha(), frozen.request.head)
+        self.assertEqual(self.native_repo.main_sha(), frozen.request.head)
+        self.assertTrue(self.native.comments)
+
+    def test_paused_setting_survives_restart_and_preserves_paid_repair_claim(self):
+        from tauceti_queue.controller import Controller
+
+        self.start_mixed()
+        batch = self.controller._head()
+        task_id = self.controller._create_task(batch, "repair", batch["base"], [], self.clock())
+        self.github.admins.add("reviewer")
+        task = self.controller.claim_task("paid-worker", "reviewer", mixed_capable=True)
+        self.assertEqual(task.task_id, task_id)
+        self.controller.set_setting("forgejo_admission_enabled", False, "operator")
+        restarted = Controller(
+            self.controller.store,
+            self.github,
+            str(self.repo.clone),
+            self.controller.repository,
+            revision="restarted",
+            canonical_branch="main",
+            mixed=self.registry_value,
+            clock=self.clock,
+        )
+        restarted.mixed_ci = self.ci
+        restarted.admission = self.controller.admission
+        self.registry_value.controller = self.ci.controller = restarted
+        self.assertFalse(restarted.setting("forgejo_admission_enabled"))
+        self.assertGreater(restarted.renew_task(task_id, task.claim_token), self.clock())
+        self.assertEqual(restarted.store.row("claims", {"token": task.claim_token})["released_at"], None)
+        from tauceti_queue.fakes import Resolution, ScriptedAgent
+
+        agent = ScriptedAgent(
+            "paid-worker",
+            "reviewer",
+            self.repo,
+            self.root / "paid-repair",
+            lambda task: {self.controller.repository + "#17": Resolution({"Github.lean": "repaired\n"})},
+        )
+        tip = agent.produce(task)
+        result = restarted.submit_task(task_id, task.claim_token, tip)
+        self.assertTrue(result.accepted, result)
+        restarted.tick()
+        frozen = self.execution.dispatches[-1]
+        self.assertEqual(frozen.request.head, tip)
+        self.execution.add(frozen, run_id="102", classification="passed")
+        self.clock.advance(60)
+        restarted.tick()
+        restarted.tick()
+        self.assertEqual(self.repo.main_sha(), tip)
+        self.assertEqual(self.native_repo.main_sha(), tip)
+        self.assertFalse(restarted.setting("forgejo_admission_enabled"))
 
     def test_historical_recovery_does_not_block_new_accepted_heads(self):
         frozen = self.start_mixed()
@@ -793,21 +918,32 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         identities = [member["source_identity"] for member in status["head"]["members"]]
         self.assertCountEqual(identities, [self.github_id.record(), self.native_id.record()])
 
-    def test_moving_execution_caller_pins_content_changes_but_refuses_control_changes(self):
-        from tauceti_queue.source_ci import SourceCandidateCI
+    def test_new_caller_freezes_updated_policy_without_changing_existing_requests(self):
+        from tauceti_queue.ci_requests import RequestLedger
 
-        approved = self.repo.main_sha()
-        self.profile.raw["execution"] = {"workflow_revision": approved}
-        self.ledger.policy = dataclasses.replace(self.ledger.policy, execution=self.github_id)
-        moved = self.github.create_pr(99, {"Content.lean": "content\n"})
-        self.github.fast_forward(self.controller.repository, "main", approved, moved)
-        with patch.object(SourceCandidateCI, "prepare", return_value="prepared"):
-            self.assertEqual(self.ci.prepare({}, [], "1" * 32), "prepared")
-            self.assertEqual(self.ledger.workflow_revision, moved)
-        changed = self.github.create_pr(100, {"scripts/unsafe.py": "changed execution\n"})
-        self.github.fast_forward(self.controller.repository, "main", moved, changed)
-        with self.assertRaisesRegex(ValueError, "execution control files changed"):
-            self.ci.prepare({}, [], "2" * 32)
+        frozen = self.start_mixed()
+        configuration = self.ledger.configuration + b"\n# reviewed control update\n"
+        policy = dataclasses.replace(
+            self.ledger.policy, harness_revision="e" * 40, config_digest=hashlib.sha256(configuration).hexdigest()
+        )
+        self.execution.caller_snapshot = ("f" * 40, policy, configuration)
+        head = self.controller._head()
+        prepared = self.ci.prepare(head, self.controller._members(head["id"]), "3" * 32)
+        self.assertEqual(prepared.request.workflow_revision, "f" * 40)
+        self.assertEqual(prepared.policy, policy)
+        self.assertEqual(prepared.configuration, configuration)
+        self.assertEqual(self.ledger.load(frozen.attempt_id), frozen)
+        recovered = RequestLedger(
+            self.controller.store,
+            self.repo.clone,
+            policy,
+            configuration,
+            workflow_revision="f" * 40,
+            mixed_sources=True,
+        )
+        self.assertEqual(recovered.load(frozen.attempt_id), frozen)
+        self.execution.add(frozen, classification="passed")
+        self.assertEqual(self.ci.observe(frozen.attempt_id).result["classification"], "passed")
 
     def test_publication_disable_preserves_pending_landing_and_mirror_intents(self):
         self.start_mixed()

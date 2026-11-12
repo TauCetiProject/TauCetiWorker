@@ -11,6 +11,7 @@ Set these **top-level** service configuration keys before `[settings]`:
 ```toml
 forgejo_mode = "disabled" # disabled | observe | admit
 forgejo_profile = ""      # absolute private JSON path, used only when enabled
+forgejo_admission_enabled = true # initial runtime setting; effective only in admit mode
 ```
 
 The equivalent environment variables are `TAUCETI_QUEUE_FORGEJO_MODE` and
@@ -26,7 +27,21 @@ in the existing admission ledger. It does not approve native inputs or mutate
 Forgejo. GitHub admissions, worker claims, builds and landings continue through
 the existing queue. Native discovery errors appear in status without stopping
 GitHub discovery. `admit` enables native inputs in that same queue, including
-qualified repair tasks and exact candidate CI. `publication_enabled = false`
+qualified repair tasks and exact candidate CI. Pause new native acceptance with
+the authenticated runtime setting, keeping `forgejo_mode = "admit"`:
+
+```sh
+tauceti-queue settings set forgejo_admission_enabled false
+# Resume with a fresh evaluation of currently open native heads:
+tauceti-queue settings set forgejo_admission_enabled true
+```
+
+The setting persists across restart. Accepted waiting/reserved inputs, existing
+batches, paid repair claims, CI, source publication and main synchronization
+continue while new native acceptance is paused. GitHub intake continues. A
+concurrent native poll cannot admit new work after the pause takes effect; a
+resume invalidates observations for unaccepted work and reevaluates it.
+`publication_enabled = false`
 continues to prevent queue publication and CI dispatch.
 
 An explicit private profile uses this shape. IDs, paths and revisions below are
@@ -45,14 +60,12 @@ private regular files as required by the existing control-policy loader.
   "execution": {
     "configuration_file": "/home/operator/.config/tauceti-queue/ci-source.toml",
     "policy_file": "/home/operator/.config/tauceti-queue/ci-source.json",
-    "workflow_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "credentials_dir": "/home/operator/.config/tauceti-queue/execution"
   },
   "mirror": {
     "forgejo_token_file": "/home/operator/.config/tauceti-queue/native-main-token",
     "forgejo_writer_id": 6,
-    "github_credentials_dir": "/home/operator/.config/tauceti-queue/github-mirror",
-    "approved_caller": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    "github_credentials_dir": "/home/operator/.config/tauceti-queue/github-mirror"
   }
 }
 ```
@@ -94,9 +107,13 @@ The execution policy must enroll both exact repository identities in its
 not match the original source of any member. Deploy the pinned shared harness,
 `.tauceti/ci-source.json` and matching `.tauceti/ci-source.toml` to the trusted
 execution caller before enabling admission. Ordinary GitHub CI keeps using the
-project's `tauceti.toml`. The private configuration bytes must exactly match the
-trusted source configuration. Legacy GitHub attempts already running retain their
-original CI path. See the shared Tools source-candidate contract for the complete
+project's `tauceti.toml`. The private policy and configuration enroll the source,
+execution and harness repositories and credential origin. New requests read the
+current policy and configuration from protected execution `main`; normal tooling
+and configuration updates there do not require replacing the private bootstrap
+files. Changing enrolled repository identities or credential roles remains an
+explicit configuration change. Legacy GitHub attempts already running retain
+their original CI path. See the shared Tools source-candidate contract for the complete
 workflow and token setup.
 
 A mixed batch freezes every original source, native repository ID, PR number and
@@ -119,21 +136,27 @@ explicit reason; switch temporarily to GitHub primary to land them. A primary
 change to Forgejo refuses pending batches containing these changes. This keeps
 the current CI scope checks intact without spending a build on a known refusal.
 
-When the execution repository is also the moving GitHub content repository,
-new requests capture its current caller SHA only after comparing execution
-control files with the explicitly approved caller. In-flight requests retain
-their original immutable caller. Changes to `.github`, `.tauceti`, `scripts` or
-`tauceti.toml` require an explicit approval/configuration update.
+Each new mixed/source-candidate request captures the configured execution
+repository's protected `main` SHA, `.tauceti/ci-source.json`, matching
+`.tauceti/ci-source.toml` and the configured caller at that exact commit. The
+policy names the immutable shared harness revision. Source, execution, harness,
+credential origin and enrolled member roles must match enrollment; a candidate
+branch cannot select a caller or grant credentials. The execution repository
+can be separate from the GitHub content repository.
 
-This is an operational hold, including after an ordinary human-approved control
-change lands on GitHub: subsequent source-candidate requests wait until the new
-execution caller is approved. Queue status reports the control-comparison error
-in the head's source-CI freeze reason. Update `execution.workflow_revision` to
-the inspected execution commit and restart the service. Separately update
-`mirror.approved_caller` when the GitHub content mirror's controls change. These
-pins may name different repositories when execution uses a dedicated repository;
-when they refer to the same repository, approve the same inspected commit for
-both roles. Ordinary mathematics changes need no re-approval.
+Ordinary reviewed changes to `.github`, `.tauceti`, `scripts` and `tauceti.toml`
+on protected execution `main` are available to the next request without a
+private caller approval or service restart. Existing frozen requests retain their
+original caller, policy and configuration across retries and process restarts.
+The run's caller, harness, configuration, candidate and attestation must match
+that original request. A caller that moves before dispatch is a proven non-send;
+the existing retry path prepares a fresh request. A lost dispatch reply is still
+reconciled without blindly resending it.
+
+Forgejo-to-GitHub follower publication checks controls against the captured
+GitHub content `main` base, with the existing ancestry and expected-old checks.
+It has no separate manually approved caller pin. Scope checks still prevent a
+native candidate from changing trusted execution controls.
 
 GitHub starts as primary. Landings enqueue follower synchronization in the
 existing retryable outbox. Both primary writers use an atomic expected-old Git
@@ -162,14 +185,9 @@ follower preflight. Disable the earlier standalone GitHub-to-Forgejo timer when
 the queue takes ownership of synchronization. Do not run independent merge
 queues or permit direct main writes on either host.
 
-Disabling native admission retains mixed work and pending native publications;
-it does not reinterpret them as GitHub work. GitHub-only batches before the first
-held batch can continue. Once a held mixed batch reaches the head, it and its
-successors wait: disabling Forgejo is not a way to remove frozen native members
-and resume GitHub-only landing. Cancelling an input does not change fixed batch
-membership. To recover, restore the enrolled `admit` configuration and reconcile
-the retained batch before disabling again. A native-primary ledger refuses to
-start without its explicit active mixed configuration. Switch back with matching
-tips before disabling the native primary's configuration. Production enablement,
-hosted mixed CI/landing evidence and production primary changes are separate
-rollout actions.
+Use `forgejo_admission_enabled = false` to pause intake. Completely disabling
+source access with `forgejo_mode = "disabled"` is for an unused or decommissioned
+integration, not an operational intake pause. Without native access, retained
+native batches wait for source recovery; a native-primary ledger requires its
+active mixed configuration. Production enablement, hosted mixed CI/landing
+evidence and production primary changes remain separate rollout actions.

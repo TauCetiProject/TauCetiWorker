@@ -90,6 +90,7 @@ class Config:
     publication_enabled: bool = False
     forgejo_mode: str = "disabled"  # disabled, observe, admit; independent of publication_enabled
     forgejo_profile: str = ""  # explicit private source/execution profile; never read while disabled
+    forgejo_admission_enabled: bool = True  # runtime intake switch; source access is controlled separately
     content_clone: Path = Path("~/.local/share/tauceti-queue/content")
     database: Path = Path("~/.local/state/tauceti-queue/queue.sqlite3")
     credentials_dir: Path = Path("~/.config/tauceti-queue")
@@ -346,7 +347,11 @@ def discover_canonical_branch(config: Config, timeout: float = 30) -> str:
 
 def runtime_settings(config: Config) -> dict[str, Any]:
     """The runtime controls the file seeds into the store: `[settings]` and `publication_enabled`."""
-    return {**config.settings.as_dict(), "publication_enabled": config.publication_enabled}
+    return {
+        **config.settings.as_dict(),
+        "publication_enabled": config.publication_enabled,
+        "forgejo_admission_enabled": config.forgejo_admission_enabled,
+    }
 
 
 def effective_runtime_settings(config: Config, stored: dict[str, dict[str, Any]] | None) -> dict[str, dict[str, Any]]:

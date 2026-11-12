@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
+import re
 import socket
 import ssl
 import time
@@ -98,6 +100,53 @@ class GitHubSourceExecution:
             raise ValueError("execution credential belongs to another repository ID")
         frozen.request.check_policy(frozen.policy)
         return self.reader_factory(frozen.policy, self.tokens.token() if token is None else token)
+
+    def caller(self, enrolled_policy):
+        """Read one immutable caller/configuration snapshot from protected main."""
+        if (
+            enrolled_policy.execution.native_id != self.tokens.repository_id
+            or enrolled_policy.execution_branch != "main"
+        ):
+            raise ValueError("trusted caller differs from the enrolled execution repository/main")
+        reader = self.reader_factory(enrolled_policy, self.tokens.token())
+        metadata = reader.repository()
+        if (metadata.get("id"), metadata.get("full_name"), metadata.get("default_branch")) != (
+            enrolled_policy.execution.native_id,
+            enrolled_policy.execution.repository.name,
+            "main",
+        ):
+            raise ValueError("trusted caller repository identity or default branch changed")
+        branch = reader.get("/branches/main")
+        revision = branch.get("commit", {}).get("sha")
+        if (
+            branch.get("protected") is not True
+            or not isinstance(revision, str)
+            or not re.fullmatch(r"[0-9a-f]{40}", revision)
+            or revision == "0" * 40
+        ):
+            raise ValueError("trusted caller requires an immutable commit on protected main")
+
+        def content(path):
+            value = reader.get("/contents/" + path + "?ref=" + revision)
+            if value.get("type") != "file" or value.get("path") != path or value.get("encoding") != "base64":
+                raise ValueError("trusted caller configuration is not a regular encoded file")
+            size = value.get("size")
+            if type(size) is not int or not 0 <= size <= 2 * 1024 * 1024:
+                raise ValueError("trusted caller file exceeds the configuration bound")
+            raw = base64.b64decode(value["content"].replace("\n", "").replace("\r", ""), validate=True)
+            if len(raw) != size:
+                raise ValueError("trusted caller file is truncated")
+            return raw
+
+        configuration = content(".tauceti/ci-source.toml")
+        policy = cc.ExecutionPolicy.parse(cc.read_json(content(".tauceti/ci-source.json")), configuration=configuration)
+        from .ci_requests import RequestLedger
+
+        RequestLedger.check_configuration(policy, configuration)
+        if RequestLedger.binding(policy) != RequestLedger.binding(enrolled_policy) or policy.execution_branch != "main":
+            raise ValueError("protected caller changes enrolled repository or credential roles")
+        content(policy.workflow)  # The configured caller must exist at this exact revision.
+        return revision, policy, configuration
 
     def _post(self, frozen, path, payload=None, *, token=None):
         # No generic retrying API client: a lost POST response is not permission
