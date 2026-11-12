@@ -280,6 +280,11 @@ class ForgejoGitSource:
             self._bound(repo)
             return "MERGEABLE" if result.returncode == 0 else "CONFLICTING"
 
+    def local_ref_sha(self, ref):
+        """Read a fetched commit ref in this private store, without a network read."""
+        ref = self._ref(ref)
+        return self._sha(self._git("rev-parse", "--verify", ref + "^{commit}").stdout.decode("ascii").strip())
+
     def update_refs(self, repo, updates):
         """Create immutable retained refs atomically; an existing different tip is refused."""
         updates = tuple(updates)

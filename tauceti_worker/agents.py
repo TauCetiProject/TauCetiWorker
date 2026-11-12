@@ -467,13 +467,14 @@ def fill_prompt(path: Path, **subs) -> str:
         host_repo = source.repository.forge.url.split("://", 1)[1] + "/" + source.repo
         # Match a complete repository token. Shared repositories such as
         # TauCetiRoadmap have the content repository's name as a prefix.
+        boundary = r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_.-])"
         text = re.sub(
-            re.escape("https://github.com/" + TAUCETI) + r"(?=$|[/#?\s)\]`]|\.git(?:$|[/#?\s)\]`]))",
-            lambda _: source.repository.url,
+            re.escape("https://github.com/" + TAUCETI) + r"(\.git)?" + boundary,
+            lambda match: source.repository.url + (match[1] or ""),
             text,
         )
         text = re.sub(
-            re.escape("--repo " + TAUCETI) + r"(?=$|[\s'\"`])",
+            re.escape("--repo " + TAUCETI) + boundary,
             lambda _: "--repo " + host_repo,
             text,
         )

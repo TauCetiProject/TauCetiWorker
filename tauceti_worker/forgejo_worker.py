@@ -26,26 +26,12 @@ class ForgejoWorkerSource(ForgejoReadSource):
         self.token_file = Path(token_file) if token_file else None
         self.anonymous_discovery = token_file is None
         self.repo = self.repository.name
-        self._mergeability_state = None
         self._mergeability_cache = {}
 
     def resolve_mergeability(self, state, number, head):
         from .source_mergeability import resolve
 
-        self._mergeability_state = state
         return resolve(self, state, number, head)
-
-    def pr_view(self, pr, fields, *, fresh=False):
-        result = super().pr_view(pr, fields, fresh=fresh)
-        if (
-            result is not None
-            and "mergeable" in fields
-            and result.get("mergeable") == "UNKNOWN"
-            and result.get("headRefOid")
-            and self._mergeability_state is not None
-        ):
-            result["mergeable"] = self.resolve_mergeability(self._mergeability_state, pr, result["headRefOid"])
-        return result
 
     def validate_binding(self):
         row = self.api.repository(self.repository)

@@ -30,8 +30,9 @@ def observe(source, state, number, expected_head):
         return cache[key]
     root = Path(state) / "mergeability"
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root.chmod(0o700)
     with (root / "lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         clone = root / "objects.git"
         if not (clone / "HEAD").is_file():
             env = {key: value for key, value in os.environ.items() if key in {"PATH", "HOME"}}
@@ -44,7 +45,18 @@ def observe(source, state, number, expected_head):
                 timeout=30,
             )
         git = ForgejoGitSource(source.identity, source.api, clone, token=source.api._token)
-        git.fetch_refs(source.repo, [head, base])
+        # Retained local tips provide negotiation haves on the next fetch. The
+        # base repository's pull ref also covers heads authored in forks.
+        head_ref, base_ref = "refs/mergeability/head", "refs/mergeability/base"
+        git.fetch_refs(
+            source.repo,
+            [
+                f"+refs/pull/{number}/head:{head_ref}",
+                f"+refs/heads/{row['base']['ref']}:{base_ref}",
+            ],
+        )
+        if (git.local_ref_sha(head_ref), git.local_ref_sha(base_ref)) != key:
+            return "UNKNOWN"
         result = git.mergeability(source.repo, head, base)
     current = source.live_pull(number)
     if current is None or (current["head"]["sha"], current["base"]["sha"]) != key:
