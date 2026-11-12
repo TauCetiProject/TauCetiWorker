@@ -87,7 +87,7 @@ def setup(tmp, *, expires_in=60, refresh="operator-refresh", opt_in=True, plan="
     tc.quota.CODEX_SYSTEM_CONFIG = etc / "config.toml"
     tc.quota.CODEX_REQUIREMENT_FILES = (etc / "requirements.toml", etc / "managed_config.toml")
     tc.quota.CODEX_MANAGED_PREFERENCES = tmp / "Managed Preferences"
-    cfg = types.SimpleNamespace(home=tmp / "iso", quota_cache=tmp / "cache")
+    cfg = types.SimpleNamespace(home=tmp / "iso", quota_cache=tmp / "cache", state=tmp / "state")
     return tc.Quota(cfg), src / "auth.json", dst / "auth.json", stale
 
 
@@ -106,11 +106,13 @@ def usage_seen(*answers):
     return seen, patch.object(tc.quota, "_http_get_json", side_effect=fake)
 
 
-def renews_with(tmp, files, *, expires_in=60, first=(200, USAGE_OK, None), plan="plus", named=None):
+def renews_with(
+    tmp, files, *, expires_in=60, first=(200, USAGE_OK, None), plan="plus", named=None, checkout="checkout"
+):
     """Write `files` (path relative to tmp -> text), then make one renewing read. Returns how many
     token exchanges it made."""
     quota, src, mirror, stale = setup(tmp, expires_in=expires_in, plan=plan)
-    quota.cfg.checkout = tmp / "checkout"
+    quota.cfg.checkout = tmp / checkout
     if named is not None:
         os.environ["TAUCETI_CODEX_REFRESH_PLANS"] = named
     for rel, text in files.items():
@@ -486,6 +488,38 @@ for name, files, kwargs, want in (
         check(f"explicit file in both, {name}: exchanges", renews_with(tmp, files, **kwargs), want)
     finally:
         os.environ.pop("TAUCETI_CODEX_REFRESH_PLANS", None)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# 6k) Codex loads every .codex/config.toml between its working directory and the project root, above
+#     the user layer. The worker launches it from the checkout, the state directory, a fresh progress
+#     writer directory and recovery checkouts, so a store set in any of their ancestors refuses.
+PROJECT_MARKERS = 'cli_auth_credentials_store = "file"\nproject_root_markers = ["outer.marker"]\n'
+for name, files, want in (
+    ("an ancestor of the progress writer", {**BOTH, "state/progress/.codex/config.toml": KEYRING}, 0),
+    ("the progress-writing directory itself", {**BOTH, "state/progress/writing/.codex/config.toml": KEYRING}, 0),
+    ("an ancestor of the state directory", {**BOTH, "state/.codex/config.toml": KEYRING}, 0),
+    ("a recovery checkout", {**BOTH, "state/recovery/r1/checkout/.codex/config.toml": KEYRING}, 0),
+    (
+        "an ancestor of the checkout under configured markers",
+        {
+            SOURCE: PROJECT_MARKERS,
+            WORKER: PROJECT_MARKERS,
+            "outer/outer.marker": "",
+            "outer/checkout/.git/HEAD": "ref: refs/heads/main\n",
+            "outer/.codex/config.toml": KEYRING,
+        },
+        0,
+    ),
+    ("an unreadable ancestor policy", {**BOTH, "state/progress/.codex/config.toml": "x = [\n"}, 0),
+    ("control: an ancestor policy that says file", {**BOTH, "state/progress/.codex/config.toml": FILE}, 1),
+    ("control: an ancestor .codex without a config", {**BOTH, "state/progress/.codex/notes": ""}, 1),
+):
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        exchanges = renews_with(tmp, files, plan="business", checkout="outer/checkout")
+        check(f"project layers, {name}: exchanges", exchanges, want)
+    finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 

@@ -15,6 +15,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -952,7 +953,7 @@ def _codex_toml(path: Path) -> dict | str | None:
     try:
         with open(path, "rb") as fh:
             data = tomllib.load(fh)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         return None
     except (OSError, tomllib.TOMLDecodeError) as e:
         return f"unreadable:{type(e).__name__}"
@@ -2116,6 +2117,48 @@ class Quota:
                 return value
         return None
 
+    def _codex_launch_dirs(self) -> list[Path]:
+        """Every directory the worker starts Codex from on this host: the checkout (authoring, repair,
+        overlap fixes), the state directory (the model-access probe), recovery checkouts, and the fresh
+        directories made per launch for the progress writer, a new recovery and the security audit,
+        each represented by a not-yet-existing child of the directory it is made in."""
+        dirs = []
+        if (checkout := getattr(self.cfg, "checkout", None)) is not None:
+            dirs.append(Path(checkout))
+        if (state := getattr(self.cfg, "state", None)) is not None:
+            state = Path(state)
+            dirs += [state, state / "progress/writing/writer-", state / "recovery/record-/checkout"]
+            try:
+                dirs += [record / "checkout" for record in (state / "recovery").iterdir()]
+            except FileNotFoundError:
+                pass
+        dirs.append(Path(tempfile.gettempdir()) / "tauceti-security-review-")
+        return dirs
+
+    def _codex_project_store(self) -> str | None:
+        """Why a project layer Codex may load for one of its launch directories may set a store other
+        than file, or None. Codex reads .codex/config.toml in every directory from its working directory
+        up to the project root, above the user layer; the root depends on `project_root_markers`, which
+        a cloud default can set, so every ancestor up to / is read instead."""
+        home = codex_dir(self.cfg.home)
+        skip = {Path(os.path.abspath(home)), home.resolve()}
+        seen: set[Path] = set()
+        try:
+            launch = self._codex_launch_dirs()
+        except OSError as e:
+            return f"project:unreadable:{type(e).__name__}"
+        for directory in launch:
+            for base in {Path(os.path.abspath(directory)), directory.resolve()}:
+                for ancestor in (base, *base.parents):
+                    dot = ancestor / ".codex"
+                    if dot in seen or dot in skip:
+                        continue
+                    seen.add(dot)
+                    value = _codex_store_setting(dot / "config.toml")
+                    if value is not None and value != "file":
+                        return f"project:{value}"
+        return None
+
     def _refresh_codex_credential(self, *, force: bool = False) -> bool:
         """Codex's counterpart of _refresh_claude_credential, under the same --auto-refresh opt-in:
         rotate the operator's source auth.json when its access token has expired or is about to, and
@@ -2124,7 +2167,8 @@ class Quota:
         It stands down when codex's credential store is not verifiably that file: a keyring login can
         share the refresh token a leftover auth.json still carries, and spending it here would log that
         login out. An isolated worker spends the source's token, so the source directory's own config
-        must pass as well as the worker's, each resolved with Codex's administrator layers.
+        must pass as well as the worker's, each resolved with Codex's administrator layers, and no
+        project layer reachable from a directory the worker launches Codex from may set another store.
 
         A workspace cloud policy or an enrolled `config_server` can also default the store, at a layer
         below the user's config.toml. When both directories set `file` there explicitly that default
@@ -2134,6 +2178,8 @@ class Quota:
             return False
         source = self._codex_creds_source()
         if self._codex_effective_store() is not None or self._codex_effective_store(source) is not None:
+            return False
+        if self._codex_project_store() is not None:
             return False
         tokens = _as_dict(_as_dict(_read_json_file(source / "auth.json")).get("tokens"))
         plans = {_TokenIdentity.of(_jwt_claims(tokens.get(key))).plan for key in ("access_token", "id_token")} - {None}
