@@ -31,6 +31,8 @@ class MixedCandidateCI(SourceCandidateCI):
         from .github_app import InstallationTokenSource, load_execution_credentials
 
         profile = registry.profile.raw["execution"]
+        if isinstance(profile, dict) and "workflow_revision" in profile:
+            raise ValueError("remove execution.workflow_revision; new requests select protected execution main")
         if not isinstance(profile, dict) or set(profile) != {
             "configuration_file",
             "policy_file",
@@ -57,13 +59,12 @@ class MixedCandidateCI(SourceCandidateCI):
                 permissions={"contents": "write", "actions": "write"},
             )
             execution = GitHubSourceExecution(tokens)
-        revision, policy, configuration = execution.caller(policy)
         ledger = RequestLedger(
             controller.store,
             controller.clone,
             policy,
             configuration,
-            workflow_revision=revision,
+            workflow_revision=None,
             mixed_sources=True,
         )
         return cls(ledger, execution, registry, controller, clock=controller.clock)

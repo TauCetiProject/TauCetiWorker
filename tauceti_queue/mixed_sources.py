@@ -135,6 +135,8 @@ class NativePoller:
     def admission_changed(self):
         """Discard observations for new work, keeping existing acceptance live."""
         for row in self.controller.store.rows("admission_work", {"repository": self.state.repository}):
+            if row["disposition"] == "closed" and row["generation"] == row["evaluated_generation"]:
+                continue
             current = self.controller._input_for(self.registry.number(row["number"]))
             if (
                 current
@@ -142,7 +144,8 @@ class NativePoller:
                 and current["state"] in {"waiting", "reserved", "inserted", "landed"}
             ):
                 continue
-            self.state.dirty(row["number"], urgent=True)
+            self.state.dirty(row["number"], urgent=False)
+            self.controller.store.update("admission_work", {"id": row["id"]}, observed_version=row["observed_version"])
         self.request_discovery()
 
     def is_current(self, number, head):

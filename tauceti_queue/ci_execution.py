@@ -184,7 +184,11 @@ class GitHubSourceExecution:
                 not isinstance(current, dict)
                 or current.get("commit", {}).get("sha") != frozen.request.workflow_revision
             ):
-                raise ValueError("trusted CI caller revision changed before dispatch")
+                raise DispatchNotAccepted(
+                    "trusted CI caller revision changed before dispatch; prepare a fresh request", retryable=False
+                )
+        except DispatchNotAccepted:
+            raise
         except Exception as error:
             # This block precedes the only dispatch POST, so these are proven
             # non-sends even when credential refresh or a read was unavailable.

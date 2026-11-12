@@ -210,6 +210,26 @@ class Mixed(MixedFixture, unittest.TestCase):
         self.assertEqual(poller.run_once()["approved"], 1)
         self.assertEqual(self.controller.input_for(self.native_id.repository.key, 1)["head_sha"], fresh)
 
+    def test_resume_same_head_does_not_requeue_closed_history_or_duplicate_discovery(self):
+        registry = self.registry()
+        poller = registry.poller = NativePoller(registry, self.controller)
+        self.native.create_pr(1, {"Closed.lean": "closed\n"})
+        self.native.prs[1]["state"] = "closed"
+        poller.state.observe(1, self.native.prs[1]["head_sha"], "closed")
+        work = poller.state.get(1)
+        poller.state.complete(work, "closed", "", "closed")
+        closed_generation = poller.state.get(1)["generation"]
+        self.controller.set_setting("forgejo_admission_enabled", False, "operator")
+        head = self.native.create_pr(2, {"Native.lean": "same head\n"})
+        self.assertEqual(poller.run_once()["approved"], 0)
+        self.controller.set_setting("forgejo_admission_enabled", True, "operator")
+        self.assertEqual(poller.state.get(1)["generation"], closed_generation)
+        self.assertEqual(poller.state.get(2)["urgent"], 0)
+        self.assertEqual(poller.run_once()["approved"], 1)
+        self.assertEqual(self.controller.input_for(self.native_id.repository.key, 2)["head_sha"], head)
+        self.clock.advance(registry.poll_seconds)
+        self.assertEqual(poller.run_once()["evaluated"], 0)
+
     def test_observation_keeps_the_existing_github_main_writer(self):
         from tauceti_queue.controller import Controller
 
@@ -468,7 +488,6 @@ class MixedExecution(MixedFixture, unittest.TestCase):
                 self.controller.repository, "main", self.repo.main_sha(), tip
             ),
         )
-        self.registry_value.approved_caller = base
         configuration = CONFIG.replace(b"https://source.example", b"https://forge.example")
         trusted = dataclasses.replace(
             policy(configuration),
@@ -507,6 +526,50 @@ class MixedExecution(MixedFixture, unittest.TestCase):
             for ref, sha in frozen.retained_refs()
         ]
         self.controller.set_setting("publication_enabled", True, "fixture")
+
+    def test_build_uses_enrolled_bootstrap_without_reading_execution_main(self):
+        from tauceti_queue.mixed_ci import MixedCandidateCI
+
+        frozen = self.start_mixed()
+        policy_file, config_file = self.root / "ci-policy.json", self.root / "ci-config.toml"
+        policy_file.write_text(dumps(self.ledger.policy.record(with_config=False)))
+        config_file.write_bytes(self.ledger.configuration)
+        policy_file.chmod(0o600)
+        config_file.chmod(0o600)
+        profile = dict(
+            policy_file=str(policy_file), configuration_file=str(config_file), credentials_dir=str(self.root)
+        )
+        self.profile.raw["execution"] = profile
+        with patch.object(self.execution, "caller", side_effect=AssertionError("startup execution network read")):
+            built = MixedCandidateCI.build(self.registry_value, self.controller, execution=self.execution)
+            self.assertEqual(built.ledger.load(frozen.attempt_id), frozen)
+            self.execution.add(frozen, classification="passed")
+            self.assertEqual(built.observe(frozen.attempt_id).result["classification"], "passed")
+        self.assertIsNone(built.ledger.workflow_revision)
+        with self.assertRaisesRegex(ValueError, "select a protected"):
+            built.ledger.prepare({}, ())
+        profile["workflow_revision"] = "a" * 40
+        with self.assertRaisesRegex(ValueError, "remove execution.workflow_revision"):
+            MixedCandidateCI.build(self.registry_value, self.controller, execution=self.execution)
+
+    def test_mirror_configuration_has_no_private_caller_pin(self):
+        from tauceti_queue import mixed_landing
+
+        self.profile.raw["mirror"] = dict(
+            forgejo_token_file=str(self.root / "main-token"),
+            forgejo_writer_id=6,
+            github_credentials_dir=str(self.root / "github-mirror"),
+        )
+        with (
+            patch.object(mixed_landing, "MainWriter", return_value=self.native) as writer,
+            patch.object(mixed_landing, "MainMirror", return_value=self.registry_value.mirror) as mirror,
+        ):
+            mixed_landing.configure(self.registry_value)
+        writer.assert_called_once()
+        self.assertEqual(mirror.call_args.args[0].execution, self.profile.github)
+        self.profile.raw["mirror"]["approved_caller"] = "a" * 40
+        with self.assertRaisesRegex(ValueError, "remove mirror.approved_caller"):
+            mixed_landing.configure(self.registry_value)
 
     def start_mixed(self):
         github = self.github.create_pr(17, {"Github.lean": "github\n"})
@@ -558,6 +621,82 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         self.assertEqual(self.native_repo.main_sha(), frozen.request.head)
         self.assertTrue(self.native.comments)
 
+    def test_pause_during_reserved_input_probe_keeps_that_accepted_input(self):
+        import threading
+
+        from tauceti_queue import chain
+
+        native = self.native.create_pr(17, {"Native.lean": "native\n"})
+        self.controller.approve(self.native_id.repository.key, 17, native, "fixture")
+        entered, release = threading.Event(), threading.Event()
+        build = chain.build
+        errors = []
+
+        def slow(*args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test release missing")
+            return build(*args, **kwargs)
+
+        def tick():
+            try:
+                self.controller.tick()
+            except Exception as error:
+                errors.append(error)
+
+        with patch.object(chain, "build", side_effect=slow):
+            thread = threading.Thread(target=tick)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertEqual(self.controller.input_for(self.native_id.repository.key, 17)["state"], "reserved")
+                self.controller.set_setting("forgejo_admission_enabled", False, "operator")
+            finally:
+                release.set()
+                thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.controller.input_for(self.native_id.repository.key, 17)["state"], "inserted")
+
+    def test_mirror_uses_current_trusted_github_base_after_reviewed_control_update(self):
+        from tauceti_queue.fakes import run_git
+        from tauceti_queue.mixed_landing import preflight
+        from tauceti_queue.stage1_mirror import MainMirror
+
+        reviewed = self.github.create_pr(90, {".github/workflows/maintenance.yml": "# reviewed update\n"})
+        self.github.fast_forward(self.controller.repository, "main", self.repo.main_sha(), reviewed)
+        run_git(self.native_repo.origin, "fetch", "-q", str(self.repo.origin), reviewed)
+        run_git(self.native_repo.origin, "update-ref", "refs/heads/main", reviewed)
+        self.execution.caller_snapshot = (reviewed, self.ledger.policy, self.ledger.configuration)
+        checked = []
+
+        def check(source, base, candidate, trusted_base):
+            self.assertEqual(trusted_base, self.repo.main_sha())
+            MainMirror.check_controls(self.repo.clone, trusted_base, candidate)
+            checked.append(("preflight", trusted_base))
+
+        def publish(source, tip, trusted_base):
+            self.assertEqual(trusted_base, self.repo.main_sha())
+            MainMirror.check_controls(self.repo.clone, trusted_base, tip)
+            checked.append(("publish", trusted_base))
+            return self.github.fast_forward(self.controller.repository, "main", trusted_base, tip)
+
+        self.registry_value.mirror.preflight = check
+        self.registry_value.mirror.publish = publish
+        self.controller.change_primary("forgejo", "operator")
+        frozen = self.start_mixed()
+        self.assertEqual(frozen.request.workflow_revision, reviewed)
+        self.execution.add(frozen, classification="passed")
+        self.clock.advance(60)
+        self.controller.tick()
+        self.controller.tick()
+        self.assertEqual(self.repo.main_sha(), frozen.request.head)
+        self.assertIn(("publish", reviewed), checked)
+        malicious = self.github.create_pr(91, {"scripts/unreviewed.py": "# candidate control change\n"})
+        run_git(self.repo.clone, "fetch", "-q", "origin", malicious)
+        with self.assertRaisesRegex(ValueError, "execution control files changed"):
+            preflight(self.registry_value, self.repo.main_sha(), malicious)
+
     def test_paused_setting_survives_restart_and_preserves_paid_repair_claim(self):
         from tauceti_queue.controller import Controller
 
@@ -581,6 +720,14 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         restarted.mixed_ci = self.ci
         restarted.admission = self.controller.admission
         self.registry_value.controller = self.ci.controller = restarted
+        new_poller = self.registry_value.poller = NativePoller(self.registry_value, restarted)
+        restarted.admission.native = new_poller
+        new_head = self.native.create_pr(18, {"Later.lean": "waiting for resume\n"})
+        self.assertEqual(new_poller.run_once()["approved"], 0)
+        self.assertIsNone(restarted.input_for(self.native_id.repository.key, 18))
+        self.assertEqual(
+            restarted.approve(self.native_id.repository.key, 18, new_head, "operator")["reason"], "admission-paused"
+        )
         self.assertFalse(restarted.setting("forgejo_admission_enabled"))
         self.assertGreater(restarted.renew_task(task_id, task.claim_token), self.clock())
         self.assertEqual(restarted.store.row("claims", {"token": task.claim_token})["released_at"], None)

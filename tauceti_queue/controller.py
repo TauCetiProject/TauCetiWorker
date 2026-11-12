@@ -543,7 +543,12 @@ class Controller:
                 self.store.journal(now, "setting", key=key, value=value, actor=actor)
                 if key == "publication_enabled" and value and not previous:
                     self._republish_retained_refs(now)
-                if key == "forgejo_admission_enabled" and self.mixed is not None and self.mixed.poller is not None:
+                if (
+                    key == "forgejo_admission_enabled"
+                    and value
+                    and self.mixed is not None
+                    and self.mixed.poller is not None
+                ):
                     self.mixed.poller.admission_changed()
             self._wake.set()
             self._refresh_snapshot()
@@ -7734,7 +7739,7 @@ class Controller:
                     alerts.append(f"head {head['id']}: {attempt['outcome_detail']} (request {attempt['request_id']})")
             if attempt["dispatch_state"] == "rejected" and not attempt["dispatch_retryable"]:
                 alerts.append(
-                    f"head {head['id']} dispatch rejected; automatic retries continue; check CI permissions and configuration"
+                    f"head {head['id']} dispatch rejected; automatic retries continue; see the dispatch-failed journal entry for the reason"
                 )
             if attempt["outcome"] == OUTCOME_INFRASTRUCTURE and attempt["infrastructure_retry"] >= 3:
                 alerts.append(

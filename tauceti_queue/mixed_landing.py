@@ -27,6 +27,8 @@ class MainWriter(ForgejoGitSource):
 
 def configure(registry):
     value = registry.profile.raw.get("mirror")
+    if isinstance(value, dict) and "approved_caller" in value:
+        raise ValueError("remove mirror.approved_caller; mirror checks use the trusted GitHub main base")
     if not isinstance(value, dict) or set(value) != {
         "forgejo_token_file",
         "forgejo_writer_id",

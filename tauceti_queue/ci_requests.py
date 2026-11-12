@@ -74,7 +74,7 @@ class RequestLedger:
         self.epoch_key = "mixed-ci:epoch" if mixed_sources else "source-ci:epoch"
         if cc.ExecutionPolicy.parse(policy.record(with_config=False), configuration=configuration) != policy:
             raise ValueError("CI policy differs from its trusted configuration")
-        if (
+        if not (mixed_sources and workflow_revision is None) and (
             not isinstance(workflow_revision, str)
             or not re.fullmatch(r"[0-9a-f]{40}", workflow_revision)
             or workflow_revision == "0" * 40
@@ -148,6 +148,8 @@ class RequestLedger:
 
     def prepare(self, attempt, members):
         """Read immutable Git data before acquiring the database write transaction."""
+        if self.workflow_revision is None:
+            raise ValueError("select a protected execution caller before preparing source CI")
         if attempt["base_ref"] != self.policy.base_branch:
             raise ValueError("source request base branch differs from trusted policy")
         members = tuple(members)

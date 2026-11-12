@@ -75,6 +75,10 @@ source token path. Admission additionally requires execution and mirror roles.
 `check-config` validates the profile shape; it does not prove enabled-mode
 readiness. Startup also validates policy/configuration bytes, stored source
 bindings, authority history, credentials and remote repository identities.
+Execution-main selection happens when preparing a new CI request, so an
+execution outage or invalid new caller does not prevent the service from
+starting and serving existing work. Request preparation reports and retries
+the execution error through the existing CI freeze-error path.
 Validate an enabled configuration against a disposable queue before applying it
 to the live service. A configuration check alone is insufficient for rollout.
 The source account needs repository access sufficient for current native
