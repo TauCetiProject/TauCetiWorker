@@ -263,6 +263,23 @@ class ForgejoGitSource:
     def update_ref(self, repo, ref, sha):
         self.update_refs(repo, [(ref, sha)])
 
+    def mergeability(self, repo, head, base):
+        """Prove textual mergeability of two exact commits, without updating refs."""
+        head, base = self._sha(head), self._sha(base)
+        with self._lock:
+            self._bound(repo)
+            result = self._git("merge-tree", "--write-tree", head, base, check=False)
+            if result.returncode not in (0, 1):
+                raise Incomplete("source mergeability could not be established")
+            # A conflict produces a tree too. An exit code without the expected
+            # merge-tree result is not evidence of a content conflict.
+            try:
+                self._sha(result.stdout.splitlines()[0].decode("ascii"))
+            except (UnicodeError, IndexError, ValueError):
+                raise Incomplete("source mergeability result is malformed") from None
+            self._bound(repo)
+            return "MERGEABLE" if result.returncode == 0 else "CONFLICTING"
+
     def update_refs(self, repo, updates):
         """Create immutable retained refs atomically; an existing different tip is refused."""
         updates = tuple(updates)

@@ -255,6 +255,26 @@ ci="one/project"
         source = ForgejoWorkerSource(self.identity, api, token_file=self.root / "token")
         return SimpleNamespace(gh=source, cfg=self.cfg, counters=Mock(), rs=Mock())
 
+    def test_native_prompt_rewrites_only_complete_content_repository_references(self):
+        from tauceti_worker.agents import TAUCETI, fill_prompt
+
+        template = self.root / "prompt.txt"
+        canonical = "https://github.com/" + TAUCETI
+        shared = [TAUCETI + suffix for suffix in ("Roadmap", "Data", "Review", "-claims")]
+        lines = [canonical, canonical + "/pull/7", canonical + ".git", "--repo " + TAUCETI]
+        for name in shared:
+            lines.extend(["https://github.com/" + name, "--repo " + name])
+        template.write_text("\n".join(lines) + "\n__CLAIMED__")
+        untrusted = canonical + " --repo " + TAUCETI
+        with patch("tauceti_worker.worker_sources.current", return_value=self.source):
+            rendered = fill_prompt(template, CLAIMED=untrusted).splitlines()
+        native = self.repo.forge.url.removeprefix("https://") + "/" + self.repo.name
+        self.assertEqual(
+            rendered[:4], [self.repo.url, self.repo.url + "/pull/7", self.repo.url + ".git", "--repo " + native]
+        )
+        self.assertEqual(rendered[4:-1], lines[4:])
+        self.assertEqual(rendered[-1], untrusted)
+
     def test_authoring_has_no_pull_request_for_the_native_source_to_authorize(self):
         worker = self.native_worker()
         self.assertTrue(still_actionable("roadmap", worker, None, Candidate(0, "", "Algebra")))
