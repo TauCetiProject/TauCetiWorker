@@ -38,6 +38,9 @@ class VerifiedExecution:
     def preflight(self, frozen):
         return "fixture-only"
 
+    def caller(self, policy):
+        return self.caller_snapshot
+
     def dispatch(self, frozen, *, prepared=None):
         self.dispatches.append(frozen)
         if self.lost_response:
