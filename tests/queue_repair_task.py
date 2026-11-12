@@ -1503,6 +1503,30 @@ class RebaseArtifacts(Fixture):
         self.service.tasks = {1: self.raw}
         return moved
 
+    def test_changed_rebase_dependencies_are_prepared_on_target_and_input_is_restored(self):
+        seed = self.content.bare.parent / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", self.onto)
+        target = commit(seed, "bump dependency", {"lake-manifest.json": '{"packages": []}\n'})
+        sh(seed, "fetch", "--quiet", str(self.content.bare), self.content.tip)
+        task = repair_task.Task.from_json({**self.raw, "onto": target, "claim_token": "x", "expires_at": time.time() + 60})
+        sh(seed, "checkout", "--quiet", "--detach", self.content.tip)
+        package = seed / ".lake" / "packages" / "hydrated"
+        for fail in (False, True):
+            try:
+                with repair_task.artifact_checkout(seed, task, self.content.tip):
+                    self.assertEqual(sh(seed, "rev-parse", "HEAD"), target)
+                    self.assertTrue((seed / "lake-manifest.json").is_file())
+                    package.parent.mkdir(parents=True, exist_ok=True)
+                    package.write_text("prepared dependency objects")
+                    if fail:
+                        raise RuntimeError("cache transport failed")
+            except RuntimeError:
+                if not fail:
+                    raise
+            self.assertEqual(sh(seed, "rev-parse", "HEAD"), self.content.tip)
+            self.assertFalse((seed / "lake-manifest.json").exists())
+            self.assertEqual(package.read_text(), "prepared dependency objects")
+
     def test_the_rebase_target_is_fetched_first(self):
         os.environ["STUB_LAKE_CACHE_FAIL_REVS"] = self.content.base  # the stale base has no outputs
         lines = self.observe_log()
