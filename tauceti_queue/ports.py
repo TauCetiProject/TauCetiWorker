@@ -381,6 +381,20 @@ class Task:
             "extra": self.extra,
             "warm_revs": list(self.warm_revs),
         }
+        mixed = self.extra.get("mixed_binding")
+        if mixed is not None and self.binding is None:
+            from .mixed_identity import SourceNumber, encode
+            from .mixed_tasks import SCHEMA, validate
+
+            record.update(schema=SCHEMA, mixed_binding=mixed)
+            for member, original in zip(record["members"], self.members, strict=True):
+                number = original.number
+                member["number"] = int(number)
+                member["source_identity"] = (
+                    number.source.record() if isinstance(number, SourceNumber) else mixed["github"]
+                )
+            validate(record)
+            record = encode(record)
         if self.binding is not None:
             # Old runners require repository and must refuse this schema rather
             # than silently fetching/pushing owner/name on GitHub.

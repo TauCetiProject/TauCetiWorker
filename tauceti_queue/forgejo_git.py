@@ -196,7 +196,8 @@ class ForgejoGitSource:
             # by their exact names instead of listing a growing queue prefix.
             prefix = ref
             if re.fullmatch(
-                r"refs/heads/tauceti-ci/[0-9a-f]{32}/[0-9a-f]{32}/(?:candidate|members|member-[1-9][0-9]*)", ref
+                r"refs/heads/tauceti-ci/[0-9a-f]{32}/[0-9a-f]{32}/(?:candidate|members|member-(?:[1-9][0-9]*|[0-9a-f]{64}))",
+                ref,
             ):
                 prefix = ref.rsplit("/", 1)[0]
             groups.setdefault(prefix, []).append(ref)

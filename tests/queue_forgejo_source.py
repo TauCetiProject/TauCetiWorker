@@ -1157,6 +1157,30 @@ class NativeSource(unittest.TestCase):
         )
         self.assertEqual(self.source.admission_policy.evaluate(snapshot)[0]["recovery_heads"], ["a" * 40])
 
+    def test_mixed_admission_allows_a_reviewed_head_after_historical_recovery(self):
+        from tauceti_queue.mixed_native import MixedNativePolicy
+
+        review = self.comment()
+        hold = self.comment(
+            actor=self.queue,
+            comment_id=2,
+            body="Merge-queue recovery for head `" + "c" * 40 + "`\n<!--tauceti-rebase:v1 " + "c" * 40 + "-->",
+        )
+        self.rows = [review, hold]
+        self.status_rows = [self.stamp(review), self.stamp(hold, actor=self.queue, status_id=2, kind="recovery")]
+        comments, review_state, recovery = self.read()
+        snapshot = ports.AdmissionSnapshot(
+            ports.PullRequest(1, "a" * 40, "main", "Proof", "", "author", "open"),
+            "b" * 40,
+            ("Math/A.lean",),
+            comments,
+            {"_native_review": review_state, "_native_recovery": recovery},
+        )
+        decision = MixedNativePolicy(self.publishers, rubrics=("proof",), prefix="Math/", allow_files=())
+        result = decision.evaluate(snapshot)[0]
+        self.assertEqual(result["recovery_heads"], ["c" * 40])
+        self.assertTrue(result["merge"], result)
+
     def test_only_an_explicit_recovery_publisher_can_clear_an_attested_hold(self):
         hold = self.comment(
             actor=self.queue,

@@ -670,7 +670,9 @@ class ControllerFeedSource:
 
     def _members(self, batch_id: int, inputs: dict[int, dict]) -> tuple[MemberView, ...]:
         rows = self.store.rows("members", {"batch_id": batch_id, "removed": 0}, order="position")
-        return tuple(self._member_view(m, inputs) for m in rows)
+        from .mixed_identity import SourceNumber
+
+        return tuple(self._member_view(m, inputs) for m in rows if not isinstance(m["number"], SourceNumber))
 
     # -- batches
 
@@ -731,7 +733,11 @@ class ControllerFeedSource:
         rows = self.store.rows("members", None, order="id DESC", limit=5000)
         inputs = self._inputs_by_id()
         out = []
+        from .mixed_identity import SourceNumber
+
         for member in rows:
+            if isinstance(member["number"], SourceNumber):
+                continue
             batch = batches.get(member["batch_id"])
             if batch is None:
                 continue
@@ -756,7 +762,11 @@ class ControllerFeedSource:
         if repo != self.controller.repository:
             return []
         approvals = []
+        from .mixed_identity import SourceNumber
+
         for row in self.store.rows("inputs", {"repository": repo}, order="id"):
+            if isinstance(row["number"], SourceNumber):
+                continue
             if row["state"] not in ("waiting", "reserved", "inserted"):
                 continue
             evidence = _loads(row.get("evidence"), {})
@@ -879,6 +889,7 @@ class ControllerFeedSource:
         return [
             AdmissionView(int(m["id"]), int(m["batch_id"]), _micro(m["added_at"]), self._member_view(m, inputs), base)
             for m in rows
+            if not m.get("source_identity")
         ]
 
 
