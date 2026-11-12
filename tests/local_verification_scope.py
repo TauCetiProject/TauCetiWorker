@@ -306,6 +306,39 @@ def main():
         check(f"{name}: no bare unscoped audit command block", "\nlake exe axioms\n" not in text)
         check(f"{name}: no stale DuplicateDeclarations script", "DuplicateDeclarations.lean" not in text)
 
+    # Both verifier paths add the same optional publication instruction.
+    from unittest.mock import patch
+
+    for helper in ("0", "1"):
+        with patch.dict(os.environ, TAUCETI_VERIFY_HELPER=helper, TAUCETI_SELF_TESTED="1"):
+            text = tc.agents.local_verification("ordinary")
+            check(
+                f"self-tested helper={helper}: label the PR after verification",
+                "Apply the `self-tested` label to the PR" in text
+                and "gh-safe-pr-create" in text
+                and "--add-label self-tested" in text
+                and "failed, incomplete, or outdated" in text,
+            )
+            for policy in ("bump", "full-lint", "lint-repair"):
+                check(
+                    f"self-tested helper={helper}: excludes {policy}",
+                    "Apply the self-tested label after verification" not in tc.agents.local_verification(policy),
+                )
+        with patch.dict(os.environ, TAUCETI_SELF_TESTED="0"):
+            check(
+                f"self-tested helper={helper}: off by default",
+                "Apply the self-tested label after verification" not in tc.agents.local_verification("ordinary"),
+            )
+
+    with (
+        patch.dict(os.environ, TAUCETI_SELF_TESTED="1"),
+        patch(
+            "tauceti_worker.worker_sources.repository_url",
+            return_value="https://git.example.org/Other/Project",
+        ),
+    ):
+        check("self-tested never labels a different source", tc.agents.self_tested_guidance("ordinary") == "")
+
     # Policy comes from surveyed labels and branch only.
     sp = tc.agents.scope_policy
     check("ordinary PR", sp(("roadmap/Foo",), "feature") == "ordinary")
