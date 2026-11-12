@@ -371,7 +371,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_PR` | _(unset)_ | Comma-separated pull request numbers for `--pr`. |
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
 | `TAUCETI_AUTO_REFRESH` | _(unset)_ | `1` is the same as `--auto-refresh`. |
-| `TAUCETI_CODEX_REFRESH_PLANS` | _(unset)_ | Comma-separated Codex plan names that `--auto-refresh` renews beyond its built-in list, for example `edu_pro`. A malformed value stops the worker at startup. See [quota and pacing](quota.md). |
+| `TAUCETI_CODEX_REFRESH_PLANS` | _(unset)_ | Comma-separated Codex plan names that `--auto-refresh` renews beyond its built-in list when the Codex configs do not set `cli_auth_credentials_store = "file"` explicitly, for example `edu_pro`. A malformed value stops the worker at startup. See [quota and pacing](quota.md). |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = `60:40`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `TAUCETI_VERIFY_CHECKPOINT_MARGIN` | `600` | Seconds reserved before the round deadline for checkpointing; verification returns incomplete at this boundary. |

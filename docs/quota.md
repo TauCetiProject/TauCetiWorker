@@ -139,25 +139,37 @@ which lasts about ten days, is within two days of expiry, or when the usage
 endpoint answers 401. It leaves the file alone unless `cli_auth_credentials_store`
 resolves to `file` both for the worker's own Codex directory and for the one that
 holds that `auth.json`, counting `/etc/codex/config.toml`, the requirements files
-in `/etc/codex` and any managed `com.openai.codex` preference as Codex does. It
-also leaves it alone for a business, education or enterprise plan, or one it does
-not recognise, since Codex applies a workspace's cloud policy to those, and that
-policy can choose the store. For any plan, it leaves the file alone while a
-requirements file in `/etc/codex` enrolls a `config_server`, whose configuration
-can choose the store too. A stop signal that arrives during the exchange takes
-effect once the new token is saved.
+in `/etc/codex` and any managed `com.openai.codex` preference as Codex does. A
+stop signal that arrives during the exchange takes effect once the new token is
+saved.
 
-`$TAUCETI_CODEX_REFRESH_PLANS` adds plans to the ones renewed: a comma-separated
-list of plan names exactly as Codex's tokens carry them, such as `edu_pro`. It is
-unset by default, and it changes only the plan rule; every other condition above
-still applies. A malformed value stops the worker at startup. Set it
-per worker through the `env` table in `workers.toml`.
+Two more sources can set the store's default: a workspace's cloud policy, which
+Codex fetches for business, education and enterprise plans, and a
+`config_server` enrolled in a requirements file in `/etc/codex`, which applies to
+any plan. Both sit below the user's `config.toml`, so how the worker treats them
+depends on that file:
+
+- **Set the store explicitly (preferred).** Put
+  `cli_auth_credentials_store = "file"` in the `config.toml` of both the worker's
+  Codex directory and the one that holds the renewed `auth.json` (the same
+  directory unless the worker is isolated). Codex then uses the file whatever
+  those defaults say, and the worker renews on any plan. Only the layers above
+  the user's file still stop it: requirements files and the legacy
+  `managed_config.toml` in `/etc/codex`, managed `com.openai.codex` preferences,
+  and a project `.codex/config.toml` in the checkout.
+- **Name the plan.** Without that setting the worker renews only plans that
+  Codex fetches no cloud policy for, plus any named in
+  `$TAUCETI_CODEX_REFRESH_PLANS`, and nothing at all while a `config_server` is
+  enrolled. The variable is a comma-separated list of plan names exactly as
+  Codex's tokens carry them, such as `edu_pro`. It is unset by default and
+  changes only the plan rule. A malformed value stops the worker at startup. Set
+  it per worker through the `env` table in `workers.toml`.
 
 Naming a plan asserts that your workspace's policy leaves Codex on the file store
 for this login, which `codex doctor` on the worker's host reports as the auth
-storage mode. If the policy requires the keyring, Codex keeps the login there,
-under a key derived from the Codex directory, and deletes `auth.json` whenever it
-saves to it. Renewing a leftover file is then usually just wasted: Codex never
+storage mode. If the policy defaults the store to the keyring, Codex keeps the
+login there, under a key derived from the Codex directory, and deletes
+`auth.json` whenever it saves to it. Renewing a leftover file is then usually just wasted: Codex never
 reads it, or the exchange fails because its refresh token was already spent. It
 logs you out only when the leftover file and the keyring hold the same refresh
 token, for example after a failed delete or a restored copy: the exchange retires
