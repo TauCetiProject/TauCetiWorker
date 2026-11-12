@@ -221,6 +221,7 @@ class RoundOpts:
     # Preserve the operator's pacing override for fresh launch-stage quota checks.
     # This never waives hard exhaustion or unreadable provider usage.
     ignore_quota: bool = False
+    quota_cmd: str | None = None  # current external admission policy, including source recovery
     loop_paced: bool = False  # soft pacing handoff; never permits telemetry-outage work
 
     @property
