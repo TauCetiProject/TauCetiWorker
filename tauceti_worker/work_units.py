@@ -1508,12 +1508,13 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
     if reviewers in ("auto", ""):
         raise Die("review needs a concrete reviewer model (resolve --agent / quota first)")
     errkey = f"review-err-{pr}"
+    reaction_claim = bool(c.contest and c.contest_reply_id and getattr(w.gh, "supports_contest_reactions", True))
     if c.contest:
         # Claim the in-flight contest with a 👀 on the contesting reply so a peer worker re-surveying
         # before the new scoreboard lands skips it (cross-fleet dedup). The engine auto-detects the
         # contest from the thread reply (no extra flag); a contest-only round is recorded as a reply
         # round, so it does not consume the review-round budget.
-        if c.contest_reply_id and not w.gh.add_reaction(c.contest_reply_id):
+        if reaction_claim and not w.gh.add_reaction(c.contest_reply_id):
             log(f"  review #{pr}: contest claim (👀) failed to post — a peer may double-review")
         log(f"  review #{pr}: author contest on {c.contest} @ {head[:12]}, reviewers={reviewers}")
     else:
@@ -1685,7 +1686,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         result_file.unlink(missing_ok=True)
         # Drop the claim: on success the watermark now prevents a re-fire; on failure releasing it lets
         # the contest be retried. A crash before here leaves the 👀 to TTL out (CONTEST_CLAIM_TTL).
-        if c.contest and c.contest_reply_id and not w.gh.remove_reaction(c.contest_reply_id):
+        if reaction_claim and not w.gh.remove_reaction(c.contest_reply_id):
             log(f"  review #{pr}: contest claim (👀) failed to release — it will TTL out in {CONTEST_CLAIM_TTL // 60}m")
 
 

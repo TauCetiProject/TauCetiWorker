@@ -289,7 +289,7 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
             raise SystemExit(143)  # RoundContext's SIGTERM handler
         return 0
 
-    proc = SimpleNamespace(pid=12345, wait=interrupted_wait)
+    proc = SimpleNamespace(pid=12345, wait=interrupted_wait, terminate=lambda: signals.append((12345, agents.signal.SIGTERM)))
     with (
         patch.object(agents.subprocess, "Popen", lambda *a, **kw: proc),
         patch.object(agents.os, "killpg", lambda pid, sig: signals.append((pid, sig))),
@@ -302,4 +302,5 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         else:
             raise AssertionError("round interruption must propagate")
     assert signals == [(12345, agents.signal.SIGTERM), (12345, agents.signal.SIGKILL)]
+    assert waits[1]["timeout"] == 35  # Let the guardian reap detached descendants before the fallback.
     print("[OK] round interruption cleans up the complete downloader process group")

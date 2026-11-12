@@ -343,6 +343,28 @@ ci="one/project"
         worker.counters.incr.assert_not_called()
         worker.counters.write.assert_not_called()
 
+    def test_contest_reactions_follow_the_source_capability_without_false_warnings(self):
+        from tauceti_worker.source_execution import review
+
+        worker = SimpleNamespace(cfg=self.cfg, gh=self.source, counters=Mock(), rs=Mock())
+        candidate = Candidate(1, "a" * 40, contest="correctness", contest_reply_id=7)
+        for supported in (False, True):
+            self.source.reset_mock()
+            self.source.supports_contest_reactions = supported
+            self.source.add_reaction.return_value = False
+            self.source.remove_reaction.return_value = False
+            with (
+                self.subTest(supported=supported),
+                patch("tauceti_worker.review_runtime.resolve", return_value=SimpleNamespace(command=lambda: ["engine"])),
+                patch("tauceti_worker.work_units.run_to_logfile", return_value=81),
+                patch("tauceti_worker.work_units.log") as log,
+            ):
+                self.assertIsNone(review(worker, None, candidate, SimpleNamespace(work_model="codex"), False))
+                warnings = [str(call) for call in log.call_args_list if "contest claim" in str(call)]
+            self.assertEqual(self.source.add_reaction.call_count, int(supported))
+            self.assertEqual(self.source.remove_reaction.call_count, int(supported))
+            self.assertEqual(len(warnings), 2 if supported else 0)
+
     def test_source_failure_at_dispatch_still_allows_the_other_source(self):
         import contextlib
 
