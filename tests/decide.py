@@ -197,7 +197,11 @@ def rounds(tmp, hub, answer=None, *, rc=0, claimed=(), claims=None, meanwhile=No
     w = SimpleNamespace(gh=hub, cfg=SimpleNamespace(state=tmp / "state", wid="w1"), claims=claims or Claims())
     with (
         patch.object(decide, "_ask", side_effect=ask),
-        patch.object(work_units, "_branch_claimed_elsewhere", side_effect=lambda _w, n: n in claimed),
+        patch.object(
+            work_units,
+            "_branch_claimed_elsewhere",
+            side_effect=lambda _w, n: claimed(n) if callable(claimed) else n in claimed,
+        ),
         patch.object(agents, "fetch_ref", side_effect=fetch),
         patch("tauceti_worker.github.me", return_value="me"),
     ):
@@ -537,6 +541,27 @@ def test_rounds(tmp):
             "…and ruled on once",
             (ruling(root)["ruling"], where(root, "declined-fix-1.json")),
             ("retry", ["acked"]),
+        )
+
+    root = tmp / "refreshed-during-checks"
+    with settings(root, TAUCETI_HOLD_DECLINED="0"):
+        declined(1)
+        hub = Hub(p1={}, p20={})
+        rounds(tmp, hub, answer((1, "wait", {"blocked_on": [20]})))
+        hub.prs[20]["state"] = "CLOSED"
+        refreshed = []
+
+        def claim_read(n):
+            # Another worker records fresh evidence while the claim is read.
+            if n == 1 and not refreshed:
+                refreshed.append(incidents.record_declined("fix", 1, "head-1", message="fresh evidence"))
+            return False
+
+        seen = rounds(tmp, hub, answer((1, "retry", {})), claimed=claim_read)
+        check(
+            "an incident refreshed while the round reads claims is put to the model once, as the fresh record",
+            [(c["case"], c["final_message"]) for c in seen["packet"]["cases"]],
+            [("declined-fix-1", "fresh evidence")],
         )
 
     root = tmp / "refreshed-landed"
