@@ -12,6 +12,7 @@ from .forgejo_reads import ForgejoReadSource
 
 
 class ForgejoWorkerSource(ForgejoReadSource):
+    supports_contest_reactions = False
     worker_capable = True
     supports_review_sandbox = False
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Cross-forge routing, independent outages, identities and budgets."""
 
+import io
 import json
 import os
 import sys
@@ -18,6 +19,7 @@ from tauceti_tools.forge import GITHUB, Forge, RepositoryRef
 from tauceti_worker.config import Config, Die
 from tauceti_worker.multi_source import collect, deduplicate
 from tauceti_worker.review_state import Meta
+from tauceti_worker.source_cli import api_command
 from tauceti_worker.source_execution import still_actionable
 from tauceti_worker.source_identity import SourceActor
 from tauceti_worker.source_survey import worker_survey
@@ -95,6 +97,103 @@ class Sources(unittest.TestCase):
             configure(SimpleNamespace())
             self.assertEqual(os.environ["TAUCETI_WORKER_FORGES"], "github")
             self.assertEqual(os.environ["TAUCETI_NEW_PR_FORGE"], "github")
+
+    def test_api_reads_use_the_shared_contract_instead_of_raw_native_pagination(self):
+        from tauceti_tools.forge_command import parse_command
+
+        for endpoint in [
+            "user",
+            "repos/one/project",
+            "repos/one/project/pulls/1",
+            "repos/one/project/issues/1/comments",
+        ]:
+            with self.subTest(endpoint=endpoint):
+                args = ["api", endpoint]
+                if endpoint.endswith("/comments"):
+                    args.append("--paginate")
+                self.assertIsNone(api_command(parse_command(args), self.source))
+        self.source.api.request.assert_not_called()
+        self.source.api.collection.assert_not_called()
+
+    def test_worker_inline_thread_read_keeps_normalized_parent_links(self):
+        from tauceti_tools.forge_command import parse_command
+
+        self.source.review_comments.return_value = [{"id": 9, "in_reply_to_id": 8}]
+        with patch("sys.stdout"):
+            self.assertEqual(
+                api_command(parse_command(["api", "repos/one/project/pulls/1/comments", "--paginate"]), self.source), 0
+            )
+        self.source.review_comments.assert_called_once_with(1)
+        self.source.api.collection.assert_not_called()
+
+    def test_cli_qualifies_exact_native_repository_endpoints(self):
+        from tauceti_worker.source_cli import main
+
+        for endpoint in ["repos/one/project", "repos/one/project?unused=value", "repos/one/project/issues/1/comments"]:
+            with (
+                self.subTest(endpoint=endpoint),
+                patch("tauceti_worker.source_cli.load_source", return_value=self.source),
+                patch.dict(os.environ, TAUCETI_SOURCE_GH_CONF="/fixture/project.toml"),
+                patch("tauceti_tools.forge_cli.run", return_value=0) as run,
+            ):
+                self.assertEqual(main(["api", endpoint]), 0)
+                self.assertEqual(run.call_args.args[0][-2:], ["--hostname", "git.example.org"])
+        self.source.api.request.assert_not_called()
+
+    def test_cli_uses_shared_synthetic_comment_pages_once_each(self):
+        from tauceti_worker.source_cli import main
+
+        configuration = self.root / "native.toml"
+        configuration.write_text("""schema_version=2
+[forges.native]
+kind="forgejo"
+url="https://git.example.org"
+[repositories]
+content={forge="native", name="one/project"}
+roadmap="one/roadmap"
+ci="one/project"
+""")
+        api = Mock(forge=self.repo.forge, max_bytes=1024 * 1024, max_pages=10)
+        api.comments.return_value = [
+            dict(
+                id=i,
+                body="comment",
+                created_at="now",
+                updated_at="now",
+                user=None,
+                html_url=self.repo.pull_url(1) + f"#issuecomment-{i}",
+            )
+            for i in range(1, 36)
+        ]
+        with (
+            patch("tauceti_worker.source_cli.load_source", return_value=self.source),
+            patch.dict(os.environ, {"TAUCETI_SOURCE_GH_CONF": str(configuration)}, clear=True),
+            patch("tauceti_tools.forge_cli.Forgejo", return_value=api),
+            patch("sys.stdout", new_callable=io.StringIO) as output,
+        ):
+            self.assertEqual(main(["api", "repos/one/project/issues/1/comments", "--paginate", "--slurp"]), 0)
+        pages = json.loads(output.getvalue())
+        self.assertEqual([len(page) for page in pages], [30, 5])
+        self.assertEqual([row["id"] for page in pages for row in page], list(range(1, 36)))
+        api.comments.assert_called_once_with(self.repo, 1)
+        api.collection.assert_not_called()
+
+    def test_cli_explains_unsupported_operations_without_leaking_transport_errors(self):
+        from tauceti_tools.forge import ForgeError, Unsupported
+
+        from tauceti_worker.source_cli import main
+
+        for error, expected in [
+            (Unsupported("unsupported JSON fields: commits"), "unsupported JSON fields: commits"),
+            (ForgeError("secret transport context"), "source operation unavailable (ForgeError)"),
+        ]:
+            with (
+                self.subTest(error=type(error).__name__),
+                patch("tauceti_worker.source_cli.load_source", side_effect=error),
+                patch("sys.stderr", new_callable=io.StringIO) as output,
+            ):
+                self.assertEqual(main(["api", "user"]), 1)
+                self.assertEqual(output.getvalue(), "gh: " + expected + "\n")
 
     def test_explicit_numeric_target_preserves_github_default(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -290,6 +389,30 @@ class Sources(unittest.TestCase):
             self.assertIsNone(review(worker, None, Candidate(1, "a" * 40), SimpleNamespace(work_model="codex"), False))
         worker.counters.incr.assert_not_called()
         worker.counters.write.assert_not_called()
+
+    def test_contest_reactions_follow_the_source_capability_without_false_warnings(self):
+        from tauceti_worker.source_execution import review
+
+        worker = SimpleNamespace(cfg=self.cfg, gh=self.source, counters=Mock(), rs=Mock())
+        candidate = Candidate(1, "a" * 40, contest="correctness", contest_reply_id=7)
+        for supported in (False, True):
+            self.source.reset_mock()
+            self.source.supports_contest_reactions = supported
+            self.source.add_reaction.return_value = False
+            self.source.remove_reaction.return_value = False
+            with (
+                self.subTest(supported=supported),
+                patch(
+                    "tauceti_worker.review_runtime.resolve", return_value=SimpleNamespace(command=lambda: ["engine"])
+                ),
+                patch("tauceti_worker.work_units.run_to_logfile", return_value=81),
+                patch("tauceti_worker.work_units.log") as log,
+            ):
+                self.assertIsNone(review(worker, None, candidate, SimpleNamespace(work_model="codex"), False))
+                warnings = [str(call) for call in log.call_args_list if "contest claim" in str(call)]
+            self.assertEqual(self.source.add_reaction.call_count, int(supported))
+            self.assertEqual(self.source.remove_reaction.call_count, int(supported))
+            self.assertEqual(len(warnings), 2 if supported else 0)
 
     def test_source_failure_at_dispatch_still_allows_the_other_source(self):
         import contextlib

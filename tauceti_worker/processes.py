@@ -5,24 +5,13 @@ import os
 import subprocess
 import sys
 import threading
+from pathlib import Path
 
 from .round import reap_round_group
 
 # The existing agent/downloader guardian also supervises other tools. Its only
 # lifetime evidence is its owner's pipe; it never scans host or historical state.
-PARENT_BOUND_AGENT = """
-import os, signal, subprocess, sys, threading
-fd = int(sys.argv[1])
-def parent_gone():
-    while os.read(fd, 1):
-        pass
-    os.killpg(os.getpgrp(), signal.SIGKILL)
-threading.Thread(target=parent_gone, daemon=True).start()
-lease = os.environ.get("TAUCETI_SHARED_MATHLIB_LEASE_FD")
-child = subprocess.Popen(sys.argv[2:], close_fds=True, pass_fds=(int(lease),) if lease else ())
-rc = child.wait()
-os._exit(rc if rc >= 0 else 128 - rc)
-"""
+PARENT_BOUND_AGENT = Path(__file__).with_name("process_guard.py").read_text()
 
 
 @contextlib.contextmanager
@@ -30,7 +19,7 @@ def owned_process(argv, **kwargs):
     """Own a tool group, cleaning it on leader exit and owner death.
 
     A waiter sweeps the group even when inherited stdout keeps a reader busy.
-    Deliberately detached descendants can escape this best-effort cleanup.
+    On Linux the guardian also adopts and reaps detached tool descendants.
     """
     reader, writer = os.pipe()
     process = None
@@ -39,6 +28,12 @@ def owned_process(argv, **kwargs):
 
     def cleanup():
         with cleanup_lock:
+            if process.poll() is None:
+                process.terminate()  # Keep the guardian alive while it reaps detached children.
+                try:
+                    process.wait(timeout=35)
+                except subprocess.TimeoutExpired:
+                    pass
             reap_round_group(process.pid)
 
     def wait_and_cleanup():
@@ -63,7 +58,7 @@ def owned_process(argv, **kwargs):
                 else:
                     extra_fds = tuple(dict.fromkeys((*extra_fds, lease_fd)))
             process = subprocess.Popen(
-                [sys.executable, "-c", PARENT_BOUND_AGENT, str(reader), *argv],
+                [sys.executable, "-I", "-c", PARENT_BOUND_AGENT, str(reader), *argv],
                 start_new_session=True,
                 pass_fds=(reader, *extra_fds),
                 **kwargs,
