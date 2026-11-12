@@ -1013,6 +1013,31 @@ class Wiring(unittest.TestCase):
                     reached.append(os.environ["TAUCETI_NEW_PR_FORGE"])
         self.assertEqual(reached, ["forgejo", "forgejo", "github", "github"])
 
+    def test_a_dashboard_worker_keeps_the_dashboards_list(self):
+        """The dashboard's `L` saves a persistent worker; the manager launches it from the saved spec,
+        not from the dashboard's environment, so the list has to be in the spec."""
+        tui = importlib.import_module("tauceti_worker.tui")
+        app = tui._dashboard_app(SimpleNamespace(logdir=Path("/nonexistent"), home=Path("/nonexistent")))
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "workers.toml"
+            fake = SimpleNamespace(
+                sel=tc.ALLOWED_TASKS.index("roadmap"),
+                model_dial="auto",
+                bubble=False,
+                workers_config=config,
+                notify=Mock(),
+                _refresh_workers=Mock(),
+            )
+            with (
+                patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS": "/srv/targets.md"}),
+                patch.object(wm, "ensure_manager"),
+            ):
+                type(app)._launch(fake, loop=True, only_selected=True)
+            (spec,) = wm.load_worker_specs(config)
+        self.assertEqual(spec.roadmap_targets, "/srv/targets.md")
+        argv = spec.work_argv()
+        self.assertEqual(argv[argv.index("--roadmap-targets") + 1], "/srv/targets.md")
+
     def test_workers_toml_key(self):
         spec = wm.WorkerSpec.from_dict({"id": "w", "only": ["roadmap"], "roadmap_targets": "/srv/targets.md"}, 0)
         self.assertEqual(spec.as_dict()["roadmap_targets"], "/srv/targets.md")
