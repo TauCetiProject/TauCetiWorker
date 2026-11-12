@@ -94,8 +94,9 @@ CODEX_REQUIREMENT_FILES = (Path("/etc/codex/requirements.toml"), Path("/etc/code
 CODEX_MANAGED_PREFERENCES = Path("/Library/Managed Preferences")
 # The ChatGPT plans for which Codex fetches no cloud policy (0.160.0 `cloud_config_eligible_auth` in
 # codex-rs/cloud-config/src/service.rs; 0.167.1 `ChatGptSource::auth` in .../chatgpt.rs). That policy
-# can default the store below the user's config.toml and is fetched on demand, so a credential whose
-# plan is neither listed here nor named in $TAUCETI_CODEX_REFRESH_PLANS is never renewed.
+# can default the store below the user's config.toml and is fetched on demand, so unless both Codex
+# directories set the store explicitly, a credential whose plan is neither listed here nor named in
+# $TAUCETI_CODEX_REFRESH_PLANS is never renewed.
 CODEX_NO_CLOUD_POLICY_PLANS = frozenset(
     {
         "free",
@@ -2099,8 +2100,7 @@ class Quota:
     def _codex_effective_store(self, directory: Path | None = None) -> str | None:
         """_codex_credentials_store for a CODEX_HOME, with the administrator layers resolved in
         Codex's order: a requirements file or managed preference overrides the user's config.toml,
-        which overrides the system config. A requirements file that enrolls a `config_server` is a
-        reason in itself. None only when every layer that applies says file or is
+        which overrides the system config. None only when every layer that applies says file or is
         silent; a layer that exists but cannot be read is a reason, as it is for the user's."""
         if _codex_managed_preferences():
             return "managed-preferences"
@@ -2108,11 +2108,6 @@ class Quota:
             value = _codex_store_setting(path)
             if value is not None and value != "file":
                 return value
-            # Codex then fetches configuration from that server for every plan, and its defaults can
-            # set the store; what they say is not known here.
-            data = _codex_toml(path)
-            if isinstance(data, dict) and "config_server" in data:
-                return "config-server"
         if reason := self._codex_credentials_store(directory):
             return reason
         if _codex_store_setting((directory or codex_dir(self.cfg.home)) / "config.toml") is None:
@@ -2129,8 +2124,12 @@ class Quota:
         It stands down when codex's credential store is not verifiably that file: a keyring login can
         share the refresh token a leftover auth.json still carries, and spending it here would log that
         login out. An isolated worker spends the source's token, so the source directory's own config
-        must pass as well as the worker's, each resolved with Codex's administrator layers, and the
-        credential's plan must be one Codex fetches no cloud policy for."""
+        must pass as well as the worker's, each resolved with Codex's administrator layers.
+
+        A workspace cloud policy or an enrolled `config_server` can also default the store, at a layer
+        below the user's config.toml. When both directories set `file` there explicitly that default
+        cannot apply; otherwise the plan must be one Codex fetches no cloud policy for, or one the
+        operator names, and no configuration server may be enrolled."""
         if os.environ.get("TAUCETI_AUTO_REFRESH") != "1":
             return False
         source = self._codex_creds_source()
@@ -2143,8 +2142,12 @@ class Quota:
         except ValueError as e:
             log(f"codex credential: not renewing ({e})")
             return False
-        if not plans or not plans <= CODEX_NO_CLOUD_POLICY_PLANS | named:
-            return False
+        explicit = all(_codex_store_setting(d / "config.toml") == "file" for d in (codex_dir(self.cfg.home), source))
+        if not explicit:
+            if not plans or not plans <= CODEX_NO_CLOUD_POLICY_PLANS | named:
+                return False
+            if any("config_server" in _as_dict(_codex_toml(path)) for path in CODEX_REQUIREMENT_FILES):
+                return False
         prov = credential_refresh.provider("codex", credentials=source / "auth.json")
         if not credential_refresh.renewable(prov):
             return False

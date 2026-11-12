@@ -110,6 +110,7 @@ def renews_with(tmp, files, *, expires_in=60, first=(200, USAGE_OK, None), plan=
     """Write `files` (path relative to tmp -> text), then make one renewing read. Returns how many
     token exchanges it made."""
     quota, src, mirror, stale = setup(tmp, expires_in=expires_in, plan=plan)
+    quota.cfg.checkout = tmp / "checkout"
     if named is not None:
         os.environ["TAUCETI_CODEX_REFRESH_PLANS"] = named
     for rel, text in files.items():
@@ -340,17 +341,16 @@ for name, locked in (("root", "Managed Preferences"), ("per-user directory", "Ma
                 (tmp / d).chmod(0o755)
         shutil.rmtree(tmp, ignore_errors=True)
 
-# 6f) Codex fetches a cloud policy, which can require a non-file store over any local setting, for
-#     business, education and enterprise workspaces. Renewal runs only for a plan outside that set.
+# 6f) Codex fetches a cloud policy for business, education and enterprise workspaces, whose defaults
+#     can choose the store when the user's config.toml does not. Without that setting, renewal runs
+#     only for a plan outside that set.
 for plan, want in (("plus", 1), ("team", 1), ("business", 0), ("hc", 0), ("edu_plus", 0), ("someday", 0), (None, 0)):
     tmp = Path(tempfile.mkdtemp())
     try:
         quota, src, mirror, stale = setup(tmp, plan=plan)
-        for d in (src.parent, mirror.parent):
-            (d / "config.toml").write_text('cli_auth_credentials_store = "file"\n')
         with rotates_to(jwt(10 * DAY)) as post, usage_seen()[1]:
             quota.codex(renew=True)
-        check(f"plan {plan!r} under explicit file stores: exchanges", post.call_count, want)
+        check(f"plan {plan!r} with the store unset: exchanges", post.call_count, want)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -455,6 +455,35 @@ for name, files, kwargs, want in (
     tmp = Path(tempfile.mkdtemp())
     try:
         check(f"config server, {name}: exchanges", renews_with(tmp, files, **kwargs), want)
+    finally:
+        os.environ.pop("TAUCETI_CODEX_REFRESH_PLANS", None)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# 6j) An explicit `file` in BOTH user layers outranks every policy default (cloud or configuration
+#     server, both below the user layer), so the plan rule and the server refusal step aside. Layers
+#     above the user's still refuse.
+BOTH = {SOURCE: FILE, WORKER: FILE}
+for name, files, kwargs, want in (
+    ("an unlisted plan", BOTH, {"plan": "business"}, 1),
+    ("an unlisted plan, 401 path", BOTH, {"plan": "edu_pro", "expires_in": 5 * DAY, "first": UNAUTHORIZED}, 1),
+    ("no plan claim", BOTH, {"plan": None}, 1),
+    ("an enrolled configuration server", {**BOTH, "etc/codex/requirements.toml": SERVER}, {"plan": "business"}, 1),
+    ("a system keyring default", {**BOTH, "etc/codex/config.toml": KEYRING}, {"plan": "business"}, 1),
+    ("only the source explicit", {SOURCE: FILE}, {"plan": "business"}, 0),
+    ("only the worker explicit", {WORKER: FILE}, {"plan": "business"}, 0),
+    ("a non-exact value", {SOURCE: 'cli_auth_credentials_store = "FILE"\n', WORKER: FILE}, {"plan": "business"}, 0),
+    ("only a system file", {"etc/codex/config.toml": FILE}, {"plan": "business"}, 0),
+    ("requirements keyring", {**BOTH, "etc/codex/requirements.toml": KEYRING}, {"plan": "business"}, 0),
+    ("managed_config keyring", {**BOTH, "etc/codex/managed_config.toml": KEYRING}, {"plan": "business"}, 0),
+    ("an unreadable requirements file", {**BOTH, "etc/codex/requirements.toml": "x = [\n"}, {"plan": "business"}, 0),
+    ("a managed preference", {**BOTH, "Managed Preferences/com.openai.codex.plist": ""}, {"plan": "business"}, 0),
+    ("a project layer", {**BOTH, "checkout/.codex/config.toml": FILE}, {"plan": "business"}, 0),
+    ("a malformed plan list", BOTH, {"plan": "business", "named": "a b"}, 0),
+):
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        check(f"explicit file in both, {name}: exchanges", renews_with(tmp, files, **kwargs), want)
     finally:
         os.environ.pop("TAUCETI_CODEX_REFRESH_PLANS", None)
         shutil.rmtree(tmp, ignore_errors=True)
