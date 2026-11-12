@@ -184,9 +184,14 @@ try:
     before = wm.WorkerSpec(id="attest").as_dict()
     desired = wm.WorkerSpec(id="attest", self_tested=True)
     assert wm._defer_read_policy_reload(desired, {"applied_spec": before, "state": "running"})
-    assert not wm._defer_read_policy_reload(desired, {
-        "applied_spec": before, "state": "idle", "next_action_at": time.time() + 30,
-    })
+    assert not wm._defer_read_policy_reload(
+        desired,
+        {
+            "applied_spec": before,
+            "state": "idle",
+            "next_action_at": time.time() + 30,
+        },
+    )
     assert "--self-tested" not in wm.WorkerSpec(id="plain").work_argv()
     assert build_parser().parse_args(["work", "--no-self-tested"]).self_tested is False
     # A worker that has NOT opted in must not emit the flag: the default is to leave the operator's

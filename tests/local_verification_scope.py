@@ -308,18 +308,27 @@ def main():
 
     # Both verifier paths add the same optional publication instruction.
     from unittest.mock import patch
+
     for helper in ("0", "1"):
         with patch.dict(os.environ, TAUCETI_VERIFY_HELPER=helper, TAUCETI_SELF_TESTED="1"):
             text = tc.agents.local_verification("ordinary")
-            check(f"self-tested helper={helper}: label the PR after verification",
-                  "Apply the `self-tested` label to the PR" in text and "--label self-tested" in text
-                  and "--add-label self-tested" in text and "failed, incomplete, or outdated" in text)
+            check(
+                f"self-tested helper={helper}: label the PR after verification",
+                "Apply the `self-tested` label to the PR" in text
+                and "--label self-tested" in text
+                and "--add-label self-tested" in text
+                and "failed, incomplete, or outdated" in text,
+            )
             for policy in ("bump", "full-lint", "lint-repair"):
-                check(f"self-tested helper={helper}: excludes {policy}",
-                      "Apply the self-tested label after verification" not in tc.agents.local_verification(policy))
+                check(
+                    f"self-tested helper={helper}: excludes {policy}",
+                    "Apply the self-tested label after verification" not in tc.agents.local_verification(policy),
+                )
         with patch.dict(os.environ, TAUCETI_SELF_TESTED="0"):
-            check(f"self-tested helper={helper}: off by default",
-                  "Apply the self-tested label after verification" not in tc.agents.local_verification("ordinary"))
+            check(
+                f"self-tested helper={helper}: off by default",
+                "Apply the self-tested label after verification" not in tc.agents.local_verification("ordinary"),
+            )
 
     # Policy comes from surveyed labels and branch only.
     sp = tc.agents.scope_policy
