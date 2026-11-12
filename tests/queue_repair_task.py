@@ -1508,7 +1508,9 @@ class RebaseArtifacts(Fixture):
         sh(seed, "checkout", "--quiet", "--detach", self.onto)
         target = commit(seed, "bump dependency", {"lake-manifest.json": '{"packages": []}\n'})
         sh(seed, "fetch", "--quiet", str(self.content.bare), self.content.tip)
-        task = repair_task.Task.from_json({**self.raw, "onto": target, "claim_token": "x", "expires_at": time.time() + 60})
+        task = repair_task.Task.from_json(
+            {**self.raw, "onto": target, "claim_token": "x", "expires_at": time.time() + 60}
+        )
         sh(seed, "checkout", "--quiet", "--detach", self.content.tip)
         package = seed / ".lake" / "packages" / "hydrated"
         for fail in (False, True):

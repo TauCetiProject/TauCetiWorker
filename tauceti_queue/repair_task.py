@@ -1267,10 +1267,22 @@ def artifact_checkout(worktree: Path, task: Task, start_tip: str):
     Lake populates the same private .lake directory for both checkouts. This hydrates
     new dependency Git objects before verification loses network access.
     """
-    changed = task.kind in repair.REBASE_KINDS and task.onto != start_tip and git(
-        worktree, "diff", "--name-only", start_tip, task.onto, "--",
-        "lake-manifest.json", "lean-toolchain", "lakefile.toml", "lakefile.lean",
-    ).strip()
+    changed = (
+        task.kind in repair.REBASE_KINDS
+        and task.onto != start_tip
+        and git(
+            worktree,
+            "diff",
+            "--name-only",
+            start_tip,
+            task.onto,
+            "--",
+            "lake-manifest.json",
+            "lean-toolchain",
+            "lakefile.toml",
+            "lakefile.lean",
+        ).strip()
+    )
     if not changed:
         yield
         return
