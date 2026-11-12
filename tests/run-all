@@ -175,6 +175,8 @@ RUN_STDLIB=(
   queue_ci_execution.py
   queue_workflow_token.py
   queue_source_ci.py
+  queue_mixed_sources.py
+  integration_forgejo_mixed.py
   queue_stage1.py
   queue_stage1_mirror.py
   queue_source_authority.py
@@ -248,6 +250,7 @@ RUN_STDLIB=(
   tend_bot_permissions.py
   worker_claude_config.py
   worker_manager.py
+  worker_manager_discovery.py
   worker_scopes.py
   workflow_backstop.py
   recovery_maintenance.py
