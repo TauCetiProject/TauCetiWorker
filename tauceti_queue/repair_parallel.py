@@ -110,7 +110,9 @@ class Group:
     def summary(self) -> dict:
         record = dataclasses.asdict(self)
         record.pop("findings")
-        return record
+        from .mixed_identity import public
+
+        return public(record)
 
 
 def _path(name: str) -> str:
@@ -279,7 +281,9 @@ def merge_errors(findings: dict, errors: list[dict]) -> dict:
     """The task's findings with the streaming build's errors added as compiler errors (a location the
     diagnostics already report is not repeated) and their modules as failed modules, and its audit and
     lint findings added as those diagnostics are (``repair.findings_from_diagnostics``)."""
-    merged = json.loads(json.dumps(findings))
+    from .store import dumps, loads
+
+    merged = loads(dumps(findings))
     checks = repair.findings_from_diagnostics(
         [{**e, "path": e.get("file") or ""} for e in errors if e.get("kind") in CHECK_KINDS]
     )
@@ -612,7 +616,7 @@ def fold_fixups(worktree: Path, base: str, tip: str, groups: list[Group]) -> dic
                 if len(owners) != 1:
                     raise RuntimeError(f"fixup target is unknown or ambiguous: {target}")
                 owner = owners[0]
-                if not owner.source_pr or int(owner.source_pr.rsplit("#", 1)[1]) not in group.members:
+                if not owner.source_pr or repair.pr_number(owner.source_pr) not in group.members:
                     raise RuntimeError(f"fixup target is outside the group's members: {target}")
                 touched = set(git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", sha).splitlines())
                 if touched - set(group.files):
@@ -748,7 +752,7 @@ def repair_groups(
         listings = repair.listings_path(path)
         listings.parent.mkdir(parents=True, exist_ok=True)
         listings.write_text(
-            "".join(json.dumps(entry) + "\n" for entry in repair.member_records(context, chain, landed))
+            "".join(json.dumps(repair.public(entry)) + "\n" for entry in repair.member_records(context, chain, landed))
         )
         if ownership is not None and hasattr(ownership, "members"):
             repair_context.write_files(ownership, path)
