@@ -482,6 +482,12 @@ class MaintenanceOrder(unittest.TestCase):
             self.assertEqual(self.offered(gh), (self.BASE, []))
             gh.open_prs.assert_not_called()
 
+    def test_cascade_without_listed_pull_requests_reads_no_owners(self):
+        sv = self.survey()
+        sv.owns = Mock(side_effect=AttributeError("author"))
+        self.assertEqual(self.order(tc.cascade(sv, tc.AUTO_STAGES)), self.BASE)
+        sv.owns.assert_not_called()
+
     def test_without_a_list_the_survey_is_not_read(self):
         sv = Mock(spec=["open_prs", "owns", "kind"])
         sv.owns.side_effect = AttributeError("author")

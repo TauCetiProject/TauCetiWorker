@@ -1378,8 +1378,10 @@ def cascade(sv: Survey, stages, listed=frozenset()) -> list[tuple[str, Candidate
     bumps = bump_prs(sv)
     pairs = [(stage, c) for stage in stages for c in sv.kind(stage).actionable]
     pairs = [pair for pair in pairs if pair[1].pr in bumps] + [pair for pair in pairs if pair[1].pr not in bumps]
+    if not listed:
+        return pairs
     own = {p.number for p in sv.open_prs if sv.owns(p)}
-    for pool in TARGET_FIRST_POOLS if listed else ():
+    for pool in TARGET_FIRST_POOLS:
         slots = [i for i, (stage, c) in enumerate(pairs) if stage in pool and c.pr in own]
         ranked = sorted((pairs[i] for i in slots), key=lambda pair: pair[1].pr not in listed)
         for i, pair in zip(slots, ranked, strict=True):
