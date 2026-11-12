@@ -1,4 +1,4 @@
-"""Best-effort shared correction without a discovery-wide pause or PR error."""
+"""Best-effort source correction without a discovery-wide pause or PR error."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import time
 
 from . import github_state
 from .config import log
-from .constants import TAUCETI
 from .runtime_status import report_runtime
 
 
@@ -25,7 +24,7 @@ def repair_selected(w, candidate, observed: str = "") -> None:
     # hot loop. This is a deadline, never ownership or permanent exclusion.
     with contextlib.suppress(OSError):
         w.counters.write(key, int(time.time()) + 30)
-    result = github_state.refresh_pr(TAUCETI, candidate.pr, candidate.head, observed)
+    result = w.gh.refresh_pr_state(candidate.pr, candidate.head, observed)
     confirmed_same_head = (
         result.get("status") == "ok"
         and result.get("data", {}).get("headRefOid") == candidate.head
@@ -39,7 +38,7 @@ def repair_selected(w, candidate, observed: str = "") -> None:
         with contextlib.suppress(OSError):
             w.rs.bust(candidate.pr)
     log(
-        f"  PR #{candidate.pr}: selected state changed; shared refresh "
+        f"  PR #{candidate.pr}: selected state changed; source refresh "
         f"{result.get('outcome') or result.get('reason') or result.get('status', 'unavailable')}"
         f"{' (repeat head mismatch)' if confirmed_same_head else ''}; selecting other work"
     )

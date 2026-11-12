@@ -24,6 +24,7 @@ from tauceti_worker import state_repair
 from tauceti_worker import work_units as work
 from tauceti_worker.config import ClaimCollision
 from tauceti_worker.constants import REVIEW_HEAD_CHANGED_EXIT, TAUCETI
+from tauceti_worker.github import GitHub
 from tauceti_worker.survey import Candidate, Counters, Survey
 
 HEAD, NEW = "a" * 40, "b" * 40
@@ -39,7 +40,7 @@ class StateRepair(unittest.TestCase):
         self.w = SimpleNamespace(
             cfg=self.cfg,
             counters=self.counters,
-            gh=SimpleNamespace(repo=TAUCETI),
+            gh=GitHub(TAUCETI),
             claims=None,
             rs=SimpleNamespace(bust=Mock(), review_rounds=lambda *_: 1),
         )
@@ -123,7 +124,7 @@ class StateRepair(unittest.TestCase):
             self.assertTrue(transport.direct_reads())
             return dict(headRefOid=NEW, state="OPEN", isDraft=False)
 
-        self.w.gh = SimpleNamespace(pr_view=read)
+        self.w.gh.pr_view = read
         self.w.rs.gh_meta = lambda *_, **__: SimpleNamespace(provenance="missing")
         self.w.rs.ledger_clean_head = lambda *_: ""
         with patch.object(state, "refresh_pr", return_value=dict(status="ok")) as refresh:

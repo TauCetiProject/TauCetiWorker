@@ -748,6 +748,11 @@ class GitHub:
         self.repo = repo
         self._review_nodes = {}
 
+    def refresh_pr_state(self, number, expected, observed=""):
+        from .github_state import refresh_pr
+
+        return refresh_pr(self.repo, number, expected, observed)
+
     def _gh(self, args: list[str]) -> subprocess.CompletedProcess:
         readonly = _gh_read_only(["gh", *args])
         if not readonly:
