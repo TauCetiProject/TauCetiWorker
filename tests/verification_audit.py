@@ -478,6 +478,8 @@ class Recovery(Receipts):
             self.assertEqual(result["status"], "incomplete")
             self.assertEqual(result["result_type"], "pending")
             self.assertIn("without a model", result["next_action"])
+            calls = self.root / ".lake/calls"
+            original_calls = calls.read_text().splitlines() if calls.exists() else []
             job_path = Path(result["continuation_job"])
             priority = v.read_json(job_path)["priority"]
             for _ in range(2):
@@ -500,7 +502,8 @@ class Recovery(Receipts):
         self.assertEqual(receipt["status"], "success", receipt.get("error"))
         self.assertEqual(complete["attempts"], 3)
         self.assertTrue(any(c["argv"] == ["lake", "build", "--iofail"] and c["exit"] == 0 for c in receipt["commands"]))
-        self.assertEqual(len(self.calls()), 1)  # all further work ran in the isolated candidate
+        self.assertEqual(calls.read_text().splitlines() if calls.exists() else [], original_calls)
+        # A deadline may arrive before the first build; continuation never adds original-root calls.
 
     def test_sigkill_build_owner_retains_mechanical_next_action(self):
         process = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="60")
