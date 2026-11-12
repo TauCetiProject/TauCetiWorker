@@ -101,7 +101,7 @@ class SourceCandidateCI:
         return unavailable
 
     def _owned(self, run_id):
-        binding = self.ledger.store.get_setting("source-ci:binding")
+        binding = self.ledger.store.get_setting(self.ledger.binding_key)
         row = self.ledger.store.row("ci_request_runs", {"execution_id": binding["execution"]["id"], "run_id": run_id})
         if row is None:
             raise ValueError("execution run is not owned by this source ledger")
