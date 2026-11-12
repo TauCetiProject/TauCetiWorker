@@ -222,7 +222,13 @@ class AdmissionPoller:
         saved = controller.store.get_setting("state:admission_discovery", {})
         self._discovery_at = float(saved.get("retry_at", 0))
         controller.admission = self
-        waiting = controller.store.rows("inputs", {"repository": repo, "state": ["waiting", "reserved"]})
+        from .mixed_identity import SourceNumber
+
+        waiting = [
+            row
+            for row in controller.store.rows("inputs", {"repository": repo, "state": ["waiting", "reserved"]})
+            if not isinstance(row["number"], SourceNumber)
+        ]
         waiting_numbers = {row["number"] for row in waiting}
         for work in controller.store.rows("admission_work", {"repository": repo}):
             previous_policy = loads(work["decision"], {}).get("evidence", {}).get("policy_digest")

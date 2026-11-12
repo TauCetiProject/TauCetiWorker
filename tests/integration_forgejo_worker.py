@@ -46,6 +46,115 @@ from tauceti_worker.worker_sources import activate, source_config
 
 @unittest.skipUnless(os.environ.get("FORGEJO_BINARY"), "set FORGEJO_BINARY for disposable native worker")
 class NativeWorker(unittest.TestCase):
+    def test_native_project_cli_uses_its_configured_source_and_recovers_unchanged(self):
+        with source_fixture() as (root, api, repository, row, tokens):
+            endpoint = "repos/" + repository.name
+            api.request("POST", endpoint + "/branches", {"old_branch_name": "main", "new_branch_name": "configured"})
+            api.request(
+                "POST",
+                endpoint + "/contents/Proof.lean",
+                {
+                    "branch": "configured",
+                    "message": "Proof",
+                    "content": base64.b64encode(b"theorem example_proof : True := trivial\n").decode(),
+                },
+            )
+            pull = api.request(
+                "POST",
+                endpoint + "/pulls",
+                {
+                    "base": "main",
+                    "head": "configured",
+                    "title": "Configured review",
+                    "body": "Review this proof.",
+                },
+            )
+            token = root / "native-token"
+            token.write_text(tokens["operator"])
+            token.chmod(0o600)
+            configuration = root / "project.toml"
+            configuration.write_text(
+                'schema_version=2\n[forges.native]\nkind="forgejo"\nurl='
+                + json.dumps(repository.forge.url)
+                + '\n[repositories]\ncontent={forge="native",name='
+                + json.dumps(repository.name)
+                + '}\nroadmap="Owner/Roadmap"\n[lean]\nroots=["Project"]\n'
+            )
+            engine = root / "engine"
+            engine.mkdir()
+            (engine / "runner").symlink_to(Path(review_cli.__file__).resolve().parent, target_is_directory=True)
+            (engine / "rubrics").mkdir()
+            (engine / "rubrics/_common.md").write_text(
+                "Project source: https://github.com/TauCetiProject/TauCeti\nTauCeti/ and TauCetiProject/TauCetiRoadmap"
+            )
+            (engine / "rubrics/style.md").write_text("Review style.")
+            roadmap = root / "roadmap"
+            roadmap.mkdir()
+            (roadmap / "README").write_text("Roadmap")
+            binary = root / "bin"
+            binary.mkdir()
+            calls = root / "calls"
+            prompt = root / "prompt"
+            model = binary / "codex"
+            model.write_text(
+                "#!"
+                + sys.executable
+                + "\n"
+                + """import json, os, re, sys
+assert not any(k.startswith(('TAUCETI_SOURCE_', 'TAUCETI_FORGEJO_', 'GH_', 'GIT_CONFIG_')) for k in os.environ)
+assert 'TAUCETI_CONF' not in os.environ
+text=sys.stdin.read()
+open(__PROMPT__, 'w').write(text)
+with open(__CALLS__, 'a') as stream: stream.write('called\\n')
+marker=re.search(r'TAUCETI-VERDICT-[0-9a-f]+',text)[0]
+print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':marker+'\\n'+json.dumps({'verdict':'approve','summary':'Clear.'})}}))
+print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_tokens':1}}))
+""".replace("__PROMPT__", repr(str(prompt))).replace("__CALLS__", repr(str(calls)))
+            )
+            model.chmod(0o700)
+            env = {k: v for k, v in os.environ.items() if not k.startswith(("TAUCETI_", "GH_", "GITHUB_", "CLAIM_"))}
+            env.update(
+                PATH=str(binary) + os.pathsep + os.environ["PATH"],
+                HOME=str(root),
+                TAUCETI_FORGEJO_TOKEN_FILE=str(token),
+                TAUCETI_FORGEJO_REPOSITORY_ID=str(row["id"]),
+            )
+            command = [
+                sys.executable,
+                str(engine / "runner/cli.py"),
+                str(pull["number"]),
+                "--conf",
+                str(configuration),
+                "--repo-dir",
+                str(engine),
+                "--roadmap-dir",
+                str(roadmap),
+                "--no-mathlib",
+                "--no-sync",
+                "--no-coordinate",
+                "--post",
+                "--rubrics",
+                "style",
+                "--store",
+                str(root / "store"),
+                "--workdir",
+                str(root / "work"),
+                "--reviewer",
+                "codex",
+            ]
+            first = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertIn(repository.url, prompt.read_text())
+            self.assertIn("Project/ and Owner/Roadmap", prompt.read_text())
+            self.assertNotIn("https://github.com/" + repository.name, prompt.read_text())
+            second = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("unchanged before preparation", second.stderr)
+            self.assertEqual(calls.read_text(), "called\n")
+            self.assertEqual(len(api.comments(repository, pull["number"])), 1)
+            ledger = json.loads((root / "store/ledger.json").read_text())["prs"][str(pull["number"])]
+            self.assertEqual(ledger["published_head_sha"], pull["head"]["sha"])
+
     def test_native_branch_pr_schedule_publication_and_recovery(self):
         engine = Path(os.environ.get("TAUCETI_REVIEW_ENGINE_DIR") or Path(review_cli.__file__).resolve().parent.parent)
         self.assertTrue(
@@ -78,6 +187,14 @@ class NativeWorker(unittest.TestCase):
                 sbcache=root / "cache",
             )
             cfg = source_config(cfg, source)
+            configuration = root / "project.toml"
+            configuration.write_text(
+                'schema_version=2\n[forges.native]\nkind="forgejo"\nurl='
+                + json.dumps(repository.forge.url)
+                + '\n[repositories]\ncontent={forge="native",name='
+                + json.dumps(repository.name)
+                + '}\nroadmap="TauCetiProject/TauCetiRoadmap"\n'
+            )
             endpoint = "repos/" + repository.name
             api.request("POST", endpoint + "/branches", {"old_branch_name": "main", "new_branch_name": "proposal"})
             api.request(
@@ -93,6 +210,14 @@ class NativeWorker(unittest.TestCase):
                 activate(source, cfg),
                 patch.object(review_cli, "CACHE_DIR", root / "review-cache"),
                 patch.dict(os.environ, {"TAUCETI_REVIEW_ENGINE_DIR": str(engine)}),
+                patch.dict(
+                    os.environ,
+                    {
+                        "TAUCETI_CONF": str(configuration),
+                        "TAUCETI_CONF_SOURCE": str(configuration),
+                        "TAUCETI_CONF_SNAPSHOT": str(configuration),
+                    },
+                ),
             ):
                 encoded = base64.b64encode(("x-access-token:" + grant["sha1"]).encode()).decode()
                 self.assertFalse(any(grant["sha1"] in value or encoded in value for value in os.environ.values()))
