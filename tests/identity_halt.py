@@ -518,6 +518,20 @@ class ForgejoHaltTests(unittest.TestCase):
         finally:
             os.umask(previous)
 
+    def test_a_read_only_credential_directory_still_activates(self):
+        from tauceti_worker.source_cli import load_source
+
+        self.serve({"id": 3, "login": "worker"})
+        token = Path(os.environ["TAUCETI_FORGEJO_TOKEN_FILE"])
+        token.chmod(0o400)
+        token.parent.chmod(0o500)
+        self.addCleanup(token.parent.chmod, 0o700)
+        with self.activation():
+            self.assertEqual(load_source().api._token, "forgejo-test-token")
+            copy = Path(os.environ["TAUCETI_FORGEJO_TOKEN_FILE"])
+        self.assertFalse(copy.parent.exists())
+        self.assertEqual(sorted(path.name for path in token.parent.iterdir()), [token.name])
+
     def test_the_executing_actor_is_held_to_the_configured_user(self):
         from tauceti_worker.source_cli import load_source
         from tauceti_worker.worker_sources import verify_forgejo_identity

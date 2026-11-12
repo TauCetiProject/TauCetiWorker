@@ -248,7 +248,7 @@ def activate(source, cfg):
         if expected is not None and source.token_file is not None:
             # Git's helper and source subprocesses read their token file on each use. Give them the
             # token verified above, so a file replaced during the round is never presented.
-            token_file = _verified_token_copy(source.token_file, source.api._token)
+            token_file = _verified_token_copy(source.api._token)
         directory = cfg.state / "bin"
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         real_gh = original.get("TAUCETI_REAL_GH") or shutil.which("gh")
@@ -305,16 +305,29 @@ def activate(source, cfg):
         os.environ.update(original)
         _selected.reset(marker)
         if token_file != source.token_file:
-            token_file.unlink(missing_ok=True)
+            shutil.rmtree(token_file.parent, ignore_errors=True)
 
 
-def _verified_token_copy(original, token):
-    # Beside the original: native_source already read it through the reader that source
-    # subprocesses use, which requires a private parent and no untrusted-writable ancestor.
-    path = original.parent / f".{original.name}.round-{uuid.uuid4().hex}"
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(descriptor, "w") as stream:
-        stream.write(token)
+def _verified_token_copy(token):
+    """A private copy of `token` in its own directory, readable as source subprocesses read credentials.
+
+    That reader refuses a symlinked or untrusted-writable ancestor, so the directory sits under the
+    resolved system temporary directory, and the copy is read back the same way before use.
+    """
+    import tempfile
+
+    from tauceti_queue.control_policy_file import read_control_policy
+
+    directory = Path(tempfile.mkdtemp(prefix="tauceti-forgejo-", dir=os.path.realpath(tempfile.gettempdir())))
+    path = directory / "token"
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(token)
+        read_control_policy(path)
+    except (OSError, ValueError):
+        shutil.rmtree(directory, ignore_errors=True)
+        raise SourceUnavailable("no private directory can hold the verified Forgejo credential") from None
     return path
 
 
