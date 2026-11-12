@@ -1574,6 +1574,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
                     prs=prs,
                     account=getattr(args, "account", None),
                     ignore_quota=ignore_quota,
+                    quota_cmd=quota_cmd,
                     authoring_profile=(
                         resolve_authoring_profile(agent, cli_model=author_model, cli_effort=author_effort)
                         if agent != "auto"
@@ -1657,6 +1658,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             review_min_age=review_min_age,
             prs=prs,
             ignore_quota=ignore_quota,
+            quota_cmd=quota_cmd,
             loop_paced=one_round and getattr(args, "loop_paced", False),
         )
         # Before preflight, and NOT gated on --dry-run: --dry-run is how an operator checks their setup,
