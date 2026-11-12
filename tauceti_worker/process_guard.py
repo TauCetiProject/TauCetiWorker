@@ -133,8 +133,13 @@ def main():
             environment[f"GIT_CONFIG_VALUE_{index}"] = "false"
         environment["GIT_CONFIG_COUNT"] = str(count + 2)
         try:
-            child = subprocess.Popen(sys.argv[2:], env=environment, close_fds=True,
-                                     start_new_session=not subreaper, pass_fds=(int(lease),) if lease else ())
+            child = subprocess.Popen(
+                sys.argv[2:],
+                env=environment,
+                close_fds=True,
+                start_new_session=not subreaper,
+                pass_fds=(int(lease),) if lease else (),
+            )
         except OSError:
             print("owned tool could not start", file=sys.stderr, flush=True)
             return 127

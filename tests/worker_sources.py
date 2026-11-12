@@ -101,7 +101,12 @@ class Sources(unittest.TestCase):
     def test_api_reads_use_the_shared_contract_instead_of_raw_native_pagination(self):
         from tauceti_tools.forge_command import parse_command
 
-        for endpoint in ["user", "repos/one/project", "repos/one/project/pulls/1", "repos/one/project/issues/1/comments"]:
+        for endpoint in [
+            "user",
+            "repos/one/project",
+            "repos/one/project/pulls/1",
+            "repos/one/project/issues/1/comments",
+        ]:
             with self.subTest(endpoint=endpoint):
                 args = ["api", endpoint]
                 if endpoint.endswith("/comments"):
@@ -115,7 +120,9 @@ class Sources(unittest.TestCase):
 
         self.source.review_comments.return_value = [{"id": 9, "in_reply_to_id": 8}]
         with patch("sys.stdout"):
-            self.assertEqual(api_command(parse_command(["api", "repos/one/project/pulls/1/comments", "--paginate"]), self.source), 0)
+            self.assertEqual(
+                api_command(parse_command(["api", "repos/one/project/pulls/1/comments", "--paginate"]), self.source), 0
+            )
         self.source.review_comments.assert_called_once_with(1)
         self.source.api.collection.assert_not_called()
 
@@ -137,7 +144,7 @@ class Sources(unittest.TestCase):
         from tauceti_worker.source_cli import main
 
         configuration = self.root / "native.toml"
-        configuration.write_text('''schema_version=2
+        configuration.write_text("""schema_version=2
 [forges.native]
 kind="forgejo"
 url="https://git.example.org"
@@ -145,10 +152,19 @@ url="https://git.example.org"
 content={forge="native", name="one/project"}
 roadmap="one/roadmap"
 ci="one/project"
-''')
+""")
         api = Mock(forge=self.repo.forge, max_bytes=1024 * 1024, max_pages=10)
-        api.comments.return_value = [dict(id=i, body="comment", created_at="now", updated_at="now", user=None,
-                                        html_url=self.repo.pull_url(1) + f"#issuecomment-{i}") for i in range(1, 36)]
+        api.comments.return_value = [
+            dict(
+                id=i,
+                body="comment",
+                created_at="now",
+                updated_at="now",
+                user=None,
+                html_url=self.repo.pull_url(1) + f"#issuecomment-{i}",
+            )
+            for i in range(1, 36)
+        ]
         with (
             patch("tauceti_worker.source_cli.load_source", return_value=self.source),
             patch.dict(os.environ, {"TAUCETI_SOURCE_GH_CONF": str(configuration)}, clear=True),
@@ -167,8 +183,10 @@ ci="one/project"
 
         from tauceti_worker.source_cli import main
 
-        for error, expected in [(Unsupported("unsupported JSON fields: commits"), "unsupported JSON fields: commits"),
-                                (ForgeError("secret transport context"), "source operation unavailable (ForgeError)")]:
+        for error, expected in [
+            (Unsupported("unsupported JSON fields: commits"), "unsupported JSON fields: commits"),
+            (ForgeError("secret transport context"), "source operation unavailable (ForgeError)"),
+        ]:
             with (
                 self.subTest(error=type(error).__name__),
                 patch("tauceti_worker.source_cli.load_source", side_effect=error),
@@ -355,7 +373,9 @@ ci="one/project"
             self.source.remove_reaction.return_value = False
             with (
                 self.subTest(supported=supported),
-                patch("tauceti_worker.review_runtime.resolve", return_value=SimpleNamespace(command=lambda: ["engine"])),
+                patch(
+                    "tauceti_worker.review_runtime.resolve", return_value=SimpleNamespace(command=lambda: ["engine"])
+                ),
                 patch("tauceti_worker.work_units.run_to_logfile", return_value=81),
                 patch("tauceti_worker.work_units.log") as log,
             ):

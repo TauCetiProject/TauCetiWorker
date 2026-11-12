@@ -63,8 +63,7 @@ class Cleanup(unittest.TestCase):
         code = (
             "import os,signal,sys,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
             + ("exec('if os.fork(): os._exit(0)'); " if double_fork else "")
-            +
-            "open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(60)"
+            + "open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(60)"
         )
         parent = (
             "import subprocess,sys,time; from pathlib import Path; "
@@ -111,8 +110,13 @@ class Cleanup(unittest.TestCase):
     def test_detached_double_fork_is_reaped_on_normal_tool_exit(self):
         unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
         try:
-            result = processes.run(self.command(detached=True, double_fork=True, inherit_output=True),
-                                   env=self.env, capture_output=True, text=True, timeout=10)
+            result = processes.run(
+                self.command(detached=True, double_fork=True, inherit_output=True),
+                env=self.env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assert_cleaned()
             self.assertIsNone(unrelated.poll())
@@ -129,8 +133,10 @@ class Cleanup(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "linux", "kernel child subreaping is Linux-specific")
     def test_detached_orphans_are_reaped_while_the_tool_is_still_running(self):
         orphan = "import os,sys; open(sys.argv[1], 'w').write(str(os.getpid()))"
-        intermediary = (f"import subprocess,sys; subprocess.Popen([sys.executable,'-c',{orphan!r},{str(self.pidfile)!r}], "
-                        "start_new_session=True)")
+        intermediary = (
+            f"import subprocess,sys; subprocess.Popen([sys.executable,'-c',{orphan!r},{str(self.pidfile)!r}], "
+            "start_new_session=True)"
+        )
         parent = f"import subprocess,sys,time; subprocess.run([sys.executable,'-c',{intermediary!r}]); time.sleep(60)"
         with processes.owned_process([sys.executable, "-c", parent], env=self.env) as process:
             deadline = time.monotonic() + 5
@@ -144,7 +150,9 @@ class Cleanup(unittest.TestCase):
             self.assertIsNone(process.poll())
 
     def test_guard_keeps_git_maintenance_in_the_tool_lifetime(self):
-        result = processes.run(["git", "config", "--get", "gc.autoDetach"], env=self.env, capture_output=True, text=True)
+        result = processes.run(
+            ["git", "config", "--get", "gc.autoDetach"], env=self.env, capture_output=True, text=True
+        )
         self.assertEqual(result.stdout.strip(), "false")
         self.assertEqual(result.returncode, 0)
 
@@ -172,20 +180,24 @@ class Cleanup(unittest.TestCase):
         self.flush_on_cancel()
 
     def test_group_fallback_also_gives_the_tool_time_to_flush(self):
-        with patch.object(processes, "PARENT_BOUND_AGENT", processes.PARENT_BOUND_AGENT.replace(
-            "subreaper = enable_subreaper()", "subreaper = False"
-        )):
+        with patch.object(
+            processes,
+            "PARENT_BOUND_AGENT",
+            processes.PARENT_BOUND_AGENT.replace("subreaper = enable_subreaper()", "subreaper = False"),
+        ):
             self.flush_on_cancel()
 
     def flush_on_cancel(self):
         flushed = self.root / "flushed"
-        code = ("import signal,sys,time; from pathlib import Path; "
-                f"signal.signal(signal.SIGTERM,lambda *_: (time.sleep(.15),Path({str(flushed)!r}).write_text('done'),sys.exit(0))); "
-                f"Path({str(self.pidfile)!r}).write_text(str(__import__('os').getpid())); time.sleep(60)")
+        code = (
+            "import signal,sys,time; from pathlib import Path; "
+            f"signal.signal(signal.SIGTERM,lambda *_: (time.sleep(.15),Path({str(flushed)!r}).write_text('done'),sys.exit(0))); "
+            f"Path({str(self.pidfile)!r}).write_text(str(__import__('os').getpid())); time.sleep(60)"
+        )
         with processes.owned_process([sys.executable, "-c", code], env=self.env) as process:
             deadline = time.monotonic() + 5
             while not self.pidfile.exists() and time.monotonic() < deadline:
-                time.sleep(.01)
+                time.sleep(0.01)
             self.assertTrue(self.pidfile.exists())
             process.terminate()
             self.assertEqual(process.wait(timeout=5), -signal.SIGTERM)

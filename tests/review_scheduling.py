@@ -72,9 +72,20 @@ native_owner = ForgejoReviewSource(RepositoryIdentity(repository, 7), api).publi
 with patch("tauceti_worker.worker_sources.current", return_value=source):
     reviewer = review_publisher()
     check("review publisher uses native identity", reviewer, native_owner)
-    check("native publisher can pick its own contest", ordered([candidate(70, age=10, owner=native_owner)], reviewer), ([70], []))
-    check("same ID on another origin is deferred", ordered([candidate(71, age=10, owner="forgejo:https://other.example.org/users/3")], reviewer), ([], [71]))
-with patch("tauceti_worker.worker_sources.current", return_value=None), patch("tauceti_worker.github.me", return_value="alice"):
+    check(
+        "native publisher can pick its own contest",
+        ordered([candidate(70, age=10, owner=native_owner)], reviewer),
+        ([70], []),
+    )
+    check(
+        "same ID on another origin is deferred",
+        ordered([candidate(71, age=10, owner="forgejo:https://other.example.org/users/3")], reviewer),
+        ([], [71]),
+    )
+with (
+    patch("tauceti_worker.worker_sources.current", return_value=None),
+    patch("tauceti_worker.github.me", return_value="alice"),
+):
     check("legacy GitHub publisher remains a login", review_publisher(), "alice")
 
 
