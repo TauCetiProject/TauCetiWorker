@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """GitHub execution adapter boundaries, single sends and ownership evidence."""
 
+import base64
+import dataclasses
 import json
 import socket
 import sys
@@ -15,7 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from queue_ci_requests import policy
+from queue_ci_requests import CONFIG, policy
 from tauceti_tools import ci_candidate as cc
 from tauceti_tools.ci_candidate_evidence import EvidenceUnavailable
 
@@ -140,6 +142,85 @@ class Execution(unittest.TestCase):
         with self.assertRaises(OSError):
             self.adapter.dispatch(self.frozen)
         self.assertEqual(len(self.posts), 2)  # exactly one POST per explicit call
+
+    def caller_reader(self, *, revision="b" * 40, protected=True, configuration=CONFIG, configured=None):
+        selected = configured or policy(configuration)
+        files = {
+            ".tauceti/ci-source.toml": configuration,
+            ".tauceti/ci-source.json": cc.canonical(selected.record(with_config=False)),
+            selected.workflow: b"# reviewed caller at an immutable commit\n",
+        }
+        reads = []
+
+        def get(path):
+            reads.append(path)
+            if path == "/branches/main":
+                return {"commit": {"sha": revision}, "protected": protected}
+            location, ref = path.removeprefix("/contents/").split("?ref=", 1)
+            self.assertEqual(ref, revision)
+            raw = files[location]
+            return dict(
+                type="file", path=location, encoding="base64", size=len(raw), content=base64.b64encode(raw).decode()
+            )
+
+        self.reader.get = get
+        return files, reads
+
+    def test_caller_reads_consistent_files_at_protected_execution_main(self):
+        _, reads = self.caller_reader()
+        revision, selected, configuration = self.adapter.caller(policy())
+        self.assertEqual((revision, selected, configuration), ("b" * 40, policy(), CONFIG))
+        self.assertTrue(all("?ref=" + revision in path for path in reads[1:]))
+        self.assertEqual(self.posts, [])
+
+    def test_caller_adopts_reviewed_harness_and_configuration_changes(self):
+        configuration = CONFIG + b"\n# protected main config update\n"
+        selected = dataclasses.replace(policy(configuration), harness_revision="f" * 40)
+        self.caller_reader(revision="c" * 40, configuration=configuration, configured=selected)
+        self.assertEqual(self.adapter.caller(policy()), ("c" * 40, selected, configuration))
+
+    def test_caller_uses_the_same_snapshot_rules_for_shared_content_execution(self):
+        configuration = CONFIG.replace(b'repository="team/Execution"', b'repository="team/Math"')
+        shared = dataclasses.replace(
+            policy(configuration),
+            execution=cc.RepositoryIdentity(dataclasses.replace(policy().execution.repository, name="team/Math"), 42),
+        )
+        self.reader.metadata["full_name"] = "team/Math"
+        self.caller_reader(revision="d" * 40, configured=shared, configuration=configuration)
+        self.assertEqual(self.adapter.caller(shared), ("d" * 40, shared, configuration))
+
+    def test_caller_refuses_a_configuration_that_changes_the_source_location(self):
+        configuration = CONFIG.replace(b'name="team/Math"', b'name="other/Untrusted"')
+        self.caller_reader(configuration=configuration)
+        with self.assertRaisesRegex(ValueError, "project source/execution"):
+            self.adapter.caller(policy())
+
+    def test_caller_refuses_unprotected_main_and_changed_enrollment(self):
+        self.caller_reader(protected=False)
+        with self.assertRaisesRegex(ValueError, "protected main"):
+            self.adapter.caller(policy())
+        selected = dataclasses.replace(policy(), source=dataclasses.replace(policy().source, native_id=99))
+        self.caller_reader(configured=selected)
+        with self.assertRaisesRegex(ValueError, "enrolled"):
+            self.adapter.caller(policy())
+        self.assertEqual(self.posts, [])
+
+    def test_caller_refuses_truncated_or_malformed_configuration(self):
+        files, _ = self.caller_reader()
+        files[".tauceti/ci-source.json"] = b'{"workflow":"candidate-selected"}'
+        with self.assertRaises(ValueError):
+            self.adapter.caller(policy())
+        original = self.reader.get
+
+        def truncated(path):
+            value = original(path)
+            if path.startswith("/contents/"):
+                value["size"] += 1
+            return value
+
+        self.reader.get = truncated
+        with self.assertRaisesRegex(ValueError, "truncated"):
+            self.adapter.caller(policy())
 
     def test_preflight_rejects_default_branch_caller_and_wrong_resource_credential(self):
         self.reader.metadata["default_branch"] = "other"
