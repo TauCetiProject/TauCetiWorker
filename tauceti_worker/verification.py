@@ -37,7 +37,7 @@ from .verification_scope import git, local_main, scope, untracked
 from .verification_storage import Pressure, cache_generation
 
 SCHEMA = "tauceti-verification/v1"
-POLICY_VERSION = 6
+POLICY_VERSION = 7
 LOCAL_CHECKERS = ("tauceti-local-axioms", "tauceti-local-lint", "tauceti-local-checks")
 HASH_CACHE_LIMIT = 200000
 _HASH_CACHE = contextvars.ContextVar("verification_hash_cache", default=None)
@@ -218,8 +218,14 @@ def cache_root() -> Path:
 def files_under(root: Path):
     if not root.exists():
         return
+    # Stock Lake may place generated artifact downloads below its installation.
+    # These hash-addressed cache outputs are not compiler/distribution inputs;
+    # other workers can populate them while this build is being verified.
+    artifacts = root / "lake/cache/artifacts" if (root / "bin/lean").is_file() else None
     for directory, dirs, files in os.walk(root, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if d not in {".git", ".lake", "__pycache__"})
+        dirs[:] = sorted(
+            d for d in dirs if d not in {".git", ".lake", "__pycache__"} and Path(directory) / d != artifacts
+        )
         for name in sorted(files + [d for d in dirs if (Path(directory) / d).is_symlink()]):
             # Lake writes these ignored input-file digests while restoring ProofWidgets.
             # Their source JSON files remain inputs; creating/replacing a derived digest

@@ -331,7 +331,7 @@ seen = []
 saved_me = tc.work_units.me
 tc.work_units.survey = lambda *_a, **_k: affine
 tc.work_units.dispatch = lambda stage, _w, _sv, c, _o: seen.append((stage, c.pr)) or None
-tc.work_units.me = lambda: "me"
+tc.work_units.review_publisher = lambda: "me"
 try:
     try:
         tc.work_units.run_round(worker, SimpleNamespace(only=["review"], dry_run=True))
