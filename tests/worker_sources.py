@@ -248,6 +248,98 @@ ci="one/project"
         self.assertFalse(still_actionable("review", SimpleNamespace(gh=self.source), None, candidate))
         self.source.live_pull.assert_not_called()
 
+    def native_worker(self):
+        from tauceti_worker.forgejo_worker import ForgejoWorkerSource
+
+        api = Mock(forge=self.repo.forge, _token="token")
+        source = ForgejoWorkerSource(self.identity, api, token_file=self.root / "token")
+        return SimpleNamespace(gh=source, cfg=self.cfg, counters=Mock(), rs=Mock())
+
+    def test_authoring_has_no_pull_request_for_the_native_source_to_authorize(self):
+        worker = self.native_worker()
+        self.assertTrue(still_actionable("roadmap", worker, None, Candidate(0, "", "Algebra")))
+        self.assertFalse(still_actionable("review", worker, None, Candidate(1, "a" * 40)))
+
+    def test_dispatch_authors_on_the_native_source(self):
+        from tauceti_worker import work_units
+        from tauceti_worker.config import NoProgress
+
+        worker = self.native_worker()
+        worker.gh.pr_list = Mock(return_value=[])
+        options = work_units.RoundOpts(
+            only=["roadmap"], agent="claude", work_model="claude", sandbox_host=True, dry_run=False
+        )
+        with (
+            patch.dict(os.environ),
+            patch.object(work_units.shutil, "which", return_value="/usr/bin/claude"),
+            patch.object(work_units, "_check_stage_read_quota"),
+            patch.object(work_units, "do_roadmap", return_value=0) as author,
+            patch("tauceti_worker.activity.select"),
+            # The stubbed round opens no pull request, so the progress guard ends it afterwards.
+            self.assertRaisesRegex(NoProgress, "nothing landed"),
+        ):
+            work_units.dispatch("roadmap", worker, Survey("worker"), Candidate(0, "", "Algebra"), options)
+        author.assert_called_once()
+
+    def test_native_authoring_after_a_declined_github_review_pushes_to_the_native_fork(self):
+        from tauceti_worker import github, work_units
+        from tauceti_worker.config import NoProgress
+        from tauceti_worker.multi_source import run_round
+
+        for cached in (github.ensure_fork, github._resolve_claims_repo):
+            cached.cache_clear()
+            self.addCleanup(cached.cache_clear)
+        reviewing = SimpleNamespace(
+            cfg=self.cfg,
+            gh=Mock(repo=github.TAUCETI, worker_capable=False),
+            rs=Mock(),
+            counters=Mock(read=Mock(return_value=0)),
+        )
+        review_work = Survey("worker")
+        review_work.reviewable.actionable.append(Candidate(1, "a" * 40))
+        self.source.token_file = self.root / "token"
+        self.source.api.request.return_value = {"id": 3, "email": "worker@example.org"}
+        self.source.writable_repository.return_value = RepositoryRef(self.repo.forge, "native-user/TauCeti")
+        self.source.pr_list.return_value = []
+        authoring = SimpleNamespace(cfg=self.cfg, gh=self.source, rs=Mock(), counters=Mock(read=Mock(return_value=0)))
+        observations = [("github", reviewing, review_work), ("forgejo", authoring, Survey("worker"))]
+        options = work_units.RoundOpts(
+            only=["review", "roadmap"], agent="claude", work_model="claude", sandbox_host=True, dry_run=False
+        )
+        launches = []
+
+        def launch(checkout, prompt, *args, **kwargs):
+            launches.append((dict(os.environ), prompt))
+            return 0
+
+        with (
+            patch.dict(os.environ, {"TAUCETI_NEW_PR_FORGE": "forgejo"}),
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch.object(github, "shared_claims_granted", return_value=False),
+            patch.object(github, "_resolve_fork", return_value="github-user/TauCeti"),
+            patch.object(github, "can_push", return_value=True),
+            patch.object(work_units, "_claim_held_elsewhere", return_value=True),
+            patch.object(work_units, "mirror_creds"),
+            patch("tauceti_worker.review_diagnostics.refund_stale_head_errors"),
+            patch("tauceti_worker.activity.select"),
+            patch.object(work_units.shutil, "which", return_value="/usr/bin/claude"),
+            patch.object(work_units, "_check_stage_read_quota"),
+            patch.object(work_units, "avoid_list", return_value="none"),
+            patch.object(work_units, "fetch_ref", return_value=True),
+            patch.object(work_units, "stage_rubrics", return_value=None),
+            patch.object(work_units, "prepare_checkout", return_value=True),
+            patch.object(work_units, "run_agent_host", side_effect=launch),
+            # The agent opens no pull request, so the progress guard ends the round afterwards.
+            self.assertRaisesRegex(NoProgress, "nothing landed"),
+        ):
+            os.environ.pop("CLAIM_REPO", None)
+            os.environ.pop("TAUCETI_FORK", None)
+            run_round(None, options)
+        [(environment, prompt)] = launches
+        self.assertEqual(environment["TAUCETI_PUSH_REMOTE"], "https://git.example.org/native-user/TauCeti")
+        self.assertIn("--head native-user:roadmap/", prompt)
+        self.source.writable_repository.assert_called_once_with()
+
     def test_github_identity_outage_does_not_hide_native_inventory(self):
         worker = SimpleNamespace(cfg=self.cfg, gh=Mock(repo="one/project"), rs=Mock(), counters=Mock(), rc=None)
         native = Survey(worker_id="worker")
