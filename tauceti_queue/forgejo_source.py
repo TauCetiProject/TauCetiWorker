@@ -771,6 +771,8 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         ):
             raise ports.PromotionRefused("candidate exceeds the current native admission path policy")
         for member in frozen.request.accepted_members:
+            if getattr(member, "source", None) is not None and member.source != self.repository_identity:
+                raise ports.PromotionRefused("native-only promotion cannot authorize another source's member")
             snapshot = self.admission_snapshot(self.repository.name, member.pr)
             if (
                 snapshot.pull.state != "open"
