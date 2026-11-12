@@ -1101,3 +1101,7 @@ crashed publishers' snapshots. Cache retention follows successful early manifest
 The upload receives the key only in its own environment. There is no staging polling,
 waiter or cross-service coordination. This gives uploads a head start; it does not
 guarantee a hit if publication remains slower than verification and staging setup.
+
+The [mixed-source queue configuration](mixed-sources.md) adds an explicit,
+default-disabled Forgejo input to the existing queue. It documents observation,
+admission, trusted native reviews, CI roles and the serialized primary change.

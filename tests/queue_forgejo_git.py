@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -257,10 +258,18 @@ class SourceGit(unittest.TestCase):
         with self.assertRaises(AmbiguousWrite):
             self.source._git("push", write=True)
         pid = int(pidfile.read_text())
-        try:
-            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-        except (FileNotFoundError, ProcessLookupError):
-            state = "gone"
+        deadline = time.monotonic() + 1
+        while True:
+            try:
+                state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            except (FileNotFoundError, ProcessLookupError):
+                state = "gone"
+            # Waiting for the transport leader does not reap its grandchildren.
+            # Allow signal delivery to finish on a loaded CI runner, while still
+            # failing if a helper survives the process-group termination.
+            if state in {"gone", "Z"} or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
         if state not in {"gone", "Z"}:
             os.kill(pid, signal.SIGKILL)
         self.assertIn(state, {"gone", "Z"})
