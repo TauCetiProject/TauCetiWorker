@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@6f7bcfc5cb5e91b0e2744e6b3f9f0cb1827fa2c3", "rich", "textual>=8,<9", "psutil>=7; sys_platform == 'darwin'"]
+# dependencies = ["tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@0894ecf0123591805cf0ee55d3edcd32728e8579", "rich", "textual>=8,<9", "psutil>=7; sys_platform == 'darwin'"]
 # ///
 """./tauceti — source-checkout entry point.
 
