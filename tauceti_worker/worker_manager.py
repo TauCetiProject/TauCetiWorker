@@ -1081,7 +1081,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
             nonlocal exiting, stop_workers
             action = req.get("action")
             if action in ("ping", "apply"):
-                return {"ok": True, "pid": os.getpid(), "config": str(config), "error": last_error}
+                return {"ok": True, "pid": os.getpid(), "config": str(config), "error": last_error, "self_tested": 1}
             if action == "restart":
                 wid = req.get("id")
                 if not isinstance(wid, str):

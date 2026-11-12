@@ -315,7 +315,7 @@ def main():
             check(
                 f"self-tested helper={helper}: label the PR after verification",
                 "Apply the `self-tested` label to the PR" in text
-                and "--label self-tested" in text
+                and "gh-safe-pr-create" in text
                 and "--add-label self-tested" in text
                 and "failed, incomplete, or outdated" in text,
             )
@@ -329,6 +329,15 @@ def main():
                 f"self-tested helper={helper}: off by default",
                 "Apply the self-tested label after verification" not in tc.agents.local_verification("ordinary"),
             )
+
+    with (
+        patch.dict(os.environ, TAUCETI_SELF_TESTED="1"),
+        patch(
+            "tauceti_worker.worker_sources.repository_url",
+            return_value="https://git.example.org/Other/Project",
+        ),
+    ):
+        check("self-tested never labels a different source", tc.agents.self_tested_guidance("ordinary") == "")
 
     # Policy comes from surveyed labels and branch only.
     sp = tc.agents.scope_policy

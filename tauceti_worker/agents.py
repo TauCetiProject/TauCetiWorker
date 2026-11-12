@@ -496,7 +496,13 @@ def scope_policy(labels=(), head_ref: str = "", *, bump: bool = False) -> str:
 
 
 def self_tested_guidance(policy: str) -> str:
-    if policy != "ordinary" or os.environ.get("TAUCETI_SELF_TESTED", "0") != "1":
+    from .worker_sources import repository_url
+
+    if (
+        policy != "ordinary"
+        or os.environ.get("TAUCETI_SELF_TESTED", "0") != "1"
+        or repository_url().lower() != "https://github.com/taucetiproject/tauceti"
+    ):
         return ""
     return (
         "### Apply the self-tested label after verification\n"
@@ -505,11 +511,13 @@ def self_tested_guidance(policy: str) -> str:
         "`lake build --iofail && lake test && lake lint`). Wait for its successful exit; "
         "failed, incomplete, or outdated checks do not qualify. Reuse successful checks whose inputs "
         "have not changed; this adds no verification pass.\n"
-        "Apply the `self-tested` label to the PR. For a new PR, include `--label self-tested` in "
-        "`gh pr create`; for an existing PR, push the verified changes, confirm the live PR commit "
-        "matches your verified commit, then use `gh pr edit <number> --repo TauCetiProject/TauCeti "
+        "Apply the `self-tested` label to the PR. Create new PRs through the existing "
+        "`gh-safe-pr-create` wrapper; do not bypass it. After creation or pushing an update, "
+        "confirm the live PR commit matches your verified commit, then use "
+        "`gh pr edit <number> --repo TauCetiProject/TauCeti "
         "--add-label self-tested`. A push clears the label, so reapply it after testing subsequent changes. "
-        "Do not apply it for infrastructure or pin changes, or full-lint/lint-repair requests. "
+        "If a concurrent push workflow removes the label again, confirm the commit still matches "
+        "and reapply it once. Do not apply it for infrastructure or pin changes, or full-lint/lint-repair requests. "
         "The trusted picker checks eligibility; reviews and all staging tests still run.\n\n"
     )
 
