@@ -66,23 +66,21 @@ class FrozenRequest:
 
 
 class RequestLedger:
-    def __init__(self, store, clone, policy, configuration, *, workflow_revision):
+    def __init__(self, store, clone, policy, configuration, *, workflow_revision, mixed_sources=False):
         self.store, self.clone = store, os.fspath(clone)
+        if mixed_sources and (not policy.member_sources or store.get_setting("source-ci:binding") is not None):
+            raise ValueError("mixed requests require explicit enrolled sources and a legacy GitHub queue")
+        self.binding_key = "mixed-ci:binding" if mixed_sources else "source-ci:binding"
+        self.epoch_key = "mixed-ci:epoch" if mixed_sources else "source-ci:epoch"
         if cc.ExecutionPolicy.parse(policy.record(with_config=False), configuration=configuration) != policy:
             raise ValueError("CI policy differs from its trusted configuration")
-        if (
+        if not (mixed_sources and workflow_revision is None) and (
             not isinstance(workflow_revision, str)
             or not re.fullmatch(r"[0-9a-f]{40}", workflow_revision)
             or workflow_revision == "0" * 40
         ):
             raise ValueError("CI caller requires an immutable revision")
-        project = parse(configuration)
-        if (project.repository_ref("content"), project.ci_repository_ref(), project.branch) != (
-            policy.source.repository,
-            policy.execution.repository,
-            policy.base_branch,
-        ):
-            raise ValueError("project source/execution differs from the CI policy")
+        self.check_configuration(policy, configuration)
         self.policy, self.configuration, self.workflow_revision = policy, configuration, workflow_revision
         self.git = shutil.which("git")
         if not self.git:
@@ -95,33 +93,46 @@ class RequestLedger:
         )
         binding = self.binding(policy)
         with store.transaction():
-            previous = store.get_setting("source-ci:binding")
+            previous = store.get_setting(self.binding_key)
             if previous is None:
                 # Never reinterpret unqualified GitHub approvals/claims as native
                 # authority. A source cutover needs an explicit ledger migration.
-                if any(
+                if not mixed_sources and any(
                     store.count(table) for table in ("inputs", "batches", "members", "claims", "tasks", "ci_attempts")
                 ):
                     raise ValueError("source CI cannot adopt an unqualified source ledger")
-                store.set_setting("source-ci:binding", binding)
-                store.set_setting("source-ci:epoch", secrets.token_hex(16))
+                store.set_setting(self.binding_key, binding)
+                store.set_setting(self.epoch_key, secrets.token_hex(16))
             elif previous != binding:
                 raise ValueError("source CI repository roles changed")
-            self.epoch = store.get_setting("source-ci:epoch")
+            self.epoch = store.get_setting(self.epoch_key)
             if not isinstance(self.epoch, str) or not re.fullmatch(r"[0-9a-f]{32}", self.epoch):
                 raise ValueError("source CI epoch is unavailable")
+
+    @staticmethod
+    def check_configuration(policy, configuration):
+        project = parse(configuration)
+        if (project.repository_ref("content"), project.ci_repository_ref(), project.branch) != (
+            policy.source.repository,
+            policy.execution.repository,
+            policy.base_branch,
+        ):
+            raise ValueError("project source/execution differs from the CI policy")
 
     @staticmethod
     def binding(policy):
         # Revisions/configuration may change through approved service upgrades;
         # native repository roles and the source branch cannot silently change.
-        return {
+        value = {
             "source": policy.source.record(),
             "execution": policy.execution.record(),
             "harness": policy.harness.record(),
             "credential_origin": policy.credential_origin.key,
             "base_branch": policy.base_branch,
         }
+        if policy.member_sources:
+            value["member_sources"] = [source.record() for source in policy.member_sources]
+        return value
 
     def _git(self, *arguments, raw=None):
         process = subprocess.run(
@@ -137,6 +148,8 @@ class RequestLedger:
 
     def prepare(self, attempt, members):
         """Read immutable Git data before acquiring the database write transaction."""
+        if self.workflow_revision is None:
+            raise ValueError("select a protected execution caller before preparing source CI")
         if attempt["base_ref"] != self.policy.base_branch:
             raise ValueError("source request base branch differs from trusted policy")
         members = tuple(members)
@@ -251,11 +264,11 @@ class RequestLedger:
         if row is None or attempt is None:
             raise ValueError("source request snapshot is unavailable")
         policy = cc.ExecutionPolicy.parse(loads(row["policy_json"]), configuration=row["configuration"])
-        if self.binding(policy) != self.store.get_setting("source-ci:binding"):
+        if self.binding(policy) != self.store.get_setting(self.binding_key):
             raise ValueError("archived request repository roles changed")
         request = cc.CandidateRequest.parse(loads(row["request_json"]), policy=policy)
         if request.member_manifest is not None:
-            request = request.bind_members(row["member_manifest"])
+            request = request.bind_members(row["member_manifest"], policy=policy)
             _, commit = manifest_objects(
                 row["member_manifest"], request.accepted_heads, epoch=request.epoch, request_id=request.request_id
             )

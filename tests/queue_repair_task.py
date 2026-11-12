@@ -109,6 +109,12 @@ if args[:2] == ["build", "--iofail"] and os.environ.get("STUB_LAKE_BUILD_SCRIPT"
     for line in Path(os.environ["STUB_LAKE_BUILD_SCRIPT"]).read_text().splitlines():
         if line.startswith("sleep "):
             time.sleep(float(line.split()[1]))
+        elif line.startswith("wait_file "):
+            gate = stub / line.split(maxsplit=1)[1]
+            deadline = time.monotonic() + 30
+            while not gate.exists():
+                if time.monotonic() >= deadline: sys.exit(90)
+                time.sleep(0.02)
         elif line.startswith("exit "):
             if int(line.split()[1]) == 0: write_outputs()
             sys.exit(int(line.split()[1]))
@@ -405,7 +411,19 @@ elif mode == "stream":
     # As the prompt asks: fix what has failed, check it with the scoped build helper (which waits for the
     # worker's build to release the lock), and record what the helper returned and what the list said.
     rebuild()
-    helper = subprocess.run([str(repair_dir / "build"), "TauCeti.Two"], text=True, capture_output=True)
+    if (stub_dir / "stream-handshake").exists():
+        process = subprocess.Popen([str(repair_dir / "build"), "TauCeti.Two"], text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        first = []
+        for line in process.stdout:
+            first.append(line)
+            if "waiting for .tauceti-repair/build.lock" in line:
+                break
+        (stub_dir / "stream-helper-waiting").touch()
+        output, error = process.communicate(timeout=30)
+        helper = subprocess.CompletedProcess(process.args, process.returncode, "".join(first) + output, error)
+    else:
+        helper = subprocess.run([str(repair_dir / "build"), "TauCeti.Two"], text=True, capture_output=True)
     deadline = time.time() + 30
     while (repair_dir / "build.lock").exists() and time.time() < deadline:
         time.sleep(0.1)
@@ -3791,7 +3809,9 @@ exit 1
         return self.root / "state" / "worktrees" / f"task-{task_id}" / ".tauceti-repair"
 
     def test_the_agent_is_launched_at_the_first_error_and_the_lock_is_released_at_the_end(self):
-        self.script()
+        # Hold the producer until the helper has observed its live lock, independent of startup speed.
+        (self.stub_dir / "stream-handshake").touch()
+        self.script(self.SCRIPT.replace("sleep 0.8", "wait_file stream-helper-waiting"))
         os.environ["STUB_AGENT_MODE"] = "stream"
         cfg = self.config(keep_worktree=True)
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))

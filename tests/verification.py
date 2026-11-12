@@ -407,8 +407,9 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
                 p.communicate(timeout=10)
 
     def test_deadline_interrupts_child_and_sigterm(self):
-        p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="10", TAUCETI_ROUND_DEADLINE=str(time.time() + 2))
-        out, _ = p.communicate(timeout=10)
+        # Leave startup/probing time before exercising cancellation of the live child.
+        p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="60", TAUCETI_ROUND_DEADLINE=str(time.time() + 10))
+        out, _ = p.communicate(timeout=20)
         result = json.loads(out)
         self.assertEqual(result["status"], "incomplete")
         self.assertLess(result["commands"][-1]["exit"], 0)
