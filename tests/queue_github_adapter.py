@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -1194,6 +1195,81 @@ class Polling(unittest.TestCase):
         stub.remaining = 150
         self.assertEqual(poller.poll(refs), [], "below the reserve nothing is polled")
         self.assertEqual(poller.skipped, 2)
+
+
+class LeasedMainPublication(unittest.TestCase):
+    def setUp(self):
+        from types import SimpleNamespace
+
+        from tauceti_queue.fakes import FakeRepo, run_git
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = FakeRepo(self.tmp.name)
+        self.base = self.repo.main_sha()
+        self.middle = self.repo.commit_branch({"Middle.lean": "middle\n"}, "middle", push_to="refs/heads/candidate")
+        self.tip = self.repo.commit_branch(
+            {"Tip.lean": "tip\n"}, "tip", start=self.middle, push_to="refs/heads/candidate"
+        )
+        run_git(self.repo.clone, "fetch", "-q", "origin", "refs/heads/candidate")
+        self.git = run_git
+        self.race = self.lose_reply = False
+        self.commands = []
+
+        def git_transport(command, **kwargs):
+            self.commands.append(command)
+            if self.race:
+                run_git(self.repo.origin, "update-ref", "refs/heads/main", self.middle, self.base)
+            command = [
+                str(self.repo.origin) if item == f"https://github.com/{TAUCETI}.git" else item for item in command
+            ]
+            result = subprocess.run(command, **kwargs)
+            if self.lose_reply and result.returncode == 0:
+                raise subprocess.TimeoutExpired(command, 600)
+            return result
+
+        self.adapter = adapter(FakeTransport(), git=git_transport)
+        self.adapter.clone_dir = str(self.repo.clone)
+        self.adapter._tokens = SimpleNamespace(token=lambda: "fixture-token")
+        self.adapter.ref_sha = lambda *args: self.repo.main_sha()
+
+    def test_real_git_expected_old_lease_refuses_racing_candidate_ancestor(self):
+        self.race = True
+        result = self.adapter.fast_forward_leased(TAUCETI, "main", self.base, self.tip)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.actual_parent, self.middle)
+        self.assertEqual(self.repo.main_sha(), self.middle)
+        self.assertIn(f"--force-with-lease=refs/heads/main:{self.base}", self.commands[0])
+        self.assertNotIn("fixture-token", " ".join(self.commands[0]))
+
+    def test_lost_leased_push_reply_is_confirmed_by_main_readback(self):
+        self.lose_reply = True
+        result = self.adapter.fast_forward_leased(TAUCETI, "main", self.base, self.tip)
+        self.assertTrue(result.ok)
+        self.assertEqual(self.repo.main_sha(), self.tip)
+
+    def test_non_descendant_is_never_pushed_even_with_an_explicit_lease(self):
+        self.git(self.repo.origin, "update-ref", "refs/heads/main", self.tip)
+        result = self.adapter.fast_forward_leased(TAUCETI, "main", self.tip, self.base)
+        self.assertFalse(result.ok)
+        self.assertEqual(self.commands, [])
+        self.assertEqual(self.repo.main_sha(), self.tip)
+
+    def test_definite_server_hook_rejection_returns_a_refusal_with_unchanged_main(self):
+        hook = self.repo.origin / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\necho 'fixture protection' >&2\nexit 1\n")
+        hook.chmod(0o700)
+        result = self.adapter.fast_forward_leased(TAUCETI, "main", self.base, self.tip)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.actual_parent, self.base)
+        self.assertIn("remote rejected", result.error)
+        self.assertEqual(self.repo.main_sha(), self.base)
+
+    def test_exit_zero_without_an_acknowledgement_or_visible_tip_is_uncertain(self):
+        self.adapter._git = lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", "")
+        with self.assertRaisesRegex(ga.GitHubError, "no definitive acknowledgement"):
+            self.adapter.fast_forward_leased(TAUCETI, "main", self.base, self.tip)
+        self.assertEqual(self.repo.main_sha(), self.base)
 
 
 if __name__ == "__main__":

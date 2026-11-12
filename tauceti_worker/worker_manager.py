@@ -36,7 +36,7 @@ from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
 from .quota import parse_pace_curve
 from .round import signal_group
-from .runtime_status import STATUS_ENV, StatusPublisher, read_json
+from .runtime_status import STATUS_ENV, StatusPublisher, atomic_json, read_json
 from .runtime_status import update_status as update_status
 
 CONFIG_VERSION = 1
@@ -1040,6 +1040,14 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             workers_die("another worker manager is already running")
+        pointer = manager_pointer(config)
+        try:
+            atomic_json(
+                pointer,
+                {"pid": os.getpid(), "runtime_dir": str(runtime_dir.resolve()), "state_dir": str(state_dir.resolve())},
+            )
+        except OSError as exc:
+            print(f"tauceti workers: cannot record manager location {pointer}: {exc}", file=sys.stderr)
         from .activity import root as activity_root
         from .retention import install_timer
 
@@ -1297,6 +1305,61 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                 server_path.unlink()
             except FileNotFoundError:
                 pass
+            if read_json(pointer).get("pid") == os.getpid():
+                try:
+                    pointer.unlink()
+                except FileNotFoundError:
+                    pass
+
+
+def manager_pointer(config: Path) -> Path:
+    """Where a running manager records which directories it uses for `config`."""
+    config = config.expanduser().resolve()
+    return config.with_name(config.name + ".manager.json")
+
+
+def _live_manager_pointer(config: Path) -> dict | None:
+    """The recorded manager for `config`, if it is still running and holds its lock."""
+    value = read_json(manager_pointer(config))
+    try:
+        pid = int(value.get("pid"))
+        runtime = Path(str(value["runtime_dir"]))
+        state = Path(str(value["state_dir"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass
+    if not _lock_is_held(runtime / "manager.lock"):
+        return None
+    return {"pid": pid, "runtime_dir": runtime, "state_dir": state}
+
+
+def adopt_manager_dirs(config: Path) -> None:
+    """Use the directories of the manager already running for `config`.
+
+    The runtime and state directories otherwise come from the caller's environment, so a command
+    run without the service's TAUCETI_RUNTIME_DIR / TAUCETI_WORKERS_STATE_DIR would look for a
+    manager in the wrong place, find none, and `ensure_manager` would start a second one over the
+    same configuration: a duplicate copy of every worker. Unset variables are filled from the
+    running manager; variables that name different directories are refused.
+    """
+    live = _live_manager_pointer(config)
+    if live is None:
+        return
+    for var, key in (("TAUCETI_RUNTIME_DIR", "runtime_dir"), ("TAUCETI_WORKERS_STATE_DIR", "state_dir")):
+        wanted = live[key]
+        current = os.environ.get(var)
+        if not current:
+            os.environ[var] = str(wanted)
+        elif Path(current).expanduser().resolve() != wanted.resolve():
+            raise WorkersError(
+                f"{config} is managed by manager pid {live['pid']} using {var}={wanted}; "
+                f"refusing to act with {var}={current}, which would start a second manager"
+            )
 
 
 def _manager_lock_held() -> bool:
@@ -2147,6 +2210,7 @@ def cmd_workers(args) -> int:
     action = args.workers_action or "status"
     config = args.config.expanduser().resolve()
     try:
+        adopt_manager_dirs(config)
         if action == "status":
             while True:
                 try:
