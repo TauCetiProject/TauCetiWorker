@@ -16,6 +16,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from .declaration_names import accepted
+from .mixed_identity import encode
 
 MAX_FILE_BYTES = 256 * 1024
 MAX_BLOB_BYTES = 8 * 1024 * 1024
@@ -56,7 +57,9 @@ def imports(text: str) -> list[str]:
 
 
 def fingerprint(records: list[dict]) -> str:
-    return hashlib.sha256(json.dumps(records, sort_keys=True).encode()).hexdigest()
+    from .mixed_identity import encode
+
+    return hashlib.sha256(json.dumps(encode(records), sort_keys=True).encode()).hexdigest()
 
 
 class Planner:
@@ -289,7 +292,7 @@ class Planner:
             "truncated": truncated,
             "message": "Admission-time predictions and overlaps; the worker's scripted build and audits decide findings.",
         }
-        while len(json.dumps(context).encode()) > MAX_CONTEXT_BYTES:
+        while len(json.dumps(encode(context)).encode()) > MAX_CONTEXT_BYTES:
             context.update(complete=False, truncated=True)
             if context["ownership"]:
                 context["ownership_complete"] = False
