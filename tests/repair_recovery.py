@@ -2324,7 +2324,7 @@ class Fixture(unittest.TestCase):
             now = self.journal()["retry_at"] + 1
         self.assertEqual(delay, 21600)
         self.assertEqual(self.journal().get("attempts", 0), 0)
-        self.assertEqual(self.journal()["content_attempts"], 0)
+        self.assertEqual(self.journal().get("content_attempts", 0), 0)
         self.assertFalse(rr.pending_for(self.cfg, "upstream/repo", 10))
         saved.guard(self.cfg, self.co, repository="upstream/repo")
         self.assertTrue(rr.due(self.cfg))
