@@ -588,6 +588,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin/urgent":
             self._admin_urgent()
             return
+        if path == "/admin/primary":
+            self._admin_primary()
+            return
         if path == "/admin/retry-ci":
             self._admin_retry_ci()
             return
@@ -808,6 +811,19 @@ class Handler(BaseHTTPRequestHandler):
         kwargs = self._source_task_kwargs()
         if self.server.source_authority is not None:
             kwargs["expected_binding"] = self._expected_task_binding
+        elif "task_schemas" in body:
+            schemas = body["task_schemas"]
+            if (
+                not isinstance(schemas, list)
+                or len(schemas) > 8
+                or any(not isinstance(schema, str) for schema in schemas)
+            ):
+                self._error(400, "task_schemas must be a bounded list of schema names")
+                return
+            from .mixed_tasks import SCHEMA
+
+            if SCHEMA in schemas:
+                kwargs["mixed_capable"] = True
         self._call(lambda: self.server.controller.claim_task(self._worker_identity(body), login, **kwargs))
 
     def _task(self, task_id: str, action: str) -> None:
@@ -868,6 +884,19 @@ class Handler(BaseHTTPRequestHandler):
         self._call(
             lambda: self.server.controller.rebuild_head(repo, identity[0], **self._source_task_kwargs(refresh=True))
         )
+
+    def _admin_primary(self) -> None:
+        identity, body = self._authenticated_json()
+        if identity is None or body is None or not self._admin(identity[0]):
+            return
+        if (
+            set(body) != {"primary"}
+            or not isinstance(body["primary"], str)
+            or body["primary"] not in {"github", "forgejo"}
+        ):
+            self._error(400, "body must contain primary: github or forgejo")
+            return
+        self._call(lambda: self.server.controller.change_primary(body["primary"], identity[0]))
 
     def _admin_retry_ci(self) -> None:
         identity, body = self._authenticated_json()
