@@ -468,7 +468,7 @@ def compare_chains(clone: Path, before: list[ChainCommit], after: list[ChainComm
 
 def owners_of(clone: Path, chain: list[ChainCommit], path: str) -> list[int]:
     """Constituent PRs whose commit touches ``path`` (file-level ownership, as Bors attributes it)."""
-    if not chain:
+    if not chain or not path:
         return []
     shas = set(git(clone, "rev-list", f"{chain[0].parent}..{chain[-1].sha}", "--", path).split())
     return [c.pr for c in chain if c.sha in shas and c.pr is not None]
@@ -1886,10 +1886,12 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
         lines.append("Compiler errors:")
         lines.append("")
         for error in findings["compiler_errors"]:
-            owners = owners_of(clone, chain, error["path"])
-            lines.append(
-                f"- `{error['path']}:{error.get('line', 0)}:{error.get('column', 0)}` ({_owner_text(owners, chain)})"
-            )
+            path = error.get("path") or ""
+            if path:
+                owners = owners_of(clone, chain, path)
+                lines.append(f"- `{path}:{error.get('line', 0)}:{error.get('column', 0)}` ({_owner_text(owners, chain)})")
+            else:
+                lines.append("- Build/verification diagnostic (no file path):")
             for text in str(error.get("message", "")).splitlines():
                 lines.append(f"      {text}")
         lines.append("")

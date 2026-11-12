@@ -4116,6 +4116,21 @@ class ErrorParsing(unittest.TestCase):
 
 
 class Records(unittest.TestCase):
+    def test_a_pathless_verification_finding_reaches_the_next_repair_prompt(self):
+        root = Path(tempfile.mkdtemp(prefix="pathless-", dir=TMP))
+        content = Content(root)
+        task = repair_task.Task.from_json({**content.task(12), "claim_token": "x", "expires_at": time.time() + 60})
+        seed = root / "seed"
+        chain = repair.read_chain(seed, content.base, content.tip)
+        context = repair_task.prompt_context(task, None, listings=repair.listings_path(seed))
+        findings = repair_task.task_findings(task)
+        findings["compiler_errors"] = [{"path": "", "message": "the repaired chain failed verification"}]
+        with patch.object(repair, "git", side_effect=AssertionError("pathless findings have no file ownership")):
+            self.assertEqual(repair.owners_of(seed, chain, ""), [])
+        prompt = repair.compose_prompt(context, findings, chain, seed)
+        self.assertIn("Build/verification diagnostic (no file path)", prompt)
+        self.assertIn("the repaired chain failed verification", prompt)
+
     def test_a_pre_rebase_prompt_lists_the_errors_its_preparation_left(self):
         root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
         content = Content(root)
