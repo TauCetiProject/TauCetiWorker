@@ -245,12 +245,14 @@ def test_random_default():
             "run_agent_host",
             "roadmap_areas",
             "ensure_fork",
+            "claims_repo",
             "avoid_list",
         )
     }
     orig_choice = tc.random.choice
     tc.work_units.fetch_ref = lambda *a, **k: True
     tc.work_units.ensure_fork = lambda: "alice/TauCeti"  # do_roadmap forks before launching; stub it
+    tc.work_units.claims_repo = lambda: "alice/TauCeti"
     tc.work_units.avoid_list = lambda *_args: "none"
     tc.work_units.prepare_checkout = lambda cfg, **_: True
     tc.work_units.run_agent_host = lambda cwd, prompt, work_model, logdir, **_kwargs: (
@@ -307,11 +309,13 @@ def test_skip_edge_cases():
             "run_agent_host",
             "roadmap_areas",
             "ensure_fork",
+            "claims_repo",
             "avoid_list",
         )
     }
     tc.work_units.fetch_ref = lambda *a, **k: True
     tc.work_units.ensure_fork = lambda: "alice/TauCeti"  # do_roadmap forks before launching; stub it
+    tc.work_units.claims_repo = lambda: "alice/TauCeti"
     tc.work_units.avoid_list = lambda *_args: "none"
     tc.work_units.prepare_checkout = lambda cfg, **_: True
     tc.work_units.run_agent_host = lambda cwd, prompt, work_model, logdir, **_kwargs: (

@@ -3081,6 +3081,9 @@ other contributors' claims, or the hard rules of the repo.
 
 """
     if bubble:
+        claim_override = os.environ.get("CLAIM_REPO", "").strip()
+        if claim_override and claim_override.lower() != fork.lower():
+            log(f"  roadmap: --bubble Git proxy only permits pushes to {fork}; ignoring $CLAIM_REPO={claim_override}")
         mounts = [f"{refs / 'roadmap'}:/opt/roadmap:ro", f"{refs / 'review'}:/opt/review:ro"]
         if bundle is not None:
             mounts.append(f"{refs / 'rubrics'}:/opt/rubrics:ro")
@@ -3114,6 +3117,7 @@ other contributors' claims, or the hard rules of the repo.
             opts,
             mounts=mounts,
             allow_push=fork,  # bubble grants git fetch/push to the fork (kim-em/bubble#320)
+            claim_repo=fork,  # in-container author/* claims use that same fork grant
         )
     if not prepare_checkout(w.cfg, work="roadmap", roadmap=only or None):
         from .work_recovery import LAST_REFUSAL
@@ -3135,4 +3139,7 @@ other contributors' claims, or the hard rules of the repo.
         LOCAL_VERIFICATION=local_verification("ordinary", bubble),
         BIN=wrapper_bin(),
     )
-    return run_agent_host(w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir, quota_cfg=w.cfg)
+    from .repair_recovery import environment
+
+    with environment(CLAIM_REPO=claims_repo()):
+        return run_agent_host(w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir, quota_cfg=w.cfg)

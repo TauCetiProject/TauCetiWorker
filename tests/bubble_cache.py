@@ -207,10 +207,24 @@ tc.agents._bubble_pop = lambda _cfg, _env: None
 os.environ["TAUCETI_AGENT_ECHO"] = "1"
 try:
     out = io.StringIO()
-    with patch.dict(os.environ, TAUCETI_VERIFY_HELPER="1"), contextlib.redirect_stdout(out):
+    with (
+        patch.dict(os.environ, TAUCETI_VERIFY_HELPER="1", CLAIM_REPO="leak/should-not-cross"),
+        contextlib.redirect_stdout(out),
+    ):
         rc = tc.run_in_bubble(w, tc.TAUCETI, "PROMPT", opts)
     work_argv = out.getvalue()
     check("work echo succeeds", rc == 0)
+    check("non-roadmap bubble does not leak host CLAIM_REPO", "CLAIM_REPO=" not in work_argv)
+
+    roadmap_out = io.StringIO()
+    with patch.dict(os.environ, TAUCETI_VERIFY_HELPER="1"), contextlib.redirect_stdout(roadmap_out):
+        roadmap_rc = tc.run_in_bubble(
+            w, tc.TAUCETI, "PROMPT", opts, allow_push="alice/TauCeti", claim_repo="alice/TauCeti"
+        )
+    roadmap_argv = roadmap_out.getvalue()
+    check("roadmap bubble echo succeeds", roadmap_rc == 0)
+    check("roadmap bubble forwards explicit claim_repo", "CLAIM_REPO=alice/TauCeti" in roadmap_argv)
+    check("roadmap bubble forwards stable TAUCETI_WORKER_ID", "TAUCETI_WORKER_ID=cache-test" in roadmap_argv)
     check("work shares the shared verification identity cache", "/opt/verification-cache:rw" in work_argv)
     check(
         "work preliminary build uses receipt verification",
