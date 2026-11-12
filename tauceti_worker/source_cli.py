@@ -94,7 +94,7 @@ def checkout(args, source):
 
 
 def api_command(command, source):
-    """Native API escape hatch for the worker's existing comment helpers."""
+    """Only worker-specific thread reads and comment writes bypass shared routing."""
     options = command.options
     endpoint = command.args[0].lstrip("/")
     prefix = "repos/" + source.repo
@@ -127,7 +127,9 @@ def api_command(command, source):
 
         value = reply_to_finding(source, int(reply[1]), int(reply[2]), data["body"])
     elif method == "GET":
-        value = source.api.collection(endpoint) if options.get("paginate") else source.api.request("GET", endpoint)
+        # Tools owns REST read projection, bounds and synthetic pagination. In
+        # particular, native issue comments do not accept page/limit parameters.
+        return None
     elif re.fullmatch(re.escape(prefix) + r"/issues(?:/[1-9][0-9]*/comments|/comments/[1-9][0-9]*)", path):
         if method not in ("POST", "PATCH", "DELETE"):
             raise Unsupported("unsupported comment operation")
@@ -168,13 +170,20 @@ def main(argv=None):
             if value in ("--repo", "-R") and args[index + 1] == source.repo:
                 args[index + 1] = host_repo
         if command.group == "api":
-            if command.args[0].lstrip("/").startswith("repos/" + source.repo + "/"):
+            endpoint = command.args[0].lstrip("/").split("?", 1)[0]
+            prefix = "repos/" + source.repo
+            if not command.options.get("hostname") and (endpoint == prefix or endpoint.startswith(prefix + "/")):
                 args.extend(["--hostname", urlsplit(source.repository.forge.url).netloc])
         configuration = os.environ.get("TAUCETI_SOURCE_GH_CONF")
         if not configuration:
             raise ValueError("Forgejo gh routing configuration unavailable")
         environment = dict(os.environ, TAUCETI_CONF=configuration)
         return run(args, environment=environment)
+    except Unsupported as error:
+        # Adapter policy diagnostics are safe, local explanations (for example
+        # unsupported fields), unlike raw transport/request failure context.
+        print(f"gh: {error}", file=sys.stderr)
+        return 1
     except (ForgeError, ValueError, OSError, KeyError, subprocess.SubprocessError) as error:
         # Never print raw Git or HTTP diagnostics carrying request context.
         print(f"gh: source operation unavailable ({type(error).__name__})", file=sys.stderr)

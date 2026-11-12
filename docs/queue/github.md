@@ -347,11 +347,19 @@ object. Lists that were empty in every saved response (`held`, `bump_repairs`,
 `handoff.released_github_prs`) take their item shape from Bors's `api_controller.ex` and the readers.
 `requested_batch`, always null in the saved responses, is linked to the `batches[]` record that
 Bors's `batch_detail` serves there. Four paths are widened beyond what was observed, each for a
-documented reason below (`batch_id`, `runner_*_at`, `unknown_reason`). The fixture validates the
-two source files and the older `candidates-2026-11-04T0416Z.json` with zero errors, and
-`tests/fixtures/bors-feeds-sample.json` is a 20 KB cut of the sources that the tests validate on
-every machine. `feeds.validate` reports a wrong type, a missing required key, an unknown key, a
-changed schema string or timestamp unit, so drift in either direction fails `tests/queue_feeds.py`.
+documented reason below (`batch_id`, `runner_*_at`, `unknown_reason`).
+`tests/fixtures/bors-feeds-sample.json` is a small cut of the sources that the tests validate on
+every machine. Ordinary tests read only committed fixtures; they never discover captures in an
+operator's home directory. To compare two external captures with the committed schema explicitly,
+run `python -m tauceti_queue.feeds validate <active-batches.json> <candidates.json>`. This read-only
+command reports the file and path of each mismatch and exits nonzero on drift. It does not
+regenerate fixtures or change the supported format.
+
+`feeds.validate` reports a wrong type, a missing required key, an unknown key, a changed schema
+string or timestamp unit. This is a strict format audit, not proof that every difference breaks
+a consumer. For example, later saved candidates contain extra `declaration_names` and
+`inherited_handoff` fields; those require an explicit compatibility decision before changing the
+baseline. Do not regenerate the schema merely to make a newer capture pass.
 
 ### Observation feed, field by field
 
