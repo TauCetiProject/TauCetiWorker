@@ -1186,7 +1186,7 @@ class Fixture(unittest.TestCase):
             self.assertTrue(self.run_recovery())
         admission.assert_called_once()
         self.assertTrue(admission.call_args.kwargs["fresh"])
-        self.assertFalse(admission.call_args.kwargs["ignore_quota"])
+        self.assertTrue(admission.call_args.kwargs["ignore_quota"])
         model.assert_called_once()
         self.assertEqual(FakeVerification.calls, 2)
         self.assertEqual(self.journal()["continuation_reason"], "exact-source-verification-failed")
@@ -1195,8 +1195,10 @@ class Fixture(unittest.TestCase):
 
     def test_verification_failure_budget_refusal_retains_source(self):
         FakeVerification.failures = 1
-        with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("budget closed")):
+        with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("budget closed")) as admission:
             self.assertFalse(self.run_recovery())
+        self.assertFalse(admission.call_args.kwargs["ignore_quota"])
+        self.assertTrue(admission.call_args.kwargs["fresh"])
         self.assertEqual(self.journal()["reason"]["code"], "budget-refused")
         self.assertEqual(self.journal()["attempts"], 0)
         self.assert_retained()

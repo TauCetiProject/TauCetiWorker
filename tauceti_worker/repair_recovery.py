@@ -1372,7 +1372,7 @@ class WorkerBackend:
                     self.w.cfg,
                     profile.provider,
                     dry=False,
-                    ignore_quota=False,
+                    ignore_quota=self.opts.ignore_quota,
                     quota_cmd=None,
                     fresh=True,
                 )
