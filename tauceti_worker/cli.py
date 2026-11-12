@@ -373,6 +373,12 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "is re-read each round. Empty string = no list. Overrides $TAUCETI_ROADMAP_TARGETS for this run",
     )
     p.add_argument(
+        "--self-tested",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="instruct source-changing agents to apply the self-tested label to eligible PRs after successful local verification",
+    )
+    p.add_argument(
         "--extra-roadmap-prompt",
         dest="extra_roadmap_prompt",
         default=None,
@@ -1016,6 +1022,7 @@ def main(argv: list[str] | None = None) -> int:
                     "activity": 1,
                     "roadmap_focus": 1,
                     "roadmap_targets": 1,
+                    "self_tested": 1,
                 }
             )
         )
@@ -1390,6 +1397,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         from .targets import load_targets
 
         load_targets(roadmap_targets())
+    # Persist the operator's choice into loop children and recovery rounds.
+    if getattr(args, "self_tested", None) is not None:
+        os.environ["TAUCETI_SELF_TESTED"] = "1" if args.self_tested else "0"
     # --extra-roadmap-prompt likewise: validated here, at the boundary, then read live by do_roadmap via
     # extra_roadmap_prompt() so loop children see it without a flag of their own.
     if getattr(args, "extra_roadmap_prompt", None) is not None:
@@ -1542,6 +1552,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
                     prs=prs,
                     account=getattr(args, "account", None),
                     ignore_quota=ignore_quota,
+                    quota_cmd=quota_cmd,
                     authoring_profile=(
                         resolve_authoring_profile(agent, cli_model=author_model, cli_effort=author_effort)
                         if agent != "auto"
@@ -1625,6 +1636,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             review_min_age=review_min_age,
             prs=prs,
             ignore_quota=ignore_quota,
+            quota_cmd=quota_cmd,
             loop_paced=one_round and getattr(args, "loop_paced", False),
         )
         # Before preflight, and NOT gated on --dry-run: --dry-run is how an operator checks their setup,

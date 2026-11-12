@@ -796,3 +796,5 @@ preflight API reads; the engine still acquires and validates its existing claim.
 Request diagnostics include JSON field names and distinguish closed-PR history
 scans from open inventories. Progress batches complete labelled histories with
 independent cursors rather than caching a potentially incomplete reporting window.
+
+Use `tauceti work --self-tested` (or `self_tested = true` in a worker definition) to instruct source-changing agents to apply the `self-tested` label to eligible mathematics PRs after successful local verification. The existing shared checks cover `lake build --iofail && lake test && lake lint`; no additional verification pass is needed. Use `--no-self-tested` to disable the prompting. Reviews and staging tests remain required.

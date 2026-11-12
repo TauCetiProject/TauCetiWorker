@@ -1372,8 +1372,8 @@ class WorkerBackend:
                     self.w.cfg,
                     profile.provider,
                     dry=False,
-                    ignore_quota=False,
-                    quota_cmd=None,
+                    ignore_quota=self.opts.ignore_quota and self.opts.agent == profile.provider,
+                    quota_cmd=getattr(self.opts, "quota_cmd", None),
                     fresh=True,
                 )
             )
