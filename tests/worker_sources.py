@@ -255,6 +255,70 @@ ci="one/project"
         source = ForgejoWorkerSource(self.identity, api, token_file=self.root / "token")
         return SimpleNamespace(gh=source, cfg=self.cfg, counters=Mock(), rs=Mock())
 
+    def test_native_prompt_rewrites_only_complete_content_repository_references(self):
+        from tauceti_worker.agents import TAUCETI, fill_prompt
+
+        template = self.root / "prompt.txt"
+        canonical = "https://github.com/" + TAUCETI
+        shared = [TAUCETI + suffix for suffix in ("Roadmap", "Data", "Review", "-claims", ".archive", ".git-other")]
+        lines = [
+            canonical,
+            canonical + "/pull/7",
+            canonical + ".git",
+            "--repo " + TAUCETI,
+            canonical + ".",
+            canonical + ",",
+            "--repo " + TAUCETI + ")",
+        ]
+        for name in shared:
+            lines.extend(["https://github.com/" + name, "--repo " + name])
+        template.write_text("\n".join(lines) + "\n__CLAIMED__")
+        untrusted = canonical + " --repo " + TAUCETI
+        with patch("tauceti_worker.worker_sources.current", return_value=self.source):
+            rendered = fill_prompt(template, CLAIMED=untrusted).splitlines()
+        native = self.repo.forge.url.removeprefix("https://") + "/" + self.repo.name
+        self.assertEqual(
+            rendered[:7],
+            [
+                self.repo.url,
+                self.repo.url + "/pull/7",
+                self.repo.url + ".git",
+                "--repo " + native,
+                self.repo.url + ".",
+                self.repo.url + ",",
+                "--repo " + native + ")",
+            ],
+        )
+        self.assertEqual(rendered[7:-1], lines[7:])
+        self.assertEqual(rendered[-1], untrusted)
+
+    def test_git_mergeability_is_only_requested_for_owned_unpaused_prs(self):
+        source = self.native_worker().gh
+        source.authenticated_actor = Mock(return_value=self.actor)
+        source.binding_current = Mock(return_value=True)
+        source.pr_progress_state = Mock(return_value=None)
+        rows = [self.row(number=n, author=4 if n == 2 else 3) for n in range(1, 5)]
+        for row in rows:
+            row["mergeable"] = "UNKNOWN"
+        rows[2]["labels"] = [{"name": "hold"}]
+        rows[3]["isDraft"] = True
+        source.open_prs = Mock(return_value=rows)
+        cfg = source_config(self.cfg, source)
+        with patch.object(type(source), "resolve_mergeability", return_value="CONFLICTING") as proof:
+            worker_survey(
+                cfg,
+                source,
+                Mock(),
+                Counters(cfg),
+                roadmap="any",
+                skip=[],
+                deep=True,
+                stages=["rebase"],
+                numbers=(),
+                count_all_roadmaps=True,
+            )
+        proof.assert_called_once_with(source, cfg.state, 1, "a" * 40)
+
     def test_authoring_has_no_pull_request_for_the_native_source_to_authorize(self):
         worker = self.native_worker()
         self.assertTrue(still_actionable("roadmap", worker, None, Candidate(0, "", "Algebra")))

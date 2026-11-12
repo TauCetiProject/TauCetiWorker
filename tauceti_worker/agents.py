@@ -465,8 +465,19 @@ def fill_prompt(path: Path, **subs) -> str:
     source = current()
     if source is not None:
         host_repo = source.repository.forge.url.split("://", 1)[1] + "/" + source.repo
-        text = text.replace("https://github.com/" + TAUCETI, source.repository.url)
-        text = text.replace("--repo " + TAUCETI, "--repo " + host_repo)
+        # Match a complete repository token. Shared repositories such as
+        # TauCetiRoadmap have the content repository's name as a prefix.
+        boundary = r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_.-])"
+        text = re.sub(
+            re.escape("https://github.com/" + TAUCETI) + r"(\.git)?" + boundary,
+            lambda match: source.repository.url + (match[1] or ""),
+            text,
+        )
+        text = re.sub(
+            re.escape("--repo " + TAUCETI) + boundary,
+            lambda _: "--repo " + host_repo,
+            text,
+        )
     # An unfilled placeholder ships literal `__BIN__/git-safe-push` to the agent, which is the
     # command-not-found failure wrapper_bin exists to end. Fail here instead, but only for the
     # prompts we ship: the progress prompt is served by the pinned TauCetiProgress build (written

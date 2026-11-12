@@ -219,6 +219,7 @@ RUN_STDLIB=(
   review_runtime.py
   review_unchanged_memo.py
   synchronous_state_repair.py
+  source_mergeability.py
   review_scheduling.py
   review_state_freshness.py
   review_throttles.py
