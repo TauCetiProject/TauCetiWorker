@@ -148,6 +148,9 @@ if mode == 'toolchain-generated-cache' and args[0] == 'build':
     cache = Path({str(self.prefix)!r})/'lake/cache/artifacts/0123456789abcdef.ltar'
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text('concurrent generated artifact')
+    outputs = cache.parent.parent/'outputs/Probe/0123456789abcdef.json'
+    outputs.parent.mkdir(parents=True, exist_ok=True)
+    outputs.write_text('concurrent generated output manifest')
 if mode == 'toolchain-library-mutation' and args[0] == 'build':
     (Path({str(self.prefix)!r})/'lib/lean/Init.olean').write_text('changed compiler input')
 if mode == 'mutation':

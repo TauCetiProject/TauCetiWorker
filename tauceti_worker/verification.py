@@ -221,11 +221,9 @@ def files_under(root: Path):
     # Stock Lake may place generated artifact downloads below its installation.
     # These hash-addressed cache outputs are not compiler/distribution inputs;
     # other workers can populate them while this build is being verified.
-    artifacts = root / "lake/cache/artifacts" if (root / "bin/lean").is_file() else None
+    cache = root / "lake/cache" if (root / "bin/lean").is_file() else None
     for directory, dirs, files in os.walk(root, followlinks=False):
-        dirs[:] = sorted(
-            d for d in dirs if d not in {".git", ".lake", "__pycache__"} and Path(directory) / d != artifacts
-        )
+        dirs[:] = sorted(d for d in dirs if d not in {".git", ".lake", "__pycache__"} and Path(directory) / d != cache)
         for name in sorted(files + [d for d in dirs if (Path(directory) / d).is_symlink()]):
             # Lake writes these ignored input-file digests while restoring ProofWidgets.
             # Their source JSON files remain inputs; creating/replacing a derived digest
