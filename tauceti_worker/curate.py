@@ -430,23 +430,29 @@ def _sync(path: Path) -> None:
         log(f"curate: local commits in {path.parent} conflict with {upstream[0]}; rebase there by hand")
 
 
-def _push(path: Path) -> None:
+def _push(path: Path, still=None) -> bool:
     """Push the list's branch to the branch it tracks when it is ahead, once more after a sync if
-    the remote has moved. A commit that cannot be pushed stays local and goes with a later call."""
+    the remote has moved; whether nothing is left unpushed. A commit that cannot be pushed stays
+    local and goes with a later call. With `still`, a sync after which `still(the file)` fails
+    stops the push."""
     upstream = _upstream(path)
     if upstream is None:
-        return
+        return True
     for attempt in (1, 2):
         ahead = _git(path, "rev-list", "--count", "@{upstream}..HEAD")
         if ahead.returncode != 0 or ahead.stdout.strip() in ("", "0"):
-            return
+            return True
         pushed = _git(path, "push", "-q", upstream[0], f"HEAD:{upstream[1]}", timeout=300)
         if pushed.returncode == 0:
             log(f"curate: pushed {ahead.stdout.strip()} commit(s) of the target list to {upstream[0]}")
-            return
+            return True
         if attempt == 1:
             _sync(path)
+            if still is not None and not still(path.read_text()):
+                log(f"curate: {upstream[0]} changed what this curation's verdicts were given; not pushed")
+                return False
     log(f"curate: push to {upstream[0]} failed ({one_line(pushed.stderr)}); the commit stays local")
+    return False
 
 
 def merge3(base: str, ours: str, theirs: str) -> str | None:
@@ -483,7 +489,8 @@ def publish(path: Path, base: str, ours: str, notes: list[str], *, still=None) -
     both touch the same lines nothing is written and a later curation starts from the new file. A
     tracked list is committed, that path only, and pushed; when the commit fails this curation's
     edit is taken back out of the file, so a later curation makes it again. With `still`, nothing
-    is written unless `still(the file as it now is)` holds."""
+    is written unless `still(the file as it now is)` holds, and a commit that is not pushed in this
+    call, or that a sync puts onto a file where `still` fails, is taken back."""
     tracked = _tracked(path)
     if tracked:
         _sync(path)
@@ -511,8 +518,14 @@ def publish(path: Path, base: str, ours: str, notes: list[str], *, still=None) -
             else:
                 _write(path, undone)
             return None
-    if tracked:
-        _push(path)
+    if tracked and not _push(path, still) and still is not None and merged != theirs:
+        # A verdict is published in the look that made it or not at all: a later push could carry
+        # it onto a goal or item line it was never given.
+        if _git(path, "reset", "-q", "--keep", "HEAD~1").returncode != 0:
+            log(f"curate: the unpushed verdict commit in {path.parent} could not be taken back; remove it by hand")
+        else:
+            log("curate: the verdicts were taken back; the next look asks again")
+        return None
     return merged
 
 
@@ -579,8 +592,11 @@ def _unchanged(path: Path, targets: Targets, items: list[TargetItem]):
     """Whether a later text of the list keeps `targets`' preamble and each of `items` as it was."""
 
     def basis(listed: Targets, item: TargetItem):
+        # The edit a verdict makes (status, `landed elsewhere:`, no `in flight:`) is not part of it.
         found = listed.find(item.slug)
-        return listed.preamble, found and (found.area, found.status, found.text, tuple(found.meta))
+        own = ("in flight", "landed elsewhere")
+        meta = found and tuple(m for m in found.meta if m.partition(":")[0].strip().lower() not in own)
+        return listed.preamble, found and (found.area, found.text, meta)
 
     before = [basis(targets, item) for item in items]
 

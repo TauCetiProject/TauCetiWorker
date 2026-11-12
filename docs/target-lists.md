@@ -187,8 +187,10 @@ look again just after another one did. Each write merges the
 edit three ways with the file as it then is, so a change made by hand while the
 look ran is kept; if both changed the same or adjacent lines nothing is written
 and the next look starts from the new file. A model verdict is written only if the list's preamble and the
-item's line are still as the agent was given them; otherwise the next look asks
-again. The file is replaced by a rename.
+item's line are still as the agent was given them, and in a tracked list only
+if that look also pushes it, after any rebase, onto a list where they still are;
+otherwise its commit is taken back and the next look asks again. The file is
+replaced by a rename.
 
 When the list is tracked in a git repository, the worker also runs git in that
 clone with the clone's own identity and credentials: before reading and before

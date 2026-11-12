@@ -435,6 +435,41 @@ class Publish(Tmp):
         self.assertEqual(git(first.parent, "log", "-1", "--format=%an"), "curator")
         self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", a)
 
+    def test_a_verdict_is_not_pushed_once_a_rebase_changes_what_it_was_given(self):
+        first, second = self.clone("first"), self.clone("second")
+        listed = t.parse_targets(EXAMPLE)
+        item = listed.find("kolmogorov-zero-one")
+        still = curate._unchanged(first, listed, [item])
+        ticked = t.rewrite_item(EXAMPLE, item, "done", add=("landed elsewhere: A.lean a_b",))
+        broadened = EXAMPLE.replace("i.i.d. integrable", "i.i.d. measurable")
+        second.write_text(broadened)
+        git(second.parent, "commit", "-q", "-m", "goal", "targets.md")
+        hook = first.parent / ".git" / "hooks" / "post-commit"
+        hook.write_text(f"#!/bin/sh\ngit -C {second.parent} push -q origin HEAD:main\n")
+        hook.chmod(0o755)
+        self.assertIsNone(curate.publish(first, EXAMPLE, ticked, ["n"], still=still))
+        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", broadened)
+        self.assertEqual(
+            (first.read_text(), git(first.parent, "rev-list", "--count", "@{upstream}..HEAD")), (broadened, "0")
+        )
+
+    def test_a_verdict_that_cannot_be_pushed_is_not_kept_for_a_later_push(self):
+        first = self.clone("first")
+        listed = t.parse_targets(EXAMPLE)
+        item = listed.find("kolmogorov-zero-one")
+        ticked = t.rewrite_item(EXAMPLE, item, "done", add=("landed elsewhere: A.lean a_b",))
+        hook = first.parent / ".git" / "hooks" / "post-commit"
+        hook.write_text("#!/bin/sh\ngit remote set-url --push origin /nonexistent/remote.git\n")
+        hook.chmod(0o755)
+        self.assertIsNone(curate.publish(first, EXAMPLE, ticked, ["n"], still=curate._unchanged(first, listed, [item])))
+        self.assertEqual(
+            (first.read_text(), git(first.parent, "rev-list", "--count", "@{upstream}..HEAD")), (EXAMPLE, "0")
+        )
+        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
+        plain = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
+        self.assertEqual(curate.publish(first, EXAMPLE, plain, ["n"]), plain)
+        self.assertEqual(git(first.parent, "rev-list", "--count", "@{upstream}..HEAD"), "1")
+
     def test_a_push_that_loses_the_race_is_retried_after_a_rebase(self):
         first, second = self.clone("first"), self.clone("second")
         a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
