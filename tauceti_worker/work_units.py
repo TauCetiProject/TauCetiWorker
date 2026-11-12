@@ -420,9 +420,11 @@ def target_list_prs(w, sv, stages) -> set[int]:
     operator's target list, which `cascade` offers before the account's others. Empty without a
     list, and when the list or the open pull requests cannot be read."""
     path = roadmap_targets()
+    if path is None:
+        return set()
     own = {p.number for p in sv.open_prs if sv.owns(p)}
     actionable = {c.pr for stage in stages for c in sv.kind(stage).actionable} & own
-    if path is None or len(actionable) < 2:
+    if len(actionable) < 2:
         return set()
     from .config import SourceUnavailable
 

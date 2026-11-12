@@ -482,6 +482,16 @@ class MaintenanceOrder(unittest.TestCase):
             self.assertEqual(self.offered(gh), (self.BASE, []))
             gh.open_prs.assert_not_called()
 
+    def test_without_a_list_the_survey_is_not_read(self):
+        sv = Mock(spec=["open_prs", "owns", "kind"])
+        sv.owns.side_effect = AttributeError("author")
+        w = SimpleNamespace(gh=Mock())
+        with patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS": ""}):
+            self.assertEqual(work.target_list_prs(w, sv, tc.AUTO_STAGES), set())
+        sv.owns.assert_not_called()
+        sv.kind.assert_not_called()
+        w.gh.open_prs.assert_not_called()
+
     def test_a_forgejo_source_offers_its_listed_pull_requests_first(self):
         """A Forgejo source's survey built by the common classifier, as a multi-source round hands it
         over, with markers read through the source's own open-PR listing."""
