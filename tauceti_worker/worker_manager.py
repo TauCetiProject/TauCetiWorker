@@ -60,6 +60,7 @@ _WORKER_KEYS = {
     "roadmap_extra_identities",
     "respect_claims",
     "extra_roadmap_prompt",
+    "self_tested",
     "source",
     "author_model",
     "author_effort",
@@ -285,6 +286,7 @@ class WorkerSpec:
     roadmap_extra_identities: tuple[str, ...] = ()
     respect_claims: bool = True
     extra_roadmap_prompt: str | None = None
+    self_tested: bool = False
     source: str | None = None
     author_model: str | None = None
     author_effort: str | None = None
@@ -352,6 +354,7 @@ class WorkerSpec:
             roadmap_extra_identities=_strings(
                 raw.get("roadmap_extra_identities", []), f"workers[{index}].roadmap_extra_identities"
             ),
+            self_tested=_boolean(raw.get("self_tested", False), f"workers[{index}].self_tested"),
             respect_claims=_boolean(raw.get("respect_claims", True), f"workers[{index}].respect_claims"),
             extra_roadmap_prompt=_extra_roadmap_prompt(
                 raw.get("extra_roadmap_prompt"), f"workers[{index}].extra_roadmap_prompt"
@@ -418,6 +421,8 @@ class WorkerSpec:
             value["roadmap_skip"] = list(self.roadmap_skip)
         if self.roadmap_extra_identities:
             value["roadmap_extra_identities"] = list(self.roadmap_extra_identities)
+        if self.self_tested:
+            value["self_tested"] = True
         if not self.respect_claims:
             value["respect_claims"] = False
         for name in (
@@ -490,6 +495,8 @@ class WorkerSpec:
         ):
             if field is not None:
                 argv += [flag, field]
+        if self.self_tested:
+            argv.append("--self-tested")
         if self.extra_roadmap_prompt is not None:
             # One argument: free text may begin with `-`, which argparse would otherwise read as a flag.
             argv.append(f"--extra-roadmap-prompt={self.extra_roadmap_prompt}")
@@ -988,7 +995,7 @@ def _defer_read_policy_reload(spec: WorkerSpec, live: dict) -> bool:
             applied = previous.as_dict()
     old = dict(applied)
     desired = spec.as_dict()
-    for field in ("max_open_prs", "github_state_url", "github_state_token_file"):
+    for field in ("max_open_prs", "github_state_url", "github_state_token_file", "self_tested"):
         old.pop(field, None)
         desired.pop(field, None)
     if old != desired:
@@ -2029,7 +2036,7 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
         for token in flags:
             if token in ("--loop", "--host"):
                 continue
-            if token in ("--ignore-quota", "--auto-refresh", "--stream", "--isolate-home", "--bubble"):
+            if token in ("--ignore-quota", "--auto-refresh", "--stream", "--isolate-home", "--bubble", "--self-tested"):
                 values[
                     {
                         "--ignore-quota": "ignore_quota",
@@ -2037,6 +2044,7 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
                         "--stream": "stream",
                         "--isolate-home": "isolate_home",
                         "--bubble": "bubble",
+                        "--self-tested": "self_tested",
                     }[token]
                 ] = True
                 continue
@@ -2142,6 +2150,7 @@ def add_workers_parser(subparsers) -> None:
         "human runs `claude`. Only safe when nothing else uses the same credential file "
         "(see `tauceti work --help`)",
     )
+    add.add_argument("--self-tested", action="store_true", help="apply the self-tested label after local verification")
     add.add_argument("--roadmap-only", help="pin roadmap rounds to one area")
     add.add_argument("--roadmap-skip", default="", help="comma-separated roadmap areas to exclude")
     add.add_argument("--extra-roadmap-prompt", help="extra guidance for roadmap rounds, appended to the agent's prompt")
@@ -2229,6 +2238,7 @@ def cmd_workers(args) -> int:
                     "sandbox": args.sandbox,
                     "ignore_quota": args.ignore_quota,
                     "auto_refresh": args.auto_refresh,
+                    "self_tested": args.self_tested,
                     "roadmap_skip": [item for item in args.roadmap_skip.split(",") if item],
                     "stream": args.stream,
                     "isolate_home": args.isolate_home,

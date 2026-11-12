@@ -360,6 +360,12 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "$TAUCETI_ROADMAP_SKIP for this run",
     )
     p.add_argument(
+        "--self-tested",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="instruct source-changing agents to apply the self-tested label to eligible PRs after successful local verification",
+    )
+    p.add_argument(
         "--extra-roadmap-prompt",
         dest="extra_roadmap_prompt",
         default=None,
@@ -1357,6 +1363,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     # roadmap_skip()).
     if getattr(args, "roadmap_skip", None) is not None:
         os.environ["TAUCETI_ROADMAP_SKIP"] = args.roadmap_skip
+    # Persist the operator's choice into loop children and recovery rounds.
+    if getattr(args, "self_tested", None) is not None:
+        os.environ["TAUCETI_SELF_TESTED"] = "1" if args.self_tested else "0"
     # --extra-roadmap-prompt likewise: validated here, at the boundary, then read live by do_roadmap via
     # extra_roadmap_prompt() so loop children see it without a flag of their own.
     if getattr(args, "extra_roadmap_prompt", None) is not None:
