@@ -495,20 +495,47 @@ def scope_policy(labels=(), head_ref: str = "", *, bump: bool = False) -> str:
     return "ordinary"
 
 
+def self_tested_guidance(policy: str) -> str:
+    from .worker_sources import repository_url
+
+    if (
+        policy != "ordinary"
+        or os.environ.get("TAUCETI_SELF_TESTED", "0") != "1"
+        or repository_url().lower() != "https://github.com/taucetiproject/tauceti"
+    ):
+        return ""
+    return (
+        "### Apply the self-tested label after verification\n"
+        "For an ordinary mathematics PR entirely under `TauCeti/`, after the final source changes "
+        "successfully complete the local verification below (equivalent to "
+        "`lake build --iofail && lake test && lake lint`). Wait for its successful exit; "
+        "failed, incomplete, or outdated checks do not qualify. Reuse successful checks whose inputs "
+        "have not changed; this adds no verification pass.\n"
+        "Apply the `self-tested` label to the PR. Create new PRs through the existing "
+        "`gh-safe-pr-create` wrapper; do not bypass it. After creation or pushing an update, "
+        "confirm the live PR commit matches your verified commit, then use "
+        "`gh pr edit <number> --repo TauCetiProject/TauCeti "
+        "--add-label self-tested`. A push clears the label, so reapply it after testing subsequent changes. "
+        "If a concurrent push workflow removes the label again, confirm the commit still matches "
+        "and reapply it once. Do not apply it for infrastructure or pin changes, or full-lint/lint-repair requests. "
+        "The trusted picker checks eligibility; reviews and all staging tests still run.\n\n"
+    )
+
+
 def local_verification(policy: str, bubble: bool = False) -> str:
     """The shared verification rules and scope recipe every authoring/repair prompt embeds."""
     if policy not in {"ordinary", "full-lint", "lint-repair", "bump"}:
         raise Die(f"unknown local verification scope policy {policy!r}")
     if os.environ.get("TAUCETI_VERIFY_HELPER", "0") != "1":
         python = "/usr/bin/python3" if bubble else sys.executable
-        return fill_prompt(
+        return self_tested_guidance(policy) + fill_prompt(
             HERE / "prompts" / "local-verification.md",
             SCOPE_POLICY=policy,
             LOCAL_CHECKS=f'"{python}" "{wrapper_bin(bubble)}/tauceti-local-checks"',
         )
     python = "/usr/bin/python3" if bubble else sys.executable
     helper = f'"{python}" "{wrapper_bin(bubble)}/tauceti-verify"'
-    return (
+    return self_tested_guidance(policy) + (
         "### Local verification\n"
         f"Run `{helper}` synchronously after the last edit or integration. "
         f"The worker's local actual-source scope policy is `{policy}`. "
