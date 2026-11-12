@@ -139,8 +139,11 @@ which lasts about ten days, is within two days of expiry, or when the usage
 endpoint answers 401. It leaves the file alone unless `cli_auth_credentials_store`
 resolves to `file` both for the worker's own Codex directory and for the one that
 holds that `auth.json`, counting `/etc/codex/config.toml`, the requirements files
-in `/etc/codex` and any managed `com.openai.codex` preference as Codex does. A
-stop signal that arrives during the exchange takes effect once the new token is
+in `/etc/codex` and any managed `com.openai.codex` preference as Codex does. It
+also leaves it alone when a project `.codex/config.toml` sets another store (or
+cannot be read) in any directory the worker starts Codex from, or in any parent
+of one: the checkout, the state directory and the progress-writer and recovery
+directories inside it, and the temporary directory. A stop signal that arrives during the exchange takes effect once the new token is
 saved.
 
 Two more sources can set the store's default: a workspace's cloud policy, which
@@ -156,7 +159,7 @@ depends on that file:
   those defaults say, and the worker renews on any plan. Only the layers above
   the user's file still stop it: requirements files and the legacy
   `managed_config.toml` in `/etc/codex`, managed `com.openai.codex` preferences,
-  and a project `.codex/config.toml` in the checkout.
+  and the project `.codex/config.toml` files described above.
 - **Name the plan.** Without that setting the worker renews only plans that
   Codex fetches no cloud policy for, plus any named in
   `$TAUCETI_CODEX_REFRESH_PLANS`, and nothing at all while a `config_server` is
