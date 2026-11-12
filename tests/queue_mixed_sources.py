@@ -587,6 +587,7 @@ class MixedExecution(MixedFixture, unittest.TestCase):
 
     def test_exact_mixed_candidate_lands_and_syncs_both_sources(self):
         frozen = self.start_mixed()
+        self.controller.set_setting("forgejo_admission_enabled", False, "operator")
         self.execution.add(frozen, classification="passed")
         self.clock.advance(60)
         self.controller.tick()
@@ -594,6 +595,7 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         self.assertEqual(self.repo.main_sha(), frozen.request.head, self.controller._reasons)
         self.assertEqual(self.native_repo.main_sha(), frozen.request.head)
         self.assertEqual(self.controller.store.rows("batches")[0]["state"], "landed")
+        self.assertEqual(len(self.execution.dispatches), 1)
         self.assertTrue(any(comment["number"] == 17 for comment in self.github.comments))
         self.assertTrue(any(comment["number"] == 17 for comment in self.native.comments))
 
@@ -1091,6 +1093,10 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         self.assertEqual(recovered.load(frozen.attempt_id), frozen)
         self.execution.add(frozen, classification="passed")
         self.assertEqual(self.ci.observe(frozen.attempt_id).result["classification"], "passed")
+        self.clock.advance(60)
+        self.controller.tick()
+        self.assertEqual(self.repo.main_sha(), frozen.request.head)
+        self.assertEqual(len(self.execution.dispatches), 1)
 
     def test_publication_disable_preserves_pending_landing_and_mirror_intents(self):
         self.start_mixed()
