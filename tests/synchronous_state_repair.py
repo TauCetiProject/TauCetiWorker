@@ -132,6 +132,15 @@ class StateRepair(unittest.TestCase):
         refresh.assert_called_once_with(TAUCETI, 7, HEAD, NEW)
         self.assertEqual(self.counters.read("review-err-7"), 0)
 
+    def test_source_without_refresh_capability_never_falls_back_to_github(self):
+        self.w.gh = SimpleNamespace()
+        with patch.object(state, "refresh_pr", side_effect=AssertionError("wrong-source refresh")):
+            state_repair.repair_selected(self.w, Candidate(7, HEAD), NEW)
+        retry = self.counters.read(state_repair.retry_key(7, HEAD))
+        self.assertGreater(retry, time.time() + 25)
+        self.assertLess(retry, time.time() + 35)
+        self.w.rs.bust.assert_called_once_with(7)
+
     def test_review_command_race_never_counts_as_a_review_or_error(self):
         self.counters.write("review-err-7", 2)
         self.w.rs.review_rounds = lambda *_: 1

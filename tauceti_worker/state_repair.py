@@ -24,7 +24,12 @@ def repair_selected(w, candidate, observed: str = "") -> None:
     # hot loop. This is a deadline, never ownership or permanent exclusion.
     with contextlib.suppress(OSError):
         w.counters.write(key, int(time.time()) + 30)
-    result = w.gh.refresh_pr_state(candidate.pr, candidate.head, observed)
+    refresh = getattr(w.gh, "refresh_pr_state", None)
+    result = (
+        refresh(candidate.pr, candidate.head, observed)
+        if refresh is not None
+        else dict(status="unavailable", reason="refresh_unsupported")
+    )
     confirmed_same_head = (
         result.get("status") == "ok"
         and result.get("data", {}).get("headRefOid") == candidate.head

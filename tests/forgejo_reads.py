@@ -376,6 +376,9 @@ class SourceTests(unittest.TestCase):
         self.assertLess(worker.counters.read(retry_key(12, "a" * 40)), time.time() + 5)
 
     def test_native_refresh_failure_does_not_reuse_the_cached_head(self):
+        from tauceti_worker.state_repair import repair_selected, retry_key
+        from tauceti_worker.survey import Candidate, Counters
+
         self.api.pull.return_value = {
             "number": 12,
             "html_url": self.repo.pull_url(12),
@@ -389,6 +392,13 @@ class SourceTests(unittest.TestCase):
         result = self.source.refresh_pr_state(12, "a" * 40, "b" * 40)
         self.assertEqual(result["status"], "unavailable")
         self.assertNotIn("data", result)
+        worker = SimpleNamespace(
+            gh=self.source, rs=self.state(), counters=Counters(SimpleNamespace(state=Path(self.root.name)))
+        )
+        repair_selected(worker, Candidate(12, "a" * 40), "b" * 40)
+        retry = worker.counters.read(retry_key(12, "a" * 40))
+        self.assertGreater(retry, time.time() + 25)
+        self.assertLess(retry, time.time() + 35)
 
     def test_review_state_consumes_native_comments_and_cache_provenance(self):
         state = self.state()

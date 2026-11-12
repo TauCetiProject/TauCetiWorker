@@ -72,9 +72,6 @@ class FakeGH:
     def pr_view(self, pr, fields):
         return self.view
 
-    def refresh_pr_state(self, pr, expected, observed=""):
-        return dict(status="ok", data=self.view or {})
-
     def fresh_claim_age(self, comment_id):
         return self.claim_age
 
