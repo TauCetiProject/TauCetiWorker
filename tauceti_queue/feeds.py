@@ -572,11 +572,24 @@ def reduce_sample(observation: dict, candidates: dict) -> dict:
 
 
 def main(argv: Sequence[str]) -> int:
-    if len(argv) != 4 or argv[1] != "derive":
-        print("usage: python -m tauceti_queue.feeds derive <active-batches.json> <candidates.json>", file=sys.stderr)
+    if len(argv) != 4 or argv[1] not in {"derive", "validate"}:
+        print(
+            "usage: python -m tauceti_queue.feeds {derive|validate} <active-batches.json> <candidates.json>",
+            file=sys.stderr,
+        )
         return 2
     observation = json.loads(pathlib.Path(argv[2]).read_text())
     candidates = json.loads(pathlib.Path(argv[3]).read_text())
+    if argv[1] == "validate":
+        errors = [
+            *(f"{argv[2]}: {error}" for error in validate_observation(observation)),
+            *(f"{argv[3]}: {error}" for error in validate_candidates(candidates)),
+        ]
+        if errors:
+            print("\n".join(errors), file=sys.stderr)
+            return 1
+        print("both captures match the committed feed schema")
+        return 0
     schema = {
         "derived_from": {"observation": pathlib.Path(argv[2]).name, "candidates": pathlib.Path(argv[3]).name},
         "observation": derive_schema(observation),

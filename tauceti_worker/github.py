@@ -250,7 +250,7 @@ def _pin_git_identity(login: str, user_id: int, *, configure_helper: bool) -> No
     os.environ["GIT_CONFIG_COUNT"] = str(count + len(settings))
 
 
-def me() -> str:
+def _source_actor():
     from .worker_sources import current
 
     source = current()
@@ -258,8 +258,20 @@ def me() -> str:
         actor = source.authenticated_actor()
         if actor is None:
             raise Die("the authenticated Forgejo actor is unavailable")
-        return actor.login
-    return _github_me()
+        return actor
+    return None
+
+
+def me() -> str:
+    """Display login for the selected source; not a persisted native identity."""
+    actor = _source_actor()
+    return actor.login if actor is not None else _github_me()
+
+
+def review_publisher() -> str:
+    """Identity used by review scoreboards, rather than a display login."""
+    actor = _source_actor()
+    return actor.qualified_id if actor is not None else me()
 
 
 @functools.lru_cache(maxsize=1)
@@ -735,6 +747,11 @@ class GitHub:
             raise ValueError("qualified repositories require GitHub.for_repository")
         self.repo = repo
         self._review_nodes = {}
+
+    def refresh_pr_state(self, number, expected, observed=""):
+        from .github_state import refresh_pr
+
+        return refresh_pr(self.repo, number, expected, observed)
 
     def _gh(self, args: list[str]) -> subprocess.CompletedProcess:
         readonly = _gh_read_only(["gh", *args])
