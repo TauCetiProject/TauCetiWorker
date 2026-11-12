@@ -1244,8 +1244,8 @@ def run_agent_proc(
                     # This agent owns a separate process group, so tools cannot
                     # outlive a lost lease and continue publishing afterwards.
                     with contextlib.suppress(ProcessLookupError):
-                        os.killpg(proc.pid, signal.SIGTERM)
-                    if not finished.wait(2):
+                        proc.terminate()
+                    if not finished.wait(35):
                         with contextlib.suppress(ProcessLookupError):
                             os.killpg(proc.pid, signal.SIGKILL)
                     return
@@ -1310,7 +1310,7 @@ def run_agent_proc(
             "terminal_failure": renderer.terminal_failure_text,
             "rate_limit_status": renderer.rate_limit_status,
             "usage": dict(renderer.usage),
-            "tail": list(tail)[-6:],  # the guardian's own traceback when the agent executable is missing
+            "tail": list(tail)[-6:],  # the guardian's fixed diagnostic when the executable cannot start
         }
         if provider in {"codex", "claude"} and not renderer.active:
             write_rendered(destination, f"[warning] no structured {provider} events were recognized\n")
@@ -1551,7 +1551,7 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
     reader, writer = os.pipe()
     try:
         proc = subprocess.Popen(
-            [sys.executable, "-c", _PARENT_BOUND_AGENT, str(reader), *command],
+            [sys.executable, "-I", "-c", _PARENT_BOUND_AGENT, str(reader), *command],
             pass_fds=(reader, *lease_fds(env)),
             cwd=cwd,
             env=env,
@@ -1571,9 +1571,9 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
         except BaseException:
             sweep = False
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGTERM)
+                proc.terminate()
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=35)
             except subprocess.TimeoutExpired:
                 pass
             finally:
