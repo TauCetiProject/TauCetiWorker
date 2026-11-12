@@ -358,6 +358,8 @@ try:
         (agent_files[1].parent / ".tauceti-creds-source").unlink()
         agent_files[1].write_text(login("agent-login", -60))
         check("an expired login that can renew itself is", quota.claude(renew=True).available, True)
+        with patch.dict(os.environ, {"TAUCETI_CLAUDE_AGENT_CREDENTIAL": "access-only"}):
+            check("unless the agent gets it without its refresh token", quota.claude(renew=True).available, False)
         for f in agent_files:
             f.unlink()
         check("a missing agents' file is not", quota.claude(renew=True).available, False)
@@ -375,7 +377,7 @@ try:
             # A --bubble round runs the agent in the container with only the mounted file.
             inner = tc.agents.bubble_work_cmd(tc.agents.agent_inner_cmd("claude"))
             check("the bubble agent is not given the environment token", "CLAUDE_CODE_OAUTH_TOKEN" in inner, False)
-            with patch.dict(os.environ, {"TAUCETI_CLAUDE_ENV_TOKEN_ROUTE": "0"}):
+            with patch.dict(os.environ, {"TAUCETI_CLAUDE_AGENT_CREDENTIAL": "file"}):
                 check(
                     "a file-only launch beside a stale file is not admitted", quota.claude(renew=True).available, False
                 )
@@ -384,25 +386,48 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
-# 9) `work` records whether its phases' Claude launches inherit the environment token, so its loop
-#    children and the pacer agree on it.
-reaches = tc.cli.claude_env_token_reaches_agents
-check("host phases inherit it", reaches([], bubble=False), True)
-check("bubble phases do not", reaches([], bubble=True), False)
-check("overlap-scan stays on the host under --bubble", reaches(["overlap-scan"], bubble=True), True)
-check("so does progress", reaches(["progress"], bubble=True), True)
-check("one bubble phase among them is enough", reaches(["overlap-scan", "review"], bubble=True), False)
-check("security-audit's private home does not", reaches(["security-audit"], bubble=False), False)
+# 9) A TauCetiReview rubric reviewer runs in a clean home seeded with the credential file only.
+from runner import reviewers  # noqa: E402
+
+tmp = Path(tempfile.mkdtemp())
+try:
+    (tmp / ".claude").mkdir()
+    (tmp / ".claude" / ".credentials.json").write_text(login("setup-token", 365 * 86400, None))
+    with (
+        patch.dict(os.environ, {"HOME": str(tmp), "CLAUDE_CODE_OAUTH_TOKEN": "env-setup-token"}),
+        patch.object(reviewers, "REV_HOME_BASE", str(tmp / "rev")),
+    ):
+        reviewer_env, reviewer_home = reviewers.reviewer_env("claude", {}, subscription=True)
+    check("the rubric reviewer is not given the environment token", "CLAUDE_CODE_OAUTH_TOKEN" in reviewer_env, False)
+    check(
+        "it is given the file",
+        (Path(reviewer_home) / ".claude" / ".credentials.json").read_text(),
+        (tmp / ".claude" / ".credentials.json").read_text(),
+    )
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+
+# 10) `work` records which Claude credential its phases' launches receive, so its loop children and
+#     the pacer agree on it.
+route = tc.cli.claude_agent_credential_route
+check("host phases without review inherit the token", route(["fix", "overlap-scan"], bubble=False), "environment")
+check("review is given the file", route(["review"], bubble=False), "file")
+check("so is every phase by default", route([], bubble=False), "file")
+check("bubble phases are given the file", route(["fix"], bubble=True), "file")
+check("overlap-scan stays on the host under --bubble", route(["overlap-scan"], bubble=True), "environment")
+check("so does progress", route(["progress"], bubble=True), "environment")
+check("one bubble phase among them is enough", route(["overlap-scan", "fix"], bubble=True), "file")
+check("security-audit gets an access-only copy", route(["security-audit", "review"], bubble=False), "access-only")
 saved_env = dict(os.environ)
 try:
-    for bubble, only, expect in ((True, [], "0"), (False, [], "1"), (True, ["overlap-scan"], "1")):
-        os.environ.pop("TAUCETI_CLAUDE_ENV_TOKEN_ROUTE", None)
+    for bubble, only, expect in ((True, ["fix"], "file"), (False, ["fix"], "environment"), (False, [], "file")):
+        os.environ.pop("TAUCETI_CLAUDE_AGENT_CREDENTIAL", None)
         args = types.SimpleNamespace(bubble=bubble, author_model=None, author_effort="high")
         try:
             tc.cli.cmd_work(args, only=only, agent="auto", one_round=False)
         except tc.Die:
             pass
-        check(f"--bubble={bubble} --only {only} is recorded", os.environ.get("TAUCETI_CLAUDE_ENV_TOKEN_ROUTE"), expect)
+        check(f"--bubble={bubble} --only {only} is recorded", os.environ.get("TAUCETI_CLAUDE_AGENT_CREDENTIAL"), expect)
 finally:
     os.environ.clear()
     os.environ.update(saved_env)

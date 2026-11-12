@@ -2159,17 +2159,16 @@ class Quota:
     def _claude_launch_credential_unusable(self) -> str | None:
         """Why the agents cannot launch, when a usage login answers for them and their own credential
         is known to be unusable: the file in $CLAUDE_CONFIG_DIR is missing, or it holds a token past
-        its expiry with no refresh token. None otherwise, and always off this route, on macOS, where
-        agents read the Keychain first, and with $CLAUDE_CODE_OAUTH_TOKEN set where the agents inherit it
-        and authenticate with it ahead of the file. `work` records in $TAUCETI_CLAUDE_ENV_TOKEN_ROUTE
-        whether its phases' launches do (cli.claude_env_token_reaches_agents)."""
+        its expiry that the agents cannot renew. None otherwise, and always off this route, on macOS,
+        where agents read the Keychain first, and with $CLAUDE_CODE_OAUTH_TOKEN set where the agents
+        inherit it and authenticate with it ahead of the file. `work` records in
+        $TAUCETI_CLAUDE_AGENT_CREDENTIAL what its phases' launches receive
+        (cli.claude_agent_credential_route); an "access-only" copy carries no refresh token."""
+        route = os.environ.get("TAUCETI_CLAUDE_AGENT_CREDENTIAL", "environment")
         if (
             claude_usage_credentials() is None
             or sys.platform == "darwin"
-            or (
-                os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
-                and os.environ.get("TAUCETI_CLAUDE_ENV_TOKEN_ROUTE") != "0"
-            )
+            or (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip() and route == "environment")
         ):
             return None
         path = claude_dir(self.cfg.home) / ".credentials.json"
@@ -2177,7 +2176,8 @@ class Quota:
         if not oauth.get("accessToken"):
             return f"no {path} (the credential agents launch from)"
         expires = oauth.get("expiresAt")
-        if not oauth.get("refreshToken") and _finite_num(expires) and expires <= time.time() * 1000:
+        renewable = bool(oauth.get("refreshToken")) and route != "access-only"
+        if not renewable and _finite_num(expires) and expires <= time.time() * 1000:
             return f"the token agents launch from in {path} has expired; replace it with a new `claude setup-token`"
         return None
 

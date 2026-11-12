@@ -488,14 +488,18 @@ def parse_only(values: list[str], flag: str = "--only") -> list[str]:
     return tasks
 
 
-def claude_env_token_reaches_agents(only: list[str], *, bubble: bool) -> bool:
-    """Whether every Claude agent these phases can launch inherits $CLAUDE_CODE_OAUTH_TOKEN. A Bubble
-    agent is handed only the credential file, and security-audit runs its agent in a private home with
-    a copy of that file and a restricted environment."""
+def claude_agent_credential_route(only: list[str], *, bubble: bool) -> str:
+    """How the Claude agents these phases can launch authenticate, strictest first:
+    "access-only" — security-audit runs its agent in a private home with a copy of the credential file
+    stripped of its refresh token; "file" — a Bubble agent, and a TauCetiReview rubric reviewer, which
+    runs in a clean home seeded with the file, are given the file and not $CLAUDE_CODE_OAUTH_TOKEN;
+    "environment" — every launch inherits the worker's environment, token included."""
     phases = only or ALLOWED_TASKS
     if "security-audit" in phases:
-        return False
-    return not (bubble and any(SANDBOX_DEFAULT.get(phase, False) for phase in phases))
+        return "access-only"
+    if "review" in phases or (bubble and any(SANDBOX_DEFAULT.get(phase, False) for phase in phases)):
+        return "file"
+    return "environment"
 
 
 def resolve_tasks(only_vals: list[str], skip_vals: list[str]) -> list[str]:
@@ -1359,10 +1363,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             "--host is now the default (the agent runs directly on the host); it is a no-op. "
             "Pass --bubble to run inside the sandbox instead"
         )
-    # The pacer reads this to know whether $CLAUDE_CODE_OAUTH_TOKEN reaches the agents; loop children
-    # re-pin it.
-    os.environ["TAUCETI_CLAUDE_ENV_TOKEN_ROUTE"] = (
-        "1" if claude_env_token_reaches_agents(only, bubble=getattr(args, "bubble", False)) else "0"
+    # The pacer reads this to know which Claude credential the agents receive; loop children re-pin it.
+    os.environ["TAUCETI_CLAUDE_AGENT_CREDENTIAL"] = claude_agent_credential_route(
+        only, bubble=getattr(args, "bubble", False)
     )
     author_model = getattr(args, "author_model", None)
     author_effort = getattr(args, "author_effort", None)
