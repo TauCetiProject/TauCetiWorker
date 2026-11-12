@@ -328,7 +328,7 @@ for number in (7, 9):
         tc.Candidate(number, "b" * 40, "ready for review", preferred_reviewer="peer", ready_at=_time.time())
     )
 seen = []
-saved_me = tc.work_units.me
+saved_publisher = tc.work_units.review_publisher
 tc.work_units.survey = lambda *_a, **_k: affine
 tc.work_units.dispatch = lambda stage, _w, _sv, c, _o: seen.append((stage, c.pr)) or None
 tc.work_units.review_publisher = lambda: "me"
@@ -340,7 +340,7 @@ try:
 finally:
     tc.work_units.survey = saved_survey
     tc.work_units.dispatch = saved_dispatch
-    tc.work_units.me = saved_me
+    tc.work_units.review_publisher = saved_publisher
 checks.append(check("bump review skips the peer affinity window", seen, [("review", 9)]))
 
 sys.exit(0 if all(checks) else 1)
