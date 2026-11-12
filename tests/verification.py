@@ -144,6 +144,15 @@ if mode == 'widget-generated-hash' and args[0] == 'build':
     (p/'packages/proofwidgets/widget/package-lock.json.hash').write_text('restored Lake digest')
 if mode == 'widget-source-mutation' and args[0] == 'build':
     (p/'packages/proofwidgets/widget/package-lock.json').write_text('changed source')
+if mode == 'toolchain-generated-cache' and args[0] == 'build':
+    cache = Path({str(self.prefix)!r})/'lake/cache/artifacts/0123456789abcdef.ltar'
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text('concurrent generated artifact')
+    outputs = cache.parent.parent/'outputs/Probe/0123456789abcdef.json'
+    outputs.parent.mkdir(parents=True, exist_ok=True)
+    outputs.write_text('concurrent generated output manifest')
+if mode == 'toolchain-library-mutation' and args[0] == 'build':
+    (Path({str(self.prefix)!r})/'lib/lean/Init.olean').write_text('changed compiler input')
 if mode == 'mutation':
     source = Path('TauCeti/A.lean'); before = source.read_text(); source.write_text('changed'); source.write_text(before)
 if mode == 'sleep':
@@ -344,6 +353,20 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
     def test_proofwidgets_source_lockfile_mutation_is_still_rejected(self):
         write(self.root, ".lake/packages/proofwidgets/widget/package-lock.json", "source lockfile")
         os.environ["FIXTURE_MODE"] = "widget-source-mutation"
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn("mutat", result["error"])
+
+    def test_generated_lake_downloads_do_not_invalidate_toolchain_identity(self):
+        write(self.prefix, "lib/lean/Init.olean", "original compiler input")
+        os.environ["FIXTURE_MODE"] = "toolchain-generated-cache"
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "success", result.get("error"))
+        self.assertTrue((self.prefix / "lake/cache/artifacts/0123456789abcdef.ltar").is_file())
+
+    def test_toolchain_library_changes_are_still_rejected(self):
+        write(self.prefix, "lib/lean/Init.olean", "original compiler input")
+        os.environ["FIXTURE_MODE"] = "toolchain-library-mutation"
         result = self.verify(stage="build")
         self.assertEqual(result["status"], "incomplete")
         self.assertIn("mutat", result["error"])

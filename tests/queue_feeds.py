@@ -2,19 +2,21 @@
 """The Bors-compatible feeds (tauceti_queue.feeds) against the schema fixture derived from saved
 production responses.
 
-Covered: the committed schema accepts the committed production sample and (when the operator's
-saved responses are present at ~/tmp/bors-journal) the full responses; the validator rejects a
+Covered: the committed schema accepts the committed production sample; the validator rejects a
 missing key, an unknown key and a type change; feeds generated from a fake controller view validate
 with the same top-level keys, schema strings and timestamp units as Bors; the generated observation
 satisfies the TauCetiTools `bors_observation.py` and `bors_scope_approval.py` readers that the
 scope-approval check and the workers use; and a `batch_id` query fills `requested_batch`.
 """
 
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import pathlib
 import sys
+import tempfile
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -23,7 +25,6 @@ sys.path.insert(0, str(REPO))
 from tauceti_queue import feeds  # noqa: E402
 
 FIXTURES = REPO / "tests" / "fixtures"
-SAVED = pathlib.Path.home() / "tmp" / "bors-journal"
 TAUCETI = "TauCetiProject/TauCeti"
 HEAD = "a" * 40
 BASE = "b" * 40
@@ -75,15 +76,26 @@ class Schema(unittest.TestCase):
         self.assertEqual(feeds.validate_observation(self.sample["observation"], self.schema), [])
         self.assertEqual(feeds.validate_candidates(self.sample["candidates"], self.schema), [])
 
-    def test_full_saved_responses_validate_when_present(self):
-        observation = SAVED / "active-batches-2026-11-04T0745Z.json"
-        if not observation.is_file():
-            self.skipTest("saved production responses are not on this machine")
-        self.assertEqual(feeds.validate_observation(json.loads(observation.read_text()), self.schema), [])
-        for name in ("candidates-latest.json", "candidates-2026-11-04T0416Z.json"):
-            path = SAVED / name
-            if path.is_file():
-                self.assertEqual(feeds.validate_candidates(json.loads(path.read_text()), self.schema), [], name)
+    def test_validate_captures_command(self):
+        # External captures are explicitly supplied, never discovered in the operator's home.
+        with tempfile.TemporaryDirectory() as tmp:
+            observation = pathlib.Path(tmp) / "observation.json"
+            candidates = pathlib.Path(tmp) / "candidates.json"
+            observation.write_text(json.dumps(self.sample["observation"]))
+            candidates.write_text(json.dumps(self.sample["candidates"]))
+            command = ["feeds", "validate", str(observation), str(candidates)]
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(feeds.main(command), 0)
+            changed = json.loads(candidates.read_text())
+            changed["candidates"][0]["snapshot"]["members"][0]["declaration_names"] = {}
+            candidates.write_text(json.dumps(changed))
+            before = candidates.read_text()
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                self.assertEqual(feeds.main(command), 1)
+            self.assertIn(str(candidates), output.getvalue())
+            self.assertIn("unknown key 'declaration_names'", output.getvalue())
+            self.assertEqual(candidates.read_text(), before)
 
     def test_validator_catches_drift(self):
         doc = copy.deepcopy(self.sample["observation"])

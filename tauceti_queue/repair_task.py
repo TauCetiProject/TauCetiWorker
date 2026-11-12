@@ -1524,7 +1524,7 @@ _CODEX_REFUSAL = re.compile(
 )
 _CLAUDE_REFUSAL = re.compile(r"API Error:\s*(401|403|429|5\d\d)\b|hit your .*limit|usage limit reached", re.I)
 # The agent runs under the worker's parent-bound guardian, so an executable that is not on PATH is the
-# guardian's traceback and exit 1 rather than an OSError from Popen (which is ``AgentLaunchUnavailable``).
+# guardian's diagnostic rather than an OSError from Popen (which is ``AgentLaunchUnavailable``).
 _NO_EXECUTABLE = re.compile(
     r"(?:FileNotFoundError|PermissionError|OSError):.*(?:No such file or directory|Permission denied)"
 )
@@ -1539,6 +1539,8 @@ def prework_failure(provider: str, rc: int, run: dict | None, infra_reason: str 
     if rc == 0 or run is None or run.get("saw_work"):
         return None
     for line in run.get("tail") or []:
+        if rc == 127 and str(line).strip() == "owned tool could not start":
+            return LAUNCH_FAILURE
         if _NO_EXECUTABLE.search(str(line)):
             return f"{LAUNCH_FAILURE}: {str(line).strip()[:200]}"
     status = run.get("rate_limit_status")
