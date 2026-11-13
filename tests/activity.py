@@ -351,6 +351,20 @@ class ActivityTests(unittest.TestCase):
         request.assert_called_once()
         self.assertTrue(a.cached()["available"])
 
+    def test_without_collector_refresh_runs_a_collector_slice(self):
+        from tauceti_worker import recovery_maintenance, retention, work_recovery
+
+        with (
+            patch.object(work_recovery, "housekeep", return_value=dict(cleanup_pending=True)) as cleanup,
+            patch.object(recovery_maintenance, "collect_discarded", return_value=dict(errors=[])) as trash,
+            patch.object(retention, "request_cleanup") as request,
+        ):
+            a.prepare(now=self.now)
+        cleanup.assert_called_once_with(cleanup=True, **retention.COLLECTOR_SLICE)
+        trash.assert_called_once_with(work_recovery._state_root().resolve())
+        request.assert_not_called()
+        self.assertTrue(a.cached()["available"])
+
     def test_current_work_counts_distinct_workers_not_unfinished_receipts(self):
         a.prepare(now=self.now)
         with contextlib.closing(a._connect()) as db, db:
