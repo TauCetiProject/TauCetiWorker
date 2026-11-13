@@ -883,6 +883,19 @@ def _round_mutated(c: Candidate, pre: dict) -> str | None:
         return None
 
 
+def _description_repaired(w: Worker, c: Candidate, pre: dict, st: dict) -> bool | None:
+    """Whether a round that pushed nothing replaced the PR description and replied, read from the PR.
+
+    The journal that records the same is optional and best effort, so it cannot be what completes a
+    final attempt. The PR shows the repair as an edit time that moved and a comment that was added;
+    the source then says whether both are this account's. A reply alone, an edit alone and a peer's
+    writes are still no progress, and so is a source that reports no edit time."""
+    if "edited" not in pre or st.get("edited") in (None, pre["edited"]) or st["ncomments"] <= pre["ncomments"]:
+        return False
+    repair = getattr(w.gh, "pr_description_repair", None)
+    return repair(c.pr, pre["edited"], pre["ncomments"]) if repair else False
+
+
 def _progressed(w: Worker, c: Candidate, pre: dict | None) -> bool | None:
     # This post-spend acknowledgement can run before the write's webhook arrives.
     # Ordinary surveys still use the freshest mirrored data without age gates.
@@ -914,7 +927,7 @@ def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool | None
             return None
         closed = st.get("state") in {"CLOSED", "MERGED"} and pre.get("state") not in {"CLOSED", "MERGED"}
         if pre.get("require_push") and (st["head"] or "") == pre["head"] and not closed:
-            return False
+            return _description_repaired(w, c, pre, st)
         if (st["head"] or "") != pre["head"] or closed or st["ncomments"] > pre["ncomments"]:
             # Bubble has no host-visible push markers. Its current baseline is
             # taken after the branch claim; unclaimed work stays unattributed.
