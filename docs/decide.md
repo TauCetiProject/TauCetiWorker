@@ -250,7 +250,9 @@ all of these hold at the moment of closing:
   the diff of one of those merged pull requests. A pull request that adds no
   named declaration cannot be closed this way. Each diff is read with `gh pr
   diff`, on Forgejo through the source's command layer, which returns the pull
-  request's own diff from its recorded merge base, merged or not.
+  request's own diff from its recorded merge base, merged or not. Comments are
+  read per diff hunk, so an added line in a hunk that lies wholly inside a
+  comment opened outside it, closer included, still counts as a declaration.
 
 A closure that does not complete when it is sent is not kept in the publication
 outbox for a later replay, which would skip these checks and the claim; the

@@ -1136,6 +1136,15 @@ def test_close(tmp):
         decide.added_declarations(commented),
         {"real"},
     )
+    closed_only = (
+        "+++ b/B.lean\n@@ -10,3 +10,5 @@\n   more of the example\n+theorem in_docs : True := trivial\n -/\n"
+        "+theorem real : True := trivial\n"
+    )
+    check(
+        "…nor in a comment whose opener lies above the hunk, which shows only its close",
+        decide.added_declarations(closed_only),
+        {"real"},
+    )
 
     root = tmp / "close"
     comment = "Everything here landed through #41, in the same file and under the same names."

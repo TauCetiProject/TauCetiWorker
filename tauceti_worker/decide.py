@@ -831,7 +831,9 @@ def max_closes() -> int:
 def added_declarations(diff: str, *, private: bool = False) -> set[str]:
     """The names, as written, of the declarations a unified diff adds to `.lean` files, outside
     comments. Each hunk's added and unchanged lines are read together, so a comment opened on an
-    unchanged line covers the added lines inside it. `private` ones are left out unless asked for."""
+    unchanged line covers the added lines inside it, and a hunk that closes a comment it did not
+    open is read as starting inside one. A hunk lying wholly inside a comment opened above it cannot
+    be told from code by the diff alone. `private` ones are left out unless asked for."""
     from tauceti_queue.repair_context import _strip_comments
 
     names: set[str] = set()
@@ -846,7 +848,12 @@ def added_declarations(diff: str, *, private: bool = False) -> set[str]:
         elif lean and hunks and line[:1] in ("+", " "):
             hunks[-1].append((line[0] == "+", line[1:]))
     for hunk in hunks:
-        for (added, _), line in zip(hunk, _strip_comments([text for _, text in hunk]), strict=True):
+        text = [line for _, line in hunk]
+        stripped = _strip_comments(text)
+        if any("-/" in line for line in stripped):
+            # A close with no opener in the hunk: the hunk starts inside a comment opened above it.
+            stripped = _strip_comments(["/-", *text])[1:]
+        for (added, _), line in zip(hunk, stripped, strict=True):
             found = _DECLARATION.match(line) if added else None
             if found and (private or "private" not in found.group("modifiers").split()):
                 names.add(found.group("name"))
