@@ -488,6 +488,18 @@ class Publish(Tmp):
         self.assertEqual(git(first.parent, "rev-list", "--count", "@{upstream}..HEAD"), "0")
         self.assertEqual(git(first.parent, "status", "--porcelain"), "M targets.md")
 
+    def test_the_first_publication_creates_the_branch_an_empty_remote_lacks(self):
+        remote = self.tmp / "empty.git"
+        git(self.tmp, "init", "-q", "--bare", "-b", "main", str(remote))
+        git(self.tmp, "clone", "-q", str(remote), str(self.tmp / "fresh"))
+        path = self.tmp / "fresh" / "targets.md"
+        path.write_text(EXAMPLE)
+        git(path.parent, "add", "targets.md")
+        git(path.parent, "commit", "-q", "-m", "list")
+        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
+        self.assertEqual(curate.publish(path, EXAMPLE, a, ["n"], still=lambda text: True), a)
+        self.assertEqual(git(remote, "show", "main:targets.md") + "\n", a)
+
     def test_a_push_that_loses_the_race_is_retried_after_a_rebase(self):
         first, second = self.clone("first"), self.clone("second")
         a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")

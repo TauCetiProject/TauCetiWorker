@@ -439,12 +439,13 @@ def _push(path: Path, still=None) -> bool:
     if upstream is None:
         return True
     for attempt in (1, 2):
+        # A failed comparison (the tracked branch not on the remote yet, say) is left to the push.
         ahead = _git(path, "rev-list", "--count", "@{upstream}..HEAD")
-        if ahead.returncode != 0 or ahead.stdout.strip() in ("", "0"):
+        if ahead.returncode == 0 and ahead.stdout.strip() in ("", "0"):
             return True
         pushed = _git(path, "push", "-q", upstream[0], f"HEAD:{upstream[1]}", timeout=300)
         if pushed.returncode == 0:
-            log(f"curate: pushed {ahead.stdout.strip()} commit(s) of the target list to {upstream[0]}")
+            log(f"curate: pushed the target list to {upstream[0]}")
             return True
         if attempt == 1:
             _sync(path)
