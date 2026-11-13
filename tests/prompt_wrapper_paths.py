@@ -19,8 +19,9 @@ This harness pins the four properties that keep that true:
   4. The bump and CI-repair prompts run the expired-shim gate and tell the worker how to migrate.
   5. `fill_prompt` raises on an unfilled placeholder in a bundled prompt, and stays quiet for a
      prompt served from elsewhere (TauCetiProgress owns the progress prompt's placeholder set).
-  6. The quality-pass instructions are in the authoring and fix prompts of both variants. Default
-     workers render `prompts/v0/`, so an addition to the helper prompts alone reaches none of them.
+  6. The quality-pass instructions are in the authoring, overlap-repair and fix prompts of both
+     variants. Default workers render `prompts/v0/`, so an addition to the helper prompts alone
+     reaches none of them.
 
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
@@ -90,6 +91,12 @@ QUALITY_PASS = {
         "saying what you ran and updated",
         "starts no re-review",
         "skip this step",
+    ),
+    "overlap-fix.md": (
+        "in this checkout has a `Quality pass:` block, run its",
+        "over every declaration you add or change",
+        "carries it completed",
+        "skip this",
     ),
 }
 
