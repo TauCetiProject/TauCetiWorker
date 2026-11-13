@@ -19,6 +19,9 @@ This harness pins the four properties that keep that true:
   4. The bump and CI-repair prompts run the expired-shim gate and tell the worker how to migrate.
   5. `fill_prompt` raises on an unfilled placeholder in a bundled prompt, and stays quiet for a
      prompt served from elsewhere (TauCetiProgress owns the progress prompt's placeholder set).
+  6. The quality-pass instructions are in the authoring, overlap-repair and fix prompts of both
+     variants. Default workers render `prompts/v0/`, so an addition to the helper prompts alone
+     reaches none of them.
 
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
@@ -75,6 +78,27 @@ CALL_SITES = {
     ),
 }
 NO_WRAPPER = {"overlap-scan.md", "pr-outcome.md", "local-verification.md"}
+# What each prompt must say about the quality pass, in either variant (see 7 below).
+QUALITY_PASS = {
+    "roadmap.md": (
+        "proof-quality, quality-pass",
+        "in this checkout has a `Quality pass:` block, run",
+        "the body carries it completed",
+    ),
+    "fix.md": (
+        "run its checks over those",
+        "gh pr edit 123 --repo TauCetiProject/TauCeti --body-file <file>",
+        "saying what you ran and updated",
+        "starts no re-review",
+        "skip this step",
+    ),
+    "overlap-fix.md": (
+        "in this checkout has a `Quality pass:` block, run its",
+        "over every declaration you add or change",
+        "carries it completed",
+        "skip this",
+    ),
+}
 
 fails = 0
 
@@ -182,6 +206,25 @@ def main():
             check("fill_prompt leaves a foreign prompt's placeholders alone", "__FACTS_FILE__" in out)
         except tc.config.Die:
             check("fill_prompt leaves a foreign prompt's placeholders alone", False)
+
+    # 7) The quality pass reaches an agent whichever variant is dispatched. Unset and "0" select
+    # the default V0 prompts and "1" the helper prompts; the instructions are conditional on the
+    # checkout's PR template, so both stay correct on a branch that predates the checklist.
+    for helper in (None, "0", "1"):
+        environment = {k: v for k, v in os.environ.items() if k != "TAUCETI_VERIFY_HELPER"}
+        if helper is not None:
+            environment["TAUCETI_VERIFY_HELPER"] = helper
+        with patch.dict(os.environ, environment, clear=True):
+            for name, phrases in QUALITY_PASS.items():
+                text = fill_prompt(PROMPTS / name, **CALL_SITES[name])
+                missing = [phrase for phrase in phrases if phrase not in text]
+                check(f"{name}: quality-pass instructions present (TAUCETI_VERIFY_HELPER={helper})", not missing)
+    for name in QUALITY_PASS:
+        lines = [
+            [ln for ln in (directory / name).read_text().splitlines() if "uality pass" in ln or "quality-pass" in ln]
+            for directory in (PROMPTS, PROMPTS / "v0")
+        ]
+        check(f"{name}: both variants say the same about the quality pass", lines[0] and lines[0] == lines[1])
 
     print("FAIL" if fails else "PASS")
     return 1 if fails else 0

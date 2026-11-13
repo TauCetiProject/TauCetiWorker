@@ -37,6 +37,17 @@ and no inputs changed, existing exact-input evidence remains reusable. Never pus
 **Do this synchronously, in this one turn.** You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
 ## Submit
+- Before you commit: if `.github/pull_request_template.md` in this checkout has a `Quality pass:`
+  block and your changes add or change declarations, run its checks over those and update the
+  matching lines of the block in the PR description, leaving the rest of the description as it
+  is: write `gh pr view __PR__ --repo TauCetiProject/TauCeti --json body --jq .body` to a file
+  outside the checkout, edit it, then run
+  `gh pr edit __PR__ --repo TauCetiProject/TauCeti --body-file <file>`. Answer a `quality-pass`
+  finding the same way: run the checks it names (all of them when the block is missing) and fix
+  or add the block. If the description is all you changed, there is nothing to commit: reply on
+  the finding's thread (as above) saying what you ran and updated, because an edit to the
+  description alone starts no re-review. If the template has no such block, the branch predates
+  the quality pass: skip this step.
 - Commit the fixes (message `<type>: <subject>`, imperative present; end the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
 - Push with the project's safe wrapper — and ONLY the wrapper:
   ```

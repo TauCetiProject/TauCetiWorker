@@ -16,7 +16,7 @@ __EXTRA_ROADMAP_PROMPT__## Choose a target
 - **Read the rubrics before you write any Lean. This is a required step, not background
   reading.** Every rubric your PR is judged against is concatenated read-only into one file at
   `__RUBRICS__` — scope, correctness, reuse, attribution, api-design, generality, placement,
-  naming, documentation, proof-quality — with the shared protocol first. Read it in full; it is
+  naming, documentation, proof-quality, quality-pass — with the shared protocol first. Read it in full; it is
   a few thousand tokens and the cheapest thing you will do this round. Every rubric must pass
   before the PR can merge, and anything you get right now saves a whole fix-and-re-review
   cycle later. They are written **to the reviewers, not to you**: use their criteria as your
@@ -66,6 +66,11 @@ from `__RUBRICS__` — the angles that most often send a PR back:
 - **`generality`** — is any hypothesis stronger than the proof actually uses, and is any
   statement proved at a level a caller cannot instantiate?
 
+Then, if `.github/pull_request_template.md` in this checkout has a `Quality pass:` block, run
+the quality pass: the block's checks, which the `quality-pass` rubric holds your report of. Run
+each over every declaration you added or changed, fix what it finds, and fill in the block's
+lines, one per check, for the PR body.
+
 Make only fixes you can justify against a rubric. Do NOT broaden the PR, add speculative
 generality, or invent findings to look diligent: scope is itself a rubric, and a sound small PR
 beats a padded one. If nothing needs changing, say so and move on. Then verify, once:
@@ -93,7 +98,7 @@ You author from **your own fork** of TauCetiProject/TauCeti (`__FORK__/TauCeti`)
   ```
   "__BIN__/gh-safe-pr-create" --repo TauCetiProject/TauCeti --base main --head __FORK__:roadmap/<short-slug>-__WORKERID__ --title "feat: <subject>" --body-file <file>
   ```
-  Do NOT run a raw `gh pr create`. The PR body opens with a paragraph beginning "This PR …" in imperative present, cites the exact roadmap target, includes a standalone `Roadmap: <target-roadmap>` line (using the canonical top-level directory, never `any`), and, after an upstream switch, a standalone `Consumer roadmap: <designated-roadmap>` line plus the explicit dependency edge. It **includes the `<!--tauceti-target:v1 …-->` marker from the claim step** (the wrapper rejects the PR without it), names any Mathlib infrastructure you vendored (with attribution), has no section headings, and ends with `🤖 Prepared with __AGENT__`. Title `feat: <subject>`.
+  Do NOT run a raw `gh pr create`. The PR body opens with a paragraph beginning "This PR …" in imperative present, cites the exact roadmap target, includes a standalone `Roadmap: <target-roadmap>` line (using the canonical top-level directory, never `any`), and, after an upstream switch, a standalone `Consumer roadmap: <designated-roadmap>` line plus the explicit dependency edge. When `.github/pull_request_template.md` has a `Quality pass:` block, the body carries it completed, one line per check in the template's format (the block is a line and a list, not a heading). It **includes the `<!--tauceti-target:v1 …-->` marker from the claim step** (the wrapper rejects the PR without it), names any Mathlib infrastructure you vendored (with attribution), has no section headings, and ends with `🤖 Prepared with __AGENT__`. Title `feat: <subject>`.
 
 ## Report a submitted PR
 After opening a PR, end with a concise summary: the target and target roadmap you chose, the designated milestone it serves, why it was the most effective current step towards that milestone, the file(s) added and line count, the PR number/URL, the rubrics you read, and what your own review of the diff found and changed. Quote the `scope:` line and state that the build and audit you ran were local checks, not CI; CI verifies the pushed PR.

@@ -845,6 +845,8 @@ def _mutation_cursor():
 
 
 def _round_mutated(c: Candidate, pre: dict) -> str | None:
+    """What this round published on its PR, from the mutation journal: "closure", "reply",
+    "description-reply" (it replaced the PR description and replied on a thread), or None."""
     cursor, round_id = pre.get("mutation_cursor"), pre.get("round_id")
     if not cursor or not round_id:
         return None
@@ -858,7 +860,7 @@ def _round_mutated(c: Candidate, pre: dict) -> str | None:
             data = stream.read(4 * 1024 * 1024 + 1)
         if len(data) > 4 * 1024 * 1024 or data and not data.endswith(b"\n"):
             return None
-        publication = None
+        publications = set()
         for line in data.splitlines():
             event = json.loads(line)
             if not isinstance(event, dict):
@@ -869,14 +871,29 @@ def _round_mutated(c: Candidate, pre: dict) -> str | None:
                 and event.get("repository") == TAUCETI
                 and event.get("pr") == c.pr
                 and event.get("activity") == "github_mutation"
-                and event.get("publication") in ("reply", "closure")
+                and event.get("publication") in ("reply", "closure", "description")
             ):
                 if event["publication"] == "closure":
                     return "closure"
-                publication = "reply"
-        return publication
+                publications.add(event["publication"])
+        if publications >= {"reply", "description"}:
+            return "description-reply"
+        return "reply" if "reply" in publications else None
     except (OSError, ValueError, TypeError):
         return None
+
+
+def _description_repaired(w: Worker, c: Candidate, pre: dict, st: dict) -> bool | None:
+    """Whether a round that pushed nothing replaced the PR description and replied, read from the PR.
+
+    The journal that records the same is optional and best effort, so it cannot be what completes a
+    final attempt. The PR shows the repair as an edit time that moved and a comment that was added;
+    the source then says whether both are this account's. A reply alone, an edit alone and a peer's
+    writes are still no progress, and so is a source that reports no edit time."""
+    if "edited" not in pre or st.get("edited") in (None, pre["edited"]) or st["ncomments"] <= pre["ncomments"]:
+        return False
+    repair = getattr(w.gh, "pr_description_repair", None)
+    return repair(c.pr, pre["edited"], pre["ncomments"]) if repair else False
 
 
 def _progressed(w: Worker, c: Candidate, pre: dict | None) -> bool | None:
@@ -900,14 +917,17 @@ def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool | None
         if pre.get("published"):
             return True
         mutated = _round_mutated(c, pre)
-        if mutated == "closure" or mutated == "reply" and not pre.get("require_push"):
+        # A finding that only the PR description can answer (a quality-pass report) leaves no source
+        # change to push. Replacing the description and replying on its thread is that repair, so it
+        # completes even a final attempt; a reply alone still does not.
+        if mutated in ("closure", "description-reply") or mutated == "reply" and not pre.get("require_push"):
             return True
         st = w.gh.pr_progress_state(c.pr)
         if st is None:
             return None
         closed = st.get("state") in {"CLOSED", "MERGED"} and pre.get("state") not in {"CLOSED", "MERGED"}
         if pre.get("require_push") and (st["head"] or "") == pre["head"] and not closed:
-            return False
+            return _description_repaired(w, c, pre, st)
         if (st["head"] or "") != pre["head"] or closed or st["ncomments"] > pre["ncomments"]:
             # Bubble has no host-visible push markers. Its current baseline is
             # taken after the branch claim; unclaimed work stays unattributed.
@@ -2008,12 +2028,7 @@ def _do_fixlike(
         ),
     )
     if getattr(c, "final_resolution", False) and may_close:
-        prompt += (
-            "\nThis is the last permitted per-head repair attempt. "
-            "Check the current rubric and actual source, then repair and push or close this PR "
-            "with the unresolved finding and a useful explanation for a fresh attempt. "
-            "A comment alone does not complete this attempt; confirm a push or closure.\n"
-        )
+        prompt += FINAL_ATTEMPT_INSTRUCTION
     if getattr(p, "automatic_bump", False):
         deadline = getattr(getattr(w, "rc", None), "deadline", time.time() + ROUND_TIMEOUT)
         prompt += (
@@ -2233,6 +2248,18 @@ def _do_fixlike(
         # provider later fails. Do not turn its scope into repeated paid tasks.
         _refund_infra_failure(w, c, label, charged)  # raises NoProgress when the provider was at fault
     return rc
+
+
+# Appended to the last per-head repair prompt of an owned PR (see _progressed_direct for the rule).
+FINAL_ATTEMPT_INSTRUCTION = (
+    "\nThis is the last permitted per-head repair attempt. "
+    "Check the current rubric and actual source, then repair and push or close this PR "
+    "with the unresolved finding and a useful explanation for a fresh attempt. "
+    "A comment alone does not complete this attempt; confirm a push or closure. "
+    "The one exception is a finding that only the PR description can answer, such as a "
+    "`quality-pass` report: there, update the description and reply on the finding's thread, "
+    "and that completes the attempt.\n"
+)
 
 
 def _close_spent_pr(w, sv, c) -> int | None:
