@@ -450,7 +450,16 @@ class Verification:
                             data = progress.read()
                             offset += len(data)
                             if data:
-                                print(data.decode(errors="replace"), file=sys.stderr, end="", flush=True)
+                                decoded = data.decode(errors="replace")
+                                print(decoded, file=sys.stderr, end="", flush=True)
+                                from .verification_resources import RESOURCE_ERROR, record_wait
+
+                                if RESOURCE_ERROR.search(decoded):
+                                    record_wait("build tool could not create threads; host resource exhaustion")
+                                    raise Incomplete(
+                                        "build tool resource exhaustion; preserve candidate and retry after backoff",
+                                        reason="resource-pressure",
+                                    )
                     self.watch()
                     if capture and time.time() - entry["started_at"] > 300:
                         raise Incomplete(f"{phase}: toolchain probe timed out")
@@ -467,6 +476,14 @@ class Verification:
                 self.save()
         text = log.read_text(errors="replace")
         captured_text = stdout_path.read_text(errors="replace")
+        from .verification_resources import RESOURCE_ERROR, record_wait
+
+        if entry["exit"] and RESOURCE_ERROR.search(text):
+            record_wait("build tool could not create threads; host resource exhaustion")
+            raise Incomplete(
+                "build tool resource exhaustion; preserve candidate and retry after backoff", reason="resource-pressure"
+            )
+
         if capture:
             entry["stdout_log"] = str(stdout_path)
         # Keep the original audit progress/timing lines verbatim in the receipt and full log.

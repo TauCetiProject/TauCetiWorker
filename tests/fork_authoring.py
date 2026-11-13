@@ -137,6 +137,7 @@ def test_fixlike():
     cap = {}
     tc.work_units.run_in_bubble = lambda w, target, prompt, opts, **k: cap.update(target=target, **k) or 0
     w = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(state=Path(tempfile.gettempdir()) / "fork-authoring-test"),
         claims=types.SimpleNamespace(begin_branch_work=lambda *a: True),
         rs=types.SimpleNamespace(bust=lambda *a: None),
         gh=types.SimpleNamespace(pr_progress_state=lambda _: None, pr_view=lambda *_: None),
