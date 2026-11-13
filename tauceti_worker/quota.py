@@ -2120,14 +2120,19 @@ class Quota:
     def _codex_launch_dirs(self) -> list[Path]:
         """Every directory the worker starts Codex from on this host: the checkout (authoring, repair,
         overlap fixes), the state directory (the model-access probe), recovery checkouts, and the fresh
-        directories made per launch for the progress writer, a new recovery and the security audit,
-        each represented by a not-yet-existing child of the directory it is made in."""
+        directories made per launch for the progress writer, an overlap scan, a new recovery and the
+        security audit, each represented by a not-yet-existing child of the directory it is made in."""
         dirs = []
         if (checkout := getattr(self.cfg, "checkout", None)) is not None:
             dirs.append(Path(checkout))
         if (state := getattr(self.cfg, "state", None)) is not None:
             state = Path(state)
-            dirs += [state, state / "progress/writing/writer-", state / "recovery/record-/checkout"]
+            dirs += [
+                state,
+                state / "progress/writing/writer-",
+                state / "overlap-runs/run-",
+                state / "recovery/record-/checkout",
+            ]
             try:
                 dirs += [record / "checkout" for record in (state / "recovery").iterdir()]
             except FileNotFoundError:

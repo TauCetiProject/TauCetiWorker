@@ -500,6 +500,7 @@ for name, files, want in (
     ("the progress-writing directory itself", {**BOTH, "state/progress/writing/.codex/config.toml": KEYRING}, 0),
     ("an ancestor of the state directory", {**BOTH, "state/.codex/config.toml": KEYRING}, 0),
     ("a recovery checkout", {**BOTH, "state/recovery/r1/checkout/.codex/config.toml": KEYRING}, 0),
+    ("the overlap-scan directory", {**BOTH, "state/overlap-runs/.codex/config.toml": KEYRING}, 0),
     (
         "an ancestor of the checkout under configured markers",
         {
@@ -519,6 +520,14 @@ for name, files, want in (
     try:
         exchanges = renews_with(tmp, files, plan="business", checkout="outer/checkout")
         check(f"project layers, {name}: exchanges", exchanges, want)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        exchanges = renews_with(
+            tmp, files, plan="plus", checkout="outer/checkout", expires_in=5 * DAY, first=UNAUTHORIZED
+        )
+        check(f"project layers, {name}, 401 path: exchanges", exchanges, want)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
