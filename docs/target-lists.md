@@ -189,7 +189,8 @@ look ran is kept; if both changed the same or adjacent lines nothing is written
 and the next look starts from the new file. A model verdict is written only if the list's preamble and the
 item's line are still as the agent was given them, and in a tracked list only
 if that look also pushes it, after any rebase, onto a list where they still are;
-otherwise its commit is taken back and the next look asks again. The file is
+otherwise the commit is undone, leaving any other edit it
+held uncommitted in the file, and the next look asks again. The file is
 replaced by a rename.
 
 When the list is tracked in a git repository, the worker also runs git in that

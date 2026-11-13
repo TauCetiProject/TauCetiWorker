@@ -470,6 +470,24 @@ class Publish(Tmp):
         self.assertEqual(curate.publish(first, EXAMPLE, plain, ["n"]), plain)
         self.assertEqual(git(first.parent, "rev-list", "--count", "@{upstream}..HEAD"), "1")
 
+    def test_taking_back_an_unpushed_verdict_keeps_the_operators_uncommitted_edits(self):
+        first = self.clone("first")
+        by_hand = (
+            EXAMPLE.replace("Goal: the strong law", "Goal: the weak law")
+            + "- [ ] `applications` — x (needs: `strong-law`)\n"
+        )
+        first.write_text(by_hand)
+        listed = t.parse_targets(by_hand)
+        item = listed.find("kolmogorov-zero-one")
+        ticked = t.rewrite_item(by_hand, item, "done", add=("landed elsewhere: A.lean a_b",))
+        hook = first.parent / ".git" / "hooks" / "post-commit"
+        hook.write_text("#!/bin/sh\ngit remote set-url --push origin /nonexistent/remote.git\n")
+        hook.chmod(0o755)
+        self.assertIsNone(curate.publish(first, by_hand, ticked, ["n"], still=curate._unchanged(first, listed, [item])))
+        self.assertEqual(first.read_text(), by_hand)
+        self.assertEqual(git(first.parent, "rev-list", "--count", "@{upstream}..HEAD"), "0")
+        self.assertEqual(git(first.parent, "status", "--porcelain"), "M targets.md")
+
     def test_a_push_that_loses_the_race_is_retried_after_a_rebase(self):
         first, second = self.clone("first"), self.clone("second")
         a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")

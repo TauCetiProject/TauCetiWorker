@@ -521,9 +521,14 @@ def publish(path: Path, base: str, ours: str, notes: list[str], *, still=None) -
     if tracked and not _push(path, still) and still is not None and merged != theirs:
         # A verdict is published in the look that made it or not at all: a later push could carry
         # it onto a goal or item line it was never given.
-        if _git(path, "reset", "-q", "--keep", "HEAD~1").returncode != 0:
+        # The commit can also hold the operator's uncommitted edits, so only this look's edit is
+        # taken out of the file, which stays uncommitted.
+        undone = merge3(ours, path.read_text(), base)
+        if undone is None or _git(path, "reset", "-q", "--soft", "HEAD~1").returncode != 0:
             log(f"curate: the unpushed verdict commit in {path.parent} could not be taken back; remove it by hand")
         else:
+            _git(path, "reset", "-q", "HEAD", "--", path.name)
+            _write(path, undone)
             log("curate: the verdicts were taken back; the next look asks again")
         return None
     return merged
