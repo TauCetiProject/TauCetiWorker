@@ -372,3 +372,121 @@ with (
     value = json.loads(path.read_text())
     assert value["status"] == "rejected" and value["retry_at"] >= time.time() + 295
     assert not getattr(rejected, "github_permanent_failure", False)
+
+# A description edit whose acknowledgement was lost is settled from the live description, so its PR
+# does not wait for manual recovery. A fix round that answers a quality-pass finding makes this edit.
+with (
+    tempfile.TemporaryDirectory() as tmp,
+    patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": tmp, "GH_TOKEN": "description-fixture"}),
+):
+    env = dict(os.environ)
+    text = "This PR proves foo.\n\nQuality pass:\n- Q1 Mathlib duplicates: checked — none\n"
+    report = Path(tmp) / "body.md"
+    lost = subprocess.CompletedProcess([], 1, "", "connection reset")
+
+    def description(body, edited):
+        pull = {"body": body, "lastEditedAt": edited}
+        return subprocess.CompletedProcess([], 0, json.dumps({"data": {"repository": {"pullRequest": pull}}}), "")
+
+    def stamp(offset):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + offset))
+
+    def retained(*form):
+        """An edit of PR 7's description that was sent and never acknowledged."""
+        report.write_text(text)
+        edit = ["gh", "pr", "edit", "7", "--repo", "org/repo", *form]
+        path = outbox.prepare(edit, env, tmp)
+        report.unlink()  # the round removes its files
+        outbox.finish(path, lost, [])
+        assert json.loads(path.read_text())["status"] == "ambiguous"
+        assert json.loads(path.read_text())["context"]["body"] == text, form
+        assert outbox.pending_for("org/repo", 7, env)
+        return path
+
+    # GitHub applied it: one read, nothing sent again, and later work on the PR may proceed.
+    for form in (
+        ["--body-file", str(report)],
+        ["-F", str(report)],
+        ["--body-file=" + str(report)],
+        ["--body", text],
+        ["-b", text],
+        ["--body=" + text],
+    ):
+        path = retained(*form)
+        applied = description(text.replace("\n", "\r\n"), stamp(0))
+        with patch.object(tr, "execute", return_value=applied) as read:
+            assert outbox.drain(env) == [] and not path.exists(), form
+            assert read.call_count == 1 and read.call_args.args[0][1:3] == ["api", "graphql"]
+        assert not outbox.pending_for("org/repo", 7, env)
+
+    # GitHub never applied it: the edit is sent again, from the copy kept of the file.
+    for form, edited in (
+        (["--body-file", str(report)], None),
+        (["-F", str(report)], "2020-01-01T00:00:00Z"),
+        (["--body-file=" + str(report)], stamp(-3600)),
+    ):
+        path = retained(*form)
+        sent = []
+
+        def unapplied(args, edited=edited, sent=sent, **_kwargs):
+            if args[1:3] == ["api", "graphql"]:
+                return description("This PR proves foo.", edited)
+            name = next(a for a in reversed(args) if "body" in a or a.endswith(".body"))
+            sent.append(Path(name.removeprefix("--body-file=")).read_text())
+            return subprocess.CompletedProcess(args, 0, "{}", "")
+
+        with patch.object(tr, "execute", side_effect=unapplied):
+            assert outbox.drain(env) == [] and not path.exists(), form
+        assert sent == [text] and not outbox.pending_for("org/repo", 7, env), form
+        assert not list(outbox.directory(env).glob("*.body"))
+
+    # A later edit left other text there: this one is set aside, never replayed over it.
+    path = retained("--body-file", str(report))
+    with patch.object(tr, "execute", return_value=description("A newer description.", stamp(30))) as read:
+        assert outbox.drain(env) == [] and not path.exists() and path.with_suffix(".failed").exists()
+        assert read.call_count == 1
+    assert not outbox.pending_for("org/repo", 7, env)
+
+    # An unreadable description settles nothing; the intent is kept and its PR still waits.
+    path = retained("--body-file", str(report))
+    value = json.loads(path.read_text())
+    for unread in (
+        subprocess.CompletedProcess([], 1, "", "timeout"),
+        subprocess.CompletedProcess([], 0, "not json", ""),
+        subprocess.CompletedProcess([], 0, json.dumps({"data": {"repository": {"pullRequest": None}}}), ""),
+    ):
+        with patch.object(tr, "execute", return_value=unread):
+            assert outbox.reconcile(value, env) is None
+    with patch.object(tr, "execute", return_value=unread):
+        assert outbox.drain(env) == [path.stem] and path.exists()
+    assert outbox.pending_for("org/repo", 7, env)
+    for live, expected in (
+        (description(text, None), True),
+        (description(None, None), False),
+        (description("other", stamp(-3600)), False),
+        (description("other", stamp(-120)), "superseded"),  # within the allowance for clock skew
+        (description("other", stamp(120)), "superseded"),
+    ):
+        with patch.object(tr, "execute", return_value=live):
+            assert outbox.reconcile(value, env) == expected, (live.stdout, expected)
+    path.unlink()
+
+    # Labels and titles are separate writes: an edit that carries one is not settled by its text,
+    # and an edit with no description is as it was.
+    for extra in (["--add-label", "self-tested"], ["--title", "A title"], ["-t", "A title"], ["--base", "main"]):
+        compound = {
+            "argv": ["pr", "edit", "7", "--repo", "org/repo", "--body", text, *extra],
+            "context": {"body": text},
+        }
+        with patch.object(tr, "execute") as read:
+            assert outbox.reconcile(compound, env) is None, extra
+            read.assert_not_called()
+    label = {"argv": ["pr", "edit", "7", "--repo", "org/repo", "--add-label", "self-tested"], "context": {}}
+    with patch.object(tr, "execute") as read:
+        assert outbox.reconcile(label, env) is None
+        read.assert_not_called()
+    assert outbox.description_edit(["pr", "edit", "7", "-R", "org/repo", "--body", "- starts with a dash"])
+    assert outbox.description_edit(["pr", "edit", "https://github.com/org/repo/pull/7", "--repo=org/repo", "-b", "x"])
+    assert not outbox.description_edit(["pr", "edit", "7", "--repo", "org/repo"])
+    assert not outbox.description_edit(["pr", "comment", "7", "--body", "x"])
+print("PASS: description edits are reconciled against the live description")

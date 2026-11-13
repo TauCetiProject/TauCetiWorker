@@ -146,7 +146,7 @@ def prepare(argv, env, cwd=None, input=None):
     asset_fields = {}
     # Snapshot transient body/input files before the paid round cleans its working directory.
     for i, arg in enumerate(args[:-1]):
-        if arg in ("--body-file", "--input") or (arg == "-F" and args[:2] == ["pr", "create"]):
+        if arg in ("--body-file", "--input") or (arg == "-F" and args[:2] in (["pr", "create"], ["pr", "edit"])):
             source = Path(args[i + 1])
             if not source.is_absolute():
                 source = Path(cwd or os.getcwd()) / source
@@ -160,6 +160,15 @@ def prepare(argv, env, cwd=None, input=None):
             if source.is_file():
                 assets[str(i + 1)] = source.read_text()
                 asset_fields[str(i + 1)] = field + "=@"
+    for i, arg in enumerate(args):
+        # The one-word form of a description edit's file, retained with its flag.
+        if arg.startswith("--body-file=") and args[:2] == ["pr", "edit"]:
+            source = Path(arg.split("=", 1)[1])
+            if not source.is_absolute():
+                source = Path(cwd or os.getcwd()) / source
+            if source.is_file():
+                assets[str(i)] = source.read_text()
+                asset_fields[str(i)] = "--body-file="
     context = {}
     context["repository"] = _flag(args, "--repo", "-R")
     context["pr"] = env.get("TAUCETI_GITHUB_PR") or None
@@ -202,7 +211,8 @@ def prepare(argv, env, cwd=None, input=None):
             body = assets.get(str(i), arg[5:])
     body_file = _flag(args, "--body-file", "-F") if args[:1] == ["pr"] else None
     if body_file:
-        body = next((assets[str(i)] for i, arg in enumerate(args) if arg == body_file and str(i) in assets), body)
+        named = (body_file, "--body-file=" + body_file)
+        body = next((assets[str(i)] for i, arg in enumerate(args) if arg in named and str(i) in assets), body)
         if body_file == "-":
             body = input
     if body == "@-":
@@ -464,6 +474,24 @@ def same_body(left, right):
     )
 
 
+def description_edit(args):
+    """A `gh pr edit` that replaces the PR description and changes nothing else."""
+    if args[:2] != ["pr", "edit"]:
+        return False
+    replaces, rest = False, iter(args[2:])
+    for arg in rest:
+        if arg in ("--body", "-b", "--body-file", "-F"):
+            replaces = True
+            next(rest, None)
+        elif arg.startswith(("--body=", "--body-file=")):
+            replaces = True
+        elif arg in ("--repo", "-R"):
+            next(rest, None)
+        elif arg.startswith("-") and not arg.startswith("--repo="):
+            return False  # labels, title and the rest are separate writes
+    return replaces
+
+
 def _report_mutation(value, result):
     try:
         from .fleet_events import mutation
@@ -531,6 +559,35 @@ def reconcile(value, env):
             ):
                 return "obsolete"
             return False if live.get("state") == "open" else None
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None
+    if args[:2] == ["pr", "edit"]:
+        # Only an edit of the description alone. A compound edit writes its labels and other
+        # fields separately, so it may have applied in part and stays for inspection.
+        body = value.get("context", {}).get("body")
+        if not repo or not number or not isinstance(body, str) or not description_edit(args):
+            return None
+        owner, _, name = repo.partition("/")
+        query = (
+            "query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name)"
+            "{pullRequest(number:$pr){body lastEditedAt}}}"
+        )
+        fields = ["-F", "owner=" + owner, "-F", "name=" + name, "-F", f"pr={number}"]
+        with tr.read_context(fresh=True, direct=True):
+            result = tr.execute(["gh", "api", "graphql", "-f", "query=" + query, *fields], env=replay)
+        if result.returncode:
+            return None
+        try:
+            live = json.loads(result.stdout)["data"]["repository"]["pullRequest"]
+            if same_body(live["body"] or "", body):
+                return True
+            edited = live["lastEditedAt"]
+            if edited is None:
+                return False  # never edited, so not by this intent either
+            # The description is not this intent's. If it was edited after the intent was written,
+            # a later description stands and a replay would put an old one back over it.
+            when = datetime.datetime.fromisoformat(edited.replace("Z", "+00:00")).timestamp()
+            return "superseded" if when >= int(value.get("created", 0)) - 300 else False
         except (ValueError, KeyError, TypeError, AttributeError):
             return None
     endpoint = None
@@ -750,6 +807,9 @@ def drain(env=None):
                     continue
                 if applied == "obsolete":
                     archive(path, value, "Recorded PR head, ownership or pause changed; closure not replayed")
+                    continue
+                if applied == "superseded":
+                    archive(path, value, "A later edit replaced the PR description; this one was not replayed")
                     continue
                 if applied == "permanent_failure":
                     archive(path, value, "Review-thread resolution unavailable for this account or target")
