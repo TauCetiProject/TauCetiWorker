@@ -224,7 +224,7 @@ def landed(items: Iterable[TargetItem], merged: Iterable[dict]) -> dict[Key, int
     excused = {(it.area, it.slug): partial_prs(it) for it in items}
     urls = {
         (it.area, it.slug): {
-            ref_key(u) for u in re.findall(r"https?://[^\s,;]+", " ".join(c for c in it.meta if _is_partial(c)))
+            ref_key(u) for u in re.findall(r"https?://[^\s,;]+", " ".join(c for c in it.meta if _is_partial(c)), re.I)
         }
         for it in items
     }
