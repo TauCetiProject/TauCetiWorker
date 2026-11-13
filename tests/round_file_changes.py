@@ -322,9 +322,12 @@ def main():
                 check(method + " is not a new reply", tc.work_units._round_mutated(candidate, baseline) is None)
 
             def record(created, argv, round_id="this-round"):
+                # The journal takes an action's round from the command's own context.
+                context = {"activity": {"round_id": round_id}}
                 with patch.dict(os.environ, TAUCETI_ACTIVITY_ROUND_ID=round_id):
                     fleet_events.mutation(
-                        command | {"created": created, "argv": argv}, types.SimpleNamespace(stdout="")
+                        command | {"created": created, "argv": argv, "context": context},
+                        types.SimpleNamespace(stdout=""),
                     )
 
             edit = ["pr", "edit", "1", "--repo", "TauCetiProject/TauCeti", "--body-file", "/tmp/body.md"]
