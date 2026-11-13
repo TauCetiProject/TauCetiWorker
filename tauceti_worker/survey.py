@@ -908,7 +908,18 @@ def survey(
     # reads no review state at all and its callers need not supply one.
     if rs is not None:
         rs.observe(prs)
-    classify_survey(cfg, gh, rs, counters, sv, enabled=enabled, deep=deep, compact=compact, cached_only=cached_only)
+    classify_survey(
+        cfg,
+        gh,
+        rs,
+        counters,
+        sv,
+        enabled=enabled,
+        deep=deep,
+        compact=compact,
+        cached_only=cached_only,
+        allow_queue_owned=bool(numbers),
+    )
     if deep:
         from .github_transport import event
 
@@ -941,6 +952,7 @@ def classify_survey(
     review_without_ci=False,
     supports_external_repair=True,
     pending=None,
+    allow_queue_owned=False,
 ):
     """One scheduling policy over normalized inventory and source capabilities.
 
@@ -979,6 +991,7 @@ def classify_survey(
         for p in nondraft
         if (sv.owns(p) or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER))
         and not {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
+        and (allow_queue_owned or "bors-staging" not in {label.lower() for label in p.labels})
     ]
     facts = {row["pr"]["number"]: row["review"] for row in compact or []}
     gaps: set[int] = set()

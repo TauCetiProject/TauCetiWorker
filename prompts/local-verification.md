@@ -27,5 +27,9 @@ After a failure, rerun the failing phase (`sources`, `axioms`, `module-system`, 
 `environment` or `shim-expiry`) as needed; `lake build --iofail` is the build command. Repeat
 successful checks only if their inputs changed. Preserve unfinished work at the round deadline.
 
+If verification reports resource exhaustion or exits 75, stop retrying in this round. Preserve
+your changes; the worker will retain them and retry with backoff. Do not edit mathematics to
+fix host resource failures, and never describe deferred verification as green.
+
 In your report quote the `scope:` and `local-axioms:` results and describe the verification as
 local checks, not CI. A full CI scope policy never means a full local axiom audit ran.
