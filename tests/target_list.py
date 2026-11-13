@@ -509,14 +509,14 @@ class ForgejoIdentity(unittest.TestCase):
         self.source.writable_repository.assert_called_once_with()
 
     def test_a_partial_url_matches_whatever_its_case(self):
-        listed = t.parse_targets(
-            "<!-- tauceti-targets:v1 -->\n## Algebra\n"
-            "- [ ] `a` — x (partial: https://git.example.org/One/Project/pulls/5)\n- [ ] `b` — y (needs: a)\n"
-        )
-        self.closed = [[self.pull(5, marker("Algebra", "a"))]]
-        live = t.live_targets(listed, self.source)
-        self.assertEqual(status(live), {"a": "open", "b": "open"})
-        self.assertEqual([it.slug for it in t.eligible_items(live, "Algebra")], ["a"])
+        for url in ("https://git.example.org/One/Project/pulls/5", "HTTPS://GIT.EXAMPLE.ORG/ONE/PROJECT/pulls/5"):
+            listed = t.parse_targets(
+                f"<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — x (partial: {url})\n- [ ] `b` — y (needs: a)\n"
+            )
+            self.closed = [[self.pull(5, marker("Algebra", "a"))]]
+            live = t.live_targets(listed, self.source)
+            self.assertEqual(status(live), {"a": "open", "b": "open"}, url)
+            self.assertEqual([it.slug for it in t.eligible_items(live, "Algebra")], ["a"])
 
     def test_spaced_marker_json_still_counts_as_a_landing(self):
         spaced = '<!--tauceti-target:v1 {"focus": "Algebra", "id": "old"}-->'
