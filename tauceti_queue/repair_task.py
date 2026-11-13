@@ -1260,6 +1260,40 @@ def artifact_revisions(task: Task) -> list[str]:
     return revisions
 
 
+@contextlib.contextmanager
+def artifact_checkout(worktree: Path, task: Task, start_tip: str):
+    """Prepare changed rebase dependencies on the target, then restore the agent's input chain.
+
+    Lake populates the same private .lake directory for both checkouts. This hydrates
+    new dependency Git objects before verification loses network access.
+    """
+    changed = (
+        task.kind in repair.REBASE_KINDS
+        and task.onto != start_tip
+        and git(
+            worktree,
+            "diff",
+            "--name-only",
+            start_tip,
+            task.onto,
+            "--",
+            "lake-manifest.json",
+            "lean-toolchain",
+            "lakefile.toml",
+            "lakefile.lean",
+        ).strip()
+    )
+    if not changed:
+        yield
+        return
+    log(f"task {task.task_id}: preparing dependencies on rebase target {task.onto[:12]}")
+    git(worktree, "checkout", "--quiet", "--force", "--detach", task.onto)
+    try:
+        yield
+    finally:
+        git(worktree, "checkout", "--quiet", "--force", "--detach", start_tip)
+
+
 HEAD_KINDS = ("repair", "rebase_conflict")  # the head's own tasks, which warm from the head's tips
 
 
@@ -2143,21 +2177,22 @@ def _run_task(
                 repair.link_shared_packages(worktree, cfg.seed_packages)
             state.write("sources_ready", worktree=str(worktree), sources=outcome["sources"])
             revisions = artifact_revisions(task)
-            artifacts = repair.prepare_artifacts(
-                worktree,
-                revisions[0],
-                env_lake,
-                logdir,
-                cfg.build_timeout,
-                repository=task.repository,
-                fallbacks=tuple(revisions[1:]),
-                ancestors=ARTIFACT_ANCESTORS,
-                mathlib_cache=cfg.mathlib_cache and cfg.seed_packages is None,
-                lake=cfg.lake,
-                preferred=repair_publish.preferred(cfg.publish, task),
-                warm=repair_publish.warm(cfg.publish, task),
-                build=not streaming and not known_checks and task.kind not in repair.REBASE_KINDS,
-            )
+            with artifact_checkout(worktree, task, start_tip):
+                artifacts = repair.prepare_artifacts(
+                    worktree,
+                    revisions[0],
+                    env_lake,
+                    logdir,
+                    cfg.build_timeout,
+                    repository=task.repository,
+                    fallbacks=tuple(revisions[1:]),
+                    ancestors=ARTIFACT_ANCESTORS,
+                    mathlib_cache=cfg.mathlib_cache and cfg.seed_packages is None,
+                    lake=cfg.lake,
+                    preferred=repair_publish.preferred(cfg.publish, task),
+                    warm=repair_publish.warm(cfg.publish, task),
+                    build=not streaming and not known_checks and task.kind not in repair.REBASE_KINDS,
+                )
             if artifacts.get("warm_attempts"):
                 warmed = artifacts.get("warmed_from") or []
                 missing = [a["revision"][:12] for a in artifacts["warm_attempts"] if not a["mapping_found"]]

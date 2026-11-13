@@ -168,6 +168,7 @@ try:
         roadmap_extra_identities=("Maintainer",),
         respect_claims=False,
         extra_roadmap_prompt="Work on the material relevant to Higher Topos Theory",
+        self_tested=True,
         source="https://example.invalid/source",
         author_model="gpt-5",
         author_effort="high",
@@ -178,6 +179,21 @@ try:
     parsed = build_parser().parse_args(maximal.work_argv()[3:])
     assert parsed.cmd == "work" and parsed.worker_id == "maximal"
     assert parsed.auto_refresh is True
+    assert parsed.self_tested is True
+    assert wm.WorkerSpec.from_dict({"id": "attest", "self_tested": True}, 0).as_dict()["self_tested"] is True
+    before = wm.WorkerSpec(id="attest").as_dict()
+    desired = wm.WorkerSpec(id="attest", self_tested=True)
+    assert wm._defer_read_policy_reload(desired, {"applied_spec": before, "state": "running"})
+    assert not wm._defer_read_policy_reload(
+        desired,
+        {
+            "applied_spec": before,
+            "state": "idle",
+            "next_action_at": time.time() + 30,
+        },
+    )
+    assert "--self-tested" not in wm.WorkerSpec(id="plain").work_argv()
+    assert build_parser().parse_args(["work", "--no-self-tested"]).self_tested is False
     # A worker that has NOT opted in must not emit the flag: the default is to leave the operator's
     # single-use refresh token alone.
     assert "--auto-refresh" not in wm.WorkerSpec(id="plain").work_argv()
