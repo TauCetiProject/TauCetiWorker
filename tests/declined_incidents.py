@@ -301,6 +301,7 @@ def test_prompt(root):
     raw = {**pr(20, conflicting=True), "labels": []}
     w = SimpleNamespace(
         gh=gh,
+        cfg=SimpleNamespace(state=root),
         claims=SimpleNamespace(begin_branch_work=lambda *args: True),
         rs=SimpleNamespace(bust=lambda *args: None),
     )
