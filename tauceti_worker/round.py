@@ -71,6 +71,11 @@ class RoundContext:
                     log(f"retention: recycled {result.get('removed_count', len(result['removed']))} generated paths")
             except Exception as error:
                 log(f"retention: cache recycling deferred: {error}")
+            from .retention import request_cleanup
+
+            # Every run mode passes here (one-off rounds, --loop, Docker, managed workers), so the
+            # collector reaches hosts without an installed service, at most hourly.
+            request_cleanup(fallback=True)
         if self.record_activity:
             from .cache_storage import admit
 

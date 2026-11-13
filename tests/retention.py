@@ -11,6 +11,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -63,6 +64,10 @@ class Retention(unittest.TestCase):
         ):
             item.start()
             self.addCleanup(item.stop)
+        # Rounds start the fallback collector; fixtures must never launch a real one.
+        self.spawn = patch.object(retention, "_fallback_collector")
+        self.fallback = self.spawn.start()
+        self.addCleanup(self.spawn.stop)
         self.git("init", "-q", "-b", "main")
         self.git("config", "user.name", "fixture")
         self.git("config", "user.email", "fixture@example.com")
@@ -1190,6 +1195,92 @@ print('{"result":"kept on protocol stdout"}', flush=True)
         self.assertTrue(entry.exists())
         retention.sweep(now=self.clock)
         self.assertFalse(entry.exists())
+
+    def test_round_start_requests_the_fallback_collector(self):
+        with round_.RoundContext(self.cfg):
+            pass
+        self.fallback.assert_called_once_with(activity.root())
+
+    def test_installed_service_is_preferred_over_the_fallback(self):
+        atomic_json(activity.root() / "cleanup-service.json", dict(installed=True))
+        with patch.object(subprocess, "run") as run:
+            retention.request_cleanup(fallback=True)
+        self.fallback.assert_not_called()
+        self.assertEqual(run.call_args.args[0][-1], "tauceti-cleanup.service")
+
+    def test_demand_without_fallback_never_spawns(self):
+        retention.request_cleanup()
+        self.fallback.assert_not_called()
+
+    def test_fallback_collector_runs_hourly_and_niced(self):
+        directory = activity.root()
+        directory.mkdir(parents=True, exist_ok=True)
+        self.spawn.stop()
+        try:
+            with (
+                patch.object(retention.subprocess, "Popen") as popen,
+                patch.object(retention.time, "time", return_value=50_000),
+                patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": "1"}),
+            ):
+                retention.request_cleanup(fallback=True)
+                retention.request_cleanup(fallback=True)
+            self.assertEqual(popen.call_count, 1)
+            argv, kwargs = popen.call_args.args[0], popen.call_args.kwargs
+            self.assertEqual(argv[-3:], ["tauceti_worker", "cleanup", "--all-data-roots"])
+            if shutil.which("nice"):
+                self.assertEqual(argv[:3], ["nice", "-n", "10"])
+            self.assertTrue(kwargs["start_new_session"])
+            self.assertEqual(kwargs["env"]["TAUCETI_ACTIVITY_DIR"], str(directory))
+            self.assertNotIn("TAUCETI_ROUND_DEADLINE", kwargs["env"])
+            # A completed collector report counts as the last run, even one the timer wrote.
+            atomic_json(directory / "cleanup-fallback.json", dict(started_at=0))
+            atomic_json(directory / "cleanup.json", dict(at=50_000 + 10))
+            with (
+                patch.object(retention.subprocess, "Popen") as again,
+                patch.object(retention.time, "time", return_value=50_000 + retention.FALLBACK_INTERVAL),
+            ):
+                retention.request_cleanup(fallback=True)
+            again.assert_not_called()
+            with (
+                patch.object(retention.subprocess, "Popen") as later,
+                patch.object(retention.time, "time", return_value=50_000 + 10 + retention.FALLBACK_INTERVAL),
+            ):
+                retention.request_cleanup(fallback=True)
+            later.assert_called_once()
+        finally:
+            self.fallback = self.spawn.start()
+
+    def test_macos_open_files_skips_uninspectable_processes(self):
+        held = self.root / "held.lock"
+        held.write_text("")
+
+        class Denied(Exception):
+            pass
+
+        class Process:
+            def __init__(self, uid, files=(), denied=False):
+                self.uid, self.files, self.denied = uid, files, denied
+
+            def uids(self):
+                return SimpleNamespace(real=self.uid)
+
+            def open_files(self):
+                if self.denied:
+                    raise Denied()
+                return [SimpleNamespace(path=str(path)) for path in self.files]
+
+            def cwd(self):
+                return None
+
+        def fake(processes):
+            return SimpleNamespace(process_iter=lambda: iter(processes), Error=Denied, NoSuchProcess=Denied)
+
+        mine = os.getuid()
+        info = held.stat()
+        with patch.dict(sys.modules, {"psutil": fake([Process(mine, [held]), Process(mine, denied=True)])}):
+            self.assertEqual(retention._open_files_psutil(), {(info.st_dev, info.st_ino)})
+        with patch.dict(sys.modules, {"psutil": fake([Process(mine + 1, [held]), Process(mine, denied=True)])}):
+            self.assertIsNone(retention._open_files_psutil())
 
 
 if __name__ == "__main__":

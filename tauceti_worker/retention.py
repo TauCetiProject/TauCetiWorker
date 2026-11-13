@@ -39,7 +39,7 @@ def safe(path, root):
 def open_files():
     """One /proc pass per daily sweep, rather than one pass per old log file."""
     if not Path("/proc/self/fd").is_dir():
-        return None  # Missing observations never mean that diagnostics are unused.
+        return _open_files_psutil() if sys.platform == "darwin" else None
     opened = set()
     for process in Path("/proc").glob("[0-9]*"):
         try:
@@ -50,6 +50,36 @@ def open_files():
         except OSError:
             continue
     return opened
+
+
+def _open_files_psutil():
+    """macOS has no /proc. The locks and logs this protects are held by worker processes, which
+    run as this user and are always inspectable. Some user-level system processes refuse
+    inspection; skipping them is safe because unlinking a file another process holds open
+    cannot disturb it, and treating them as evidence would disable cleanup permanently."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    uid = os.getuid()
+    opened = set()
+    inspected = 0
+    for process in psutil.process_iter():
+        try:
+            if process.uids().real != uid:
+                continue
+            paths = [item.path for item in process.open_files()]
+            with contextlib.suppress(psutil.Error, OSError, TypeError):
+                if cwd := process.cwd():
+                    paths.append(cwd)
+        except (psutil.Error, OSError):
+            continue
+        inspected += 1
+        for path in paths:
+            with contextlib.suppress(OSError):
+                info = os.stat(path)
+                opened.add((info.st_dev, info.st_ino))
+    return opened if inspected else None  # Not even this process: no observation at all.
 
 
 def workspace_idle(cfg, opened):
@@ -667,13 +697,23 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
     return report
 
 
-def request_cleanup():
-    """Ask the installed project collector to run asynchronously, without a disk scan."""
+FALLBACK_INTERVAL = 3600  # the installed timer's cadence
+
+
+def request_cleanup(*, fallback=False):
+    """Ask the collector to run asynchronously, without a disk scan.
+
+    Most installations have no collector service (macOS, Docker, one-off rounds, Linux without
+    `workers service install`). With ``fallback`` the caller accepts starting the collector as a
+    detached low-priority process instead, at most once per FALLBACK_INTERVAL."""
     from .activity import root
 
     directory = root()
     try:
-        if not read_json(directory / "cleanup-service.json").get("installed"):
+        installed = read_json(directory / "cleanup-service.json").get("installed")
+        if not installed:
+            if fallback:
+                _fallback_collector(directory)
             return  # Do not invoke a global unit for an uninstalled/isolated project.
         with locked(directory / "cleanup-request.lock"):
             marker = directory / "cleanup-request.json"
@@ -693,6 +733,38 @@ def request_cleanup():
             )
     except (OSError, ValueError, subprocess.SubprocessError):
         pass  # The hourly collector remains independent of ordinary worker progress.
+
+
+def _fallback_collector(directory):
+    """Start `cleanup --all-data-roots` like the timer would: hourly, niced, idle I/O.
+
+    cleanup.lock still serialises collectors, so a start racing a running one exits at once."""
+    with locked(directory / "cleanup-request.lock"):
+        marker = directory / "cleanup-fallback.json"
+        now = time.time()
+        last = max(read_json(marker).get("started_at", 0), read_json(directory / "cleanup.json").get("at", 0))
+        if now - last < FALLBACK_INTERVAL:
+            return
+        atomic_json(marker, dict(started_at=now))
+    env = self_env()
+    env["TAUCETI_ACTIVITY_DIR"] = str(directory)
+    env.pop("TAUCETI_ROUND_DEADLINE", None)
+    from .paths import self_argv
+
+    argv = self_argv("cleanup", "--all-data-roots")
+    if sys.platform == "linux" and shutil.which("ionice"):
+        argv = ["ionice", "-c3", *argv]
+    if shutil.which("nice"):
+        argv = ["nice", "-n", "10", *argv]
+    subprocess.Popen(
+        argv,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
 
 
 def pressure_cleanup():
