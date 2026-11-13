@@ -142,8 +142,8 @@ holds that `auth.json`, counting `/etc/codex/config.toml`, the requirements file
 in `/etc/codex` and any managed `com.openai.codex` preference as Codex does. It
 also leaves it alone when a project `.codex/config.toml` sets another store (or
 cannot be read) in any directory the worker starts Codex from, or in any parent
-of one: the checkout, the state directory and the progress-writer and recovery
-directories inside it, and the temporary directory. A stop signal that arrives during the exchange takes effect once the new token is
+of one: the checkout, the state directory and the progress-writer, overlap-scan and
+recovery directories inside it, and the temporary directory. A stop signal that arrives during the exchange takes effect once the new token is
 saved.
 
 Two more sources can set the store's default: a workspace's cloud policy, which
