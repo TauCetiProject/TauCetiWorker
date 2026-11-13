@@ -904,6 +904,9 @@ def drain_pending(reports, *, once=False, deadline=None):
         while pending:
             again = []
             for path, report in pending:
+                if deadline is not None and time.monotonic() >= deadline:
+                    again = []
+                    break
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
                 totals = report.setdefault("drain", dict(slices=0, removed_bytes=0, removed_entries=0))
                 try:
@@ -950,11 +953,18 @@ def drain_pending(reports, *, once=False, deadline=None):
             os.environ["TAUCETI_LEGACY_DATA_ROOT"] = previous
 
 
+def root_lock(state_root, *, dry=False):
+    """cleanup.lock is per activity directory. Installations sharing a data root through different
+    activity directories must still never collect it concurrently, so each collected worker-state
+    root carries its own lock too; run_all() takes them in sorted order, so none can deadlock."""
+    return locked(Path(state_root).resolve() / ".cleanup.lock", dry=dry)
+
+
 def run(*, dry=False, diagnostics_only=False, deadline=None):
     from .activity import pin_root, root
 
     pin_root()
-    with locked(root() / "cleanup.lock", dry=dry):
+    with locked(root() / "cleanup.lock", dry=dry), root_lock(worker_state_root(), dry=dry):
         before = free_bytes(worker_state_root())
         report = sweep(dry=dry, diagnostics_only=diagnostics_only)
         report["free_before_bytes"] = before
@@ -1046,9 +1056,11 @@ def run_all(*, dry=False, deadline=None):
     report = fresh_report()
     report["roots"] = []
     report["free_before_bytes"] = free_bytes(worker_state_root())
-    with locked(root() / "cleanup.lock", dry=dry):
+    with locked(root() / "cleanup.lock", dry=dry), contextlib.ExitStack() as roots:
         try:
             paths = data_roots()
+            for path in sorted(paths):
+                roots.enter_context(root_lock(path / "state", dry=dry))
             configs = []
             for path in paths:
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
@@ -1056,7 +1068,7 @@ def run_all(*, dry=False, deadline=None):
             initial = {path: dict(free_before_bytes=free_bytes(path)) for path in paths}
             if not dry:
                 # Exact queued disposal must not wait behind shared-cache inventory.
-                drain_pending(list(initial.items()), once=True)
+                drain_pending(list(initial.items()), once=True, deadline=deadline)
             for index, path in enumerate(paths):
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
                 try:
@@ -1096,10 +1108,7 @@ def cmd_cleanup(args):
     seconds = getattr(args, "max_seconds", None)
     deadline = time.monotonic() + seconds if seconds else None
     try:
-        # cleanup.lock is per activity directory; installations sharing one data root through
-        # different activity directories must still never collect it concurrently.
-        with locked(legacy_data_root().resolve() / "state" / ".cleanup.lock", dry=args.dry_run):
-            report = (run_all if args.all_data_roots else run)(dry=args.dry_run, deadline=deadline)
+        report = (run_all if args.all_data_roots else run)(dry=args.dry_run, deadline=deadline)
     except BlockingIOError:
         raise Die("cleanup is already running") from None
     if not args.dry_run:

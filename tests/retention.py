@@ -1324,17 +1324,38 @@ print('{"result":"kept on protocol stdout"}', flush=True)
             with round_.RoundContext(self.cfg) as context:
                 self.assertIsNotNone(context)
 
-    def test_drain_deadline_ends_after_the_current_slice(self):
+    def test_drain_deadline_is_checked_before_every_root_slice(self):
         from tauceti_worker import recovery_maintenance as maintenance
         from tauceti_worker import verification_storage
 
+        clock = [100.0]
+
+        def prepare(*args, **kwargs):
+            clock[0] += 30  # one slice uses its whole budget
+            return dict(removed_entries=1, sweep_complete=False)
+
+        roots = [(self.root, {}), (self.root, {}), (self.root, {})]
         with (
-            patch.object(maintenance, "prepare", return_value=dict(removed_entries=1, sweep_complete=False)) as prepare,
+            patch.object(maintenance, "prepare", side_effect=prepare) as sliced,
             patch.object(maintenance, "collect_discarded", return_value={}),
             patch.object(verification_storage, "housekeep", return_value={}),
+            patch.object(retention.time, "monotonic", side_effect=lambda: clock[0]),
         ):
-            retention.drain_pending([(self.root, {})], deadline=time.monotonic() - 1)
-        self.assertEqual(prepare.call_count, 1)
+            retention.drain_pending(roots, deadline=99.0)  # expired on entry
+            self.assertEqual(sliced.call_count, 0)
+            retention.drain_pending(roots, deadline=120.0)
+            self.assertEqual(sliced.call_count, 1)
+
+    def test_collection_holds_a_lock_inside_the_worker_state_root(self):
+        import fcntl
+
+        retention.run()
+        lock = self.state.parent / ".cleanup.lock"
+        self.assertTrue(lock.exists())
+        with open(lock) as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(BlockingIOError):
+                retention.run()
 
     def test_macos_open_files_treats_uninspectable_owners_as_unknown(self):
         held = self.root / "held.lock"

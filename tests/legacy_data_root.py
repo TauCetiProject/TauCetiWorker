@@ -108,6 +108,31 @@ class LegacyDataRoot(unittest.TestCase):
                     self.assertIsInstance(item["free_bytes"], int)
                 self.assertEqual(paths.legacy_data_root(), current)
 
+    def test_cleanup_locks_every_root_it_collects(self):
+        import fcntl
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            fleet = home / ".local/share/tauceti-fleet"
+            old = fleet / "worker-data/retained/old"
+            current = fleet / "worker-data/current"
+            for path in (old, current):
+                (path / "state/w").mkdir(parents=True)
+            (fleet / "worker-data/roots.json").write_text(json.dumps(dict(roots={"old": str(old)})))
+            with (
+                patch.dict(os.environ, TAUCETI_LEGACY_DATA_ROOT=str(current), TAUCETI_ACTIVITY_DIR=temporary + "/a"),
+                patch.object(retention.Config, "resolve", return_value=SimpleNamespace(home=home)),
+                patch.object(retention, "legacy_project", return_value=True),
+                patch.object(retention, "sweep", return_value=retention.fresh_report()),
+                patch.object(retention, "drain_pending"),
+                open(old / "state/.cleanup.lock", "a") as held,
+            ):
+                # Another collector, selecting the old root, is collecting it right now.
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaises(BlockingIOError):
+                    retention.run_all()
+
     def test_default_and_invalid_override(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TAUCETI_LEGACY_DATA_ROOT", None)
