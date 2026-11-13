@@ -347,6 +347,7 @@ class Candidate:
     rebase_budget_key: str = ""  # immutable budget chosen by this survey, including its verified progress epoch
     foreign_repair_base: str = ""  # explicit one-PR operator scope; never adds the fork to other stages
     bump_integration_failure: bool = False
+    bump_pending: bool = False  # an automatic bump taken before its build finished
     final_resolution: bool = False  # existing own-PR fix budget is spent; resolve or close
     partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
     source_repository: RepositoryRef | None = None
@@ -1305,11 +1306,15 @@ def classify_survey(
             if pending
             else "bump-mathlib, build red",
             bump_integration_failure=integration,
+            bump_pending=pending,
         )
         per_head = counters.read(f"bump-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"bump-pr-{p.number}")
         c.attempts, c.budget = per_head, MAX_BUMP_ATTEMPTS
-        if not p.automatic_bump and (per_head >= MAX_BUMP_ATTEMPTS or per_pr >= MAX_BUMP_PR_ATTEMPTS):
+        # One round per pending head; once CI fails, the ordinary red-build retries apply.
+        if (pending and per_head) or (
+            not p.automatic_bump and (per_head >= MAX_BUMP_ATTEMPTS or per_pr >= MAX_BUMP_PR_ATTEMPTS)
+        ):
             sv.bump.suppressed.append(c)
         else:
             sv.bump.actionable.append(c)

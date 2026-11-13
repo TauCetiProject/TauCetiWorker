@@ -76,8 +76,23 @@ def classify(record, stages, reviews=None, rounds=0, attempts=100):
 assert classify(raw(), ["bump"]).bump.count == 1
 # A pending automatic bump is adapted without waiting for CI, until CI or a local verification passes.
 pending = raw(statusCheckRollup=[{"context": "build", "state": "PENDING"}])
-assert classify(pending, ["bump"]).bump.actionable[0].reason == "bump-mathlib, build pending"
-assert classify(raw(statusCheckRollup=[]), ["bump"]).bump.count == 1
+assert classify(pending, ["bump"], attempts=0).bump.actionable[0].reason == "bump-mathlib, build pending"
+assert classify(raw(statusCheckRollup=[]), ["bump"], attempts=0).bump.count == 1
+# One round per pending head; a red head keeps its unlimited retries.
+assert not classify(pending, ["bump"], attempts=1).bump.actionable
+assert classify(raw(), ["bump"], attempts=1).bump.actionable
+# Dispatch re-reads a pending bump and declines it once CI or another worker has settled the head.
+candidate = classify(pending, ["bump"], attempts=0).bump.actionable[0]
+for rollup, want in [
+    ([{"context": "build", "state": "PENDING"}], True),
+    ([{"context": "build", "state": "SUCCESS"}], False),
+    ([{"context": "build", "state": "PENDING"}, {"context": "self-tested/1", "state": "SUCCESS"}], False),
+]:
+    fresh = raw(statusCheckRollup=rollup, labels=[{"name": "self-tested"}])
+    live = SimpleNamespace(gh=SimpleNamespace(pr_view=lambda *_args, f=fresh: f))
+    assert w._still_actionable("bump", live, None, candidate) is want, rollup
+moved = SimpleNamespace(gh=SimpleNamespace(pr_view=lambda *_args: pending | {"headRefOid": "c" * 40}))
+assert not w._still_actionable("bump", moved, None, candidate)
 assert not classify(raw(statusCheckRollup=[{"context": "build", "state": "SUCCESS"}]), ["bump"]).bump.count
 assert not classify(pending | {"author": {"login": "someone"}}, ["bump"]).bump.count
 self_tested = pending | {

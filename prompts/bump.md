@@ -43,8 +43,8 @@ the foreground; a background build will be abandoned when the session ends. Push
 before ending your turn; no later turn will recover unpushed edits. Full-library compilation and
 all audits remain required for merging; a partial checkpoint must never be described as green.
 
-If the head already builds and passes the shim-expiry check, push nothing and end the session; the
-worker then verifies that head itself. When the migration is complete, run the final verification
+If the head needs no source change and the final verification below passes, push nothing and end
+the session; the worker then verifies that head itself. When the migration is complete, run the final verification
 below if time permits. Otherwise
 push the completed repairs and let full CI verify them. Do not spend the session waiting for CI.
 
