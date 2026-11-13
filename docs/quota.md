@@ -202,8 +202,10 @@ agent is given the file and not the variable: `review`, whose rubric reviewers
 run in a clean home seeded with the file; any Bubble-eligible phase under
 `--bubble` (`progress` and `overlap-scan` stay on the host); and
 `security-audit`, whose agent runs in a private home with a copy of the file
-stripped of its refresh token, so for it an expired token blocks even when the
-file holds a refresh token.
+stripped of its refresh token. These agents work on a copy, so a renewal they
+make is not kept: for them an expired token blocks even when the file holds a
+refresh token, and something other than the worker has to keep that login
+current, since `--auto-refresh` renews only the usage login.
 
 ## macOS and the login Keychain
 

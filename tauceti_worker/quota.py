@@ -2163,7 +2163,8 @@ class Quota:
         where agents read the Keychain first, and with $CLAUDE_CODE_OAUTH_TOKEN set where the agents
         inherit it and authenticate with it ahead of the file. `work` records in
         $TAUCETI_CLAUDE_AGENT_CREDENTIAL what its phases' launches receive
-        (cli.claude_agent_credential_route); an "access-only" copy carries no refresh token."""
+        (cli.claude_agent_credential_route). Only an "environment" launch uses the file in place and keeps
+        a renewal; the other routes hand the agent a copy, so their file needs a live access token."""
         route = os.environ.get("TAUCETI_CLAUDE_AGENT_CREDENTIAL", "environment")
         if (
             claude_usage_credentials() is None
@@ -2176,9 +2177,12 @@ class Quota:
         if not oauth.get("accessToken"):
             return f"no {path} (the credential agents launch from)"
         expires = oauth.get("expiresAt")
-        renewable = bool(oauth.get("refreshToken")) and route != "access-only"
+        renewable = bool(oauth.get("refreshToken")) and route == "environment"
         if not renewable and _finite_num(expires) and expires <= time.time() * 1000:
-            return f"the token agents launch from in {path} has expired; replace it with a new `claude setup-token`"
+            return (
+                f"the token agents launch from in {path} has expired; renew that login or replace it with a "
+                "new `claude setup-token`"
+            )
         return None
 
     def _claude_pass(
