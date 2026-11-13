@@ -72,7 +72,7 @@ def main():
         check("swap-account is still symlinked (worker tooling)", (iso / "swap-account").is_symlink())
         written = json.loads((iso / "settings.json").read_text())
         check("settings.json is ours, not the operator's", "hooks" not in written and "theme" not in written)
-        check("settings.json keeps transcripts", written.get("cleanupPeriodDays") == 36500)
+        check("settings.json keeps a month of transcripts", written.get("cleanupPeriodDays") == 30)
         check("settings.json disables artifacts", written.get("enableArtifact") is False)
         check("settings.json is not a symlink", not (iso / "settings.json").is_symlink())
 

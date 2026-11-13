@@ -1191,6 +1191,41 @@ print('{"result":"kept on protocol stdout"}', flush=True)
         retention.sweep(now=self.clock)
         self.assertFalse(entry.exists())
 
+    def test_codex_sessions_expire_after_a_month_and_claude_prunes_its_own(self):
+        from tauceti_worker import agents
+
+        self.assertEqual(agents._WORKER_CLAUDE_SETTINGS["cleanupPeriodDays"] * 86400, retention.TRANSCRIPT_LIFETIME)
+        home, _anchor = retention.worker_home(self.cfg)
+        sessions = home / ".codex/sessions"
+        old = sessions / "2026/01/02/rollout-old.jsonl"
+        recent = sessions / "2026/03/01/rollout-recent.jsonl"
+        for path in (old, recent):
+            path.parent.mkdir(parents=True)
+            path.write_text("{}")
+        stale = self.clock - retention.TRANSCRIPT_LIFETIME - 1
+        os.utime(old, (stale, stale))
+        os.utime(recent, (self.clock, self.clock))
+        report = retention.fresh_report(self.clock)
+        retention.expire_transcripts(self.cfg, report, now=self.clock, dry=True)
+        self.assertTrue(old.exists())
+        retention.expire_transcripts(self.cfg, report, now=self.clock)
+        self.assertFalse(old.exists())
+        self.assertFalse((sessions / "2026/01").exists())
+        self.assertTrue(recent.exists())
+
+    def test_manager_log_keeps_one_previous_generation(self):
+        from tauceti_worker import worker_manager
+
+        log = self.root / "manager.log"
+        log.write_bytes(b"x" * 11)
+        worker_manager.rotate_log(log, limit=10)
+        self.assertFalse(log.exists())
+        self.assertEqual((self.root / "manager.log.1").read_bytes(), b"x" * 11)
+        log.write_bytes(b"y")
+        worker_manager.rotate_log(log, limit=10)
+        self.assertEqual(log.read_bytes(), b"y")
+        worker_manager.rotate_log(self.root / "missing.log")
+
 
 if __name__ == "__main__":
     unittest.main()

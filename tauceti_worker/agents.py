@@ -3064,8 +3064,9 @@ _WORKER_SKILL = "pi"
 # from host_agent_argv, so they are deliberately absent rather than a second source of truth.
 _WORKER_CLAUDE_SETTINGS = {
     # The isolated .claude/projects/*.jsonl is the only per-turn record of what a claude round did;
-    # the worker's own logs/agent-*.log is a rendered summary. Keep both.
-    "cleanupPeriodDays": 36500,
+    # the worker's own logs/agent-*.log is a rendered summary. Keep a month of transcripts
+    # (retention.TRANSCRIPT_LIFETIME, which also bounds Codex sessions): unbounded, they filled disks.
+    "cleanupPeriodDays": 30,
     "permissions": {"defaultMode": "bypassPermissions"},
     # An unattended round has no one to show an artifact to, and publishing one is outward-facing.
     "enableArtifact": False,

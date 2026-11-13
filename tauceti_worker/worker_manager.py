@@ -133,6 +133,18 @@ def default_workers_config() -> Path:
     return Path(override).expanduser() if override else config_home() / "workers.toml"
 
 
+MANAGER_LOG_BYTES = 16 * 1024**2
+
+
+def rotate_log(path: Path, limit: int = MANAGER_LOG_BYTES) -> None:
+    """Keep one previous generation of an append-only log once it passes ``limit``."""
+    try:
+        if path.stat().st_size > limit:
+            path.replace(path.with_name(path.name + ".1"))
+    except OSError:
+        pass  # a missing or unmovable log never prevents starting the manager
+
+
 def workers_state_dir() -> Path:
     override = os.environ.get("TAUCETI_WORKERS_STATE_DIR")
     if override:
@@ -1372,6 +1384,7 @@ def ensure_manager(config: Path) -> bool:
             if spawned is None:
                 state = workers_state_dir()
                 state.mkdir(parents=True, exist_ok=True)
+                rotate_log(state / "manager.log")
                 log = (state / "manager.log").open("ab", buffering=0)
                 try:
                     spawned = subprocess.Popen(
