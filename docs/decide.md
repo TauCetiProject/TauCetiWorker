@@ -251,6 +251,10 @@ all of these hold at the moment of closing:
   diff`, on Forgejo through the source's command layer, which returns the pull
   request's own diff from its recorded merge base, merged or not.
 
+A closure that does not complete when it is sent is not kept in the publication
+outbox for a later replay, which would skip these checks and the claim; the
+ruling records it as not made.
+
 The closing comment is the model's `comment` followed by the evidence checked
 and a line saying the closure was automatic and can be reopened. The comparison
 is by name: a subsuming pull request that states the same result under another

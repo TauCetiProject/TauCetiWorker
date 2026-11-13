@@ -1329,6 +1329,30 @@ def test_forgejo(tmp):
         )
 
 
+def test_github_close_is_not_retained(tmp):
+    """A closure that does not complete is never kept for a later replay that skips its checks."""
+    from tauceti_worker import github, github_outbox
+
+    retained = []
+
+    def gh(args):
+        retained.append(github_outbox.prepare(["gh", *args], dict(os.environ)))
+        return subprocess.CompletedProcess(args, 1, "", "connection reset by peer")
+
+    hub = github.GitHub("example/project")
+    with (
+        patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": str(tmp / "github")}),
+        patch.object(hub, "_gh", side_effect=gh),
+        patch.object(hub, "pr_view", return_value={"state": "OPEN"}),
+    ):
+        closed = hub.close_pr(5, "subsumed")
+        check(
+            "GitHub close_pr: an unconfirmed closure is reported and leaves no intent to replay",
+            (closed, retained, os.environ.get("TAUCETI_GITHUB_EPHEMERAL")),
+            (False, [None], None),
+        )
+
+
 def test_forgejo_adapters(tmp):
     """`pr_diff` and `close_pr` on the Forgejo worker source are the familiar `gh pr` commands."""
     from tauceti_worker.forgejo_worker import ForgejoWorkerSource
@@ -1367,6 +1391,7 @@ def main():
         test_close(tmp)
         test_forgejo(tmp)
         test_forgejo_adapters(tmp)
+        test_github_close_is_not_retained(tmp)
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
     return 1 if fails else 0
 

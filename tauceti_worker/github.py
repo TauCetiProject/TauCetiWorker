@@ -943,8 +943,18 @@ class GitHub:
         return p.stdout if p.returncode == 0 else None
 
     def close_pr(self, pr: int, comment: str) -> bool:
-        """Close the pull request with a comment; True once a fresh read shows it closed."""
-        self._gh(["pr", "close", str(pr), "--repo", self.repo, "--comment", comment])
+        """Close the pull request with a comment; True once a fresh read shows it closed. The command
+        is not kept in the publication outbox: a closure that does not complete here is reported as
+        not made, and is never replayed later without the checks and claim its caller made first."""
+        previous = os.environ.get("TAUCETI_GITHUB_EPHEMERAL")
+        os.environ["TAUCETI_GITHUB_EPHEMERAL"] = "1"
+        try:
+            self._gh(["pr", "close", str(pr), "--repo", self.repo, "--comment", comment])
+        finally:
+            if previous is None:
+                os.environ.pop("TAUCETI_GITHUB_EPHEMERAL", None)
+            else:
+                os.environ["TAUCETI_GITHUB_EPHEMERAL"] = previous
         with transport.read_context(fresh=True, direct=True):
             after = self.pr_view(pr, ["state"])
         return bool(after) and after.get("state") in ("CLOSED", "MERGED")
