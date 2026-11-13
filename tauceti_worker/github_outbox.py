@@ -270,12 +270,37 @@ def prepare(argv, env, cwd=None, input=None):
         return path
 
 
-def may_send(path):
+def may_send(path, env=None, since=None):
+    """Whether this command may send its intent now.
+
+    `since` is when the command began. An intent written before then was retained from an earlier
+    attempt of the same command, and a retained description is checked against the live one before
+    it is sent again, as `drain` checks it.
+    """
     with tr.locked(path.with_suffix(".lock")):
         try:
-            return json.loads(path.read_text()).get("status") in ("prepared", "rejected")
+            value = json.loads(path.read_text())
         except FileNotFoundError:
             return False  # A newer comment body superseded this unsent edit.
+        if value.get("status") not in ("prepared", "rejected"):
+            return False
+        retained = env is not None and since is not None and value.get("created", since) < since
+        if not retained or not description_target(value):
+            return True
+        applied = reconcile(value, env)
+        if applied == "superseded":
+            from .config import GitHubUnavailable
+
+            archive(path, value, "A later edit replaced the PR description; this one was not sent again")
+            raise GitHubUnavailable(
+                "A later edit replaced the PR description, so this older text was not sent",
+                retry_at=time.time() + 1,
+            )
+        if applied is None:
+            value["retry_at"] = time.time() + 60  # unreadable: nothing is sent over a text not seen
+            tr.atomic(path, value)
+            return False
+        return True
 
 
 def retry_at(path):
@@ -492,6 +517,15 @@ def description_edit(args):
     return replaces
 
 
+def description_target(value):
+    """The PR and the text of an edit of its description alone, or None for any other intent."""
+    repo, number = target(value)
+    body = value.get("context", {}).get("body")
+    if not repo or not number or not isinstance(body, str) or not description_edit(value["argv"]):
+        return None
+    return repo, number, body
+
+
 def _report_mutation(value, result):
     try:
         from .fleet_events import mutation
@@ -564,13 +598,14 @@ def reconcile(value, env):
     if args[:2] == ["pr", "edit"]:
         # Only an edit of the description alone. A compound edit writes its labels and other
         # fields separately, so it may have applied in part and stays for inspection.
-        body = value.get("context", {}).get("body")
-        if not repo or not number or not isinstance(body, str) or not description_edit(args):
+        edit = description_target(value)
+        if not edit:
             return None
+        body = edit[2]
         owner, _, name = repo.partition("/")
         query = (
             "query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name)"
-            "{pullRequest(number:$pr){body lastEditedAt}}}"
+            "{pullRequest(number:$pr){body lastEditedAt editor{login}}}}"
         )
         fields = ["-F", "owner=" + owner, "-F", "name=" + name, "-F", f"pr={number}"]
         with tr.read_context(fresh=True, direct=True):
@@ -587,7 +622,16 @@ def reconcile(value, env):
             # The description is not this intent's. If it was edited after the intent was written,
             # a later description stands and a replay would put an old one back over it.
             when = datetime.datetime.fromisoformat(edited.replace("Z", "+00:00")).timestamp()
-            return "superseded" if when >= int(value.get("created", 0)) - 300 else False
+            created = int(value.get("created", 0))
+            if when >= created:
+                return "superseded"
+            if when < created - 300:
+                return False
+            # In the allowance for clock skew before the intent, an edit counts as later, unless
+            # this account made it: its own earlier text is what this one was written to replace.
+            who = actor(env)
+            mine = bool(who) and ((live.get("editor") or {}).get("login") or "").lower() == who
+            return False if mine else "superseded"
         except (ValueError, KeyError, TypeError, AttributeError):
             return None
     endpoint = None
@@ -798,7 +842,10 @@ def drain(env=None):
             allowed = value.get("status") in ("rejected", "prepared")
             optional_resolution = bool(resolution(value["argv"]))
             fork_operation = value["argv"][:2] == ["repo", "fork"]
-            if not allowed or optional_resolution or fork_operation:
+            # A retained description is the whole text as it stood when written. Whatever became
+            # of its last attempt, it is checked against the live one before it is sent again.
+            description = bool(description_target(value))
+            if not allowed or optional_resolution or fork_operation or description:
                 applied = reconcile(value, env)
                 if applied is True:
                     if fork_operation:

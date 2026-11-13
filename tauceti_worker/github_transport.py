@@ -707,9 +707,10 @@ def execute(argv, *, env=None, wait: bool = False, **kwargs):
     ) or any(a.endswith("=@-") for a in args)
     if stdin_body and kwargs.get("input") is None and not sys.stdin.isatty():
         kwargs["input"] = sys.stdin.read()
+    began = time.time()
     intent = github_outbox.prepare(argv, effective, kwargs.get("cwd"), kwargs.get("input"))
     try:
-        if intent and not github_outbox.may_send(intent):
+        if intent and not github_outbox.may_send(intent, effective, began):
             from tauceti_worker.config import GitHubUnavailable
 
             raise GitHubUnavailable(
