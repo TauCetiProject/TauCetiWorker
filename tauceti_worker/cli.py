@@ -1927,7 +1927,14 @@ def cli_main() -> int:
     except Halted as e:
         log(f"halted ({e.reason}): {e}")
         report_failure(str(e), code=EX_HALTED)
-        report_runtime("halted", detail=str(e), halt_reason=e.reason, next_action_at=None)
+        record = halt_file()
+        report_runtime(
+            "halted",
+            detail=str(e),
+            halt_reason=e.reason,
+            halt_file=str(record) if record else None,
+            next_action_at=None,
+        )
         return EX_HALTED
     except Die as e:
         event = blocking_event_since(started)

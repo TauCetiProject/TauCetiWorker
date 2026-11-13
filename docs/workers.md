@@ -284,9 +284,10 @@ tauceti workers clear-halt reviewer
 tauceti workers restart reviewer
 ```
 
-`workers clear-halt` runs `tauceti work --worker-id reviewer --clear-halt` with
-the worker's own `conf` and `env`, so it finds the record under the worker's
-data root rather than the caller's. For a worker the manager does not run, use
+`workers clear-halt` removes the record the worker reported in its status when
+it halted, which may lie under a data root inherited from the manager's launch
+environment; otherwise it runs `tauceti work --worker-id reviewer --clear-halt`
+with the worker's own `conf` and `env`. For a worker the manager does not run, use
 that `work` command directly.
 
 Rate limits, other GitHub 403 responses such as a missing scope or SSO

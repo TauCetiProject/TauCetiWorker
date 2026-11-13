@@ -784,10 +784,19 @@ def worker_env(spec: WorkerSpec) -> dict[str, str]:
 
 
 def clear_worker_halt(config: Path, wid: str) -> int:
-    """Run `work --clear-halt` in the worker's own environment, so it reads that worker's state."""
+    """Clear the record this worker reported halting on, else run `work --clear-halt` as the worker."""
     spec = next((spec for spec in load_worker_specs(config) if spec.id == wid), None)
     if spec is None:
         raise WorkersError(f"unknown worker: {wid}")
+    # The worker resolves its data root from the manager's launch environment, which this caller
+    # may not share; the path it published is the record that stopped it.
+    reported = runner_status(wid).get("halt_file")
+    if isinstance(reported, str):
+        path = Path(reported)
+        if path.is_absolute() and path.name == "halt.json" and path.parent.name == wid and path.exists():
+            from .identity import clear_halt
+
+            return clear_halt(path)
     argv = self_argv("work", "--worker-id", spec.id, *(["--conf", spec.conf] if spec.conf else []), "--clear-halt")
     return subprocess.run(argv, cwd=HERE, env=worker_env(spec), check=False).returncode
 
@@ -866,6 +875,7 @@ def cmd_managed_runner(args) -> int:
                 exit_code=None,
                 stopped_at=None,
                 halt_reason=None,
+                halt_file=None,
                 **isolation,
             )
             test_command = os.environ.get("TAUCETI_MANAGER_TEST_COMMAND")

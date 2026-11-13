@@ -276,6 +276,44 @@ class IdentityHaltTests(unittest.TestCase):
         with self.assertRaises(wm.WorkersError):
             wm.clear_worker_halt(config, "w2")
 
+    def test_workers_clear_halt_finds_a_record_under_the_managers_data_root(self):
+        config, service, state = self.root / "workers.toml", self.root / "service-data", self.root / "workers"
+        wm.save_worker_specs(config, [wm.WorkerSpec(id="w1")])
+        self.answer("bob")
+        # The worker inherits its data root from the manager's launch environment, not from `env`.
+        worker = subprocess.run(
+            [sys.executable, "-m", "tauceti_worker", "_round", "--worker-id", "w1", "--github-account", "alice"],
+            cwd=REPO,
+            env={
+                **os.environ,
+                "TAUCETI_LEGACY_DATA_ROOT": str(service),
+                "TAUCETI_RUNTIME_STATUS": str(wm.status_path("w1", state)),
+            },
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        record = service / "state" / "w1" / "halt.json"
+        self.assertEqual(worker.returncode, EX_HALTED, worker.stderr)
+        self.assertTrue(record.exists())
+        for operator_root in (str(self.root), None):
+            record.write_text(json.dumps({"reason": "github:identity-mismatch", "detail": "bob", "at": "then"}))
+            env = {**os.environ, "TAUCETI_WORKERS_STATE_DIR": str(state)}
+            env.pop("TAUCETI_LEGACY_DATA_ROOT")
+            if operator_root:
+                env["TAUCETI_LEGACY_DATA_ROOT"] = operator_root
+            shown = subprocess.run(
+                [sys.executable, "-m", "tauceti_worker", "workers", "--config", str(config), "clear-halt", "w1"],
+                cwd=REPO,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(shown.returncode, 0, shown.stderr)
+            self.assertIn("github:identity-mismatch", shown.stdout)
+            self.assertFalse(record.exists())
+
     def test_loop_stops_without_backoff(self):
         args = cli.build_parser().parse_args(["work", "--agent", "claude", "--claude-billing", "api", "--loop"])
         states = []
