@@ -71,7 +71,7 @@ class FakeGitHub:
         return self.statuses.pop(0) if self.statuses else ""
 
 
-def attest(tmp, pulls, statuses, *, verified="success", unchanged=False, bubble=False, dirty=False):
+def attest(tmp, pulls, statuses, *, verified="success", bubble=False, dirty=False):
     root, base, head = checkout(tmp)
     if dirty:
         (root / "b.lean").write_text("x\n")
@@ -82,9 +82,7 @@ def attest(tmp, pulls, statuses, *, verified="success", unchanged=False, bubble=
     ticks = iter(range(0, 10**6, 5))
     try:
         w = SimpleNamespace(cfg=SimpleNamespace(checkout=root, state=Path(tmp), logdir=Path(tmp)), gh=gh)
-        outcome = ba.attest(
-            w, 9, head if unchanged else base, bubble=bubble, sleep=lambda _s: None, clock=lambda: next(ticks)
-        )
+        outcome = ba.attest(w, 9, bubble=bubble, sleep=lambda _s: None, clock=lambda: next(ticks))
     finally:
         ba.verify = saved
     return outcome, calls, gh.labelled, base
@@ -103,7 +101,6 @@ CASES = [
     ),
     ("bubble rounds keep ordinary CI", {"bubble": True}, lambda h: [pull(h)], [], "skipped: bubble", 0, 0),
     ("dirty checkout is not attested", {"dirty": True}, lambda h: [pull(h)], [], "skipped: checkout has", 0, 0),
-    ("unchanged head is not verified", {"unchanged": True}, lambda h: [pull(h)], [], "skipped: the round pushed", 0, 0),
     ("moved head is not verified", {}, lambda h: [pull("d" * 40)], [], "skipped: PR head moved", 0, 0),
     ("non-bot author is refused", {}, lambda h: [pull(h, author="someone")], [], "skipped: not authored", 0, 0),
     ("held bump is refused", {}, lambda h: [pull(h, labels=("hold",))], [], "skipped: held", 0, 0),
@@ -144,7 +141,7 @@ for name, options, pulls, statuses, prefix, verify_calls, labels in CASES:
 os.environ["TAUCETI_BUMP_SELF_TESTED"] = "0"
 try:
     w = SimpleNamespace(cfg=SimpleNamespace(checkout=Path("/nonexistent")), gh=None)
-    check("disabled by environment", ba.attest(w, 9, "", bubble=False), lambda got: "disabled" in got)
+    check("disabled by environment", ba.attest(w, 9, bubble=False), lambda got: "disabled" in got)
 finally:
     del os.environ["TAUCETI_BUMP_SELF_TESTED"]
 

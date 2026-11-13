@@ -346,10 +346,17 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             if rc == EX_ADMISSION_WAIT:
                 paused = runtime_snapshot()
                 reason = fleet_admission_reason(cfg.wid)
-                waiting = paused.get("state") in ("waiting-capacity", "waiting-budget", "waiting-storage")
+                waiting = paused.get("state") in (
+                    "waiting-capacity",
+                    "waiting-budget",
+                    "waiting-storage",
+                    "waiting-resource",
+                )
                 state = "waiting-capacity" if reason else (paused["state"] if waiting else "waiting-budget")
-                admission_streak = admission_streak + 1 if state == "waiting-budget" else 0
+                admission_streak = admission_streak + 1 if state in ("waiting-budget", "waiting-resource") else 0
                 nap = 60 if state == "waiting-storage" else min(60, 5 * (1 << min(max(0, admission_streak - 1), 4)))
+                if state == "waiting-resource":
+                    nap = min(300, 30 * (1 << min(max(0, admission_streak - 1), 4)))
                 with contextlib.suppress(BudgetError, OSError):
                     if api_mode():
                         Budget().refresh_waiter(cfg.wid)
