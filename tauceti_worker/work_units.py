@@ -979,6 +979,8 @@ def _selected_pr_matches(stage: str, c: Candidate, live) -> bool | None:
 def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool | None:
     from tauceti_tools.forge import GITHUB, RepositoryRef
 
+    if not c.pr and stage in ("roadmap",):
+        return True  # no pull request to re-read or to authorize on any source
     source_repository = getattr(c, "source_repository", None)
     if source_repository is not None:
         selected = getattr(w.gh, "repository", None)
@@ -1057,6 +1059,12 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) ->
             labels = {str(label.get("name", "")).lower() for label in live.get("labels", [])}
             if labels & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}:
                 return False
+            # Some source APIs cannot distinguish conflicts from an unfinished
+            # check. Let their adapter prove the exact commit pair only after
+            # the shared ownership, head, base and pause checks have passed.
+            resolver = getattr(type(w.gh), "resolve_mergeability", None)
+            if live.get("mergeable") == "UNKNOWN" and resolver is not None:
+                live["mergeable"] = resolver(w.gh, w.cfg.state, c.pr, c.head)
             return live.get("mergeable") == "CONFLICTING" or (
                 "needs-rebase" in labels and w.gh.rebase_requested(c.pr, c.head)
             )

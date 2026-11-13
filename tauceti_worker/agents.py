@@ -465,8 +465,19 @@ def fill_prompt(path: Path, **subs) -> str:
     source = current()
     if source is not None:
         host_repo = source.repository.forge.url.split("://", 1)[1] + "/" + source.repo
-        text = text.replace("https://github.com/" + TAUCETI, source.repository.url)
-        text = text.replace("--repo " + TAUCETI, "--repo " + host_repo)
+        # Match a complete repository token. Shared repositories such as
+        # TauCetiRoadmap have the content repository's name as a prefix.
+        boundary = r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_.-])"
+        text = re.sub(
+            re.escape("https://github.com/" + TAUCETI) + r"(\.git)?" + boundary,
+            lambda match: source.repository.url + (match[1] or ""),
+            text,
+        )
+        text = re.sub(
+            re.escape("--repo " + TAUCETI) + boundary,
+            lambda _: "--repo " + host_repo,
+            text,
+        )
     # An unfilled placeholder ships literal `__BIN__/git-safe-push` to the agent, which is the
     # command-not-found failure wrapper_bin exists to end. Fail here instead, but only for the
     # prompts we ship: the progress prompt is served by the pinned TauCetiProgress build (written
@@ -829,24 +840,21 @@ def fetch_git_source(url: str, dir: Path) -> bool:
     return _fetch_shallow(url, dir)
 
 
-SHELL_LIMIT_SECONDS = 600  # an authoring round's foreground shell limit
-
-
 def _foreground_shell_env(deadline: float, limit_seconds: float | None = None) -> dict[str, str]:
-    # A shell command is not a whole round. Background tasks can retain the CLI
-    # after its final answer and overlap later builds in the same checkout.
-    # ``TAUCETI_SHELL_LIMIT_SECONDS`` lets a launcher with its own budget (the queue's repair task,
-    # whose agent runs whole-library builds in the foreground) lengthen the limit for its agent.
+    # Keep commands in the foreground, bounded by the round rather than an unrelated
+    # ten-minute ceiling: waiting for compiler capacity consumes wall time too.
+    # Launchers may still request a shorter command budget explicitly.
     if limit_seconds is None:
         try:
-            limit_seconds = float(os.environ.get("TAUCETI_SHELL_LIMIT_SECONDS") or SHELL_LIMIT_SECONDS)
+            value = os.environ.get("TAUCETI_SHELL_LIMIT_SECONDS")
+            limit_seconds = float(value) if value else None
         except ValueError:
-            limit_seconds = SHELL_LIMIT_SECONDS
-    limit_ms = max(1000, int(limit_seconds * 1000))
+            limit_seconds = None
     remaining_ms = max(1000, int((deadline - time.time()) * 1000))
+    timeout_ms = remaining_ms if limit_seconds is None else min(remaining_ms, max(1000, int(limit_seconds * 1000)))
     return {
-        "BASH_DEFAULT_TIMEOUT_MS": str(min(limit_ms, remaining_ms)),
-        "BASH_MAX_TIMEOUT_MS": str(min(limit_ms, remaining_ms)),
+        "BASH_DEFAULT_TIMEOUT_MS": str(timeout_ms),
+        "BASH_MAX_TIMEOUT_MS": str(timeout_ms),
         "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
     }
 
