@@ -742,7 +742,7 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     for stage in ("overlap-fix", "overlap-scan"):
         if stage in opts.only and sv.kind(stage).suppressed:
             raise NoProgress(f"{stage}: {sv.kind(stage).suppressed[0].reason}")
-    if opts.only == ["curate"] and curation.reason:
+    if set(opts.only) == {"curate"} and curation.reason:
         raise NoProgress(f"curate: {curation.reason}")
     error = ClaimCollision if claim_collision or w.selection_changed else NoEligibleWork
     raise error(f"no eligible work this round under {scope}")

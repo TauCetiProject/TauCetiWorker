@@ -952,6 +952,9 @@ class Wiring(Tmp):
         result, calls, _ = ran(["roadmap", "curate"], both, [current, 0])
         self.assertEqual((result, [only for _, only, _ in calls]), (0, [["curate"], ["roadmap"]]))
         self.assertEqual(ran(["curate"], both, [current])[:2], ("curate: the target list is current", calls[:1]))
+        self.assertEqual(
+            ran(["curate", "curate"], both, [current])[:2], ("curate: the target list is current", calls[:1])
+        )
         paused = tc.AdmissionUnavailable("storage unavailable", state="waiting-storage")
         self.assertEqual(ran(["curate", "fix"], both, [paused])[0], "storage unavailable")
         self.assertIs(self.raised, paused)

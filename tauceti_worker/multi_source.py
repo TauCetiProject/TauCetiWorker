@@ -215,20 +215,21 @@ def run_round(w, opts, *, use_fleet_focus=True):
         name, worker, result = min(healthy, key=lambda row: (row[0] != "github", row[0] != destination))
         worker.target_sources = [other.gh for _, other, _ in healthy if other is not worker]
         selected = dataclasses.replace(opts, only=["curate"])
+        rest = [task for task in opts.only if task != "curate"]
         try:
             if name == "github":
                 return ordinary_round(worker, selected, prepared_survey=result)
             with activate(worker.gh, worker.cfg):
                 return ordinary_round(worker, selected, prepared_survey=result)
         except NoProgress as error:
-            if opts.only == ["curate"]:
+            if not rest:  # an empty `only` would mean every task
                 raise
             # A typed pause (admission, an unavailable forge) is raised if nothing else runs.
             if type(error) is not NoProgress and not isinstance(error, NoEligibleWork):
                 pause = error
                 waits.append(error)
             log(f"{error}; going on to the other selected work")
-        opts = dataclasses.replace(opts, only=[task for task in opts.only if task != "curate"])
+        opts = dataclasses.replace(opts, only=rest)
     executable = [(name, worker, result) for name, worker, result in healthy if name == "github" or opts.sandbox_host]
     if len(executable) != len(healthy):
         log("Forgejo agent rounds currently require host mode")
