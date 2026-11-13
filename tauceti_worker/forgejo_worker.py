@@ -110,6 +110,7 @@ class ForgejoWorkerSource(ForgejoReadSource):
         import urllib.parse
 
         from .config import SourceUnavailable
+        from .github import BORS_MERGED_PREFIX
         from .targets import MARKER_TAG, body_matches, search_id, search_phrases
 
         phrases = search_phrases(search)
@@ -121,8 +122,11 @@ class ForgejoWorkerSource(ForgejoReadSource):
             path = f"repos/{self.repository.name}/issues?{query}"
 
         def merged(row):
-            # A pull listing row says `merged`; an issue search row says it under `pull_request`.
-            return (row if keyword is None else row.get("pull_request") or {}).get("merged") is True
+            # A pull listing row says `merged`; an issue search row says it under `pull_request`. The
+            # queue lands a pull request by squash and closes it, unmerged, under BORS_MERGED_PREFIX.
+            if (row if keyword is None else row.get("pull_request") or {}).get("merged") is True:
+                return True
+            return row.get("state") == "closed" and str(row.get("title") or "").startswith(BORS_MERGED_PREFIX)
 
         def fetch():
             rows = []

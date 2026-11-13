@@ -121,7 +121,7 @@ class Source:
 
     def view(self, number: int) -> dict:
         row = self._read("pr_view", number, ["state", "title", "body", "headRefOid"]) or {}
-        return row if self.native else normalize_merged(row)
+        return normalize_merged(row)
 
 
 class _GitHubHistory(GitHubMarkerReads):

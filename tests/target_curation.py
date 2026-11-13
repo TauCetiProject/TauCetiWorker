@@ -816,6 +816,37 @@ class ForgejoLists(Tmp):
             self.assertEqual(self.curate(self.forgejo), (None, "the target list is current"))
         self.assertEqual((self.github_reads.call_count, self.path.read_text()), (2, listed))
 
+    def test_a_forgejo_pull_request_the_queue_landed_counts_as_merged(self):
+        landed = "[Merged by Bors] - t"
+        self.merged_rows = [
+            {
+                "number": 3,
+                "title": landed,
+                "body": marker("MeasureTheory", "kolmogorov-zero-one"),
+                "state": "closed",
+                "merged": False,
+            }
+        ]
+        url = self.repo.pull_url(12)
+        self.path.write_text(EXAMPLE.replace("in flight: #1234", f"in flight: {url}"))
+        self.states = {12: {"state": "CLOSED", "title": landed, "body": "", "headRefOid": "a" * 40}}
+        self.assertEqual(self.curate(self.forgejo), (0, ""))
+        text = self.path.read_text()
+        self.assertIn(f"(needs: none; landed: {url})", text)
+        self.assertIn(f"landed: {self.repo.pull_url(3)})", text)
+        self.assertEqual(incidents.records(incidents.TARGET_CLOSED), [])
+        item = t.parse_targets(EXAMPLE).find("kolmogorov-zero-one")
+        self.merged_rows = [
+            {
+                "number": 3,
+                "title": landed,
+                "body": marker("MeasureTheory", "kolmogorov-zero-one"),
+                "state": "closed",
+                "pull_request": {"merged": False},
+            }
+        ]
+        self.assertEqual(t.landed_pr(item, self.forgejo), 3)
+
     def test_a_mixed_worker_settles_items_from_both_forges(self):
         self.path.write_text(EXAMPLE)
         github = self.github({1234: {"state": "MERGED", "body": ""}})
