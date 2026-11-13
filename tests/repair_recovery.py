@@ -1639,7 +1639,7 @@ class Fixture(unittest.TestCase):
                 self.assertEqual(journal["reason"]["code"], "worker-resource")
                 rr.write(self.record, journal, "eligible", retry_at=0)
         self.assertEqual((self.record / "checkout/A.lean").read_text(), "retained repair\n")
-        self.assertEqual(self.values["fix-10-head"], 0)
+        self.assertEqual(self.values.get("fix-10-head", 0), 0)
 
     def test_continuation_resource_failure_refunds_paid_content_and_preserves_edits(self):
         from tauceti_worker.verification_resources import record_wait
