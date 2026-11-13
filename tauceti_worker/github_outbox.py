@@ -605,7 +605,7 @@ def reconcile(value, env):
         owner, _, name = repo.partition("/")
         query = (
             "query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name)"
-            "{pullRequest(number:$pr){body lastEditedAt editor{login}}}}"
+            "{pullRequest(number:$pr){body lastEditedAt}}}"
         )
         fields = ["-F", "owner=" + owner, "-F", "name=" + name, "-F", f"pr={number}"]
         with tr.read_context(fresh=True, direct=True):
@@ -620,18 +620,11 @@ def reconcile(value, env):
             if edited is None:
                 return False  # never edited, so not by this intent either
             # The description is not this intent's. If it was edited after the intent was written,
-            # a later description stands and a replay would put an old one back over it.
+            # a later description stands and a replay would put an old one back over it. This
+            # clock and GitHub's cannot order two edits a few minutes apart, so an edit in that
+            # allowance counts as later whoever made it: workers share their operator's account.
             when = datetime.datetime.fromisoformat(edited.replace("Z", "+00:00")).timestamp()
-            created = int(value.get("created", 0))
-            if when >= created:
-                return "superseded"
-            if when < created - 300:
-                return False
-            # In the allowance for clock skew before the intent, an edit counts as later, unless
-            # this account made it: its own earlier text is what this one was written to replace.
-            who = actor(env)
-            mine = bool(who) and ((live.get("editor") or {}).get("login") or "").lower() == who
-            return False if mine else "superseded"
+            return "superseded" if when >= int(value.get("created", 0)) - 300 else False
         except (ValueError, KeyError, TypeError, AttributeError):
             return None
     endpoint = None

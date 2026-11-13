@@ -469,18 +469,12 @@ with (
     ):
         with patch.object(tr, "execute", return_value=live):
             assert outbox.reconcile(value, env) == expected, (live.stdout, expected)
-    # In the minutes before the intent was written the clocks cannot order two edits. Another
-    # account's counts as later. This account's own is the text this one was written to replace.
+    # In the minutes before the intent was written, this clock and GitHub's cannot order two edits,
+    # so an edit there counts as later whoever made it: workers share their operator's account.
     author = {**env, "TAUCETI_GITHUB_ACCOUNT": "Author"}
-    for live, expected in (
-        (description("other", stamp(-120), "author"), False),
-        (description("other", stamp(-120), "Maintainer"), "superseded"),
-        (description("other", stamp(-120)), "superseded"),
-        (description("other", stamp(120), "author"), "superseded"),  # its own later text stands too
-        (description("other", stamp(-3600), "maintainer"), False),
-    ):
-        with patch.object(tr, "execute", return_value=live):
-            assert outbox.reconcile(value, author) == expected, (live.stdout, expected)
+    for editor in ("author", "maintainer", None):
+        with patch.object(tr, "execute", return_value=description("other", stamp(-120), editor)):
+            assert outbox.reconcile(value, author) == "superseded", editor
     path.unlink()
 
     # The same check is made before every later attempt, whatever became of the last one.
@@ -537,16 +531,25 @@ with (
         assert sent == [], make.__name__
 
     # While the description is still the one it was written to replace, a refused edit is sent
-    # again as before: never edited, edited long before, or edited by this account just before.
+    # again as before: never edited, or last edited long before.
     for live in (
         description("This PR proves foo.", None),
         description("This PR proves foo.", stamp(-3600), "maintainer"),
-        description("Its first text.", stamp(-60), "author"),
     ):
         path, sent = rejected(), []
         with patch.object(tr, "execute", side_effect=github(live, sent)):
-            assert outbox.drain(author) == [] and not path.exists(), live.stdout
+            assert outbox.drain(env) == [] and not path.exists(), live.stdout
         assert sent == [text] and not path.with_suffix(".failed").exists(), live.stdout
+
+    # This host's clock runs a minute ahead of GitHub's. The operator, on the account the worker
+    # shares, edits the description half a minute after the refused edit was written, so GitHub
+    # stamps that later edit half a minute before the intent. The older text is not sent over it.
+    ahead = 60
+    path, sent = rejected(), []
+    operator = description("The operator's later description.", stamp(30 - ahead), "author")
+    with patch.object(tr, "execute", side_effect=github(operator, sent)):
+        assert outbox.drain(author) == [] and not path.exists() and path.with_suffix(".failed").exists()
+    assert sent == [], "an older text went back over a later edit from the same account"
 
     # The description cannot be read: nothing is sent over a text that was not seen, and the
     # intent waits as it was.
