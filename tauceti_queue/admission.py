@@ -152,7 +152,9 @@ class AdmissionPolicy:
         The review engine runs a rubric being phased in only on those PRs, so requiring it of an
         earlier one would hold that PR for a row no review adds. The table is the pinned policy's:
         it reaches this service when the pin moves, and a pin that predates it requires the
-        configured rubrics of every PR. A source that names no repository takes no phased rubric.
+        configured rubrics of every PR. Each forge numbers its own PRs, so the table has a cutoff
+        for each repository: the GitHub service names its repository `owner/name`, and a native
+        source names its own by its qualified key. A policy that names none takes no phased rubric.
         """
         phased = getattr(policy, "with_phased_rubrics", None)
         if phased is None or not self.repository:
