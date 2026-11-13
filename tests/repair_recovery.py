@@ -1186,7 +1186,7 @@ class Fixture(unittest.TestCase):
             self.assertTrue(self.run_recovery())
         admission.assert_called_once()
         self.assertTrue(admission.call_args.kwargs["fresh"])
-        self.assertFalse(admission.call_args.kwargs["ignore_quota"])
+        self.assertTrue(admission.call_args.kwargs["ignore_quota"])
         model.assert_called_once()
         self.assertEqual(FakeVerification.calls, 2)
         self.assertEqual(self.journal()["continuation_reason"], "exact-source-verification-failed")
@@ -1218,10 +1218,76 @@ class Fixture(unittest.TestCase):
 
     def test_verification_failure_budget_refusal_retains_source(self):
         FakeVerification.failures = 1
-        with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("budget closed")):
+        with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("budget closed")) as admission:
             self.assertFalse(self.run_recovery())
+        self.assertFalse(admission.call_args.kwargs["ignore_quota"])
+        self.assertTrue(admission.call_args.kwargs["fresh"])
         self.assertEqual(self.journal()["reason"]["code"], "budget-refused")
         self.assertEqual(self.journal()["attempts"], 0)
+        self.assert_retained()
+
+    def test_explicit_override_continues_through_soft_pacing_with_real_admission(self):
+        from tauceti_worker.quota import Provider, Window
+
+        FakeVerification.failures = 1
+        self.opts.ignore_quota = True
+        provider = Provider("claude", False, "opus", [Window("session", 60, 20, None, "over-pace")])
+        with (
+            patch("tauceti_worker.loop.choose_model", return_value=(None, {"claude": provider})) as choose,
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=self.model_repair) as model,
+        ):
+            self.assertTrue(self.run_recovery())
+        self.assertTrue(choose.call_args.kwargs["refresh"])
+        model.assert_called_once()
+
+    def test_auto_recovery_does_not_gain_the_explicit_provider_pacing_override(self):
+        from tauceti_worker.quota import Provider, Window
+
+        FakeVerification.failures = 1
+        self.opts.agent = "auto"
+        self.opts.ignore_quota = True
+        provider = Provider("claude", False, "opus", [Window("session", 60, 20, None, "over-pace")])
+        with (
+            patch("tauceti_worker.loop.choose_model", return_value=(None, {"claude": provider})),
+            patch("tauceti_worker.agents.run_agent_host") as model,
+        ):
+            self.assertFalse(self.run_recovery())
+        model.assert_not_called()
+        self.assertEqual(self.journal()["reason"]["code"], "budget-refused")
+        self.assertEqual(self.journal().get("content_attempts", 0), 0)
+        self.assert_retained()
+
+    def test_explicit_override_keeps_hard_exhaustion_blocking_with_real_admission(self):
+        from tauceti_worker.quota import Provider, Window
+
+        FakeVerification.failures = 1
+        self.opts.ignore_quota = True
+        provider = Provider("claude", False, "opus", [Window("session", 100, 20, None, "exhausted")])
+        with (
+            patch("tauceti_worker.loop.choose_model", return_value=(None, {"claude": provider})),
+            patch("tauceti_worker.agents.run_agent_host") as model,
+        ):
+            self.assertFalse(self.run_recovery())
+        model.assert_not_called()
+        self.assertEqual(self.journal()["reason"]["code"], "budget-refused")
+        self.assertEqual(self.journal()["attempts"], 0)
+        self.assertEqual(self.journal().get("content_attempts", 0), 0)
+        self.assert_retained()
+
+    def test_external_quota_command_keeps_authority_over_the_pacing_override(self):
+        FakeVerification.failures = 1
+        self.opts.ignore_quota = True
+        self.opts.quota_cmd = "operator-quota-policy"
+        with (
+            patch("tauceti_worker.loop.choose_model", return_value=(None, {})) as choose,
+            patch("tauceti_worker.agents.run_agent_host") as model,
+        ):
+            self.assertFalse(self.run_recovery())
+        self.assertEqual(choose.call_args.args[2], "operator-quota-policy")
+        model.assert_not_called()
+        self.assertEqual(self.journal()["reason"]["code"], "budget-refused")
+        self.assertEqual(self.journal().get("content_attempts", 0), 0)
         self.assert_retained()
 
     def test_identity_profile_mismatch_new_narrow_conversation(self):
@@ -1584,6 +1650,44 @@ class Fixture(unittest.TestCase):
         self.assertTrue(rr.due(self.cfg, only=["fix"]))
         self.opts.only = ["fix"]
         self.assertTrue(self.run_recovery())
+
+    def test_repeated_resource_waits_preserve_source_and_recovery_allowance(self):
+        receipt = dict(status="incomplete", incomplete_reason="resource-pressure", error="thread exhaustion")
+        with patch.object(self.backend, "verify", return_value=receipt):
+            for _ in range(4):
+                self.assertFalse(self.run_recovery())
+                journal = self.journal()
+                self.assertEqual(journal["state"], "eligible")
+                self.assertEqual(journal["attempts"], 0)
+                self.assertEqual(journal["reason"]["code"], "worker-resource")
+                rr.write(self.record, journal, "eligible", retry_at=0)
+        self.assertEqual((self.record / "checkout/A.lean").read_text(), "retained repair\n")
+        self.assertEqual(self.values.get("fix-10-head", 0), 0)
+
+    def test_continuation_resource_failure_refunds_paid_content_and_preserves_edits(self):
+        from tauceti_worker.verification_resources import record_wait
+
+        FakeVerification.failures = 1
+
+        def exhausted(checkout, *args, **kwargs):
+            (checkout / "A.lean").write_text("repair before resource failure\n")
+            record_wait("thread exhaustion")
+            self.assertTrue(kwargs["cancel_event"].is_set())
+            return 75
+
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", exhausted),
+        ):
+            self.assertFalse(self.run_recovery())
+        journal = self.journal()
+        self.assertEqual(journal["reason"]["code"], "worker-resource")
+        self.assertEqual(journal["content_attempts"], 0)
+        self.assertEqual(journal["attempts"], 0)
+        self.assertEqual(self.values["fix-10-head"], 0)
+        self.assertTrue(Path(journal["source_checkpoint"]).is_dir())
+        self.assertEqual((self.record / "checkout/A.lean").read_text(), "repair before resource failure\n")
 
     def test_api_refusal_before_admission_refunds_content(self):
         import contextlib

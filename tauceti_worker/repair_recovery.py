@@ -37,6 +37,7 @@ HOLDS = {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
 LOCAL_WAITS = {"work-policy", "pr-policy", "profile-policy", "roadmap-policy"}
 METADATA_WAITS = {
     "pr-held",
+    "queue-owned",
     "push-permission",
     "ownership-changed",
     "maintenance-blocked",
@@ -425,6 +426,8 @@ class Recovery:
             receipt = b.verify(checkout, m, facts)
             if receipt.get("status") != "success":
                 if receipt.get("status") == "incomplete":
+                    if receipt.get("incomplete_reason") == "resource-pressure":
+                        raise Wait("worker-resource", receipt.get("error") or "Await host build resources")
                     raise RuntimeError(receipt.get("error") or "Verification incomplete")
                 if pending:
                     raise Wait(
@@ -612,6 +615,10 @@ class WorkerBackend:
                 "pr-closed",
                 f"PR is {facts['state']}; saved source is archived",
             )
+        from .verification_resources import queue_owned
+
+        if queue_owned(facts["labels"]):
+            raise Block("queue-owned", "Merge queue owns this PR; preserve source until ownership changes")
         if facts["draft"] or HOLDS & {label.lower() for label in facts["labels"]}:
             raise Block(
                 "pr-held",
@@ -1373,8 +1380,8 @@ class WorkerBackend:
                     self.w.cfg,
                     profile.provider,
                     dry=False,
-                    ignore_quota=False,
-                    quota_cmd=None,
+                    ignore_quota=self.opts.ignore_quota and self.opts.agent == profile.provider,
+                    quota_cmd=getattr(self.opts, "quota_cmd", None),
                     fresh=True,
                 )
             )
@@ -1392,6 +1399,7 @@ class WorkerBackend:
             take_last_agent_infra_failure,
         )
         from .budget import BudgetError
+        from .build_resources import MaintenanceStop, QueueOwned, ResourceUnavailable
         from .claude_api import api_context, api_mode
         from .config import AdmissionUnavailable
         from .fleet_capacity import admission_unit, unit_admitted
@@ -1454,17 +1462,25 @@ class WorkerBackend:
                             conversation_reason="fresh-checkout-no-historical-cwd-rebinding",
                         )
                         try:
-                            rc = run_agent_host(
-                                checkout,
-                                prompt,
-                                profile,
-                                self.w.cfg.logdir,
-                                cancel_event=self.w.claims.lost,
-                                session_path=record / "continuation-session.json",
-                                session_actor=auth.get("actor"),
-                                session_scope=scope,
-                                quota_cfg=self.w.cfg,
-                            )
+                            with MaintenanceStop(self.w, SimpleNamespace(pr=m["pr"])) as stop:
+                                rc = run_agent_host(
+                                    checkout,
+                                    prompt,
+                                    profile,
+                                    self.w.cfg.logdir,
+                                    cancel_event=stop,
+                                    session_path=record / "continuation-session.json",
+                                    session_actor=auth.get("actor"),
+                                    session_scope=scope,
+                                    quota_cfg=self.w.cfg,
+                                )
+                        except (ResourceUnavailable, QueueOwned) as error:
+                            refund_content(known_no_launch=True)
+                            self.snapshot_continuation(checkout, record, m, j)
+                            raise Wait(
+                                "worker-resource" if isinstance(error, ResourceUnavailable) else "queue-owned",
+                                str(error),
+                            ) from error
                         except BuildCacheUnavailable as error:
                             refund_content(known_no_launch=True)
                             raise RuntimeError(
