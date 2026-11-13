@@ -911,18 +911,17 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
             from . import expanded_cache, shared_mathlib, work_recovery
 
             try:
-                from . import recovery_maintenance, retention
+                from . import retention
 
                 if read_json(root() / "cleanup-service.json").get("installed"):
                     housekeeping = work_recovery.housekeep(cleanup=False)
                     if housekeeping.get("cleanup_pending"):
                         retention.request_cleanup()
                 else:
-                    # No collector will ever drain this host, so run its slice here. The
-                    # default tick budget (256 MiB) cannot keep pace with retired Lake
-                    # trees, and only collect_discarded() empties recovery-cleanup/discarded.
+                    # No installed collector drains this host, so give the in-refresh sweep
+                    # the collector's slice. The default tick budget (256 MiB per refresh)
+                    # cannot keep pace with retired checkouts and their Lake trees.
                     work_recovery.housekeep(cleanup=True, **retention.COLLECTOR_SLICE)
-                    recovery_maintenance.collect_discarded(work_recovery._state_root().resolve())
             except Exception as error:
                 errors.append(f"Recovery housekeeping deferred ({type(error).__name__}); retryable jobs retained")
             from . import verification_storage
