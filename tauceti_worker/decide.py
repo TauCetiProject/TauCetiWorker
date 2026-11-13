@@ -176,7 +176,7 @@ def _record(incident: dict, ruling: str, by: str, **fields) -> Path | None:
         **fields,
     )
     if path is not None and not incidents.acknowledge(incident["kind"], incident["key"], incident):
-        if next(iter(incidents.find(incident["kind"], incident["key"])), incident) != incident:
+        if _superseded(incident):
             log(f"decide: #{incident['pr']}: its {incident['kind']} record was rewritten meanwhile; it stays live")
     return path
 
@@ -394,8 +394,10 @@ def run(w, opts) -> int | None:
             rd = _Round(w, source, {row["number"]: row for row in rows})
             _settle(rd)
             # Records are written without this round's lock, so a reconsidered incident can gain a
-            # newer live record while eligibility is read; one case each, the later (live) one kept.
-            cases = list({case_id(incident): incident for incident in _recheck(rd) + _unruled(rd)}.values())
+            # newer live record while eligibility is read. Such a snapshot is dropped, and its live
+            # record waits for `_unruled` in this or a later round; one case each.
+            again = [incident for incident in _recheck(rd) if not _superseded(incident)]
+            cases = list({case_id(incident): incident for incident in again + _unruled(rd)}.values())
             cases = cases[: max_cases()]
             return _rule(rd, opts, cases) if cases else None
         except (GitHubError, SourceUnavailable, ForgeError) as error:
@@ -449,6 +451,11 @@ def _blockers(rd: _Round, ruling: dict) -> tuple[list[str] | None, str]:
     return (None, "") if pending else (landed, "")
 
 
+def _superseded(incident: dict) -> bool:
+    """Whether a newer record of `incident` is live than the version given."""
+    return next(iter(incidents.find(incident["kind"], incident["key"])), incident) != incident
+
+
 def _recheck(rd: _Round) -> list[dict]:
     """Look again at each live ruling that waits. One whose blockers have all landed becomes a
     `retry`, or an `escalate` where no retry is left; the incident of one whose blocker can no
@@ -461,7 +468,7 @@ def _recheck(rd: _Round) -> list[dict]:
         incident = _incident_of(ruling, rd.source) if landed or lost else None
         if incident is None or not rd.at_head(incident):
             continue
-        if next(iter(incidents.find(incident["kind"], incident["key"])), incident) != incident:
+        if _superseded(incident):
             log(f"decide: #{incident['pr']}: a newer record of it is live; ruling on that instead")
             continue
         if lost:

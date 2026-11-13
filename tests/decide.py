@@ -564,6 +564,40 @@ def test_rounds(tmp):
             [("declined-fix-1", "fresh evidence")],
         )
 
+    root = tmp / "refreshed-during-checks-crowded"
+    with settings(root, TAUCETI_HOLD_DECLINED="0"):
+        declined(9)
+        hub = Hub(p9={}, p20={}, **{f"p{n}": {} for n in range(1, 7)})
+        rounds(tmp, hub, answer((9, "wait", {"blocked_on": [20]})))
+        declined(*range(1, 7))
+        later()
+        hub.prs[20]["state"] = "CLOSED"
+        refreshed = []
+
+        def claim_read(n):
+            # Another worker records fresh evidence while the claim is read.
+            if n == 9 and not refreshed:
+                refreshed.append(incidents.record_declined("fix", 9, "head-9", message="fresh evidence"))
+            return False
+
+        seen = rounds(tmp, hub, answer((9, "retry", {})), claimed=claim_read)
+        fresh = incidents.find(incidents.DECLINED, "fix-9")[0]
+        check(
+            "a reconsidered incident refreshed during the claim read is not ruled on in its old version",
+            (
+                "declined-fix-9" in [c["case"] for c in seen["packet"]["cases"]],
+                decide.ruling_on(fresh),
+                decide._may_retry(fresh),
+            ),
+            (False, None, True),
+        )
+        seen = rounds(tmp, hub, answer((9, "retry", {})))
+        check(
+            "…its fresh record is ruled on next, with its retry",
+            ([c["case"] for c in seen["packet"]["cases"]], decide.ruling_on(fresh)["ruling"]),
+            (["declined-fix-9"], "retry"),
+        )
+
     root = tmp / "refreshed-landed"
     with settings(root, TAUCETI_HOLD_DECLINED="0"):
         declined(1)
