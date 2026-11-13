@@ -761,14 +761,17 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--lint-modules", result.stdout)
 
-    def test_host_wrapper_keeps_shell_work_foreground_and_bounds_each_command(self):
+    def test_host_wrapper_keeps_verification_foreground_until_the_round_deadline(self):
         from tauceti_worker.agents import host_agent_argv, local_verification
 
-        with patch.dict(os.environ, TAUCETI_ROUND_DEADLINE=str(time.time() + 1800)):
+        with (
+            patch("tauceti_worker.agents.time.time", return_value=1000),
+            patch.dict(os.environ, TAUCETI_ROUND_DEADLINE="2800", TAUCETI_SHELL_LIMIT_SECONDS=""),
+        ):
             _, env = host_agent_argv("fixture prompt", "claude")
         self.assertEqual(env["TAUCETI_VERIFY_PYTHON"], sys.executable)
-        self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], "600000")
-        self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "600000")
+        self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], "1800000")
+        self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "1800000")
         self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
         self.assertIn(sys.executable, local_verification("ordinary"))
 

@@ -186,6 +186,22 @@ def worker_survey(cfg, source, rs, counters, *, roadmap, skip, deep, stages, num
             else [pr for pr in result.open_prs if in_scope(pr.labels, pr.target_focuses, pr.head_ref, roadmap, skip)]
         )
     rs.observe(result.open_prs)
+    # Native false conflates conflicts with checking/error states. Resolve only
+    # owned, unpaused rebase work, then use the ordinary shared classifier.
+    resolver = getattr(type(source), "resolve_mergeability", None)
+    if deep and "rebase" in stages and resolver is not None:
+        from dataclasses import replace
+
+        paused = {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
+        result.open_prs = [
+            replace(pr, mergeable=resolver(source, cfg.state, pr.number, pr.head_oid))
+            if pr.mergeable == "UNKNOWN"
+            and result.owns(pr)
+            and not pr.is_draft
+            and not (set(map(str.lower, pr.labels)) & paused)
+            else pr
+            for pr in result.open_prs
+        ]
     classify_survey(
         cfg,
         source,
