@@ -109,6 +109,12 @@ if args[:2] == ["build", "--iofail"] and os.environ.get("STUB_LAKE_BUILD_SCRIPT"
     for line in Path(os.environ["STUB_LAKE_BUILD_SCRIPT"]).read_text().splitlines():
         if line.startswith("sleep "):
             time.sleep(float(line.split()[1]))
+        elif line.startswith("wait_file "):
+            gate = stub / line.split(maxsplit=1)[1]
+            deadline = time.monotonic() + 30
+            while not gate.exists():
+                if time.monotonic() >= deadline: sys.exit(90)
+                time.sleep(0.02)
         elif line.startswith("exit "):
             if int(line.split()[1]) == 0: write_outputs()
             sys.exit(int(line.split()[1]))
@@ -405,7 +411,19 @@ elif mode == "stream":
     # As the prompt asks: fix what has failed, check it with the scoped build helper (which waits for the
     # worker's build to release the lock), and record what the helper returned and what the list said.
     rebuild()
-    helper = subprocess.run([str(repair_dir / "build"), "TauCeti.Two"], text=True, capture_output=True)
+    if (stub_dir / "stream-handshake").exists():
+        process = subprocess.Popen([str(repair_dir / "build"), "TauCeti.Two"], text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        first = []
+        for line in process.stdout:
+            first.append(line)
+            if "waiting for .tauceti-repair/build.lock" in line:
+                break
+        (stub_dir / "stream-helper-waiting").touch()
+        output, error = process.communicate(timeout=30)
+        helper = subprocess.CompletedProcess(process.args, process.returncode, "".join(first) + output, error)
+    else:
+        helper = subprocess.run([str(repair_dir / "build"), "TauCeti.Two"], text=True, capture_output=True)
     deadline = time.time() + 30
     while (repair_dir / "build.lock").exists() and time.time() < deadline:
         time.sleep(0.1)
@@ -1484,6 +1502,32 @@ class RebaseArtifacts(Fixture):
         self.raw["diagnostics"][0]["onto"] = moved
         self.service.tasks = {1: self.raw}
         return moved
+
+    def test_changed_rebase_dependencies_are_prepared_on_target_and_input_is_restored(self):
+        seed = self.content.bare.parent / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", self.onto)
+        target = commit(seed, "bump dependency", {"lake-manifest.json": '{"packages": []}\n'})
+        sh(seed, "fetch", "--quiet", str(self.content.bare), self.content.tip)
+        task = repair_task.Task.from_json(
+            {**self.raw, "onto": target, "claim_token": "x", "expires_at": time.time() + 60}
+        )
+        sh(seed, "checkout", "--quiet", "--detach", self.content.tip)
+        package = seed / ".lake" / "packages" / "hydrated"
+        for fail in (False, True):
+            try:
+                with repair_task.artifact_checkout(seed, task, self.content.tip):
+                    self.assertEqual(sh(seed, "rev-parse", "HEAD"), target)
+                    self.assertTrue((seed / "lake-manifest.json").is_file())
+                    package.parent.mkdir(parents=True, exist_ok=True)
+                    package.write_text("prepared dependency objects")
+                    if fail:
+                        raise RuntimeError("cache transport failed")
+            except RuntimeError:
+                if not fail:
+                    raise
+            self.assertEqual(sh(seed, "rev-parse", "HEAD"), self.content.tip)
+            self.assertFalse((seed / "lake-manifest.json").exists())
+            self.assertEqual(package.read_text(), "prepared dependency objects")
 
     def test_the_rebase_target_is_fetched_first(self):
         os.environ["STUB_LAKE_CACHE_FAIL_REVS"] = self.content.base  # the stale base has no outputs
@@ -3783,7 +3827,9 @@ exit 1
         return self.root / "state" / "worktrees" / f"task-{task_id}" / ".tauceti-repair"
 
     def test_the_agent_is_launched_at_the_first_error_and_the_lock_is_released_at_the_end(self):
-        self.script()
+        # Hold the producer until the helper has observed its live lock, independent of startup speed.
+        (self.stub_dir / "stream-handshake").touch()
+        self.script(self.SCRIPT.replace("sleep 0.8", "wait_file stream-helper-waiting"))
         os.environ["STUB_AGENT_MODE"] = "stream"
         cfg = self.config(keep_worktree=True)
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
@@ -4096,6 +4142,21 @@ class ErrorParsing(unittest.TestCase):
 
 
 class Records(unittest.TestCase):
+    def test_a_pathless_verification_finding_reaches_the_next_repair_prompt(self):
+        root = Path(tempfile.mkdtemp(prefix="pathless-", dir=TMP))
+        content = Content(root)
+        task = repair_task.Task.from_json({**content.task(12), "claim_token": "x", "expires_at": time.time() + 60})
+        seed = root / "seed"
+        chain = repair.read_chain(seed, content.base, content.tip)
+        context = repair_task.prompt_context(task, None, listings=repair.listings_path(seed))
+        findings = repair_task.task_findings(task)
+        findings["compiler_errors"] = [{"path": "", "message": "the repaired chain failed verification"}]
+        with patch.object(repair, "git", side_effect=AssertionError("pathless findings have no file ownership")):
+            self.assertEqual(repair.owners_of(seed, chain, ""), [])
+        prompt = repair.compose_prompt(context, findings, chain, seed)
+        self.assertIn("Build/verification diagnostic (no file path)", prompt)
+        self.assertIn("the repaired chain failed verification", prompt)
+
     def test_a_pre_rebase_prompt_lists_the_errors_its_preparation_left(self):
         root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
         content = Content(root)
@@ -4648,15 +4709,17 @@ class Records(unittest.TestCase):
     def test_the_shell_limit_is_the_repair_task_s_own(self):
         from tauceti_worker import agents
 
-        deadline = time.time() + 3 * 3600
+        self.addCleanup(patch.stopall)
+        patch("tauceti_worker.agents.time.time", return_value=1000).start()
+        deadline = 1000 + 3 * 3600
         with patch.dict(os.environ, {"TAUCETI_SHELL_LIMIT_SECONDS": str(repair.SHELL_LIMIT_SECONDS)}):
             env = agents._foreground_shell_env(deadline)
         self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "7200000")
         self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], "7200000")
         with patch.dict(os.environ, {"TAUCETI_SHELL_LIMIT_SECONDS": ""}):
-            self.assertEqual(agents._foreground_shell_env(deadline)["BASH_MAX_TIMEOUT_MS"], "600000")
+            self.assertEqual(agents._foreground_shell_env(deadline)["BASH_MAX_TIMEOUT_MS"], "10800000")
         with patch.dict(os.environ, {"TAUCETI_SHELL_LIMIT_SECONDS": "7200"}):
-            self.assertEqual(agents._foreground_shell_env(time.time() + 30)["BASH_MAX_TIMEOUT_MS"][:2], "29")
+            self.assertEqual(agents._foreground_shell_env(time.time() + 30)["BASH_MAX_TIMEOUT_MS"], "30000")
 
     def test_admin_predicate(self):
         repair_task.verify_admin(PROJECT)

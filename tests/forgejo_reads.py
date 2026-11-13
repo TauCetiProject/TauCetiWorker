@@ -327,6 +327,7 @@ class SourceTests(unittest.TestCase):
         # and service destination exist. No real credential/network is used.
         for target in [
             "tauceti_worker.github_state.read",
+            "tauceti_worker.github_state.refresh_pr",
             "tauceti_worker.github_state.enabled",
             "tauceti_worker.review_state.github_state_enabled",
             "tauceti_worker.github.gh_run",
@@ -351,6 +352,53 @@ class SourceTests(unittest.TestCase):
     def state(self, source=None):
         cfg = SimpleNamespace(sbcache=Path(self.root.name) / "scoreboard")
         return ReviewState(cfg, source or self.source)
+
+    def test_selected_head_refresh_bypasses_cached_native_header_and_never_uses_github(self):
+        from tauceti_worker.state_repair import repair_selected, retry_key
+        from tauceti_worker.survey import Candidate, Counters
+
+        self.api.pull.return_value = {
+            "number": 12,
+            "html_url": self.repo.pull_url(12),
+            "flow": 0,
+            "state": "open",
+            "merged": False,
+            "head": {"sha": "a" * 40},
+        }
+        self.assertEqual(self.source.pr_view(12, ["headRefOid"]), {"headRefOid": "a" * 40})
+        self.api.pull.return_value["head"]["sha"] = "b" * 40
+        cfg = SimpleNamespace(state=Path(self.root.name))
+        worker = SimpleNamespace(gh=self.source, rs=self.state(), counters=Counters(cfg))
+        repair_selected(worker, Candidate(12, "a" * 40), "b" * 40)
+        self.assertTrue(worker.selection_changed)
+        self.assertEqual(self.api.pull.call_count, 2)
+        # A successful native refresh needs no outage backoff from the GitHub service.
+        self.assertLess(worker.counters.read(retry_key(12, "a" * 40)), time.time() + 5)
+
+    def test_native_refresh_failure_does_not_reuse_the_cached_head(self):
+        from tauceti_worker.state_repair import repair_selected, retry_key
+        from tauceti_worker.survey import Candidate, Counters
+
+        self.api.pull.return_value = {
+            "number": 12,
+            "html_url": self.repo.pull_url(12),
+            "flow": 0,
+            "state": "open",
+            "merged": False,
+            "head": {"sha": "a" * 40},
+        }
+        self.source.pr_view(12, ["headRefOid"])
+        self.api.pull.side_effect = ForgeError("offline", status=503)
+        result = self.source.refresh_pr_state(12, "a" * 40, "b" * 40)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertNotIn("data", result)
+        worker = SimpleNamespace(
+            gh=self.source, rs=self.state(), counters=Counters(SimpleNamespace(state=Path(self.root.name)))
+        )
+        repair_selected(worker, Candidate(12, "a" * 40), "b" * 40)
+        retry = worker.counters.read(retry_key(12, "a" * 40))
+        self.assertGreater(retry, time.time() + 25)
+        self.assertLess(retry, time.time() + 35)
 
     def test_review_state_consumes_native_comments_and_cache_provenance(self):
         state = self.state()
@@ -695,7 +743,7 @@ repository="one/Project"
             timeout=60,
         )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("Stage 1B requires GitHub bindings", result.stderr)
+        self.assertIn("Shared roadmap, tool and archive repositories must currently use GitHub bindings", result.stderr)
 
     def test_generic_test_doubles_do_not_select_direct_source_by_truthiness(self):
         cfg = SimpleNamespace(sbcache=Path(self.root.name) / "legacy")

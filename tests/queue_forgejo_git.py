@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +34,20 @@ class SourceGit(unittest.TestCase):
             request=Mock(return_value=[]),
         )
         self.source = ForgejoGitSource(self.identity, self.api, self.clone, token="fixture-source-token")
+
+    def test_mergeability_distinguishes_a_proved_conflict_from_tool_failure(self):
+        for status, output, expected in (
+            (0, b"c" * 40 + b"\n", "MERGEABLE"),
+            (1, b"c" * 40 + "\nconflict: é\n".encode(), "CONFLICTING"),
+        ):
+            with patch.object(self.source, "_git", return_value=subprocess.CompletedProcess([], status, output, b"")):
+                self.assertEqual(self.source.mergeability("team/Math", "a" * 40, "b" * 40), expected)
+        for status, output in ((1, b"failed\n"), (128, b""), (0, b"")):
+            with (
+                patch.object(self.source, "_git", return_value=subprocess.CompletedProcess([], status, output, b"")),
+                self.assertRaises(Incomplete),
+            ):
+                self.source.mergeability("team/Math", "a" * 40, "b" * 40)
 
     def test_credentials_are_scoped_and_do_not_inherit_execution_or_trace_environment(self):
         with patch.dict(
@@ -257,10 +272,18 @@ class SourceGit(unittest.TestCase):
         with self.assertRaises(AmbiguousWrite):
             self.source._git("push", write=True)
         pid = int(pidfile.read_text())
-        try:
-            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-        except (FileNotFoundError, ProcessLookupError):
-            state = "gone"
+        deadline = time.monotonic() + 1
+        while True:
+            try:
+                state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            except (FileNotFoundError, ProcessLookupError):
+                state = "gone"
+            # Waiting for the transport leader does not reap its grandchildren.
+            # Allow signal delivery to finish on a loaded CI runner, while still
+            # failing if a helper survives the process-group termination.
+            if state in {"gone", "Z"} or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
         if state not in {"gone", "Z"}:
             os.kill(pid, signal.SIGKILL)
         self.assertIn(state, {"gone", "Z"})

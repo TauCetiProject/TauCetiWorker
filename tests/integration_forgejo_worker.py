@@ -15,19 +15,229 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).parent / "fixtures"))
 
 from forgejo_git_source import source_fixture
+from runner import cli as review_cli
+from runner import publication as shared_publication
 from tauceti_tools.ci_candidate import RepositoryIdentity
 
 from tauceti_worker.config import Config
 from tauceti_worker.forgejo_worker import ForgejoWorkerSource
 from tauceti_worker.review_state import ReviewState
-from tauceti_worker.source_publication import pending, publish, retain_plan
+from tauceti_worker.source_publication import pending
+
+
+def retain_plan(source, cfg, number, head, path, *, actor_id):
+    assert json.loads(path.read_text())["head_sha"] == head
+    return shared_publication.retain(
+        source.repository.key, number, path, cfg.store, actor=source.repository.forge.key + "/users/" + str(actor_id)
+    )
+
+
+def publish(source, path):
+    value = json.loads(path.read_text())
+    status = shared_publication.publish(source.repository.key, path, Path(value["ledger"]))
+    if status == 0:
+        source.invalidate(value["pr"])
+    return status == 0
+
+
 from tauceti_worker.survey import Counters, survey
 from tauceti_worker.worker_sources import activate, source_config
 
 
 @unittest.skipUnless(os.environ.get("FORGEJO_BINARY"), "set FORGEJO_BINARY for disposable native worker")
 class NativeWorker(unittest.TestCase):
+    def test_rebase_uses_git_proof_and_rechecks_a_changed_base(self):
+        from tauceti_tools.forge import Forgejo, Incomplete
+
+        from tauceti_queue.forgejo_git import ForgejoGitSource
+        from tauceti_worker.work_units import _still_actionable
+
+        with source_fixture() as (root, api, repository, row, tokens):
+            endpoint = "repos/" + repository.name
+
+            def write(branch, content, *, create=False, client=api, target=endpoint):
+                data = {"branch": branch, "message": "Acceptance input", "content": base64.b64encode(content).decode()}
+                if not create:
+                    data["sha"] = client.request("GET", target + "/contents/Conflict.txt?ref=" + branch)["sha"]
+                client.request("POST" if create else "PUT", target + "/contents/Conflict.txt", data)
+
+            write("main", b"base\n", create=True)
+            peer = Forgejo(repository.forge, token=tokens["contributor"])
+            fork = peer.request("POST", endpoint + "/forks", {})
+            fork_endpoint = "repos/" + fork["full_name"]
+            peer.request(
+                "POST", fork_endpoint + "/branches", {"old_branch_name": "main", "new_branch_name": "conflict"}
+            )
+            write("conflict", b"branch\n", client=peer, target=fork_endpoint)
+            write("main", b"main\n")
+            pull = api.request(
+                "POST", endpoint + "/pulls", {"base": "main", "head": "contributor:conflict", "title": "Conflict"}
+            )
+            number, head = pull["number"], pull["head"]["sha"]
+            self.assertFalse(api.pull(repository, number)["mergeable"])
+            token = root / "native-token"
+            token.write_text(tokens["operator"])
+            token.chmod(0o600)
+            source = ForgejoWorkerSource(RepositoryIdentity(repository, row["id"]), api, token_file=token)
+            cfg = dataclasses.replace(
+                Config.resolve("native-rebase", home=root), state=root / "state", store_dir=root / "store"
+            )
+            cfg = source_config(cfg, source)
+            counters = Counters(cfg)
+
+            def observe():
+                return survey(
+                    cfg, source, ReviewState(cfg, source), counters, deep=True, stages=["rebase"], numbers=(number,)
+                )
+
+            # A Git failure is not a conflict, and admits no model work.
+            with patch.object(ForgejoGitSource, "mergeability", side_effect=Incomplete("unavailable")):
+                self.assertEqual(observe().rebaseable.actionable, [])
+            result = observe()
+            self.assertEqual([pr.mergeable for pr in result.open_prs], ["CONFLICTING"])
+            [candidate] = result.rebaseable.actionable
+            worker = type("Worker", (), {"gh": source, "cfg": cfg})()
+            self.assertTrue(_still_actionable("rebase", worker, result, candidate))
+            self.assertEqual(api.pull(repository, number)["head"]["sha"], head)
+            # Changing only main invalidates the old proof, even with an unchanged PR head.
+            write("main", b"branch\n")
+            transport = ForgejoGitSource(
+                source.identity, api, cfg.state / "mergeability/objects.git", token=tokens["operator"]
+            )
+            new_base = transport.ref_sha(repository.name, "heads/main")
+            real_pull = api.pull
+
+            def ambiguous(repo, pr):
+                value = real_pull(repo, pr)
+                self.assertEqual(value["base"]["sha"], new_base)
+                value["mergeable"] = False
+                return value
+
+            original = ForgejoGitSource.mergeability
+            with (
+                patch.object(api, "pull", side_effect=ambiguous),
+                patch.object(ForgejoGitSource, "mergeability", autospec=True, side_effect=original) as proof,
+            ):
+                self.assertFalse(_still_actionable("rebase", worker, result, candidate))
+            proof.assert_called_once()
+            self.assertEqual(proof.call_args.args[2:], (head, new_base))
+            self.assertEqual(api.pull(repository, number)["head"]["sha"], head)
+
+    def test_native_project_cli_uses_its_configured_source_and_recovers_unchanged(self):
+        with source_fixture() as (root, api, repository, row, tokens):
+            endpoint = "repos/" + repository.name
+            api.request("POST", endpoint + "/branches", {"old_branch_name": "main", "new_branch_name": "configured"})
+            api.request(
+                "POST",
+                endpoint + "/contents/Proof.lean",
+                {
+                    "branch": "configured",
+                    "message": "Proof",
+                    "content": base64.b64encode(b"theorem example_proof : True := trivial\n").decode(),
+                },
+            )
+            pull = api.request(
+                "POST",
+                endpoint + "/pulls",
+                {
+                    "base": "main",
+                    "head": "configured",
+                    "title": "Configured review",
+                    "body": "Review this proof.",
+                },
+            )
+            token = root / "native-token"
+            token.write_text(tokens["operator"])
+            token.chmod(0o600)
+            configuration = root / "project.toml"
+            configuration.write_text(
+                'schema_version=2\n[forges.native]\nkind="forgejo"\nurl='
+                + json.dumps(repository.forge.url)
+                + '\n[repositories]\ncontent={forge="native",name='
+                + json.dumps(repository.name)
+                + '}\nroadmap="Owner/Roadmap"\n[lean]\nroots=["Project"]\n'
+            )
+            engine = root / "engine"
+            engine.mkdir()
+            (engine / "runner").symlink_to(Path(review_cli.__file__).resolve().parent, target_is_directory=True)
+            (engine / "rubrics").mkdir()
+            (engine / "rubrics/_common.md").write_text(
+                "Project source: https://github.com/TauCetiProject/TauCeti\nTauCeti/ and TauCetiProject/TauCetiRoadmap"
+            )
+            (engine / "rubrics/style.md").write_text("Review style.")
+            roadmap = root / "roadmap"
+            roadmap.mkdir()
+            (roadmap / "README").write_text("Roadmap")
+            binary = root / "bin"
+            binary.mkdir()
+            calls = root / "calls"
+            prompt = root / "prompt"
+            model = binary / "codex"
+            model.write_text(
+                "#!"
+                + sys.executable
+                + "\n"
+                + """import json, os, re, sys
+assert not any(k.startswith(('TAUCETI_SOURCE_', 'TAUCETI_FORGEJO_', 'GH_', 'GIT_CONFIG_')) for k in os.environ)
+assert 'TAUCETI_CONF' not in os.environ
+text=sys.stdin.read()
+open(__PROMPT__, 'w').write(text)
+with open(__CALLS__, 'a') as stream: stream.write('called\\n')
+marker=re.search(r'TAUCETI-VERDICT-[0-9a-f]+',text)[0]
+print(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':marker+'\\n'+json.dumps({'verdict':'approve','summary':'Clear.'})}}))
+print(json.dumps({'type':'turn.completed','usage':{'input_tokens':1,'output_tokens':1}}))
+""".replace("__PROMPT__", repr(str(prompt))).replace("__CALLS__", repr(str(calls)))
+            )
+            model.chmod(0o700)
+            env = {k: v for k, v in os.environ.items() if not k.startswith(("TAUCETI_", "GH_", "GITHUB_", "CLAIM_"))}
+            env.update(
+                PATH=str(binary) + os.pathsep + os.environ["PATH"],
+                HOME=str(root),
+                TAUCETI_FORGEJO_TOKEN_FILE=str(token),
+                TAUCETI_FORGEJO_REPOSITORY_ID=str(row["id"]),
+            )
+            command = [
+                sys.executable,
+                str(engine / "runner/cli.py"),
+                str(pull["number"]),
+                "--conf",
+                str(configuration),
+                "--repo-dir",
+                str(engine),
+                "--roadmap-dir",
+                str(roadmap),
+                "--no-mathlib",
+                "--no-sync",
+                "--no-coordinate",
+                "--post",
+                "--rubrics",
+                "style",
+                "--store",
+                str(root / "store"),
+                "--workdir",
+                str(root / "work"),
+                "--reviewer",
+                "codex",
+            ]
+            first = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertIn(repository.url, prompt.read_text())
+            self.assertIn("Project/ and Owner/Roadmap", prompt.read_text())
+            self.assertNotIn("https://github.com/" + repository.name, prompt.read_text())
+            second = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("unchanged before preparation", second.stderr)
+            self.assertEqual(calls.read_text(), "called\n")
+            self.assertEqual(len(api.comments(repository, pull["number"])), 1)
+            ledger = json.loads((root / "store/ledger.json").read_text())["prs"][str(pull["number"])]
+            self.assertEqual(ledger["published_head_sha"], pull["head"]["sha"])
+
     def test_native_branch_pr_schedule_publication_and_recovery(self):
+        engine = Path(os.environ.get("TAUCETI_REVIEW_ENGINE_DIR") or Path(review_cli.__file__).resolve().parent.parent)
+        self.assertTrue(
+            (engine / "runner/cli.py").is_file() and (engine / "rubrics").is_dir(),
+            "Set TAUCETI_REVIEW_ENGINE_DIR to a Review checkout when using an installed Review wheel",
+        )
         with source_fixture() as (root, api, repository, row, tokens):
             from tauceti_tools.forge import Forgejo
 
@@ -54,6 +264,14 @@ class NativeWorker(unittest.TestCase):
                 sbcache=root / "cache",
             )
             cfg = source_config(cfg, source)
+            configuration = root / "project.toml"
+            configuration.write_text(
+                'schema_version=2\n[forges.native]\nkind="forgejo"\nurl='
+                + json.dumps(repository.forge.url)
+                + '\n[repositories]\ncontent={forge="native",name='
+                + json.dumps(repository.name)
+                + '}\nroadmap="TauCetiProject/TauCetiRoadmap"\n'
+            )
             endpoint = "repos/" + repository.name
             api.request("POST", endpoint + "/branches", {"old_branch_name": "main", "new_branch_name": "proposal"})
             api.request(
@@ -65,7 +283,29 @@ class NativeWorker(unittest.TestCase):
                     "content": base64.b64encode(b"theorem example_proof : True := trivial\n").decode(),
                 },
             )
-            with activate(source, cfg):
+            with (
+                activate(source, cfg),
+                patch.object(review_cli, "CACHE_DIR", root / "review-cache"),
+                patch.dict(os.environ, {"TAUCETI_REVIEW_ENGINE_DIR": str(engine)}),
+                patch.dict(
+                    os.environ,
+                    {
+                        "TAUCETI_CONF": str(configuration),
+                        "TAUCETI_CONF_SOURCE": str(configuration),
+                        "TAUCETI_CONF_SNAPSHOT": str(configuration),
+                    },
+                ),
+            ):
+                encoded = base64.b64encode(("x-access-token:" + grant["sha1"]).encode()).decode()
+                self.assertFalse(any(grant["sha1"] in value or encoded in value for value in os.environ.values()))
+                from tauceti_worker import agents
+
+                with patch.object(agents, "sync_mathlib_pool"):
+                    self.assertTrue(agents.prepare_checkout(cfg, work="fix"))
+                self.assertEqual(
+                    os.environ.get("TAUCETI_VERIFY_BASE"),
+                    api.request("GET", endpoint + "/branches/main")["commit"]["id"],
+                )
                 # Exercise an actual worker-authored Git commit and safe push;
                 # API file writes do not verify process-local commit attribution.
                 checkout = root / "author-checkout"
@@ -123,13 +363,20 @@ class NativeWorker(unittest.TestCase):
                 self.assertEqual(candidate.source_repository, repository)
                 self.assertEqual(candidate.source_repository_id, row["id"])
                 self.assertFalse(sv.open_prs[0].build_success)
+                from types import SimpleNamespace
+
+                from tauceti_worker.work_units import _still_actionable
+
+                worker = SimpleNamespace(cfg=cfg, gh=source, rs=rs, counters=counters)
+                self.assertTrue(_still_actionable("review", worker, sv, candidate))
 
                 work = cfg.state / "review-work/test"
                 work.mkdir(parents=True)
                 from tauceti_worker.source_claims import lease
-                from tauceti_worker.source_review import prepare
 
-                comparison = prepare(source, pr, head, work)
+                _, base = review_cli.pr_ref_oids(repository.key, pr)
+                comparison = review_cli.merge_base_sha(repository.key, base, head, pr)
+                review_cli.prepare_review_source(repository.key, head, comparison, work)
                 self.assertIsNotNone(comparison)
                 first_claim = lease(source, cfg, f"review/{pr}/{head}")
                 peer_cfg = dataclasses.replace(cfg, wid="other-worker")
@@ -177,6 +424,7 @@ class NativeWorker(unittest.TestCase):
                     "pr": pr,
                     "head": head,
                     "actor_id": actor_id,
+                    "lifecycle": 2,
                     "store": str(cfg.store),
                 }
                 (work / "review-context.json").write_text(json.dumps(context))
@@ -239,6 +487,7 @@ class NativeWorker(unittest.TestCase):
                 rs.bust(pr)
                 fixed = survey(cfg, source, rs, counters, deep=True, stages=["fix"], selected_roadmap="any")
                 self.assertEqual([candidate.pr for candidate in fixed.needs_fix.actionable], [pr], fixed.errors)
+                self.assertTrue(_still_actionable("fix", worker, fixed, fixed.needs_fix.actionable[0]))
 
                 api.request(
                     "POST",

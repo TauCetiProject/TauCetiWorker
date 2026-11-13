@@ -572,11 +572,24 @@ def reduce_sample(observation: dict, candidates: dict) -> dict:
 
 
 def main(argv: Sequence[str]) -> int:
-    if len(argv) != 4 or argv[1] != "derive":
-        print("usage: python -m tauceti_queue.feeds derive <active-batches.json> <candidates.json>", file=sys.stderr)
+    if len(argv) != 4 or argv[1] not in {"derive", "validate"}:
+        print(
+            "usage: python -m tauceti_queue.feeds {derive|validate} <active-batches.json> <candidates.json>",
+            file=sys.stderr,
+        )
         return 2
     observation = json.loads(pathlib.Path(argv[2]).read_text())
     candidates = json.loads(pathlib.Path(argv[3]).read_text())
+    if argv[1] == "validate":
+        errors = [
+            *(f"{argv[2]}: {error}" for error in validate_observation(observation)),
+            *(f"{argv[3]}: {error}" for error in validate_candidates(candidates)),
+        ]
+        if errors:
+            print("\n".join(errors), file=sys.stderr)
+            return 1
+        print("both captures match the committed feed schema")
+        return 0
     schema = {
         "derived_from": {"observation": pathlib.Path(argv[2]).name, "candidates": pathlib.Path(argv[3]).name},
         "observation": derive_schema(observation),
@@ -670,7 +683,9 @@ class ControllerFeedSource:
 
     def _members(self, batch_id: int, inputs: dict[int, dict]) -> tuple[MemberView, ...]:
         rows = self.store.rows("members", {"batch_id": batch_id, "removed": 0}, order="position")
-        return tuple(self._member_view(m, inputs) for m in rows)
+        from .mixed_identity import SourceNumber
+
+        return tuple(self._member_view(m, inputs) for m in rows if not isinstance(m["number"], SourceNumber))
 
     # -- batches
 
@@ -731,7 +746,11 @@ class ControllerFeedSource:
         rows = self.store.rows("members", None, order="id DESC", limit=5000)
         inputs = self._inputs_by_id()
         out = []
+        from .mixed_identity import SourceNumber
+
         for member in rows:
+            if isinstance(member["number"], SourceNumber):
+                continue
             batch = batches.get(member["batch_id"])
             if batch is None:
                 continue
@@ -756,7 +775,11 @@ class ControllerFeedSource:
         if repo != self.controller.repository:
             return []
         approvals = []
+        from .mixed_identity import SourceNumber
+
         for row in self.store.rows("inputs", {"repository": repo}, order="id"):
+            if isinstance(row["number"], SourceNumber):
+                continue
             if row["state"] not in ("waiting", "reserved", "inserted"):
                 continue
             evidence = _loads(row.get("evidence"), {})
@@ -879,6 +902,7 @@ class ControllerFeedSource:
         return [
             AdmissionView(int(m["id"]), int(m["batch_id"]), _micro(m["added_at"]), self._member_view(m, inputs), base)
             for m in rows
+            if not m.get("source_identity")
         ]
 
 

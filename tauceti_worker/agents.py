@@ -465,8 +465,19 @@ def fill_prompt(path: Path, **subs) -> str:
     source = current()
     if source is not None:
         host_repo = source.repository.forge.url.split("://", 1)[1] + "/" + source.repo
-        text = text.replace("https://github.com/" + TAUCETI, source.repository.url)
-        text = text.replace("--repo " + TAUCETI, "--repo " + host_repo)
+        # Match a complete repository token. Shared repositories such as
+        # TauCetiRoadmap have the content repository's name as a prefix.
+        boundary = r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_.-])"
+        text = re.sub(
+            re.escape("https://github.com/" + TAUCETI) + r"(\.git)?" + boundary,
+            lambda match: source.repository.url + (match[1] or ""),
+            text,
+        )
+        text = re.sub(
+            re.escape("--repo " + TAUCETI) + boundary,
+            lambda _: "--repo " + host_repo,
+            text,
+        )
     # An unfilled placeholder ships literal `__BIN__/git-safe-push` to the agent, which is the
     # command-not-found failure wrapper_bin exists to end. Fail here instead, but only for the
     # prompts we ship: the progress prompt is served by the pinned TauCetiProgress build (written
@@ -495,20 +506,47 @@ def scope_policy(labels=(), head_ref: str = "", *, bump: bool = False) -> str:
     return "ordinary"
 
 
+def self_tested_guidance(policy: str) -> str:
+    from .worker_sources import repository_url
+
+    if (
+        policy != "ordinary"
+        or os.environ.get("TAUCETI_SELF_TESTED", "0") != "1"
+        or repository_url().lower() != "https://github.com/taucetiproject/tauceti"
+    ):
+        return ""
+    return (
+        "### Apply the self-tested label after verification\n"
+        "For an ordinary mathematics PR entirely under `TauCeti/`, after the final source changes "
+        "successfully complete the local verification below (equivalent to "
+        "`lake build --iofail && lake test && lake lint`). Wait for its successful exit; "
+        "failed, incomplete, or outdated checks do not qualify. Reuse successful checks whose inputs "
+        "have not changed; this adds no verification pass.\n"
+        "Apply the `self-tested` label to the PR. Create new PRs through the existing "
+        "`gh-safe-pr-create` wrapper; do not bypass it. After creation or pushing an update, "
+        "confirm the live PR commit matches your verified commit, then use "
+        "`gh pr edit <number> --repo TauCetiProject/TauCeti "
+        "--add-label self-tested`. A push clears the label, so reapply it after testing subsequent changes. "
+        "If a concurrent push workflow removes the label again, confirm the commit still matches "
+        "and reapply it once. Do not apply it for infrastructure or pin changes, or full-lint/lint-repair requests. "
+        "The trusted picker checks eligibility; reviews and all staging tests still run.\n\n"
+    )
+
+
 def local_verification(policy: str, bubble: bool = False) -> str:
     """The shared verification rules and scope recipe every authoring/repair prompt embeds."""
     if policy not in {"ordinary", "full-lint", "lint-repair", "bump"}:
         raise Die(f"unknown local verification scope policy {policy!r}")
     if os.environ.get("TAUCETI_VERIFY_HELPER", "0") != "1":
         python = "/usr/bin/python3" if bubble else sys.executable
-        return fill_prompt(
+        return self_tested_guidance(policy) + fill_prompt(
             HERE / "prompts" / "local-verification.md",
             SCOPE_POLICY=policy,
             LOCAL_CHECKS=f'"{python}" "{wrapper_bin(bubble)}/tauceti-local-checks"',
         )
     python = "/usr/bin/python3" if bubble else sys.executable
     helper = f'"{python}" "{wrapper_bin(bubble)}/tauceti-verify"'
-    return (
+    return self_tested_guidance(policy) + (
         "### Local verification\n"
         f"Run `{helper}` synchronously after the last edit or integration. "
         f"The worker's local actual-source scope policy is `{policy}`. "
@@ -516,7 +554,7 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "module-system, lint and shim-expiry phases. It prints `scope:`, phase exits and a durable receipt path. "
         "For diagnosis, use `--stage build|axioms|module-system|lint|shim-expiry`; final verification uses all stages. "
         "Exact-input phase receipts avoid repeated successful work; use `--no-reuse` only to investigate evidence. "
-        "Claude shell commands run in the foreground with a ten-minute limit, or the shorter remaining round. "
+        "Foreground verification may use the remaining round budget; do not impose a ten-minute timeout. "
         "If an interrupted helper hands verification to a supervisor continuation, let it finish there. "
         "If Codex returns an execution session ID, keep waiting on that same session with write_stdin until it exits. "
         "Write diagnostic logs and module lists outside the checkout (the helper already keeps logs in worker state). "
@@ -749,11 +787,14 @@ def prepare_checkout(
             "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main"),
         ):
             return False
-    from .verification_scope import local_main
-
+    # Origin was validated and fetched above, and HEAD is now its main commit.
+    # Carry that exact base into verification rather than asking the standalone
+    # verifier to rediscover a canonical remote (which defaults to GitHub).
     os.environ.pop("TAUCETI_VERIFY_BASE", None)
-    with contextlib.suppress(ValueError, subprocess.CalledProcessError):
-        os.environ["TAUCETI_VERIFY_BASE"] = local_main(co)
+    with contextlib.suppress(subprocess.CalledProcessError):
+        os.environ["TAUCETI_VERIFY_BASE"] = subprocess.check_output(
+            ["git", "-C", str(co), "rev-parse", "--verify", "HEAD^{commit}"], text=True
+        ).strip()
     os.environ["TAUCETI_VERIFY_STATE"] = str(cfg.state.resolve())
     # The checkout is quiescent here: the previous agent has exited and the next one has not started.
     # Compare canonical main, rather than an arbitrary PR branch, and retire old-toolchain artifacts
@@ -799,24 +840,21 @@ def fetch_git_source(url: str, dir: Path) -> bool:
     return _fetch_shallow(url, dir)
 
 
-SHELL_LIMIT_SECONDS = 600  # an authoring round's foreground shell limit
-
-
 def _foreground_shell_env(deadline: float, limit_seconds: float | None = None) -> dict[str, str]:
-    # A shell command is not a whole round. Background tasks can retain the CLI
-    # after its final answer and overlap later builds in the same checkout.
-    # ``TAUCETI_SHELL_LIMIT_SECONDS`` lets a launcher with its own budget (the queue's repair task,
-    # whose agent runs whole-library builds in the foreground) lengthen the limit for its agent.
+    # Keep commands in the foreground, bounded by the round rather than an unrelated
+    # ten-minute ceiling: waiting for compiler capacity consumes wall time too.
+    # Launchers may still request a shorter command budget explicitly.
     if limit_seconds is None:
         try:
-            limit_seconds = float(os.environ.get("TAUCETI_SHELL_LIMIT_SECONDS") or SHELL_LIMIT_SECONDS)
+            value = os.environ.get("TAUCETI_SHELL_LIMIT_SECONDS")
+            limit_seconds = float(value) if value else None
         except ValueError:
-            limit_seconds = SHELL_LIMIT_SECONDS
-    limit_ms = max(1000, int(limit_seconds * 1000))
+            limit_seconds = None
     remaining_ms = max(1000, int((deadline - time.time()) * 1000))
+    timeout_ms = remaining_ms if limit_seconds is None else min(remaining_ms, max(1000, int(limit_seconds * 1000)))
     return {
-        "BASH_DEFAULT_TIMEOUT_MS": str(min(limit_ms, remaining_ms)),
-        "BASH_MAX_TIMEOUT_MS": str(min(limit_ms, remaining_ms)),
+        "BASH_DEFAULT_TIMEOUT_MS": str(timeout_ms),
+        "BASH_MAX_TIMEOUT_MS": str(timeout_ms),
         "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
     }
 
@@ -853,7 +891,9 @@ def host_agent_argv(
 
     With ``prompt_on_stdin`` the prompt is left out of argv (Claude) or replaced by ``-`` (Codex) and
     the caller writes it to the process's stdin; see ``host_agent_launch``."""
-    env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
+    from .build_resources import defaults
+
+    env = defaults({**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"})
     env["TAUCETI_VERIFY_PYTHON"] = sys.executable
     env.update(_foreground_shell_env(float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200)))
     profile = _authoring_profile(profile)
@@ -1241,8 +1281,8 @@ def run_agent_proc(
                     # This agent owns a separate process group, so tools cannot
                     # outlive a lost lease and continue publishing afterwards.
                     with contextlib.suppress(ProcessLookupError):
-                        os.killpg(proc.pid, signal.SIGTERM)
-                    if not finished.wait(2):
+                        proc.terminate()
+                    if not finished.wait(35):
                         with contextlib.suppress(ProcessLookupError):
                             os.killpg(proc.pid, signal.SIGKILL)
                     return
@@ -1307,7 +1347,7 @@ def run_agent_proc(
             "terminal_failure": renderer.terminal_failure_text,
             "rate_limit_status": renderer.rate_limit_status,
             "usage": dict(renderer.usage),
-            "tail": list(tail)[-6:],  # the guardian's own traceback when the agent executable is missing
+            "tail": list(tail)[-6:],  # the guardian's fixed diagnostic when the executable cannot start
         }
         if provider in {"codex", "claude"} and not renderer.active:
             write_rendered(destination, f"[warning] no structured {provider} events were recognized\n")
@@ -1463,6 +1503,9 @@ def lake_cache_max_revs(env: dict) -> str:
 @contextlib.contextmanager
 def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
     """Keep the public service available through repairs, merges and dependency changes."""
+    from .build_resources import defaults
+
+    defaults(env)
     if not TAUCETI_CACHE_SERVICE:
         yield
         return
@@ -1548,7 +1591,7 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
     reader, writer = os.pipe()
     try:
         proc = subprocess.Popen(
-            [sys.executable, "-c", _PARENT_BOUND_AGENT, str(reader), *command],
+            [sys.executable, "-I", "-c", _PARENT_BOUND_AGENT, str(reader), *command],
             pass_fds=(reader, *lease_fds(env)),
             cwd=cwd,
             env=env,
@@ -1568,9 +1611,9 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
         except BaseException:
             sweep = False
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGTERM)
+                proc.terminate()
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=35)
             except subprocess.TimeoutExpired:
                 pass
             finally:
@@ -2324,6 +2367,12 @@ def run_in_bubble(
     (rounddir / "lean").chmod(0o755)
     (rounddir / "tauceti-tools").write_text('#!/bin/sh\nexec python3 -m tauceti_tools "$@"\n')
     (rounddir / "tauceti-tools").chmod(0o755)
+    shutil.copy(
+        HERE / "verification_resources.py"
+        if (HERE / "verification_resources.py").exists()
+        else HERE / "tauceti_worker/verification_resources.py",
+        rounddir / "verification_resources.py",
+    )
     # Cheap V0 diagnostics also need these; do not tie them to the helper canary opt-in.
     from tauceti_tools.templates import ASSETS
 
@@ -2454,7 +2503,16 @@ def run_in_bubble(
         if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
             tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
     tcenv += " TAUCETI_LOCAL_LINT_CACHE=/opt/local-lint-cache TAUCETI_VERIFY_PYTHON=/usr/bin/python3"
+    if resource_wait := os.environ.get("TAUCETI_BUILD_RESOURCE_WAIT"):
+        wait_path = Path(resource_wait)
+        wait_path.parent.mkdir(parents=True, exist_ok=True)
+        mount_flags += ["--mount", f"{wait_path.parent}:/opt/resource-waits:rw"]
+        tcenv += " TAUCETI_BUILD_RESOURCE_WAIT=/opt/resource-waits/" + shlex.quote(wait_path.name)
     tcenv += " LAKE_OVERRIDE_LEAN=true LEAN=/opt/round/tauceti-lean"
+    from .build_resources import DEFAULTS
+
+    for name, value in DEFAULTS.items():
+        tcenv += f" {name}={shlex.quote(os.environ.get(name, value))}"
     if inner_cmd is None:
         for key, value in _foreground_shell_env(
             getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)
@@ -2852,26 +2910,10 @@ def _review_in_bubble(
     cross-repo `gh api` for its own rev. TAUCETI_REVIEW_ENGINE_DIR pins a local engine checkout
     (operator override / pre-merge testing); otherwise a shallow REVIEW clone is staged."""
     cfg = w.cfg
-    eng = os.environ.get("TAUCETI_REVIEW_ENGINE_DIR")
-    engine_dir = Path(eng) if eng else (cfg.state / "refs" / "review-engine")
-    if not eng:
-        ref = os.environ.get("TAUCETI_REVIEW_REF")
-        if ref:
-            engine_dir = cfg.state / "refs" / f"review-engine-{ref}"
-            current = subprocess.run(
-                ["git", "-C", str(engine_dir), "rev-parse", "HEAD"], capture_output=True, text=True
-            )
-            if current.returncode or current.stdout.strip() != ref:
-                engine_dir.mkdir(parents=True, exist_ok=True)
-                commands = (
-                    ["git", "init", "-q", str(engine_dir)],
-                    ["git", "-C", str(engine_dir), "fetch", "--depth", "1", f"https://github.com/{REVIEW}", ref],
-                    ["git", "-C", str(engine_dir), "checkout", "--detach", "FETCH_HEAD"],
-                )
-                if any(subprocess.run(command, timeout=120).returncode for command in commands):
-                    raise Die(f"fetch pinned {REVIEW}@{ref} failed")
-        elif not fetch_ref(REVIEW, engine_dir):
-            raise Die(f"fetch {REVIEW} failed")
+    from .review_runtime import resolve
+
+    runtime = getattr(w, "review_runtime", None) or resolve(cfg)
+    engine_dir = runtime.directory
     roadmap_dir = cfg.state / "refs" / "roadmap"
     if not fetch_ref(ROADMAP, roadmap_dir):
         raise Die(f"fetch {ROADMAP} failed")

@@ -65,7 +65,7 @@ def classify(record, stages, reviews=None, rounds=0, attempts=100):
             json.dumps({"prs": {"1": {"rounds": [{"ts": datetime.now(UTC).isoformat()} for _ in range(rounds)]}}})
         )
         return s.survey(
-            SimpleNamespace(wid="test", store_dir=Path(directory)),
+            SimpleNamespace(wid="test", store_dir=Path(directory), state=Path(directory)),
             SimpleNamespace(open_prs=lambda: [record], fresh_claim_age=lambda _: None),
             reviews or Reviews(),
             SimpleNamespace(read=lambda _: attempts),
@@ -74,6 +74,32 @@ def classify(record, stages, reviews=None, rounds=0, attempts=100):
 
 
 assert classify(raw(), ["bump"]).bump.count == 1
+# A pending automatic bump is adapted without waiting for CI, until CI or a local verification passes.
+pending = raw(statusCheckRollup=[{"context": "build", "state": "PENDING"}])
+assert classify(pending, ["bump"], attempts=0).bump.actionable[0].reason == "bump-mathlib, build pending"
+assert classify(raw(statusCheckRollup=[]), ["bump"], attempts=0).bump.count == 1
+# One round per pending head; a red head keeps its unlimited retries.
+assert not classify(pending, ["bump"], attempts=1).bump.actionable
+assert classify(raw(), ["bump"], attempts=1).bump.actionable
+# Dispatch re-reads a pending bump and declines it once CI or another worker has settled the head.
+candidate = classify(pending, ["bump"], attempts=0).bump.actionable[0]
+for rollup, want in [
+    ([{"context": "build", "state": "PENDING"}], True),
+    ([{"context": "build", "state": "SUCCESS"}], False),
+    ([{"context": "build", "state": "PENDING"}, {"context": "self-tested/1", "state": "SUCCESS"}], False),
+]:
+    fresh = raw(statusCheckRollup=rollup, labels=[{"name": "self-tested"}])
+    live = SimpleNamespace(gh=SimpleNamespace(pr_view=lambda *_args, f=fresh: f))
+    assert w._still_actionable("bump", live, None, candidate) is want, rollup
+moved = SimpleNamespace(gh=SimpleNamespace(pr_view=lambda *_args: pending | {"headRefOid": "c" * 40}))
+assert not w._still_actionable("bump", moved, None, candidate)
+assert not classify(raw(statusCheckRollup=[{"context": "build", "state": "SUCCESS"}]), ["bump"]).bump.count
+assert not classify(pending | {"author": {"login": "someone"}}, ["bump"]).bump.count
+self_tested = pending | {
+    "labels": [{"name": "self-tested"}],
+    "statusCheckRollup": [{"context": "build", "state": "PENDING"}, {"context": "self-tested/1", "state": "SUCCESS"}],
+}
+assert not classify(self_tested, ["bump"]).bump.count
 assert classify(raw(mergeable="CONFLICTING"), ["rebase"]).rebaseable.count == 1
 assert not classify(raw(headRefName="feature"), ["fix-ci"]).red_ci.count
 assert not classify(raw(author={"login": "me"}, headRepositoryOwner={"login": "me"}), ["bump"]).bump.count
@@ -95,6 +121,7 @@ assert classify(green, ["review"], Reviews(clean=True, contest=contest)).reviewa
 # Dispatch revalidation must apply the same exemption as the survey.
 sv = classify(green, ["fix"])
 worker = SimpleNamespace(
+    cfg=SimpleNamespace(state=Path(tempfile.gettempdir()) / "automatic-bump-test"),
     rs=Reviews(),
     counters=SimpleNamespace(read=lambda _: 100),
     gh=SimpleNamespace(pr_view=lambda *args: {"state": "OPEN", "isDraft": False, "headRefOid": HEAD}),

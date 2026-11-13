@@ -276,6 +276,18 @@ def collect_review_scratch(cfg, report, *, dry=False):
                 ):
                     note(report, "protected", str(path))
                     continue
+                publication = read_json(path / "publication.json")
+                if (
+                    (path / "publication.json").exists() and publication.get("state") not in {"published", "superseded"}
+                ) or (
+                    not publication
+                    and any(
+                        (path / name).is_file() and read_json(path / name).get("review_changed") is not False
+                        for name in ("post_plan.json", "plan.json")
+                    )
+                ):
+                    note(report, "protected", f"{path}: rendered review output awaits reconciliation")
+                    continue
                 mounts = mount_points()
                 if mounts is None or any(p == path.resolve() or p.is_relative_to(path.resolve()) for p in mounts):
                     note(report, "protected", str(path))
@@ -713,6 +725,11 @@ def pending_work(base):
     return result
 
 
+# One collector slice of recovery housekeeping. Activity refresh reuses it on hosts
+# without an installed collector, where it is the only path that deletes anything.
+COLLECTOR_SLICE = dict(seconds=30, entries=262144, bytes=1024**3, removal_bytes=32 * 1024**3)
+
+
 def drain_pending(reports, *, once=False):
     """Round-robin existing deletion slices without repeating expensive inventories."""
     from . import recovery_maintenance, verification_storage
@@ -732,13 +749,7 @@ def drain_pending(reports, *, once=False):
                     states = [
                         member for cfg in worker_configs() for member in (cfg.state, cfg.state / "verification-state")
                     ]
-                    recovery = recovery_maintenance.prepare(
-                        worker_state_root().resolve(),
-                        seconds=30,
-                        entries=262144,
-                        bytes=1024**3,
-                        removal_bytes=32 * 1024**3,
-                    )
+                    recovery = recovery_maintenance.prepare(worker_state_root().resolve(), **COLLECTOR_SLICE)
                     trash = recovery_maintenance.collect_discarded(worker_state_root().resolve())
                     verification = verification_storage.housekeep(
                         states,
