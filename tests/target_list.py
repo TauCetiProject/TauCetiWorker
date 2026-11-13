@@ -429,6 +429,19 @@ class Forgejo(unittest.TestCase):
         with self.assertRaises(SourceUnavailable):
             self.source.merged_prs(f"{t.MERGED_SEARCH} sort:updated", limit=200)
 
+    def test_a_queue_landed_pull_request_completes_its_item(self):
+        """The merge queue lands a pull request by squash and closes it, unmerged, under the Bors title."""
+        from tauceti_worker.github import BORS_MERGED_PREFIX
+
+        title = BORS_MERGED_PREFIX + "Prove a"
+        landed = dict(self.pull(6, marker("Algebra", "a"), merged=False), title=title)
+        unmerged = dict(self.pull(7, marker("Algebra", "b"), merged=False), title="Prove b")
+        self.closed = [[landed, unmerged]]
+        listed = t.parse_targets("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — x\n- [ ] `b` — y\n")
+        self.assertEqual(status(t.live_targets(listed, self.source)), {"a": "done", "b": "open"})
+        self.found = [[{"number": 6, "title": title, "body": landed["body"], "state": "closed"}]]
+        self.assertEqual(t.landed_pr(listed.find("a"), self.source), 6)
+
     def test_partial_clause_names_a_forgejo_pull_request_by_url(self):
         url = self.repo.pull_url(5)
         listed = t.parse_targets(f"<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — x (partial: #5, {url})\n")
