@@ -1022,6 +1022,22 @@ def test_prerequisite(tmp):
             ("retry", "recheck", True),
         )
 
+    root = tmp / "prerequisite-relative"
+    path.write_text(LIST)
+    cwd = os.getcwd()
+    os.chdir(path.parent)
+    try:
+        with settings(root, TAUCETI_ROADMAP_TARGETS=path.name):
+            declined(4)
+            listed = rounds(tmp, Hub(p4={}), {"rulings": []})["packet"]["target_list"]
+    finally:
+        os.chdir(cwd)
+    check(
+        "a relative target-list setting reaches the model as an absolute path",
+        (Path(listed).is_absolute(), Path(listed).resolve() == path.resolve()),
+        (True, True),
+    )
+
     root = tmp / "prerequisite-native"
     path.write_text(LIST)
     case = f"declined-{incidents.subject('fix', 4, FORGEJO)}"

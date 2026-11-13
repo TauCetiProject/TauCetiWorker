@@ -605,7 +605,7 @@ def _rule(rd: _Round, opts, cases: list[dict]) -> int:
     packet = {
         "repository": incidents.repository_ref(rd.source).url,
         "roadmaps": str(rd.roadmaps or ""),
-        "target_list": str(rd.listed[0]) if rd.listed else "",
+        "target_list": str(rd.listed[0].absolute()) if rd.listed else "",
         "cases": [_case(rd, incident) for incident in cases],
     }
     log("decide: asking the model about " + ", ".join(pull_ref(rd.source, incident["pr"]) for incident in cases))
