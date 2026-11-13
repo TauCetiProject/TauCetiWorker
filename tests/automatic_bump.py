@@ -95,6 +95,7 @@ assert classify(green, ["review"], Reviews(clean=True, contest=contest)).reviewa
 # Dispatch revalidation must apply the same exemption as the survey.
 sv = classify(green, ["fix"])
 worker = SimpleNamespace(
+    cfg=SimpleNamespace(state=Path(tempfile.gettempdir()) / "automatic-bump-test"),
     rs=Reviews(),
     counters=SimpleNamespace(read=lambda _: 100),
     gh=SimpleNamespace(pr_view=lambda *args: {"state": "OPEN", "isDraft": False, "headRefOid": HEAD}),

@@ -554,7 +554,7 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "module-system, lint and shim-expiry phases. It prints `scope:`, phase exits and a durable receipt path. "
         "For diagnosis, use `--stage build|axioms|module-system|lint|shim-expiry`; final verification uses all stages. "
         "Exact-input phase receipts avoid repeated successful work; use `--no-reuse` only to investigate evidence. "
-        "Claude shell commands run in the foreground with a ten-minute limit, or the shorter remaining round. "
+        "Foreground verification may use the remaining round budget; do not impose a ten-minute timeout. "
         "If an interrupted helper hands verification to a supervisor continuation, let it finish there. "
         "If Codex returns an execution session ID, keep waiting on that same session with write_stdin until it exits. "
         "Write diagnostic logs and module lists outside the checkout (the helper already keeps logs in worker state). "
@@ -891,7 +891,9 @@ def host_agent_argv(
 
     With ``prompt_on_stdin`` the prompt is left out of argv (Claude) or replaced by ``-`` (Codex) and
     the caller writes it to the process's stdin; see ``host_agent_launch``."""
-    env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
+    from .build_resources import defaults
+
+    env = defaults({**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"})
     env["TAUCETI_VERIFY_PYTHON"] = sys.executable
     env.update(_foreground_shell_env(float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200)))
     profile = _authoring_profile(profile)
@@ -1501,6 +1503,9 @@ def lake_cache_max_revs(env: dict) -> str:
 @contextlib.contextmanager
 def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
     """Keep the public service available through repairs, merges and dependency changes."""
+    from .build_resources import defaults
+
+    defaults(env)
     if not TAUCETI_CACHE_SERVICE:
         yield
         return
@@ -2362,6 +2367,12 @@ def run_in_bubble(
     (rounddir / "lean").chmod(0o755)
     (rounddir / "tauceti-tools").write_text('#!/bin/sh\nexec python3 -m tauceti_tools "$@"\n')
     (rounddir / "tauceti-tools").chmod(0o755)
+    shutil.copy(
+        HERE / "verification_resources.py"
+        if (HERE / "verification_resources.py").exists()
+        else HERE / "tauceti_worker/verification_resources.py",
+        rounddir / "verification_resources.py",
+    )
     # Cheap V0 diagnostics also need these; do not tie them to the helper canary opt-in.
     from tauceti_tools.templates import ASSETS
 
@@ -2492,7 +2503,16 @@ def run_in_bubble(
         if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
             tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
     tcenv += " TAUCETI_LOCAL_LINT_CACHE=/opt/local-lint-cache TAUCETI_VERIFY_PYTHON=/usr/bin/python3"
+    if resource_wait := os.environ.get("TAUCETI_BUILD_RESOURCE_WAIT"):
+        wait_path = Path(resource_wait)
+        wait_path.parent.mkdir(parents=True, exist_ok=True)
+        mount_flags += ["--mount", f"{wait_path.parent}:/opt/resource-waits:rw"]
+        tcenv += " TAUCETI_BUILD_RESOURCE_WAIT=/opt/resource-waits/" + shlex.quote(wait_path.name)
     tcenv += " LAKE_OVERRIDE_LEAN=true LEAN=/opt/round/tauceti-lean"
+    from .build_resources import DEFAULTS
+
+    for name, value in DEFAULTS.items():
+        tcenv += f" {name}={shlex.quote(os.environ.get(name, value))}"
     if inner_cmd is None:
         for key, value in _foreground_shell_env(
             getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)

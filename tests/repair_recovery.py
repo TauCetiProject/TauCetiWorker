@@ -1628,6 +1628,44 @@ class Fixture(unittest.TestCase):
         self.opts.only = ["fix"]
         self.assertTrue(self.run_recovery())
 
+    def test_repeated_resource_waits_preserve_source_and_recovery_allowance(self):
+        receipt = dict(status="incomplete", incomplete_reason="resource-pressure", error="thread exhaustion")
+        with patch.object(self.backend, "verify", return_value=receipt):
+            for _ in range(4):
+                self.assertFalse(self.run_recovery())
+                journal = self.journal()
+                self.assertEqual(journal["state"], "eligible")
+                self.assertEqual(journal["attempts"], 0)
+                self.assertEqual(journal["reason"]["code"], "worker-resource")
+                rr.write(self.record, journal, "eligible", retry_at=0)
+        self.assertEqual((self.record / "checkout/A.lean").read_text(), "retained repair\n")
+        self.assertEqual(self.values["fix-10-head"], 0)
+
+    def test_continuation_resource_failure_refunds_paid_content_and_preserves_edits(self):
+        from tauceti_worker.verification_resources import record_wait
+
+        FakeVerification.failures = 1
+
+        def exhausted(checkout, *args, **kwargs):
+            (checkout / "A.lean").write_text("repair before resource failure\n")
+            record_wait("thread exhaustion")
+            self.assertTrue(kwargs["cancel_event"].is_set())
+            return 75
+
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", exhausted),
+        ):
+            self.assertFalse(self.run_recovery())
+        journal = self.journal()
+        self.assertEqual(journal["reason"]["code"], "worker-resource")
+        self.assertEqual(journal["content_attempts"], 0)
+        self.assertEqual(journal["attempts"], 0)
+        self.assertEqual(self.values["fix-10-head"], 0)
+        self.assertTrue(Path(journal["source_checkpoint"]).is_dir())
+        self.assertEqual((self.record / "checkout/A.lean").read_text(), "repair before resource failure\n")
+
     def test_api_refusal_before_admission_refunds_content(self):
         import contextlib
 

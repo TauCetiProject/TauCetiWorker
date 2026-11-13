@@ -50,6 +50,7 @@ trap 'rm -rf "$RUN_ROOT"' EXIT
 
 # stdlib-only python tests, run with the project interpreter
 RUN_STDLIB=(
+  build_resources.py
   activity.py
   activity_git.py
   activity_costs.py
