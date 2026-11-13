@@ -660,6 +660,8 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_mode = cleanup.add_mutually_exclusive_group()
     cleanup_mode.add_argument("--dry-run", action="store_true", help="report eligible paths without changing files")
     cleanup_mode.add_argument("--install-timer", action="store_true", help="install hourly systemd user cleanup")
+    cleanup.add_argument("--max-seconds", type=float, help="stop draining deletion work after this long")
+    cleanup.add_argument("--fallback-marker", type=Path, help=argparse.SUPPRESS)
 
     w = sub.add_parser(
         "work",

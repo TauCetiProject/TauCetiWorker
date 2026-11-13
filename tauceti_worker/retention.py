@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -52,34 +53,45 @@ def open_files():
     return opened
 
 
+# Read-only system volume (SIP). Its agents run as the user yet refuse inspection; none of them
+# can be a worker, Lake, Git or agent process, which always run from writable locations.
+_PLATFORM_EXECUTABLES = ("/System/", "/usr/libexec/", "/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/")
+
+
 def _open_files_psutil():
-    """macOS has no /proc. The locks and logs this protects are held by worker processes, which
-    run as this user and are always inspectable. Some user-level system processes refuse
-    inspection; skipping them is safe because unlinking a file another process holds open
-    cannot disturb it, and treating them as evidence would disable cleanup permanently."""
+    """macOS has no /proc: observe this user's processes through psutil. Only this user can hold
+    this user's private data open. A process that refuses inspection makes the observation
+    unavailable, unless it is an operating-system binary that cannot be one of ours."""
     try:
         import psutil
     except ImportError:
         return None
     uid = os.getuid()
     opened = set()
-    inspected = 0
     for process in psutil.process_iter():
         try:
             if process.uids().real != uid:
                 continue
             paths = [item.path for item in process.open_files()]
-            with contextlib.suppress(psutil.Error, OSError, TypeError):
-                if cwd := process.cwd():
-                    paths.append(cwd)
-        except (psutil.Error, OSError):
+        except psutil.NoSuchProcess:
             continue
-        inspected += 1
+        except (psutil.Error, OSError):
+            try:
+                if process.exe().startswith(_PLATFORM_EXECUTABLES):
+                    continue
+            except psutil.NoSuchProcess:
+                continue
+            except (psutil.Error, OSError):
+                pass
+            return None  # Missing observations never mean that diagnostics are unused.
+        with contextlib.suppress(psutil.Error, OSError, TypeError):
+            if cwd := process.cwd():
+                paths.append(cwd)
         for path in paths:
             with contextlib.suppress(OSError):
                 info = os.stat(path)
                 opened.add((info.st_dev, info.st_ino))
-    return opened if inspected else None  # Not even this process: no observation at all.
+    return opened
 
 
 def workspace_idle(cfg, opened):
@@ -698,6 +710,41 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
 
 
 FALLBACK_INTERVAL = 3600  # the installed timer's cadence
+FALLBACK_RETRY = 300  # after a start that never reported back
+FALLBACK_SECONDS = 900  # one fallback run's budget; durable cursors resume the rest next hour
+FALLBACK_LOG_BYTES = 1024**2
+# The installed timer's environment: project selection and shared roots, nothing worker-specific.
+COLLECTOR_ENV = frozenset(
+    {
+        "PYTHONPATH",
+        "TAUCETI_PROJECT_STATE",
+        "TAUCETI_LEGACY_DATA_ROOT",
+        "TAUCETI_REPO",
+        "TAUCETI_ACTIVITY_DIR",
+        "TAUCETI_SHARED_MATHLIB_ROOT",
+        "TAUCETI_REVIEW_MATHLIB_CACHE",
+        "TAUCETI_SHARED_REPOSITORIES_DIR",
+        "TAUCETI_GITHUB_SHARED_DIR",
+        "TAUCETI_WORKERS_STATE_DIR",
+        "XDG_STATE_HOME",
+        "PATH",
+        "TAUCETI_BUILD_CACHE_ROOT",
+        "TAUCETI_CACHE_MAX_GIB",
+    }
+)
+# Beyond the timer's set: what a user session supplies to a systemd unit implicitly.
+_SESSION_ENV = ("USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR")
+
+
+def _covered_root():
+    return str(legacy_data_root().resolve())
+
+
+def _stamp(value):
+    """A recorded time, or 0 when missing, malformed, non-finite or in the future."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return 0
+    return value if 0 <= value <= time.time() + 60 else 0
 
 
 def request_cleanup(*, fallback=False):
@@ -705,16 +752,19 @@ def request_cleanup(*, fallback=False):
 
     Most installations have no collector service (macOS, Docker, one-off rounds, Linux without
     `workers service install`). With ``fallback`` the caller accepts starting the collector as a
-    detached low-priority process instead, at most once per FALLBACK_INTERVAL."""
+    detached low-priority process instead, at most once per FALLBACK_INTERVAL for its data root."""
     from .activity import root
 
     directory = root()
     try:
-        installed = read_json(directory / "cleanup-service.json").get("installed")
-        if not installed:
+        service = read_json(directory / "cleanup-service.json")
+        if not service.get("installed"):
             if fallback:
                 _fallback_collector(directory)
             return  # Do not invoke a global unit for an uninstalled/isolated project.
+        if fallback and service.get("root") != _covered_root():
+            # The unit runs for whichever installation installed it; also cover this one.
+            _fallback_collector(directory)
         with locked(directory / "cleanup-request.lock"):
             marker = directory / "cleanup-request.json"
             previous = read_json(marker)
@@ -731,40 +781,77 @@ def request_cleanup(*, fallback=False):
                 timeout=3,
                 check=False,
             )
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass  # The hourly collector remains independent of ordinary worker progress.
+    except Exception:
+        pass  # Best effort: cleanup scheduling never affects ordinary worker progress.
+
+
+def _fallback_marker(directory):
+    import hashlib
+
+    key = hashlib.sha256(_covered_root().encode()).hexdigest()[:16]
+    return directory / f"cleanup-fallback-{key}.json"
+
+
+def _collector_env(directory):
+    """Reproduce the timer's context rather than the calling worker's isolated one."""
+    import pwd
+
+    source = self_env()
+    env = {key: value for key, value in source.items() if key in COLLECTOR_ENV or key in _SESSION_ENV}
+    env["HOME"] = pwd.getpwuid(os.getuid()).pw_dir  # the worker may run with an isolated HOME
+    env["TAUCETI_ACTIVITY_DIR"] = str(directory)
+    env["TAUCETI_LEGACY_DATA_ROOT"] = _covered_root()
+    return env
 
 
 def _fallback_collector(directory):
-    """Start `cleanup --all-data-roots` like the timer would: hourly, niced, idle I/O.
+    """Start `cleanup --all-data-roots` like the timer would: hourly, niced, idle I/O, bounded.
 
-    cleanup.lock still serialises collectors, so a start racing a running one exits at once."""
+    cleanup.lock still serialises collectors, so a start racing a running one exits at once.
+    A start counts only once the collector reports back; until then it is retried after
+    FALLBACK_RETRY, so one failed launch cannot suppress cleanup for an hour."""
+    if os.environ.get("TAUCETI_BACKGROUND_CLEANUP", "").lower() == "off":
+        return
+    marker = _fallback_marker(directory)
     with locked(directory / "cleanup-request.lock"):
-        marker = directory / "cleanup-fallback.json"
         now = time.time()
-        last = max(read_json(marker).get("started_at", 0), read_json(directory / "cleanup.json").get("at", 0))
-        if now - last < FALLBACK_INTERVAL:
+        row = read_json(marker)
+        completed, attempted = _stamp(row.get("completed_at")), _stamp(row.get("attempted_at"))
+        if now - completed < FALLBACK_INTERVAL or now - attempted < FALLBACK_RETRY:
             return
-        atomic_json(marker, dict(started_at=now))
-    env = self_env()
-    env["TAUCETI_ACTIVITY_DIR"] = str(directory)
-    env.pop("TAUCETI_ROUND_DEADLINE", None)
+        atomic_json(marker, {**row, "attempted_at": now})
     from .paths import self_argv
 
-    argv = self_argv("cleanup", "--all-data-roots")
+    argv = self_argv("cleanup", "--all-data-roots", "--max-seconds", FALLBACK_SECONDS, "--fallback-marker", marker)
     if sys.platform == "linux" and shutil.which("ionice"):
         argv = ["ionice", "-c3", *argv]
     if shutil.which("nice"):
         argv = ["nice", "-n", "10", *argv]
-    subprocess.Popen(
-        argv,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
+    log_path = directory / "cleanup-fallback.log"
+    with contextlib.suppress(OSError):
+        if log_path.stat().st_size > FALLBACK_LOG_BYTES:
+            log_path.replace(log_path.with_suffix(".log.1"))
+    with log_path.open("ab") as output:
+        child = subprocess.Popen(
+            argv,
+            env=_collector_env(directory),
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=output,
+            start_new_session=True,
+            close_fds=True,
+        )
+    # Reap the child whenever it exits, even in a long-lived `work --loop` or manager.
+    threading.Thread(target=child.wait, name="cleanup-fallback-reaper", daemon=True).start()
+
+
+def report_fallback(marker, report):
+    """Called by the collector a fallback started, once its run finished."""
+    if marker is None:
+        return
+    row = read_json(marker)
+    errors = len(report.get("errors", [])) if isinstance(report, dict) else 0
+    atomic_json(marker, {**row, "completed_at": time.time(), "errors": errors})
 
 
 def pressure_cleanup():
@@ -802,8 +889,10 @@ def pending_work(base):
 COLLECTOR_SLICE = dict(seconds=30, entries=262144, bytes=1024**3, removal_bytes=32 * 1024**3)
 
 
-def drain_pending(reports, *, once=False):
-    """Round-robin existing deletion slices without repeating expensive inventories."""
+def drain_pending(reports, *, once=False, deadline=None):
+    """Round-robin existing deletion slices without repeating expensive inventories.
+
+    ``deadline`` (time.monotonic()) ends the run after the current slice; cursors resume later."""
     from . import recovery_maintenance, verification_storage
     from .activity import root
 
@@ -845,7 +934,7 @@ def drain_pending(reports, *, once=False):
                     report["free_bytes"] = shutil.disk_usage(worker_state_root()).free
                 except Exception as error:
                     note(report, "errors", f"{path}: {error}")
-            if once:
+            if once or (deadline is not None and time.monotonic() >= deadline):
                 break
             requested = read_json(root() / "cleanup-request.json").get("at", 0)
             if requested > requested_at and (again or not extra_requested):
@@ -861,7 +950,7 @@ def drain_pending(reports, *, once=False):
             os.environ["TAUCETI_LEGACY_DATA_ROOT"] = previous
 
 
-def run(*, dry=False, diagnostics_only=False):
+def run(*, dry=False, diagnostics_only=False, deadline=None):
     from .activity import pin_root, root
 
     pin_root()
@@ -870,7 +959,7 @@ def run(*, dry=False, diagnostics_only=False):
         report = sweep(dry=dry, diagnostics_only=diagnostics_only)
         report["free_before_bytes"] = before
         if not dry and not diagnostics_only:
-            drain_pending([(legacy_data_root(HERE), report)])
+            drain_pending([(legacy_data_root(HERE), report)], deadline=deadline)
             report["pending_work"] = pending_work(worker_state_root())
             report["free_bytes"] = free_bytes(worker_state_root())
             atomic_json(root() / "cleanup.json", report)
@@ -893,25 +982,7 @@ def install_timer():
 
     environment = self_env()
     extra = "".join(
-        "Environment=" + quote(key + "=" + value) + "\n"
-        for key, value in environment.items()
-        if key
-        in {
-            "PYTHONPATH",
-            "TAUCETI_PROJECT_STATE",
-            "TAUCETI_LEGACY_DATA_ROOT",
-            "TAUCETI_REPO",
-            "TAUCETI_ACTIVITY_DIR",
-            "TAUCETI_SHARED_MATHLIB_ROOT",
-            "TAUCETI_REVIEW_MATHLIB_CACHE",
-            "TAUCETI_SHARED_REPOSITORIES_DIR",
-            "TAUCETI_GITHUB_SHARED_DIR",
-            "TAUCETI_WORKERS_STATE_DIR",
-            "XDG_STATE_HOME",
-            "PATH",
-            "TAUCETI_BUILD_CACHE_ROOT",
-            "TAUCETI_CACHE_MAX_GIB",
-        }
+        "Environment=" + quote(key + "=" + value) + "\n" for key, value in environment.items() if key in COLLECTOR_ENV
     )
     (directory / "tauceti-cleanup.service").write_text(
         "[Unit]\nDescription=Reclaim retired TauCeti worker data\n[Service]\nType=oneshot\nNice=10\n"
@@ -935,7 +1006,8 @@ def install_timer():
             raise Die(f"cleanup timer installation failed: {detail or error}") from None
     from .activity import root
 
-    atomic_json(root() / "cleanup-service.json", dict(installed=True))
+    # Record which installation the unit collects for; others keep their fallback.
+    atomic_json(root() / "cleanup-service.json", dict(installed=True, root=_covered_root()))
 
 
 def data_roots():
@@ -963,12 +1035,12 @@ def data_roots():
     return [selected, *sorted(roots - {selected})]
 
 
-def run_all(*, dry=False):
+def run_all(*, dry=False, deadline=None):
     """One collector covers current and retired roots, with fair deletion slices."""
     from .activity import pin_root, root
 
     if not legacy_project():
-        return run(dry=dry)
+        return run(dry=dry, deadline=deadline)
     pin_root()
     previous = os.environ.get("TAUCETI_LEGACY_DATA_ROOT")
     report = fresh_report()
@@ -997,7 +1069,7 @@ def run_all(*, dry=False):
                     result["drain"] = initial[path]["drain"]
                 report["roots"].append(dict(path=str(path), **result))
             if not dry:
-                drain_pending([(Path(result["path"]), result) for result in report["roots"]])
+                drain_pending([(Path(result["path"]), result) for result in report["roots"]], deadline=deadline)
             for result in report["roots"]:
                 base = Path(result["path"]) / "state"
                 try:
@@ -1021,9 +1093,16 @@ def cmd_cleanup(args):
     if args.install_timer:
         install_timer()
         return 0
+    seconds = getattr(args, "max_seconds", None)
+    deadline = time.monotonic() + seconds if seconds else None
     try:
-        report = (run_all if args.all_data_roots else run)(dry=args.dry_run)
+        # cleanup.lock is per activity directory; installations sharing one data root through
+        # different activity directories must still never collect it concurrently.
+        with locked(legacy_data_root().resolve() / "state" / ".cleanup.lock", dry=args.dry_run):
+            report = (run_all if args.all_data_roots else run)(dry=args.dry_run, deadline=deadline)
     except BlockingIOError:
         raise Die("cleanup is already running") from None
+    if not args.dry_run:
+        report_fallback(getattr(args, "fallback_marker", None), report)
     print(json.dumps(report, indent=2))
     return int(bool(report["errors"]))

@@ -582,6 +582,19 @@ the previous behaviour of sharing your own `CLAUDE.md`, settings, and skills,
 including on a worker already seeded the clean way; a `settings.json` you have
 edited is kept rather than replaced.
 
+## Cleanup
+
+Every round starts the cleanup collector (`tauceti cleanup --all-data-roots`) in
+the background, at most once an hour per data root, at low CPU and I/O priority
+and for at most 15 minutes, unless the systemd timer installed by `workers
+service install` already collects that data root. The collector expires retained
+checkouts, discarded recovery trees, logs and verification runs older than three
+days, idle checkouts, and shared build pools. A retained checkout whose source
+could not be preserved within 24 hours is abandoned with the rest of its task,
+as the timer already did; workers write fresh PRs instead. Its output goes to
+`cleanup-fallback.log` in the activity directory. Set
+`TAUCETI_BACKGROUND_CLEANUP=off` to stop rounds from starting it.
+
 ## State on disk
 
 | Path | Contents |
