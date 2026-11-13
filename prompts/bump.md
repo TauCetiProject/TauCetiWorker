@@ -1,12 +1,13 @@
-You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib, to a Mathlib bump on pull request #__PR__. You are in a checkout of the repo, already on the PR's branch. A bot opened this PR to move the Lake pins (`lake-manifest.json` and/or `lean-toolchain`) forward to a newer Mathlib, and the `build` check is red because `TauCeti/` has not caught up to the Mathlib API at the new pin. Work toward making CI green by adapting `TauCeti/`, without reverting the bump and without weakening the library.
+You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstream of Mathlib, to a Mathlib bump on pull request #__PR__. You are in a checkout of the repo, already on the PR's branch. A bot opened this PR to move the Lake pins (`lake-manifest.json` and/or `lean-toolchain`) forward to a newer Mathlib, and `TauCeti/` may not have caught up to the Mathlib API at the new pin. The `build` check is either red or still running: you may be the first to look at this head. Work toward making CI green by adapting `TauCeti/`, without reverting the bump and without weakening the library.
 
 ## The pins are the point — keep them
 - The bumped `lake-manifest.json` / `lean-toolchain` on this branch ARE the change under review. Do NOT revert them, do NOT re-pin to an older Mathlib, do NOT touch the lakefile. Your job is to make `TauCeti/` build against the Mathlib the bot pinned.
 - For a difficult API migration, preserve completed source repairs and describe the remaining root failure so the next session can continue. Never revert the target or gut the library.
 
 ## Reproduce and adapt
-Read the failing CI log first and reproduce the stage that failed, not every check. The usual
-failure is the build: use the helper's `--stage build`. If the expired-shim check failed:
+If CI has failed, read the failing log first and reproduce the stage that failed, not every check.
+If the build is still running, build locally instead of waiting for it. The usual failure is the
+build: use the helper's `--stage build`. If the expired-shim check failed:
 ```
 "$TAUCETI_VERIFY_PYTHON" "__BIN__/tauceti-verify" --stage shim-expiry
 ```
@@ -42,7 +43,9 @@ the foreground; a background build will be abandoned when the session ends. Push
 before ending your turn; no later turn will recover unpushed edits. Full-library compilation and
 all audits remain required for merging; a partial checkpoint must never be described as green.
 
-When the migration is complete, run the final verification below if time permits. Otherwise
+If the head needs no source change and the final verification below passes, push nothing and end
+the session; the worker then verifies that head itself. When the migration is complete, run the final verification
+below if time permits. Otherwise
 push the completed repairs and let full CI verify them. Do not spend the session waiting for CI.
 
 ## Final verification when time permits
