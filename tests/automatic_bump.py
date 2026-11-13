@@ -74,6 +74,17 @@ def classify(record, stages, reviews=None, rounds=0, attempts=100):
 
 
 assert classify(raw(), ["bump"]).bump.count == 1
+# A pending automatic bump is adapted without waiting for CI, until CI or a local verification passes.
+pending = raw(statusCheckRollup=[{"context": "build", "state": "PENDING"}])
+assert classify(pending, ["bump"]).bump.actionable[0].reason == "bump-mathlib, build pending"
+assert classify(raw(statusCheckRollup=[]), ["bump"]).bump.count == 1
+assert not classify(raw(statusCheckRollup=[{"context": "build", "state": "SUCCESS"}]), ["bump"]).bump.count
+assert not classify(pending | {"author": {"login": "someone"}}, ["bump"]).bump.count
+self_tested = pending | {
+    "labels": [{"name": "self-tested"}],
+    "statusCheckRollup": [{"context": "build", "state": "PENDING"}, {"context": "self-tested/1", "state": "SUCCESS"}],
+}
+assert not classify(self_tested, ["bump"]).bump.count
 assert classify(raw(mergeable="CONFLICTING"), ["rebase"]).rebaseable.count == 1
 assert not classify(raw(headRefName="feature"), ["fix-ci"]).red_ci.count
 assert not classify(raw(author={"login": "me"}, headRepositoryOwner={"login": "me"}), ["bump"]).bump.count

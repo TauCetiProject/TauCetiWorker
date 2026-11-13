@@ -1447,6 +1447,27 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # worker pushed the branch first and safe-push declined rather than clobber, or the agent chose not
     # to act. Surface it as no-progress (so the loop backs off) but say so plainly and point at the log.
     progress = _progressed(w, c, pre) if rc == 0 and stage in PROGRESS_GUARDED else None
+    if (
+        rc == 0
+        and (progress is True or (progress is False and stage == "bump"))
+        and stage in FILE_CHANGE_STAGES
+        and c.pr
+        and not opts.dry_run
+        and any(p.number == c.pr and getattr(p, "automatic_bump", False) for p in sv.open_prs)
+    ):
+        # A bump head left by the round, pushed or unchanged, is verified locally and labelled
+        # `self-tested`, so its review and admission need not wait for the ordinary PR build
+        # (bump_attestation). Verifying an unchanged head is what ends work on a bump that needed
+        # no repair. Any attestation failure leaves the PR on ordinary CI.
+        try:
+            from .bump_attestation import attest
+
+            outcome = attest(w, c.pr, bubble=bubble)
+            log(f"  {stage} #{c.pr}: self-tested: {outcome}")
+            if outcome.startswith("attested"):
+                progress = True
+        except Exception as error:  # noqa: BLE001 - an attestation problem must not fail the round
+            log(f"  {stage} #{c.pr}: self-tested attestation failed ({one_line(str(error))}); ordinary CI continues")
     if rc == 0 and stage in PROGRESS_GUARDED and progress is None:
         from .activity import observation
 
@@ -1468,23 +1489,6 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             )
             return None
         raise NoProgress(reason)
-    if (
-        rc == 0
-        and progress is True
-        and stage in FILE_CHANGE_STAGES
-        and c.pr
-        and not opts.dry_run
-        and any(p.number == c.pr and getattr(p, "automatic_bump", False) for p in sv.open_prs)
-    ):
-        # A pushed bump head is verified locally and labelled `self-tested`, so its review and
-        # admission need not wait for the ordinary PR build (bump_attestation). The round's
-        # result never depends on it: any failure leaves the PR on ordinary CI.
-        try:
-            from .bump_attestation import attest
-
-            log(f"  {stage} #{c.pr}: self-tested: {attest(w, c.pr, c.head, bubble=bubble)}")
-        except Exception as error:  # noqa: BLE001 - an attestation problem must not fail the pushed round
-            log(f"  {stage} #{c.pr}: self-tested attestation failed ({one_line(str(error))}); ordinary CI continues")
     if rc == 0 and stage in PR_TASKS and c.pr and (stage not in PROGRESS_GUARDED or progress is True):
         with contextlib.suppress(Exception):
             from .fleet_events import emit

@@ -1276,11 +1276,15 @@ def classify_survey(
     #    out from under the last-known-good bump and TauCeti/ needs adapting. We adapt it; we never
     #    author a bump (the bot owns opening them, CI owns merging the green ones). This is the
     #    bump-specific CI-fixer: fix-ci defers a red bump PR here (rebase still owns its conflicts and
-    #    fix still owns its review findings).
+    #    fix still owns its review findings). An automatic bump is also taken while its build is
+    #    still PENDING: a full rebuild against a new Mathlib takes hours of CI, and a worker with a
+    #    warm cache finds the breakage in minutes. It stays actionable until CI is green or a round
+    #    has verified the head locally (`self-tested`).
     for p in tended if "bump" in enabled else []:
         integration = p.build_success and p.bump_integration_failed
         branch = p.head_ref.startswith(BUMP_HEAD_PREFIX) or (integration and p.head_ref == "hopscotch/lkg-bump")
-        if not (branch and (p.needs_ci_repair or integration)):
+        pending = p.automatic_bump and not (p.build_success or p.build_failed or p.self_tested)
+        if not (branch and (p.needs_ci_repair or integration or pending)):
             continue
         if {label.lower() for label in p.labels} & {
             "keep",
@@ -1295,7 +1299,11 @@ def classify_survey(
         c = Candidate(
             p.number,
             p.head_oid,
-            "bump-mathlib, singleton integration failed" if integration else "bump-mathlib, build red",
+            "bump-mathlib, singleton integration failed"
+            if integration
+            else "bump-mathlib, build pending"
+            if pending
+            else "bump-mathlib, build red",
             bump_integration_failure=integration,
         )
         per_head = counters.read(f"bump-{p.number}-{p.head_oid[:12]}")
