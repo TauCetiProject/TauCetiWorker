@@ -31,6 +31,10 @@ class SourceActor:
     principal: PrincipalRef
     login: str = field(compare=False)
 
+    @property
+    def qualified_id(self) -> str:
+        return self.principal.forge.key + "/users/" + self.principal.native_id
+
     def __post_init__(self):
         if (
             not isinstance(self.principal, PrincipalRef)

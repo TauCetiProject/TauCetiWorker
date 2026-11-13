@@ -10,8 +10,9 @@ or when the build ends, whichever comes first, with a "Build in progress" prompt
 files and the rule that exactly one ``lake build`` runs at a time: no build of its own while the lock
 exists, and ``.tauceti-repair/build <Module> ...`` (``repair_tools``) for a scoped build once the lock
 is free. When the build ends the worker appends a ``build finished, exit N, M errors total`` line to
-the error list and removes the lock. The agent's final whole-library ``lake build --iofail`` after its
-fixes is still the only verdict. When the build is green and the worker gave it an ``audit`` callable
+the error list and removes the lock. With worker-owned verification, the agent returns after
+scoped checks and the worker runs the final full suite; other callers retain the agent's final
+whole-library build advice. When the build is green and the worker gave it an ``audit`` callable
 (``repair_audit.check``), CI's audits and the changed-module environment lint run before the lock is
 released, and their findings are appended to the error list like compiler errors (``kind`` ``audit`` or
 ``lint``, ``module``, ``file``, ``message``, ``member``, ``commit``). The lock is ``repair_tools``'s, the one the agent's build script takes, and
@@ -160,7 +161,9 @@ class StreamingBuild:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.errors_path.write_text("")
         repair_tools.take_lock(self.lock_path, log=lambda *a, **k: None)
-        argv = [*self.lake, "build", "--iofail"]
+        from tauceti_queue.repair_publish import build_flags
+
+        argv = [*self.lake, "build", *build_flags(self.worktree)]
         self.started_at = time.monotonic()
         with self.log_path.open("wb") as handle:
             handle.write(f"$ {' '.join(argv)}\n".encode())
@@ -227,7 +230,7 @@ class StreamingBuild:
             "seconds": self.seconds,
         }
 
-    def prompt_section(self) -> list[str]:
+    def prompt_section(self, *, worker_verifies: bool = False) -> list[str]:
         directory = self.directory.name
         count = len(self.errors)
         errors = f"{count} error{'s' if count != 1 else ''}"
@@ -251,7 +254,11 @@ class StreamingBuild:
             "`member` (the PR whose squash commit last touched the file) and `commit`; both grow while the build "
             "runs, so read the error list again before deciding what is left. When the build ends, the worker "
             f"appends a `build finished, exit N, M errors total` line to the error list and removes `{directory}/{LOCK_FILE}`; "
-            "after a green build it first runs CI's audits and lints and appends their findings to the same list.",
+            + (
+                "after a green build it runs the assigned audits and lints and appends their findings to the same list."
+                if self.audit is not None
+                else "Full audits and lint run in staging."
+            ),
             "",
             "Start on the modules that have already failed while the build goes on; they are in the error list, and "
             "the running build will not revisit them. Edit only modules that have already failed: a module the build "
@@ -259,13 +266,18 @@ class StreamingBuild:
             f"not start your own `lake build` while `{directory}/{LOCK_FILE}` exists. `{directory}/{repair_tools.BUILD_FILE} "
             "<Module> ...` waits for the lock to be free, builds only the named modules (`--dependents` adds the modules "
             "importing them) and returns Lake's exit status, so a fix is checked in seconds rather than by rerunning the "
-            "whole library; the same command with no modules runs the whole library with `--iofail`. The verdict is "
-            "still your own whole-library `lake build --iofail` after your fixes, once the lock is free.",
+            "whole library. "
+            + (
+                "Return after the scoped checks; the worker completes its assigned verification before submission."
+                if worker_verifies
+                else "The same command with no modules runs the whole library with `--iofail`. The verdict is "
+                "still your own whole-library `lake build --iofail` after your fixes, once the lock is free."
+            ),
         ]
 
-    def annotate(self, prompt: str) -> str:
+    def annotate(self, prompt: str, *, worker_verifies: bool = False) -> str:
         """The prompt with the Build in progress section before the local verification section."""
-        section = "\n".join(self.prompt_section())
+        section = "\n".join(self.prompt_section(worker_verifies=worker_verifies))
         marker = "\n## Verifying locally"
         at = prompt.find(marker)
         if at < 0:

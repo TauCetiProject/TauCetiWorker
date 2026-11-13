@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS inputs (
     id INTEGER PRIMARY KEY,
     repository TEXT NOT NULL,
     number INTEGER NOT NULL,
+    source_identity TEXT NOT NULL DEFAULT '',
     head_sha TEXT NOT NULL,
     title TEXT NOT NULL DEFAULT '',
     description TEXT NOT NULL DEFAULT '',
@@ -146,6 +147,7 @@ CREATE TABLE IF NOT EXISTS members (
     input_id INTEGER NOT NULL,
     source_pr TEXT NOT NULL,
     number INTEGER NOT NULL,
+    source_identity TEXT NOT NULL DEFAULT '',
     accepted_head TEXT NOT NULL,
     position INTEGER NOT NULL,
     commit_sha TEXT,
@@ -314,6 +316,7 @@ CREATE TABLE IF NOT EXISTS journal (
     batch_id INTEGER,
     detail TEXT NOT NULL DEFAULT '{}'
 );
+CREATE INDEX IF NOT EXISTS journal_batch_kind ON journal (batch_id, kind, id);
 """
 
 
@@ -322,13 +325,17 @@ TABLES = "".join(statement + ";\n" for statement in SCHEMA.split(";") if stateme
 
 
 def dumps(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    from .mixed_identity import encode
+
+    return json.dumps(encode(value), sort_keys=True, separators=(",", ":"))
 
 
 def loads(text: str | None, default: Any = None) -> Any:
     if text is None or text == "":
         return default
-    return json.loads(text)
+    from .mixed_identity import decode
+
+    return json.loads(text, object_hook=decode)
 
 
 def declared_columns() -> dict[str, list[tuple[str, str]]]:
@@ -421,13 +428,27 @@ class Store:
     def query(self, sql: str, params=()) -> list[dict[str, Any]]:
         """Fetch a complete read under the shared connection lock."""
         with self._lock:
-            return [dict(row) for row in self._connection.execute(sql, params).fetchall()]
+            return [self._record(dict(row)) for row in self._connection.execute(sql, params).fetchall()]
 
     def execute(self, sql: str, params: tuple[Any, ...] | list[Any] = ()) -> sqlite3.Cursor:
         with self._lock:
             return self._connection.execute(sql, params)
 
+    @staticmethod
+    def _record(row):
+        from .mixed_identity import qualify_record
+
+        return qualify_record(row)
+
     def insert(self, table: str, **row: Any) -> int:
+        from .mixed_identity import SourceNumber, source_record
+
+        if table in {"inputs", "members"} and isinstance(row.get("number"), SourceNumber):
+            identity = source_record(row["number"])
+            if row.get("source_identity", identity) != identity:
+                raise ValueError("queue record source identity mismatch")
+            row["source_identity"] = identity
+            row["number"] = int(row["number"])
         columns = ", ".join(row)
         marks = ", ".join("?" for _ in row)
         with self.transaction():
@@ -438,7 +459,7 @@ class Store:
         if not values:
             return 0
         sets = ", ".join(f"{column} = ?" for column in values)
-        clause, params = self._where(where)
+        clause, params = self._where(where, qualified=table in {"inputs", "members"})
         with self.transaction():
             cursor = self.execute(f"UPDATE {table} SET {sets}{clause}", [*values.values(), *params])
             return cursor.rowcount
@@ -450,7 +471,7 @@ class Store:
         order: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        clause, params = self._where(where or {})
+        clause, params = self._where(where or {}, qualified=table in {"inputs", "members"})
         sql = f"SELECT * FROM {table}{clause}"
         if order:
             sql += f" ORDER BY {order}"
@@ -460,24 +481,36 @@ class Store:
         # without the controller lock): the fetch must happen under the same lock as the execute, or a
         # concurrent statement resets the cursor mid-read (seen as `IndexError` on `/status` live).
         with self._lock:
-            return [dict(row) for row in self._connection.execute(sql, params).fetchall()]
+            return [self._record(dict(row)) for row in self._connection.execute(sql, params).fetchall()]
 
     def row(self, table: str, where: Mapping[str, Any], order: str | None = None) -> dict[str, Any] | None:
         found = self.rows(table, where, order=order, limit=1)
         return found[0] if found else None
 
     def count(self, table: str, where: Mapping[str, Any] | None = None) -> int:
-        clause, params = self._where(where or {})
+        clause, params = self._where(where or {}, qualified=table in {"inputs", "members"})
         with self._lock:
             return int(self._connection.execute(f"SELECT COUNT(*) FROM {table}{clause}", params).fetchone()[0])
 
     @staticmethod
-    def _where(where: Mapping[str, Any]) -> tuple[str, list[Any]]:
+    def _where(where: Mapping[str, Any], *, qualified=False) -> tuple[str, list[Any]]:
         if not where:
             return "", []
         parts: list[str] = []
         params: list[Any] = []
         for column, value in where.items():
+            if qualified and column == "number" and "source_identity" not in where:
+                from .mixed_identity import source_record
+
+                numbers = list(value) if isinstance(value, (list, tuple, set)) else [value]
+                parts.append(
+                    "(" + " OR ".join("(number = ? AND source_identity = ?)" for _ in numbers) + ")"
+                    if numbers
+                    else "0 = 1"
+                )
+                for number in numbers:
+                    params.extend([int(number), source_record(number)])
+                continue
             if value is None:
                 parts.append(f"{column} IS NULL")
             elif isinstance(value, (list, tuple, set)):

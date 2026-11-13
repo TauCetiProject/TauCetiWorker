@@ -2,7 +2,8 @@
 
 Worker attempts and publishers hold shared per-task leases; collection takes an exclusive lease.
 The lease files live outside disposable worktrees and are never unlinked. Unknown queue state,
-active claims, and live owners preserve the tree. Logs, task records, Git refs and caches are kept.
+active claims, and live owners preserve the tree. Idle caches retain bounded recent snapshots.
+Logs, task records and Git refs are kept.
 """
 
 from __future__ import annotations
@@ -123,11 +124,11 @@ def _collect_one(store, clone, root, tree, task_id, result, *, apply):
     ).fetchone():
         result["state"] = "claimed"
         return
-    publication = root / "tasks" / str(task_id) / "logs" / "publish.json"
-    if publication.exists():
+    publications = (root / "tasks" / str(task_id) / "logs").glob("**/publish.json")
+    for publication in publications:
         pub = _record(publication)
-        # Close the worker -> systemd publisher startup gap. Once started, the publisher holds
-        # the same lease. A crashed publisher's old 'running' record cannot retain a tree forever.
+        # Cover both late publishers and immutable early snapshots during unit startup.
+        # Once started the publisher holds this task's shared lease.
         if pub.get("state") == "running" and now - float(pub.get("started_at", now)) < HANDOFF_SECONDS:
             result["state"] = "publisher-starting"
             return
@@ -148,8 +149,22 @@ def main() -> int:
     results = collect(
         Path(config["database"]), Path(config["clone"]), [Path(p) for p in config["roots"]], apply=args.apply
     )
-    print(json.dumps({"apply": args.apply, "worktrees": results}), flush=True)
-    return int(any(row["state"] == "error" for row in results))
+    from tauceti_queue import repair_cache
+
+    roots = [Path(p) for p in config["roots"]]
+    migrations = []
+    if config.get("cache_root"):
+        shared = Path(config["cache_root"])
+        migrations = repair_cache.migrate(Path(config["database"]), roots, shared, apply=args.apply)
+        cache_roots = [shared]
+    else:
+        cache_roots = roots
+    caches = repair_cache.collect(Path(config["database"]), cache_roots, apply=args.apply)
+    print(
+        json.dumps({"apply": args.apply, "worktrees": results, "caches": caches, "cache_migrations": migrations}),
+        flush=True,
+    )
+    return int(any(row["state"] == "error" for row in [*results, *caches, *migrations]))
 
 
 if __name__ == "__main__":

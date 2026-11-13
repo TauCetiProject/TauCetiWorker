@@ -98,9 +98,12 @@ class Service:
         self.controller: Any = None
         self.server: Any = None
         self.poller: Any = None
+        self.forgejo_poller: Any = None
         self.loop_module: ModuleType | None = None
         self.unavailable_reason: str | None = None
         self.native = native
+        if native is not None and config.forgejo_mode != "disabled":
+            raise ValueError("native-only launch cannot also enable a mixed source")
         self.native_http = None
         self._native_store_lock = None
         self._native_listener = None
@@ -114,30 +117,29 @@ class Service:
     # change is one edit here.
 
     def open_store(self) -> None:
-        if self.native is not None:
-            # Reserve the existing store before a constructor can commit any
-            # binding or publisher rotation. Two native services must not share
-            # a writable queue, even if they listen on different ports.
-            import fcntl
-            import stat
+        # Reserve the existing store before a constructor can commit any
+        # binding or publisher rotation. Two queue services must not share
+        # a writable queue, even if they listen on different ports.
+        import fcntl
+        import stat
 
-            database = self.config.database.resolve()
-            database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            fd = os.open(str(database) + ".native-service.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-            try:
-                info = os.fstat(fd)
-                if (
-                    not stat.S_ISREG(info.st_mode)
-                    or info.st_uid != os.geteuid()
-                    or info.st_mode & 0o077
-                    or info.st_nlink != 1
-                ):
-                    raise ValueError("native service lock must be an owned private regular file")
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BaseException:
-                os.close(fd)
-                raise
-            self._native_store_lock = fd
+        database = self.config.database.resolve()
+        database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(str(database) + ".native-service.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077
+                or info.st_nlink != 1
+            ):
+                raise ValueError("native service lock must be an owned private regular file")
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._native_store_lock = fd
         module = _optional("store")
         if module is None:
             self.unavailable_reason = "tauceti_queue.store is not installed"
@@ -200,6 +202,13 @@ class Service:
         if not (clone / "HEAD").exists() and not (clone / ".git").exists():
             self.unavailable_reason = f"content clone missing at {clone}; see docs/queue/operations.md"
             return
+        mixed = None
+        if self.config.forgejo_mode != "disabled":
+            from .mixed_profile import MixedProfile
+            from .mixed_sources import MixedSources
+
+            profile = MixedProfile.load(self.config.forgejo_profile, self.config)
+            mixed = MixedSources(profile, self.config, self.store, self.github, clone)
         self.controller = module.Controller(
             self.store,
             self.github,
@@ -207,6 +216,7 @@ class Service:
             self.config.repository,
             revision=self.runtime.revision.sha,
             canonical_branch=self.config.canonical_branch or None,
+            mixed=mixed,
         )
         self.loop_module = _optional("loop")
         poll_module = _optional("approval_poll")
@@ -231,6 +241,9 @@ class Service:
                     self.controller, self.github, self.config.repository, review_app_id=self.config.review_app_id
                 )
 
+        if mixed is not None:
+            self.forgejo_poller = mixed.connect(self.controller, self.poller)
+
     def seed_settings(self) -> None:
         """Seed the store with the configuration file's runtime controls (`serve` only).
 
@@ -254,6 +267,12 @@ class Service:
         document = rt.status_document(
             self.runtime, self.config.settings.as_dict(), controller_status, self.unavailable_reason
         )
+        document["forgejo"] = {"mode": self.config.forgejo_mode}
+        if self.forgejo_poller is not None:
+            document["forgejo"].update(
+                source=self.forgejo_poller.registry.profile.forgejo.record(),
+                observation=self.forgejo_poller.last_summary,
+            )
         if self.native is not None:
             policy = self.native.execution_policy
             document["service"].update(
@@ -296,10 +315,16 @@ class Service:
             if self.poller is not None and poll_module is not None:
                 poll_loop = poll_module.ApprovalPollLoop(self.poller)
                 poll_loop.start()
+            native_loop = None
+            if self.forgejo_poller is not None and poll_module is not None:
+                native_loop = poll_module.ApprovalPollLoop(self.forgejo_poller)
+                native_loop.start()
             try:
                 while not self.stop.wait(self.config.reconcile_interval_seconds):
                     pass
             finally:
+                if native_loop is not None:
+                    native_loop.stop(timeout=DEFAULT_STOP_GRACE)
                 if poll_loop is not None:
                     poll_loop.stop(timeout=DEFAULT_STOP_GRACE)
                 loop.stop(timeout=DEFAULT_STOP_GRACE)
@@ -492,6 +517,13 @@ def cmd_check_config(args: argparse.Namespace) -> int:
         _log(str(exc))
         return 1
     problems = configuration.validate(config, check_credentials=launch is None)
+    if config.forgejo_mode in {"observe", "admit"}:
+        from .mixed_profile import MixedProfile
+
+        try:
+            MixedProfile.load(config.forgejo_profile, config)
+        except ConfigError as error:
+            problems.append(str(error))
     stored = _stored_settings(config)
     values = config.as_dict()
     if launch:

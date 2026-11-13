@@ -491,6 +491,7 @@ class Planning(unittest.TestCase):
             self.assertIsNone(self.controller._prepare_outcome(batch))
 
     def test_unclaimed_collision_preparation_stays_claimable_during_insertions(self):
+        self.controller.set_setting("pre_rebase_enabled", False, "test-own-base-fallback")
         _, head_task = self.start_prediction()
         self.controller.set_setting("repair_concurrency", 2, "test")
         head_claim = self.controller.claim_task("head-worker", "admin-worker")
@@ -522,6 +523,7 @@ class Planning(unittest.TestCase):
         self.assertEqual(self.controller.store.row("batches", {"id": batch["id"]})["version"], current["version"])
 
     def test_old_unclaimed_collision_marker_does_not_suppress_a_new_offer(self):
+        self.controller.set_setting("pre_rebase_enabled", False, "test-own-base-fallback")
         self.start_prediction()
         self.approve(102, {"TauCeti/A.lean": "def a := 1\n"})
         self.controller.tick()
@@ -535,6 +537,7 @@ class Planning(unittest.TestCase):
         self.assertNotEqual(offered[0]["id"], old["id"])
 
     def test_claimed_collision_preparation_keeps_quiet_rule_for_later_insertions(self):
+        self.controller.set_setting("pre_rebase_enabled", False, "test-own-base-fallback")
         _, head_task = self.start_prediction()
         self.controller.set_setting("repair_concurrency", 2, "test")
         self.assertEqual(self.controller.claim_task("head-worker", "admin-worker").task_id, head_task["id"])
@@ -663,6 +666,7 @@ class Planning(unittest.TestCase):
         self.assertEqual(json.loads(row["detail"])["verified_fixed"], [])
 
     def test_clean_background_preparation_records_zero_source_fixes(self):
+        self.controller.set_setting("pre_rebase_enabled", False, "test-own-base-fallback")
         self.start_prediction()
         self.controller.set_setting("repair_concurrency", 2, "operator")
         self.approve(102, {"TauCeti/B.lean": "def b := 1\n"})

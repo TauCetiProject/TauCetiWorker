@@ -144,6 +144,15 @@ if mode == 'widget-generated-hash' and args[0] == 'build':
     (p/'packages/proofwidgets/widget/package-lock.json.hash').write_text('restored Lake digest')
 if mode == 'widget-source-mutation' and args[0] == 'build':
     (p/'packages/proofwidgets/widget/package-lock.json').write_text('changed source')
+if mode == 'toolchain-generated-cache' and args[0] == 'build':
+    cache = Path({str(self.prefix)!r})/'lake/cache/artifacts/0123456789abcdef.ltar'
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text('concurrent generated artifact')
+    outputs = cache.parent.parent/'outputs/Probe/0123456789abcdef.json'
+    outputs.parent.mkdir(parents=True, exist_ok=True)
+    outputs.write_text('concurrent generated output manifest')
+if mode == 'toolchain-library-mutation' and args[0] == 'build':
+    (Path({str(self.prefix)!r})/'lib/lean/Init.olean').write_text('changed compiler input')
 if mode == 'mutation':
     source = Path('TauCeti/A.lean'); before = source.read_text(); source.write_text('changed'); source.write_text(before)
 if mode == 'sleep':
@@ -348,6 +357,20 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result["status"], "incomplete")
         self.assertIn("mutat", result["error"])
 
+    def test_generated_lake_downloads_do_not_invalidate_toolchain_identity(self):
+        write(self.prefix, "lib/lean/Init.olean", "original compiler input")
+        os.environ["FIXTURE_MODE"] = "toolchain-generated-cache"
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "success", result.get("error"))
+        self.assertTrue((self.prefix / "lake/cache/artifacts/0123456789abcdef.ltar").is_file())
+
+    def test_toolchain_library_changes_are_still_rejected(self):
+        write(self.prefix, "lib/lean/Init.olean", "original compiler input")
+        os.environ["FIXTURE_MODE"] = "toolchain-library-mutation"
+        result = self.verify(stage="build")
+        self.assertEqual(result["status"], "incomplete")
+        self.assertIn("mutat", result["error"])
+
     def test_source_pin_base_and_toolchain_invalidate(self):
         self.assertEqual(self.verify(stage="build")["status"], "success")
         for path in ("TauCeti/A.lean", "lake-manifest.json", "lean-toolchain", "lakefile.toml"):
@@ -407,8 +430,9 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
                 p.communicate(timeout=10)
 
     def test_deadline_interrupts_child_and_sigterm(self):
-        p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="10", TAUCETI_ROUND_DEADLINE=str(time.time() + 2))
-        out, _ = p.communicate(timeout=10)
+        # Leave startup/probing time before exercising cancellation of the live child.
+        p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="60", TAUCETI_ROUND_DEADLINE=str(time.time() + 10))
+        out, _ = p.communicate(timeout=20)
         result = json.loads(out)
         self.assertEqual(result["status"], "incomplete")
         self.assertLess(result["commands"][-1]["exit"], 0)
@@ -737,14 +761,17 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--lint-modules", result.stdout)
 
-    def test_host_wrapper_keeps_shell_work_foreground_and_bounds_each_command(self):
+    def test_host_wrapper_keeps_verification_foreground_until_the_round_deadline(self):
         from tauceti_worker.agents import host_agent_argv, local_verification
 
-        with patch.dict(os.environ, TAUCETI_ROUND_DEADLINE=str(time.time() + 1800)):
+        with (
+            patch("tauceti_worker.agents.time.time", return_value=1000),
+            patch.dict(os.environ, TAUCETI_ROUND_DEADLINE="2800", TAUCETI_SHELL_LIMIT_SECONDS=""),
+        ):
             _, env = host_agent_argv("fixture prompt", "claude")
         self.assertEqual(env["TAUCETI_VERIFY_PYTHON"], sys.executable)
-        self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], "600000")
-        self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "600000")
+        self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], "1800000")
+        self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "1800000")
         self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
         self.assertIn(sys.executable, local_verification("ordinary"))
 

@@ -250,8 +250,32 @@ def _pin_git_identity(login: str, user_id: int, *, configure_helper: bool) -> No
     os.environ["GIT_CONFIG_COUNT"] = str(count + len(settings))
 
 
-@functools.lru_cache(maxsize=1)
+def _source_actor():
+    from .worker_sources import current
+
+    source = current()
+    if source is not None:
+        actor = source.authenticated_actor()
+        if actor is None:
+            raise Die("the authenticated Forgejo actor is unavailable")
+        return actor
+    return None
+
+
 def me() -> str:
+    """Display login for the selected source; not a persisted native identity."""
+    actor = _source_actor()
+    return actor.login if actor is not None else _github_me()
+
+
+def review_publisher() -> str:
+    """Identity used by review scoreboards, rather than a display login."""
+    actor = _source_actor()
+    return actor.qualified_id if actor is not None else me()
+
+
+@functools.lru_cache(maxsize=1)
+def _github_me() -> str:
     """The GitHub login the worker is authenticated as (gh). Its PRs are the ones the worker tends
     (fix / fix-ci / rebase). Never hardcoded: whoever set up `gh auth` is who the worker acts as."""
     selected = os.environ.get("_TAUCETI_PINNED_GITHUB_ACCOUNT")
@@ -270,9 +294,27 @@ def me() -> str:
     return login
 
 
+me.cache_clear = _github_me.cache_clear
+me.cache_info = _github_me.cache_info
+
+
 def can_push(repo: str) -> bool | None:
     """Does the authenticated account have push (write) access to `repo`? `true`/`false` from GitHub's
     own `permissions.push`, or None when we can't tell (network/rate-limit/parse)."""
+
+    from .worker_sources import current
+
+    source = current()
+    if source is not None:
+        try:
+            from tauceti_tools.forge import RepositoryRef
+
+            source.validate_binding()
+            return (
+                source.api.repository(RepositoryRef(source.repository.forge, repo)).get("permissions", {}).get("push")
+            )
+        except Exception:
+            return None
 
     def fetch():
         r = gh_run(["gh", "api", f"repos/{repo}", "--jq", ".permissions.push"])
@@ -374,11 +416,21 @@ def _find_fork() -> str | None:
     return None
 
 
-@functools.lru_cache(maxsize=1)
 def ensure_fork() -> str:
     """The contributor's own fork of TAUCETI (`owner/repo`), creating it if absent. The worker pushes
     authored branches here and opens PRs from it, so it never needs write access to canonical. Fails
     closed if the resolved fork can't be pushed to (e.g. a token scoped only to the base repo)."""
+    from .worker_sources import current
+
+    return _source_fork(current())
+
+
+@functools.lru_cache(maxsize=4)
+def _source_fork(source) -> str:
+    # Keyed by the selected source: a round can resolve its GitHub claim fork and its native fork.
+    if source is not None:
+        return source.writable_repository().name
+
     fork = _resolve_fork()
     if can_push(fork) is False:  # explicit denial only; None (couldn't tell) fails open
         raise Die(
@@ -386,6 +438,9 @@ def ensure_fork() -> str:
             f"push to your fork (a token scoped only to {TAUCETI} is not enough), or set TAUCETI_FORK."
         )
     return fork
+
+
+ensure_fork.cache_clear = _source_fork.cache_clear
 
 
 def _resolve_fork() -> str:
@@ -556,6 +611,13 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
     A TRANSIENT failure of a READ (a 5xx, a truncated body, a dropped connection) is retried a few
     seconds later, up to GH_TRANSIENT_TRIES times. Any other failure is returned unchanged for the
     caller to handle as before."""
+    from .worker_sources import current
+
+    source = current()
+    if source is not None:
+        from .source_cli import execute
+
+        return execute(argv[1:] if argv[0] == "gh" else argv, source)
     waited = 0
     attempt = 0
     tries = 0
@@ -692,6 +754,11 @@ class GitHub:
             raise ValueError("qualified repositories require GitHub.for_repository")
         self.repo = repo
         self._review_nodes = {}
+
+    def refresh_pr_state(self, number, expected, observed=""):
+        from .github_state import refresh_pr
+
+        return refresh_pr(self.repo, number, expected, observed)
 
     def _gh(self, args: list[str]) -> subprocess.CompletedProcess:
         readonly = _gh_read_only(["gh", *args])
@@ -830,6 +897,35 @@ class GitHub:
         if p.returncode != 0:
             return None
         return json.loads(p.stdout or "{}")
+
+    def live_pull(self, pr: int) -> dict | None:
+        """The PR as GitHub reports it now, bypassing shared and cached state; None when unreadable."""
+        with transport.read_context(fresh=True):
+            result = self._gh(["api", f"repos/{self.repo}/pulls/{int(pr)}"])
+        if result.returncode:
+            return None
+        try:
+            return json.loads(result.stdout)
+        except ValueError:
+            return None
+
+    def commit_status(self, sha: str, context: str) -> str:
+        """The newest state of one commit-status context on `sha`, fresh; "" when absent or unreadable."""
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return ""
+        with transport.read_context(fresh=True):
+            result = self._gh(["api", f"repos/{self.repo}/commits/{sha}/status?per_page=100"])
+        if result.returncode:
+            return ""
+        try:
+            rows = [s for s in json.loads(result.stdout).get("statuses", []) if s.get("context") == context]
+        except (ValueError, AttributeError):
+            return ""
+        return str(max(rows, key=lambda s: s.get("id") or 0).get("state", "")) if rows else ""
+
+    def add_label(self, pr: int, name: str) -> bool:
+        result = self._gh(["api", "-X", "POST", f"repos/{self.repo}/issues/{int(pr)}/labels", "-f", f"labels[]={name}"])
+        return result.returncode == 0
 
     def bump_repair_requested(self, pr: int, head: str) -> int | None:
         """Fresh proof of a stopped singleton, never a pending retry or speculative label."""

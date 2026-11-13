@@ -285,6 +285,10 @@ class ExecutionPort(Protocol):
         """
         ...
 
+    def retry_status_delivery(self, repo: str, run_id: str, run_attempt: int, *, base_ref: str) -> None:
+        """Request the existing retained-intent reporter for an exact original run/attempt."""
+        ...
+
     def commit_status(self, repo: str, sha: str, context: str) -> Status | None: ...
 
 
@@ -377,6 +381,20 @@ class Task:
             "extra": self.extra,
             "warm_revs": list(self.warm_revs),
         }
+        mixed = self.extra.get("mixed_binding")
+        if mixed is not None and self.binding is None:
+            from .mixed_identity import SourceNumber, encode
+            from .mixed_tasks import SCHEMA, validate
+
+            record.update(schema=SCHEMA, mixed_binding=mixed)
+            for member, original in zip(record["members"], self.members, strict=True):
+                number = original.number
+                member["number"] = int(number)
+                member["source_identity"] = (
+                    number.source.record() if isinstance(number, SourceNumber) else mixed["github"]
+                )
+            validate(record)
+            record = encode(record)
         if self.binding is not None:
             # Old runners require repository and must refuse this schema rather
             # than silently fetching/pushing owner/name on GitHub.
@@ -392,7 +410,9 @@ class Task:
 class Adoption:
     """The controller's answer to a submitted chain.
 
-    `accepted` means the chain is now the batch's authoritative tip at `version`. A rejected
+    `accepted` confirms adoption. `already-adopted` replays a receipt for the exact claim/tip
+    after a lost response (no new adoption; version is None). Otherwise the chain is now the batch's
+    authoritative tip at `version`. A rejected
     submission keeps its commits retained under `retained_ref` so they can be reused; `reason` is a
     stable code (`claim-expired`, `claim-superseded`, `version-mismatch`, `not-authorized`,
     `invalid-chain`, `explanation-required`, `no-repair-edited`, `unknown-task`) and `violations` carries the chain
@@ -412,6 +432,8 @@ class Adoption:
     def to_dict(self) -> dict[str, Any]:
         return vars(self) | {"violations": list(self.violations), "provenance": dict(self.provenance)}
 
+
+REPAIR_CHECKPOINT = "repair-checkpoint"
 
 AGENT_INSTRUCTION = (
     "Resolve the reported conflicts or CI failures in this batch. Preserve the constituent PRs' intent as best "

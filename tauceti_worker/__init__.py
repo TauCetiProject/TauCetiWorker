@@ -6,6 +6,7 @@ the driver loop); `tauceti status` prints the read-only survey.
 The worker acts on TauCetiProject/TauCeti as the authenticated `gh` account, and treats that
 account's own PRs as the ones it tends. Each round does exactly ONE unit of work, chosen in
 priority order: rebase -> bump -> lint-repair -> progress -> fix-ci -> fix -> review -> roadmap.
+Work of any of those kinds on an automatic Mathlib bump PR comes before all other work.
 
 This package was split from a single-file script for navigability. The split is behaviour-
 preserving. For both the test harness (which reaches `tauceti_worker.<NAME>`) and the historical
@@ -17,22 +18,30 @@ a function on the module that actually looks it up.
 
 from __future__ import annotations
 
-from tauceti_tools.project import bootstrap as _bootstrap_project
+from tauceti_tools.project import bootstrap_qualified as _bootstrap_project
 
 
 def _bootstrap_worker_project():
     project = _bootstrap_project()
     if project is None:
         return
-    # Tools may enable other consumers before Worker's remaining adapters are
-    # ready. Keep this consumer's activation decision in Worker as well.
-    from tauceti_tools.forge import GITHUB, resolve_repository
+    import os
 
-    references = list(project.raw["repositories"].values())
-    references += [tool["repo"] for tool in project.raw.get("tools", {}).values()]
-    references += [upstream["repo"] for upstream in project.raw.get("upstreams", [])]
-    if any(resolve_repository(value, project.raw.get("forges")).forge != GITHUB for value in references):
-        raise ValueError("Worker Forgejo activation requires the remaining source and CI adapters")
+    from tauceti_tools.forge import GITHUB
+    from tauceti_tools.project import QUALIFIED_CONTEXT_VARIABLES
+
+    from .source_project import shared_settings
+
+    reference = project.repository_ref("content")
+    settings = shared_settings(project)
+    if reference.forge == GITHUB:
+        return
+    environment = settings.environment()
+    environment.update(dict.fromkeys(QUALIFIED_CONTEXT_VARIABLES, ""))
+    environment.update(TAUCETI_PROJECT_STATE=str(project.state_root), TAUCETI_PROJECT_KEY=project.key)
+    os.environ.update(environment)
+    os.environ.setdefault("TAUCETI_FORGEJO_ORIGIN", reference.forge.url)
+    os.environ.setdefault("TAUCETI_FORGEJO_REPO", reference.name)
 
 
 try:

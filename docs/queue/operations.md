@@ -212,13 +212,39 @@ uv run tauceti-queue status --url https://queue.taucetiproject.org   # through t
 
 ## Current deployment
 
-The controller, SQLite store, content clone, public tunnel, repair workers, monitoring publisher,
-history timer and backup timer run as `kim` on **chungus2**. Repair execution moved on November 7;
-the remaining controller services moved on November 8. Both public hostnames,
-`queue.taucetiproject.org` and `bors.taucetiproject.org`, now terminate at the same tunnel on
-chungus2. The configured canonical branch remains `main` and publication/admission remain enabled.
-Read the actual revision from `/status`; the relocation retained `6348a0116c2c` rather than
-combining a host move with an upgrade.
+The controller, SQLite store, content clone, public tunnel, monitoring publisher,
+history timer and backup timer run as `kim` on **tauchonki2** since November 10.
+Both public hostnames, `queue.taucetiproject.org` and `bors.taucetiproject.org`,
+terminate at the existing tunnel identity on that host. Canonical `main`, publication,
+automatic admission and the persisted three-worker concurrency policy are unchanged.
+
+Repair workers transfer individually at fresh idle heartbeats with no live claims.
+During the transition, existing claims continue on chungus2 and renew against the
+same public queue URL; replacement workers use `@tauchonki2` identities. A finite
+handoff service on chungus2 stops each old worker only when idle, starts its
+counterpart on tauchonki2, mirrors retained task observations, and collects source
+worktrees against a fresh read-only snapshot of the destination database. Never
+restart a retired source worker to repair apparent inactivity without checking
+current claims and the handoff receipt first.
+
+New staging builds are pinned by repository variable `STAGING_RUNS_ON` to
+`fleet-74773fc7f54d4877add11d80113fe340`, tauchonki2's reserved staging-only runner.
+Its CPU weight is 10000 versus 100 for ordinary PR runners. Staging compiler
+memory-admission sleeps are disabled; ordinary CI retains its admission policy.
+Physical VM/cgroup limits still apply. Already-running staging builds finish on
+their original host; neither routing changes nor controller relocation moves them.
+
+The November 10 cutover stopped the old writer and tunnel, transferred a consistent
+SQLite backup with verified integrity and table counts, synchronized final source
+refs and publisher state, and verified local health before enabling the destination
+tunnel. Public service returned after approximately 40 seconds. Active staging and
+repair processes retained their run identities. The source controller, tunnel,
+monitoring and backup units are disabled and masked to prevent competing writers
+or stale publication. The App delivery journal covered the cutover window: all eight
+relevant missed deliveries were confirmed successful; 1,417 failed notifications
+were discarded by the existing primary-intake filter. Migration evidence and final source snapshot are under
+`~/TauCetiQueue-data/migration-tauchonki2-20261110/` on chungus2; the destination
+holds its runtime checks and transfer receipts under the same path.
 
 All active processes use systemd user units. There are no detached controller/tunnel supervisors
 on the destination. The retired units on chungus are masked and its `run-service.sh`,
@@ -228,9 +254,8 @@ final database backup and migration evidence remain under
 and agent logs remain there as history; task JSON needed for reporting was copied to chungus2.
 Do not resurrect any retired unit while the new controller is authoritative.
 
-Chungus2 still has `Linger=no`. The user manager provides ordinary process recovery while it is
-running, but startup after reboot or loss of that manager is not guaranteed. The explicit host move
-does not claim to complete the postponed reboot-supervision work.
+Tauchonki2 has `Linger=yes`; the enabled user units and timers start with its user manager
+after reboot. Verify the public endpoint, backup, monitoring and worker claims after recovery.
 
 Production repair admission uses `repair_concurrency=3` and `background_start_limit=2`.
 Count all live claims when starting a task: a non-head task can increase the total to
@@ -246,27 +271,27 @@ additional user unit is `tauceti-queue-repair@3.service`, using the private
 worktree cleanup and public monitoring (and historical telemetry) when enabling it.
 Existing active workers need not restart for controller admission changes.
 
-Paths on chungus2, where they differ from the default layout:
+Paths on tauchonki2, where they differ from the default layout:
 
 | Path | Content |
 | --- | --- |
 | `~/TauCetiQueue` | shared code checkout for controller and repair workers at the installed revision |
-| `~/.config/tauceti-queue/config.toml` | `host = "chungus2"`, existing App/review/admission configuration and data paths |
+| `~/.config/tauceti-queue/config.toml` | `host = "tauchonki2"`, existing App/review/admission configuration and data paths |
 | `~/.config/tauceti-queue/environment` | controller overrides, including `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` for NixOS TLS trust |
 | `~/TauCetiQueue-data/clone` | controller content clone, including retained private source refs |
 | `~/TauCetiQueue-data/queue.sqlite3` (+ `-wal`, `-shm`) | authoritative queue database |
 | `~/TauCetiQueue-data/logs` | service-owned files; process logs use `journalctl --user -u tauceti-queue` |
 | `~/TauCetiQueue-data/repair-clone`, `repair`, `repair-2`, `repair-3` | separate repair Git clone and worker task/cache roots; active tasks use private writable dependencies |
-| `~/TauCetiQueue-data/mathlib-packages` | retained original dependency seed; no longer configured for live repairs |
+| `~/TauCetiQueue-data/repair-shared/lake-cache` | one shared Lake cache for all repair workers, seeded from the source host |
 | `~/TauCetiQueue-data/monitoring/` | publisher identity/epoch/delta state, private token, prepared observations and pinned exporter release |
 | `~/TauCetiQueue-data/reports/` | retained pilot inputs and Bors baseline used by the history timer |
 | `~/.local/state/tauceti-queue/backups/` | daily and pre-deployment SQLite backups; an immediate destination backup was verified |
-| `~/.cloudflared/config.yml`, `<tunnel id>.json`, `cert.pem` | existing tunnel identity and configuration; DNS did not change |
-| `~/TauCetiQueue-data/controller-migration-20261108/` | final source snapshot, member/settings comparison, webhook recovery and destination migration evidence |
+| `~/.config/tauceti-queue/tunnel/config.yml`, `<tunnel id>.json` | existing tunnel identity and configuration; DNS did not change |
+| `~/TauCetiQueue-data/migration-tauchonki2-20261110/` | cutover checks, runtime setup and worker-handoff evidence |
 
 ### Supervision and deployment
 
-On chungus2:
+On tauchonki2:
 
 ```sh
 systemctl --user status tauceti-queue cloudflared-tauceti-queue
@@ -277,8 +302,9 @@ systemctl --user list-timers 'tauceti-queue*'
 
 The controller and repair units use `LimitNOFILE=65536`. Their process supervisors remain outside
 worker OOM victim groups. Monitoring/history units retain their previous limits and run independently
-of scheduling. The old repair-observation SSH mirror is retired: the publisher now reads the local
-worker roots and verifies their local processes directly.
+of scheduling. The publisher reads local worker roots directly. During the November 10 transition,
+retained source observations are mirrored under `legacy-chungus2/`; remote PID liveness
+is unverified. The finite handoff service refreshes those observations until each old worker stops.
 
 Before an update, take an online backup with `services/queue/backup.sh`, verify the target revision
 and fast-forward the checkout. Use the service installer for controller deployment or explicitly
@@ -342,7 +368,7 @@ members/settings and source objects before starting the new controller. Switch t
 only after local health is verified. Audit/redeliver outage webhooks, run a destination backup and
 verify monitoring/history and worker claims.
 
-Rollback to chungus requires transferring the **current** chungus2 database and source/publisher
+Rollback to the previous host requires transferring the **current** tauchonki2 database and source/publisher
 state after stopping its authoritative services. The old pre-move backup is historical, not a safe
 replacement for work accepted since cutover. Restore/unmask the source units and configuration only
 once destination ownership has ended. Retained credentials and originals make rollback possible;
@@ -720,7 +746,6 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `claim_ttl_seconds` | `900` | integer, at least 0 |
 | `dispatch_timeout_seconds` | `600` | integer, at least 0 |
 | `lost_run_seconds` | `14400` | integer, at least 0 |
-| `infrastructure_retry_limit` | `3` | integer, at least 0 |
 | `infrastructure_retry_backoff_seconds` | `60` | integer, at least 0 |
 | `inference_failure_threshold` | `3` | integer, at least 0 |
 | `inference_hold_backoff_seconds` | `60` | integer, at least 0 |
@@ -911,6 +936,31 @@ set `publication_enabled = false` (restart). The service returns to shadow mode 
 resumes approval intake. Approved inputs the service holds at that moment are re-approved under Bors by
 their authors or the review App; the service's observation feed lists them.
 
+### Forgejo Stage 1 authority transfer
+
+The [Stage 1 cutover runbook](../forgejo-stage1-cutover.md) defines a separately
+authorized transfer to human-operated Forgejo development. While that authority
+transfer is active, keep the old GitHub queue's persisted `publication_enabled`
+setting false and its service disabled. Do not use the Bors rollback above to
+restore a second GitHub merge writer.
+
+`services/queue/install.sh` enables and starts the controller even with
+`--no-restart`. Do not run it on a host fenced for Forgejo cutover without the
+explicit authority decision. Preserve the host's deployment notice, old ledger,
+prepared work, and configured settings; a file seed or fresh database must not
+silently restore publication. The GitHub mirror can share the old queue App
+identity, so a branch exception alone does not distinguish those processes.
+
+`services/queue/install-repair.sh` also enables its unit with `--no-restart`.
+Keep it out of updates to a fenced host without the explicit authority decision.
+Record the identity behind each repair token and fallback login; retain any
+repository-admin credential only in the named administrative profile, outside
+retired unattended repair runtimes. Preserve the corresponding recovery records.
+
+This is a cutover condition, not an instruction to stop current production during
+preparation. Keep normal worker/CI admissions enabled until the authorized
+project-specific authority switch.
+
 ### Rebuilding the head
 
 `POST /admin/rebuild-head` (bearer token of a repository admin, body `{}`) rebuilds the head's chain
@@ -919,7 +969,7 @@ and lets the next tick dispatch a fresh attempt. It is for a head whose commits 
 without a source change, for example after a chain tool fix changed the commit message format and the
 head's CI failed on a consequence of the old format; it is refused while the head is claimed and when a
 member carries agent edits, which a rebuild would discard. `POST /admin/retry-ci` stays the action for
-exhausted infrastructure retries.
+persistent infrastructure failures; automatic retries continue with capped backoff.
 
 ## Monitoring
 
@@ -960,3 +1010,98 @@ service's candidates feed and the Bors baseline window ([journal-report.md](jour
 PRs per hour, head cycle time and its CI/repair split, repair rounds per landed head, repair time and
 inference cost per task, shrink events, singleton builds (expected zero), claim collisions, PR waiting
 age, inference holds and stall conditions, each beside its baseline value.
+
+### Repair cache retention
+
+Set `TAUCETI_QUEUE_CACHE_ROOT` identically for all colocated repair workers, for example
+`/home/operator/TauCetiQueue-data/repair-shared`, and pass that path to
+`services/queue/install-repair-cleanup.sh --cache-root PATH` along with every worker root.
+They share one `lake-cache` and its ownership lease, while credentials/configuration,
+worktrees, logs and task checkpoints stay in their separate worker roots. Tasks persist
+their selected cache root so a restart/configuration change cannot move an active attempt.
+Publishers receive that exact root in their spec. Fetches use disposable per-fetch
+views seeded by hardlinks to shared archives, then atomically transfer verified
+metadata to the common pool; this isolates stock Lake's fixed download temporary
+filenames without serializing downloads or builds. Views are removed on exit, and
+idle retention also removes scratch directories left by crashed fetches.
+
+The minute-by-minute cleanup timer migrates idle legacy pools into the common pool
+using atomic hardlinks without overwriting existing destination names, then removes
+the redundant private directories. Busy legacy attempts keep their old pools until
+completion; migration retries automatically without changing admissions. The timer
+also collects idle `lake-cache` pools.
+Each pool retains at most two distinct snapshots per package from the last seven days,
+within a total 32 GiB artifact budget (one budget for the shared pool). Active attempts
+can temporarily exceed the budget; collection waits for their leases. Recent complete
+dependency output records without revision maps share this budget. Successful local publication manifests count as
+snapshots, including publications made before retention was deployed. If a snapshot
+would exceed the budget, it is not retained; a future task can fetch it from the cache service.
+
+Retention follows both compressed archives and every expanded native output facet,
+removing obsolete output indexes and artifact aliases (including hardlinks). External
+hardlinks remain valid; reported freed bytes count only final links. Diagnostic logs,
+task checkpoints and source Git references remain available.
+
+Worker attempts and background publishers hold a shared root cache lease; collection
+takes it exclusively without waiting. Cleanup also runs before a new attempt
+when its pool has no worktrees. Shared-pool collection requires all participating
+attempts and publishers to be idle; it never interrupts them to enforce the budget.
+Any remaining worktree, live local task claim or
+recent publisher handoff also prevents collection, protecting older worker processes.
+Unknown metadata or symlinks fail closed before any cache files are removed. Cleanup
+prints per-pool retained bytes, removed artifacts/indexes and physically freed bytes.
+The usual cleanup command without `--apply` previews the plan.
+
+### Focused repair checks and worker verification
+
+For warm `repair` and `prepare` attempts with worker audits enabled, the agent repairs
+located findings and runs `.tauceti-repair/check-findings`. This helper compiles the
+finding modules and the repair's source delta from the failing candidate, then runs
+only the reported linters with the existing pinned native driver, or the pinned
+ownership-only checker for duplicate declarations. It records its advisory scope and
+timings in `tasks/<id>/logs/targeted-*/result.json`. Unavailable or unsupported checks
+are reported explicitly; they do not authorize submission.
+
+The agent can also run `.tauceti-repair/build <Module.Name> --dependents`. Its full-suite
+helper is disabled in this mode: the worker owns the whole-library build, audits and
+environment lint after the agent returns. Remaining failures go back to the agent as
+diagnostics. Rebase/cold attempts and configurations without worker verification keep
+their existing validation contract. No agent-reported or cached verdict replaces the
+worker's final verification.
+
+Verification records include wall-clock costs for tools setup, script materialization,
+driver preparation, build, audits and lint. Existing `audit-import`, `audit-duplicates`
+and `audit-axioms` timestamps are preserved as `logs/audit-phases.tsv` and summarized
+in `logs/checks-timing.json` and the outcome's verification record. Incomplete intervals
+are marked incomplete; missing telemetry never changes the checker verdict. Phase
+records survive worktree collection, so further checker optimization can be guided by
+measurements rather than inferred from one combined duration.
+
+### Overlap repair publication with verification
+
+With the default `TAUCETI_REPAIR_PUBLISH=after`, a green whole-library build freezes its
+output map and archive hardlinks before the remaining audit/lint checks start. A normal
+background publisher uploads the snapshot using stock `lake cache put-staged --rev=...`;
+it does not depend on the live source tree or read a later checkout's Git revision.
+This applies to worker verification, clean preparation and the rebase agent's full-build
+helper. Snapshots require platform-independent root-package outputs and a fixed toolchain
+name; unsupported layouts retain the existing late publisher.
+
+Early publication does not pass an audit or authorize submission. Failed checks still
+go back to repair, and staging starts immediately after adoption without waiting for
+upload completion. An exact-revision early upload is reused; a changed revision, failed
+upload or unavailable snapshot falls back to the existing after-submission path. Rebase
+prompts ask agents to finalize fixups and message explanations before their full build,
+so the snapshot names the revision eventually submitted.
+
+Early logs and retained output manifests live in `tasks/<id>/logs/publications/<revision>/`.
+Frozen payloads live in `worktrees/task-<id>-publish-<revision>` and are removed after upload.
+They hold the same task/cache leases, and the existing terminal-task cleanup also removes
+crashed publishers' snapshots. Cache retention follows successful early manifests.
+The upload receives the key only in its own environment. There is no staging polling,
+waiter or cross-service coordination. This gives uploads a head start; it does not
+guarantee a hit if publication remains slower than verification and staging setup.
+
+The [mixed-source queue configuration](mixed-sources.md) adds an explicit,
+default-disabled Forgejo input to the existing queue. It documents observation,
+admission, trusted native reviews, CI roles and the serialized primary change.

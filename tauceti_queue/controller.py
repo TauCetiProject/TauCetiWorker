@@ -34,8 +34,10 @@ from typing import Any
 
 from . import admission_planning, chain, declaration_names
 from .eligibility import KEEP as BLOCKING_LABELS
+from .mixed_identity import SourceNumber
 from .ports import (
     AGENT_INSTRUCTION,
+    REPAIR_CHECKPOINT,
     Adoption,
     CandidateRun,
     DispatchNotAccepted,
@@ -81,12 +83,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "background_start_limit": 2,
     "stall_interval_seconds": 900,
     "publication_enabled": False,
+    "forgejo_admission_enabled": True,
     "claim_ttl_seconds": 900,
     "dispatch_timeout_seconds": 600,
     # An in-progress run counts as lost only when neither its jobs nor GitHub's direct read of the run
     # (`updated_at`) have moved for this long; until then a long build is a `stall` reason line.
     "lost_run_seconds": 14400,
-    "infrastructure_retry_limit": 3,
     "infrastructure_retry_backoff_seconds": 60,
     "inference_failure_threshold": 3,
     "inference_hold_backoff_seconds": 60,
@@ -176,7 +178,7 @@ BACKGROUND_OPERATIONS = tuple(f"task:{kind}" for kind in BACKGROUND_TASKS)
 # How often a worker holding a `prepare` claim renews it (`Task.extra.renew_after`): a refused renewal
 # is how the worker learns that the controller took the batch back (it sealed, or the head needs the
 # worker), so the interval bounds how long a superseded preparation keeps running.
-PREPARE_RENEW_SECONDS = 60
+HANDOFF_RENEW_SECONDS = 15
 # Resolutions of a `prepare` task that settle its batch version: no second task is created for it.
 PREPARE_SETTLED = ("adopted", "prepared", "failed")
 # Worker release reasons: `prepared_clean` (the batch built without errors, nothing to repair) and the
@@ -205,12 +207,14 @@ LIVE_RUN_STATUSES = ("queued", "in_progress", "waiting", "requested", "pending")
 LOST_IN_PROGRESS = "lost-run: in_progress"
 
 _PR_MENTION_RE = re.compile(r"(?:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#(?P<number>\d+)")
+_SOURCE_PR_MENTION_RE = re.compile(
+    r"forgejo:https?://[^\s`<>]+@[1-9][0-9]*#[1-9][0-9]*"
+    r"|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*"
+)
 # The subject of a squash commit bors-ng lands: `<title> (#<number>)`, with no `Source-PR` trailer.
 _BORS_SUBJECT_RE = re.compile(r"\(#(?P<number>\d+)\)\s*$")
 # What the agent appends to an emptied `no_repair` member's message (the repair prompt's "Do not edit").
-_INTERACTING_PR_RE = re.compile(
-    r"^\s*Interacting-PR:\s*(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#(?P<number>\d+)", re.M | re.I
-)
+_INTERACTING_PR_RE = re.compile(r"^\s*Interacting-PR:\s*`?(?P<reference>[^\s`]+)", re.M | re.I)
 _INTERACTING_FILE_RE = re.compile(r"^\s*Interacting-File:\s*`?(?P<file>[^`\n]+?)`?\s*$", re.M | re.I)
 _FINDING_RE = re.compile(r"^\s*Finding:\s*(?P<finding>\S.*?)\s*$", re.M | re.I)
 
@@ -377,6 +381,7 @@ class Controller:
         execution: ExecutionPort | None = None,
         candidate_ci=None,
         source_authority=None,
+        mixed=None,
         canonical_branch: str | None = None,
         clock: Callable[[], float] = time.time,
         rng: random.Random | None = None,
@@ -388,7 +393,11 @@ class Controller:
             store.set_setting("queue:operating-mode", "controller")
         self.store = store
         self.admission = None  # primary policy intake, attached by the service in policy mode
-        self.source = github
+        if store.get_setting("mixed:primary", "github") != "github" and mixed is None:
+            raise ValueError("Forgejo primary cannot run without its explicit mixed-source configuration")
+        self.source = mixed.port if mixed is not None and mixed.mode == "admit" else github
+        self.mixed = mixed
+        self.mixed_ci = None
         self.execution = execution if execution is not None else github
         self.candidate_ci = candidate_ci
         self.source_authority = source_authority
@@ -489,7 +498,7 @@ class Controller:
             raise ValueError("controller source repository or branch differs from its CI policy")
         self._canonical: str | None = self.store.get_setting("state:canonical_sha")
         # Labels this process has made sure exist in the repository (`_ensure_labels`).
-        self._labels_ensured: set[str] = set()
+        self._labels_ensured: set[tuple[str, str]] = set()
 
     # --- settings ----------------------------------------------------------------------------------
 
@@ -534,6 +543,13 @@ class Controller:
                 self.store.journal(now, "setting", key=key, value=value, actor=actor)
                 if key == "publication_enabled" and value and not previous:
                     self._republish_retained_refs(now)
+                if (
+                    key == "forgejo_admission_enabled"
+                    and value
+                    and self.mixed is not None
+                    and self.mixed.poller is not None
+                ):
+                    self.mixed.poller.admission_changed()
             self._wake.set()
             self._refresh_snapshot()
             return self.effective_settings()
@@ -634,7 +650,10 @@ class Controller:
 
     @staticmethod
     def input_ref(number: int, sha: str) -> str:
-        return f"{chain.REF_NAMESPACE}/inputs/{number}/{sha}"
+        from .mixed_identity import SourceNumber
+
+        key = number.ref_key if isinstance(number, SourceNumber) else number
+        return f"{chain.REF_NAMESPACE}/inputs/{key}/{sha}"
 
     @staticmethod
     def staging_candidate_ref(candidate_id: int, generation: int) -> str:
@@ -665,6 +684,12 @@ class Controller:
         """Bring a PR head into the clone: by its pull ref first, by SHA if the ref has moved on."""
         if chain.object_exists(self.clone, sha):
             return True
+        from .mixed_identity import SourceNumber
+
+        if isinstance(number, SourceNumber):
+            if self.mixed is None or self.mixed.mode != "admit":
+                return False
+            return self.mixed.fetch_head(number, sha)
         probe = f"{chain.REF_NAMESPACE}/pulls/{number}"
         try:
             self.source.fetch_refs(self.repository, [f"+refs/pull/{number}/head:{probe}"])
@@ -678,7 +703,39 @@ class Controller:
             self.log.warning("fetch of %s failed: %s", sha, error)
         return chain.object_exists(self.clone, sha)
 
+    def _source_number(self, repo, number):
+        if self.mixed is not None and repo == self.mixed.profile.forgejo.repository.key:
+            return self.mixed.number(number)
+        return number
+
+    def _source_pr(self, number):
+        from .mixed_identity import SourceNumber
+
+        return number.source_pr if isinstance(number, SourceNumber) else f"{self.provenance_repository}#{number}"
+
+    def _member_repository(self, number):
+        from .mixed_identity import SourceNumber
+
+        return (
+            f"{number.source.repository.forge.key}/{number.source.repository.name}@{number.source.native_id}"
+            if isinstance(number, SourceNumber)
+            else self.provenance_repository
+        )
+
+    def _pull_url(self, number):
+        from .mixed_identity import SourceNumber
+
+        return (
+            number.pull_url
+            if isinstance(number, SourceNumber)
+            else f"https://github.com/{self.repository}/pull/{number}"
+        )
+
     def _check_repo(self, repo: str) -> None:
+        if self.mixed is not None and repo == self.mixed.profile.forgejo.repository.key:
+            if self.mixed.mode != "admit":
+                raise ControllerError("forgejo-inert", "native queue admission is not enabled")
+            return
         if repo != self.repository:
             raise ControllerError("unknown-repository", repo)
 
@@ -815,6 +872,7 @@ class Controller:
         """
         with self._lock:
             self._check_repo(repo)
+            pr = self._source_number(repo, pr)
             now = self.clock()
             existing = self._input_for(pr)
             if existing is not None:
@@ -829,6 +887,8 @@ class Controller:
                     return {"accepted": True, "reason": "already-approved", "input": self._input_for(pr)}
                 if existing["state"] == INPUT_INSERTED:
                     return {"accepted": False, "reason": "member", "input": existing}
+            if isinstance(pr, SourceNumber) and not self.setting("forgejo_admission_enabled"):
+                return {"accepted": False, "reason": "admission-paused", "input": None}
             if pull is None or pull.head_sha != head_sha:
                 pull, reason = self.validate_pull(repo, pr, head_sha)
                 if reason is not None:
@@ -850,7 +910,7 @@ class Controller:
                 self._retain(ref, head_sha)
                 input_id = self.store.insert(
                     "inputs",
-                    repository=repo,
+                    repository=self.repository,
                     number=pr,
                     head_sha=head_sha,
                     title=pull.title,
@@ -926,6 +986,7 @@ class Controller:
         """The PR's newest live input row, or its newest terminal row when none is live, or None."""
         with self._lock:
             self._check_repo(repo)
+            pr = self._source_number(repo, pr)
             return self._input_for(pr)
 
     def note_approval(self, source: str) -> None:
@@ -1048,6 +1109,7 @@ class Controller:
     def _withdraw(self, repo: str, pr: int, reason: str, actor: str, *, head_sha: str = "") -> dict[str, Any]:
         with self._lock:
             self._check_repo(repo)
+            pr = self._source_number(repo, pr)
             now = self.clock()
             current = self._input_for(pr)
             if (
@@ -1076,6 +1138,7 @@ class Controller:
     def set_priority(self, repo: str, pr: int, priority: int) -> dict[str, Any]:
         with self._lock:
             self._check_repo(repo)
+            pr = self._source_number(repo, pr)
             current = self._input_for(pr)
             if current is None or current["state"] not in (INPUT_WAITING, INPUT_RESERVED):
                 return {"changed": False, "reason": "not-waiting"}
@@ -1087,6 +1150,7 @@ class Controller:
         """The operator's urgent lane: the PR is drawn next and its batch seals as soon as the head lands."""
         with self._lock:
             self._check_repo(repo)
+            pr = self._source_number(repo, pr)
             now = self.clock()
             current = self._input_for(pr)
             if current is None or current["state"] in (INPUT_LANDED, INPUT_CANCELLED):
@@ -1102,7 +1166,13 @@ class Controller:
 
     def _input_for(self, pr: int) -> dict[str, Any] | None:
         """The PR's newest live input, otherwise its newest terminal input."""
-        rows = self.store.rows("inputs", {"repository": self.repository, "number": pr}, order="id DESC")
+        from .mixed_identity import source_record
+
+        rows = self.store.rows(
+            "inputs",
+            {"repository": self.repository, "number": int(pr), "source_identity": source_record(pr)},
+            order="id DESC",
+        )
         for row in rows:
             if row["state"] in (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED):
                 return row
@@ -1130,7 +1200,8 @@ class Controller:
     def _pull_request_event(self, payload: dict[str, Any], now: float) -> None:
         action = payload.get("action", "")
         pull = payload.get("pull_request", {}) or {}
-        number = int(payload.get("number") or pull.get("number") or 0)
+        raw_number = payload.get("number") or pull.get("number") or 0
+        number = raw_number if isinstance(raw_number, SourceNumber) else int(raw_number)
         if not number:
             return
         if action == "closed" and (pull.get("merged") or str(pull.get("title") or "").startswith(MERGED_TITLE_PREFIX)):
@@ -1349,7 +1420,7 @@ class Controller:
         )
 
     def claim_task(
-        self, worker_identity: str, github_login: str, *, source_access=None, expected_binding=None
+        self, worker_identity: str, github_login: str, *, source_access=None, expected_binding=None, mixed_capable=False
     ) -> Task | None:
         """Hand an open task to an authorized worker under a renewable claim, within `repair_concurrency`.
 
@@ -1386,6 +1457,12 @@ class Controller:
                 return None
             concurrency = int(self.setting("repair_concurrency"))
             claimable = self._claimable_tasks()
+            if not mixed_capable:
+                claimable = [
+                    pair
+                    for pair in claimable
+                    if loads(pair[0]["task_binding"], {}).get("schema") != "tauceti-queue.mixed-task/v1"
+                ]
             if len(self._active_task_claims()) >= concurrency:
                 if claimable and claimable[0][0]["kind"] not in BACKGROUND_TASKS:
                     self._count("claim_collisions")
@@ -1543,6 +1620,45 @@ class Controller:
                     del self._renewal_waiters[claim_token]
                     self._renewing.pop(claim_token, None)
 
+    def _task_checks_owner(self, task: dict[str, Any]) -> str:
+        if task["kind"] not in BACKGROUND_TASKS:
+            return "staging"
+        head = self._head()
+        if head is not None:
+            if head["id"] == task["batch_id"]:
+                return "staging"
+            if task["kind"] == TASK_PREPARE and not self._pre_rebased_prepare(task):
+                first = self._open_batch()
+                if (
+                    first is not None
+                    and first["id"] == task["batch_id"]
+                    and not self._state("inference_hold")
+                    and self._pre_rebase_blocked(head) is None
+                ):
+                    # Finish useful source work, then release the old-base owner so
+                    # the successor can rebase. Its rebased worker may run full checks.
+                    return "staging"
+            return "worker"
+        first = self._open_batch()
+        ready = (
+            first is not None
+            and first["id"] == task["batch_id"]
+            and not self._state("inference_hold")
+            and not self._external_head_blocks_sealing()
+        )
+        return "staging" if ready else "worker"
+
+    def task_check_policy(self, task_id: int) -> dict:
+        """Refresh optional check priority over the existing authenticated claim renewal."""
+        with self._lock.priority():
+            task = self.store.row("tasks", {"id": task_id})
+            if task is None:
+                return {}
+            policy = {"checks_owner": self._task_checks_owner(task)}
+            if task["kind"] in BACKGROUND_TASKS:
+                policy["renew_after"] = HANDOFF_RENEW_SECONDS
+            return policy
+
     def release_task(self, task_id: int, claim_token: str, reason: str, error: str = "", *, source_access=None) -> None:
         """A worker gives a task back. Reason `inference_unavailable` counts toward the inference hold.
 
@@ -1616,6 +1732,7 @@ class Controller:
         tip_sha: str,
         worker_notes: str = "",
         *,
+        checkpoint: bool = False,
         source_access=None,
         source_refresh=None,
     ) -> Adoption:
@@ -1623,6 +1740,8 @@ class Controller:
 
         A late result (expired claim, superseded task or batch version) is rejected but its commits
         stay retained under a submissions ref. See `Adoption` for the reason codes.
+        A repair checkpoint takes the same validation path, retains the chain for the next claim
+        and releases the current claim without adopting the chain.
         """
         with self._lock.priority():
             now = self.clock()
@@ -1634,6 +1753,26 @@ class Controller:
                 raise TaskError("unknown-claim", "no claim with that token on this task")
             if self.candidate_ci is not None:
                 self._source_request_access(source_access, claim=claim)
+            # A lost HTTP response must not cause a second adoption. This is a
+            # receipt for this exact claim/tip, never permission to adopt stale work.
+            receipt = self.store.row(
+                "submissions",
+                {"task_id": task_id, "claim_id": claim["id"], "tip": tip_sha, "accepted": 1},
+                order="id DESC",
+            )
+            if receipt is not None:
+                return Adoption(
+                    True, "already-adopted", task_id, task["batch_id"], None, tip_sha, receipt["retained_ref"], []
+                )
+            if checkpoint:
+                saved = self.store.row(
+                    "submissions",
+                    {"task_id": task_id, "claim_id": claim["id"], "tip": tip_sha, "reason": REPAIR_CHECKPOINT},
+                )
+                if saved is not None:
+                    return Adoption(
+                        False, REPAIR_CHECKPOINT, task_id, task["batch_id"], None, tip_sha, saved["retained_ref"], []
+                    )
             self._task_binding(task, allow_stale_policy=True)
             batch = self.store.row("batches", {"id": task["batch_id"]})
             assert batch is not None
@@ -1654,7 +1793,8 @@ class Controller:
                     created_at=now,
                 )
                 self.store.update("tasks", {"id": task_id}, submissions=task["submissions"] + 1)
-                self.store.journal(now, "submission-rejected", batch["id"], task_id=task_id, reason=reason, tip=tip_sha)
+                kind = "repair-checkpoint-retained" if reason == REPAIR_CHECKPOINT else "submission-rejected"
+                self.store.journal(now, kind, batch["id"], task_id=task_id, reason=reason, tip=tip_sha)
                 return Adoption(
                     False,
                     reason,
@@ -1784,6 +1924,30 @@ class Controller:
                 knowledge = next(
                     (d for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions"), {}
                 )
+            if checkpoint:
+                try:
+                    notes = loads(worker_notes, {})
+                except ValueError:
+                    notes = {}
+                findings = notes.get("repair_checkpoint") if isinstance(notes, dict) else None
+                if not (
+                    self._can_checkpoint_repair(task)
+                    and isinstance(findings, list)
+                    and 0 < len(findings) <= 20
+                    and all(
+                        isinstance(finding, dict)
+                        and finding.get("kind") in ("audit", "lint")
+                        and isinstance(finding.get("message"), str)
+                        and len(finding["message"]) <= 2000
+                        for finding in findings
+                    )
+                ):
+                    return reject("invalid-repair-checkpoint")
+                with self.store.transaction():
+                    result = reject(REPAIR_CHECKPOINT)
+                    self._release_claim(claim, REPAIR_CHECKPOINT, now)
+                self._wake.set()
+                return result
             if tip_sha == task["tip"] and knowledge.get("was_proactive"):
                 self._release_claim(claim, "source-failure-refresh", now)
                 return reject(
@@ -2008,9 +2172,17 @@ class Controller:
             m["source_pr"]: "edited" if m["source_pr"] in edits else m["provenance"] for m in self._task_members(task)
         }
         ref = self.pre_rebase_ref(batch["id"], task["onto"])
+        prepared = self._verified_pre_rebase(task, tip_sha, worker_notes)
         with self.store.transaction():
             self._set_pre_rebase(
-                batch, PRE_REBASE_ADOPTED, now, tip=tip_sha, onto=task["onto"], source=task["tip"], edits=edits
+                batch,
+                PRE_REBASE_ADOPTED,
+                now,
+                tip=tip_sha,
+                onto=task["onto"],
+                source=task["tip"],
+                edits=edits,
+                prepared=prepared,
             )
             self.store.update(
                 "tasks",
@@ -2044,10 +2216,26 @@ class Controller:
                 onto=task["onto"],
                 tip=tip_sha,
                 provenance=provenance,
+                prepared=prepared,
             )
         self.report_inference(claim["worker"], True)
         self._wake.set()
         return Adoption(True, "adopted", task["id"], batch["id"], batch["version"], tip_sha, ref, provenance=provenance)
+
+    def _verified_pre_rebase(self, task: dict[str, Any], tip: str, worker_notes: str) -> bool:
+        from . import repair_audit
+
+        try:
+            notes = loads(worker_notes, {})
+            evidence = notes.get("pre_rebase_verification") if isinstance(notes, dict) else None
+            if not isinstance(evidence, dict) or evidence.get("tip") != tip or evidence.get("base") != task["onto"]:
+                return False
+            # The commit binds the toolchain, manifest and full-library inputs.
+            # Compare the actual tools the worker ran to the pin in that commit.
+            repo, ref = repair_audit.parse_tools_pin(chain.git(self.clone, "show", f"{tip}:tauceti.toml"))
+        except (ValueError, chain.ChainError, repair_audit.Unavailable):
+            return False
+        return evidence.get("tools") == f"{repo}@{ref}"
 
     def _claim_for(self, task_id: int, token: str, now: float, *, allow_stale_policy=False) -> dict[str, Any]:
         claim = self.store.row("claims", {"task_id": task_id, "token": token})
@@ -2090,6 +2278,32 @@ class Controller:
             row = loads(task.get("task_binding"), {})
         except (TypeError, ValueError):
             raise TaskError("not-authorized", "qualified task binding is unreadable") from None
+        from .mixed_tasks import SCHEMA as MIXED_TASK_SCHEMA
+        from .mixed_tasks import binding as mixed_binding
+
+        if isinstance(row, dict) and row.get("schema") == MIXED_TASK_SCHEMA:
+            if self.mixed is None or self.mixed.mode != "admit" or self.mixed_ci is None:
+                raise TaskError("not-authorized", "mixed task requires active enrolled sources")
+            current = mixed_binding(self.mixed)
+            same_scope = all(row.get(key) == current[key] for key in ("github", "forgejo", "epoch"))
+            if row != current and not (allow_stale_policy and same_scope):
+                raise TaskError("not-authorized", "mixed task policy changed")
+            return None  # Worker control and retained refs keep the existing GitHub authority.
+        if any(isinstance(member["number"], SourceNumber) for member in self._members(task["batch_id"])):
+            # A previously claimed GitHub task keeps its original immutable tip,
+            # even if a native member was appended to its batch meanwhile.
+            cache = getattr(self, "_task_source_cache", {})
+            key = (task["base"], task["tip"])
+            if key not in cache:
+                cache[key] = any(
+                    commit.source_pr and commit.source_pr.startswith("forgejo:") and "@" in commit.source_pr
+                    for commit in chain.chain_commits(self.clone, *key)
+                )
+                if len(cache) > 512:
+                    cache.pop(next(iter(cache)))
+                self._task_source_cache = cache
+            if cache[key]:
+                raise TaskError("not-authorized", "mixed task has no frozen source binding")
         if self.candidate_ci is None:
             if not isinstance(row, dict) or row != {}:
                 raise TaskError("not-authorized", "native task requires its qualified controller")
@@ -2146,7 +2360,7 @@ class Controller:
         return replacement
 
     def _supersede_stale_source_tasks(self, now):
-        if self.candidate_ci is None:
+        if self.candidate_ci is None and self.mixed_ci is None:
             return
         for previous in self.store.rows("tasks", {"repository": self.repository, "state": TASK_OPEN}):
             task = self.store.row("tasks", {"id": previous["id"]})
@@ -2177,9 +2391,32 @@ class Controller:
                 )
             )
         refs = [self.batch_ref(batch["id"], task["batch_version"])] + [m.retained_ref for m in members]
-        extra: dict[str, Any] = {"canonical_branch": self.canonical_branch, "claim_id": claim_id}
-        if task["kind"] == TASK_PREPARE:
-            extra["renew_after"] = PREPARE_RENEW_SECONDS
+        extra: dict[str, Any] = {
+            "canonical_branch": self.canonical_branch,
+            "claim_id": claim_id,
+            "checks_owner": self._task_checks_owner(task),
+        }
+        if loads(task.get("task_binding"), {}).get("schema") == "tauceti-queue.mixed-task/v1":
+            if self.mixed is None:
+                raise TaskError("source-disabled", "mixed task requires its enrolled sources")
+            self._task_binding(task)
+            extra["mixed_binding"] = loads(task["task_binding"])
+        warm_revs = self._warm_revs(task, batch)
+        if self._can_checkpoint_repair(task):
+            extra["can_checkpoint_repair"] = True
+            checkpoint = self.store.row(
+                "submissions", {"task_id": task["id"], "reason": REPAIR_CHECKPOINT}, order="id DESC"
+            )
+            if checkpoint is not None:
+                tip = checkpoint["tip"]
+                extra["repair_checkpoint"] = {
+                    "tip": tip,
+                    "diagnostics": loads(checkpoint["worker_notes"])["repair_checkpoint"],
+                }
+                refs.append(checkpoint["retained_ref"])
+                warm_revs = list(dict.fromkeys([tip, *warm_revs]))
+        if task["kind"] in BACKGROUND_TASKS:
+            extra["renew_after"] = HANDOFF_RENEW_SECONDS
         if self._pre_rebased_prepare(task):
             # The pre-rebased chain exists only in the controller's clone until `_prepare_pre_rebased`
             # retains it on GitHub; the worker builds on the head's tip and falls back to the public
@@ -2222,9 +2459,12 @@ class Controller:
             instruction=AGENT_INSTRUCTION,
             created_at=task["created_at"],
             extra=extra,
-            warm_revs=self._warm_revs(task, batch),
+            warm_revs=warm_revs,
             binding=self._task_binding(task),
         )
+
+    def _can_checkpoint_repair(self, task: dict[str, Any]) -> bool:
+        return self.candidate_ci is None and task["kind"] in (TASK_REPAIR, TASK_REBASE_CONFLICT, TASK_PRE_REBASE)
 
     def _create_task(
         self,
@@ -2253,6 +2493,27 @@ class Controller:
             )
         # The head's task replaces any other; an open batch's background tasks (`prepare`, `pre_rebase`)
         # each replace only their own kind.
+        task_binding = {}
+        if self.candidate_ci is not None:
+            task_binding = TaskBinding.from_policy(
+                self.candidate_ci.ledger.policy, queue_epoch=self.candidate_ci.ledger.epoch
+            ).record()
+        elif (
+            self.mixed is not None
+            and self.mixed.mode == "admit"
+            and (
+                any(isinstance(member["number"], SourceNumber) for member in self._members(head["id"]))
+                or (
+                    (attempt := self._current_attempt(head)) is not None
+                    and self.store.row("ci_requests", {"attempt_id": attempt["id"]}) is not None
+                )
+            )
+        ):
+            if self.mixed_ci is None:
+                raise TaskError("source-disabled", "mixed task requires active enrolled sources")
+            from .mixed_tasks import binding
+
+            task_binding = binding(self.mixed)
         where: dict[str, Any] = {"batch_id": head["id"], "state": TASK_OPEN}
         if kind in (TASK_PREPARE, TASK_PRE_REBASE):
             where["kind"] = kind
@@ -2275,13 +2536,7 @@ class Controller:
                 created_at=now,
                 ci_attempt_id=ci_attempt_id,
                 pre_rebase_source=pre_rebased[1] if pre_rebased else None,
-                task_binding=dumps(
-                    TaskBinding.from_policy(
-                        self.candidate_ci.ledger.policy, queue_epoch=self.candidate_ci.ledger.epoch
-                    ).record()
-                )
-                if self.candidate_ci is not None
-                else "{}",
+                task_binding=dumps(task_binding),
             )
             self._count("tasks_prepare_pre_rebased" if pre_rebased else f"tasks_{kind}")
             self.store.journal(
@@ -2342,9 +2597,21 @@ class Controller:
 
     # --- records -----------------------------------------------------------------------------------
 
-    def _open_batches(self) -> list[dict[str, Any]]:
-        """Non-head batches oldest first, including the sealed successor (`state=open, sealed=1`)."""
-        return self.store.rows("batches", {"repository": self.repository, "state": BATCH_OPEN}, order="id")
+    def _inert_barrier(self):
+        if self.mixed is not None and self.mixed.mode == "admit":
+            return None
+        batches = self.store.rows(
+            "batches", {"repository": self.repository, "state": [BATCH_OPEN, BATCH_HEAD]}, order="id"
+        )
+        return next(
+            (batch["id"] for batch in batches if self._mixed_inert_batch(batch) or self._inert_ci_batch(batch)), None
+        )
+
+    def _open_batches(self, *, include_inert=False) -> list[dict[str, Any]]:
+        """Keep staging order, holding an unavailable source and its successors."""
+        batches = self.store.rows("batches", {"repository": self.repository, "state": BATCH_OPEN}, order="id")
+        barrier = None if include_inert else self._inert_barrier()
+        return [batch for batch in batches if barrier is None or batch["id"] < barrier]
 
     def _unsealed_batches(self) -> list[dict[str, Any]]:
         """Batches still accepting insertions; only these count against `open_batch_limit`."""
@@ -2364,14 +2631,65 @@ class Controller:
         input_row = self.store.row("inputs", {"id": member["input_id"]}) or {}
         coauthors = loads(input_row.get("coauthors"))
         return chain.Member(
-            self.provenance_repository,
-            member["number"],
+            self._member_repository(member["number"]),
+            int(member["number"]),
             member["accepted_head"],
             title=input_row.get("title", ""),
             description=input_row.get("description", ""),
-            author="" if self.native_source else input_row.get("author", ""),
+            author=""
+            if self.native_source or isinstance(member["number"], SourceNumber)
+            else input_row.get("author", ""),
             coauthors=None if coauthors is None else tuple(coauthors),
         )
+
+    def _mixed_inert_batch(self, batch):
+        return bool(
+            batch
+            and any(isinstance(member["number"], SourceNumber) for member in self._members(batch["id"]))
+            and (self.mixed is None or self.mixed.mode != "admit")
+        )
+
+    def _inert_ci_batch(self, batch):
+        if batch is None or self.mixed_ci is not None or self.candidate_ci is not None:
+            return False
+        attempt = self._current_attempt(batch)
+        return bool(attempt and self.store.row("ci_requests", {"attempt_id": attempt["id"]}))
+
+    def _candidate_coordinator(self, *, batch_id=None, attempt_id=None, run_id=None):
+        if self.candidate_ci is not None:
+            return self.candidate_ci
+        if self.mixed_ci is None:
+            owned = False
+            if attempt_id is not None:
+                owned = self.store.row("ci_requests", {"attempt_id": attempt_id}) is not None
+            elif run_id is not None:
+                owned = bool(self.store.query("SELECT 1 FROM ci_request_runs WHERE run_id=? LIMIT 1", (run_id,)))
+            else:
+                batch = self.store.row("batches", {"id": batch_id}) if batch_id is not None else self._head()
+                owned = self._inert_ci_batch(batch)
+            if owned:
+                raise ControllerError(
+                    "forgejo-inert", "qualified CI ownership is retained until its coordinator is enabled"
+                )
+            return None
+        if run_id is not None:
+            rows = self.store.query(
+                "SELECT r.attempt_id FROM ci_requests r JOIN ci_request_runs o ON o.request_digest=r.request_digest WHERE o.run_id=?",
+                (run_id,),
+            )
+            return self.mixed_ci if rows else None
+        if attempt_id is not None:
+            return self.mixed_ci if self.store.row("ci_requests", {"attempt_id": attempt_id}) is not None else None
+        batch = self.store.row("batches", {"id": batch_id}) if batch_id is not None else self._head()
+        if batch is None:
+            return None
+        native = any(isinstance(member["number"], SourceNumber) for member in self._members(batch["id"]))
+        if native:
+            return self.mixed_ci
+        previous = self.store.rows("ci_attempts", {"batch_id": batch["id"]}, order="id DESC", limit=1)
+        if previous:
+            return self._candidate_coordinator(attempt_id=previous[0]["id"])
+        return self.mixed_ci if self.mixed.primary == "forgejo" else None
 
     def _current_attempt(self, head: dict[str, Any]) -> dict[str, Any] | None:
         rows = self.store.query(
@@ -2529,6 +2847,100 @@ class Controller:
         self.store.journal(now, "batch-opened", batch_id, base=base)
         return self.store.row("batches", {"id": batch_id}) or {}
 
+    def change_primary(self, target: str, actor: str) -> dict:
+        """Change landing authority and sync direction without disturbing admissions or CI."""
+        if target not in {"github", "forgejo"}:
+            raise ValueError("primary must be github or forgejo")
+        with self._ticking, self._lock:
+            if self.mixed is None or self.mixed.mode != "admit":
+                raise ControllerError("forgejo-inert", "primary changes require active enrolled sources")
+            self.mixed.check_writer()
+            # An uncertain leased write must be read back in its original direction.
+            self._drain_outbox(self.clock())
+            from .mixed_landing import tips
+
+            with self._lock.unlocked():
+                current = tips(self.mixed)
+                self.mixed.check_github()
+                check_actor = getattr(self.mixed.native_main, "check_actor", None)
+                if check_actor is not None:
+                    check_actor()
+                if target == "forgejo":
+                    if any(
+                        not self.mixed.supports_candidate(batch["base"], batch["tip"])
+                        for batch in self.store.rows(
+                            "batches", {"repository": self.repository, "state": [BATCH_OPEN, BATCH_HEAD]}
+                        )
+                    ):
+                        raise ControllerError(
+                            "github-primary-required", "land pending human control-file changes on GitHub first"
+                        )
+                    self.mixed.mirror.preflight(self.mixed.native, current[target], current[target], current["github"])
+            if current["github"] != current["forgejo"]:
+                raise ControllerError(
+                    "main-tips-differ", "synchronize both protected main tips before changing primary"
+                )
+            for entry in self.store.rows("outbox", {"kind": "promote"}):
+                intent = loads(entry["payload"], {})
+                phase = intent.get("promotion_send", {}).get("state")
+                unknown = phase == "sending" or phase is None and entry["attempts"] and entry["state"] == "pending"
+                if not unknown:
+                    continue
+                original = intent.get("primary", "github")
+                send = intent.get("promotion_send", {})
+                expected = intent.get("expected_parent")
+                observed = current[original]
+                cannot_apply = (
+                    expected
+                    and observed != expected
+                    and (send.get("lease") is True or not chain.is_ancestor(self.clone, observed, intent["tip"]))
+                )
+                if chain.is_ancestor(self.clone, intent["tip"], observed) or cannot_apply:
+                    intent["promotion_send"] = {"state": "settled"}
+                    self.store.update("outbox", {"id": entry["id"]}, payload=dumps(intent))
+                else:
+                    raise ControllerError(
+                        "landing-uncertain",
+                        "reconcile a sent landing in its original direction before changing primary",
+                    )
+            if target == self.mixed.primary:
+                return {
+                    "changed": False,
+                    "primary": target,
+                    "main": current[target],
+                    "generation": self.mixed.generation,
+                }
+            generation = self.mixed.generation + 1
+            with self.store.transaction():
+                self.store.set_setting("mixed:primary", target, actor, self.clock())
+                self.store.set_setting("mixed:primary_generation", generation, actor, self.clock())
+                if target == "github":
+                    for row in self._waiting():
+                        if row["last_probe"].startswith("source-ci-scope:"):
+                            self.store.update(
+                                "inputs",
+                                {"id": row["id"]},
+                                last_probe="",
+                                last_probe_tip="",
+                                last_probe_base="",
+                                probe_conflicts="{}",
+                            )
+                self._set_state("canonical_sha", current[target])
+                self.store.journal(
+                    self.clock(),
+                    "primary-changed",
+                    previous=self.mixed.primary,
+                    primary=target,
+                    generation=generation,
+                    main=current[target],
+                    actor=actor,
+                )
+            self.mixed.primary, self.mixed.generation = target, generation
+            self._canonical = current[target]
+            self._retain_local(self._canonical_ref(), current[target])
+            self._wake.set()
+            return {"changed": True, "primary": target, "main": current[target], "generation": generation}
+
     # --- the reconciliation pass -------------------------------------------------------------------
 
     def tick(self) -> list[str]:
@@ -2551,6 +2963,9 @@ class Controller:
         now = self.clock()
         self._supersede_stale_source_tasks(now)
         self._expire_claims(now)
+        if self.mixed is not None and self.mixed.mode == "admit" and self.setting("publication_enabled"):
+            sync_key = f"mixed-sync:startup:{self.mixed.generation}:{self.revision}"
+            self._enqueue("mixed-sync", sync_key, {})
         self._drain_outbox(now)
         offer()
         try:
@@ -2560,6 +2975,9 @@ class Controller:
             self._reasons.append(f"canonical branch unavailable: {error}")
             return list(self._reasons)
         self._observe_canonical(canonical, now)
+        if self._mixed_inert_batch(self._head()) or self._inert_ci_batch(self._head()):
+            self._reasons.append("Forgejo admission is disabled; mixed work is retained pending explicit enablement")
+            return list(self._reasons)
         self._follow_anticipated(now)
         hold = self._state("inference_hold")
         if hold:
@@ -2659,9 +3077,17 @@ class Controller:
                     trees[commit.sha] = commit.tree
                     if empty:
                         continue  # an empty placeholder lands no contribution
-                    if source and source.startswith(f"{self.provenance_repository}#"):
+                    if source and source.startswith("forgejo:") and "@" in source:
+                        from .mixed_identity import from_source_pr
+
+                        qualified = from_source_pr(source)
+                        if self.mixed is not None and qualified.source == self.mixed.profile.forgejo:
+                            landed_prs.add(qualified)
+                    elif source and source.startswith(f"{self.provenance_repository}#"):
                         landed_prs.add(int(source.rsplit("#", 1)[1]))
-                    elif not source and not self.native_source:
+                    elif (
+                        not source and not self.native_source and (self.mixed is None or self.mixed.primary == "github")
+                    ):
                         # Bors's squash commits carry no Source-PR trailer; the subject names the PR.
                         lines = (commit.message or "").splitlines()
                         match = _BORS_SUBJECT_RE.search(lines[0]) if lines else None
@@ -2778,7 +3204,9 @@ class Controller:
         ):
             observed = verification.get("observed_duplicate_names", [])
             if isinstance(observed, list) and all(isinstance(n, str) for n in observed):
-                edited_numbers = {int(pr.rsplit("#", 1)[1]) for pr in edited}
+                from .mixed_identity import from_source_pr
+
+                edited_numbers = {from_source_pr(pr) for pr in edited}
                 fixed = sorted(
                     {
                         r["name"]
@@ -2867,6 +3295,13 @@ class Controller:
 
     def _waiting(self) -> list[dict[str, Any]]:
         rows = self.store.rows("inputs", {"repository": self.repository, "state": INPUT_WAITING})
+        from .mixed_identity import SourceNumber
+
+        rows = [
+            row
+            for row in rows
+            if not isinstance(row["number"], SourceNumber) or self.mixed is not None and self.mixed.mode == "admit"
+        ]
         rows.sort(key=lambda row: (-row["urgent"], -row["priority"], row["approved_at"], row["id"]))
         return rows
 
@@ -2886,6 +3321,9 @@ class Controller:
         inputs wait for the next tick, which the loop is woken to run at once. `probed` is per tick and
         the draw's age bound carries over in `passes_waited`, so a paused tick starves nobody.
         """
+        if self._inert_barrier() is not None:
+            self._reasons.append("insertion waits behind retained work from a disabled source")
+            return
         probed: set[tuple[int, int]] = set()  # (input, batch) pairs probed in this tick
         started = time.monotonic()
         budget = float(self.setting("insertion_probe_budget_seconds"))
@@ -2918,6 +3356,16 @@ class Controller:
                 if not remaining:
                     break
             if target is None:
+                # An out-of-scope input already tried on canonical cannot be
+                # helped by another empty batch on that same tree. A primary
+                # reversal clears the wait; a new canonical allows one retry.
+                remaining = [
+                    row
+                    for row in remaining
+                    if not (
+                        row["last_probe"].startswith("source-ci-scope:") and row["last_probe_tip"] == self._canonical
+                    )
+                ]
                 if not remaining or len(batches) >= max(1, int(self.setting("open_batch_limit"))):
                     break
                 assert self._canonical is not None
@@ -3018,12 +3466,12 @@ class Controller:
             )
             claim = self._take_claim(batch, "insert", now)
         member = chain.Member(
-            self.provenance_repository,
-            row["number"],
+            self._member_repository(row["number"]),
+            int(row["number"]),
             row["head_sha"],
             title=row["title"],
             description=row["description"],
-            author="" if self.native_source else row["author"],
+            author="" if self.native_source or isinstance(row["number"], SourceNumber) else row["author"],
             coauthors=None if loads(row["coauthors"]) is None else tuple(loads(row["coauthors"])),
         )
         chain_id = f"probe-{batch['id']}-{secrets.token_hex(4)}"
@@ -3031,6 +3479,7 @@ class Controller:
         result: chain.ChainResult | None = None
         gaps: list[tuple[str, str]] = []
         scan_unavailable: str | None = None
+        scope_supported = True
         try:
             with self._lock.unlocked():
                 if not self._fetch_head(row["number"], row["head_sha"]):
@@ -3039,6 +3488,8 @@ class Controller:
                 gaps, scan_unavailable = (
                     self._new_import_gaps(batch["tip"], result) if result.status == chain.CLEAN else ([], None)
                 )
+                if result.status == chain.CLEAN and self.mixed is not None and self.mixed.mode == "admit":
+                    scope_supported = self.mixed.supports_candidate(batch["base"], result.tip)
         except chain.ChainError as error:
             failure = error
         finally:
@@ -3146,6 +3597,37 @@ class Controller:
                 )
             return False
         record = result.commits[0]
+        source_ci_required = (
+            self.mixed is not None
+            and self.mixed.mode == "admit"
+            and (
+                isinstance(row["number"], SourceNumber) or self._candidate_coordinator(batch_id=batch["id"]) is not None
+            )
+        )
+        if source_ci_required and not scope_supported:
+            reason = (
+                "source-ci-scope: native candidate needs a compatible batch or changes within the native path policy"
+                if isinstance(row["number"], SourceNumber)
+                else "source-ci-scope: human control-file changes require GitHub primary and a GitHub-only batch"
+            )
+            with self.store.transaction():
+                open_ids = {str(b["id"]) for b in self._open_batches()}
+                conflicts = {k: v for k, v in loads(row["probe_conflicts"], {}).items() if k in open_ids}
+                if self._members(batch["id"]):
+                    conflicts[str(batch["id"])] = batch["base"]
+                self.store.update(
+                    "inputs",
+                    {"id": row["id"]},
+                    state=INPUT_WAITING,
+                    batch_id=None,
+                    last_probe=reason,
+                    last_probe_tip=batch["tip"],
+                    last_probe_base=batch["base"],
+                    probe_conflicts=dumps(conflicts),
+                )
+                self._release_claim(claim, "source-ci-scope", now)
+                self.store.journal(now, "probe-source-ci-scope", batch["id"], number=row["number"], reason=reason)
+            return False
         if scan_unavailable is not None:
             self.store.journal(
                 now, "probe-import-scan-unavailable", batch["id"], number=row["number"], reason=scan_unavailable
@@ -3622,6 +4104,16 @@ class Controller:
         if not self.setting("prepare_open_batches") or self._state("inference_hold"):
             return
         for batch in self._open_batches():
+            successor = self._open_batch()
+            if (
+                self.setting("prepare_pre_rebased")
+                and successor
+                and successor["id"] == batch["id"]
+                and self._pre_rebase_blocked(self._head()) is None
+            ):
+                # Prepare this successor on its intended parent. Starting another
+                # own-base pass would serialize two full builds and rewrite repairs.
+                continue
             if not self._prepare_due(batch, now):
                 continue
             pre_rebase = self._open_pre_rebase_task(batch)
@@ -3647,31 +4139,12 @@ class Controller:
             self._note_reason(f"open batch {batch['id']} waits for a worker to prepare it")
 
     def _pre_rebase_waits_for_prepare(self, batch: dict[str, Any]) -> str | None:
-        """Why a `pre_rebase` task may not be created for the batch yet; None once it may.
-
-        A batch that background preparation applies to (`prepare_open_batches` on, at least
-        `prepare_min_members` members) is pre-rebased by an agent only from its prepared chain: a
-        preparation adopted later would rewrite the chain under the pre-rebase and discard the
-        agent's resolutions. So the task waits while a `prepare` task is open and until the batch is
-        prepared at its current version, or its preparation at that version failed.
-        """
+        """A live own-base owner finishes first; future work uses the intended parent."""
         prepare = self._open_own_base_prepare(batch)
         if prepare is not None:
             held = "claimed" if self._active_claims(batch["id"], task_id=prepare["id"]) else "open"
             return f"prepare task {prepare['id']} is {held}"
-        if not self.setting("prepare_open_batches"):
-            return None
-        if not batch["sealed"] and len(self._members(batch["id"])) < max(1, int(self.setting("prepare_min_members"))):
-            return None
-        if batch["prepared_version"] == batch["version"]:
-            return None
-        settled = self.store.row(
-            "tasks",
-            {"batch_id": batch["id"], "batch_version": batch["version"], "kind": TASK_PREPARE, "resolution": "failed"},
-        )
-        if settled is not None:
-            return None
-        return f"not yet prepared at v{batch['version']}"
+        return None
 
     def _prepare_outcome(self, batch: dict[str, Any]) -> dict[str, Any] | None:
         """The `prepare_errors` diagnostic of a batch prepared at its current version: the errors its
@@ -3924,6 +4397,9 @@ class Controller:
             return
         assert head is not None
         onto = head["tip"]
+        own_prepare = self._open_own_base_prepare(batch)
+        if own_prepare and not self._active_claims(batch["id"], task_id=own_prepare["id"]):
+            self._supersede_prepare(batch["id"], "pre-rebase", now, own_base_only=True)
         state = batch["pre_rebase_state"]
         if self._open_pre_rebase_task(batch) is not None:
             self._reasons.append(f"open batch {batch['id']} waits for a worker to resolve its pre-rebase")
@@ -4270,7 +4746,9 @@ class Controller:
 
         def records(batch_id: int) -> dict[int, dict]:
             return {
-                m["number"]: loads((self.store.row("inputs", {"id": m["input_id"]}) or {}).get("declaration_names"), {})
+                (str(m["number"]) if isinstance(m["number"], SourceNumber) else m["number"]): loads(
+                    (self.store.row("inputs", {"id": m["input_id"]}) or {}).get("declaration_names"), {}
+                )
                 for m in self._members(batch_id)
             }
 
@@ -4383,8 +4861,9 @@ class Controller:
     # --- CI ----------------------------------------------------------------------------------------
 
     def _advance_attempt(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> None:
+        candidate_ci = self._candidate_coordinator(attempt_id=attempt["id"])
         if attempt.get("dispatch_state") == "prepared":
-            if self.candidate_ci is not None and now < (attempt["dispatch_retry_at"] or 0):
+            if candidate_ci is not None and now < (attempt["dispatch_retry_at"] or 0):
                 self._reasons.append(
                     f"head {head['id']}: prepared source CI retry at {attempt['dispatch_retry_at']:.0f}"
                 )
@@ -4392,15 +4871,6 @@ class Controller:
             self._send_prepared(head, attempt, now)
         else:
             self._observe_attempt(head, attempt, now)
-
-    def _recover_exhausted(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> bool:
-        """Keep looking for a late live run after exhaustion, at the normal poll rate."""
-        if now - (attempt["last_observed_at"] or attempt["dispatched_at"]) < int(
-            self.setting("polling_interval_seconds")
-        ):
-            return False
-        self.store.update("ci_attempts", {"id": attempt["id"]}, last_observed_at=now)
-        return self._readopt_live_run(head, now)
 
     def _ci(self, head: dict[str, Any], now: float) -> None:
         attempt = self._current_attempt(head)
@@ -4419,27 +4889,9 @@ class Controller:
             )
             retries = sum(a["dispatch_state"] != "rejected" for a in failures)
             rejected = attempt["dispatch_state"] == "rejected"
-            permanent_rejections = sum(
-                a["dispatch_state"] == "rejected" and not a["dispatch_retryable"] for a in failures
-            )
-            limit = int(self.setting("infrastructure_retry_limit"))
-            if rejected and not attempt["dispatch_retryable"] and permanent_rejections > limit:
-                if self._recover_exhausted(head, attempt, now):
-                    return
-                self._reasons.append(
-                    f"head {head['id']}: permanent dispatch rejections exhausted retries; repair configuration and use retry_ci"
-                )
-                return
-            if not rejected and retries > limit:
-                if self._recover_exhausted(head, attempt, now):
-                    return
-                self._reasons.append(
-                    f"head {head['id']}: {retries} infrastructure failures ({attempt['outcome_detail']}); retries exhausted, use retry_ci"
-                )
-                return
             # Proven non-sends need no CI-run retry budget. Keep retrying with bounded
             # backoff, respecting a backend's persisted rate-limit deadline.
-            exponent = min(3, len(failures) - retries - 1) if rejected else retries - 1
+            exponent = min(3, max(0, len(failures) - retries - 1 if rejected else retries - 1))
             backoff = int(self.setting("infrastructure_retry_backoff_seconds")) * (2 ** max(0, exponent))
             due = (attempt["last_observed_at"] or attempt["dispatched_at"]) + backoff
             due = max(due, attempt.get("dispatch_retry_at") or 0)
@@ -4551,6 +5003,7 @@ class Controller:
         Refused (`reason: live-run`) while GitHub reports a run for the head's tip queued or in
         progress, since the re-dispatch would cancel it; `github-unavailable` when that cannot be checked.
         """
+        candidate_ci = self._candidate_coordinator()
         with self._lock:
             if self.source_authority is not None:
                 access, _ = self._source_request_access(source_access)
@@ -4562,11 +5015,11 @@ class Controller:
             now = self.clock()
             attempts = self._tip_attempts(head)
             current_attempt = self._current_attempt(head)
-            if self.candidate_ci is not None and (
+            if candidate_ci is not None and (
                 current_attempt is None or request_id is None or request_id != current_attempt["request_id"]
             ):
                 return {"retried": False, "reason": "request-identity-required"}
-            if self.candidate_ci is not None:
+            if candidate_ci is not None:
                 prepared = current_attempt["dispatch_state"] == "prepared"
                 if prepared and current_attempt["outcome"] == OUTCOME_PENDING:
                     with self.store.transaction():
@@ -4631,7 +5084,7 @@ class Controller:
                     # completed run without usable evidence can then be retired
                     # explicitly; no absence or title proves an unowned send lost.
                     source_pending = (
-                        self.candidate_ci is not None
+                        candidate_ci is not None
                         and attempt["request_id"] == request_id
                         and attempt["outcome"] == OUTCOME_PENDING
                         and attempt["dispatch_state"] == "accepted"
@@ -4653,7 +5106,7 @@ class Controller:
                 count = len(forgotten)
                 self.store.journal(now, "retry-ci", head["id"], actor=actor, forgotten=count, attempts=forgotten)
             self._wake.set()
-            return {"retried": bool(count) if self.candidate_ci is not None else True, "forgotten": count}
+            return {"retried": bool(count) if candidate_ci is not None else True, "forgotten": count}
 
     def _tip_attempts(self, head: dict[str, Any]) -> list[dict[str, Any]]:
         """The attempts at the head's current version for its current tip and base, oldest first."""
@@ -4680,9 +5133,10 @@ class Controller:
     def _live_run(self, head: dict[str, Any], attempts: list[dict[str, Any]]) -> CandidateRun | None:
         """The newest run GitHub reports for the head's tip since its first attempt, when it is still
         queued or in progress; `None` when there is none. Raises when GitHub cannot be asked."""
-        if self.candidate_ci is not None:
+        candidate_ci = self._candidate_coordinator(batch_id=head["id"])
+        if candidate_ci is not None:
             with self._lock.unlocked():
-                live = self.candidate_ci.live_attempt(attempts, discover_completed=True)
+                live = candidate_ci.live_attempt(attempts, discover_completed=True)
             if not self._source_head_current(head):
                 raise ControllerError("head-changed", "source head changed during live CI discovery")
             return None if live is None else live[1]
@@ -4708,19 +5162,20 @@ class Controller:
         live run, so the staging candidate branch named after the attempt stays the one CI verifies.
         Returns whether the dispatch must not happen this tick (re-adopted, or GitHub could not be asked).
         """
+        candidate_ci = self._candidate_coordinator(batch_id=head["id"])
         attempts = self._tip_attempts(head)
         if not attempts:
             return False
         try:
             qualified = None
-            if self.candidate_ci is not None:
+            if candidate_ci is not None:
                 with self._lock.unlocked():
-                    qualified = self.candidate_ci.live_attempt(attempts)
+                    qualified = candidate_ci.live_attempt(attempts)
                 if not self._source_head_current(head):
                     return True
             run = (
                 (None if qualified is None else qualified[1])
-                if self.candidate_ci is not None
+                if candidate_ci is not None
                 else self._live_run(head, attempts)
             )
         except Exception as error:  # noqa: BLE001
@@ -4743,11 +5198,11 @@ class Controller:
         if attempt is None:
             self._reasons.append(f"head {head['id']}: live run {run.run_id} has no previously sent attempt; waiting")
             return True
-        if self.candidate_ci is not None and self.candidate_ci.ledger.owner_run(attempt["id"]) != run.run_id:
+        if candidate_ci is not None and candidate_ci.ledger.owner_run(attempt["id"]) != run.run_id:
             self._reasons.append(f"head {head['id']}: verified duplicate run {run.run_id} is still live; waiting")
             return True
         where = {"id": attempt["id"]}
-        if self.candidate_ci is not None:
+        if candidate_ci is not None:
             where.update(
                 {key: attempt[key] for key in ("outcome", "dispatch_state", "cancelled_at", "run_id", "request_id")}
             )
@@ -4771,7 +5226,7 @@ class Controller:
             for rejected in attempts:
                 if rejected["id"] > attempt["id"] and rejected["dispatch_state"] == "rejected":
                     match = {"id": rejected["id"]}
-                    if self.candidate_ci is not None:
+                    if candidate_ci is not None:
                         match.update(dispatch_state="rejected", outcome=rejected["outcome"])
                     self.store.update("ci_attempts", match, outcome=OUTCOME_SUPERSEDED)
             self._count("ci_readoptions")
@@ -4799,8 +5254,9 @@ class Controller:
 
     def _read_run(self, run_id: str, *, with_jobs: bool) -> CandidateRun | None:
         """`read_run` on the port; a port without it reads nothing directly (raises, so nothing is lost)."""
-        if self.candidate_ci is not None:
-            return self.candidate_ci.read_run(run_id)
+        candidate_ci = self._candidate_coordinator(run_id=run_id)
+        if candidate_ci is not None:
+            return candidate_ci.read_run(run_id)
         reader = getattr(self.execution, "read_run", None)
         if reader is None:
             raise ControllerError("no-read-run", "the GitHub port cannot read a run directly")
@@ -4825,16 +5281,23 @@ class Controller:
         anything back. The attempt is recorded as cancelled either way, so observation and the
         re-adoption of live runs leave its run alone.
         """
-        cancel = (
-            self.candidate_ci.cancel_run
-            if self.candidate_ci is not None
-            else getattr(self.execution, "cancel_run", None)
-        )
-        if cancel is None:
-            return
         adopted = self.store.row("ci_attempts", {"id": by}) if by is not None else None
         protected_run = adopted["run_id"] if adopted is not None else None
         for attempt in self.store.rows("ci_attempts", {"batch_id": batch_id}, order="id"):
+            if (
+                self.candidate_ci is None
+                and self.mixed_ci is None
+                and self.store.row("ci_requests", {"attempt_id": attempt["id"]}) is not None
+            ):
+                continue
+            candidate_ci = self._candidate_coordinator(attempt_id=attempt["id"])
+            if candidate_ci is None and self.store.row("ci_requests", {"attempt_id": attempt["id"]}) is not None:
+                continue  # Disabled source: retain ownership for the enrolled coordinator.
+            cancel = (
+                candidate_ci.cancel_run if candidate_ci is not None else getattr(self.execution, "cancel_run", None)
+            )
+            if cancel is None:
+                continue
             if attempt["id"] == by or attempt["cancelled_at"] is not None:
                 continue
             if protected_run and attempt["run_id"] == protected_run:
@@ -4852,9 +5315,9 @@ class Controller:
                 )
                 if attempt["dispatch_state"] in {"sending", "uncertain", "accepted"}:
                     try:
-                        if self.candidate_ci is not None:
+                        if candidate_ci is not None:
                             with self._lock.unlocked():
-                                run = self.candidate_ci.observe(attempt["id"]).run
+                                run = candidate_ci.observe(attempt["id"]).run
                         else:
                             run = self.execution.find_candidate_run(
                                 self.repository,
@@ -4876,7 +5339,7 @@ class Controller:
                 continue
             run_id = str(attempt["run_id"])
             try:
-                if self.candidate_ci is not None:
+                if candidate_ci is not None:
                     with self._lock.unlocked():
                         result = cancel(run_id)
                 else:
@@ -4916,13 +5379,17 @@ class Controller:
                 )
 
     def _dispatch(self, head: dict[str, Any], now: float, retry: int) -> None:
+        candidate_ci = self._candidate_coordinator(batch_id=head["id"])
+        if self._mixed_inert_batch(head):
+            self._reasons.append("Forgejo admission is disabled; retaining the mixed batch")
+            return
         if not self.setting("publication_enabled"):
             self._reasons.append(
                 f"publication disabled: would dispatch CI for head {head['id']} v{head['version']} ({head['tip'][:12]} on {head['base'][:12]})"
             )
             return
         freeze_key = f"source-ci:freeze-error:{head['id']}"
-        failed = self.store.get_setting(freeze_key) if self.candidate_ci is not None else None
+        failed = self.store.get_setting(freeze_key) if candidate_ci is not None else None
         binding = [head["version"], head["tip"], head["base"]]
         if failed and failed["binding"] == binding and now < failed["retry_at"]:
             self._reasons.append(f"head {head['id']}: source CI preparation retry at {failed['retry_at']:.0f}")
@@ -4939,9 +5406,9 @@ class Controller:
         members = self._members(head["id"])
         try:
             prepared = None
-            if self.candidate_ci is not None:
+            if candidate_ci is not None:
                 with self._lock.unlocked():
-                    prepared = self.candidate_ci.prepare(head, members, request_id, fetch_missing=self._fetch_head)
+                    prepared = candidate_ci.prepare(head, members, request_id, fetch_missing=self._fetch_head)
                 current = self.store.row("batches", {"id": head["id"]})
                 if current is None or any(current[key] != head[key] for key in ("state", "version", "tip", "base")):
                     return
@@ -4962,10 +5429,10 @@ class Controller:
                     request_id=request_id,
                     dispatch_state="prepared",
                 )
-                if self.candidate_ci is not None:
-                    self.candidate_ci.freeze(attempt_id, members, prepared=prepared)
+                if candidate_ci is not None:
+                    candidate_ci.freeze(attempt_id, members, prepared=prepared)
         except Exception as error:  # noqa: BLE001 - head failure must not stop unrelated queue work
-            if self.candidate_ci is None:
+            if candidate_ci is None:
                 raise
             detail = f"{type(error).__name__}: {str(error)[:200]}"
             self._reasons.append(f"head {head['id']}: cannot freeze source CI request ({detail})")
@@ -4978,12 +5445,13 @@ class Controller:
                     now, "source-ci-freeze-failed", head["id"], error=type(error).__name__, detail=detail
                 )
             return
-        if self.candidate_ci is not None and failed:
+        if candidate_ci is not None and failed:
             self.store.set_setting(freeze_key, None)
         self._send_prepared(head, self.store.row("ci_attempts", {"id": attempt_id}), now)
 
     def _send_prepared(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> None:
         """Finish a persisted preparation, then attempt its execution send once."""
+        candidate_ci = self._candidate_coordinator(attempt_id=attempt["id"])
         if not self.setting("publication_enabled"):
             self._reasons.append(f"publication disabled: would resume CI for head {head['id']}")
             return
@@ -5007,9 +5475,9 @@ class Controller:
             # out by SHA, so the retained ref is pushed before the dispatch rather than by the outbox later.
             # The staging candidate branch is the same commit under the name pr-build.yml's train identity
             # check fetches and compares with the dispatched head.
-            if self.candidate_ci is not None:
+            if candidate_ci is not None:
                 with self._lock.unlocked():
-                    dispatch_prepared = self.candidate_ci.prepare_source(attempt_id, self.source)
+                    dispatch_prepared = candidate_ci.prepare_source(attempt_id, self.source)
                 current_head = self.store.row("batches", {"id": head["id"]})
                 if current_head is None or any(
                     current_head[key] != head[key] for key in ("state", "version", "tip", "base")
@@ -5042,9 +5510,9 @@ class Controller:
             if claimed != 1:
                 return  # Another recovery process already owns or settled this send.
             sending = True
-            if self.candidate_ci is not None:
+            if candidate_ci is not None:
                 with self._lock.unlocked():
-                    dispatch_id = self.candidate_ci.dispatch(attempt_id, prepared=dispatch_prepared)
+                    dispatch_id = candidate_ci.dispatch(attempt_id, prepared=dispatch_prepared)
             else:
                 dispatch_id = self.execution.dispatch_candidate(
                     self.repository,
@@ -5065,10 +5533,10 @@ class Controller:
                 pending = current["outcome"] == OUTCOME_PENDING
                 retryable = (
                     getattr(error, "retryable", not isinstance(error, (ValueError, TypeError, KeyError)))
-                    if self.candidate_ci is not None
+                    if candidate_ci is not None
                     else getattr(error, "retryable", True)
                 )
-                resume_prepared = self.candidate_ci is not None and not uncertain and pending and retryable
+                resume_prepared = candidate_ci is not None and not uncertain and pending and retryable
                 retry_at = getattr(error, "retry_at", None)
                 failures = current["dispatch_failures"] + 1
                 if resume_prepared:
@@ -5162,6 +5630,31 @@ class Controller:
         if current["outcome"] == OUTCOME_PENDING and self.setting("publication_enabled"):
             self._cancel_superseded_runs(head["id"], now, reason=f"superseded by attempt {attempt_id}", by=attempt_id)
 
+    def _retry_status_delivery(self, attempt: dict[str, Any], run: CandidateRun, now: float) -> None:
+        """Reuse the durable outbox and existing intent-only workflow, without a retry limit."""
+        candidate_ci = self._candidate_coordinator(attempt_id=attempt["id"])
+        if candidate_ci is not None:
+            return  # native execution receipts use their existing result protocol
+        run_attempt = run.attempt or 1
+        key = f"status-delivery:{attempt['id']}:{run.run_id}:{run_attempt}"
+        existing = self.store.row("outbox", {"key": key})
+        if existing is None:
+            self._enqueue(
+                "retry_status_delivery",
+                key,
+                {
+                    "attempt_id": attempt["id"],
+                    "run_id": run.run_id,
+                    "run_attempt": run_attempt,
+                    "base_ref": attempt["base_ref"],
+                },
+            )
+        elif existing["state"] == "done" and now - (existing["done_at"] or 0) >= LOG_GRACE_SECONDS:
+            # A successful dispatch is not successful delivery. If its job died,
+            # timed out or lost the reply, retry the same retained original-run
+            # intents. Workflow concurrency coalesces these reporting jobs only.
+            self.store.update("outbox", {"id": existing["id"]}, state="pending", next_attempt_at=now)
+
     def _check_lost_run(
         self, head: dict[str, Any], attempt: dict[str, Any], run: CandidateRun, values: dict[str, Any], now: float
     ) -> None:
@@ -5208,6 +5701,7 @@ class Controller:
     def _observe_attempt(
         self, head: dict[str, Any], attempt: dict[str, Any], now: float, *, strict: bool = False
     ) -> None:
+        candidate_ci = self._candidate_coordinator(attempt_id=attempt["id"])
         interval = int(self.setting("polling_interval_seconds"))
         due = (
             attempt["needs_observation"]
@@ -5216,7 +5710,7 @@ class Controller:
         )
         if not due:
             return
-        if self.candidate_ci is not None:
+        if candidate_ci is not None:
             self._observe_source_attempt(head, attempt, now, strict=strict)
             return
         try:
@@ -5373,23 +5867,14 @@ class Controller:
         if status.state == "success":
             unbound = [context for context in VERDICT_CONTEXTS if not bound[context]]
             if unbound:
-                # The finalizer posts all three statuses in the one step that posts `build`; a bound
-                # `build` with the others absent is that step still in flight (or a post that failed).
-                # Look again for a little while, then treat it as the missing `build` case above.
-                if now - values["run_completed_at"] < LOG_GRACE_SECONDS:
-                    self._reasons.append(
-                        f"head {head['id']}: run {run.run_id} posted build, waiting for {', '.join(unbound)}"
-                    )
-                    self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
-                    return
-                values.update(
-                    outcome=OUTCOME_INFRASTRUCTURE,
-                    outcome_detail=f"missing-status: the completed run posted no bound {', '.join(unbound)} status",
-                )
-                self.store.journal(
-                    now, "ci-infrastructure", head["id"], attempt_id=attempt["id"], detail=values["outcome_detail"]
+                # Compilation and exact cache publication already succeeded.
+                # Preserve this attempt forever while required status delivery
+                # recovers; a transport failure must not schedule another build.
+                self._reasons.append(
+                    f"head {head['id']}: verified run {run.run_id} awaits delivery of {', '.join(unbound)}"
                 )
                 self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
+                self._retry_status_delivery(attempt, run, now)
                 return
             failed = [context for context in VERDICT_CONTEXTS if statuses[context].state != "success"]
             if failed:
@@ -5471,6 +5956,7 @@ class Controller:
         Absence, expiry and unavailable APIs preserve the single-send intent.
         They never become an infrastructure verdict that authorizes a new send.
         """
+        candidate_ci = self._candidate_coordinator(attempt_id=attempt["id"])
         values = {"last_observed_at": now, "needs_observation": 0}
         hold = self.store.get_setting(f"source-ci:promotion-hold:{attempt['id']}")
         if hold is not None:
@@ -5481,7 +5967,7 @@ class Controller:
             return
         try:
             with self._lock.unlocked():
-                observation = self.candidate_ci.observe(attempt["id"])
+                observation = candidate_ci.observe(attempt["id"])
         except Exception as error:  # noqa: BLE001 - keep pending, including malformed evidence
             if not self._source_head_current(head, attempt):
                 if strict:
@@ -5640,13 +6126,25 @@ class Controller:
     # --- promotion and landing ---------------------------------------------------------------------
 
     def _promote(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> None:
+        candidate_ci = self._candidate_coordinator(attempt_id=attempt["id"])
+        if self._mixed_inert_batch(head):
+            self._reasons.append("Forgejo admission is disabled; retaining the mixed batch")
+            return
         if not self.setting("publication_enabled"):
             self._reasons.append(
                 f"publication disabled: would fast-forward {self.canonical_branch} from {head['base'][:12]} to {head['tip'][:12]}"
             )
             return
         key = f"promote:{head['id']}:{head['version']}:{head['tip']}"
-        if self.candidate_ci is not None:
+        primary_binding = {}
+        generation = self.store.get_setting("mixed:primary_generation", 0)
+        if generation or self.mixed is not None and self.mixed.mode == "admit":
+            key += f":primary:{generation}"
+            primary_binding = {
+                "primary": self.store.get_setting("mixed:primary", "github"),
+                "primary_generation": generation,
+            }
+        if candidate_ci is not None:
             generation = self.store.get_setting(f"source-ci:promotion-generation:{attempt['id']}", 0)
             key += f":source:{attempt['id']}:{generation}"
         if self.store.row("outbox", {"key": key}) is None:
@@ -5661,6 +6159,8 @@ class Controller:
                         "expected_parent": head["base"],
                         "tip": head["tip"],
                         "attempt_id": attempt["id"],
+                        **primary_binding,
+                        **({"promotion_send": {"state": "not-sent"}} if primary_binding else {}),
                     },
                 )
                 self.store.journal(now, "promotion-queued", head["id"], version=head["version"], tip=head["tip"])
@@ -5668,6 +6168,7 @@ class Controller:
             self._reasons.append(f"head {head['id']} promotion pending in the outbox")
 
     def _landed(self, batch: dict[str, Any], how: str, now: float) -> None:
+        candidate_ci = None if self._inert_ci_batch(batch) else self._candidate_coordinator(batch_id=batch["id"])
         batch = self.store.row("batches", {"id": batch["id"]}) or batch
         if batch["state"] == BATCH_LANDED:
             return
@@ -5677,18 +6178,28 @@ class Controller:
         withdrawn = [m["number"] for m in everyone if m["withdrawn"]]
         rejected = []
         members = []
+        external_members: set[int] = set()
+        landed_ranges: dict[str, dict[str, str]] = {}
         for member in everyone:
             if member["withdrawn"]:
                 continue
             commit = chain.read_commit(self.clone, member["commit_sha"])
             empty = len(commit.parents) == 1 and commit.tree == chain.tree_of(self.clone, commit.parents[0])
-            if empty and not chain.carries_landed_note(commit.message):
+            external = empty and chain.carries_landed_note(commit.message)
+            if empty and not external:
+                since = chain.git(self.clone, "merge-base", member["accepted_head"], batch["base"]).strip()
+                if since not in landed_ranges:
+                    landed_ranges[since] = chain.landed_prs(self.clone, since, batch["base"])
+                external = chain.landed_commit(landed_ranges[since], member["source_pr"]) is not None
+            if external:
+                external_members.add(member["id"])
+            if empty and not external:
                 rejected.append(member)
             else:
                 members.append(member)
         with self.store.transaction():
             self.store.update("batches", {"id": batch["id"]}, state=BATCH_LANDED, landed_at=now, landed_how=how)
-            if self.candidate_ci is not None:
+            if candidate_ci is not None:
                 self.store.execute("DELETE FROM settings WHERE key=?", (f"source-ci:freeze-error:{batch['id']}",))
                 for recorded_attempt in self.store.rows("ci_attempts", {"batch_id": batch["id"]}):
                     for category in (
@@ -5748,10 +6259,12 @@ class Controller:
             )
             if self.setting("publication_enabled"):
                 for member in members:
-                    self._enqueue_landing_effects(batch, member)
+                    self._enqueue_landing_effects(batch, member, landed_externally=member["id"] in external_members)
                 for member in rejected:
                     self._enqueue_rejection_effects(batch, member)
             self._interacting_landed({m["number"] for m in members}, now)
+        if self.mixed is not None and self.mixed.mode == "admit" and self.setting("publication_enabled"):
+            self._enqueue("mixed-sync", f"mixed-sync:{self.mixed.generation}:{batch['id']}:{batch['tip']}", {})
         self._cancel_superseded_runs(batch["id"], now, reason="batch landed")
         self._wake.set()
 
@@ -5769,7 +6282,7 @@ class Controller:
             lines += ["", "The repair agent's explanation:", ""]
             lines += [f"> {line}" if line else ">" for line in member["explanation"].splitlines()]
         lines += ["", f"The staging history is retained under `{self.batch_ref(batch['id'], batch['version'])}`."]
-        marker = f"<!-- {COMMENT_MARKER} rejected:{self.repository}#{number}:{batch['id']}:{member['commit_sha']} -->"
+        marker = f"<!-- {COMMENT_MARKER} rejected:{self._source_pr(number)}:{batch['id']}:{member['commit_sha']} -->"
         self._enqueue(
             "comment",
             f"rejected-comment:{batch['id']}:{number}",
@@ -5788,7 +6301,9 @@ class Controller:
             {"number": number, "rejected": True, "head_sha": member["accepted_head"], "input_id": member["input_id"]},
         )
 
-    def _enqueue_landing_effects(self, batch: dict[str, Any], member: dict[str, Any]) -> None:
+    def _enqueue_landing_effects(
+        self, batch: dict[str, Any], member: dict[str, Any], *, landed_externally: bool = False
+    ) -> None:
         number = member["number"]
         body = self.member_comment(batch, member)
         if member["provenance"] != "clean":
@@ -5806,7 +6321,7 @@ class Controller:
                 error=diff["error"],
             )
             label = self.setting("repaired_label")
-            if label and not self._landed_outside_queue(member):
+            if label and not landed_externally and not self._landed_outside_queue(member):
                 self._enqueue(
                     "labels",
                     f"repaired-label:{batch['id']}:{number}",
@@ -5819,7 +6334,7 @@ class Controller:
                         ],
                     },
                 )
-        marker = f"<!-- {COMMENT_MARKER} landed:{self.repository}#{number}:{batch['id']}:{member['commit_sha']} -->"
+        marker = f"<!-- {COMMENT_MARKER} landed:{self._source_pr(number)}:{batch['id']}:{member['commit_sha']} -->"
         self._enqueue(
             "comment",
             f"landed-comment:{batch['id']}:{number}",
@@ -5869,13 +6384,15 @@ class Controller:
                     + ", ".join(f"[`{sha[:12]}`](https://github.com/{self.repository}/commit/{sha})" for sha in edited)
                     + ".",
                 ]
-            mentioned = self._mentioned_prs(member["explanation"], exclude=member["number"])
+            mentioned = self._mentioned_prs(
+                member["explanation"],
+                exclude=member["number"],
+                qualified=any(isinstance(m["number"], SourceNumber) for m in self._members(batch["id"])),
+            )
             if mentioned:
                 lines += [
                     "",
-                    "Related PRs: "
-                    + ", ".join(f"[#{n}](https://github.com/{self.repository}/pull/{n})" for n in mentioned)
-                    + ".",
+                    "Related PRs: " + ", ".join(f"[#{n}]({self._pull_url(n)})" for n in mentioned) + ".",
                 ]
             lines += ["", f"The source is retained under `{self.batch_ref(batch['id'], batch['version'])}`."]
         return "\n".join(lines)
@@ -5931,27 +6448,48 @@ class Controller:
             ]
         return lines
 
-    def _mentioned_prs(self, text: str, exclude: int) -> list[int]:
+    def _mentioned_prs(self, text: str, exclude: int, *, qualified=False) -> list[int]:
+        from .mixed_identity import from_source_pr
+
+        candidates = []
+        references = list(_SOURCE_PR_MENTION_RE.finditer(text))
+        for match in references:
+            value = match.group()
+            if not value.startswith("forgejo:") and value.rsplit("#", 1)[0] not in {
+                self.provenance_repository,
+                self.repository,
+            }:
+                continue
+            try:
+                number = from_source_pr(value)
+            except (ValueError, TypeError):
+                continue
+            candidates.append((match.start(), number))
+        if not (qualified or isinstance(exclude, SourceNumber)):
+            for match in _PR_MENTION_RE.finditer(text):
+                if any(reference.start() <= match.start() < reference.end() for reference in references):
+                    continue
+                if match["repo"] is None or match["repo"] == self.repository:
+                    candidates.append((match.start(), int(match["number"])))
         found: list[int] = []
-        for match in _PR_MENTION_RE.finditer(text):
-            repo = match["repo"]
-            number = int(match["number"])
-            if (repo is None or repo == self.repository) and number != exclude and number not in found:
+        for _, number in sorted(candidates, key=lambda candidate: candidate[0]):
+            if number != exclude and number not in found:
                 found.append(number)
         return found
 
     # --- the no-repair opt-out: problem-anticipated withdrawals ----------------------------------
 
-    def _attribution(self, explanation: str, exclude: int) -> dict[str, Any]:
+    def _attribution(self, explanation: str, exclude: int, *, qualified=False) -> dict[str, Any]:
         """The interacting PR, file and finding the agent appended to an emptied `no_repair` member's
         message (`Interacting-PR:`, `Interacting-File:`, `Finding:` lines); the PR falls back to the
         first other PR the text mentions. Missing parts are None."""
         number = None
         match = _INTERACTING_PR_RE.search(explanation)
-        if match and int(match["number"]) != exclude:
-            number = int(match["number"])
+        if match:
+            mentioned = self._mentioned_prs(match["reference"], exclude, qualified=qualified)
+            number = mentioned[0] if mentioned else None
         if number is None:
-            mentioned = self._mentioned_prs(explanation, exclude=exclude)
+            mentioned = self._mentioned_prs(explanation, exclude=exclude, qualified=qualified)
             number = mentioned[0] if mentioned else None
         file_match = _INTERACTING_FILE_RE.search(explanation)
         finding_match = _FINDING_RE.search(explanation)
@@ -5966,10 +6504,12 @@ class Controller:
         if self._canonical is None:
             return False
         # Git uses POSIX ERE, whose literal escaping differs from Python re.escape.
-        repository = "".join("\\" + char if char in ".[](){}*+?^$|\\" else char for char in self.provenance_repository)
-        pattern = rf"(\(#{number}\)$|^{chain.SOURCE_PR_TRAILER}: {repository}#{number}$)"
-        if self.native_source:
-            pattern = rf"^{chain.SOURCE_PR_TRAILER}: {repository}#{number}$"
+        repository = "".join(
+            "\\" + char if char in ".[](){}*+?^$|\\" else char for char in self._member_repository(number)
+        )
+        pattern = rf"(\(#{int(number)}\)$|^{chain.SOURCE_PR_TRAILER}: {repository}#{int(number)}$)"
+        if self.native_source or isinstance(number, SourceNumber):
+            pattern = rf"^{chain.SOURCE_PR_TRAILER}: {repository}#{int(number)}$"
         result = chain._git(
             self.clone, "log", "-n", "5", "--format=%H", "-E", f"--grep={pattern}", self._canonical, "--"
         )
@@ -6001,7 +6541,11 @@ class Controller:
         the PR comes back through `needs-rebase` and re-approval once the other side lands, or is
         re-admitted at its original age if the other side leaves the queue without landing (`_follow_anticipated`).
         """
-        attribution = self._attribution(explanation, member["number"])
+        attribution = self._attribution(
+            explanation,
+            member["number"],
+            qualified=any(isinstance(m["number"], SourceNumber) for m in self._members(batch["id"])),
+        )
         interacting = attribution["interacting"]
         record = {
             "batch_id": batch["id"],
@@ -6094,7 +6638,12 @@ class Controller:
             {"repository": self.repository, "state": INPUT_CANCELLED, "reason": PROBLEM_ANTICIPATED},
             order="id",
         )
-        return [row for row in rows if loads(row["anticipated"], {}).get("stage") == ANTICIPATED_PENDING]
+        return [
+            row
+            for row in rows
+            if loads(row["anticipated"], {}).get("stage") == ANTICIPATED_PENDING
+            and (not isinstance(row["number"], SourceNumber) or self.mixed is not None and self.mixed.mode == "admit")
+        ]
 
     def _needs_rebase(self, row: dict[str, Any], record: dict[str, Any], now: float, *, comment: bool = True) -> None:
         """The interacting PR is on `main`: the problem is reproducible on the author's branch. Comment
@@ -6330,9 +6879,13 @@ class Controller:
             current = self._pending_entry(entry)
             if current is None:
                 return
+            if current["kind"] in {"promote", "mixed-sync"} and not self.setting("publication_enabled"):
+                return
             if current["kind"] == "promote":
                 try:
-                    result = self._perform(current["kind"], loads(current["payload"], {}), now)
+                    payload = loads(current["payload"], {})
+                    payload["_outbox_id"] = current["id"]
+                    result = self._perform(current["kind"], payload, now)
                 except Exception as error:  # noqa: BLE001 - every adapter failure is recorded and retried
                     self._outbox_failed(current, loads(current["history"], []), error, now)
                 else:
@@ -6448,7 +7001,7 @@ class Controller:
     def _outbox_failed(self, entry: dict[str, Any], history: list[Any], error: Exception, now: float) -> None:
         attempts = entry["attempts"] + 1
         backoff = min(
-            int(self.setting("outbox_retry_seconds")) * (2 ** (attempts - 1)),
+            int(self.setting("outbox_retry_seconds")) * (2 ** min(20, attempts - 1)),
             int(self.setting("outbox_retry_max_seconds")),
         )
         history.append({"at": now, "error": str(error)[:500]})
@@ -6465,13 +7018,26 @@ class Controller:
         """Create each label the repository may lack, once per process: adding a missing label to a PR
         would otherwise create it with GitHub's default colour and no description."""
         for label in labels:
-            if label["name"] in self._labels_ensured:
+            label_key = (repo, label["name"])
+            if label_key in self._labels_ensured:
                 continue
             self.source.ensure_label(repo, label["name"], label["color"], label["description"])
-            self._labels_ensured.add(label["name"])
+            self._labels_ensured.add(label_key)
 
     def _perform(self, kind: str, payload: dict[str, Any], now: float) -> str:
+        candidate_ci = (
+            self._candidate_coordinator(attempt_id=payload.get("attempt_id"), batch_id=payload.get("batch_id"))
+            if kind == "cancel_run"
+            else None
+        )
         repo = self.repository
+        from .mixed_identity import SourceNumber
+
+        if isinstance(payload.get("number"), SourceNumber):
+            repo = payload["number"].source.repository.key
+            self._check_repo(repo)
+            if not self.setting("publication_enabled"):
+                raise ControllerError("publication-disabled", "native publication remains pending")
         if kind == "retain_ref":
             self.source.update_ref(repo, payload["ref"], payload["sha"])
             return "retained"
@@ -6555,23 +7121,83 @@ class Controller:
                 title = pull.title if pull.title.startswith(MERGED_TITLE_PREFIX) else MERGED_TITLE_PREFIX + pull.title
             self.source.close_pr(repo, payload["number"], title)
             return "closed"
+        if kind == "mixed-sync":
+            if self.mixed is None or self.mixed.mode != "admit":
+                raise ControllerError("forgejo-inert", "main synchronization awaits source enablement")
+            if not self.setting("publication_enabled"):
+                raise ControllerError("publication-disabled", "main synchronization remains pending")
+            from .mixed_landing import synchronize
+
+            return dumps(synchronize(self.mixed))
         if kind == "promote":
             return self._perform_promotion(payload, now)
+        if kind == "retry_status_delivery":
+            attempt = self.store.row("ci_attempts", {"id": payload["attempt_id"]})
+            head = self._head()
+            if (
+                attempt is None
+                or head is None
+                or attempt["batch_id"] != head["id"]
+                or attempt["batch_version"] != head["version"]
+                or attempt["outcome"] != OUTCOME_PENDING
+                or attempt["run_id"] != payload["run_id"]
+                or (attempt["run_attempt"] or 1) != payload["run_attempt"]
+            ):
+                return "superseded status delivery"
+            self.execution.retry_status_delivery(
+                repo, payload["run_id"], payload["run_attempt"], base_ref=payload["base_ref"]
+            )
+            return "status recovery requested"
+        if kind == "cancel_run" and candidate_ci is None and payload.get("attempt_id") is not None:
+            if self.store.row("ci_requests", {"attempt_id": payload["attempt_id"]}) is not None:
+                raise ControllerError("forgejo-inert", "qualified cancellation awaits its CI coordinator")
         if kind == "cancel_run":
             # The one retry of a cancel that failed inline: a second failure is recorded, not retried.
             try:
-                if self.candidate_ci is not None:
-                    return self.candidate_ci.cancel_run(payload["run_id"])
+                if candidate_ci is not None:
+                    return candidate_ci.cancel_run(payload["run_id"])
                 return self.execution.cancel_run(repo, payload["run_id"])
             except Exception as error:  # noqa: BLE001
                 self.log.warning("retry of cancelling CI run %s failed, giving up: %s", payload["run_id"], error)
                 return f"gave-up: {str(error)[:200]}"
         raise ControllerError("unknown-outbox-kind", kind)
 
+    def _promotion_send_state(self, payload, state, *, lease=False, refused=False):
+        entry_id = payload.get("_outbox_id")
+        if entry_id is None:
+            return
+        with self.store.transaction():
+            entry = self.store.row("outbox", {"id": entry_id})
+            intent = loads(entry["payload"], {})
+            previous = intent.get("promotion_send", {})
+            uncertain = previous.get("state") == "sending" or not previous.get("state") and entry["attempts"]
+            if refused and previous.get("unresolved_unleased"):
+                return  # A new refusal does not resolve a preceding lost API reply.
+            intent["promotion_send"] = {"state": state}
+            if lease and (not uncertain or previous.get("lease") is True):
+                intent["promotion_send"]["lease"] = True
+            elif state == "sending" and uncertain:
+                intent["promotion_send"]["unresolved_unleased"] = True
+            self.store.update("outbox", {"id": entry_id}, payload=dumps(intent))
+
     def _perform_promotion(self, payload: dict[str, Any], now: float) -> str:
+        candidate_ci = self._candidate_coordinator(
+            attempt_id=payload.get("attempt_id"), batch_id=payload.get("batch_id")
+        )
         batch = self.store.row("batches", {"id": payload["batch_id"]})
         if batch is None:
             return "no-batch"
+        if self._mixed_inert_batch(batch):
+            raise ControllerError("forgejo-inert", "mixed promotion awaits source enablement")
+        if candidate_ci is None and any(
+            isinstance(member["number"], SourceNumber) for member in self._members(batch["id"])
+        ):
+            raise ControllerError("forgejo-inert", "native members require their qualified candidate CI coordinator")
+        primary_generation = self.store.get_setting("mixed:primary_generation", 0)
+        if payload.get("primary_generation", 0) != primary_generation:
+            return "stale-primary-generation"
+        if self.mixed is None and payload.get("primary", "github") != "github":
+            raise ControllerError("forgejo-inert", "Forgejo primary requires active configuration")
         if batch["state"] == BATCH_LANDED:
             return "already-landed"
         if batch["version"] != payload["version"] or batch["tip"] != payload["tip"]:
@@ -6581,9 +7207,10 @@ class Controller:
         if canonical == payload["tip"] or chain.is_ancestor(self.clone, payload["tip"], canonical):
             self._canonical = canonical
             self._set_state("canonical_sha", canonical)
+            self._promotion_send_state(payload, "settled")
             self._landed(batch, "promoted", now)
             return "already-visible"
-        if self.candidate_ci is not None:
+        if candidate_ci is not None:
             attempt = self.store.row("ci_attempts", {"id": payload["attempt_id"]})
             if (
                 attempt is None
@@ -6600,7 +7227,7 @@ class Controller:
             members = self._members(batch["id"])
             try:
                 with self._lock.unlocked():
-                    self.candidate_ci.verify_promotion(attempt["id"], members, self.source)
+                    candidate_ci.verify_promotion(attempt["id"], members, self.source)
             except Exception as error:  # noqa: BLE001 - settle this outbox entry; re-observe or reconcile
                 permanent = isinstance(error, PromotionRefused)
                 detail = (
@@ -6650,9 +7277,36 @@ class Controller:
                 generation_key = f"source-ci:promotion-generation:{attempt['id']}"
                 self.store.set_setting(generation_key, self.store.get_setting(generation_key, 0) + 1)
                 return "stale-source-work"
-        result = self.source.fast_forward(
-            self.repository, self.canonical_branch, payload["expected_parent"], payload["tip"]
-        )
+        if self.mixed is not None and self.mixed.mode == "admit":
+            from .mixed_landing import preflight
+
+            before = (
+                self.store.row("batches", {"id": batch["id"]}),
+                self._members(batch["id"]),
+                self.store.row("ci_attempts", {"id": payload["attempt_id"]}),
+            )
+            with self._lock.unlocked():
+                preflight(self.mixed, payload["expected_parent"], payload["tip"])
+            after = (
+                self.store.row("batches", {"id": batch["id"]}),
+                self._members(batch["id"]),
+                self.store.row("ci_attempts", {"id": payload["attempt_id"]}),
+            )
+            if before != after or self._active_claims(batch["id"]):
+                raise ControllerError(
+                    "promotion-changed", "work changed during primary preflight; retained for reconciliation"
+                )
+            if primary_generation != self.store.get_setting("mixed:primary_generation", 0):
+                return "stale-primary-generation"
+        if not self.setting("publication_enabled"):
+            raise ControllerError("publication-disabled", "landing remains pending while publication is disabled")
+        leased = (self.mixed is not None and self.mixed.mode == "admit") or bool(primary_generation)
+        self._promotion_send_state(payload, "sending", lease=leased)
+        fast_forward = self.source.fast_forward
+        if leased and (self.mixed is None or self.mixed.mode != "admit"):
+            fast_forward = self.source.fast_forward_leased
+        result = fast_forward(self.repository, self.canonical_branch, payload["expected_parent"], payload["tip"])
+        self._promotion_send_state(payload, "settled", refused=not result.ok)
         if result.ok:
             self._canonical = payload["tip"]
             self._set_state("canonical_sha", payload["tip"])
@@ -6722,7 +7376,7 @@ class Controller:
             now = self.clock()
             settings = self.effective_settings()
             waiting = self._waiting()
-            open_batches = self._open_batches()
+            open_batches = self._open_batches(include_inert=True)
             open_batch = open_batches[0] if open_batches else None
             head = self._head()
             hold = self._state("inference_hold")
@@ -6750,6 +7404,21 @@ class Controller:
                 },
                 "settings": settings,
                 "publication_enabled": bool(settings["publication_enabled"]),
+                **(
+                    {
+                        "mixed_sources": {
+                            "mode": self.mixed.mode,
+                            "primary": self.mixed.primary,
+                            "generation": self.mixed.generation,
+                            "github": self.mixed.profile.github.record(),
+                            "forgejo": self.mixed.profile.forgejo.record(),
+                            "observation": self.store.get_setting("state:forgejo_observation"),
+                            "last_sync": self.store.get_setting("mixed:last_sync"),
+                        }
+                    }
+                    if self.mixed is not None
+                    else {}
+                ),
                 "inference_hold": hold,
                 "waiting": {
                     "count": len(waiting),
@@ -6822,9 +7491,17 @@ class Controller:
             "release_reason": record.get("release_reason"),
         }
 
+    def _public_pull_identity(self, number):
+        if isinstance(number, SourceNumber):
+            return {"source_identity": number.source.record(), "source_pr": number.source_pr}
+        if self.mixed is not None:
+            return {"source_identity": self.mixed.profile.github.record(), "source_pr": self._source_pr(number)}
+        return {}
+
     def _input_status(self, row: dict[str, Any]) -> dict[str, Any]:
         return {
-            "number": row["number"],
+            "number": int(row["number"]),
+            **self._public_pull_identity(row["number"]),
             "head_sha": row["head_sha"],
             "approved_at": row["approved_at"],
             "priority": row["priority"],
@@ -6951,6 +7628,7 @@ class Controller:
                 {
                     "number": m["number"],
                     "source_pr": m["source_pr"],
+                    **self._public_pull_identity(m["number"]),
                     "accepted_head": m["accepted_head"],
                     "commit": m["commit_sha"],
                     "provenance": m["provenance"],
@@ -6984,7 +7662,10 @@ class Controller:
     def _head_status(
         self, head: dict[str, Any], now: float, settings: dict[str, Any], alerts: list[str]
     ) -> dict[str, Any]:
+        candidate_ci = None if self._inert_ci_batch(head) else self._candidate_coordinator(batch_id=head["id"])
         info = self._batch_status(head, now)
+        if self._inert_ci_batch(head):
+            info["source_disabled"] = True
         info["sealed_at"] = head["sealed_at"]
         info["expected_parent"] = head["expected_parent"]
         info["first_dispatch_at"] = head["first_dispatch_at"]
@@ -7007,7 +7688,7 @@ class Controller:
         else:
             stage = attempt["outcome"]
         info["stage"] = stage
-        if self.candidate_ci is not None:
+        if candidate_ci is not None:
             failure = self.store.get_setting(f"source-ci:freeze-error:{head['id']}")
             if failure and failure["binding"] == [head["version"], head["tip"], head["base"]] and failure["count"] >= 3:
                 alerts.append(
@@ -7047,7 +7728,7 @@ class Controller:
                 "repair_outputs_revs": loads(attempt.get("repair_outputs_revs"), []),
             }
             info["ci"] = ci
-            if self.candidate_ci is not None:
+            if candidate_ci is not None:
                 if attempt["dispatch_state"] == "prepared" and attempt["dispatch_failures"] >= 3:
                     alerts.append(
                         f"head {head['id']}: source CI preparation failed or send was refused {attempt['dispatch_failures']} times; "
@@ -7058,14 +7739,19 @@ class Controller:
                     alerts.append(f"head {head['id']}: {attempt['outcome_detail']} (request {attempt['request_id']})")
             if attempt["dispatch_state"] == "rejected" and not attempt["dispatch_retryable"]:
                 alerts.append(
-                    f"head {head['id']} dispatch rejected; check CI permissions and configuration, then use retry_ci after repair if retries are exhausted"
+                    f"head {head['id']} dispatch rejected; automatic retries continue; see the dispatch-failed journal entry for the reason"
+                )
+            if attempt["outcome"] == OUTCOME_INFRASTRUCTURE and attempt["infrastructure_retry"] >= 3:
+                alerts.append(
+                    f"head {head['id']} CI repeatedly failed on infrastructure: {attempt['outcome_detail']}; "
+                    "automatic retries continue"
                 )
             if attempt["outcome"] == OUTCOME_PENDING and attempt["dispatch_state"] in {"sending", "uncertain"}:
                 alerts.append(
                     f"head {head['id']} dispatch outcome unknown (request {attempt['request_id']}); "
                     + (
                         "source CI requires verified ownership before retry_ci can proceed"
-                        if self.candidate_ci is not None
+                        if candidate_ci is not None
                         else "reconciling, use retry_ci only to authorize another send"
                     )
                 )
@@ -7085,9 +7771,17 @@ class Controller:
                         "phase": (ci["phases"][-1]["name"] if ci["phases"] else None),
                     }
                     if silence >= 2 * interval:
-                        alerts.append(
-                            f"head {head['id']} build stalled for {silence:.0f}s on {attempt['runner_name'] or 'unknown runner'} ({attempt['host'] or 'unknown host'})"
-                        )
+                        if attempt["run_status"] == "completed" and (
+                            ci["verdicts"].get(BUILD_CONTEXT, {}).get("state") == "success"
+                        ):
+                            alerts.append(
+                                f"head {head['id']} verified run {attempt['run_id']} still awaits required status delivery; "
+                                "automatic reporting retries continue"
+                            )
+                        else:
+                            alerts.append(
+                                f"head {head['id']} build stalled for {silence:.0f}s on {attempt['runner_name'] or 'unknown runner'} ({attempt['host'] or 'unknown host'})"
+                            )
         if task is not None and not info["task"]["active_claims"]:
             unclaimed_at = task["created_at"]
             for claim in self.store.rows("claims", {"task_id": task["id"]}):

@@ -115,7 +115,9 @@ def self_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
     HERE is the repo root (which contains tauceti_worker/), so putting it on PYTHONPATH lets the
     child `python -m tauceti_worker`; in a wheel the package is already importable and this is a
     harmless no-op."""
-    base = dict(os.environ if env is None else env)
+    from .build_resources import defaults
+
+    base = defaults(dict(os.environ if env is None else env))
     existing = base.get("PYTHONPATH")
     base["PYTHONPATH"] = os.pathsep.join([str(HERE)] + ([existing] if existing else []))
     ensure_ssl_cert_file(base)

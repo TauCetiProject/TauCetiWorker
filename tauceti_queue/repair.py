@@ -43,6 +43,7 @@ from pathlib import Path
 
 from tauceti_queue import chain as chain_tool
 from tauceti_queue import diagnostics, repair_sandbox, repair_tools
+from tauceti_queue.mixed_identity import public
 
 DEFAULT_REPOSITORY = "TauCetiProject/TauCeti"
 CACHE_DOMAIN = os.environ.get("TAUCETI_CACHE_DOMAIN", "cache.taucetiproject.org")
@@ -350,8 +351,10 @@ def read_chain(clone: Path, base: str, tip: str) -> list[ChainCommit]:
         message, trailers = split_trailers(body)
         pr = None
         if "Source-PR" in trailers:
-            match = re.search(r"#(\d+)\s*$", trailers["Source-PR"])
-            pr = int(match.group(1)) if match else None
+            try:
+                pr = pr_number(trailers["Source-PR"])
+            except (ValueError, IndexError):
+                pr = None
         if pr is None:
             match = SUBJECT_PR.search(subject)
             pr = int(match.group(1)) if match else None
@@ -465,7 +468,7 @@ def compare_chains(clone: Path, before: list[ChainCommit], after: list[ChainComm
 
 def owners_of(clone: Path, chain: list[ChainCommit], path: str) -> list[int]:
     """Constituent PRs whose commit touches ``path`` (file-level ownership, as Bors attributes it)."""
-    if not chain:
+    if not chain or not path:
         return []
     shas = set(git(clone, "rev-list", f"{chain[0].parent}..{chain[-1].sha}", "--", path).split())
     return [c.pr for c in chain if c.sha in shas and c.pr is not None]
@@ -473,7 +476,9 @@ def owners_of(clone: Path, chain: list[ChainCommit], path: str) -> list[int]:
 
 def pr_number(source_pr: str) -> int:
     """``owner/repo#N`` to ``N``."""
-    return int(source_pr.rsplit("#", 1)[1])
+    from .mixed_identity import from_source_pr
+
+    return from_source_pr(source_pr)
 
 
 def chain_report(
@@ -594,7 +599,7 @@ def link_shared_packages(worktree: Path, seed_packages: Path) -> None:
     target.symlink_to(seed_packages)
 
 
-def lake_env(root: Path, base_env: dict | None = None) -> dict:
+def lake_env(root: Path, base_env: dict | None = None, *, cache_root: Path | None = None) -> dict:
     """The workers' artifact-cache environment: the public service and a private artifact pool."""
     root.mkdir(parents=True, exist_ok=True)
     config = root / "lake.toml"
@@ -606,7 +611,7 @@ def lake_env(root: Path, base_env: dict | None = None) -> dict:
         )
     env = dict(os.environ if base_env is None else base_env)
     env["LAKE_CONFIG"] = str(config)
-    env["LAKE_CACHE_DIR"] = str(root / "lake-cache")
+    env["LAKE_CACHE_DIR"] = str((cache_root or root) / "lake-cache")
     env["LAKE_ARTIFACT_CACHE"] = "1"
     env["LAKE_RESTORE_ARTIFACTS"] = "1"
     env.pop("TAUCETI_PR_CACHE_MISS", None)
@@ -895,56 +900,79 @@ def prepare_artifacts(
     record: dict = {}
     seconds = 0.0
     reasons: list[str] = []
-    if mathlib_cache:
-        deps = run_logged([*lake, "exe", "cache", "get"], worktree, logdir / "cache-get-mathlib.log", env, 1800)
-        record["mathlib_cache"] = deps
-        seconds += deps["seconds"]
-        if deps["rc"] != 0:
-            reasons.append(f"lake exe cache get exited {deps['rc']}")
-    warm_attempts: list[dict] = []
-    for service, revision in dict.fromkeys((service, revision) for service, revision in warm if revision):
-        fetch = _fetch_mapping(
-            worktree, revision, env, logdir, repository=repository, lake=lake, mappings_only=False, service=service
-        )
-        fetch["distance"] = None
-        warm_attempts.append(fetch)
-        seconds += fetch["seconds"]
-    warmed = [fetch for fetch in warm_attempts if fetch["mapping_found"]]
-    record["warm_attempts"] = warm_attempts
-    record["warmed_from"] = [fetch["revision"] for fetch in warmed]
-    tried = {(fetch["service"], fetch["revision"]) for fetch in warm_attempts}
-    attempts: list[dict] = []
-    candidates = [
-        (service, revision, None) for service, revision in preferred if revision and (service, revision) not in tried
-    ] + [
-        (CACHE_SERVICE, revision, distance)
-        for revision, distance in _artifact_candidates(worktree, base, fallbacks, ancestors)
-    ]
-    for service, revision, distance in candidates:
-        fetch = _fetch_mapping(
-            worktree, revision, env, logdir, repository=repository, lake=lake, mappings_only=False, service=service
-        )
-        fetch["distance"] = distance
-        attempts.append(fetch)
-        seconds += fetch["seconds"]
-        if fetch["mapping_found"]:
-            break
-    found = attempts[-1] if attempts[-1]["mapping_found"] else None
-    record["base_cache"] = attempts[-1]
-    if found is None and warmed:
-        found = warmed[0]
-    record["cache_attempts"] = attempts
-    record["cache_revision"] = found["revision"] if found else None
-    record["cache_distance"] = found["distance"] if found else None
-    record["cache_service"] = found["service"] if found else None
-    record["cache_skipped"] = _skipped_summary(attempts, base)
-    if found is None:
-        reasons.append("; ".join(record["cache_skipped"]))
-    if candidate:
-        own = _fetch_mapping(worktree, candidate, env, logdir, repository=repository, lake=lake, mappings_only=True)
-        own["published"] = own["mapping_found"]
-        record["candidate_outputs_published"] = own
-        seconds += own["seconds"]
+    from tauceti_queue.repair_cache import downloads
+
+    with downloads(env) as fetch_env:
+        if mathlib_cache:
+            deps = run_logged(
+                [*lake, "exe", "cache", "get"], worktree, logdir / "cache-get-mathlib.log", fetch_env, 1800
+            )
+            record["mathlib_cache"] = deps
+            seconds += deps["seconds"]
+            if deps["rc"] != 0:
+                reasons.append(f"lake exe cache get exited {deps['rc']}")
+        warm_attempts: list[dict] = []
+        for service, revision in dict.fromkeys((service, revision) for service, revision in warm if revision):
+            fetch = _fetch_mapping(
+                worktree,
+                revision,
+                fetch_env,
+                logdir,
+                repository=repository,
+                lake=lake,
+                mappings_only=False,
+                service=service,
+            )
+            fetch["distance"] = None
+            warm_attempts.append(fetch)
+            seconds += fetch["seconds"]
+        warmed = [fetch for fetch in warm_attempts if fetch["mapping_found"]]
+        record["warm_attempts"] = warm_attempts
+        record["warmed_from"] = [fetch["revision"] for fetch in warmed]
+        tried = {(fetch["service"], fetch["revision"]) for fetch in warm_attempts}
+        attempts: list[dict] = []
+        candidates = [
+            (service, revision, None)
+            for service, revision in preferred
+            if revision and (service, revision) not in tried
+        ] + [
+            (CACHE_SERVICE, revision, distance)
+            for revision, distance in _artifact_candidates(worktree, base, fallbacks, ancestors)
+        ]
+        for service, revision, distance in candidates:
+            fetch = _fetch_mapping(
+                worktree,
+                revision,
+                fetch_env,
+                logdir,
+                repository=repository,
+                lake=lake,
+                mappings_only=False,
+                service=service,
+            )
+            fetch["distance"] = distance
+            attempts.append(fetch)
+            seconds += fetch["seconds"]
+            if fetch["mapping_found"]:
+                break
+        found = attempts[-1] if attempts[-1]["mapping_found"] else None
+        record["base_cache"] = attempts[-1]
+        if found is None and warmed:
+            found = warmed[0]
+        record["cache_attempts"] = attempts
+        record["cache_revision"] = found["revision"] if found else None
+        record["cache_distance"] = found["distance"] if found else None
+        record["cache_service"] = found["service"] if found else None
+        record["cache_skipped"] = _skipped_summary(attempts, base)
+        if found is None:
+            reasons.append("; ".join(record["cache_skipped"]))
+        if candidate:
+            own = _fetch_mapping(
+                worktree, candidate, fetch_env, logdir, repository=repository, lake=lake, mappings_only=True
+            )
+            own["published"] = own["mapping_found"]
+            record["candidate_outputs_published"] = own
+            seconds += own["seconds"]
     if build and not reasons:
         built = run_logged(
             repair_sandbox.sandboxed_lake([*lake, "build", "--iofail"], worktree, env),
@@ -1010,6 +1038,8 @@ class PromptContext:
     instruction: str = AGENT_INSTRUCTION  # the plan's instruction; the service sends it with the task
     artifacts_cold: bool = False  # no warm artifacts: the agent's first build starts from nothing
     artifacts_reason: str | None = None  # ``prepare_artifacts``'s ``unavailable_reason`` when cold
+    worker_verifies: bool = False  # worker owns the final full suite; agent checks are scoped
+    staging_checks: bool = False  # staging owns full audits and lint
     check_findings_known: bool = False  # cached artifacts fetched; CI already supplied the failures
     listings_path: Path | None = None  # where the member listings and the check script are written
     shell_limit: int = SHELL_LIMIT_SECONDS  # what the prompt says about the foreground shell limit
@@ -1143,6 +1173,10 @@ def member_records(
             record["state"] = (
                 MEMBER_STATES[0] if index < stop else MEMBER_STATES[1] if index == stop else MEMBER_STATES[2]
             )
+        from .mixed_identity import SourceNumber
+
+        if isinstance(commit.pr, SourceNumber):
+            record["source_pr"] = commit.pr.source_pr
         records.append(record)
     return records
 
@@ -1207,7 +1241,7 @@ for member, sha in zip(members, shas):
     if len(parents.split()) != 1:
         fail(f"{{where}}: a merge commit; the chain must be linear")
     found = trailers(message)
-    expected_pr = f"{{REPOSITORY}}#{{member['pr']}}"
+    expected_pr = member.get("source_pr") or f"{{REPOSITORY}}#{{member['pr']}}"
     if found.get("Source-PR") != [expected_pr]:
         fail(f"{{where}}: expected one `Source-PR: {{expected_pr}}` trailer (recorded order), found {{found.get('Source-PR')}}")
     if found.get("Accepted-Head") != [member["accepted_head"]]:
@@ -1245,7 +1279,8 @@ if ! in_progress; then
 fi
 while in_progress; do
   sha=$(git rev-parse --verify -q REBASE_HEAD) || break
-  pr=$(git show -s --format=%B "$sha" | sed -n 's/^Source-PR: .*#\\([0-9][0-9]*\\).*$/\\1/p' | head -1)
+  source_pr=$(git show -s --format=%B "$sha" | sed -n 's/^Source-PR: //p' | head -1)
+  case "$source_pr" in forgejo:*@*#*) pr="$source_pr" ;; *) pr="${{source_pr##*#}}" ;; esac
   conflicted=$(git diff --name-only --diff-filter=U)
   if [ -n "$conflicted" ] && ! grep -qx -- "${{pr:-none}}" <<<"$landed"; then
     printf 'stopped at PR #%s, commit %s: resolve the conflict in\n%s\n' "$pr" "${{sha:0:12}}" "$conflicted"; exit 1
@@ -1274,12 +1309,12 @@ def write_listings(
     directory = context.listings_path.parent
     directory.mkdir(parents=True, exist_ok=True)
     context.listings_path.write_text(
-        "".join(json.dumps(record, sort_keys=False) + "\n" for record in member_records(context, chain, landed))
+        "".join(json.dumps(public(record), sort_keys=False) + "\n" for record in member_records(context, chain, landed))
     )
     check = directory / CHECK_FILE
     check.write_text(check_script(context.base, context.repository))
     check.chmod(0o755)
-    repair_tools.write_build_script(directory)
+    repair_tools.write_build_script(directory, worker_verifies=context.worker_verifies)
     if context.kind in REBASE_KINDS and (context.conflict or {}).get("previous_base"):
         step = directory / STEP_FILE
         step.write_text(step_script(context.base, str(context.conflict["previous_base"]), context.rebase_options))
@@ -1387,6 +1422,12 @@ def _verification_section(
 ) -> list[str]:
     conflict = context.conflict if context.kind in REBASE_KINDS else None
     lines = ["", "## Verifying locally", ""]
+    if not context.worker_verifies:
+        lines += [
+            "Fold fixups and finalize all commit-message explanations before the final whole-library build. "
+            "That lets the worker start publishing outputs for the final revision while audits and lint run.",
+            "",
+        ]
     if check_command:
         lines += [
             f"`{check_command}` verifies the chain: linear on `{base_short}`, exactly one commit per `Source-PR` trailer "
@@ -1395,6 +1436,38 @@ def _verification_section(
             "finish.",
             "",
         ]
+    if context.worker_verifies:
+        lines += [
+            "The worker owns final verification. Repair the reported findings first; do not run a whole-library "
+            "build, the full audit suite or the full environment lint in the agent turn. "
+            "Cached outputs may still need unpacking, and Lake checks their input traces.",
+            "",
+            f"Run `{LISTINGS_DIR}/check-findings`: it builds the finding modules and your edited modules, "
+            "then runs the reported linters or the ownership-only check. These are advisory checks, "
+            "not a claim that the entire batch passes. During a rebase, check edited modules directly; "
+            "finish all conflicts before checking their combined downstream closure. The worker performs "
+            "that closure check in its final whole-library verification.",
+            "",
+            "After the focused checks and the chain check, return your summary. "
+            + (
+                "The worker compiles the final chain and submits it; staging runs full audits and environment lint. "
+                if context.staging_checks
+                else "The worker runs the whole-library build, full audits and environment lint before submission "
+                "and sends remaining failures back as diagnostics. "
+            )
+            + "If a targeted checker is unavailable, report that and return after scoped compilation; "
+            "do not replace it with the full suite.",
+            "",
+            CACHE_SENTENCE,
+            f"Run scoped checks in the foreground: shell commands have a {_hours_text(context.shell_limit)} limit. "
+            "Do not use `--fail-fast`.",
+            "",
+            HARD_RULES,
+            "",
+            "Finish the focused work synchronously. Summarize the fixes in their owning PR commits and "
+            "the exit status of each focused check; full verification is the worker's next step.",
+        ]
+        return lines
     scoped = (
         [
             "",
@@ -1600,7 +1673,10 @@ def _landed_section(
 def _no_repair_section(context: PromptContext, chain: list[ChainCommit]) -> list[str]:
     """The "Do not edit" section: members whose authors opted out of repair (``no_repair``), and those
     the queue already withdrew that way (``withdrawn``), which stay empty commits."""
+    from .mixed_identity import SourceNumber
+
     by_number = _members_by_number(context)
+    mixed = any(isinstance(number, SourceNumber) for number in by_number)
     titles = {c.pr: c.subject for c in chain if c.pr is not None}
     guarded = [n for n, m in by_number.items() if m.get("no_repair") and n in titles]
     if not guarded:
@@ -1613,14 +1689,19 @@ def _no_repair_section(context: PromptContext, chain: list[ChainCommit]) -> list
     ]
     for number in guarded:
         state = " (withdrawn: keep it an empty commit)" if by_number[number].get("withdrawn") else ""
-        lines.append(f"- #{number} {by_number[number].get('title') or titles[number]}{state}")
+        reference = by_number[number].get("source_pr") if mixed else f"#{number}"
+        lines.append(f"- {reference} {by_number[number].get('title') or titles[number]}{state}")
     lines += [
         "",
         "If making the batch build needs a change to one of them, do not make it: reduce that member to an empty "
         "commit instead (its content removed, its message kept) and append to its message, as its explanation, which "
         "other PR, file and finding made the change necessary, one per line:",
         "",
-        "    Interacting-PR: #<the other PR>",
+        (
+            "    Interacting-PR: <the other member's exact Source-PR value>"
+            if mixed
+            else "    Interacting-PR: #<the other PR>"
+        ),
         "    Interacting-File: <path of the file>",
         "    Finding: <conflict, duplicate declaration, rename ripple or build error>: <one sentence>",
         "",
@@ -1805,10 +1886,14 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
         lines.append("Compiler errors:")
         lines.append("")
         for error in findings["compiler_errors"]:
-            owners = owners_of(clone, chain, error["path"])
-            lines.append(
-                f"- `{error['path']}:{error.get('line', 0)}:{error.get('column', 0)}` ({_owner_text(owners, chain)})"
-            )
+            path = error.get("path") or ""
+            if path:
+                owners = owners_of(clone, chain, path)
+                lines.append(
+                    f"- `{path}:{error.get('line', 0)}:{error.get('column', 0)}` ({_owner_text(owners, chain)})"
+                )
+            else:
+                lines.append("- Build/verification diagnostic (no file path):")
             for text in str(error.get("message", "")).splitlines():
                 lines.append(f"      {text}")
         lines.append("")
@@ -2267,5 +2352,5 @@ def agent_usage(stream: Path, config_dir: Path | None = None) -> dict:
 def write_record(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(record, indent=1, default=str))
+    tmp.write_text(json.dumps(public(record), indent=1, default=str))
     os.replace(tmp, path)

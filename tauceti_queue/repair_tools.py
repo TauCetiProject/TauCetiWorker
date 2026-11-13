@@ -106,7 +106,8 @@ BUILD_HEADER = '''#!/usr/bin/env python3
 
 Usage: .tauceti-repair/build [--dependents] [--no-audit] [TauCeti.Foo.Bar | TauCeti/Foo/Bar.lean ...]; no
 arguments builds the whole library and, when it is green, runs CI's audits and the changed-module
-environment lint (tauceti_queue.repair_audit; --no-audit skips them), appending any finding to
+environment lint (tauceti_queue.repair_audit; --no-audit skips them), unless the worker owns full
+verification: that mode requires named modules and uses check-findings for diagnostics. Findings go to
 .tauceti-repair/errors.jsonl. --dependents adds the modules importing the named ones (from the library's
 import lines, cached in .tauceti-repair/imports.json: delete it after changing imports). Builds wait for
 and hold the lock directory .tauceti-repair/build.lock (mkdir, pid inside); exits with Lake's status, or 1
@@ -124,13 +125,18 @@ BUILD_MAIN = """
 options = ("--dependents", "--no-audit")
 modules = [a[:-5].replace("/", ".") if a.endswith(".lean") else a for a in sys.argv[1:] if a not in options]
 scoped = bool(modules)
+if WORKER_VERIFIES and not scoped:
+    print("full verification is owned by the worker; use check-findings or build <Module.Name>, then return", flush=True)
+    sys.exit(2)
 if "--dependents" in sys.argv:
     table = imports(ROOT)
     for m in modules:  # grows while iterating: the closure over the reverse import graph
         modules += [d for d, deps in table.items() if m in deps and d not in modules]
 take_lock(lock := LOCK)
 try:
-    rc = subprocess.run(sandboxed_lake(["lake", "build", "--iofail", *modules], ROOT), cwd=ROOT).returncode
+    from tauceti_queue.repair_publish import build_flags
+    flags = ["--iofail"] if scoped else build_flags(ROOT)
+    rc = subprocess.run(sandboxed_lake(["lake", "build", *flags, *modules], ROOT), cwd=ROOT).returncode
     if rc == 0 and scoped:
         print("audits: CI's audits and lint run after a whole-library build (no module arguments)", flush=True)
     elif rc == 0 and "--no-audit" not in sys.argv:
@@ -143,7 +149,7 @@ finally:
 """
 
 
-def build_script(lock: Path | None = None) -> str:
+def build_script(lock: Path | None = None, *, worker_verifies: bool = False) -> str:
     """The agent's build script: the lock helpers and ``imports`` verbatim, the lock (the worktree's own
     ``.tauceti-repair/build.lock``, or ``lock`` when several worktrees of one repair share one) and the
     main, which runs Lake through ``repair_sandbox.sandboxed_lake`` imported from this checkout of the
@@ -159,16 +165,17 @@ def build_script(lock: Path | None = None) -> str:
         + "\n\n".join(inspect.getsource(f) for f in (reclaim_dead_lock, take_lock, imports))
         + "\n"
         + where
+        + f"WORKER_VERIFIES = {worker_verifies!r}\n"
         + BUILD_MAIN
     )
 
 
-def write_build_script(directory: Path, lock: Path | None = None) -> Path:
+def write_build_script(directory: Path, lock: Path | None = None, *, worker_verifies: bool = False) -> Path:
     """Write ``directory/build``, executable, dropping any stale import cache beside it; ``lock`` names
     a lock directory shared with other worktrees (``repair_parallel``) instead of the worktree's own."""
     directory.mkdir(parents=True, exist_ok=True)
     script = directory / BUILD_FILE
-    script.write_text(build_script(lock))
+    script.write_text(build_script(lock, worker_verifies=worker_verifies))
     script.chmod(0o755)
     (directory / "imports.json").unlink(missing_ok=True)
     return script

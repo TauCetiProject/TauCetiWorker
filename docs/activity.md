@@ -41,7 +41,7 @@ approved PR head and constructed batch commit. Titles, reviews, CI success and
 staging pushes are not landing evidence. Ordinary closed PRs do not produce a
 missing-landing warning.
 
-## Costs and initiated PR output
+## Costs and landed PR output
 
 Average API spending has **1h**, **3h**, **24h**, **7d** and **All time** columns in
 $/hour. It uses accrued conversation costs, including running and interrupted work
@@ -78,12 +78,17 @@ but are omitted from the display to avoid suggesting they should be added again.
 Healthy accounting adds no diagnostic lines. Unresolved stopped conversations
 and stale live estimates still produce warnings.
 
-The 24-hour and seven-day denominators contain only PRs initiated within their respective windows;
-all-time contains all retained initiated PRs. Each verified landed PR contributes
-its Lean lines added, each currently open PR contributes half its Lean lines
-added, and a closed unmerged PR contributes nothing. Reviews and other assists
-never add another author's LOC to this denominator. Fleet totals pool costs and
-weighted LOC before dividing; they do not average machine ratios.
+The 24-hour and seven-day denominators contain every fleet-created PR that
+**landed in that window**, regardless of when it was opened. All time includes
+all retained fleet-created PRs with verified landing evidence. Older creation
+receipts remain eligible, including PRs opened before local activity recording
+began; an upgrade replays retained PR journals to restore identities previously
+removed by the history cutoff. PRs opened outside the fleet are excluded.
+Open, closed unmerged, and unknown-state PRs without landing evidence contribute
+nothing. Reviews and other assists never add another author's LOC to this
+denominator. Fleet totals pool costs and landed LOC before dividing; they do not
+average machine ratios. The display shows landed Lean lines added, estimated
+API dollars per landed line, and measured-PR coverage when incomplete.
 
 PR state, landing evidence and exact head/base identities come from the shared
 GitHub state server. LOC uses its cached measurement when available. Otherwise,
@@ -97,15 +102,110 @@ leaves the count unknown and normal refresh retries. No Git work runs in `status
 File-derived measurements require complete cached file lists and immutable URL
 and total validation; Git-derived measurements bind the exact head/base pair.
 The observation route never schedules collection or falls back to GitHub.
-Missing or stale LOC is extrapolated from measured PRs in the same window: measured weighted LOC
-per measured PR weight, multiplied by total eligible PR weight (landed = 1,
-open = ½). Unknown PR states contribute zero. These estimates carry `~` and show
-measured-PR coverage. With no measured LOC, missing LOC contributes zero; positive
-spending divided by zero LOC displays `$∞` (zero spending displays `$0.0000`).
-Missing financial data remains explicitly unavailable. Fleet totals pool the
-measurement counts and costs before estimating and dividing.
+Missing or stale LOC is extrapolated from measured landed PRs in the same window:
+measured LOC per measured PR, multiplied by the number of landed PRs. These
+estimates carry `~` and show measured-PR coverage. With no measured LOC, missing
+LOC contributes zero; positive spending divided by zero LOC displays `$∞` (zero
+spending displays `$0.0000`). Missing financial data remains explicitly unavailable.
+Fleet totals pool measurement counts and costs before estimating and dividing.
+Older prepared creation-cohort summaries cannot supply landing-window totals;
+they show unavailable LOC until refreshed, including fleets with mixed collector
+versions. Status never relabels the old figures or fetches replacement data.
 Cost preparation runs in the existing background collector;
 `activity` and `workers status` still only read small JSON summaries.
+
+### Credit for reviewing and fixing other contributors' PRs
+
+The raw authored-LOC figures remain visible. `Attributed landed Lean LOC` also credits
+review and fix work on other contributors' landed PRs, and reduces our credit when other
+contributors review ours. There is no fixed author/reviewer split. For each landed PR:
+
+```text
+outside review cost = outside review passes × our measured cost per review pass
+outside production cost = 0 for our PRs
+                        = max(0, measured production $/LOC × LOC − our fixes) otherwise
+credited LOC = LOC × our PR cost / (our PR cost + outside costs)
+```
+
+Our PR cost includes authoring, reviews and fixes (`fix`, `fix-ci`, `rebase`,
+`lint-repair`, `overlap-fix`, and recovery continuations), accumulated through
+landing. Only completed rounds enter contribution shares or calibration; failed
+attempts remain fully charged in the spending numerator. Local paid review
+passes count once even when they launch several model conversations.
+
+The existing shared-state activity response supplies estimated total review
+passes from cumulative `round` counters on cached scoreboard comments. It
+requires complete cached comment history, current compact fragments, and a
+scoreboard at the observed PR head. Counter granularity can include reply,
+carry and publication-control passes; this is a participation proxy, not an
+exact count of model calls. Every observed pass receives equal weight, with no
+review-quality or dimension judgments. The collector reads the new scalar in
+its existing PR observation batch. Already-landed PRs receive a bounded initial
+observation backfill; incomplete cached histories remain unknown and retry at
+most hourly for a week after landing, with one initial read for older landed PRs.
+Existing verified LOC at the same head is retained without re-measurement. No GitHub collection is scheduled by these reads.
+
+Existing full local archive clones and worker outboxes remain a fallback when
+cached counters are unavailable. This fallback deduplicates execution IDs,
+excludes model-free/shadow records, and requires a consistent normal archive
+fetch covering landing plus one minute. It never creates or refreshes a clone.
+
+We use the PR's own measured local cost per review pass where possible. When we did none
+of its reviews, the fallback is our measured average per paid review pass over the last
+seven days, falling back to retained history. The production rate likewise uses local
+authoring plus fixes on measured, locally authored landed PRs from the last seven days,
+with a retained-history fallback. Other contributors' review costs and production costs
+are estimates based on these local measurements, not their actual bills. Complete cached counters for the observed PR head are estimates of total participation.
+Their verification can predate landing: reviews normally finish before staging lands a
+PR, and reporting does not request a new collection of closed PR comments. Late reviews
+missing from that snapshot can make our share look too high. The oldest counter/archive
+observation time is available as `review_counts_observed_at` in per-host cost-window JSON.
+The collector reads the cache once after landing before parking the PR. Archive fallback observations may lag until an existing review sync runs; hosts that do not
+push archives may never refresh that fallback. Neither source schedules collection.
+Missing or stale evidence remains explicitly incomplete. Settled measurements are
+parked; new local reviews reopen their PR's measurement.
+
+`Estimated $ / attributed LOC` divides **all** accrued spending by summed credited LOC.
+Unsuccessful work, open/unmerged PRs, unlinked costs, and spending on `bump`,
+`progress`, and other maintenance remain fully charged in this numerator. They are
+amortized across all credited output; we do not estimate whether other contributors paid
+their share of this overhead. Costs used to estimate a landed PR's share include earlier
+windows, but exclude work after landing. The spending numerator retains the displayed
+time window, so daily rates still fluctuate with landing delays.
+
+`Landed PRs with attribution data` reports coverage. Missing exact LOC, review records,
+cost links or calibration samples supply no attributed output. With no covered PRs the
+attributed rate is unavailable; partial output is shown with its coverage rather than
+silently assuming there was no outside work. The compact report shows estimates with
+`~` and the coverage counts, without repeated attribution caveats or `partial` prefixes.
+An all-missing rate is unavailable. During historical backfill, adjusted
+LOC and cost rates are unavailable: full spending divided by partly reconstructed
+credit is not a fleet estimate. The underlying provisional sums remain in JSON for
+diagnostics, with `attribution_backfilling=true`. This is separate from an ordinary
+pending live refresh, which retains the last prepared estimate. Finishing backfill
+forces a final report refresh before the backfilling flag clears. Unpriced completed local review passes
+also make coverage incomplete. Older hosts cannot supply attribution until their
+collectors are updated. Fleet reporting pools dollars and locally estimated credit
+before dividing. Worker and group summaries share host-wide measured rates and per-PR
+denominators, so their credited output adds to the host total. Cross-host production
+assists may overlap; this report does not reconcile global contribution ownership.
+
+Existing admission receipts now retain the round and selected PR identities. The
+collector preserves round links from existing PR receipts and can recover historical
+links from an unambiguous PR receipt inside a worker's recorded round interval.
+Ambiguous links remain unknown; no transcript parsing is used. Archive reads stay in the
+existing collector, with at most 32 tracked PRs, 256 small round records and a
+one-second archive work budget per pass. Session links and PR facts use a separate
+one-second budget with at most 1,024 changed/backfill sessions and 128 keys per fact
+stage. Backfill progress is explicit. Live session, receipt and PR updates run before
+historical backfill. Quiet passes read cached reports and do not scan billing history.
+Current measured rates are recomputed from compact prepared PR facts when evidence or
+time-window boundaries change, at most every five minutes for large histories; rates are not frozen per PR. Unchanged
+archive directories require no enumeration or record reads. The default source is the
+review runner's existing cache; previously recorded worker cache paths are also reused.
+`TAUCETI_ACTIVITY_REVIEW_ARCHIVES` can select already-existing archive checkouts
+(separated by the platform path separator). No new process, clone, archive sync, GitHub
+request or shared-server request is introduced.
 
 Local [work recovery](work-recovery.md) counts come from each worker's
 `state/<worker>/recovery` directory: saved, checkouts moved aside, incomplete and
@@ -224,10 +324,10 @@ long session from appearing entirely in the window in which it happens to finish
 Unknown usage remains incomplete and reserved; it is not invented as spending.
 
 The cost/LOC numerator is the same accrued spending, including reviews and other
-fleet conversations. The denominator still uses only initiated PRs: landed LOC
-plus half of open LOC. Seven-day output includes only PRs opened in those seven
-days. Missing LOC uses the existing extrapolation/zero fallback and never hides
-the rate. Costs remain seven days and all time; hourly rates retain four windows.
+fleet conversations. Its denominator is Lean LOC from every fleet-created PR
+that landed in the window, regardless of opening date. Missing landed LOC uses
+the extrapolation/zero fallback described above. Costs have 24h, seven-day and
+all-time windows; hourly rates retain all five activity windows.
 
 Preparation is local and runs in the existing background collector. Reading
 `status` performs no transcript scans, SQL queries or additional GitHub requests.
@@ -248,3 +348,11 @@ The same totals cover worker time, rounds, PR/LOC output, contributions and CI.
 A new schema or discarded/replaced cache may require one migration scan.
 `--inventory` explicitly reads the prepared PR table; the collector does not
 serialize the entire inventory every minute.
+
+Confirmed deferred publications retain their original worker, host and round ID.
+A successful PR creation reconciles an unconfirmed authoring round; a branch push
+or closure reconciles an unconfirmed repair round. This changes only the outcome,
+keeping the original finish timestamp and counts. Receipt order and duplicate
+replays do not change the result. Execution failures and rounds without a recorded
+finish remain separate; replies alone do not prove a repair that required a push.
+Legacy intents without a saved round ID never borrow the round draining them.

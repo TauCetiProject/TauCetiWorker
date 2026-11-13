@@ -237,6 +237,7 @@ def test_semantic_evidence_reaches_claimed_repair(provisional=False):
     raw = pr(20)
     raw["statusCheckRollup"] = [{"context": "build", "state": "SUCCESS"}]
     w = SimpleNamespace(
+        cfg=SimpleNamespace(state=Path(tempfile.gettempdir()) / "rebase-handoff-test"),
         gh=gh,
         claims=SimpleNamespace(begin_branch_work=lambda *args: True),
         rs=SimpleNamespace(bust=lambda *args: None),

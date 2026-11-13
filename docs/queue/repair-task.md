@@ -292,19 +292,23 @@ has a time budget holds because the service re-exposes the task.
    commit it, and `checkout_worktree` leaves it alone; a prompt composed without a worktree (the
    experiment's preview) carries the listings inline. The verification advice follows
    the artifacts outcome: a warm rebase fetches cached outputs without compiling the old chain and
-   asks the agent to finish the replay before building the resulting chain. Other warm tasks describe
-   the incremental whole-library build; when a
+   asks the agent to finish the replay before building the resulting chain. Warm repair/prepare tasks
+   with worker verification enabled instead use `.tauceti-repair/check-findings`: scoped compilation
+   of the reported modules and actual repair delta, then the named linters or ownership-only check.
+   They return for the worker's full verification; their build helper requires module arguments.
+   Other configurations retain the incremental whole-library advice. When a
    rebase conflict runs without them (`cold`) it says so, gives the reason, warns that
    `lake build --iofail` starts from nothing and may take hours, and asks for the touched modules
    (`lake build <Module>`) to be built first. Either way the prompt tells the agent to check a fix
-   with the scoped build first and to run the whole-library `lake build --iofail` only as the final
-   verdict: `.tauceti-repair/build` (written by `repair_tools.write_build_script` beside the check
+   with the scoped build first; when the worker owns full verification it is the worker's next
+   step after the agent returns. Otherwise the agent runs `lake build --iofail` as its final verdict.
+   `.tauceti-repair/build` (written by `repair_tools.write_build_script` beside the check
    script, a Python script of under eighty-five lines) takes module names (`TauCeti.Foo.Bar`) or paths
    (`TauCeti/Foo/Bar.lean`), with `--dependents` every module importing them transitively (from the
    library's `import` lines, read in one pass and cached in `.tauceti-repair/imports.json`, which the
    worker drops whenever it rewrites the script), and runs `lake build --iofail` on them in the
    foreground, exiting with Lake's status; with no arguments it builds the whole library and, when that
-   is green, runs CI's audits and the changed-module lint (below; `--no-audit` skips them, a scoped build
+   is green, runs CI's audits and full-library lint (below; `--no-audit` skips them, a scoped build
    prints that they run on the whole-library build). Every build
    in the worktree holds the lock directory `.tauceti-repair/build.lock`, taken atomically by `mkdir`
    with the holder's pid in `pid` inside: a waiter polls every 2 s, prints a line every 30 s, and
@@ -356,11 +360,11 @@ has a time budget holds because the service re-exposes the task.
    default on, and `--no-worker-audits`). Head 2's first CI round after a green worker build failed in the
    audit phase on a duplicate declaration the agent's text scan had listed and set aside, so the checks are
    the worker's, not the agent's. After every green whole-library `lake build --iofail` it runs (the
-   streaming build, the parallel path's verification build, the verification below and the agent's
-   `.tauceti-repair/build` without module arguments) it runs what CI's `sandbox-build.sh` runs after its
+   streaming build, the parallel path's verification build, the verification below and, in configurations
+   where the worker does not own final verification, the agent's full-library helper) it runs what CI's `sandbox-build.sh` runs after its
    build: the `audit-driver` under `lake env timeout 3000s` (import of every TauCeti module, duplicate
-   declarations, axioms) and `lint-env.sh` with the `lint-env-driver` on the TauCeti modules changed between
-   the task's base and HEAD (`lint-scope.sh`'s module list for a batch). The sources are the TauCetiTools pin
+   declarations, axioms) and `lint-env.sh` with the `lint-env-driver` over the full library. Without a frozen
+   GitHub scope-policy snapshot the worker uses staging's conservative full-lint fallback. The sources are the TauCetiTools pin
    the worktree's `tauceti.toml` names (`[tools.tools] repo`, `ref`): fetched once into
    `<root>/tauceti-tools/<ref>`, materialized with `python -m tauceti_tools materialize` and the worktree's
    `scripts/` as policy directory into `.lake/tauceti-repair-audit/scripts`, with both drivers compiled by the
@@ -376,8 +380,9 @@ has a time budget holds because the service re-exposes the task.
    (`repair_audit.verify`, under the build lock: the whole-library build, then the checks); a failure is not
    submitted: the agent is run again with the findings as the task's diagnostics and the report as feedback,
    up to `verify_retries` (2) times, then the task is released as `agent_failed`. Each verification is in the
-   outcome's `verification` list. The prompt says only that the helper and the worker's verification run CI's
-   audits and lints and that the task cannot be submitted until they pass. CI's module-system check and
+   outcome's `verification` list. For warm repair/prepare/rebase tasks the prompt gives the agent focused
+   feedback checks and assigns the complete verification to the worker, avoiding a duplicate agent
+   pass. The task cannot be submitted while the worker's checks report failures. CI's module-system check and
    source style lint are not run on the worker. In CI runs of 2026-11-05 on the full library (24,455 TauCeti
    modules) the audit's import took 5 s warm and 27 s cold, the duplicate check 3 s and the axiom scan of a
    PR's few modules 4 s; the lint of five changed modules took 45 s and the two driver builds about 4 s.
@@ -418,8 +423,9 @@ build script of `tauceti_queue/repair_tools.py`, whose lock the streaming build 
 `take_lock` so the two never overlap) waits for the lock and builds only the named modules.
 When the build ends the worker appends a `build finished, exit N, M errors total` line to the error
 list, removes the lock and copies the log to `tasks/<id>/logs/stream-build.log`; the outcome records
-the build under `stream_build`. The agent's final whole-library `lake build --iofail` after its fixes
-is still the only verdict. A build still running when the task ends or is interrupted is stopped and
+the build under `stream_build`. When worker verification is enabled, the agent returns after focused
+checks and the worker runs the final full verification. Other configurations retain the agent's
+whole-library `lake build --iofail` verdict. A build still running when the task ends or is interrupted is stopped and
 its lock removed. Rebase-conflict and pre-rebase tasks fetch caches and go directly to the agent,
 which finishes the replay before building the resulting chain. Resumed tasks continue their agent
 session. For repairs without known audit/lint findings, `--no-stream-repair` keeps the sequential
@@ -468,20 +474,19 @@ with it and CI's fetch for the exact staging head finds these outputs.
 
 ## Repair cache publication
 
-After a chain is submitted, `repair_publish.publish_outputs` publishes the worktree's build outputs under the tip's revision to a cache namespace only the workers
-read, so the next repair round on the same head and the next head's agent start warm instead of
-rebuilding what this repair built. `lake build --no-build --rehash -o <map>` writes the output map and
-exits nonzero unless every module is built and current at the tip, so only a green final build is
-published; `lake cache put <map> --service tauceti-repair-upload --repo <repository>` then uploads the
-map and its artifacts with a bounded timeout (`TAUCETI_REPAIR_CACHE_PUBLISH_TIMEOUT`, default 1800 s),
-and the outcome's `publish` record holds the artifact count, bytes and seconds. A failure or a skip
+The final build writes `.lake/outputs.jsonl` with `--rehash -o` when publication is configured.
+`lake cache stage` copies that native map and its complete artifacts; stock `lake cache put-staged`
+uploads them with an explicit repository, revision and toolchain from an isolated staging directory,
+without loading candidate workspace configuration. There is no second build scan or reconnect pass.
+The upload has a bounded timeout (`TAUCETI_REPAIR_CACHE_PUBLISH_TIMEOUT`, default 1800 s),
+and the outcome's `publish` record holds artifact count, bytes and seconds. A failure or a skip
 is logged and recorded and never fails the task. The namespace is two services the worker writes
 into the pool's `lake.toml`: `tauceti-repair` reads from `TAUCETI_REPAIR_CACHE_URL` (public, since Lake
 fetches without credentials) and `tauceti-repair-upload` writes to `TAUCETI_REPAIR_CACHE_UPLOAD_URL`
 (the S3 endpoint of the same bucket; default the read URL), each holding `artifacts/` and `revisions/`
 laid out like the public cache. The write key, the `access-key-id:secret` pair Lake takes as
 `LAKE_CACHE_KEY`, is read from the file named by `TAUCETI_REPAIR_CACHE_KEY_FILE` and given only to the
-`lake cache put` process; `LAKE_CACHE_KEY` is removed from the environment the agent inherits. Use a
+`lake cache put-staged` process; `LAKE_CACHE_KEY` is removed from the environment the agent inherits. Use a
 bucket of its own with an R2 token scoped to it, so the worker's key cannot write the public cache
 CI publishes to (`LAKE_CACHE_KEY` in TauCeti's `publish-lake-cache.yml`). `TAUCETI_QUEUE_PUBLISH_CACHE`
 (`1`/`0`) switches publication on or off; unset, it is on when the key file and an upload URL are
@@ -493,7 +498,15 @@ Publication never delays the submission. On 2026-11-05 head 2's repair validated
 the publish step (the `--no-build --rehash` pass over about 26,000 modules, then the upload) ran for
 more than 12 minutes before the chain was submitted, and CI, dispatched only after submission, waited
 with the whole queue. `TAUCETI_REPAIR_PUBLISH` (`after`, the default; `before`; `off`) now chooses
-the order. Under `after` the worker pushes and submits exactly as before (the same checkpoint token,
+the order. With `after`, a green full-library build now first freezes an output map and
+complete native artifacts and starts a background upload while audits and lint run. Stock Lake's
+`cache put-staged --rev=...` uploads for that captured revision without consulting the live
+workspace. Compilation outputs are reusable even if audits subsequently reject the chain;
+checks and submission remain independent. At submission an upload for the exact accepted
+revision is reused without waiting. A changed revision, failure or unavailable snapshot
+retains the late-publication fallback described below.
+
+Under that fallback the worker pushes and submits exactly as before (the same checkpoint token,
 the claim released or adopted by the submission) and then starts `repair_publish.start_background`
 for the submitted tip, after `adopted` or `not_adopted` and after a `prepared_clean` release, and
 goes on to its next claim. The publisher is a process of its own: under systemd a transient unit
@@ -502,8 +515,8 @@ on a stop or restart), elsewhere a new session, so a stopping worker does not ta
 `tasks/<id>/logs/publish.log` and its record `tasks/<id>/logs/publish.json` (`published`, `skipped`
 or `failed`), removes the task's worktree when done, and `worker.json` reports running publications,
 counts and the last result and failure under `publish`; a failure is logged there and in the journal
-and never changes the task's outcome. Both the rehash and `lake cache put` run under `nice -n 10`, so
-a concurrent repair or build on the host keeps the CPU. `lake cache put` uploads every artifact
+and never changes the task's outcome. Native upload runs under `nice -n 10`, so
+a concurrent repair or build on the host keeps the CPU. `lake cache put-staged` uploads every artifact
 before the revision mapping the fetcher reads, and exits without writing the mapping when an
 artifact upload fails, so CI never sees a mapping for a partially uploaded set; a publisher killed
 mid-upload leaves no mapping, which the fetch script treats as the normal miss. `before` keeps the
@@ -726,3 +739,37 @@ scoped builds and taking over a stale lock, a provider-neutral group prompt, and
 unassignable failures staying sequential. A `prepare` task whose batch builds is released as
 `prepared_clean` without an agent, and one whose batch fails is repaired with the not-yet-tried
 prompt and adopted. No real inference and no network.
+
+## Throughput and delivery recovery
+
+When the next batch's intended parent is available, prepare directly on that parent rather than
+requiring an old-base full build. Already claimed preparations finish normally. Rebase agents resolve
+all conflicts and perform focused checks; the worker owns the combined whole-library verification.
+
+`checks-timing.json` records wall times and sampled process-tree RSS. Matching previous measurements
+and at least twice their summed peak RSS plus 8 GiB of available host/cgroup memory permit audit and
+lint to overlap over read-only compiled outputs. Otherwise checks remain serial. Both are joined
+before task cleanup, and both failures are collected. The pinned lint driver records import, docscan,
+linters and report times; `TAUCETI_LINT_PROFILE=1` additionally profiles each linter separately.
+These timing observations never authorize a pass.
+
+The worker tests submission Git access before inference. A verified tip whose push/submission fails
+stays in the existing `delivery_pending` checkpoint and retained ref; polling renews its claim and
+retries delivery with bounded individual attempts. Unchanged source and checking identity reuse
+verification. A changed checking policy requires verification again. The controller replays an
+accepted receipt only for the exact claim and tip, so a lost response cannot adopt twice or authorize
+stale work. Terminal worktrees are removed as before.
+
+Staging status intents persist for the existing retry workflow. A green build waits for required
+status delivery on its original run. The finalizer still requires the build and exact public map.
+Legacy missing-run grace is unchanged pending duplicate-safe dispatch evidence.
+
+For a repair or rebase that compiles and still fails audit or lint after local retries, the worker
+can send a checkpoint using the current claim and its submission ref. The controller validates the
+chain and records it as a retained submission without adopting it. A new claim on the same task
+starts from that tip and receives the outstanding findings. It runs full verification before final
+submission. The old worktree is removed once the checkpoint receipt is confirmed.
+
+When a pre-rebase passes full verification, the worker reports the verified tip, parent and tools
+pin with its submission. A matching result counts as preparation for that tip. A changed chain
+gets its own preparation and staging still makes the landing decision.

@@ -64,39 +64,53 @@ def hourly_rate(spent, covered_seconds):
     )
 
 
-def measured_pr_weight(row):
-    """Full weight for measured landed PRs, half for measured open PRs."""
-    if row.get("measured_pr_weight") is not None:
-        return Decimal(str(row["measured_pr_weight"]))
-    # Older prepared summaries have only unweighted coverage counts.
-    weight = Decimal(row.get("landed_prs", 0)) + Decimal(row.get("open_prs", 0)) / 2
-    known = row.get("known_loc_prs", 0)
-    count = known + row.get("missing_loc_prs", 0)
-    return weight * known / count if count else weight
-
-
 def loc_estimate(row):
-    """Keep partial PR coverage useful without fetching any additional data."""
-    measured = Decimal(row.get("landed_loc_added", 0)) + Decimal(row.get("open_loc_added", 0)) / 2
-    weighted = measured
+    """Estimate missing measurements using only PRs that landed in the window."""
+    # Creation-cohort summaries cannot be converted into landing windows.
+    if row.get("loc_basis") != "landed_at":
+        return dict(landed_loc=None, loc_estimated=False, usd_per_loc=None)
+    measured = Decimal(row.get("landed_loc_added", 0))
+    landed = measured
     missing = bool(row.get("missing_loc_prs"))
-    if missing:
-        known_weight = measured_pr_weight(row)
-        total_weight = Decimal(row.get("landed_prs", 0)) + Decimal(row.get("open_prs", 0)) / 2
-        if known_weight > 0:
-            weighted = measured * total_weight / known_weight
+    known = row.get("known_loc_prs", 0)
+    if missing and known:
+        landed = measured * row.get("landed_prs", 0) / known
     cost = row.get("estimated_usd")
     rate = None
     if cost is not None:
         cost = Decimal(cost)
-        # No measured output means zero LOC, never an invented positive denominator.
-        rate = cost / weighted if weighted else Decimal("Infinity") if cost else Decimal(0)
+        rate = cost / landed if landed else Decimal("Infinity") if cost else Decimal(0)
     return dict(
-        measured_weighted_loc=str(measured),
-        weighted_loc=str(weighted),
+        landed_loc=str(landed),
         loc_estimated=missing,
         usd_per_loc=str(rate) if rate is not None else None,
     )
+
+
+def attribution_backfilling(row):
+    # Older collectors exposed one flag for historical backfill and live refresh.
+    return bool(row.get("attribution_backfilling", row.get("attribution_preparing", False)))
+
+
+def attributed_rate(row):
+    if attribution_backfilling(row):
+        return None
+    if row.get("attribution_known_prs") == 0 and (
+        row.get("attribution_missing_prs") or row.get("attribution_preparing")
+    ):
+        return None
+    loc, cost = row.get("attributed_loc"), row.get("estimated_usd")
+    if loc is None or cost is None:
+        return None
+    loc, cost = Decimal(loc), Decimal(cost)
+    return str(cost / loc if loc else Decimal("Infinity") if cost else Decimal(0))
+
+
+def attributed_rate_display(row):
+    rate = attributed_rate(row)
+    if rate is None:
+        return "—"
+    return "~" + amount(rate, rate=True)
 
 
 def display(value, default_kinds=()):
@@ -210,8 +224,8 @@ def display(value, default_kinds=()):
     cost_rows = []
     loc_rows = []
     if costs.get("windows"):
-        # Compatibility for snapshots prepared before partial-coverage estimates.
-        windows = {w: {**r, **loc_estimate(r)} if "loc_estimated" not in r else r for w, r in costs["windows"].items()}
+        # Recompute rates from the window evidence, guarding older cohort summaries.
+        windows = {w: {**r, **loc_estimate(r)} for w, r in costs["windows"].items()}
         for key, label in (
             ("spent_usd", "API cost: completed sessions"),
             (
@@ -237,37 +251,62 @@ def display(value, default_kinds=()):
                 )
             )
         cost_rows.append(("API cost: estimated total", [amount(windows[w].get("estimated_usd")) for w in cost_windows]))
-        for key, label in (
-            ("landed_loc_added", "Authored Lean LOC: landed"),
-            ("open_loc_added", "Authored Lean LOC: open"),
-        ):
-            loc_rows.append((label, [str(windows[w].get(key, 0)) for w in cost_windows]))
         loc_rows.append(
             (
-                "Lean LOC (landed + ½ open)",
+                "Landed Lean LOC",
                 [
-                    "~" + number(f"{Decimal(windows[w]['weighted_loc']):.1f}")
-                    if windows[w].get("loc_estimated")
-                    else number(windows[w].get("weighted_loc", 0))
+                    "—"
+                    if windows[w]["landed_loc"] is None
+                    else ("~" if windows[w].get("loc_estimated") else "")
+                    + number(f"{Decimal(windows[w]['landed_loc']):.1f}")
                     for w in cost_windows
                 ],
             )
         )
         loc_rows.append(
             (
-                "Estimated $ / weighted LOC",
+                "Estimated $ / landed LOC",
                 [
                     ("~" if windows[w].get("loc_estimated") else "") + amount(windows[w].get("usd_per_loc"), rate=True)
                     for w in cost_windows
                 ],
             )
         )
+        if any(windows[w].get("attribution_version") for w in cost_windows):
+            loc_rows.extend(
+                [
+                    (
+                        "Attributed landed Lean LOC",
+                        [
+                            "—"
+                            if attribution_backfilling(windows[w]) or windows[w].get("attributed_loc") is None
+                            else "~" + number(f"{Decimal(windows[w]['attributed_loc']):.1f}")
+                            for w in cost_windows
+                        ],
+                    ),
+                    (
+                        "Estimated $ / attributed LOC",
+                        [attributed_rate_display(windows[w]) for w in cost_windows],
+                    ),
+                    (
+                        "Landed PRs with attribution data",
+                        [
+                            "—"
+                            if windows[w].get("attribution_known_prs") is None
+                            else f"{windows[w]['attribution_known_prs']}/{windows[w]['attribution_known_prs'] + windows[w]['attribution_missing_prs']}"
+                            for w in cost_windows
+                        ],
+                    ),
+                ]
+            )
         if any(windows[w].get("missing_loc_prs") for w in cost_windows):
             loc_rows.append(
                 (
-                    "Authored PRs with measured LOC",
+                    "Landed PRs with measured LOC",
                     [
-                        f"{windows[w].get('known_loc_prs', 0)}/{windows[w].get('known_loc_prs', 0) + windows[w].get('missing_loc_prs', 0)}"
+                        "—"
+                        if windows[w].get("loc_basis") != "landed_at"
+                        else f"{windows[w].get('known_loc_prs', 0)}/{windows[w].get('known_loc_prs', 0) + windows[w].get('missing_loc_prs', 0)}"
                         for w in cost_windows
                     ],
                 )
@@ -315,10 +354,12 @@ def display(value, default_kinds=()):
             max(len(h), *(len(str(values[i])) for _, values in [*cost_rows, *loc_rows]))
             for i, h in enumerate(cost_headers)
         ]
-        table("Costs / initiated PR output", cost_headers, cost_rows, cost_widths)
+        table("Costs / landed PR output", cost_headers, cost_rows, cost_widths)
         table(None, cost_headers, loc_rows, cost_widths)
+        if any(windows[w].get("loc_basis") != "landed_at" for w in cost_windows):
+            print("Landed LOC unavailable from older summaries; refresh activity collectors.")
         if any(windows[w].get("loc_estimated") for w in cost_windows):
-            print("~ Missing LOC estimated from measured PRs; zero if none measured. Unknown PR states count as zero.")
+            print("~ Missing LOC estimated from measured landed PRs; zero if none measured.")
     funding = costs.get("funding")
     if funding:
         print()
@@ -549,11 +590,9 @@ def combine(values):
             k: sum(r.get(k, 0) for r in rows)
             for k in (
                 "landed_loc_added",
-                "open_loc_added",
                 "missing_loc_prs",
                 "known_loc_prs",
                 "landed_prs",
-                "open_prs",
             )
         }
         for key in (
@@ -570,7 +609,8 @@ def combine(values):
                 if compatible_costs and all(r.get(key) is not None for r in rows) and len(known) == len(values)
                 else None
             )
-        row["measured_pr_weight"] = float(sum((measured_pr_weight(r) for r in rows), Decimal(0)))
+        if all(r.get("loc_basis") == "landed_at" for r in rows):
+            row["loc_basis"] = "landed_at"
         if accounting_versions == {2, 3} and row.get("active_accrued_usd") is not None:
             row["active_accrued_usd"] = str(
                 sum(
@@ -587,6 +627,16 @@ def combine(values):
                 )
             )
         row.update(loc_estimate(row))
+        if any(r.get("attribution_version") for r in rows):
+            compatible = len(known) == len(values) and all(r.get("attribution_version") == 1 for r in rows)
+            row["attribution_version"] = 1
+            row["attribution_preparing"] = any(r.get("attribution_preparing") for r in rows)
+            row["attribution_backfilling"] = any(attribution_backfilling(r) for r in rows)
+            for field in ("attribution_known_prs", "attribution_missing_prs"):
+                row[field] = sum(r[field] for r in rows) if compatible else None
+            row["attributed_loc"] = (
+                str(sum((Decimal(r.get("attributed_loc") or "0") for r in rows), Decimal(0))) if compatible else None
+            )
         s["costs"]["windows"][w] = row
     if any(v.get("costs", {}).get("spending") for v in known):
         s["costs"]["spending"] = {}

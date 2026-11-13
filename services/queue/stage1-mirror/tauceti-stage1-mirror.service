@@ -1,0 +1,19 @@
+[Unit]
+Description=Reconcile the Stage 1 Forgejo main mirror
+Documentation=https://github.com/TauCetiProject/TauCetiWorker/blob/main/docs/forgejo-stage1-cutover.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h
+EnvironmentFile=%h/.config/tauceti-stage1/mirror.env
+Environment=PATH=/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/bin/sh -c 'case "$${TAUCETI_STAGE1_PYTHON}" in /*) test -x "$${TAUCETI_STAGE1_PYTHON}" || exit 78 ;; *) exit 78 ;; esac; case "$${TAUCETI_STAGE1_MIRROR_PROFILE}" in /*) ;; *) exit 78 ;; esac'
+ExecStart=/usr/bin/env ${TAUCETI_STAGE1_PYTHON} -I -m tauceti_queue.stage1 --profile ${TAUCETI_STAGE1_MIRROR_PROFILE} mirror
+SyslogIdentifier=tauceti-stage1-mirror
+UMask=0077
+NoNewPrivileges=true
+KillMode=control-group
+TimeoutStartSec=10min
+
+# Exit 75 (busy), 77 (unavailable), and 78 (refused) remain visible as failures.
+# The timer retries the same reconcile command; it never dispatches or merges.

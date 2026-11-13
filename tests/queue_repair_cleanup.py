@@ -199,12 +199,15 @@ class Cleanup(unittest.TestCase):
         from types import SimpleNamespace
 
         from tauceti_queue import repair_task
+        from tauceti_queue.repair_cache import cache_lease
 
         self.tree(state="submitted")
         cfg = SimpleNamespace(root=self.worker, binding=None)
         task = SimpleNamespace(task_id="1", binding=None)
 
         def attempt(*args, **kwargs):
+            with cache_lease(self.worker, exclusive=True) as acquired:
+                self.assertFalse(acquired)
             self.assertEqual(self.collect()[0]["state"], "busy")
             raise RuntimeError("worker failed")
 
@@ -217,18 +220,51 @@ class Cleanup(unittest.TestCase):
 
     def test_publisher_holds_the_same_lease_even_after_worker_submission(self):
         from tauceti_queue import repair_publish
+        from tauceti_queue.repair_cache import cache_lease
 
         path = self.tree(state="submitted")
         spec = self.root / "publish-spec.json"
         spec.write_text(json.dumps({"worktree": str(path), "task_id": "1"}))
 
         def publish(_path):
+            with cache_lease(self.worker, exclusive=True) as acquired:
+                self.assertFalse(acquired)
             self.assertEqual(self.collect()[0]["state"], "busy")
             return 0
 
         with patch.object(repair_publish, "_run_spec", side_effect=publish):
             self.assertEqual(repair_publish.run_spec(spec), 0)
         self.assertEqual(self.collect()[0]["state"], "removed")
+
+    def test_publisher_holds_the_tasks_shared_cache_lease(self):
+        from tauceti_queue import repair_publish
+        from tauceti_queue.repair_cache import cache_lease
+
+        path = self.tree(state="submitted")
+        shared = self.root / "shared-cache"
+        spec = self.root / "publish-spec.json"
+        spec.write_text(json.dumps({"worktree": str(path), "task_id": "1", "cache_root": str(shared)}))
+
+        def publish(_path):
+            with cache_lease(shared, exclusive=True) as acquired:
+                self.assertFalse(acquired)
+            return 0
+
+        with patch.object(repair_publish, "_run_spec", side_effect=publish):
+            self.assertEqual(repair_publish.run_spec(spec), 0)
+
+    def test_early_snapshot_handoff_is_protected_then_terminal_scratch_is_removed(self):
+        tree = self.tree(state="submitted", suffix="-publish-" + "a" * 40)
+        (tree / "outputs.jsonl").write_text('"2026-03-17"\n')
+        (tree / ("1" * 16 + ".ltar")).write_text("frozen artifact")
+        logdir = self.worker / "tasks/1/logs/publications" / ("a" * 40)
+        logdir.mkdir(parents=True)
+        record = logdir / "publish.json"
+        record.write_text(json.dumps({"state": "running", "started_at": time.time()}))
+        self.assertEqual(self.collect()[0]["state"], "publisher-starting")
+        record.write_text(json.dumps({"state": "running", "started_at": 0}))
+        self.assertEqual(self.collect()[0]["state"], "removed")
+        self.assertFalse(tree.exists(), "a crashed early publisher cannot leave frozen artifacts behind")
 
     def test_installer_writes_private_configuration_and_installs_both_units(self):
         home = self.root / "home"

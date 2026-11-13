@@ -50,6 +50,7 @@ import argparse
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import json
 import os
 import re
@@ -76,6 +77,7 @@ from tauceti_queue import (
     repair_stream,
     task_transport,
 )
+from tauceti_queue.ports import REPAIR_CHECKPOINT
 from tauceti_queue.repair import PromptContext, checkout_worktree, git, read_chain
 from tauceti_queue.task_identity import (
     TASK_SCHEMA,
@@ -96,6 +98,7 @@ RELEASE_REASONS = (
     "agent_launch_failed",
     "agent_failed",
     "push_failed",
+    "submission_unavailable",  # preflight failed before inference; retry without settling preparation
     "worker-stopped",  # the worker was stopped (SIGTERM) before the task reached a resumable phase
     "prepared_clean",  # a ``prepare`` task's batch built without an error: nothing to repair
 )
@@ -107,12 +110,15 @@ IN_FLIGHT_STATES = (
     "artifacts_unavailable",
     "agent_running",
     "validated",
+    "delivery_pending",
+    "verifying",
     "pushed",
     "submitted",
     "interrupted",
 )
 # In-flight states a restarted worker continues instead of releasing: the agent's session exists.
-RESUMABLE_STATES = ("agent_running", "interrupted")
+DELIVERY_STATES = ("delivery_pending", "pushed", "submitted")
+RESUMABLE_STATES = ("agent_running", "interrupted", *DELIVERY_STATES)
 # ``run_repair_agent`` statuses that release the task under the same name.
 RELEASED_AGENT_STATUSES = ("inference_unavailable", "artifacts_unavailable", "agent_launch_failed")
 
@@ -180,7 +186,7 @@ class TaskMember:
     no_repair: bool = False  # the PR opted out of repair: never edited, only emptied with an attribution
     withdrawn: bool = False  # already withdrawn that way: it stays an empty commit
     declaration_names: dict = dataclasses.field(default_factory=dict)
-    source_identity: str = ""
+    source_identity: str | dict = ""
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -217,13 +223,34 @@ class Task:
     extra: dict = dataclasses.field(default_factory=dict)
     warm_revs: list[str] = dataclasses.field(default_factory=list)  # repair outputs to restore, in order
     binding: TaskBinding | None = None
+    mixed_binding: dict | None = None
 
     @classmethod
     def from_json(cls, data: dict) -> Task:
         if not isinstance(data, dict):
             raise ValueError("task record must be an object")
         binding = None
-        if "binding" in data or "schema" in data:
+        mixed_binding = None
+        from .mixed_tasks import SCHEMA as MIXED_SCHEMA
+        from .mixed_tasks import validate as validate_mixed
+
+        if data.get("schema") == MIXED_SCHEMA:
+            from .mixed_identity import decode
+
+            data = json.loads(json.dumps(data), object_hook=decode)
+            validate_mixed(data)
+            mixed_binding = data["mixed_binding"]
+        elif "mixed_binding" in data or any(
+            isinstance(member, dict)
+            and (
+                isinstance(member.get("source_identity"), dict)
+                or str(member.get("source_pr", "")).startswith("forgejo:")
+                and "@" in str(member.get("source_pr", ""))
+            )
+            for member in data.get("members", [])
+        ):
+            raise TaskBindingMismatch("mixed task identity schema was removed")
+        elif "binding" in data or "schema" in data:
             if data.get("schema") != TASK_SCHEMA or "repository" in data:
                 raise TaskBindingMismatch("unknown or downgraded task identity schema")
             binding = TaskBinding.parse(data.get("binding"))
@@ -250,11 +277,21 @@ class Task:
                 }:
                     raise TaskBindingMismatch("task member belongs to another qualified source")
             number = raw.get("number", raw.get("pr"))
+            if mixed_binding is not None:
+                from tauceti_tools.ci_candidate import RepositoryIdentity
+
+                from .mixed_identity import SourceNumber
+
+                source = RepositoryIdentity.parse(raw["source_identity"])
+                if source.repository.forge.kind == "forgejo":
+                    number = SourceNumber(number, source)
             source_pr = raw.get("source_pr") or f"{repository}#{number}"
             members.append(
                 TaskMember(
                     source_pr=str(source_pr),
-                    number=int(number if number is not None else source_pr.rsplit("#", 1)[1]),
+                    number=number
+                    if mixed_binding is not None
+                    else int(number if number is not None else source_pr.rsplit("#", 1)[1]),
                     accepted_head=str(raw.get("accepted_head") or ""),
                     commit=raw.get("commit"),
                     provenance=raw.get("provenance"),
@@ -268,7 +305,9 @@ class Task:
                     declaration_names=raw.get("declaration_names")
                     if isinstance(raw.get("declaration_names"), dict)
                     else {},
-                    source_identity=raw.get("source_identity", "") if binding is not None else "",
+                    source_identity=raw.get("source_identity", "")
+                    if binding is not None or mixed_binding is not None
+                    else "",
                 )
             )
         extra = dict(data.get("extra") or {})
@@ -318,13 +357,24 @@ class Task:
             extra=extra,
             warm_revs=[str(r) for r in (data.get("warm_revs") or extra.get("warm_revs") or []) if r],
             binding=binding,
+            mixed_binding=mixed_binding,
         )
 
     def to_json(self) -> dict:
         record = dataclasses.asdict(self)
         record["members"] = [m.to_json() for m in self.members]
         record.pop("binding")
-        if self.binding is not None:
+        record.pop("mixed_binding")
+        if self.mixed_binding is not None:
+            from .mixed_tasks import SCHEMA
+
+            record.update(schema=SCHEMA, mixed_binding=self.mixed_binding)
+            for member in record["members"]:
+                member["number"] = int(member["number"])
+            from .mixed_identity import encode
+
+            record = encode(record)
+        elif self.binding is not None:
             record.pop("repository")
             record.update(schema=TASK_SCHEMA, binding=self.binding.record())
         else:
@@ -452,7 +502,12 @@ class TaskClient:
         return status, parsed
 
     def claim(self) -> Task | None:
-        status, payload = self._post("/tasks/claim", {"worker": self.worker})
+        body = {"worker": self.worker}
+        if self.binding is None:
+            from .mixed_tasks import SCHEMA
+
+            body["task_schemas"] = [SCHEMA]
+        status, payload = self._post("/tasks/claim", body)
         if status == 204 or (self.binding is None and status == 200 and not payload):
             return None
         if status in (401, 403):
@@ -494,13 +549,20 @@ class TaskClient:
             raise ServiceError("renew: invalid native claim expiry")
         if not isinstance(value, (int, float)):
             raise ServiceError("renew: no expires_at in the response")
+        if isinstance(payload, dict):
+            owner = payload.get("checks_owner")
+            if owner in ("worker", "staging"):
+                task.extra["checks_owner"] = owner
+            interval = payload.get("renew_after")
+            if type(interval) in (int, float) and 0 < interval <= 300:
+                task.renew_after = float(interval)
         return float(value)
 
-    def submit(self, task: Task, tip: str, pushed_ref: str, notes: dict | None) -> dict:
+    def submit(self, task: Task, tip: str, pushed_ref: str, notes: dict | None, *, checkpoint: bool = False) -> dict:
         """``submit_task(task_id, claim_token, tip_sha, worker_notes)``; returns the Adoption record."""
         self._require_task(task)
         status, payload = self._post(
-            f"/tasks/{task.task_id}/result",
+            f"/tasks/{task.task_id}/{'checkpoint' if checkpoint else 'result'}",
             {
                 "worker": self.worker,
                 "claim_token": task.claim_token,
@@ -509,6 +571,8 @@ class TaskClient:
                 "worker_notes": json.dumps(notes or {}, sort_keys=True, default=str),
             },
         )
+        if checkpoint and status == 404:
+            raise EndpointMissing("repair checkpoint endpoint unavailable")
         if status in (401, 403, 404, 409, 410):
             raise ClaimRefused(f"result refused: HTTP {status} {_error_text(payload)}".strip())
         if status != 200 or not isinstance(payload, dict):
@@ -602,6 +666,7 @@ class ClaimLease(threading.Thread):
         *,
         retry_interval: float = 15.0,
         clock=time.time,
+        check_settings: Path | None = None,
     ):
         super().__init__(name=f"claim-lease-{task.task_id}", daemon=True)
         self.client = client
@@ -619,6 +684,7 @@ class ClaimLease(threading.Thread):
         self.renewals = 0
         self.errors = 0
         self.lost_reason: str | None = None
+        self.check_settings = check_settings
 
     def run(self) -> None:
         interval = max(0.05, float(self.task.renew_after))
@@ -626,6 +692,8 @@ class ClaimLease(threading.Thread):
             try:
                 self.expires_at = self.client.renew(self.task)
                 self.task.expires_at = self.expires_at
+                if self.check_settings is not None:
+                    repair_audit.update_checks_owner(self.check_settings, self.task.extra.get("checks_owner"))
                 self.renewals += 1
                 interval = max(0.05, float(self.task.renew_after))
             except ClaimRefused as error:
@@ -646,6 +714,8 @@ class ClaimLease(threading.Thread):
         self.lost_reason = reason
         self.lost.set()
         self.cancel.set()
+        if self.check_settings is not None:
+            repair_audit.update_checks_owner(self.check_settings, "staging")
         log(f"claim lost: {reason}")
 
     def stop(self) -> None:
@@ -859,6 +929,17 @@ class TaskState:
         self.task = task
         self.progress_outcome: dict | None = None  # Live accounting; never copied into the checkpoint.
         self.record = self.read()
+        recorded_task = self.record.get("task") or {}
+        if recorded_task and recorded_task.get("claim_token") != task.claim_token:
+            # A new claim can continue the retained chain, but the previous
+            # worker's in-flight delivery and agent session belong to its lease.
+            self.record = {
+                "schema": SCHEMA,
+                "task": task.to_json(),
+                "history": self.record.get("history", []),
+                "pending_release": None,
+            }
+            self.session_path.unlink(missing_ok=True)
         if not self.record:
             self.record = {"schema": SCHEMA, "task": task.to_json(), "history": []}
 
@@ -890,7 +971,7 @@ class TaskState:
     @property
     def resumable(self) -> bool:
         """A checkpoint a restarted runner continues: mid-agent, or interrupted by a stop."""
-        return self.state in ("agent_running", "interrupted")
+        return self.state in RESUMABLE_STATES
 
     @property
     def agent_started(self) -> bool:
@@ -1179,6 +1260,40 @@ def artifact_revisions(task: Task) -> list[str]:
     return revisions
 
 
+@contextlib.contextmanager
+def artifact_checkout(worktree: Path, task: Task, start_tip: str):
+    """Prepare changed rebase dependencies on the target, then restore the agent's input chain.
+
+    Lake populates the same private .lake directory for both checkouts. This hydrates
+    new dependency Git objects before verification loses network access.
+    """
+    changed = (
+        task.kind in repair.REBASE_KINDS
+        and task.onto != start_tip
+        and git(
+            worktree,
+            "diff",
+            "--name-only",
+            start_tip,
+            task.onto,
+            "--",
+            "lake-manifest.json",
+            "lean-toolchain",
+            "lakefile.toml",
+            "lakefile.lean",
+        ).strip()
+    )
+    if not changed:
+        yield
+        return
+    log(f"task {task.task_id}: preparing dependencies on rebase target {task.onto[:12]}")
+    git(worktree, "checkout", "--quiet", "--force", "--detach", task.onto)
+    try:
+        yield
+    finally:
+        git(worktree, "checkout", "--quiet", "--force", "--detach", start_tip)
+
+
 HEAD_KINDS = ("repair", "rebase_conflict")  # the head's own tasks, which warm from the head's tips
 
 
@@ -1244,6 +1359,7 @@ def prompt_context(
     artifacts: dict | None = None,
     listings: Path | None = None,
     shell_limit: int = repair.SHELL_LIMIT_SECONDS,
+    worker_verifies: bool = False,
 ) -> PromptContext:
     """``artifacts`` is the ``prepare_artifacts`` record (the prompt says when the build is cold);
     ``listings`` is where the member listings and the check script go (``repair.listings_path``);
@@ -1282,6 +1398,8 @@ def prompt_context(
         artifacts_cold=cold,
         artifacts_reason=(artifacts or {}).get("unavailable_reason") if cold else None,
         check_findings_known=known_check_failures(task),
+        worker_verifies=worker_verifies and not cold,
+        staging_checks=repair_audit.staging_checks(task),
         listings_path=listings,
         shell_limit=shell_limit,
         pre_rebased=pre_rebased(task) is not None,
@@ -1440,7 +1558,7 @@ _CODEX_REFUSAL = re.compile(
 )
 _CLAUDE_REFUSAL = re.compile(r"API Error:\s*(401|403|429|5\d\d)\b|hit your .*limit|usage limit reached", re.I)
 # The agent runs under the worker's parent-bound guardian, so an executable that is not on PATH is the
-# guardian's traceback and exit 1 rather than an OSError from Popen (which is ``AgentLaunchUnavailable``).
+# guardian's diagnostic rather than an OSError from Popen (which is ``AgentLaunchUnavailable``).
 _NO_EXECUTABLE = re.compile(
     r"(?:FileNotFoundError|PermissionError|OSError):.*(?:No such file or directory|Permission denied)"
 )
@@ -1455,6 +1573,8 @@ def prework_failure(provider: str, rc: int, run: dict | None, infra_reason: str 
     if rc == 0 or run is None or run.get("saw_work"):
         return None
     for line in run.get("tail") or []:
+        if rc == 127 and str(line).strip() == "owned tool could not start":
+            return LAUNCH_FAILURE
         if _NO_EXECUTABLE.search(str(line)):
             return f"{LAUNCH_FAILURE}: {str(line).strip()[:200]}"
     status = run.get("rate_limit_status")
@@ -1768,6 +1888,42 @@ def _parallel_summary(record: dict) -> dict:
     return {k: v for k, v in record.items() if k not in ("remaining", "report", "attempts")}
 
 
+def delivery_identity(cfg: RunnerConfig, task: Task, tip: str) -> dict:
+    """Only unchanged source and checking policy may reuse completed verification."""
+    return {
+        "tip": tip,
+        "base": task.validation_base,
+        "audits": cfg.worker_audits,
+        "full_checks": cfg.worker_audits and not repair_audit.staging_checks(task),
+        "lake": list(cfg.lake),
+        "checker": hashlib.sha256(
+            Path(repair_audit.__file__).read_bytes() + Path(repair_sandbox.__file__).read_bytes()
+        ).hexdigest(),
+    }
+
+
+def check_submission_access(cfg: RunnerConfig, task: Task, logdir: Path) -> dict:
+    """Exercise receive-pack authentication without changing any remote ref."""
+    remote = cfg.push_remote or f"https://github.com/{task.repository}"
+    return repair.run_logged(
+        [
+            "git",
+            "-c",
+            "push.followTags=false",
+            "push",
+            "--dry-run",
+            "--porcelain",
+            "--force",
+            remote,
+            task.tip + ":" + task.submission_ref,
+        ],
+        cfg.clone,
+        logdir / "submission-access.log",
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        timeout=30,
+    )
+
+
 def push_result(cfg: RunnerConfig, task: Task, worktree: Path, tip: str, logdir: Path, expect: str | None) -> dict:
     """Push the proposed tip to the task's ``submission_ref`` through ``git-safe-push``.
 
@@ -1858,10 +2014,15 @@ def run_task(
     resume_state: TaskState | None = None,
     stop: Stop | None = None,
 ) -> dict:
+    from tauceti_queue.repair_cache import before_task, cache_lease, task_cache
     from tauceti_queue.repair_cleanup import worktree_lease
 
     require_task_execution(cfg=cfg, task=task)
-    with worktree_lease(cfg.root, task.task_id):
+    cache_root = task_cache(cfg.root, task.task_id)
+    cache_cleanup = before_task(cache_root)
+    if cache_cleanup["state"] != "busy":
+        log(f"repair cache retention: {json.dumps(cache_cleanup, sort_keys=True)}")
+    with cache_lease(cache_root), worktree_lease(cfg.root, task.task_id):
         return _run_task(cfg, task, client, resume_state=resume_state, stop=stop)
 
 
@@ -1883,20 +2044,38 @@ def _run_task(
     """
     require_task_execution(cfg=cfg, task=task)
     state_dir = cfg.tasks_dir / task.task_id
+    staging_checks = functools.partial(repair_audit.staging_checks, task)
+    if task.extra.get("checks_owner") in ("worker", "staging") and cfg.publish.when == "before":
+        # Reuse the existing asynchronous publisher so staging setup overlaps the upload.
+        cfg = dataclasses.replace(cfg, publish=dataclasses.replace(cfg.publish, when="after"))
     logdir = state_dir / "logs"
     state = resume_state or TaskState(state_dir, task)
-    resuming = resume_state is not None and resume_state.agent_started
+    pending_delivery = state.record.get("delivery") if state.state in IN_FLIGHT_STATES else None
+    resuming = resume_state is not None and (resume_state.agent_started or bool(pending_delivery))
     cancel = threading.Event()
     if stop is not None:
         stop.attach(cancel)
-    lease = ClaimLease(client, task, cancel, retry_interval=cfg.lease_retry_interval)
+    lease = ClaimLease(
+        client,
+        task,
+        cancel,
+        retry_interval=cfg.lease_retry_interval,
+        check_settings=cfg.root
+        / "worktrees"
+        / f"task-{task.task_id}"
+        / repair.LISTINGS_DIR
+        / repair_audit.SETTINGS_FILE,
+    )
     lease.start()
     worktree = cfg.root / "worktrees" / f"task-{task.task_id}"
-    outcome: dict = {"task_id": task.task_id, "status": "running", "worker": cfg.worker}
+    outcome: dict = dict(state.record.get("outcome") or {}) if pending_delivery else {}
+    outcome.update(task_id=task.task_id, status="running", worker=cfg.worker)
     state.progress_outcome = outcome
+    continuation = task.extra.get("repair_checkpoint") if cfg.worker_audits else None
+    start_tip = continuation["tip"] if continuation else task.tip
     # A ``prepare`` task always streams: the streaming build is how it learns whether there is anything
     # to repair at all (the batch has not been tried, so the task carries no diagnostics).
-    known_checks = known_check_failures(task)
+    known_checks = bool(continuation) or known_check_failures(task)
     streaming = (
         task.kind == "prepare" or (cfg.stream_repair and task.kind == "repair" and not known_checks)
     ) and not resuming
@@ -1919,12 +2098,16 @@ def _run_task(
         """``TAUCETI_REPAIR_PUBLISH=after``: publish ``revision``'s outputs in the background now that the
         result is in; the publisher removes the worktree when done. Never fails the task. Under ``off``
         the record says so and nothing starts."""
-        if cfg.publish.when == "before":
+        if cfg.publish.when == "before" and not staging_checks():
             return
+        early = repair_publish.early_record(logdir, revision, cfg.publish)
+        if early:
+            outcome["publish"] = {**early, "early": True}
+            return  # frozen outputs do not need the live worktree kept alive
         record = repair_publish.start_background(
             worktree,
             revision,
-            settings=cfg.publish,
+            settings=dataclasses.replace(cfg.publish, when="after") if cfg.publish.when == "before" else cfg.publish,
             env=env_lake,
             logdir=logdir,
             task_id=task.task_id,
@@ -1961,11 +2144,20 @@ def _run_task(
             cfg, client, task, state, "worker-stopped", f"worker stopped while {phase}: {detail}", outcome, lease
         )
 
+    def defer_delivery(detail: str) -> dict:
+        lease.submitting.clear()
+        outcome.update(status="delivery_pending", detail=detail)
+        state.write("delivery_pending", detail=detail, outcome=outcome, next_retry_at=time.time() + cfg.poll_seconds)
+        log(f"task {task.task_id}: delivery retained for automatic retry: {detail}")
+        return outcome
+
     try:
         state.write("claimed", worker=cfg.worker, service=cfg.service, resumed=resuming)
         if task.repository != cfg.repository:
             verify_admin(task.repository)
-        env_lake = repair.lake_env(cfg.root)
+        from tauceti_queue.repair_cache import task_cache
+
+        env_lake = repair.lake_env(cfg.root, cache_root=task_cache(cfg.root, task.task_id))
         repair_publish.configure(env_lake, cfg.publish)
         if not resuming:
             try:
@@ -1980,26 +2172,27 @@ def _run_task(
                 if stopping() and not lease.lost.is_set():
                     return cancelled("the worker stopped while the sources were fetched")
                 raise
-            outcome["sources"]["worktree_reused"] = checkout_worktree(cfg.clone, task.tip, worktree)
+            outcome["sources"]["worktree_reused"] = checkout_worktree(cfg.clone, start_tip, worktree)
             if cfg.seed_packages:
                 repair.link_shared_packages(worktree, cfg.seed_packages)
             state.write("sources_ready", worktree=str(worktree), sources=outcome["sources"])
             revisions = artifact_revisions(task)
-            artifacts = repair.prepare_artifacts(
-                worktree,
-                revisions[0],
-                env_lake,
-                logdir,
-                cfg.build_timeout,
-                repository=task.repository,
-                fallbacks=tuple(revisions[1:]),
-                ancestors=ARTIFACT_ANCESTORS,
-                mathlib_cache=cfg.mathlib_cache and cfg.seed_packages is None,
-                lake=cfg.lake,
-                preferred=repair_publish.preferred(cfg.publish, task),
-                warm=repair_publish.warm(cfg.publish, task),
-                build=not streaming and not known_checks and task.kind not in repair.REBASE_KINDS,
-            )
+            with artifact_checkout(worktree, task, start_tip):
+                artifacts = repair.prepare_artifacts(
+                    worktree,
+                    revisions[0],
+                    env_lake,
+                    logdir,
+                    cfg.build_timeout,
+                    repository=task.repository,
+                    fallbacks=tuple(revisions[1:]),
+                    ancestors=ARTIFACT_ANCESTORS,
+                    mathlib_cache=cfg.mathlib_cache and cfg.seed_packages is None,
+                    lake=cfg.lake,
+                    preferred=repair_publish.preferred(cfg.publish, task),
+                    warm=repair_publish.warm(cfg.publish, task),
+                    build=not streaming and not known_checks and task.kind not in repair.REBASE_KINDS,
+                )
             if artifacts.get("warm_attempts"):
                 warmed = artifacts.get("warmed_from") or []
                 missing = [a["revision"][:12] for a in artifacts["warm_attempts"] if not a["mapping_found"]]
@@ -2047,7 +2240,21 @@ def _run_task(
             return release_task(
                 cfg, client, task, state, "agent_failed", "resume: the worktree is gone", outcome, lease
             )
+        if not resuming:
+            access = check_submission_access(cfg, task, logdir)
+            if access["rc"]:
+                return release_task(
+                    cfg,
+                    client,
+                    task,
+                    state,
+                    "submission_unavailable",
+                    "submission authentication/preflight failed; see submission-access.log",
+                    outcome,
+                    lease,
+                )
         chain_before = read_chain(cfg.clone, task.base, task.tip)
+        prompt_chain = read_chain(cfg.clone, task.validation_base, start_tip) if continuation else chain_before
         ownership = repair_context.compute(
             cfg.clone,
             chain_before,
@@ -2058,9 +2265,22 @@ def _run_task(
         )
         outcome["repair_context"] = ownership.summary()
         tools_root = cfg.root / repair_audit.TOOLS_DIR
+        repair_publish.write_early_settings(
+            worktree,
+            settings=cfg.publish,
+            logdir=logdir,
+            task_id=task.task_id,
+            repository=task.repository,
+            lake=tuple(cfg.lake),
+        )
         if cfg.worker_audits:
             repair_audit.write_settings(
-                worktree, base=task.validation_base, tools_root=tools_root, lake=tuple(cfg.lake)
+                worktree,
+                base=task.validation_base,
+                tools_root=tools_root,
+                lake=tuple(cfg.lake),
+                logdir=logdir,
+                checks_owner="staging" if staging_checks() else "worker",
             )
         if streaming and (outcome.get("artifacts") or {}).get("available"):
             stream = repair_stream.start_build(
@@ -2081,6 +2301,7 @@ def _run_task(
                     logdir=logdir,
                     lake=tuple(cfg.lake),
                     timeout=cfg.build_timeout,
+                    defer_when=staging_checks,
                 )
                 if cfg.worker_audits
                 else None,
@@ -2097,7 +2318,7 @@ def _run_task(
             ):
                 # The batch builds on its base as assembled: give the task back as prepared, without an
                 # agent, and publish the outputs for the head's later rounds.
-                if cfg.publish.when == "before":
+                if cfg.publish.when == "before" and not staging_checks():
                     outcome["publish"] = repair_publish.publish_outputs(
                         worktree,
                         task.tip,
@@ -2121,23 +2342,37 @@ def _run_task(
                 )
                 publish_after(task.tip)
                 return released
-        findings = task_findings(task)
-        feedback: str | None = None
-        pushed: str | None = None
+        findings = (
+            repair.findings_from_diagnostics(continuation["diagnostics"]) if continuation else task_findings(task)
+        )
+        feedback: str | None = (
+            f"The checkout starts at retained repair `{start_tip[:12]}` on the required base. "
+            "That chain compiled. Keep its repairs and fix the audit or lint findings listed here."
+            if continuation
+            else None
+        )
+        pushed: str | None = state.record.get("pushed_tip") if pending_delivery else None
         attempt = 0
         validation_retries = 0
         verify_rounds = 0
         explanation_resubmits = 0
         resubmit = False
-        agent_records: list[dict] = []
+        agent_records: list[dict] = list(outcome.get("agent", []))
+        agent = {"status": "ok"}
         resume_session = state.session() if resuming else None
         resume_provider = state.session_provider() if resuming else None
-        skip_agent = False
+        skip_agent = bool(pending_delivery)
         while True:
             attempt += 1
             if cancel.is_set() or stopping():
                 return cancelled("cancelled before the agent started")
-            if attempt == 1 and not resuming and task.kind in ("repair", "prepare") and cfg.parallel_agents > 1:
+            if (
+                attempt == 1
+                and not resuming
+                and not continuation
+                and task.kind in ("repair", "prepare")
+                and cfg.parallel_agents > 1
+            ):
                 # Independent failing groups are repaired by concurrent agents first; what they leave
                 # (nothing, a group that failed, a build that still fails) goes to the usual agent below.
                 parallel, remaining = run_parallel_groups(
@@ -2164,6 +2399,9 @@ def _run_task(
             elif skip_agent:
                 skip_agent = False  # every group folded and the verification build passed; check and submit
             else:
+                pending_delivery = None
+                state.record.pop("delivery", None)
+                outcome.pop("repair_checkpoint", None)
                 context = prompt_context(
                     task,
                     feedback,
@@ -2171,11 +2409,19 @@ def _run_task(
                     artifacts=outcome.get("artifacts") or state.record.get("artifacts"),
                     listings=repair.listings_path(worktree),
                     shell_limit=int(cfg.shell_limit),
+                    worker_verifies=cfg.worker_audits,
                 )
                 context.repair_context = ownership
-                prompt = repair.compose_prompt(context, findings, chain_before, cfg.clone)
+                if continuation:
+                    context.kind = "repair"
+                    context.check_findings_known = True
+                if context.worker_verifies:
+                    from tauceti_queue import repair_targeted
+
+                    repair_targeted.write(worktree / repair.LISTINGS_DIR, candidate=start_tip, findings=findings)
+                prompt = repair.compose_prompt(context, findings, prompt_chain, cfg.clone)
                 if stream is not None:
-                    prompt = stream.annotate(prompt)
+                    prompt = stream.annotate(prompt, worker_verifies=context.worker_verifies)
                 if resume_session:
                     prompt = (
                         "The worker running this task was interrupted and has resumed your session; the worktree is "
@@ -2259,11 +2505,15 @@ def _run_task(
                     log(f"attempt {attempt} not acceptable; retrying once with the report")
                     continue
                 return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
-            verified = (outcome.get("parallel") or {}).get("verified_tip") == tip
+            parallel = outcome.get("parallel") or {}
+            verified = (
+                parallel.get("verified_tip") == tip and (staging_checks() or "checks" in parallel)
+            ) or pending_delivery == delivery_identity(cfg, task, tip)
             artifacts_cold = bool((outcome.get("artifacts") or state.record.get("artifacts") or {}).get("cold"))
-            if cfg.worker_audits and task.kind in ("repair", "prepare") and not artifacts_cold and not verified:
-                # The worker's own verdict before anything is submitted: the whole-library build, then CI's
-                # audits and the changed-module lint. A finding goes back to the agent as a diagnostic.
+            if cfg.worker_audits and (not artifacts_cold or continuation) and not verified:
+                outcome.pop("repair_checkpoint", None)
+                # Compile the final chain and capture its native output map. New tasks
+                # leave full checks to staging; older tasks retain their assigned checks.
                 state.write("verifying", attempt=attempt, tip=tip)
                 verification = repair_audit.verify(
                     worktree,
@@ -2273,6 +2523,8 @@ def _run_task(
                     logdir=logdir,
                     lake=tuple(cfg.lake),
                     timeout=cfg.build_timeout,
+                    audits=True,
+                    defer_when=staging_checks,
                 )
                 outcome.setdefault("verification", []).append(
                     {k: v for k, v in verification.items() if k != "diagnostics"}
@@ -2289,6 +2541,10 @@ def _run_task(
                 checks = verification.get("checks") or {}
                 if checks.get("status") == "unavailable":
                     log(f"task {task.task_id}: audits unavailable ({checks.get('reason')}); CI runs them")
+                    if continuation:
+                        return release_task(
+                            cfg, client, task, state, "artifacts_unavailable", checks.get("reason"), outcome, lease
+                        )
                 if not verification["ok"]:
                     detail = "The worker's verification of the chain failed:\n" + repair_audit.format_findings(
                         verification["diagnostics"]
@@ -2304,10 +2560,28 @@ def _run_task(
                         )
                         log(f"attempt {attempt}: verification failed; running the agent on its findings")
                         continue
-                    return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
+                    if not (
+                        task.extra.get("can_checkpoint_repair")
+                        and verification.get("build", {}).get("rc") == 0
+                        and checks.get("status") == "failed"
+                        and verification["diagnostics"]
+                        and all(d.get("kind") in ("audit", "lint") for d in verification["diagnostics"])
+                    ):
+                        return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
+                    outcome["repair_checkpoint"] = {
+                        "tip": tip,
+                        "diagnostics": [
+                            {**finding, "message": finding["message"][:2000]}
+                            for finding in verification["diagnostics"][:20]
+                        ],
+                    }
             if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost before the push")
-            if cfg.publish.when == "before" and (outcome.get("publish") or {}).get("revision") != tip:
+            if (
+                cfg.publish.when == "before"
+                and not staging_checks()
+                and (outcome.get("publish") or {}).get("revision") != tip
+            ):
                 outcome["publish"] = repair_publish.publish_outputs(
                     worktree,
                     tip,
@@ -2317,14 +2591,15 @@ def _run_task(
                     repository=task.repository,
                     lake=cfg.lake,
                 )
+            state.write(
+                "delivery_pending", delivery=delivery_identity(cfg, task, tip), outcome=outcome, next_retry_at=0
+            )
             push = push_result(cfg, task, worktree, tip, logdir, pushed)
             outcome["push"] = {k: v for k, v in push.items() if "load" not in k}
             if not push["ok"]:
-                return release_task(
-                    cfg, client, task, state, "push_failed", f"git-safe-push exited {push['rc']}", outcome, lease
-                )
+                return defer_delivery(f"git-safe-push exited {push['rc']}")
             pushed = tip
-            state.write("pushed", tip=tip, pushed_ref=push["ref"])
+            state.write("pushed", tip=tip, pushed_tip=tip, pushed_ref=push["ref"], outcome=outcome)
             if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost after the push")
             notes = {
@@ -2341,21 +2616,61 @@ def _run_task(
             )
             if verification_note is not None:
                 notes["admission_verification"] = verification_note
+            if task.kind == "pre_rebase":
+                for result in reversed(outcome.get("verification", [])):
+                    checks = result.get("checks") or {}
+                    build_only = (
+                        staging_checks() and checks.get("status") != "passed" and result.get("build", {}).get("rc") == 0
+                    )
+                    if (
+                        result.get("tip") == tip
+                        and result.get("ok") is True
+                        and (build_only or checks.get("status") == "passed")
+                    ):
+                        tools = checks.get("tools")
+                        if build_only:
+                            try:
+                                repo, ref = repair_audit.tools_pin(worktree)
+                                tools = f"{repo}@{ref}"
+                            except repair_audit.Unavailable:
+                                break
+                        notes["pre_rebase_verification"] = {
+                            "tip": tip,
+                            "base": task.validation_base,
+                            "tools": tools,
+                            "scope": "build" if build_only else "full",
+                        }
+                        break
             if task.kind == "prepare":
                 notes["remaining_errors"] = prepare_remaining_errors(outcome.get("parallel"), findings, worktree)
+            checkpoint = outcome.get("repair_checkpoint") or {}
+            saving_checkpoint = checkpoint.get("tip") == tip
+            submit_options = {"checkpoint": True} if saving_checkpoint else {}
+            if saving_checkpoint:
+                notes["repair_checkpoint"] = checkpoint["diagnostics"]
             lease.submitting.set()
             try:
                 response = with_retries(
-                    functools.partial(client.submit, task, tip, push["ref"], notes),
+                    functools.partial(client.submit, task, tip, push["ref"], notes, **submit_options),
                     attempts=cfg.service_attempts,
                     delays=cfg.service_delays,
                     what="result",
                 )
+            except EndpointMissing as error:
+                return release_task(cfg, client, task, state, "agent_failed", str(error), outcome, lease)
             except ClaimRefused as error:
                 return discard(f"result refused: {error}")
+            except ServiceError as error:
+                return defer_delivery(f"result response unavailable: {error}")
             state.write("submitted", attempt=attempt, response=response)
             outcome["response"] = response
             reason = str(response.get("reason") or "")
+            if reason == REPAIR_CHECKPOINT:
+                lease.stop()
+                outcome.update(status="released", reason=REPAIR_CHECKPOINT, tip=tip, pushed_ref=push["ref"])
+                state.write("released", outcome=outcome)
+                publish_after(tip)
+                return outcome
             if response.get("accepted"):
                 lease.stop()
                 outcome.update(status="adopted", tip=tip, pushed_ref=push["ref"], version=response.get("version"))
@@ -2433,7 +2748,11 @@ def _run_task(
         outcome["lease"] = {"renewals": lease.renewals, "errors": lease.errors, "lost": lease.lost.is_set()}
         # An interrupted task keeps its worktree: the next start resumes the agent in it. A background
         # publication owns it from its start and removes it when done.
-        if not cfg.keep_worktree and outcome.get("status") not in ("error", "interrupted") and not background:
+        if (
+            not cfg.keep_worktree
+            and outcome.get("status") not in ("error", "interrupted", "delivery_pending")
+            and not background
+        ):
             with contextlib.suppress(Exception):
                 repair.remove_worktree(cfg.clone, worktree)
         with contextlib.suppress(Exception):
@@ -2588,13 +2907,61 @@ def resume_pending(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None =
         try:
             task.expires_at = client.renew(task)
         except ClaimRefused as error:
+            # Submission may have committed before its response was lost. Ask for
+            # the exact delivery's receipt before treating a released claim as loss.
+            delivery = record.get("delivery") or {}
+            if record.get("pushed_tip") and delivery.get("tip") == record["pushed_tip"]:
+                checkpoint = (record.get("outcome") or {}).get("repair_checkpoint") or {}
+                submit_options = {"checkpoint": True} if checkpoint.get("tip") == record["pushed_tip"] else {}
+                try:
+                    response = client.submit(task, record["pushed_tip"], task.submission_ref, {}, **submit_options)
+                except (ClaimRefused, ServiceError):
+                    continue
+                except EndpointMissing:
+                    response = {}
+                saved = response.get("reason") == REPAIR_CHECKPOINT
+                if response.get("accepted") or saved:
+                    status = "released" if saved else "adopted"
+                    outcome = dict(
+                        record.get("outcome") or {},
+                        status=status,
+                        tip=record["pushed_tip"],
+                        response=response,
+                        version=response.get("version"),
+                    )
+                    if saved:
+                        outcome["reason"] = REPAIR_CHECKPOINT
+                    # A lost reply must not skip publication's submission-time
+                    # fallback. Freeze any surviving outputs before terminal cleanup.
+                    from tauceti_queue.repair_cache import cache_lease, task_cache
+                    from tauceti_queue.repair_cleanup import worktree_lease
+
+                    worktree = cfg.root / "worktrees" / f"task-{task.task_id}"
+                    with cache_lease(task_cache(cfg.root, task.task_id)), worktree_lease(cfg.root, task.task_id):
+                        if worktree.is_dir():
+                            env = repair.lake_env(cfg.root, cache_root=task_cache(cfg.root, task.task_id))
+                            publication = repair_publish.start_early(worktree, env)
+                            if publication is not None:
+                                outcome["publish"] = publication
+                    state.write(status, outcome=outcome)
+                    outcomes.append(outcome)
+                    if not cfg.keep_worktree:
+                        with contextlib.suppress(Exception):
+                            repair.remove_worktree(cfg.clone, cfg.root / "worktrees" / f"task-{task.task_id}")
+                    continue
             state.write("claim_lost", detail=f"resume: {error}")
+            if not cfg.keep_worktree:
+                with contextlib.suppress(Exception):
+                    repair.remove_worktree(cfg.clone, cfg.root / "worktrees" / f"task-{task.task_id}")
             log(f"task {task.task_id}: claim no longer ours; not resumed")
             continue
         except ServiceError as error:
             log(f"task {task.task_id}: renew failed during resume ({error}); will retry on the next start")
             continue
-        if record.get("state") not in RESUMABLE_STATES:
+        if record.get("delivery"):
+            if record.get("next_retry_at", 0) > time.time():
+                continue
+        elif record.get("state") not in ("agent_running", "interrupted"):
             # Claimed and stopped before the agent ran (or past the agent, mid-submission): nothing
             # to continue; give the claim back now and claim fresh rather than hold it to expiry.
             log(
@@ -2860,7 +3227,7 @@ def serve(
         """Wait before the next claim when a task was released for want of artifacts; the service
         re-exposes the same task at once, and nothing publishes its cache within seconds."""
         nonlocal artifacts_wait
-        if outcome.get("reason") != "artifacts_unavailable":
+        if outcome.get("reason") not in ("artifacts_unavailable", "submission_unavailable"):
             artifacts_wait = 0.0
             return
         first, cap = cfg.artifacts_backoff
@@ -2884,6 +3251,13 @@ def serve(
     while not stop.is_set():
         outcome = None
         try:
+            deliveries = [r for _, r in in_flight_checkpoints(cfg) if r.get("delivery")]
+            if deliveries:
+                for completed in resume_pending(cfg, client, stop=stop):
+                    record(completed)
+                write_heartbeat(cfg, summary, "delivery")
+                stop.wait(cfg.poll_seconds)
+                continue
             settled = retry_releases(cfg, client, stop=stop)
             if settled:
                 summary["releases_settled"] = summary.get("releases_settled", 0) + len(settled)

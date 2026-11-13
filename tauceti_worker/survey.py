@@ -15,6 +15,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from tauceti_tools.forge import RepositoryRef
+
 from .config import Config, log, roadmap_only, roadmap_skip
 from .config import max_open_prs as configured_max_open_prs
 from .constants import (
@@ -59,6 +61,12 @@ from .survey_facts import in_scope, roadmap_focuses, target_focuses
 
 class RebaseBudgetUnavailable(ValueError):
     """Existing retry evidence could not be read safely."""
+
+
+# How long an engine "already published at this head" result suppresses re-dispatching a PR whose
+# review history is incomplete. A new push changes the head and is reviewed at once; the TTL bounds
+# how late a contest reply on such a PR is noticed while its history is still being filled in.
+UNCHANGED_REVIEW_TTL = 6 * 3600
 
 
 class Counters:
@@ -107,6 +115,20 @@ class Counters:
         v = self.read(name) + 1
         self.write(name, v)
         return v
+
+    def record_unchanged_review(self, pr: int, head: str) -> None:
+        """Remember that the review engine found this head's verdict already published."""
+        self._atomic_write(f"review-unchanged-{pr}.json", json.dumps({"head": head, "at": time.time()}))
+
+    def unchanged_review_recent(self, pr: int, head: str, ttl: float = UNCHANGED_REVIEW_TTL) -> bool:
+        """Whether the engine recently found `head`'s verdict already published. A partial history
+        cannot show that, so without this record the same PRs are re-dispatched on every pass."""
+        try:
+            value = json.loads((self.state / f"review-unchanged-{pr}.json").read_text())
+            at = float(value["at"])
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+        return value.get("head") == head and 0 <= time.time() - at < ttl
 
     def foreign_repair_launched(self, pr: int) -> bool:
         # An unreadable/malformed receipt still consumes the optional canary.
@@ -185,9 +207,31 @@ TARGET_MARKER_RE = re.compile(r"<!--tauceti-target:v1 (\{[^}]*\})-->")
 TARGET_ID_RE = re.compile(r'"id"\s*:\s*"([^"]+)"')
 
 
+def _unchanged_review_recent(counters, pr: int, head: str) -> bool:
+    check = getattr(counters, "unchanged_review_recent", None)
+    return bool(check and check(pr, head))
+
+
 def target_marker_focuses(body: str) -> tuple[str, ...]:
     """Concrete roadmap focuses in target markers; all/auto are scopes, not roadmap area names."""
     return tuple(target_focuses(body))
+
+
+def work_target_keys(body):
+    result = set()
+    for match in TARGET_MARKER_RE.finditer(body):
+        try:
+            target = json.loads(match[1])
+        except ValueError:
+            continue
+        if all(isinstance(target.get(key), str) and target[key] for key in ("focus", "id")):
+            result.add(json.dumps([target["focus"], target["id"]], separators=(",", ":")))
+    return tuple(sorted(result))
+
+
+def origin_pr_url(body):
+    match = re.search(r"^Origin-PR:\s*(https?://[^\s]+)\s*$", body, re.M | re.I)
+    return match[1].rstrip("/") if match else ""
 
 
 @dataclass(frozen=True)
@@ -217,6 +261,8 @@ class PRInfo:
     updated_at: str = ""
     bump_integration_failed: bool = False
     self_tested: bool = False
+    work_targets: tuple[str, ...] = ()
+    origin_pr: str = ""
 
     @property
     def review_ready(self) -> bool:
@@ -279,6 +325,8 @@ class PRInfo:
             build_status_at=max([t for t in posted if t is not None], default=None),
             updated_at=str(d.get("updatedAt") or ""),
             self_tested=local,
+            work_targets=work_target_keys(d.get("body", "")),
+            origin_pr=origin_pr_url(d.get("body", "")),
             bump_integration_failed=any(
                 c.get("context") == "bump-integration" and c.get("state") in BUILD_FAIL for c in rollup
             ),
@@ -299,8 +347,11 @@ class Candidate:
     rebase_budget_key: str = ""  # immutable budget chosen by this survey, including its verified progress epoch
     foreign_repair_base: str = ""  # explicit one-PR operator scope; never adds the fork to other stages
     bump_integration_failure: bool = False
+    bump_pending: bool = False  # an automatic bump taken before its build finished
     final_resolution: bool = False  # existing own-PR fix budget is spent; resolve or close
     partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
+    source_repository: RepositoryRef | None = None
+    source_repository_id: int | None = None
     progress: dict | None = field(
         default=None, repr=False, compare=False
     )  # current claimed-PR baseline; never persisted
@@ -766,9 +817,11 @@ def survey(
         roadmap_skip=roadmap_skip(),
     )
     if getattr(gh, "direct_source", False) is True:
-        from .source_survey import inventory_survey
+        from .source_survey import inventory_survey, worker_survey
 
-        return inventory_survey(
+        consumer = worker_survey if getattr(gh, "worker_capable", False) is True else inventory_survey
+        runtime = {"rs": rs, "counters": counters} if consumer is worker_survey else {}
+        return consumer(
             cfg,
             gh,
             roadmap=sv.roadmap_only,
@@ -777,6 +830,7 @@ def survey(
             stages=enabled,
             numbers=numbers,
             count_all_roadmaps=count_all_roadmaps,
+            **runtime,
         )
     compact = []
     if seed := getattr(rs, "seed_survey", None):
@@ -854,6 +908,66 @@ def survey(
     # reads no review state at all and its callers need not supply one.
     if rs is not None:
         rs.observe(prs)
+    classify_survey(
+        cfg,
+        gh,
+        rs,
+        counters,
+        sv,
+        enabled=enabled,
+        deep=deep,
+        compact=compact,
+        cached_only=cached_only,
+        allow_queue_owned=bool(numbers),
+    )
+    if deep:
+        from .github_transport import event
+
+        event(
+            {
+                "kind": "survey_result",
+                "source": "compact" if available else "direct",
+                "roadmap": sv.roadmap_only,
+                "prs": len(prs),
+                "inventory_prs": len(raw),
+                "elapsed_ms": round((time.monotonic() - began) * 1000),
+                "issue_gaps": sum(not row["review"]["issue_complete"] for row in compact or []),
+                "review_gaps": sum(not row["review"]["review_complete"] for row in compact or []),
+            }
+        )
+    return sv
+
+
+def classify_survey(
+    cfg,
+    gh,
+    rs,
+    counters,
+    sv,
+    *,
+    enabled,
+    deep=True,
+    compact=(),
+    cached_only=False,
+    review_without_ci=False,
+    supports_external_repair=True,
+    pending=None,
+    allow_queue_owned=False,
+):
+    """One scheduling policy over normalized inventory and source capabilities.
+
+    Review admission can precede execution evidence on an explicitly configured
+    source; this never sets build_success or grants queue/CI authority.
+    """
+    from .review_runtime import pending_reviews
+
+    enabled = set(enabled)
+    pending = (pending_reviews(cfg) if deep else set()) if pending is None else pending
+    prs = sv.open_prs
+
+    def review_ready(pr):
+        return pr.review_ready or review_without_ci
+
     nondraft = [
         p
         for p in prs
@@ -863,20 +977,21 @@ def survey(
             and {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
         )
     ]
-    me_login = me()
+    me_login = sv.me_login or me()
     sv.me_login = me_login
-    mine = [p for p in nondraft if p.author == me_login]
+    mine = [p for p in nondraft if sv.owns(p)]
     # Tend our own PRs, plus bot PRs hosted on canonical when this identity can push there. Only query
     # that permission while such a bot PR is open; an unknown result skips optional bot work this round.
     bot_on_canonical = bool(enabled & {"rebase", "fix", "fix-ci", "bump", "lint-repair"}) and any(
         p.author_is_bot and p.head_owner == TAUCETI_OWNER for p in nondraft
     )
-    tend_bot = bot_on_canonical and can_push(TAUCETI) is True
+    tend_bot = supports_external_repair and bot_on_canonical and can_push(TAUCETI) is True
     tended = [
         p
         for p in nondraft
-        if (p.author == me_login or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER))
+        if (sv.owns(p) or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER))
         and not {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
+        and (allow_queue_owned or "bors-staging" not in {label.lower() for label in p.labels})
     ]
     facts = {row["pr"]["number"]: row["review"] for row in compact or []}
     gaps: set[int] = set()
@@ -891,12 +1006,12 @@ def survey(
         return ready
 
     sv.n_open_nondraft = len(nondraft)
-    sv.n_reviewable = sum(1 for p in nondraft if p.review_ready)
+    sv.n_reviewable = sum(1 for p in nondraft if review_ready(p))
     sv._mine_open_prs = mine
     sv.rescope_roadmap()
     # Bucket open non-draft PRs by the STATUS_LABELS pipeline (fixed order), pairing each label's
     # total with the subset this identity authored, for the per-round "open PRs" line.
-    sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login)
+    sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login, owns=sv.owns)
 
     # 1) rebase: tended (ours or bot-authored), conflicting or a sweep handoff for
     #    this exact head, under the per-PR budget since last verified progress.
@@ -904,7 +1019,7 @@ def survey(
     #    exists, so rebase owns the git conflict on those too. No review-round gate: a conflicting PR
     #    is rebased until it merges or CI retires it.
     foreign_repairs = []
-    if "rebase" in enabled:
+    if "rebase" in enabled and supports_external_repair:
         from .repair_route import authorize, target
 
         scope = target()
@@ -989,7 +1104,9 @@ def survey(
     for p in nondraft if "review" in enabled else []:
         if {label.lower() for label in p.labels} & {"hold", "wip", "human", "on-hold"}:
             continue
-        if not p.review_ready:
+        if not review_ready(p) or (p.number, p.head_oid) in pending:
+            continue
+        if _unchanged_review_recent(counters, p.number, p.head_oid):
             continue
         if not deep:
             sv.reviewable.actionable.append(
@@ -1002,7 +1119,11 @@ def survey(
             # A partial projection is not an empty history. Let the review engine
             # inspect the selected PR and coordinate its real per-head claim.
             # Author-action PRs are handled by their writer instead.
-            if "awaiting-author" not in p.labels and "ready-to-merge" not in p.labels:
+            if (
+                "awaiting-author" not in p.labels
+                and "ready-to-merge" not in p.labels
+                and not _unchanged_review_recent(counters, p.number, p.head_oid)
+            ):
                 c = Candidate(
                     p.number,
                     p.head_oid,
@@ -1015,6 +1136,9 @@ def survey(
                 (sv.reviewable.suppressed if c.attempts >= c.budget else sv.reviewable.actionable).append(c)
             continue
         m = rs.gh_meta(p.number)
+        if m.provenance in {"stale", "fetch_failed"}:
+            gaps.add(p.number)
+            continue
         if rs.ledger_clean_head(p.number) != p.head_oid:
             # normal review path: the head moved or the last round errored.
             c = Candidate(
@@ -1087,7 +1211,7 @@ def survey(
             if not history_ready(p):
                 # Preserve the existing fallback for build-green PRs with
                 # incomplete history; a label alone is not a current finding.
-                if p.review_ready and "awaiting-author" in p.labels:
+                if review_ready(p) and "awaiting-author" in p.labels:
                     c = Candidate(
                         p.number,
                         p.head_oid,
@@ -1115,7 +1239,7 @@ def survey(
             disp, why = fix_disposition(
                 meta,
                 p.head_oid,
-                p.review_ready,
+                review_ready(p),
                 blocking,
                 per_head,
                 pending_contest=pending_contest,
@@ -1166,11 +1290,15 @@ def survey(
     #    out from under the last-known-good bump and TauCeti/ needs adapting. We adapt it; we never
     #    author a bump (the bot owns opening them, CI owns merging the green ones). This is the
     #    bump-specific CI-fixer: fix-ci defers a red bump PR here (rebase still owns its conflicts and
-    #    fix still owns its review findings).
+    #    fix still owns its review findings). An automatic bump is also taken while its build is
+    #    still PENDING: a full rebuild against a new Mathlib takes hours of CI, and a worker with a
+    #    warm cache finds the breakage in minutes. It stays actionable until CI is green or a round
+    #    has verified the head locally (`self-tested`).
     for p in tended if "bump" in enabled else []:
         integration = p.build_success and p.bump_integration_failed
         branch = p.head_ref.startswith(BUMP_HEAD_PREFIX) or (integration and p.head_ref == "hopscotch/lkg-bump")
-        if not (branch and (p.needs_ci_repair or integration)):
+        pending = p.automatic_bump and not (p.build_success or p.build_failed or p.self_tested)
+        if not (branch and (p.needs_ci_repair or integration or pending)):
             continue
         if {label.lower() for label in p.labels} & {
             "keep",
@@ -1185,13 +1313,21 @@ def survey(
         c = Candidate(
             p.number,
             p.head_oid,
-            "bump-mathlib, singleton integration failed" if integration else "bump-mathlib, build red",
+            "bump-mathlib, singleton integration failed"
+            if integration
+            else "bump-mathlib, build pending"
+            if pending
+            else "bump-mathlib, build red",
             bump_integration_failure=integration,
+            bump_pending=pending,
         )
         per_head = counters.read(f"bump-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"bump-pr-{p.number}")
         c.attempts, c.budget = per_head, MAX_BUMP_ATTEMPTS
-        if not p.automatic_bump and (per_head >= MAX_BUMP_ATTEMPTS or per_pr >= MAX_BUMP_PR_ATTEMPTS):
+        # One round per pending head; once CI fails, the ordinary red-build retries apply.
+        if (pending and per_head) or (
+            not p.automatic_bump and (per_head >= MAX_BUMP_ATTEMPTS or per_pr >= MAX_BUMP_PR_ATTEMPTS)
+        ):
             sv.bump.suppressed.append(c)
         else:
             sv.bump.actionable.append(c)
@@ -1240,30 +1376,32 @@ def survey(
     sv.discovery_gaps = len(gaps)
     sv.discovery_gap_prs = sorted(gaps)
     sv.next_auto_stage = _next_auto_stage(sv)
-    if deep:
-        from .github_transport import event
-
-        event(
-            {
-                "kind": "survey_result",
-                "source": "compact" if available else "direct",
-                "roadmap": sv.roadmap_only,
-                "prs": len(prs),
-                "inventory_prs": len(raw),
-                "elapsed_ms": round((time.monotonic() - began) * 1000),
-                "issue_gaps": sum(not row["review"]["issue_complete"] for row in compact or []),
-                "review_gaps": sum(not row["review"]["review_complete"] for row in compact or []),
-            }
-        )
     return sv
+
+
+def bump_prs(sv: Survey) -> set[int]:
+    """Open automatic Mathlib bump PRs in this survey."""
+    return {p.number for p in sv.open_prs if p.automatic_bump}
+
+
+def cascade(sv: Survey, stages) -> list[tuple[str, Candidate]]:
+    """Actionable (stage, candidate) pairs in the order a round offers them.
+
+    Every stage's work on an automatic Mathlib bump comes first, in stage order: its conflicts,
+    red build, review findings and pending reviews. Main moves faster than an ordinary queue
+    position allows a bump round to start, so a bump that waits behind unrelated work goes stale
+    again before it can be admitted. Everything else follows in the usual stage order.
+    """
+    bumps = bump_prs(sv)
+    pairs = [(stage, c) for stage in stages for c in sv.kind(stage).actionable]
+    return [pair for pair in pairs if pair[1].pr in bumps] + [pair for pair in pairs if pair[1].pr not in bumps]
 
 
 def _next_auto_stage(sv: Survey) -> str | None:
     if hasattr(sv, "source_repository"):
         return None  # Source inventory supplies no scheduling or publication authority.
-    for stage in AUTO_STAGES:
-        if sv.kind(stage).actionable:
-            return stage
+    for stage, _ in cascade(sv, AUTO_STAGES):
+        return stage
     if not sv.roadmap_backpressure:
         return "roadmap"
     return None

@@ -497,6 +497,72 @@ class Repair(QueueFixture):
 
 
 class EmptyContributions(QueueFixture):
+    def assert_unrelated_history_still_rejects(self, message, *, empty=False):
+        self.repaired_empty()
+        self.repo.advance_main({} if empty else {"Other.lean": "other\n"}, message=message)
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "empty-commit")
+        self.assertEqual(self.controller.status()["counters"].get("prs_rejected", 0), 1)
+        self.assertNotIn("successfully merged", self.github.comments_for(101)[0]["body"])
+
+    def test_a_pr_reference_in_a_commit_body_is_not_landing_evidence(self):
+        self.assert_unrelated_history_still_rejects("Other change\n\nFollow-up to cleanup (#101)")
+
+    def test_a_foreign_trailer_takes_precedence_over_the_subject(self):
+        self.assert_unrelated_history_still_rejects("Other change (#101)\n\nSource-PR: other/repo#101")
+
+    def test_a_native_trailer_does_not_land_a_github_pr_with_the_same_number(self):
+        self.assert_unrelated_history_still_rejects(
+            "Other change (#101)\n\nSource-PR: forgejo:example.test/library#101"
+        )
+
+    def test_an_earlier_empty_placeholder_is_not_landing_evidence(self):
+        self.assert_unrelated_history_still_rejects("Change 101 (#101)", empty=True)
+
+    def test_external_merge_is_recognized_without_a_staging_landing_note(self):
+        self.github.ci_policy = verdicts("fail")
+        self.approve(101, {"A.lean": "a\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        agent = self.agent(
+            script=lambda task: {f"{PROJECT}#101": Resolution(empty=True, explanation="Dropped A during repair.")}
+        )
+        self.assertTrue(agent.run(self.controller).accepted)
+        # An independent merge is already in the batch base when its repaired empty commit lands.
+        landing = self.repo.advance_main({"A.lean": "a\n"}, message="Change 101 (#101)")
+        self.github.ci_policy = verdicts()
+        with patch.object(chain, "landed_message", side_effect=lambda message, sha: message):
+            self.tick()
+        head = self.head()
+        self.assertEqual(head["base"], landing)
+        commit = next(c for c in self.chain_commits(head) if c.source_pr == f"{PROJECT}#101")
+        self.assertFalse(chain.carries_landed_note(commit.message))
+        self.assertTrue(self.controller._commit_empty(commit.sha))
+        self.run_ci()
+        self.tick(2)
+        row = self.controller.input_for(PROJECT, 101)
+        self.assertEqual(row["state"], "landed")
+        self.assertEqual(self.controller.status()["counters"]["prs_landed"], 2)
+        self.assertEqual(self.controller.status()["counters"].get("prs_rejected", 0), 0)
+        self.assertIn("successfully merged", self.github.comments_for(101)[0]["body"])
+        self.assertNotIn("repaired-in-queue", self.github.labels[101])
+        self.assertFalse(self.controller.store.rows("outbox", {"key": f"rejected-close:{head['id']}:101"}))
+
+    def test_external_merge_lookup_failure_defers_landing_instead_of_rejecting(self):
+        head = self.repaired_empty()
+        self.github.update_ref(PROJECT, "refs/heads/main", head["tip"])
+        with patch.object(chain, "landed_prs", side_effect=chain.ChainError("history temporarily unavailable")):
+            with self.assertRaises(chain.ChainError):
+                self.tick()
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
+        self.assertFalse(self.controller.store.rows("outbox", {"key": f"rejected-close:{head['id']}:101"}))
+        self.tick(2)
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "empty-commit")
+
     def repaired_empty(self, count=1):
         self.github.ci_policy = verdicts("fail")
         for number in range(101, 101 + count):
@@ -970,9 +1036,8 @@ class HeadOperations(QueueFixture):
         self.assertEqual(self.repo.main_sha(), head["tip"])
         self.assertEqual(self.repo.file_at("main", "A.lean"), "a\n", "the accepted head landed, not the later push")
 
-    def test_infrastructure_failures_are_retried_with_backoff_and_bounded(self):
+    def test_infrastructure_failures_retry_with_capped_backoff_until_recovery(self):
         self.github.ci_policy = verdicts("infrastructure", "lost", "no-status", "infrastructure")
-        self.controller.set_setting("infrastructure_retry_limit", 3, "t")
         self.approve(101, {"A.lean": "a\n"})
         self.tick()
         head = self.head()
@@ -1003,15 +1068,15 @@ class HeadOperations(QueueFixture):
         self.run_ci()
         self.clock.advance(8 * backoff + 1)
         reasons = self.tick()
-        self.assertEqual(len(self.github.dispatches), 4, "bounded: the fourth infrastructure failure stops re-dispatch")
-        self.assertIn("retries exhausted", " ".join(reasons))
+        self.assertEqual(len(self.github.dispatches), 4, "the fourth failure was just observed")
+        self.assertNotIn("exhausted", " ".join(reasons))
         self.assertEqual(self.head()["id"], head["id"], "the head waits with its membership intact")
         self.assertEqual(
             self.controller.status()["counters"].get("tasks_repair", 0), 0, "infrastructure never makes a repair task"
         )
-        self.controller.retry_ci(PROJECT, "operator")
+        self.clock.advance(8 * backoff + 1)
         self.tick()
-        self.assertEqual(len(self.github.dispatches), 5)
+        self.assertEqual(len(self.github.dispatches), 5, "retries continue without an operator")
         self.run_ci()
         self.tick(2)
         self.assertEqual(self.repo.main_sha(), head["tip"])
@@ -1528,23 +1593,21 @@ class Preparation(QueueFixture):
         batch, agent = self.scenario(prepare=True)
         result = agent.run(self.controller)
         self.assertEqual(agent.tasks[0].kind, "prepare")
-        self.assertEqual((agent.tasks[0].base, agent.tasks[0].onto), (batch["base"], batch["base"]))
+        self.assertEqual((agent.tasks[0].base, agent.tasks[0].onto), (self.head()["tip"], self.head()["tip"]))
         self.assertTrue(result.accepted, result)
         prepared = self.controller.store.row("batches", {"id": batch["id"]})
-        self.assertEqual((prepared["state"], prepared["prepared_version"]), ("open", prepared["version"]))
+        self.assertEqual((prepared["state"], prepared["pre_rebase_prepared"]), ("open", result.tip))
         self.drive_until_landed(batch, [agent])
         landed = self.controller.store.row("batches", {"id": batch["id"]})
         self.assertEqual(landed["state"], "landed")
         self.assertEqual(self.source_failures(batch), 0, "the head's CI round found nothing left to repair")
-        self.assertEqual(
-            [t.kind for t in agent.tasks], ["prepare", "prepare"], "no repair round for the prepared batch"
-        )
+        self.assertEqual([t.kind for t in agent.tasks], ["prepare"], "one intended-parent preparation, no repair round")
         self.assertEqual(
             ["pre_rebased" in t.extra for t in agent.tasks],
-            [False, True],
-            "prepared on its own base, then its pre-rebased chain on the head's tip",
+            [True],
+            "prepared directly on the head's tip",
         )
-        stacked = agent.results[1]
+        stacked = agent.results[0]
         self.assertTrue(stacked.accepted, stacked)
         attempts = self.controller.store.rows("ci_attempts", {"batch_id": batch["id"]}, order="id")
         self.assertEqual(attempts[0]["head_sha"], stacked.tip, "CI ran on the exact prepared tip")
@@ -1638,6 +1701,7 @@ class SequencedBackgroundTasks(QueueFixture):
 
     def test_the_pre_rebase_follows_the_preparation_and_seals_with_both(self):
         self.controller.set_setting("prepare_min_members", 2, "t")
+        self.controller.set_setting("pre_rebase_enabled", False, "t")
         self.github.ci_policy = lambda head, _base, members: (
             ("fail", [{"kind": "compiler", "module": "TauCeti/P203.lean", "message": "error in PR 203"}])
             if "BROKEN" in (self.repo.file_at(head, "TauCeti/P203.lean") or "")
@@ -1650,7 +1714,7 @@ class SequencedBackgroundTasks(QueueFixture):
         self.approve(203, {"TauCeti/P203.lean": "BROKEN\n"})
         self.tick()
         batch = self.open_batch()
-        self.assertEqual(batch["pre_rebase_state"], "conflict")
+        self.assertEqual(batch["pre_rebase_state"], "")
         self.assertEqual(self.controller.store.count("tasks", {"kind": "pre_rebase"}), 0, "not before preparation")
         self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
         self.tick()
@@ -1666,6 +1730,7 @@ class SequencedBackgroundTasks(QueueFixture):
         )
         self.assertTrue(preparer.run(self.controller).accepted)
         self.assertEqual(preparer.tasks[0].kind, "prepare")
+        self.controller.set_setting("pre_rebase_enabled", True, "t")
         self.tick()
         prepared = self.open_batch()
         pre_rebase = self.controller.store.row("tasks", {"kind": "pre_rebase", "state": "open"})

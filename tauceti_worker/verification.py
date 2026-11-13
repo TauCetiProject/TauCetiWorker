@@ -37,7 +37,7 @@ from .verification_scope import git, local_main, scope, untracked
 from .verification_storage import Pressure, cache_generation
 
 SCHEMA = "tauceti-verification/v1"
-POLICY_VERSION = 6
+POLICY_VERSION = 7
 LOCAL_CHECKERS = ("tauceti-local-axioms", "tauceti-local-lint", "tauceti-local-checks")
 HASH_CACHE_LIMIT = 200000
 _HASH_CACHE = contextvars.ContextVar("verification_hash_cache", default=None)
@@ -218,8 +218,12 @@ def cache_root() -> Path:
 def files_under(root: Path):
     if not root.exists():
         return
+    # Stock Lake may place generated artifact downloads below its installation.
+    # These hash-addressed cache outputs are not compiler/distribution inputs;
+    # other workers can populate them while this build is being verified.
+    cache = root / "lake/cache" if (root / "bin/lean").is_file() else None
     for directory, dirs, files in os.walk(root, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if d not in {".git", ".lake", "__pycache__"})
+        dirs[:] = sorted(d for d in dirs if d not in {".git", ".lake", "__pycache__"} and Path(directory) / d != cache)
         for name in sorted(files + [d for d in dirs if (Path(directory) / d).is_symlink()]):
             # Lake writes these ignored input-file digests while restoring ProofWidgets.
             # Their source JSON files remain inputs; creating/replacing a derived digest
@@ -417,6 +421,9 @@ class Verification:
             raise Incomplete("dependency, toolchain or verifier mutated during verification")
 
     def command(self, phase, argv, *, env=None, capture=False):
+        from .verification_resources import defaults
+
+        env = defaults(dict(os.environ if env is None else env))
         self.watch()
         report_runtime("verifying", verification_phase=phase, verification_receipt=str(self.path))
         log = self.directory / f"{len(self.receipt['commands']):03d}-{phase}.log"
@@ -446,7 +453,16 @@ class Verification:
                             data = progress.read()
                             offset += len(data)
                             if data:
-                                print(data.decode(errors="replace"), file=sys.stderr, end="", flush=True)
+                                decoded = data.decode(errors="replace")
+                                print(decoded, file=sys.stderr, end="", flush=True)
+                                from .verification_resources import RESOURCE_ERROR, record_wait
+
+                                if RESOURCE_ERROR.search(decoded):
+                                    record_wait("build tool could not create threads; host resource exhaustion")
+                                    raise Incomplete(
+                                        "build tool resource exhaustion; preserve candidate and retry after backoff",
+                                        reason="resource-pressure",
+                                    )
                     self.watch()
                     if capture and time.time() - entry["started_at"] > 300:
                         raise Incomplete(f"{phase}: toolchain probe timed out")
@@ -463,6 +479,14 @@ class Verification:
                 self.save()
         text = log.read_text(errors="replace")
         captured_text = stdout_path.read_text(errors="replace")
+        from .verification_resources import RESOURCE_ERROR, record_wait
+
+        if entry["exit"] and RESOURCE_ERROR.search(text):
+            record_wait("build tool could not create threads; host resource exhaustion")
+            raise Incomplete(
+                "build tool resource exhaustion; preserve candidate and retry after backoff", reason="resource-pressure"
+            )
+
         if capture:
             entry["stdout_log"] = str(stdout_path)
         # Keep the original audit progress/timing lines verbatim in the receipt and full log.

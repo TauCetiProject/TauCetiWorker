@@ -392,6 +392,16 @@ class ServerTest(unittest.TestCase):
         status, body = self.request("POST", "/tasks/17/renew", {"claim_token": "t1"}, self.bearer("ghp_worker"))
         self.assertEqual((status, body), (200, {"task_id": 17, "expires_at": 1_793_776_000.0}))
         self.assertEqual(self.controller.calls[-1], ("renew_task", 17, "t1"))
+        with patch.object(
+            self.controller,
+            "task_check_policy",
+            create=True,
+            return_value={"checks_owner": "staging", "renew_after": 15},
+        ):
+            status, renewed = self.request("POST", "/tasks/17/renew", {"claim_token": "t1"}, self.bearer("ghp_worker"))
+        self.assertEqual(status, 200)
+        self.assertEqual(renewed["checks_owner"], "staging")
+        self.assertEqual(renewed["renew_after"], 15)
         self.assertEqual(self.request("POST", "/tasks/17/renew", {}, self.bearer("ghp_worker"))[0], 400)
         status, body = self.request("POST", "/tasks/17/renew", {"claim_token": "stale"}, self.bearer("ghp_worker"))
         self.assertEqual((status, body), (409, {"error": "claim-expired", "detail": "the claim expired"}))

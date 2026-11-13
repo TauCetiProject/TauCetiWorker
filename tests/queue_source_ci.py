@@ -38,6 +38,9 @@ class VerifiedExecution:
     def preflight(self, frozen):
         return "fixture-only"
 
+    def caller(self, policy):
+        return self.caller_snapshot
+
     def dispatch(self, frozen, *, prepared=None):
         self.dispatches.append(frozen)
         if self.lost_response:
@@ -381,7 +384,7 @@ class SourceController(unittest.TestCase):
         self.assertEqual(self.execution.dispatches, [frozen])
         self.assertEqual(self.retained, [frozen])
 
-    def test_bad_scope_preflight_exhausts_finite_budget_without_publishing_source_refs(self):
+    def test_bad_scope_preflight_keeps_retrying_without_publishing_source_refs(self):
         def refused(_frozen):
             raise DispatchNotAccepted("credential scope mismatch", retryable=False)
 
@@ -390,7 +393,7 @@ class SourceController(unittest.TestCase):
         for _ in range(8):
             self.clock.advance(3600)
             self.controller.tick()
-        self.assertEqual(self.store.count("ci_attempts"), 1 + self.controller.setting("infrastructure_retry_limit"))
+        self.assertEqual(self.store.count("ci_attempts"), 9)
         self.assertEqual(self.retained, [])
         self.assertEqual(self.execution.dispatches, [])
 

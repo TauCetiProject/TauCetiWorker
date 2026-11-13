@@ -292,9 +292,13 @@ is the run that completed for this attempt, all three `success` (a red `scope` o
 a green `build` is a source failure carrying the status description); anything else (no run within `dispatch_timeout_seconds`, a lost run, a cancelled, timed out or skipped run, a completed run without a bound status, a
 status from another run, a failure whose description starts with `infrastructure` or whose findings
 are all of kind `infrastructure`) is an infrastructure outcome: the candidate is unchanged and is
-re-dispatched after `infrastructure_retry_backoff_seconds * 2^n`, at most
-`infrastructure_retry_limit` times, after which the head waits and status says so (`retry_ci` is the
-operator's reset). A failing status with source findings is a source failure and opens a `repair`
+re-dispatched after `infrastructure_retry_backoff_seconds * 2^min(n,3)`, indefinitely until
+recovery or supersession. There is no infrastructure retry exhaustion. A bound successful build
+with missing policy statuses keeps its original attempt and uses the existing durable outbox to
+replay that run's retained reporting intents. Dispatching recovery is not delivery: the same entry
+is rearmed after ten minutes while statuses remain missing. API failures use the outbox's capped
+backoff; a controller restart does not lose pending work. Compilation is never repeated for this
+reporting-only failure. A failing status with source findings is a source failure and opens a `repair`
 task carrying the findings. A pass enqueues the promotion.
 
 Candidate revisions for published outputs: the repair worker publishes Lake build outputs to the
@@ -365,7 +369,11 @@ Landing side effects replicate bors-ng's squash landing exactly (`lib/worker/bat
 landed commit is the landing evidence; GitHub does not show the PR as merged.
 
 At landing, a final commit whose tree equals its parent's is rejected instead of merged, unless
-it is the existing placeholder for a PR merged externally or an opt-out withdrawal. Its input is
+it is a PR merged externally or an opt-out withdrawal. For an empty commit without a landing note,
+the controller also checks the history from the accepted head's merge base to the batch base for
+a nonempty commit naming the PR. This uses `chain.landed_prs` and `chain.landed_commit`, with the
+same qualified-trailer precedence and GitHub subject rules as chain construction. Git read failures defer landing rather than
+classifying unknown history as rejection. A rejected input is
 `cancelled` with reason `empty-commit`, with no landing time or SHA. The `landed` journal entry
 lists these PRs under `rejected`; `prs_rejected` counts them, merged counters exclude them, and
 their per-PR feed outcome is `canceled`. The rejection comment quotes the explanations already
@@ -460,7 +468,6 @@ and reported in status:
 | `claim_ttl_seconds` | 900 | claim lifetime between renewals |
 | `dispatch_timeout_seconds` | 600 | no run found after a dispatch: infrastructure |
 | `lost_run_seconds` | 14400 | an in-progress run whose jobs and `updated_at` have not moved for this long is lost (CI section above) |
-| `infrastructure_retry_limit` | 3 | re-dispatches per head version after infrastructure failures |
 | `infrastructure_retry_backoff_seconds` | 60 | base of the re-dispatch backoff |
 | `inference_failure_threshold` | 3 | consecutive provider failures that start a hold |
 | `inference_hold_backoff_seconds`, `inference_hold_backoff_max_seconds` | 60, 3600 | hold backoff |
