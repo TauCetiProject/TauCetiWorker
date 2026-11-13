@@ -360,6 +360,9 @@ try:
         check("an expired login that can renew itself is", quota.claude(renew=True).available, True)
         with patch.dict(os.environ, {"TAUCETI_CLAUDE_AGENT_CREDENTIAL": "access-only"}):
             check("unless the agent gets it without its refresh token", quota.claude(renew=True).available, False)
+        # A review rubric renews a copy in a home deleted after the attempt; the original stays expired.
+        with patch.dict(os.environ, {"TAUCETI_CLAUDE_AGENT_CREDENTIAL": "file"}):
+            check("or gets a copy whose renewal is not kept", quota.claude(renew=True).available, False)
         for f in agent_files:
             f.unlink()
         check("a missing agents' file is not", quota.claude(renew=True).available, False)
