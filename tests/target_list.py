@@ -848,6 +848,37 @@ class Wiring(unittest.TestCase):
         argv = spec.work_argv()
         self.assertEqual(argv[argv.index("--roadmap-targets") + 1], "/srv/targets.md")
 
+    def test_a_dashboard_list_given_relative_is_saved_absolute(self):
+        tui = importlib.import_module("tauceti_worker.tui")
+        app = tui._dashboard_app(SimpleNamespace(logdir=Path("/nonexistent"), home=Path("/nonexistent")))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            config = root / "workers.toml"
+            wm.save_worker_specs(config, [wm.WorkerSpec(id="worker1")])
+            fake = SimpleNamespace(
+                sel=tc.ALLOWED_TASKS.index("roadmap"),
+                model_dial="auto",
+                bubble=False,
+                workers_config=config,
+                notify=Mock(),
+                _refresh_workers=Mock(),
+            )
+            cwd = os.getcwd()
+            os.chdir(root)
+            try:
+                with (
+                    patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS": "targets.md"}),
+                    patch.object(wm, "ensure_manager"),
+                ):
+                    type(app)._launch(fake, loop=True, only_selected=True)
+            finally:
+                os.chdir(cwd)
+            first, added = wm.load_worker_specs(config)
+            self.assertEqual(added.roadmap_targets, str(root / "targets.md"))
+            with patch.object(wm, "ensure_manager"):
+                wm.set_worker_enabled(config, "worker1", False)
+            self.assertFalse(wm.load_worker_specs(config)[0].enabled)
+
     def test_workers_toml_key(self):
         spec = wm.WorkerSpec.from_dict({"id": "w", "only": ["roadmap"], "roadmap_targets": "/srv/targets.md"}, 0)
         self.assertEqual(spec.as_dict()["roadmap_targets"], "/srv/targets.md")
