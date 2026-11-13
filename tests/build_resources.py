@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -78,6 +79,25 @@ class Resources(unittest.TestCase):
         with self.assertRaises(Block) as caught:
             backend.policy({}, {"state": "OPEN", "labels": ["bors-staging"]})
         self.assertEqual(caught.exception.code, "queue-owned")
+
+    def test_native_verifier_applies_defaults_to_actual_child_without_mutating_parent(self):
+        from tauceti_worker.verification import Verification
+
+        verifier = Verification(self.root, self.root / "state")
+        verifier.directory.mkdir(parents=True)
+        env = {k: value for k, value in os.environ.items() if k not in v.DEFAULTS}
+        command = [
+            sys.executable,
+            "-c",
+            "import os; print(os.environ['LEAN_NUM_THREADS'], os.environ['RAYON_NUM_THREADS'])",
+        ]
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(verifier.command("test", command, env=env), "4 1")
+            self.assertEqual(
+                verifier.command("test", command, env={**env, "LEAN_NUM_THREADS": "2", "RAYON_NUM_THREADS": "3"}), "2 3"
+            )
+        self.assertNotIn("LEAN_NUM_THREADS", env)
+        self.assertNotIn("RAYON_NUM_THREADS", env)
 
     def test_defaults_preserve_explicit_values(self):
         self.assertEqual(v.defaults({}), {"LEAN_NUM_THREADS": "4", "RAYON_NUM_THREADS": "1"})
