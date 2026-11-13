@@ -814,8 +814,9 @@ CLOSE_ENV = "TAUCETI_DECIDE_CLOSE"
 CLOSES_ENV = "TAUCETI_DECIDE_MAX_CLOSES_PER_DAY"
 CLOSURES = "closures.log"
 _DECLARATION = re.compile(
-    r"\+\s*(?:@\[[^\]]*\]\s*)*((?:(?:private|protected|noncomputable|unsafe|partial|nonrec|scoped|local)\s+)*)"
-    r"(?:theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom)\s+([^\s:({\[⦃]+)"
+    r"^\s*(?:@\[[^\]]*\]\s*)*(?P<modifiers>(?:(?:private|protected|noncomputable|unsafe|partial|nonrec|scoped|local)\s+)*)"
+    r"(?:theorem|lemma|def|abbrev|instance|structure|class(?:\s+inductive)?|inductive|opaque|axiom)\s+"
+    r"(?:\(\s*priority\s*:=[^)]*\)\s*)?(?P<name>[^\s:(\[{⦃⟨⟪|,]+)"
 )
 
 
@@ -828,15 +829,27 @@ def max_closes() -> int:
 
 
 def added_declarations(diff: str, *, private: bool = False) -> set[str]:
-    """The names, as written, of the declarations a unified diff adds to `.lean` files. `private`
-    ones are left out unless asked for."""
+    """The names, as written, of the declarations a unified diff adds to `.lean` files, outside
+    comments. Each hunk's added and unchanged lines are read together, so a comment opened on an
+    unchanged line covers the added lines inside it. `private` ones are left out unless asked for."""
+    from tauceti_queue.repair_context import _strip_comments
+
     names: set[str] = set()
+    hunks: list[list[tuple[bool, str]]] = []
     lean = False
     for line in diff.splitlines():
         if line.startswith("+++ "):
             lean = line.rstrip().endswith(".lean")
-        elif lean and (found := _DECLARATION.match(line)) and (private or "private" not in found.group(1)):
-            names.add(found.group(2))
+            hunks.append([])
+        elif line.startswith("@@"):
+            hunks.append([])
+        elif lean and hunks and line[:1] in ("+", " "):
+            hunks[-1].append((line[0] == "+", line[1:]))
+    for hunk in hunks:
+        for (added, _), line in zip(hunk, _strip_comments([text for _, text in hunk]), strict=True):
+            found = _DECLARATION.match(line) if added else None
+            if found and (private or "private" not in found.group("modifiers").split()):
+                names.add(found.group("name"))
     return names
 
 

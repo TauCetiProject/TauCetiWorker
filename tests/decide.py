@@ -1109,6 +1109,17 @@ def test_close(tmp):
         {"strong_law", "Foo.bar"},
     )
     check("…private ones on request", decide.added_declarations(LEAN, private=True), {"strong_law", "aux"})
+    priority = "+++ b/B.lean\n@@ -1 +1,2 @@\n theorem old : True := trivial\n+instance (priority := 100) extra : Inhabited Nat := ⟨0⟩\n"
+    check("…an instance with a priority clause", decide.added_declarations(priority), {"extra"})
+    commented = (
+        "+++ b/B.lean\n@@ -1,2 +1,6 @@\n /-! An example:\n+theorem in_docs : True := trivial\n -/\n"
+        "+/- another\n+  theorem in_block : True := trivial -/\n+theorem real : True := trivial -- theorem in_line\n"
+    )
+    check(
+        "…but none inside a comment, even one opened on an unchanged line",
+        decide.added_declarations(commented),
+        {"real"},
+    )
 
     root = tmp / "close"
     comment = "Everything here landed through #41, in the same file and under the same names."
@@ -1131,6 +1142,24 @@ def test_close(tmp):
         "under a hold label", attempt(merged(labels=["Do-Not-Close"])), (False, "it carries the label do-not-close", [])
     )
     check("the subsuming one is open", attempt(Hub(p1={}, p41={})), (False, "#41 has not merged", []))
+    covered = "+++ b/A.lean\n@@ -0,0 +1,2 @@\n+theorem covered : True := trivial\n"
+    candidate = covered + "+instance (priority := 100) missingInstance : Inhabited Nat := ⟨0⟩\n"
+    documented = covered + "+/-! For example:\n+theorem missingFact : True := trivial\n+-/\n"
+    check(
+        "a prioritized instance the subsuming one lacks is not covered",
+        attempt(Hub(p1={"diff": candidate}, p41={"state": "MERGED", "diff": covered})),
+        (False, "#41 do not add `missingInstance`", []),
+    )
+    check(
+        "…nor is a declaration it shows only in a comment",
+        attempt(
+            Hub(
+                p1={"diff": covered + "+theorem missingFact : True := trivial\n"},
+                p41={"state": "MERGED", "diff": documented},
+            )
+        ),
+        (False, "#41 do not add `missingFact`", []),
+    )
     check(
         "…or merged into another branch than this one targets",
         attempt(Hub(p1={}, p41={"state": "MERGED", "base": "integration"})),

@@ -245,7 +245,8 @@ all of these hold at the moment of closing:
   again with the pull request just before closing.
 - Every non-private declaration the pull request's diff adds to a `.lean` file
   (`theorem`, `lemma`, `def`, `abbrev`, `instance`, `structure`, `class`,
-  `inductive`, `opaque`, `axiom`, compared by name as written) is also added by
+  `inductive`, `opaque`, `axiom`, an instance's name after any priority clause,
+  outside comments, compared by name as written) is also added by
   the diff of one of those merged pull requests. A pull request that adds no
   named declaration cannot be closed this way. Each diff is read with `gh pr
   diff`, on Forgejo through the source's command layer, which returns the pull
