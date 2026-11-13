@@ -1216,6 +1216,10 @@ print('{"result":"kept on protocol stdout"}', flush=True)
         """Run the real launcher with only Popen replaced."""
         self.spawn.stop()
         self.addCleanup(lambda: setattr(self, "fallback", self.spawn.start()))
+        enabled = patch.dict(os.environ)  # tests/run-all exports TAUCETI_BACKGROUND_CLEANUP=off
+        enabled.start()
+        self.addCleanup(enabled.stop)
+        os.environ.pop("TAUCETI_BACKGROUND_CLEANUP", None)
         activity.root().mkdir(parents=True, exist_ok=True)
 
     def test_fallback_collector_runs_hourly_bounded_and_in_the_timer_context(self):
