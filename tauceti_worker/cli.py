@@ -663,6 +663,10 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--max-seconds", type=float, help="stop draining deletion work after this long")
     cleanup.add_argument("--fallback-marker", type=Path, help=argparse.SUPPRESS)
 
+    purge = sub.add_parser("purge", help="remove all TauCetiWorker data for this user (run before uninstalling)")
+    purge.add_argument("--yes", action="store_true", help="delete; without it, only print what would be removed")
+    purge.add_argument("--config", action="store_true", help="also remove configuration (workers.toml, settings)")
+
     w = sub.add_parser(
         "work",
         help="do work: one round, or the driver loop with --loop",
@@ -968,6 +972,10 @@ def main(argv: list[str] | None = None) -> int:
         from .retention import cmd_cleanup
 
         return cmd_cleanup(args)
+    if cmd == "purge":
+        from .purge import cmd_purge
+
+        return cmd_purge(args)
 
     from .config import max_open_prs
     from .overlaps import batch_size

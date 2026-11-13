@@ -1,12 +1,16 @@
 # Persistent workers
 
-For the legacy TauCeti project, `TAUCETI_LEGACY_DATA_ROOT` selects an absolute
-directory containing `state/`, `checkouts/`, and `logs/`. Set it before starting
-a worker to reuse its existing credentials, recovery records, and checkouts
-with a different installed code revision. Round, verification, and cleanup
-subprocesses inherit the same location; bundled scripts and prompts remain with
-the code. Without this setting, the existing installation-relative layout is
-preserved. Changing the setting does not move data or merge worker histories.
+Worker data (`state/`, `checkouts/` and `logs/`) lives in one data root. An
+installed package (`uv tool install`, pip, a Fleet runtime) uses
+`$XDG_DATA_HOME/tauceti`, else `~/Library/Application Support/tauceti/data` on
+macOS, else `~/.local/share/tauceti`, so upgrading or reinstalling the code keeps
+it. A source checkout keeps it beside the code, gitignored. For the legacy
+TauCeti project, `TAUCETI_LEGACY_DATA_ROOT` selects another absolute directory;
+round, verification and cleanup subprocesses inherit it, and bundled scripts and
+prompts remain with the code. Changing the location does not move data: the
+cleanup collector deletes data an earlier installation left in its package
+directory, and on Fleet hosts other runtimes' roots, once no worker or round
+holds their locks.
 
 ## Fleet admission and reporting
 
@@ -582,18 +586,33 @@ the previous behaviour of sharing your own `CLAUDE.md`, settings, and skills,
 including on a worker already seeded the clean way; a `settings.json` you have
 edited is kept rather than replaced.
 
-## Cleanup
+## Cleanup and uninstalling
 
 Every round starts the cleanup collector (`tauceti cleanup --all-data-roots`) in
 the background, at most once an hour per data root, at low CPU and I/O priority
 and for at most 15 minutes, unless the systemd timer installed by `workers
 service install` already collects that data root. The collector expires retained
 checkouts, discarded recovery trees, logs and verification runs older than three
-days, idle checkouts, and shared build pools. A retained checkout whose source
-could not be preserved within 24 hours is abandoned with the rest of its task,
-as the timer already did; workers write fresh PRs instead. Its output goes to
-`cleanup-fallback.log` in the activity directory. Set
+days, idle checkouts, and shared build pools, and deletes the data roots of
+earlier installations once no worker or round holds their locks. A retained
+checkout whose source could not be preserved within 24 hours is abandoned with
+the rest of its task, as the timer already did; workers write fresh PRs instead.
+Its output goes to `cleanup-fallback.log` in the activity directory. Set
 `TAUCETI_BACKGROUND_CLEANUP=off` to stop rounds from starting it.
+
+To remove everything TauCetiWorker stored for your account, stop the workers and
+run `tauceti purge` before uninstalling the code:
+
+```bash
+tauceti workers manager-stop
+tauceti purge          # prints what would be removed
+tauceti purge --yes    # removes it, and the worker service and timers
+uv tool uninstall tauceti
+```
+
+`--config` also removes `workers.toml` and other settings. `~/.elan` is kept
+because other Lean projects share it; `elan toolchain gc` reclaims toolchains
+nothing uses.
 
 ## State on disk
 

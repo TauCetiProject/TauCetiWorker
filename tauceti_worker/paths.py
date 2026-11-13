@@ -17,17 +17,33 @@ from pathlib import Path
 
 _pkg = Path(__file__).resolve().parent  # …/tauceti_worker
 HERE = _pkg if (_pkg / "prompts").is_dir() else _pkg.parent
+INSTALLED = HERE == _pkg  # a wheel (uv tool, pip, Fleet runtime), not a source checkout
+
+
+def user_data_root() -> Path:
+    """Per-user worker data for installed packages, outside the replaceable install."""
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "tauceti"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "tauceti" / "data"
+    return Path.home() / ".local" / "share" / "tauceti"
 
 
 def legacy_data_root(default: Path | None = None) -> Path:
-    """Keep existing worker data when changing the installed code revision.
+    """Where worker state/, checkouts/ and logs/ live.
 
-    Assets stay beside the code. An explicit data root is inherited by round,
-    verification and cleanup subprocesses, including isolated worker homes.
+    An explicit TAUCETI_LEGACY_DATA_ROOT wins and is inherited by round, verification and
+    cleanup subprocesses, including isolated worker homes. A source checkout keeps them beside
+    the code (gitignored). An installed package uses user_data_root(): data inside the package
+    directory was silently kept across `uv tool upgrade` yet destroyed by `--force` or
+    `uninstall`, and the collector now deletes what earlier installations left there.
     """
     raw = os.environ.get("TAUCETI_LEGACY_DATA_ROOT")
     if not raw:
-        return HERE if default is None else default
+        if default is not None and default != HERE:
+            return default
+        return user_data_root() if INSTALLED else HERE
     root = Path(raw).expanduser()
     if not root.is_absolute():
         raise ValueError("TAUCETI_LEGACY_DATA_ROOT must be an absolute path")

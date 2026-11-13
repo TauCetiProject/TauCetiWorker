@@ -967,6 +967,8 @@ def run(*, dry=False, diagnostics_only=False, deadline=None):
     with locked(root() / "cleanup.lock", dry=dry), root_lock(worker_state_root(), dry=dry):
         before = free_bytes(worker_state_root())
         report = sweep(dry=dry, diagnostics_only=diagnostics_only)
+        if not diagnostics_only:
+            retire_roots(report, dry=dry)
         report["free_before_bytes"] = before
         if not dry and not diagnostics_only:
             drain_pending([(legacy_data_root(HERE), report)], deadline=deadline)
@@ -1045,6 +1047,146 @@ def data_roots():
     return [selected, *sorted(roots - {selected})]
 
 
+RETIRED_PARTS = ("state", "checkouts", "logs")
+
+
+def retired_roots():
+    """Data roots no current configuration selects: the package directory of an installed
+    worker (its pre-user_data_root location) and, on Fleet hosts, other runtimes' roots."""
+    from .paths import INSTALLED
+
+    selected = legacy_data_root().resolve()
+    candidates = set(data_roots()[1:]) if legacy_project() else set()
+    if INSTALLED:
+        candidates.add(HERE.resolve())
+    candidates.discard(selected)
+    return sorted(
+        root
+        for root in candidates
+        if any((root / part).is_dir() and not (root / part).is_symlink() for part in RETIRED_PARTS)
+        or any(root.glob(".tauceti-retired-*"))
+    )
+
+
+@contextlib.contextmanager
+def _idle_root(root):
+    """Hold every worker slot and round lock of a root, or yield False if any is in use.
+
+    Older runtimes keep these flocks for the life of a worker or round, so holding them all
+    while the root is renamed away excludes every process that could still be writing there."""
+    held = []
+    try:
+        for lock in sorted([*root.glob("state/*/instance.lock"), *root.glob("state/*/round.lock")]):
+            if lock.is_symlink():
+                yield False
+                return
+            fd = os.open(lock, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            held.append(fd)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+        yield True
+    finally:
+        for fd in held:
+            os.close(fd)
+
+
+def _open_paths():
+    """Every working directory and open file path of this user's processes, or None if unknown.
+
+    Locks only cover workers and rounds; services, verification jobs and older reporting
+    commands may keep a retired root's files open without holding either."""
+    paths = []
+    if Path("/proc/self/fd").is_dir():
+        uid = os.getuid()
+        for process in Path("/proc").glob("[0-9]*"):
+            try:
+                if process.stat().st_uid != uid:
+                    continue
+                paths.append(os.readlink(process / "cwd"))
+                for descriptor in (process / "fd").iterdir():
+                    with contextlib.suppress(OSError):
+                        paths.append(os.readlink(descriptor))
+            except OSError:
+                continue  # exited, or not ours to inspect
+        return paths
+    if sys.platform != "darwin":
+        return None
+    try:
+        import psutil
+    except ImportError:
+        return None
+    for process in psutil.process_iter():
+        try:
+            if process.uids().real != os.getuid():
+                continue
+            paths += [item.path for item in process.open_files()]
+            paths.append(process.cwd())
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.Error, OSError):
+            with contextlib.suppress(psutil.Error, OSError):
+                if process.exe().startswith(_PLATFORM_EXECUTABLES):
+                    continue
+            return None
+    return paths
+
+
+def _used_by_process(root, opened):
+    prefixes = [os.path.join(str(root), part) for part in RETIRED_PARTS]
+    return any(path == prefix or path.startswith(prefix + os.sep) for path in opened for prefix in prefixes)
+
+
+def _rmtree(path):
+    def writable(function, target, _excinfo):
+        # Lake and Git leave read-only directories; regain write permission, never follow links.
+        parent = os.path.dirname(target)
+        with contextlib.suppress(OSError):
+            os.chmod(parent, os.stat(parent, follow_symlinks=False).st_mode | 0o700)
+        function(target)
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=writable)
+    else:
+        shutil.rmtree(path, onerror=writable)
+
+
+def retire_roots(report, *, dry=False):
+    """Delete worker data left by earlier installations and runtimes, once nothing uses it.
+
+    Nothing migrates such data and no current worker reads it, so it is deleted outright:
+    checkouts, caches, logs and unpublished recovery records alike. Taking a retired root's
+    worker locks can only delay an older runtime's worker starting at that instant."""
+    roots = retired_roots()
+    opened = _open_paths() if roots else []
+    for root in roots:
+        try:
+            if opened is None or _used_by_process(root.resolve(), opened):
+                note(report, "protected", str(root))
+                continue
+            with _idle_root(root) as idle:
+                if not idle:
+                    note(report, "protected", str(root))
+                    continue
+                if dry:
+                    for part in RETIRED_PARTS:
+                        if (root / part).is_dir():
+                            note(report, "removed", str(root / part))
+                    continue
+                for part in RETIRED_PARTS:
+                    path = root / part
+                    if path.is_dir() and not path.is_symlink():
+                        path.rename(root / f".tauceti-retired-{part}-{os.getpid()}-{time.time_ns()}")
+            for trash in sorted(root.glob(".tauceti-retired-*")):
+                if trash.is_dir() and not trash.is_symlink():
+                    _rmtree(trash)
+                    note(report, "removed", str(trash))
+        except OSError as error:
+            note(report, "errors", f"{root}: {error}")
+
+
 def run_all(*, dry=False, deadline=None):
     """One collector covers current and retired roots, with fair deletion slices."""
     from .activity import pin_root, root
@@ -1058,6 +1200,7 @@ def run_all(*, dry=False, deadline=None):
     report["free_before_bytes"] = free_bytes(worker_state_root())
     with locked(root() / "cleanup.lock", dry=dry), contextlib.ExitStack() as roots:
         try:
+            retire_roots(report, dry=dry)
             paths = data_roots()
             for path in sorted(paths):
                 roots.enter_context(root_lock(path / "state", dry=dry))
