@@ -914,6 +914,7 @@ def build_parser() -> argparse.ArgumentParser:
     mr.add_argument("--spec", required=True)
     mr.add_argument("--state-dir", required=True)
     mr.add_argument("--runtime-dir", required=True)
+    mr.add_argument("--config", default=None)
     return p
 
 

@@ -789,9 +789,11 @@ def clear_worker_halt(config: Path, wid: str) -> int:
     if spec is None:
         raise WorkersError(f"unknown worker: {wid}")
     # The worker resolves its data root from the manager's launch environment, which this caller
-    # may not share; the path it published is the record that stopped it.
-    reported = runner_status(wid).get("halt_file")
-    if isinstance(reported, str):
+    # may not share; the path it published is the record that stopped it, when the runner that
+    # published it was launched from this configuration (state directories can be shared).
+    status = runner_status(wid)
+    reported = status.get("halt_file")
+    if isinstance(reported, str) and status.get("workers_config") == str(Path(config).expanduser().resolve()):
         path = Path(reported)
         if path.is_absolute() and path.name == "halt.json" and path.parent.name == wid and path.exists():
             from .identity import clear_halt
@@ -876,6 +878,7 @@ def cmd_managed_runner(args) -> int:
                 stopped_at=None,
                 halt_reason=None,
                 halt_file=None,
+                workers_config=getattr(args, "config", None),
                 **isolation,
             )
             test_command = os.environ.get("TAUCETI_MANAGER_TEST_COMMAND")
@@ -964,7 +967,9 @@ def _stop_runner(worker_id: str, runtime_dir: Path | None = None) -> bool:
     return bool(response and response.get("ok"))
 
 
-def _launch_runner(spec: WorkerSpec, state_dir: Path, runtime_dir: Path) -> subprocess.Popen:
+def _launch_runner(
+    spec: WorkerSpec, state_dir: Path, runtime_dir: Path, config: Path | None = None
+) -> subprocess.Popen:
     return subprocess.Popen(
         self_argv(
             "_managed-run",
@@ -974,6 +979,7 @@ def _launch_runner(spec: WorkerSpec, state_dir: Path, runtime_dir: Path) -> subp
             state_dir,
             "--runtime-dir",
             runtime_dir,
+            *(("--config", Path(config).expanduser().resolve()) if config else ()),
         ),
         cwd=HERE,
         env=self_env(unselected_github_env()),
@@ -1283,7 +1289,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     ):
                         continue
                     try:
-                        children[wid] = _launch_runner(spec, state_dir, runtime_dir)
+                        children[wid] = _launch_runner(spec, state_dir, runtime_dir, config)
                     except OSError as exc:
                         print(f"tauceti workers: cannot launch {wid}: {exc}", file=sys.stderr)
                         unreported_exit(wid, spec.fingerprint())

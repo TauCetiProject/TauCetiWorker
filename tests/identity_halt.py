@@ -279,6 +279,9 @@ class IdentityHaltTests(unittest.TestCase):
     def test_workers_clear_halt_finds_a_record_under_the_managers_data_root(self):
         config, service, state = self.root / "workers.toml", self.root / "service-data", self.root / "workers"
         wm.save_worker_specs(config, [wm.WorkerSpec(id="w1")])
+        state.mkdir()
+        # What the runner publishes at launch; the worker's halt adds to the same record.
+        wm.status_path("w1", state).write_text(json.dumps({"id": "w1", "workers_config": str(config.resolve())}))
         self.answer("bob")
         # The worker inherits its data root from the manager's launch environment, not from `env`.
         worker = subprocess.run(
@@ -313,6 +316,35 @@ class IdentityHaltTests(unittest.TestCase):
             self.assertEqual(shown.returncode, 0, shown.stderr)
             self.assertIn("github:identity-mismatch", shown.stdout)
             self.assertFalse(record.exists())
+
+    def test_workers_clear_halt_ignores_another_configurations_status(self):
+        state = self.root / "workers"
+        state.mkdir()
+        records = {}
+        for name in ("a", "b"):
+            data = self.root / f"data-{name}"
+            records[name] = data / "state" / "w1" / "halt.json"
+            records[name].parent.mkdir(parents=True)
+            records[name].write_text(json.dumps({"reason": "github:invalid-credentials", "detail": name, "at": "then"}))
+            spec = wm.WorkerSpec(id="w1", env={"TAUCETI_LEGACY_DATA_ROOT": str(data)})
+            wm.save_worker_specs(self.root / f"workers-{name}.toml", [spec])
+        # The shared state directory holds configuration a's worker status, as after its last run.
+        a_status = {"id": "w1", "workers_config": str((self.root / "workers-a.toml").resolve())}
+        wm.status_path("w1", state).write_text(json.dumps({**a_status, "halt_file": str(records["a"])}))
+        shown = subprocess.run(
+            [
+                *(sys.executable, "-m", "tauceti_worker", "workers"),
+                *("--config", str(self.root / "workers-b.toml"), "clear-halt", "w1"),
+            ],
+            cwd=REPO,
+            env={**os.environ, "TAUCETI_WORKERS_STATE_DIR": str(state)},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertTrue(records["a"].exists())
+        self.assertFalse(records["b"].exists())
 
     def test_loop_stops_without_backoff(self):
         args = cli.build_parser().parse_args(["work", "--agent", "claude", "--claude-billing", "api", "--loop"])

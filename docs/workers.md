@@ -285,8 +285,9 @@ tauceti workers restart reviewer
 ```
 
 `workers clear-halt` removes the record the worker reported in its status when
-it halted, which may lie under a data root inherited from the manager's launch
-environment; otherwise it runs `tauceti work --worker-id reviewer --clear-halt`
+it halted, provided that status came from a manager running the same
+configuration file; the record may lie under a data root inherited from the
+manager's launch environment; otherwise it runs `tauceti work --worker-id reviewer --clear-halt`
 with the worker's own `conf` and `env`. For a worker the manager does not run, use
 that `work` command directly.
 
