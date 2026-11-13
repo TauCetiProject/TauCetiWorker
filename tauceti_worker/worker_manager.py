@@ -1765,7 +1765,9 @@ def add_dashboard_worker(
             roadmap_only=roadmap_only,
             roadmap_skip=tuple(part.strip() for part in (roadmap_skip or "").split(",") if part.strip()),
             extra_roadmap_prompt=extra_roadmap_prompt,
-            roadmap_targets=roadmap_targets,
+            roadmap_targets=_roadmap_targets(
+                str(Path(roadmap_targets).expanduser().resolve()) if roadmap_targets else None, "roadmap_targets"
+            ),
         )
         _write_worker_specs(config, [*specs, spec])
     ensure_manager(config)
