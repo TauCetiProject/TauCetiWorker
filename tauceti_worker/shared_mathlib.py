@@ -427,6 +427,105 @@ EVICTION_GRACE = 20  # seconds between SIGTERM and SIGKILL for rounds holding an
 EVICTION_WAIT = 40  # each of three waits for an evicted entry's exclusive lock
 
 
+DEPENDENCY_FILES = ("lake-manifest.json", "lean-toolchain", "lakefile.toml", "lakefile.lean")
+BUMP_PIN_SECONDS = 7 * 86400
+
+
+def _manifest_pin(text):
+    try:
+        packages = json.loads(text).get("packages", [])
+    except (ValueError, AttributeError, TypeError):
+        return None
+    return next((p.get("rev") for p in packages if isinstance(p, dict) and p.get("name") == "mathlib"), None)
+
+
+_PURPOSE = {}
+
+
+def set_round_purpose(checkout, *, rebase=False, bump=False):
+    """Record what the current round in ``checkout`` is for. Keyed by the checkout, so cache
+    preparation for any other directory (verification jobs, recovery) is unaffected."""
+    _PURPOSE.clear()
+    if rebase or bump:
+        _PURPOSE[Path(checkout).resolve()] = dict(rebase=rebase, bump=bump)
+
+
+def _purpose(cwd):
+    with contextlib.suppress(OSError):
+        return _PURPOSE.get(Path(cwd).resolve(), {})
+    return {}
+
+
+@contextlib.contextmanager
+def rebase_target(cwd, env):
+    """For a round whose job is to rebase onto main, prepare Mathlib for main, not the branch.
+
+    The branch is on an old Mathlib by definition, and that pin is refused. While the shared view
+    is chosen and the dependency checkouts are synchronized, the workspace carries origin/main's
+    dependency files; ``restore()`` puts the branch's own files back before the agent starts.
+    After the agent's rebase the pins agree with the shared build. Until then the agent's
+    ``lake`` refuses to run (scripts/lake-guard.py), so it cannot compile the old Mathlib."""
+    restored = [True]
+
+    def restore():
+        if restored[0]:
+            return
+        for name, data in saved.items():
+            if data is None:
+                (cwd / name).unlink(missing_ok=True)
+            else:
+                (cwd / name).write_bytes(data)
+        restored[0] = True
+
+    saved = {}
+    if _purpose(cwd).get("rebase"):
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(
+                ["git", "-C", str(cwd), "fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+                capture_output=True,
+                timeout=60,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                stdin=subprocess.DEVNULL,
+            )
+        target = {}
+        for name in DEPENDENCY_FILES:
+            shown = subprocess.run(
+                ["git", "-C", str(cwd), "show", f"origin/main:{name}"], capture_output=True, timeout=30
+            )
+            target[name] = shown.stdout if shown.returncode == 0 else None
+        try:
+            current = (cwd / "lake-manifest.json").read_text()
+        except OSError:
+            current = None
+        main_pin = target["lake-manifest.json"] and _manifest_pin(target["lake-manifest.json"])
+        if main_pin and _manifest_pin(current) != main_pin:
+            saved = {name: (cwd / name).read_bytes() if (cwd / name).is_file() else None for name in DEPENDENCY_FILES}
+            restored[0] = False
+            from .config import log
+
+            log(f"shared Mathlib: preparing main's Mathlib {main_pin[:12]} for this rebase round")
+            for name, data in target.items():
+                if data is None:
+                    (cwd / name).unlink(missing_ok=True)
+                else:
+                    (cwd / name).write_bytes(data)
+    try:
+        yield restore
+    finally:
+        restore()
+
+
+def bump_pins(pool):
+    """Mathlib pins that bump rounds used recently: the next main, so never refused or evicted first."""
+    pins = set()
+    with contextlib.suppress(OSError):
+        for path in (pool / "bump-pins").iterdir():
+            with contextlib.suppress(OSError):
+                if time.time() - path.stat().st_mtime < BUMP_PIN_SECONDS:
+                    pins.add(path.name)
+    return pins
+
+
 def allowed_revisions(cwd):
     """The Mathlib revisions pinned by current origin/main and by the pin before it, or None.
 
@@ -1265,6 +1364,14 @@ def view(cwd, env, logdir, fetch):
                 raise Unavailable(reason)
             key, spec = signature(cwd, env)
             allowed = allowed_revisions(cwd)
+            if _purpose(cwd).get("bump") and re.fullmatch(r"[0-9a-f]{40}", spec["mathlib"]):
+                # A bump round adapts TauCeti to the next Mathlib; recording its pin keeps every
+                # round's cap ranking from evicting it as if it were an abandoned old version.
+                bumps = pool / "bump-pins"
+                bumps.mkdir(parents=True, exist_ok=True)
+                (bumps / spec["mathlib"]).touch()
+            if allowed is not None:
+                allowed |= bump_pins(pool)
             if allowed is not None and spec["mathlib"] not in allowed:
                 report(pool, env, mode="blocked", key=key, reason="Mathlib pin is not current or previous main")
                 raise PinRefused(

@@ -1515,10 +1515,14 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
         from . import shared_mathlib
 
         try:
-            with shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix:
+            with (
+                shared_mathlib.rebase_target(cwd, env) as restore,
+                shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix,
+            ):
                 if prefix:
                     env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
                 try:
+                    restore()
                     yield prefix
                 finally:
                     env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)
@@ -1543,7 +1547,10 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
         report = {}
         mathlib_started = expanded_cache.clock()
         try:
-            with shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix:
+            with (
+                shared_mathlib.rebase_target(cwd, env) as restore,
+                shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix,
+            ):
                 expanded_cache.record_phase(report, "mathlib_view", mathlib_started)
                 if prefix:
                     env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
@@ -1556,6 +1563,7 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
                         raise
                     if prefix:
                         shared_mathlib.preparation_status(env)
+                    restore()  # a rebase round's agent starts on its own branch's files
                     yield prefix
                 finally:
                     env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)

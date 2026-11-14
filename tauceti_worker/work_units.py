@@ -1431,6 +1431,9 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         checked = validate_kiro_model_access(w.cfg, kiro_probe_profile)
         if stage != "review":
             opts.authoring_profile = checked
+    from . import shared_mathlib
+
+    shared_mathlib.set_round_purpose(w.cfg.checkout)  # stages that need one set it themselves
     fn = {
         "review": do_review,
         "fix": do_fix,
@@ -1987,6 +1990,13 @@ def _do_fixlike(
         getattr(p, "labels", ()), p.head_ref, bump=label == "bump" or getattr(p, "automatic_bump", False)
     )
     os.environ["TAUCETI_VERIFY_POLICY"] = policy
+    # Shared Mathlib follows the round's purpose: a rebase prepares main's Mathlib, which the
+    # branch is about to move to, and a bump may use the next Mathlib it pins.
+    from . import shared_mathlib
+
+    shared_mathlib.set_round_purpose(
+        w.cfg.checkout, rebase=label == "rebase", bump=label == "bump" or getattr(p, "automatic_bump", False)
+    )
     prompt = fill_prompt(
         HERE / "prompts" / prompt_file,
         PR=pr,
