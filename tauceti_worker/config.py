@@ -80,6 +80,14 @@ def roadmap_skip() -> list[str]:
     return sorted({tok for tok in (t.strip() for t in raw.split(",")) if tok})
 
 
+def roadmap_targets() -> Path | None:
+    """The operator's target list for roadmap rounds (see docs/target-lists.md), read live from
+    TAUCETI_ROADMAP_TARGETS so --roadmap-targets is inherited by loop children. None when unset or
+    blank: roadmap rounds choose their own target. The file itself is read once per round."""
+    raw = os.environ.get("TAUCETI_ROADMAP_TARGETS", "").strip()
+    return Path(raw) if raw else None
+
+
 EXTRA_ROADMAP_PROMPT_MAX_CHARS = 4096
 
 
@@ -118,6 +126,23 @@ def roadmap_extra_identities() -> list[str]:
     `gh auth`; this only widens that set when the operator opts in."""
     raw = os.environ.get("TAUCETI_ROADMAP_EXTRA_IDENTITIES", "")
     return sorted({tok.lower() for tok in (t.strip() for t in raw.split(",")) if tok})
+
+
+def targets_fallback_max_open() -> int | None:
+    """The cutoff for authoring outside the operator's target list when it offers nothing (see
+    docs/target-lists.md): such a round authors only while fewer than this many of the account's open
+    pull requests serve no list item. Read live from TAUCETI_TARGETS_FALLBACK_MAX_OPEN so
+    --targets-fallback-max-open is inherited by loop children. None when unset or blank: such a round
+    authors nothing. ValueError unless it is a positive integer."""
+    raw = os.environ.get("TAUCETI_TARGETS_FALLBACK_MAX_OPEN", "").strip()
+    return positive_integer(raw) if raw else None
+
+
+def targets_fallback_cap_file() -> Path | None:
+    """A file holding one integer that replaces `targets_fallback_max_open()` for the round that
+    reads it, from TAUCETI_TARGETS_FALLBACK_CAP_FILE. None when unset or blank."""
+    raw = os.environ.get("TAUCETI_TARGETS_FALLBACK_CAP_FILE", "").strip()
+    return Path(raw) if raw else None
 
 
 def respect_claims() -> bool:

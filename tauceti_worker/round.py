@@ -280,6 +280,28 @@ class Claims:
             os.environ.pop("TAUCETI_CLAIM_REPO", None)
         return True
 
+    def begin_target_work(self, area: str, slug: str) -> int:
+        """Take the authoring claim `author/<area>/<slug>` before the agent launches, so workers that
+        share a target list settle who writes what. Returns claim.sh's verdict: 0 held (heartbeat
+        running, released with the round), 1 held by another worker, 2 the claim could not be
+        registered. A claim still held from earlier in the round is released first. Cooperative only:
+        it sets none of the push-arbiter env, and losing the lease mid-round is logged without
+        stopping the agent."""
+        if self.held:
+            # A branch claim from a repair that fell through to authoring. Its renewer goes first,
+            # so a failed release leaves the lease to expire rather than to a forgotten heartbeat.
+            self.stop_heartbeat()
+            self.release()
+        key = f"author/{area}/{slug}"
+        claim_repo = claims_repo()
+        claim_env = {**os.environ, "CLAIM_REPO": claim_repo}
+        rc = subprocess.run([CLAIM_SH, "acquire", key, str(CLAIM_TTL_S)], capture_output=True, env=claim_env).returncode
+        if rc == 0:
+            self.held = (key, claim_repo)
+            self.ctx.add_cleanup(self.release)
+            self.start_heartbeat(key, claim_repo)
+        return rc
+
     def start_heartbeat(self, key: str, claim_repo: str) -> None:
         rfd, wfd = os.pipe()
         os.set_inheritable(rfd, True)
@@ -302,7 +324,11 @@ class Claims:
 
         def watch(hb=self._hb):
             if hb.wait(None) == HEARTBEAT_LOST and not stopped.is_set():
-                log(f"claim {key}: lease lost; cancelling the branch work that depends on it")
+                branch = key.startswith("branch/")
+                log(
+                    f"claim {key}: lease lost; "
+                    + ("cancelling the branch work that depends on it" if branch else "no longer renewing it")
+                )
                 lost.set()
 
         threading.Thread(target=watch, daemon=True).start()

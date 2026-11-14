@@ -22,6 +22,9 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
 | `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
 | `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
+| `--roadmap-targets FILE` | Author only from an operator [target list](target-lists.md): each roadmap round takes one open item whose prerequisites have landed, claims it, and assigns it to the agent; with nothing eligible the round authors nothing. `--roadmap-only` and `--roadmap-skip` narrow the areas it draws from. Re-read every round; an empty value means no list. |
+| `--targets-fallback-max-open N` | With `--roadmap-targets`: a roadmap round the list offers nothing [authors outside it](target-lists.md#authoring-outside-the-list), as a worker without a list does, while fewer than N of your open pull requests serve no item of the list; rounds on the same host already authoring one count too. Unset, such a round authors nothing. |
+| `--targets-fallback-cap-file FILE` | A file holding one non-negative integer that replaces N of `--targets-fallback-max-open` in each round that reads it; `0` stops authoring outside the list. A missing or malformed file leaves N in force. |
 | `--extra-roadmap-prompt TEXT` | Operator guidance rendered into the roadmap prompt as its own section, steering the choice of target within the designated roadmap (and of area under `--roadmap-only ""`; an unpinned worker still draws its area at random first). It cannot override `--roadmap-skip`, others' claims, or the repository's rules; other phases ignore it. At most 4096 characters, not blank. |
 | `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. A shallow snapshot is stored in worker state, refreshed on later rounds, and mounted read-only in Bubble mode. Requires the roadmap phase to be enabled and one specific `--roadmap-only AREA`; other enabled phases ignore it, and the roadmap and review quality remain authoritative. |
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
@@ -365,6 +368,9 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_FORK` | auto-created | Point at an existing fork instead of the one the worker creates. |
 | `TAUCETI_ROADMAP_ONLY` | _(unset)_ | The single roadmap area for `--roadmap-only`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
 | `TAUCETI_ROADMAP_SKIP` | _(unset)_ | Comma-separated roadmap areas to exclude, for `--roadmap-skip`. |
+| `TAUCETI_ROADMAP_TARGETS` | _(unset)_ | Path of the operator target list, for `--roadmap-targets`; blank means no list. |
+| `TAUCETI_TARGETS_FALLBACK_MAX_OPEN` | _(unset)_ | Cutoff for authoring outside the target list, for `--targets-fallback-max-open`; unset or blank means never. |
+| `TAUCETI_TARGETS_FALLBACK_CAP_FILE` | _(unset)_ | Path of the file whose integer replaces that cutoff, for `--targets-fallback-cap-file`. |
 | `TAUCETI_EXTRA_ROADMAP_PROMPT` | _(unset)_ | Operator guidance for roadmap rounds, for `--extra-roadmap-prompt`. |
 | `TAUCETI_ROADMAP_EXTRA_IDENTITIES` | _(unset)_ | Comma-separated extra GitHub logins whose claimed intentions count as the worker's own. |
 | `TAUCETI_RESPECT_CLAIMS` | `true` | Whether roadmap workers avoid others' claimed intentions; `false` is the same as `--ignore-claims`. |

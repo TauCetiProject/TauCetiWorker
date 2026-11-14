@@ -62,9 +62,11 @@ from .config import (
     is_git_url,
     log,
     roadmap_only,
+    roadmap_targets,
     sanitize_wid,
     security_audit_problem,
     set_log_file,
+    targets_fallback_max_open,
     validate_extra_roadmap_prompt,
     warn_red,
 )
@@ -147,6 +149,9 @@ environment (flags win; full reference linked below):
   TAUCETI_ROADMAP_ONLY   single roadmap area (unset = a fresh random area each round; "" = all areas)
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
   TAUCETI_EXTRA_ROADMAP_PROMPT   extra guidance for roadmap rounds; default for --extra-roadmap-prompt
+  TAUCETI_ROADMAP_TARGETS        operator target list for roadmap rounds; default for --roadmap-targets
+  TAUCETI_TARGETS_FALLBACK_MAX_OPEN   default for --targets-fallback-max-open (unset = never author outside the list)
+  TAUCETI_TARGETS_FALLBACK_CAP_FILE   default for --targets-fallback-cap-file
   TAUCETI_PR             comma-separated PR numbers; default for --pr
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_PACE           pacing curve "t:b,..." (default = 60:40); see --pace
@@ -358,6 +363,37 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--roadmap-skip OneParameterSemigroups. Excludes them from the auto-random pick and the "
         "all-areas case; --roadmap-only takes precedence if it names a skipped area. Overrides "
         "$TAUCETI_ROADMAP_SKIP for this run",
+    )
+    p.add_argument(
+        "--roadmap-targets",
+        dest="roadmap_targets",
+        default=None,
+        metavar="FILE",
+        help="for roadmap rounds, an operator target list (docs/target-lists.md): milestones grouped "
+        "by roadmap area, each with the items it needs first. Every round the worker takes one open "
+        "item whose needs have landed, claims it, and hands it to the agent; with nothing eligible it "
+        "authors nothing. --roadmap-only and --roadmap-skip narrow the areas it draws from. The file "
+        "is re-read each round. Empty string = no list. Overrides $TAUCETI_ROADMAP_TARGETS for this run",
+    )
+    p.add_argument(
+        "--targets-fallback-max-open",
+        dest="targets_fallback_max_open",
+        default=None,
+        metavar="N",
+        help="with --roadmap-targets: a roadmap round the list offers nothing authors outside it, in "
+        "the area an ordinary round would take, while fewer than N of your open PRs serve no item of "
+        "the list (rounds on this host already authoring one count too). Without it such a round "
+        "authors nothing. Overrides $TAUCETI_TARGETS_FALLBACK_MAX_OPEN for this run",
+    )
+    p.add_argument(
+        "--targets-fallback-cap-file",
+        dest="targets_fallback_cap_file",
+        default=None,
+        metavar="FILE",
+        help="a file holding one non-negative integer that replaces N of --targets-fallback-max-open "
+        "for each round that reads it, so the cutoff can move while workers run (0 = no authoring "
+        "outside the list). A missing or malformed file leaves N in force. Overrides "
+        "$TAUCETI_TARGETS_FALLBACK_CAP_FILE for this run",
     )
     p.add_argument(
         "--self-tested",
@@ -1012,7 +1048,16 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "_fleet-protocol":
         print(
             json.dumps(
-                {"version": 1, "admission": True, "events": True, "activity": 1, "roadmap_focus": 1, "self_tested": 1}
+                {
+                    "version": 1,
+                    "admission": True,
+                    "events": True,
+                    "activity": 1,
+                    "roadmap_focus": 1,
+                    "roadmap_targets": 1,
+                    "targets_fallback": 1,
+                    "self_tested": 1,
+                }
             )
         )
         return 0
@@ -1377,6 +1422,24 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     # roadmap_skip()).
     if getattr(args, "roadmap_skip", None) is not None:
         os.environ["TAUCETI_ROADMAP_SKIP"] = args.roadmap_skip
+    # --roadmap-targets likewise. The path is made absolute for loop children, and the driver parses
+    # the file once so that a missing or unmarked list stops the worker at startup.
+    if getattr(args, "roadmap_targets", None) is not None:
+        chosen = args.roadmap_targets.strip()
+        os.environ["TAUCETI_ROADMAP_TARGETS"] = str(Path(chosen).expanduser().resolve()) if chosen else ""
+    if not one_round and roadmap_targets() is not None:
+        from .targets import load_targets
+
+        load_targets(roadmap_targets())
+    if getattr(args, "targets_fallback_max_open", None) is not None:
+        os.environ["TAUCETI_TARGETS_FALLBACK_MAX_OPEN"] = args.targets_fallback_max_open
+    try:
+        targets_fallback_max_open()
+    except ValueError as e:
+        raise Die(f"--targets-fallback-max-open / $TAUCETI_TARGETS_FALLBACK_MAX_OPEN {e}") from None
+    if getattr(args, "targets_fallback_cap_file", None) is not None:
+        chosen = args.targets_fallback_cap_file.strip()
+        os.environ["TAUCETI_TARGETS_FALLBACK_CAP_FILE"] = str(Path(chosen).expanduser().resolve()) if chosen else ""
     # Persist the operator's choice into loop children and recovery rounds.
     if getattr(args, "self_tested", None) is not None:
         os.environ["TAUCETI_SELF_TESTED"] = "1" if args.self_tested else "0"
