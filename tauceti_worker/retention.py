@@ -701,12 +701,12 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
                 except (OSError, ValueError, TypeError) as error:
                     note(report, "errors", f"{path}: {error}")
     try:
-        for key in (
+        for path in (
             ()
-            if not shared or diagnostics_only or not (shared_mathlib.root() / "entries").is_dir()
+            if not shared or diagnostics_only or not shared_mathlib.root().is_dir()
             else shared_mathlib.collect(shared_mathlib.root(), max_age=LIFETIME, now=now, dry_run=dry)
         ):
-            note(report, "removed", str(shared_mathlib.root() / "entries" / key))
+            note(report, "removed", path)
     except OSError as error:
         note(report, "errors", str(error))
     if shared and not diagnostics_only:

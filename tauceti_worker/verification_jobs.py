@@ -35,31 +35,13 @@ def copy_file(source, target):
         return shutil.copy2(source, target)
 
 
-def backing_source(source, build, lower):
-    """Merged enumeration owns whiteouts; open real backing files for reflink."""
-    source = Path(source)
-    if not source.is_relative_to(build):
-        return source
-    relative = source.relative_to(build)
-    private = build.parent / "tauceti-overlay-upper" / relative
-    return private if private.is_file() else lower / relative
-
-
-def snapshot_command():
-    """Private subprocess entry; preserve retryable storage failures across IPC."""
-    payload = json.load(sys.stdin)
-    for name in ("root", "target", "immutable_packages"):
-        if payload.get(name) is not None:
-            payload[name] = Path(payload[name])
-    try:
-        snapshot(**payload)
-    except Pressure as error:
-        print(json.dumps(dict(pressure=error.reason, error=str(error))))
-        raise SystemExit(75) from error
-
-
 def snapshot(root, target, names, *, immutable_packages=None, include_builds=True):
-    """A failed copy is disposable until the caller durably publishes isolated ownership."""
+    """A failed copy is disposable until the caller durably publishes isolated ownership.
+
+    Shared Mathlib is never copied: its package links into the host's read-only sources are kept
+    as links, the private view state is left behind, and the candidate's own verification enters a
+    fresh shared view. A checkout still carrying an older layout's sparse Mathlib upper copies its
+    sources without build outputs; its next view retires that private package."""
     from .shared_mathlib import remove_tree
     from .verification import atomic, digest
     from .verification_storage import candidate, release
@@ -71,71 +53,12 @@ def snapshot(root, target, names, *, immutable_packages=None, include_builds=Tru
     marker = state / "verification-copy-incomplete" / f"{target.name}.json"
     atomic(marker, dict(version=1, source=str(root), source_digest=digest(names)))
     try:
-        # After the agent namespace exits, this host path is only the sparse
-        # upper (possibly with whiteouts), not a usable Mathlib build. Materialize
-        # its merged cache while holding the existing lower's ordinary reader lease.
-        from . import shared_mathlib
-        from .verification import Incomplete
+        legacy = root / ".lake/packages/mathlib/.lake/tauceti-shared-mathlib.json"
+        if include_builds and legacy.is_file() and not (root / ".lake/packages/mathlib").is_symlink():
+            from .config import log
 
-        upper = root / ".lake/packages/mathlib/.lake/build"
-        shared = read_json(upper.parent / "tauceti-shared-mathlib.json")
-        if include_builds and shared and not upper.is_mount():
-            if not shared_mathlib._build_parent_owned(upper):
-                # A stale overlay under caller-owned dependency links must not
-                # be detached or repeatedly rehydrated. Preserve independent
-                # exact sources; normal verification warms the private cache.
-                from .config import log
-
-                log("verification: stale shared Mathlib build under linked packages; preserving private sources")
-                return _snapshot(root, target, names, immutable_packages=None, include_builds=False)
-            key = shared.get("key", "")
-            if not re.fullmatch("[0-9a-f]{64}", key):
-                raise Incomplete("invalid shared Mathlib snapshot identity", reason="preservation")
-            pool = Path(shared.get("pool") or shared_mathlib.root())
-            with shared_mathlib.key_lock(pool, key, exclusive=False) as lease:
-                lower = pool / "entries" / key / "build"
-                if lower.is_dir() and shared.get("boot_id") == shared_mathlib.boot_id():
-                    work = upper.with_name("tauceti-overlay-work")
-                    work.mkdir(exist_ok=True)
-                    payload = dict(
-                        root=str(root),
-                        target=str(target),
-                        names=names,
-                        immutable_packages=str(immutable_packages) if immutable_packages else None,
-                        include_builds=include_builds,
-                    )
-                    env = dict(os.environ)
-                    package = str(Path(__file__).resolve().parent.parent)
-                    env["PYTHONPATH"] = package + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-                    result = subprocess.run(
-                        shared_mathlib.overlay_command(lower, upper, work, upper, pool, lease_fd=lease.fileno())
-                        + [sys.executable, "-m", "tauceti_worker.verification_jobs"],
-                        input=json.dumps(payload),
-                        env=env,
-                        text=True,
-                        capture_output=True,
-                        pass_fds=(lease.fileno(),),
-                    )
-                    if result.returncode == 75:
-                        failure = json.loads(result.stdout)
-                        raise Pressure(failure["error"], reason=failure["pressure"])
-                    if result.returncode:
-                        raise Incomplete(
-                            "merged Mathlib snapshot failed: " + result.stderr[-1000:], reason="preservation"
-                        )
-                    return
-            # A collected lower or pre-reboot disposable upper is a cache
-            # miss. Rehydrate normally, with the normal service config.
-            from .agents import host_build_cache_context
-
-            try:
-                shared_mathlib.detach_upper(upper, upper.parent / "tauceti-shared-mathlib.json")
-                with host_build_cache_context(root, dict(os.environ), state / "verification-cache-prepare"):
-                    return snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=True)
-            except Pressure:
-                raise
-            except Exception as error:
-                raise Pressure(f"Mathlib cache preparation pending: {error}", reason="cache") from error
+            log("verification: older shared Mathlib layout under this checkout; copying sources only")
+            include_builds = False
         return _snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=include_builds)
     except BaseException:
         # Nothing in this directory has become an authoritative workspace. Owner death leaves
@@ -162,18 +85,20 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
         amount = reserve(target.parent.parent, target.name)
         budget = CopyBudget(amount, target)
 
-        build = root / ".lake/packages/mathlib/.lake/build"
-        shared = read_json(build.parent / "tauceti-shared-mathlib.json")
-        lower = None
-        if shared and build.is_mount():
-            from .shared_mathlib import root as shared_root
+        from .shared_mathlib import META
+        from .shared_mathlib import root as shared_root
 
-            lower = Path(shared.get("pool") or shared_root()) / "entries" / shared["key"] / "build"
+        pool = str(shared_root()) + os.sep
+        packages = root / ".lake/packages"
+        shared_links = {}
+        if packages.is_dir() and not packages.is_symlink():
+            for link in packages.iterdir():
+                if link.is_symlink() and os.readlink(link).startswith(pool):
+                    shared_links[link.name] = os.readlink(link)
 
         def copy(source, dest):
             budget.charge(Path(source))
-            actual = backing_source(source, build, lower) if lower is not None else source
-            return copy_file(actual, dest)
+            return copy_file(source, dest)
 
         index = git(root, "rev-parse", "--git-path", "index").decode().strip()
         index = Path(index) if Path(index).is_absolute() else root / index
@@ -235,8 +160,10 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
                         "build-before-sharing",
                         "build-shared-delta",
                     }
-                    or name == "build-shared-deltas"
+                    or name in ("build-shared-deltas", META)
                     and Path(directory).name == ".lake"
+                    or Path(directory) == packages
+                    and name in shared_links
                     or not include_builds
                     and name in {"build", "build-before-sharing"}
                     and Path(directory).name == ".lake"
@@ -257,6 +184,11 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
         if immutable_packages is not None:
             (target / ".lake").mkdir(exist_ok=True)
             (target / ".lake/packages").symlink_to(immutable_packages, target_is_directory=True)
+        elif shared_links:
+            # The candidate attaches to the same read-only shared sources, never a copy of them.
+            (target / ".lake/packages").mkdir(parents=True, exist_ok=True)
+            for name, link in shared_links.items():
+                (target / ".lake/packages" / name).symlink_to(link, target_is_directory=True)
         with contextlib.suppress(OSError, Pressure):
             settle(target.parent.parent, target.name, budget.bytes + 65536, compact=not include_builds)
     except (OSError, subprocess.CalledProcessError) as error:
@@ -487,6 +419,25 @@ def _settle_child(state, path, job, process, result_path):
         path.unlink(missing_ok=True)
 
 
+def _mathlib_view(stack, root, env, state):
+    """The shared Mathlib view prefix for a continuation in ``root`` (``[]`` without Mathlib)."""
+    from . import shared_mathlib
+
+    if not shared_mathlib._names_mathlib(root):
+        return []
+    from .agents import _cache_fetch
+
+    try:
+        prefix = stack.enter_context(shared_mathlib.view(root, env, state / "verification-cache-prepare", _cache_fetch))
+    except shared_mathlib.PinRefused:
+        raise
+    except shared_mathlib.Unavailable as error:
+        raise Pressure(f"shared Mathlib view pending: {error}", reason="cache") from error
+    if prefix:
+        env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
+    return prefix
+
+
 def reap_continuations(cfg):
     key = str(getattr(cfg, "state", ""))
     active = []
@@ -643,7 +594,14 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             TAUCETI_VERIFY_JOB_FD=str(owner.fileno()),
                             TAUCETI_VERIFY_PYTHON=sys.executable,
                         )
+                        # Mathlib comes only from a shared view; its leases outlive this supervisor
+                        # in the helper's namespace, exactly as an agent's do.
+                        prefix = _mathlib_view(stack, root, env, state)
+                        from .shared_mathlib import lease_fds
+
+                        fds = (owner.fileno(), *lease_fds(env))
                         argv = [
+                            *prefix,
                             sys.executable,
                             str(HERE / "scripts/tauceti-verify"),
                             "--base",
@@ -672,7 +630,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                                     stdout=output,
                                     stderr=log,
                                     start_new_session=True,
-                                    pass_fds=(owner.fileno(),),
+                                    pass_fds=fds,
                                 )
                             _CHILDREN.setdefault(str(cfg.state), []).append((state, path, job, process, result_path))
                             return True
@@ -683,7 +641,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             stdout=subprocess.PIPE,
                             text=True,
                             start_new_session=True,
-                            pass_fds=(owner.fileno(),),
+                            pass_fds=fds,
                         )
                         try:
                             output, _ = process.communicate()
@@ -729,7 +687,3 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                         report_runtime("verification-incomplete", detail=str(error), verification_job=job["id"])
                     return True
     return False
-
-
-if __name__ == "__main__":
-    snapshot_command()
