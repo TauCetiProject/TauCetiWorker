@@ -306,3 +306,46 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert signals == [(12345, agents.signal.SIGTERM), (12345, agents.signal.SIGKILL)]
     assert waits[1]["timeout"] == 35  # Let the guardian reap detached descendants before the fallback.
     print("[OK] round interruption cleans up the complete downloader process group")
+
+# A fresh checkout has no .lake/packages/mathlib yet. Shared Mathlib can only be chosen once it exists, so
+# the dependency sources are materialized first; otherwise every fresh round unpacked a private Mathlib build.
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    (root / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib"}, {"name": "batteries"}]}))
+    calls = []
+
+    def lake_env(argv, **kwargs):
+        calls.append((argv, kwargs["cwd"]))
+        (kwargs["cwd"] / ".lake/packages/mathlib").mkdir(parents=True)
+        return SimpleNamespace(returncode=0)
+
+    from tauceti_worker import processes
+
+    with patch.object(processes, "run", side_effect=lake_env):
+        agents.materialize_dependencies(root, {}, root / "logs")
+        agents.materialize_dependencies(root, {}, root / "logs")  # already present: nothing to do
+    assert calls == [(["lake", "env", "true"], root)], calls
+    for malformed in ({"packages": None}, {"packages": [{"name": ["mathlib"]}]}, [], "x"):
+        odd = root / f"odd-{len(list(root.glob('odd-*')))}"
+        odd.mkdir()
+        (odd / "lake-manifest.json").write_text(json.dumps(malformed))
+        with patch.object(processes, "run") as run:
+            agents.materialize_dependencies(odd, {}, root / "logs")  # never raises; repair handles it
+        run.assert_not_called()
+    other = root / "no-mathlib"
+    other.mkdir()
+    (other / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "batteries"}]}))
+    with patch.object(processes, "run") as run:
+        agents.materialize_dependencies(other, {}, root / "logs")
+        agents.materialize_dependencies(root / "missing", {}, root / "logs")
+    run.assert_not_called()
+    failing = root / "failing"
+    failing.mkdir()
+    (failing / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib"}]}))
+    with (
+        patch.object(processes, "run", return_value=SimpleNamespace(returncode=1)),
+        contextlib.redirect_stderr(io.StringIO()),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        agents.materialize_dependencies(failing, {}, root / "logs")  # logged, never raised
+print("[OK] fresh checkouts materialize Mathlib's source before shared Mathlib is chosen")
