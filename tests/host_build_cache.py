@@ -386,6 +386,101 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert waits[1]["timeout"] == 35  # Let the guardian reap detached descendants before the fallback.
     print("[OK] round interruption cleans up the complete downloader process group")
 
+# Without a TauCeti cache service the round must still enter the shared Mathlib view.
+with tempfile.TemporaryDirectory() as tmp:
+    co = Path(tmp)
+    (co / "lakefile.toml").write_text('name = "fixture"\n')
+    entered = []
+
+    @contextlib.contextmanager
+    def fake_view(cwd, env, logdir, fetch):
+        entered.append(cwd)
+        yield ["bwrap", "fixture"]
+
+    from tauceti_worker import shared_mathlib
+
+    with (
+        patch.object(agents, "TAUCETI_CACHE_SERVICE", ""),
+        patch.object(shared_mathlib, "view", fake_view),
+    ):
+        env = {}
+        with agents.host_build_cache_context(co, env, co / "logs") as prefix:
+            assert prefix == ["bwrap", "fixture"], prefix
+            assert json.loads(env["TAUCETI_SHARED_MATHLIB_VIEW"]) == prefix
+        assert "TAUCETI_SHARED_MATHLIB_VIEW" not in env
+
+        @contextlib.contextmanager
+        def refused(cwd, env, logdir, fetch):
+            raise shared_mathlib.Unavailable("fixture refusal")
+            yield
+
+        with patch.object(shared_mathlib, "view", refused):
+            try:
+                with agents.host_build_cache_context(co, {}, co / "logs"):
+                    raise AssertionError("round started without shared Mathlib")
+            except agents.BuildCacheUnavailable as error:
+                assert "fixture refusal" in str(error)
+    assert entered == [co]
+print("[OK] a round without the TauCeti cache service still requires the shared Mathlib view")
+
+# A workspace without Mathlib never runs Mathlib's cache executable.
+with tempfile.TemporaryDirectory() as tmp:
+    co = Path(tmp)
+    (co / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "batteries", "url": "x"}]}))
+    commands = []
+
+    def record(command, *args, **kwargs):
+        commands.append(list(command))
+        return 0
+
+    with patch.object(agents, "_cache_fetch", record):
+        try:
+            agents.warm_host_build_caches(co, {}, co / "logs")
+        except Exception:
+            pass  # later TauCeti steps need a real workspace; only the Mathlib step matters here
+    assert not any(c[-4:] == ["lake", "exe", "cache", "get"] for c in commands), commands
+print("[OK] a workspace without Mathlib skips Mathlib's cache fetch")
+
+# A rebase round chooses the shared view on main's pins, and the agent starts on its branch's files.
+with tempfile.TemporaryDirectory() as tmp:
+    from tauceti_worker import shared_mathlib
+
+    co = Path(tmp)
+    git = ["git", "-C", str(co)]
+    agents.subprocess.run([*git, "init", "-q", "-b", "main"], check=True)
+    for key, value in (("user.name", "t"), ("user.email", "t@example.com"), ("commit.gpgsign", "false")):
+        agents.subprocess.run([*git, "config", key, value], check=True)
+
+    def commit(pin):
+        (co / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib", "rev": pin}]}))
+        (co / "lakefile.toml").write_text('name = "fixture"\n')
+        agents.subprocess.run([*git, "add", "-A"], check=True)
+        agents.subprocess.run([*git, "commit", "-qm", pin], check=True)
+
+    commit("o" * 40)
+    agents.subprocess.run([*git, "switch", "-q", "-c", "branch"], check=True)
+    agents.subprocess.run([*git, "switch", "-q", "main"], check=True)
+    commit("m" * 40)
+    agents.subprocess.run([*git, "update-ref", "refs/remotes/origin/main", "main"], check=True)
+    agents.subprocess.run([*git, "switch", "-q", "branch"], check=True)
+    seen = []
+
+    @contextlib.contextmanager
+    def pin_view(cwd, env, logdir, fetch):
+        seen.append(shared_mathlib._manifest_pin((cwd / "lake-manifest.json").read_text()))
+        yield ["bwrap", "fixture"]
+
+    shared_mathlib.set_round_purpose(co, rebase=True)
+    try:
+        with patch.object(agents, "TAUCETI_CACHE_SERVICE", ""), patch.object(shared_mathlib, "view", pin_view):
+            with agents.host_build_cache_context(co, {}, co / "logs") as prefix:
+                assert prefix == ["bwrap", "fixture"]
+                assert shared_mathlib._manifest_pin((co / "lake-manifest.json").read_text()) == "o" * 40
+    finally:
+        shared_mathlib.set_round_purpose(co)
+    assert seen == ["m" * 40], seen
+    assert agents.subprocess.run([*git, "status", "--porcelain"], capture_output=True, text=True).stdout == ""
+print("[OK] a rebase round prepares main's Mathlib and hands the agent its own branch")
 # A fresh checkout has no .lake/packages/mathlib yet. Shared Mathlib can only be chosen once it exists, so
 # the dependency sources are materialized first; otherwise every fresh round unpacked a private Mathlib build.
 with tempfile.TemporaryDirectory() as tmp:
