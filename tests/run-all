@@ -78,6 +78,7 @@ RUN_STDLIB=(
   lean_pressure.py
   repair_pressure.py
   repair_parallel_fold.py
+  round_storage.py
   shared_mathlib.py
   agent_cmds.py
   agent_transcript.py
