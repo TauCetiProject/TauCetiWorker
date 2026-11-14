@@ -2843,6 +2843,9 @@ def _review_mathlib_staging(base):
         _prune_review_mathlib_staging(base)
 
 
+REVIEW_SOURCE_MIN_AGE = 86400
+
+
 def _review_source_base() -> Path:
     """One host-wide directory of exact Mathlib sources for Bubble reviewers, shared by workers."""
     from .shared_repositories import root
@@ -2949,12 +2952,16 @@ def _review_mathlib_source(cfg: Config, head: str):
         if not (src / "Mathlib.lean").is_file():
             raise NoProgress("review: the pinned Mathlib source snapshot is incomplete; no review started")
         os.utime(src)
-        snapshots = sorted(
-            (p for p in base.glob("mathlib-src-*") if not p.name.startswith("mathlib-src-tmp-")),
-            key=lambda p: p.stat().st_mtime,
-        )
+        ages = {}
+        for path in base.glob("mathlib-src-*"):
+            if not path.name.startswith("mathlib-src-tmp-"):
+                with contextlib.suppress(FileNotFoundError):  # another worker pruned it
+                    ages[path] = path.stat().st_mtime
+        snapshots = sorted(ages, key=ages.get)
         for old in snapshots[:-2]:
-            if old == src:
+            # The lease covers a live worker; the age also covers a container that outlived
+            # its worker (a failed pop, or a killed worker), since each use refreshes the mtime.
+            if old == src or time.time() - ages[old] < REVIEW_SOURCE_MIN_AGE:
                 continue
             try:
                 with _review_source_lease(base, old.name.removeprefix("mathlib-src-"), exclusive=True, blocking=False):

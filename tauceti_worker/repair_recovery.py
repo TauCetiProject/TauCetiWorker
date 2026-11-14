@@ -207,12 +207,23 @@ def local_clone(source, target):
     An explicit `--local` makes Git fail instead of copying when a hard link is unavailable, so
     recovery never holds an independent copy of TauCeti's history.
     """
-    subprocess.run(
-        ["git", "clone", "--local", "--no-checkout", "--quiet", str(source), str(target)],
-        capture_output=True,
-        check=True,
-        timeout=600,
-    )
+    try:
+        subprocess.run(
+            ["git", "clone", "--local", "--no-checkout", "--quiet", str(source), str(target)],
+            capture_output=True,
+            check=True,
+            timeout=600,
+        )
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or b"").decode(errors="replace")
+        if "failed to create link" in detail:
+            # A host layout problem, not this record's: wait without consuming an attempt.
+            raise Wait(
+                "checkout-links",
+                f"Recovery needs hard links from {source} (same filesystem); nothing was copied",
+                "Move recovery state onto the checkout's filesystem",
+            ) from error
+        raise
 
 
 def scratch_path(rel):
@@ -399,6 +410,9 @@ class Recovery:
                 # warm caches or repeat the same expensive failed build each time.
                 b.continuation_admission(self.record, m, j)
             prior = prior_checkout if prior_checkout.is_dir() else b.w.cfg.checkout
+            if not (prior / ".git").exists():
+                # Restoring links from the worker's clone; never download another copy.
+                raise Wait("checkout", "No local TauCeti clone to link recovery objects from")
             b.check_verification_tools(prior)
             b.acquire(m, facts)
             # No attempt is consumed until a real claim and all prerequisites are available.

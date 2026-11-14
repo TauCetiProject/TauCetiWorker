@@ -25,24 +25,11 @@ from .runtime_status import read_json, report_runtime
 from .verification_scope import git
 from .verification_storage import Pressure
 
-# Build payloads are hard-linked from the source workspace, never copied: Lake replaces these
-# files (it clears outputs before writing them), so a link never sees a rewrite in place.
-LINKED = (
-    ".olean",
-    ".olean.server",
-    ".olean.private",
-    ".ilean",
-    ".ir",
-    ".ir.sig",
-    ".c",
-    ".ltar",
-    ".o",
-    ".a",
-    ".so",
-    ".dylib",
-    ".lean",
-)
-# Overlay scratch and markers of an agent's shared Mathlib view; never part of a candidate.
+# Everything under `.lake` is hard-linked from the source workspace, never copied, except small
+# files that Lake or Git rewrite in place, where a link would let the live workspace change the
+# candidate: traces, hashes, manifests and logs, and Git metadata outside its object store.
+COPIED = (".trace", ".hash", ".json", ".toml", ".log", ".lock")
+LINKS = "tauceti-links.json"
 FORWARDED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 CONTINUATION = "tauceti-continuation.json"
 # Imports this package by path, so the verifier's environment (PYTHONPATH included) is unchanged.
@@ -53,6 +40,7 @@ CONTINUE = (
 )
 SCRATCH = {
     CONTINUATION,
+    LINKS,
     "__pycache__",
     "tauceti-scope",
     "tauceti-overlay-work",
@@ -112,7 +100,7 @@ def link(source, dest):
 def _shared_builds(lake):
     """Package build directories that are views of the host's shared Mathlib."""
     packages = lake / "packages"
-    if not packages.is_dir() or packages.is_symlink():
+    if not packages.is_dir():  # a symlinked packages tree is followed, as `_link_tree` does
         return set()
     return {
         package / ".lake/build"
@@ -121,9 +109,21 @@ def _shared_builds(lake):
     }
 
 
+def _copied(relative):
+    parts = relative.parts
+    if ".git" in parts:
+        return "objects" not in parts[parts.index(".git") :]
+    return relative.name.endswith(COPIED)
+
+
 def _link_tree(lake, dest, budget, *, include_builds, immutable_packages, target):
-    """Rebuild `.lake` under `dest`: payloads by hard link, small mutable metadata by copy."""
+    """Rebuild `.lake` under `dest`: everything by hard link except small mutable metadata.
+
+    Returns `{relative path: [inode, size, mtime_ns]}` of the links, so a continuation can
+    prove that nothing wrote through a shared inode in the meantime.
+    """
     shared = _shared_builds(lake)
+    linked = {}
     for directory, dirs, files in os.walk(lake, followlinks=True):
         here = Path(directory)
         out = dest / here.relative_to(lake)
@@ -155,13 +155,33 @@ def _link_tree(lake, dest, budget, *, include_builds, immutable_packages, target
             info = source.stat()
             if not stat.S_ISREG(info.st_mode):
                 continue
-            if name.endswith(LINKED) or info.st_mode & 0o111 or "objects" in here.relative_to(lake).parts:
-                link(source, out / name)
-            else:
-                # Traces, hashes and manifests are rewritten in place by Lake and Git; a link
-                # would let the live workspace change the candidate. They are small.
+            relative = source.relative_to(lake)
+            if _copied(relative):
                 budget.charge(source)
                 shutil.copy2(source, out / name)
+            else:
+                link(source, out / name)
+                linked[str(relative)] = [info.st_ino, info.st_size, info.st_mtime_ns]
+                budget.linked += info.st_size
+    return linked
+
+
+def links_intact(root):
+    """Whether every hard link a snapshot made still has the inode, size and mtime it had.
+
+    Lake replaces outputs instead of writing them in place, and Git checks files out by
+    rename, but an editor or tool can write a linked source in place. Such a candidate is
+    abandoned rather than verified against changed dependencies.
+    """
+    recorded = read_json(root / ".lake" / LINKS).get("links") or {}
+    for relative, expected in recorded.items():
+        try:
+            info = (root / ".lake" / relative).lstat()
+        except OSError:
+            return False
+        if [info.st_ino, info.st_size, info.st_mtime_ns] != expected:
+            return False
+    return True
 
 
 def _snapshot(root, target, names, *, immutable_packages=None, include_builds=True):
@@ -209,8 +229,9 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
             budget.charge(source)
             shutil.copy2(source, dest, follow_symlinks=False)
         lake = root / ".lake"
+        budget.linked = 0
         if lake.exists():
-            _link_tree(
+            linked = _link_tree(
                 lake,
                 target / ".lake",
                 budget,
@@ -218,6 +239,7 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
                 immutable_packages=immutable_packages,
                 target=target,
             )
+            (target / ".lake" / LINKS).write_text(json.dumps(dict(version=1, links=linked)))
         if lake.exists() and _shared_builds(lake) and include_builds:
             # The continuation must attach the host's shared Mathlib view to build here.
             (target / ".lake").mkdir(exist_ok=True)
@@ -226,7 +248,9 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
             (target / ".lake").mkdir(exist_ok=True)
             (target / ".lake/packages").symlink_to(immutable_packages, target_is_directory=True)
         with contextlib.suppress(OSError, Pressure):
-            settle(target.parent.parent, target.name, budget.bytes + 65536, compact=not include_builds)
+            # Count linked bytes too: once the source workspace drops its links, the
+            # candidate is their only holder.
+            settle(target.parent.parent, target.name, budget.bytes + budget.linked + 65536, compact=not include_builds)
     except subprocess.CalledProcessError as error:
         detail = (error.stderr or b"").decode(errors="replace").strip()[-300:]
         raise Incomplete(f"candidate preservation incomplete: {error} {detail}", reason="preservation") from error
@@ -278,6 +302,10 @@ def continue_command(argv):
     os.dup2(2, 1)
     try:
         with host_build_cache_context(root, env, logdir) as prefix:
+            if not prefix:
+                # Without the shared view, Lake would rebuild Mathlib privately here.
+                print("verification continuation: no shared Mathlib view; not building privately", file=sys.stderr)
+                return 75
             # The supervisor stops a continuation by signalling this wrapper: pass it on, so
             # the verifier and its tools stop with it instead of outliving their owner.
             pending, children = [], []
@@ -660,6 +688,8 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             raise ValueError("isolated candidate path does not match its job")
                         if digest(inventory(root, job["base"])) != job["source_digest"]:
                             raise ValueError("candidate source changed; preserved job requires reconciliation")
+                        if job.get("isolated") and not links_intact(root):
+                            raise ValueError("a file linked into the candidate was written in place; abandoned")
                         if not job.get("isolated"):
                             if target == root or target in root.parents or root in target.parents:
                                 raise ValueError("continuation snapshot path overlaps its source")

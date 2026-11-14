@@ -66,6 +66,7 @@ def test_pruning_keeps_a_snapshot_another_reviewer_holds():
         tempfile.TemporaryDirectory() as tmp,
         patch.dict(os.environ, TAUCETI_SHARED_REPOSITORIES_DIR=str(Path(tmp) / "shared")),
         patch.object(agents.subprocess, "run", side_effect=git),
+        patch.object(agents, "REVIEW_SOURCE_MIN_AGE", 0),
     ):
         cfg = SimpleNamespace(state=Path(tmp) / "worker")
 

@@ -182,6 +182,7 @@ class SharedTests(unittest.TestCase):
         (tauceti / "Fixture.olean").write_bytes(b"tauceti output")
         (tauceti / "Fixture.trace").write_text('{"depHash": "1"}')
         (tauceti / "Fixture.setup.json").write_text("{}")
+        (tauceti / "Fixture.bc").write_bytes(b"bitcode")
         target = self.root / "state/verification-candidates" / ("a" * 32)
         target.parent.mkdir(parents=True)
         with (
@@ -200,6 +201,13 @@ class SharedTests(unittest.TestCase):
         self.assertEqual((out / "Fixture.olean").stat().st_ino, (tauceti / "Fixture.olean").stat().st_ino)
         self.assertNotEqual((out / "Fixture.trace").stat().st_ino, (tauceti / "Fixture.trace").stat().st_ino)
         self.assertFalse((out / "Fixture.setup.json").exists())
+        self.assertEqual((out / "Fixture.bc").stat().st_ino, (tauceti / "Fixture.bc").stat().st_ino)
+        from tauceti_worker.verification_jobs import links_intact
+
+        self.assertTrue(links_intact(target))
+        with (self.mathlib / "Mathlib/Test.lean").open("a") as stream:
+            stream.write("-- edited in place through the live workspace\n")
+        self.assertFalse(links_intact(target), "an in-place write through a shared inode is detected")
         packs = list((self.cwd / ".git/objects").rglob("*"))
         linked = [p for p in packs if p.is_file() and p.stat().st_nlink > 1]
         self.assertTrue(linked, "the candidate's Git objects are hard links")
