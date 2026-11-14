@@ -3342,7 +3342,16 @@ class RealVerifierIntegration(unittest.TestCase):
         backend = rr.WorkerBackend(w, SimpleNamespace())
         facts = dict(labels=[], ref="repair", head=case.base, repository="alice/repo")
         manifest = dict(id="real-receipt", authorization={})
-        with patch("tauceti_worker.agents.prepare_host_build_caches") as warm:
+        import contextlib
+
+        @contextlib.contextmanager
+        def shared_view(cwd, env, logdir, fetch):
+            yield ["env"]  # a transparent stand-in for the shared Mathlib namespace prefix
+
+        with (
+            patch("tauceti_worker.agents.prepare_host_build_caches") as warm,
+            patch("tauceti_worker.shared_mathlib.view", shared_view),
+        ):
             first = backend.verify(case.root, manifest, facts)
             self.assertEqual(first["status"], "success", first.get("error"))
             second = backend.verify(case.root, manifest, facts)

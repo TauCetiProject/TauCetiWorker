@@ -557,8 +557,10 @@ class Recovery(Receipts):
 import signal, sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 from tauceti_worker.verification_jobs import resume_pending
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+patch("tauceti_worker.verification_jobs._mathlib_view", return_value=[]).start()  # as Receipts does
 resume_pending(SimpleNamespace(state=Path(sys.argv[1])))
 """
         process = subprocess.Popen(

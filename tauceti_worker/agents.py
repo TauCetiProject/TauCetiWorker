@@ -960,10 +960,15 @@ def run_agent_host(
     session_scope=None,
     quota_cfg=None,
     cache_note: bool = True,
+    queue_mathlib: bool = False,
 ) -> int:
     """``cache_note=False`` leaves out the build-cache appendix (fetch commands and the
     ``TAUCETI_PR_CACHE_MISS`` stop rule): the queue's repair worker warms the tree itself and its own
-    prompt tells the agent not to fetch, and a queue head's tip is never in the public cache."""
+    prompt tells the agent not to fetch, and a queue head's tip is never in the public cache.
+
+    ``queue_mathlib=True`` is only for the queue's repair service, whose own sandboxed builds run
+    outside any shared view on a Mathlib it prepares itself; moving that producer onto the shared
+    layout is a later step. Worker rounds never pass it."""
     global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
     if (
@@ -972,11 +977,15 @@ def run_agent_host(
         and any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean"))
     ):
         prompt += (
-            "\n\nBuild cache preparation: the worker attempted to warm Mathlib and TauCeti artifacts for this "
-            "checkout and current main. The public `tauceti-public` Lake service remains configured "
-            "during this run. After merging/rebasing, changing the toolchain or dependencies, or "
-            "repairing a malformed workspace, fetch both caches before building:\n"
-            "lake exe cache get\n"
+            "\n\nBuild cache preparation: Mathlib and its dependencies (Batteries, Aesop, Qq, ProofWidgets "
+            "and the rest) come from this host's shared, read-only build, attached under "
+            "`.lake/packages`; the worker also warmed TauCeti artifacts for this checkout and current "
+            "main. Never run `lake exe cache get` or `lake update`: there is nothing to fetch, and the "
+            "shared sources cannot be changed from this round. If merging/rebasing changes the Mathlib "
+            "pin in `lake-manifest.json`, `lake` refuses to build until it matches the shared build "
+            "again; stop and report instead of working around it. The public `tauceti-public` Lake "
+            "service remains configured during this run. After merging/rebasing, fetch TauCeti's cache "
+            "before building:\n"
             f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI} "
             f"--max-revs={lake_cache_max_revs(os.environ)}\n"
             "A transport or incomplete-artifact download failure is infrastructure trouble: report "
@@ -1038,7 +1047,7 @@ def run_agent_host(
     _LAST_AGENT_FAILURE = None
     from . import round_storage
 
-    with host_build_cache_context(cwd, env, logdir) as prefix:
+    with host_build_cache_context(cwd, env, logdir, **({"queue_mathlib": True} if queue_mathlib else {})) as prefix:
         if not cache_note:
             env.pop("TAUCETI_PR_CACHE_MISS", None)  # the convention belongs to the appendix left out
         rc = run_agent_proc(
@@ -1520,7 +1529,7 @@ def lake_cache_max_revs(env: dict) -> str:
 
 
 @contextlib.contextmanager
-def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
+def host_build_cache_context(cwd: Path, env: dict, logdir: Path, *, queue_mathlib: bool = False):
     """Keep the public service available through repairs, merges and dependency changes."""
     from .build_resources import defaults
 
@@ -1528,6 +1537,26 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
     if not any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
         yield
         return
+    logdir.mkdir(parents=True, exist_ok=True)  # callers append their own logs here afterwards
+    from . import shared_mathlib
+
+    def mathlib_view():
+        if queue_mathlib:
+            # The queue repair service's checkout keeps the Mathlib it prepares (see run_agent_host).
+            return contextlib.nullcontext([])
+        return shared_mathlib.view(cwd, env, logdir, _cache_fetch)
+
+    if queue_mathlib:
+        env["TAUCETI_QUEUE_MATHLIB"] = "1"
+    try:
+        with _host_build_cache_context(cwd, env, logdir, mathlib_view) as prefix:
+            yield prefix
+    finally:
+        env.pop("TAUCETI_QUEUE_MATHLIB", None)
+
+
+@contextlib.contextmanager
+def _host_build_cache_context(cwd: Path, env: dict, logdir: Path, mathlib_view):
     if not TAUCETI_CACHE_SERVICE:
         # No TauCeti artifact service to warm, but Mathlib must still come from the shared
         # build: without the view the agent's first `lake build` compiles it privately.
@@ -1536,7 +1565,7 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
         try:
             with (
                 shared_mathlib.rebase_target(cwd, env) as restore,
-                shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix,
+                mathlib_view() as prefix,
             ):
                 if prefix:
                     env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
@@ -1563,13 +1592,12 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
         env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
         from . import expanded_cache, shared_mathlib
 
-        materialize_dependencies(cwd, env, logdir)
         report = {}
         mathlib_started = expanded_cache.clock()
         try:
             with (
                 shared_mathlib.rebase_target(cwd, env) as restore,
-                shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix,
+                mathlib_view() as prefix,
             ):
                 expanded_cache.record_phase(report, "mathlib_view", mathlib_started)
                 if prefix:
@@ -1598,48 +1626,6 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
             raise BuildCacheUnavailable(
                 f"shared Mathlib preparation unavailable: {error}", log_file=logdir / "shared-mathlib-prepare.log"
             ) from error
-
-
-def materialize_dependencies(cwd: Path, env: dict, logdir: Path, timeout: float = 900) -> None:
-    """Clone missing dependency sources before shared Mathlib is chosen.
-
-    `shared_mathlib.view()` can only share a Mathlib build once `.lake/packages/mathlib` exists. In
-    a fresh checkout it did not, so the round chose a private build and `lake cache get` then unpacked
-    a full private copy of Mathlib's outputs. Lake's ordinary workspace load clones the manifest's
-    package sources (tens of seconds, no builds, no cache downloads), which is what `cache get`
-    would have done anyway, only later. Failure is not fatal here: the view reports why it cannot
-    share."""
-    from . import processes
-
-    try:
-        manifest = json.loads((cwd / "lake-manifest.json").read_text())
-    except (OSError, ValueError):
-        return
-    packages = manifest.get("packages") if isinstance(manifest, dict) else None
-    if not isinstance(packages, list):
-        return  # malformed manifests reach the ordinary workspace-error and repair paths
-    names = {p["name"] for p in packages if isinstance(p, dict) and isinstance(p.get("name"), str)}
-    if "mathlib" not in names or (cwd / ".lake/packages/mathlib").is_dir():
-        return
-    logdir.mkdir(parents=True, exist_ok=True)
-    quiet = {**env, "GIT_TERMINAL_PROMPT": "0"}  # Git can prompt through /dev/tty despite null stdin
-    with open(logdir / "materialize-dependencies.log", "ab") as output:
-        try:
-            # The owned process group takes Lake's Git and SSH children with it on timeout.
-            result = processes.run(
-                ["lake", "env", "true"],
-                cwd=cwd,
-                env=quiet,
-                stdin=subprocess.DEVNULL,
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                timeout=timeout,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            log(f"dependencies: could not materialize Mathlib before sharing ({error})")
-            return
-    if result.returncode:
-        log(f"dependencies: lake env exited {result.returncode}; shared Mathlib may be skipped")
 
 
 def relink_build_outputs(cwd: Path, env: dict, *, phase: str, prefix=()) -> dict | None:
@@ -1835,14 +1821,15 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
     if not has_mathlib:
         log("host build caches: the workspace does not depend on Mathlib; no Mathlib cache to fetch")
     elif shared_view:
-        # The shared entry holds Mathlib's own build. Running `lake exe cache get` inside the view
-        # re-extracts every archive, and each new file lands in this checkout's private overlay
-        # upper: a full private copy of Mathlib's outputs under a "shared" round. Mathlib's
-        # dependencies (Batteries, Aesop, ...) are not in the entry yet; Lake restores or builds
-        # them in the checkout until the entry carries the whole dependency tree.
-        log("host build caches: Mathlib comes from the shared build; not fetching it again")
+        # The shared entry holds the build of Mathlib and its whole dependency closure. Running
+        # `lake exe cache get` inside the view re-extracts every archive, and each new file lands in
+        # this checkout's private overlay upper: a full private copy under a "shared" round.
+        log("host build caches: Mathlib and its dependencies come from the shared build; not fetching them")
+    elif env.get("TAUCETI_QUEUE_MATHLIB") != "1":
+        # Sharing is the only way a round gets Mathlib; a private `cache get` is a private copy.
+        unavailable("this workspace needs Mathlib but has no shared Mathlib view")
     elif fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
-        return
+        return  # the queue repair service's own Mathlib, until that producer shares too
     # Mathlib itself knows which compressed archives the selected dependency tree
     # needs. Prune stale private links daily so pool GC can actually release them;
     # otherwise the old promote/hydrate-all exchange resurrects dead archives forever.
