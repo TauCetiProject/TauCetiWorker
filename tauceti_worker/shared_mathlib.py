@@ -1176,7 +1176,6 @@ def summary(env=None, *, scope=None, worker=None):
     )
 
 
-@contextlib.contextmanager
 def _names_mathlib(cwd):
     try:
         packages = json.loads((cwd / "lake-manifest.json").read_text()).get("packages")
@@ -1187,6 +1186,7 @@ def _names_mathlib(cwd):
     return any(isinstance(p, dict) and p.get("name") == "mathlib" for p in packages)
 
 
+@contextlib.contextmanager
 def view(cwd, env, logdir, fetch):
     """Yield an argv prefix and keep the lower leased until the whole agent exits."""
     pool = root(env)
