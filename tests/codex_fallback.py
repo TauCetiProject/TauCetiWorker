@@ -47,7 +47,7 @@ TRANSIENT = SimpleNamespace(returncode=1, stdout=unavailable(500) + "\n", stderr
 RAW_FALSE_POSITIVE = SimpleNamespace(returncode=1, stdout="error: model not found\n", stderr="")
 
 
-def run(sequence, *, repeat=False, explicit=False, user_config=None):
+def run(sequence, *, repeat=False, explicit=False, user_config=None, project_config=None):
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         home = root / "home"
@@ -60,7 +60,10 @@ def run(sequence, *, repeat=False, explicit=False, user_config=None):
         if user_config is not None:
             (home / ".codex" / "config.toml").write_text(user_config)
         saved_codex_home = os.environ.pop("CODEX_HOME", None)
-        cfg = SimpleNamespace(home=home, quota_cache=cache, state=state)
+        cfg = SimpleNamespace(home=home, quota_cache=cache, state=state, checkout=root / "checkout")
+        if project_config is not None:
+            (cfg.checkout / ".codex").mkdir(parents=True)
+            (cfg.checkout / ".codex" / "config.toml").write_text(project_config)
         profile = tc.AuthoringProfile(
             provider="codex",
             model=SOL,
@@ -113,7 +116,9 @@ check("probe closes stdin", kwargs.get("stdin"), subprocess.DEVNULL)
 check("probe strips API-key billing", "OPENAI_API_KEY" in kwargs.get("env", {}), False)
 
 # --ignore-user-config drops the user's credential-store setting with the rest of that file, so a
-# system default would choose the probe's store. The probe carries the user's explicit setting.
+# system default would choose the probe's store. The probe carries an explicit `file` setting, and
+# nothing else: a project layer can override any other user choice for authoring, but a -c override
+# would outrank that project layer.
 STORE = 'cli_auth_credentials_store="file"'
 check("no user store setting adds no override", STORE in argv, False)
 _, _, _, calls, _ = run([OK], user_config='cli_auth_credentials_store = "file"\n')
@@ -123,8 +128,16 @@ check(
     (STORE in argv, argv[argv.index(STORE) - 1] if STORE in argv else None),
     (True, "-c"),
 )
-_, _, _, calls, _ = run([OK], user_config='cli_auth_credentials_store = "keyring"\n')
-check("an explicit keyring store reaches it too", 'cli_auth_credentials_store="keyring"' in calls[0][0], True)
+_, _, _, calls, _ = run(
+    [OK],
+    user_config='cli_auth_credentials_store = "keyring"\n',
+    project_config='cli_auth_credentials_store = "file"\n',
+)
+check(
+    "a user keyring setting under a project file store adds no override",
+    any("cli_auth_credentials_store" in a for a in calls[0][0]),
+    False,
+)
 _, _, _, calls, _ = run([OK], user_config='cli_auth_credentials_store = "file; x"\n')
 check("an unknown value adds no override", any("cli_auth_credentials_store" in a for a in calls[0][0]), False)
 

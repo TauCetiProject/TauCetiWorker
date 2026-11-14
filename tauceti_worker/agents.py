@@ -256,10 +256,10 @@ def _codex_model_probe(cfg: Config, model: str) -> subprocess.CompletedProcess[s
         "--ignore-rules",
     ]
     # --ignore-user-config also drops the user's credential store, leaving the system or workspace
-    # default to choose it; repeat an explicit choice so the probe uses the credential authoring will.
-    store = _codex_store_setting(codex_dir(cfg.home) / "config.toml")
-    if store in ("file", "keyring", "auto", "ephemeral"):
-        command += ["-c", f'cli_auth_credentials_store="{store}"']
+    # default to choose it. Repeat an explicit `file` only: it is what auto-refresh renews, and a -c
+    # override of any other value would outrank a project layer that authoring still honours.
+    if _codex_store_setting(codex_dir(cfg.home) / "config.toml") == "file":
+        command += ["-c", 'cli_auth_credentials_store="file"']
     command.append(_CODEX_MODEL_ACCESS_PROMPT)
     try:
         return run_process(
