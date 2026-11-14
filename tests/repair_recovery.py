@@ -1193,6 +1193,29 @@ class Fixture(unittest.TestCase):
         self.assertEqual(self.journal()["content_attempts"], 1)
         self.assertEqual(self.values["fix-10-head"], 1)
 
+    def continue_with_shared_counters(self, outcome):
+        from tauceti_worker.survey import Counters, completed_attempts
+
+        FakeVerification.failures = 1
+        self.opts.ignore_quota = True
+        with patch.dict(os.environ, TAUCETI_SHARED_ATTEMPTS_DIR=str(self.root / "attempts")):
+            self.w.counters = Counters(SimpleNamespace(state=self.root / "counters"))
+        with (
+            patch("tauceti_worker.loop.resolve_work_model", return_value="claude"),
+            patch("tauceti_worker.work_units.raise_on_account_mismatch"),
+            patch("tauceti_worker.agents.run_agent_host", side_effect=outcome),
+        ):
+            succeeded = self.run_recovery()
+        self.assertEqual(self.w.counters.read("fix-10-head"), 1)
+        self.assertEqual(completed_attempts(self.w.counters, "fix-10-head"), 1)
+        return succeeded
+
+    def test_a_shared_continuation_counts_as_a_completed_attempt(self):
+        self.assertTrue(self.continue_with_shared_counters(self.model_repair))
+
+    def test_a_failed_shared_continuation_counts_as_a_completed_attempt(self):
+        self.assertFalse(self.continue_with_shared_counters(lambda *args, **kwargs: 1))
+
     def test_verification_failure_budget_refusal_retains_source(self):
         FakeVerification.failures = 1
         with patch("tauceti_worker.loop.resolve_work_model", side_effect=RuntimeError("budget closed")) as admission:

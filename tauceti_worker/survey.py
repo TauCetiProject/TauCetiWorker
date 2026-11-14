@@ -3,12 +3,15 @@ picker, `status`, and the TUI all consume."""
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import math
 import os
 import random
 import re
+import stat
 import subprocess
 import tempfile
 import time
@@ -63,19 +66,103 @@ class RebaseBudgetUnavailable(ValueError):
     """Existing retry evidence could not be read safely."""
 
 
+# The attempt budgets of the branch-writing stages, the provider-outage refunds charged against them,
+# and the rebase checkpoint that rebase budget keys derive from.
+SHARED_ATTEMPT_RE = re.compile(
+    r"(?:fix|ci|bump|lint-repair)-\d+-\w+|(?:ci|bump|lint-repair)-pr-\d+|rebase-pr-\d+(?:-\w+)?"
+    r"|infra-(?:fix|fix-ci|rebase|bump|lint-repair)-\d+|rebase-progress-\d+\.json"
+)
+
 # How long an engine "already published at this head" result suppresses re-dispatching a PR whose
 # review history is incomplete. A new push changes the head and is reviewed at once; the TTL bounds
 # how late a contest reply on such a PR is noticed while its history is still being filled in.
 UNCHANGED_REVIEW_TTL = 6 * 3600
 
+COMPLETED_PREFIX = "done-"
+
+
+def checkpoint_counters(counters, names) -> dict[str, tuple[int, int]]:
+    take = getattr(counters, "checkpoint", None)
+    return take(names) if take else {name: (counters.read(name), 0) for name in names}
+
+
+def restore_counters(counters, saved: dict[str, tuple[int, int]]) -> None:
+    """Undo the attempts charged since `checkpoint_counters`, leaving a refund already made in place."""
+    restore = getattr(counters, "restore", None)
+    if restore:
+        restore(saved)
+        return
+    for name, (value, _added) in saved.items():
+        counters.write(name, min(value, counters.read(name)))
+
+
+def settle_counters(counters, saved: dict[str, tuple[int, int]]) -> None:
+    settle = getattr(counters, "settle", None)
+    if settle:
+        settle(saved)
+
+
+def completed_attempts(counters, name: str) -> int:
+    """Attempts on `name` whose stage has finished: a peer's attempt still in progress may yet be refunded."""
+    completed = getattr(counters, "completed", None)
+    return completed(name) if completed else counters.read(name)
+
+
+def charge_attempts(counters, limits: dict[str, int | None]) -> bool:
+    """Charge one attempt to each counter; False, with nothing charged, if another worker sharing the
+    counters spent one of the limits since the survey. `None` is no limit."""
+    charge = getattr(counters, "charge", None)
+    if charge:
+        return charge(limits)
+    for name in limits:
+        counters.write(name, counters.read(name) + 1)
+    return True
+
 
 class Counters:
+    """Integer files in the worker's state directory.
+
+    With TAUCETI_SHARED_ATTEMPTS_DIR set, the names matching SHARED_ATTEMPT_RE live in that directory,
+    which every worker naming it reads and charges. There `write` applies the caller's change, the
+    difference from this process's last `read`, under the directory's lock, and lowers a counter by no
+    more than this process has added to it: a refund hands back the caller's own charge and leaves
+    what peers charged meanwhile.
+    """
+
     def __init__(self, cfg: Config):
         self.state = cfg.state
+        shared = os.environ.get("TAUCETI_SHARED_ATTEMPTS_DIR", "").strip()
+        self._shared_root = Path(shared) if shared else None
+        self.shared = self._shared_root
+        if self._shared_root is not None and self.state.parent.name == "sources":
+            # A forge source's state is `sources/<repository digest>` (worker_sources.source_config), and
+            # the digest names the same repository on every host.
+            self.shared = self._shared_root / "sources" / self.state.name
+        self._seen: dict[str, int] = {}
+        self._added: dict[str, int] = {}
+
+    def _store(self, name: str) -> Path:
+        shared = self.shared is not None and SHARED_ATTEMPT_RE.fullmatch(name.removeprefix(COMPLETED_PREFIX))
+        return self.shared if shared else self.state
+
+    @contextlib.contextmanager
+    def _locked(self):
+        self._make_shared()
+        # The lock is on the directory itself: every user who can list it can take it.
+        lock = os.open(self.shared, os.O_RDONLY)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(lock)
 
     def read(self, name: str) -> int:
+        value = self._seen[name] = self._read(name)
+        return value
+
+    def _read(self, name: str) -> int:
         try:
-            txt = (self.state / name).read_text().strip()
+            txt = (self._store(name) / name).read_text().strip()
         except FileNotFoundError:
             return 0
         except (OSError, UnicodeError):
@@ -87,19 +174,85 @@ class Counters:
         return int(txt) if txt.isdigit() else 0
 
     def write(self, name: str, value: int) -> None:
-        self._atomic_write(name, str(value))
+        self._write(name, value)
+
+    def _write(self, name: str, value: int) -> int:
+        if self._store(name) is self.state:
+            self._atomic_write(name, str(value))
+            return value
+        with self._locked():
+            stored = self._read(name)
+            stored = self._apply(name, stored, value - self._seen.get(name, stored))
+        self._seen[name] = value
+        return stored
+
+    def _apply(self, name: str, stored: int, change: int) -> int:
+        if change < 0:
+            change = -min(-change, stored, self._added.get(name, 0))
+        if change:
+            self._added[name] = self._added.get(name, 0) + change
+            stored += change
+            self._atomic_write(name, str(stored))
+        return stored
+
+    def checkpoint(self, names) -> dict[str, tuple[int, int]]:
+        """Each counter's value and this process's net charge to it, for `restore`."""
+        return {name: (self.read(name), self._added.get(name, 0)) for name in names}
+
+    def restore(self, saved: dict[str, tuple[int, int]]) -> None:
+        """Hand back what this process charged since `checkpoint`; a private counter returns to at most
+        its checkpoint value, and a shared one keeps whatever peers charged or refunded meanwhile."""
+        for name, (value, added) in saved.items():
+            if self._store(name) is self.state:
+                self.write(name, min(value, self.read(name)))
+                continue
+            with self._locked():
+                stored = self._apply(name, self._read(name), min(0, added - self._added.get(name, 0)))
+            self._seen[name] = stored
+
+    def settle(self, saved: dict[str, tuple[int, int]]) -> None:
+        """Record what this process still has charged since `checkpoint` as completed attempts."""
+        for name, (_value, added) in saved.items():
+            if self._store(name) is self.state or (finished := self._added.get(name, 0) - added) <= 0:
+                continue
+            with self._locked():
+                self._atomic_write(COMPLETED_PREFIX + name, str(self._read(COMPLETED_PREFIX + name) + finished))
+
+    def completed(self, name: str) -> int:
+        """In the shared directory, the attempts whose stage has settled; otherwise the counter itself."""
+        return self.read(name) if self._store(name) is self.state else self._read(COMPLETED_PREFIX + name)
+
+    def _make_shared(self) -> None:
+        self._shared_root.mkdir(parents=True, exist_ok=True)
+        mode = stat.S_IMODE(self._shared_root.stat().st_mode)
+        directory = self._shared_root
+        for part in self.shared.relative_to(self._shared_root).parts:
+            directory = directory / part
+            try:
+                directory.mkdir()
+            except FileExistsError:
+                continue
+            # Workers of other users write here too: give it the shared directory's mode, not the umask's.
+            directory.chmod(mode)
 
     def _atomic_write(self, name: str, text: str) -> None:
-        self.state.mkdir(parents=True, exist_ok=True)
+        store = self._store(name)
+        if store is self.shared:
+            self._make_shared()
+        else:
+            store.mkdir(parents=True, exist_ok=True)
         temporary = None
         try:
-            with tempfile.NamedTemporaryFile(mode="w", dir=self.state, prefix=f".{name}-", delete=False) as target:
+            with tempfile.NamedTemporaryFile(mode="w", dir=store, prefix=f".{name}-", delete=False) as target:
                 temporary = Path(target.name)
                 target.write(text)
                 target.flush()
                 os.fsync(target.fileno())
-            os.replace(temporary, self.state / name)
-            directory = os.open(self.state, os.O_RDONLY)
+            if store is self.shared:
+                # Peers of another user must read the file; the directory's mode says who they are.
+                os.chmod(temporary, store.stat().st_mode & 0o666)
+            os.replace(temporary, store / name)
+            directory = os.open(store, os.O_RDONLY)
             try:
                 os.fsync(directory)
             finally:
@@ -112,9 +265,23 @@ class Counters:
                     pass
 
     def incr(self, name: str) -> int:
-        v = self.read(name) + 1
-        self.write(name, v)
-        return v
+        return self._write(name, self.read(name) + 1)
+
+    def charge(self, limits: dict[str, int | None]) -> bool:
+        """Count one attempt on every counter in `limits`. In the shared directory the counters are
+        checked against their limits and charged under one lock, and none is charged when one is spent."""
+        shared = {name: limit for name, limit in limits.items() if self._store(name) is not self.state}
+        if shared:
+            with self._locked():
+                stored = {name: self._read(name) for name in shared}
+                if any(limit is not None and stored[name] >= limit for name, limit in shared.items()):
+                    return False
+                for name in shared:
+                    self._seen[name] = self._apply(name, stored[name], 1)
+        for name in limits:
+            if name not in shared:
+                self.incr(name)
+        return True
 
     def record_unchanged_review(self, pr: int, head: str) -> None:
         """Remember that the review engine found this head's verdict already published."""
@@ -141,8 +308,9 @@ class Counters:
         )
 
     def _rebase_progress(self, pr: int) -> dict | None:
+        name = f"rebase-progress-{pr}.json"
         try:
-            value = json.loads((self.state / f"rebase-progress-{pr}.json").read_text())
+            value = json.loads((self._store(name) / name).read_text())
         except FileNotFoundError:
             return None
         except (OSError, ValueError) as error:
@@ -1220,7 +1388,8 @@ def classify_survey(
                         budget=MAX_FIX_ATTEMPTS,
                         partial_history=True,
                     )
-                    c.final_resolution = c.attempts >= c.budget - 1 and sv.owns(p) and not p.automatic_bump
+                    completed = completed_attempts(counters, f"fix-{p.number}-{p.head_oid[:12]}")
+                    c.final_resolution = completed >= c.budget - 1 and sv.owns(p) and not p.automatic_bump
                     (
                         sv.needs_fix.suppressed
                         if c.attempts >= c.budget and not c.final_resolution
@@ -1254,7 +1423,10 @@ def classify_survey(
                     "blocking review at head",
                     attempts=per_head,
                     budget=MAX_FIX_ATTEMPTS,
-                    final_resolution=per_head >= MAX_FIX_ATTEMPTS - 1 and sv.owns(p) and not p.automatic_bump,
+                    final_resolution=completed_attempts(counters, f"fix-{p.number}-{p.head_oid[:12]}")
+                    >= MAX_FIX_ATTEMPTS - 1
+                    and sv.owns(p)
+                    and not p.automatic_bump,
                 )
                 sv.needs_fix.actionable.append(c)
                 continue

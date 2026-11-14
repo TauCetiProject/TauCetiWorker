@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""TAUCETI_SHARED_ATTEMPTS_DIR gives every worker naming one directory one attempt budget per PR."""
+
+import importlib
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+survey_mod = importlib.import_module("tauceti_worker.survey")
+from tauceti_worker import agents, work_units
+from tauceti_worker import github_transport as transport
+from tauceti_worker.config import GitHubUnavailable, NoProgress
+
+HEAD = "a" * 40
+FIX = "fix-7-" + HEAD[:12]
+SHARED_NAMES = (
+    FIX,
+    "ci-7-" + HEAD[:12],
+    "ci-pr-7",
+    "bump-7-" + HEAD[:12],
+    "bump-pr-7",
+    "lint-repair-7-" + HEAD[:12],
+    "lint-repair-pr-7",
+    "rebase-pr-7",
+    "rebase-pr-7-0123456789abcdef0123",
+    "infra-fix-ci-7",
+)
+WORKER_NAMES = (
+    "review-err-7",
+    "review-contest-7",
+    "review-contest-7-style",
+    "round-base-7",
+    "state-refresh-7-aaaaaaaaaaaa-retry-at",
+    "progress-attempt-ts",
+)
+
+
+def healthy(number=7):
+    return survey_mod.PRInfo(
+        number=number,
+        head_oid=HEAD,
+        head_ref="feature",
+        head_owner="me",
+        head_repo="TauCeti",
+        is_draft=False,
+        mergeable="MERGEABLE",
+        author="me",
+        build_success=True,
+        build_failed=False,
+    )
+
+
+class SharedAttemptsTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.shared = self.root / "attempts"
+
+    def counters(self, worker, *, shared=True):
+        environment = {"TAUCETI_SHARED_ATTEMPTS_DIR": str(self.shared) if shared else ""}
+        with patch.dict(os.environ, environment):
+            return survey_mod.Counters(SimpleNamespace(state=self.root / worker))
+
+    def test_unset_keeps_every_counter_in_the_worker_state(self):
+        first, second = self.counters("first", shared=False), self.counters("second", shared=False)
+        for name in SHARED_NAMES + WORKER_NAMES:
+            self.assertEqual(first.incr(name), 1)
+            self.assertEqual(second.read(name), 0)
+            self.assertTrue((self.root / "first" / name).is_file())
+        first.write(FIX, 0)
+        self.assertEqual(first.read(FIX), 0)
+        first.observe_rebase_progress(healthy(), handoff=False)
+        self.assertEqual(second.rebase_budget_key(7), "rebase-pr-7")
+        self.assertFalse(self.shared.exists())
+
+    def test_each_forge_source_has_its_own_budgets_on_every_host(self):
+        from tauceti_tools.forge import GITHUB, Forge, RepositoryRef
+
+        from tauceti_worker.config import Config
+        from tauceti_worker.worker_sources import source_config
+
+        def host(name):
+            base = self.root / name
+            paths = (base / "state", base / "checkout", base / "store", base / "sb", base / "logs", base / "quota")
+            return Config("worker", base, base, *paths)
+
+        forgejo = RepositoryRef(Forge("forgejo", "https://forge.example"), "Project/Repo")
+        source = SimpleNamespace(repository=forgejo, identity=SimpleNamespace(native_id=1))
+        other = SimpleNamespace(repository=RepositoryRef(GITHUB, "Project/Repo"), identity=SimpleNamespace(native_id=1))
+        self.shared.mkdir()
+        self.shared.chmod(0o2770)
+        with patch.dict(os.environ, {"TAUCETI_SHARED_ATTEMPTS_DIR": str(self.shared)}):
+            github = survey_mod.Counters(host("one"))
+            native = [survey_mod.Counters(source_config(host(name), source)) for name in ("one", "two")]
+            elsewhere = survey_mod.Counters(source_config(host("one"), other))
+        github.incr(FIX)
+        self.assertEqual(native[0].read(FIX), 0)
+        native[0].incr(FIX)
+        self.assertEqual(native[1].incr(FIX), 2)
+        self.assertEqual((github.read(FIX), elsewhere.read(FIX)), (1, 0))
+        digest = source_config(host("one"), source).state.name
+        self.assertEqual((self.shared / FIX).read_text(), "1")
+        self.assertEqual((self.shared / "sources" / digest / FIX).read_text(), "2")
+        for directory in (self.shared / "sources", self.shared / "sources" / digest):
+            self.assertEqual(directory.stat().st_mode, self.shared.stat().st_mode)
+
+        with patch.dict(os.environ, {"TAUCETI_SHARED_ATTEMPTS_DIR": ""}):
+            private = survey_mod.Counters(source_config(host("one"), source))
+        private.incr(FIX)
+        self.assertTrue((source_config(host("one"), source).state / FIX).is_file())
+        self.assertEqual(native[0].read(FIX), 2)
+
+    def test_workers_charge_one_budget(self):
+        first, second = self.counters("first"), self.counters("second")
+        for name in SHARED_NAMES:
+            self.assertEqual(first.incr(name), 1)
+            self.assertEqual(second.incr(name), 2)
+            self.assertEqual(first.read(name), 2)
+            self.assertEqual((self.shared / name).read_text(), "2")
+        for name in WORKER_NAMES:
+            first.incr(name)
+            self.assertEqual(second.read(name), 0)
+            self.assertFalse((self.shared / name).exists())
+        first.record_foreign_repair_launch(7, HEAD, "evidence", "main")
+        self.assertFalse(second.foreign_repair_launched(7))
+        self.assertEqual(sorted(path.name for path in (self.root / "first").iterdir() if path.name in SHARED_NAMES), [])
+
+    def test_a_refund_returns_the_callers_own_charge(self):
+        first, second = self.counters("first"), self.counters("second")
+        second.incr(FIX)
+
+        # The decrement every refund path writes, with a peer charging between its read and write.
+        first.incr(FIX)
+        seen = first.read(FIX)
+        second.incr(FIX)
+        first.write(FIX, max(0, seen - 1))
+        self.assertEqual(second.read(FIX), 2)
+
+        # The restore a paused stage writes, likewise.
+        before = first.read(FIX)
+        first.incr(FIX)
+        second.incr(FIX)
+        first.write(FIX, min(before, first.read(FIX)))
+        self.assertEqual(second.read(FIX), 3)
+        first.write(FIX, min(before, first.read(FIX)))
+        self.assertEqual(second.read(FIX), 3)
+
+        # A worker that charged nothing lowers nothing; one that charged can hand all of it back.
+        third = self.counters("third")
+        third.write(FIX, max(0, third.read(FIX) - 1))
+        third.write(FIX, 0)
+        self.assertEqual(second.read(FIX), 3)
+        for _ in range(5):
+            second.write(FIX, max(0, second.read(FIX) - 1))
+        self.assertEqual(first.read(FIX), 0)
+
+    def test_a_rebase_checkpoint_renews_the_budget_for_every_worker(self):
+        first, second = self.counters("first"), self.counters("second")
+        for _ in range(3):
+            first.incr("rebase-pr-7")
+        self.assertEqual(second.read(second.rebase_budget_key(7)), 3)
+        first.observe_rebase_progress(healthy(), handoff=False)
+        renewed = second.rebase_budget_key(7)
+        self.assertNotEqual(renewed, "rebase-pr-7")
+        self.assertEqual(renewed, first.rebase_budget_key(7))
+        self.assertTrue((self.shared / "rebase-progress-7.json").is_file())
+        self.assertFalse((self.root / "first" / "rebase-progress-7.json").exists())
+        second.incr(renewed)
+        self.assertEqual(first.read(renewed), 1)
+
+    def test_files_take_the_directory_read_and_write_bits(self):
+        for mode, expected in ((0o2770, 0o660), (0o700, 0o600), (0o775, 0o664)):
+            self.shared.mkdir(exist_ok=True)
+            self.shared.chmod(mode)
+            counters = self.counters("first")
+            counters.incr(FIX)
+            counters.observe_rebase_progress(healthy(), handoff=False)
+            for name in (FIX, "rebase-progress-7.json"):
+                self.assertEqual(stat.S_IMODE((self.shared / name).stat().st_mode), expected)
+                (self.shared / name).unlink()
+
+    def test_concurrent_processes_lose_no_charge(self):
+        script = (
+            "import sys; from pathlib import Path; from types import SimpleNamespace\n"
+            "from tauceti_worker.survey import Counters\n"
+            "counters = Counters(SimpleNamespace(state=Path(sys.argv[1])))\n"
+            "for _ in range(25):\n"
+            "    counters.incr(sys.argv[2])\n"
+            "    counters.incr(sys.argv[2])\n"
+            "    counters.write(sys.argv[2], max(0, counters.read(sys.argv[2]) - 1))\n"
+        )
+        environment = {**os.environ, "TAUCETI_SHARED_ATTEMPTS_DIR": str(self.shared), "PYTHONPATH": str(REPO)}
+        workers = [
+            subprocess.Popen([sys.executable, "-c", script, str(self.root / f"w{index}"), FIX], env=environment)
+            for index in range(4)
+        ]
+        self.assertEqual([worker.wait(timeout=120) for worker in workers], [0] * 4)
+        self.assertEqual(self.counters("reader").read(FIX), 100)
+        self.assertEqual([path.name for path in self.shared.iterdir()], [FIX])
+
+    def test_a_github_pause_leaves_a_peers_charge(self):
+        first, second = self.counters("first"), self.counters("second")
+        second.incr(FIX)
+        candidate = SimpleNamespace(pr=7, head=HEAD)
+
+        def interrupted(*_args):
+            first.incr(FIX)
+            second.incr(FIX)
+            transport.record_block("core", 2000000000)
+            return 1
+
+        with (
+            patch.dict(
+                os.environ,
+                {"TAUCETI_GITHUB_SHARED_DIR": str(self.root / "github"), "GH_TOKEN": "fixture"},
+            ),
+            self.assertRaises(GitHubUnavailable),
+        ):
+            work_units._run_github_stage(
+                "fix", interrupted, SimpleNamespace(counters=first, cfg=None), None, candidate, None, False
+            )
+        self.assertEqual(second.read(FIX), 2)
+
+    def test_a_github_pause_refunds_its_charge_when_a_peer_refunds_meanwhile(self):
+        first, second = self.counters("first"), self.counters("second")
+        second.incr(FIX)
+        candidate = SimpleNamespace(pr=7, head=HEAD)
+
+        def interrupted(*_args):
+            first.incr(FIX)
+            second.write(FIX, max(0, second.read(FIX) - 1))
+            raise GitHubUnavailable("paused")
+
+        with (
+            patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": str(self.root / "github")}),
+            self.assertRaises(GitHubUnavailable),
+        ):
+            work_units._run_github_stage(
+                "fix", interrupted, SimpleNamespace(counters=first, cfg=None), None, candidate, None, False
+            )
+        self.assertEqual(second.read(FIX), 0)
+
+    def test_restore_keeps_the_private_arithmetic(self):
+        counters = self.counters("first", shared=False)
+        counters.incr(FIX)
+        saved = survey_mod.checkpoint_counters(counters, (FIX,))
+        counters.incr(FIX)
+        counters.incr(FIX)
+        survey_mod.restore_counters(counters, saved)
+        self.assertEqual(counters.read(FIX), 1)
+        counters.write(FIX, 0)
+        survey_mod.restore_counters(counters, saved)
+        self.assertEqual(counters.read(FIX), 0)
+
+    def test_a_peer_closes_a_pr_only_on_completed_attempts(self):
+        first, second = self.counters("first"), self.counters("second")
+        candidate = SimpleNamespace(pr=7, head=HEAD, foreign_repair_base="")
+        pr = SimpleNamespace(number=7, automatic_bump=False, head_ref="feature", head_owner="me", head_repo="TauCeti")
+        sv = SimpleNamespace(open_prs=[pr], owns=lambda _pr: True)
+        claims = SimpleNamespace(begin_branch_work=Mock(return_value=False))
+        closer = SimpleNamespace(counters=second, claims=claims)
+        closures = []
+
+        def attempt(*, refunded=False):
+            def stage(*_args):
+                self.assertTrue(first.charge({FIX: survey_mod.MAX_FIX_ATTEMPTS}))
+                closures.append(work_units._close_spent_pr(closer, sv, candidate))
+                if refunded:
+                    first.write(FIX, max(0, first.read(FIX) - 1))
+                    return None
+                return 0
+
+            work_units._run_github_stage(
+                "fix", stage, SimpleNamespace(counters=first, cfg=None), None, candidate, None, False
+            )
+
+        with patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": str(self.root / "github")}):
+            for _ in range(survey_mod.MAX_FIX_ATTEMPTS - 1):
+                attempt()
+            # The last attempt is reserved, then refunded when its worker loses the branch claim.
+            attempt(refunded=True)
+            self.assertEqual(second.read(FIX), survey_mod.MAX_FIX_ATTEMPTS - 1)
+            claims.begin_branch_work.assert_not_called()
+            attempt()
+            self.assertEqual(survey_mod.completed_attempts(second, FIX), survey_mod.MAX_FIX_ATTEMPTS)
+            self.assertIsNone(work_units._close_spent_pr(closer, sv, candidate))
+            claims.begin_branch_work.assert_called_once()
+        self.assertEqual(closures, [None] * (survey_mod.MAX_FIX_ATTEMPTS + 1))
+
+        private = self.counters("private", shared=False)
+        private.write(FIX, 2)
+        self.assertEqual(survey_mod.completed_attempts(private, FIX), 2)
+        survey_mod.settle_counters(private, survey_mod.checkpoint_counters(private, (FIX,)))
+        self.assertEqual(sorted(path.name for path in (self.root / "private").iterdir()), [FIX])
+
+    def test_the_last_attempt_instruction_counts_only_completed_attempts(self):
+        first, second = self.counters("first"), self.counters("second")
+        saved = first.checkpoint((FIX,))
+        first.charge({FIX: None})
+        first.settle(saved)
+        # A peer's reservation makes this look like the last attempt when the candidate is chosen.
+        first.charge({FIX: None})
+        pr = SimpleNamespace(number=7, head_ref="feature", head_owner="me", head_repo="TauCeti")
+        sv = SimpleNamespace(open_prs=[pr])
+        candidate = SimpleNamespace(pr=7, head=HEAD, foreign_repair_base="", final_resolution=True)
+        claims = SimpleNamespace(begin_branch_work=lambda *_args: True, held=("branch/7", "claims"))
+        seen = []
+
+        def snapshot(_w, c):
+            seen.append(c.final_resolution)
+            raise NoProgress("stop after the claim")
+
+        with patch.object(work_units, "_progress_snapshot", side_effect=snapshot), self.assertRaises(NoProgress):
+            self.assertTrue(second.charge({FIX: survey_mod.MAX_FIX_ATTEMPTS}))
+            first.write(FIX, max(0, first.read(FIX) - 1))
+            work_units._do_fixlike(
+                SimpleNamespace(counters=second, claims=claims),
+                sv,
+                candidate,
+                None,
+                False,
+                prompt_file="fix.md",
+                label="fix",
+                charged=(FIX,),
+            )
+        self.assertEqual(seen, [False])
+
+        private = self.counters("private", shared=False)
+        private.write(FIX, survey_mod.MAX_FIX_ATTEMPTS - 1)
+        private.incr(FIX)
+        candidate.final_resolution = True
+        with patch.object(work_units, "_progress_snapshot", side_effect=snapshot), self.assertRaises(NoProgress):
+            work_units._do_fixlike(
+                SimpleNamespace(counters=private, claims=claims),
+                sv,
+                candidate,
+                None,
+                False,
+                prompt_file="fix.md",
+                label="fix",
+                charged=(FIX,),
+            )
+        self.assertEqual(seen, [False, True])
+
+    def test_the_helpers_need_only_read_and_write(self):
+        values = {}
+        counters = SimpleNamespace(read=lambda key: values.get(key, 0), write=values.__setitem__)
+        saved = survey_mod.checkpoint_counters(counters, (FIX,))
+        self.assertTrue(survey_mod.charge_attempts(counters, {FIX: 1, "ci-pr-7": None}))
+        self.assertEqual(values, {FIX: 1, "ci-pr-7": 1})
+        survey_mod.restore_counters(counters, saved)
+        self.assertEqual(values[FIX], 0)
+        survey_mod.settle_counters(counters, saved)
+        self.assertEqual(survey_mod.completed_attempts(counters, "ci-pr-7"), 1)
+
+    def test_a_candidate_surveyed_before_a_peer_spent_the_budget_is_declined(self):
+        first, second = self.counters("first"), self.counters("second")
+        ci = ("ci-7-" + HEAD[:12], "ci-pr-7")
+        for _ in range(survey_mod.MAX_CI_ATTEMPTS - 1):
+            first.charge(dict.fromkeys(ci))
+        candidate = SimpleNamespace(pr=7, head=HEAD, rebase_budget_key="rebase-pr-7", foreign_repair_base="")
+        sv = SimpleNamespace(open_prs=[])
+        with patch.object(work_units, "_do_fixlike", return_value=0) as launched:
+            self.assertEqual(work_units.do_fix_ci(SimpleNamespace(counters=first), sv, candidate, None, False), 0)
+            self.assertIsNone(work_units.do_fix_ci(SimpleNamespace(counters=second), sv, candidate, None, False))
+            self.assertEqual(launched.call_count, 1)
+            self.assertEqual([first.read(key) for key in ci], [survey_mod.MAX_CI_ATTEMPTS] * 2)
+
+            # Each budget declines at its own limit, and nothing is charged when one of two is spent.
+            for stage, key, limit in (
+                (work_units.do_fix, FIX, survey_mod.MAX_FIX_ATTEMPTS),
+                (work_units.do_rebase, "rebase-pr-7", survey_mod.MAX_REBASE_ATTEMPTS),
+                (work_units.do_bump, "bump-pr-7", survey_mod.MAX_BUMP_PR_ATTEMPTS),
+                (work_units.do_lint_repair, "lint-repair-pr-7", survey_mod.MAX_LINT_REPAIR_PR_ATTEMPTS),
+            ):
+                (self.shared / key).write_text(str(limit))
+                self.assertIsNone(stage(SimpleNamespace(counters=second), sv, candidate, None, False), key)
+            self.assertEqual(second.read("bump-7-" + HEAD[:12]), 0)
+            self.assertEqual(launched.call_count, 1)
+
+            # An automatic bump PR has no attempt limit.
+            sv.open_prs.append(SimpleNamespace(number=7, automatic_bump=True))
+            self.assertEqual(work_units.do_bump(SimpleNamespace(counters=second), sv, candidate, None, False), 0)
+
+            # A private store charges as it always has.
+            private = self.counters("private", shared=False)
+            for _ in range(survey_mod.MAX_CI_ATTEMPTS + 1):
+                work_units.do_fix_ci(SimpleNamespace(counters=private), sv, candidate, None, False)
+            self.assertEqual(private.read(ci[0]), survey_mod.MAX_CI_ATTEMPTS + 1)
+
+    def test_the_outage_refund_allowance_is_shared(self):
+        first, second = self.counters("first"), self.counters("second")
+        candidate = SimpleNamespace(pr=7, head=HEAD)
+        for counters in (first, second):
+            counters.incr(FIX)
+            agents._LAST_AGENT_FAILURE = "provider returned 529"
+            with self.assertRaises(NoProgress):
+                work_units._refund_infra_failure(SimpleNamespace(counters=counters), candidate, "fix", (FIX,))
+        self.assertEqual(first.read(FIX), 0)
+        self.assertEqual((self.shared / "infra-fix-7").read_text(), "2")
+
+
+if __name__ == "__main__":
+    unittest.main()

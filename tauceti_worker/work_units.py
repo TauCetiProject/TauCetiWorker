@@ -63,8 +63,15 @@ from .constants import (
     CONTEST_CLAIM_TTL,
     EX_CLAIM_COLLISION,
     EX_NOPROGRESS,
+    MAX_BUMP_ATTEMPTS,
+    MAX_BUMP_PR_ATTEMPTS,
+    MAX_CI_ATTEMPTS,
+    MAX_CI_PR_ATTEMPTS,
     MAX_FIX_ATTEMPTS,
     MAX_INFRA_REFUNDS,
+    MAX_LINT_REPAIR_ATTEMPTS,
+    MAX_LINT_REPAIR_PR_ATTEMPTS,
+    MAX_REBASE_ATTEMPTS,
     OPENROUTER_MODELS,
     PR_TASKS,
     PROGRESS_ATTEMPT_GAP,
@@ -108,11 +115,16 @@ from .survey import (
     bump_prs,
     bust_progress_cache,
     cascade,
+    charge_attempts,
+    checkpoint_counters,
+    completed_attempts,
     fix_disposition,
     owns_author,
     owns_pr,
     prioritize_review_candidates,
     progress_argv,
+    restore_counters,
+    settle_counters,
     spread_candidates,
     survey,
 )
@@ -1181,7 +1193,9 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) ->
             unlimited=getattr(p, "automatic_bump", False),
         )
         c.final_resolution = (
-            attempts >= MAX_FIX_ATTEMPTS - 1 and owns_pr(sv, p) and not getattr(p, "automatic_bump", False)
+            completed_attempts(w.counters, f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS - 1
+            and owns_pr(sv, p)
+            and not getattr(p, "automatic_bump", False)
         )
         if disp != "actionable" and not (disp == "exhausted" and c.final_resolution):
             log(f"  fix #{c.pr}: not actionable on a fresh read ({why or disp}) — skipping")
@@ -1233,9 +1247,9 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
         "lint-repair": (f"lint-repair-{pr}-{head}", f"lint-repair-pr-{pr}"),
         "progress": (PROGRESS_ERROR_KEY,),
     }.get(stage, ())
-    before = {key: w.counters.read(key) for key in keys}
+    before = checkpoint_counters(w.counters, keys)
     admission_keys = (*keys, "progress-attempt-ts") if stage == "progress" else keys
-    admission_before = {key: w.counters.read(key) for key in admission_keys}
+    admission_before = checkpoint_counters(w.counters, admission_keys)
     foreign_receipt = (
         w.cfg.state / f"rebase-foreign-launch-{pr}.json"
         if stage == "rebase" and getattr(c, "foreign_repair_base", "")
@@ -1251,8 +1265,7 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
 
         if (CURRENT_CONTEXT is not None and CURRENT_CONTEXT.launched) or unit_admitted():
             return
-        for key, value in admission_before.items():
-            w.counters.write(key, min(value, w.counters.read(key)))
+        restore_counters(w.counters, admission_before)
         if (
             foreign_receipt is not None
             and not had_foreign_receipt
@@ -1261,57 +1274,57 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
             foreign_receipt.unlink(missing_ok=True)
 
     def pause():
-        for key, value in before.items():
-            # Another infrastructure handler may already have refunded this attempt.
-            w.counters.write(key, min(value, w.counters.read(key)))
+        # Another infrastructure handler may already have refunded this attempt.
+        restore_counters(w.counters, before)
         event = blocking_event_since(started) or {}
         raise GitHubUnavailable(
             f"{stage}: GitHub API exhausted — waiting for reset, not charged to the PR", retry_at=event.get("reset")
         )
 
     try:
-        rc = fn(w, sv, c, opts, bubble)
-        check_result(rc)
-    except AdmissionUnavailable as error:
-        from .build_resources import ResourceUnavailable
+        try:
+            rc = fn(w, sv, c, opts, bubble)
+            check_result(rc)
+        except AdmissionUnavailable as error:
+            from .build_resources import ResourceUnavailable
 
-        if isinstance(error, ResourceUnavailable):
-            for key, value in before.items():
-                w.counters.write(key, min(value, w.counters.read(key)))
-        else:
-            refund_admission()
-        raise
-    except GitHubUnavailable as error:
-        for key, value in before.items():
-            w.counters.write(key, min(value, w.counters.read(key)))
-        raise error
-    except NoProgress as error:
-        from .build_resources import QueueOwned
+            if isinstance(error, ResourceUnavailable):
+                restore_counters(w.counters, before)
+            else:
+                refund_admission()
+            raise
+        except GitHubUnavailable as error:
+            restore_counters(w.counters, before)
+            raise error
+        except NoProgress as error:
+            from .build_resources import QueueOwned
 
-        if isinstance(error, QueueOwned):
-            for key, value in before.items():
-                w.counters.write(key, min(value, w.counters.read(key)))
-        # Preserve verification, lease/cache, and other independently typed pauses.
-        if type(error) is NoProgress and blocked_since(started):
+            if isinstance(error, QueueOwned):
+                restore_counters(w.counters, before)
+            # Preserve verification, lease/cache, and other independently typed pauses.
+            if type(error) is NoProgress and blocked_since(started):
+                pause()
+            raise
+        except Exception:
+            # Only pre-inference parsing failures can stand in for a refused result.
+            from .claude_api import CURRENT_CONTEXT
+
+            if (
+                CURRENT_CONTEXT is not None
+                and not CURRENT_CONTEXT.launched
+                and isinstance(failure := blocked_failure(), AdmissionUnavailable)
+            ):
+                refund_admission()
+                raise failure from None
+            if blocked_since(started):
+                pause()
+            raise
+        if rc != 0 and blocked_since(started):
             pause()
-        raise
-    except Exception:
-        # Only pre-inference parsing failures can stand in for a refused result.
-        from .claude_api import CURRENT_CONTEXT
-
-        if (
-            CURRENT_CONTEXT is not None
-            and not CURRENT_CONTEXT.launched
-            and isinstance(failure := blocked_failure(), AdmissionUnavailable)
-        ):
-            refund_admission()
-            raise failure from None
-        if blocked_since(started):
-            pause()
-        raise
-    if rc != 0 and blocked_since(started):
-        pause()
-    return rc
+        return rc
+    finally:
+        # A peer may close a PR on its completed attempts, so an attempt counts there once its stage ends.
+        settle_counters(w.counters, before)
 
 
 def _check_stage_read_quota(stage):
@@ -1373,7 +1386,11 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     os.environ["TAUCETI_GITHUB_PR"] = str(c.pr or "")
     _check_stage_read_quota(stage)
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
-    if stage == "fix" and c.final_resolution and w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS:
+    if (
+        stage == "fix"
+        and c.final_resolution
+        and completed_attempts(w.counters, f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS
+    ):
         return _close_spent_pr(w, sv, c)
     profile = _effective_authoring_profile(opts) if stage != "review" else None
     kiro_probe_profile = profile
@@ -1836,7 +1853,7 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     lifetime or progress-scoped (`ci-pr-`, `bump-pr-`, rebase budgets), so a head-keyed allowance would reset on every
     push while still handing those back, and a persistent false positive could evade the lifetime
     backstop indefinitely by moving the head. The counters live in the worker's own state, so this is
-    per worker rather than fleet-wide; a fleet-wide bound would need shared state it does not have.
+    per worker rather than fleet-wide, unless TAUCETI_SHARED_ATTEMPTS_DIR gives the workers one store.
     """
     from .claude_api import blocked_failure
     from .config import AdmissionUnavailable
@@ -1934,6 +1951,9 @@ def _do_fixlike(
         for key in charged:
             w.counters.write(key, max(0, w.counters.read(key) - 1))
         return None
+    if label == "fix" and getattr(c, "final_resolution", False):
+        # Under the claim, a peer's reservation is about to be refunded; only completed attempts are spent.
+        c.final_resolution = completed_attempts(w.counters, f"fix-{pr}-{head[:12]}") >= MAX_FIX_ATTEMPTS - 1
 
     def decline_repair():
         # Dispatch can immediately try another candidate. Stop/release only the
@@ -2284,7 +2304,7 @@ def _close_spent_pr(w, sv, c) -> int | None:
         or not owns_pr(sv, p)
         or p.automatic_bump
         or c.foreign_repair_base
-        or w.counters.read(f"fix-{c.pr}-{c.head[:12]}") < MAX_FIX_ATTEMPTS
+        or completed_attempts(w.counters, f"fix-{c.pr}-{c.head[:12]}") < MAX_FIX_ATTEMPTS
     ):
         return None
     if not w.claims.begin_branch_work(c.pr, c.head, p.head_ref, p.head_owner, p.head_repo):
@@ -2335,18 +2355,31 @@ def _close_spent_pr(w, sv, c) -> int | None:
         w.claims.release()
 
 
+def _charge(w, c, stage: str, limits: dict[str, int | None]) -> bool:
+    if charge_attempts(w.counters, limits):
+        return True
+    log(f"  {stage} #{c.pr}: another worker spent this attempt budget since the survey; skipping")
+    return False
+
+
+def _automatic_bump(sv, pr: int) -> bool:
+    return any(p.number == pr and getattr(p, "automatic_bump", False) for p in getattr(sv, "open_prs", ()))
+
+
 def do_fix(w, sv, c, opts, bubble) -> int | None:
     pr, head = c.pr, c.head
     key = f"fix-{pr}-{head[:12]}"
-    w.counters.incr(key)  # count up front (an un-checkout-able PR mustn't loop)
+    limit = None if _automatic_bump(sv, pr) else MAX_FIX_ATTEMPTS
+    if not _charge(w, c, "fix", {key: limit}):  # count up front (an un-checkout-able PR mustn't loop)
+        return None
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix.md", label="fix", charged=(key,))
 
 
 def do_fix_ci(w, sv, c, opts, bubble) -> int | None:
     pr, head = c.pr, c.head
     keys = (f"ci-{pr}-{head[:12]}", f"ci-pr-{pr}")
-    for key in keys:
-        w.counters.incr(key)
+    if not _charge(w, c, "fix-ci", {keys[0]: MAX_CI_ATTEMPTS, keys[1]: MAX_CI_PR_ATTEMPTS}):
+        return None
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="fix-ci.md", label="fix-ci", charged=keys)
 
 
@@ -2358,7 +2391,8 @@ def do_rebase(w, sv, c, opts, bubble) -> int | None:
         w.counters.read(key) >= 1 or w.counters.foreign_repair_launched(c.pr)
     ):
         return None
-    w.counters.incr(key)
+    if not _charge(w, c, "rebase", {key: 1 if getattr(c, "foreign_repair_base", "") else MAX_REBASE_ATTEMPTS}):
+        return None
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="rebase.md", label="rebase", charged=(key,))
 
 
@@ -2367,8 +2401,10 @@ def do_bump(w, sv, c, opts, bubble) -> int | None:
     shape as a fix: claim the branch, check the PR out, drive the agent on prompts/bump.md to green it."""
     pr, head = c.pr, c.head
     keys = (f"bump-{pr}-{head[:12]}", f"bump-pr-{pr}")  # count up front so an un-checkout-able PR can't loop
-    for key in keys:
-        w.counters.incr(key)
+    unlimited = _automatic_bump(sv, pr)
+    limits = {keys[0]: None if unlimited else MAX_BUMP_ATTEMPTS, keys[1]: None if unlimited else MAX_BUMP_PR_ATTEMPTS}
+    if not _charge(w, c, "bump", limits):
+        return None
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="bump.md", label="bump", charged=keys)
 
 
@@ -2378,8 +2414,8 @@ def do_lint_repair(w, sv, c, opts, bubble) -> int | None:
     prompts/lint-repair.md to fix TauCeti/ until the PR's full lint passes."""
     pr, head = c.pr, c.head
     keys = (f"lint-repair-{pr}-{head[:12]}", f"lint-repair-pr-{pr}")  # counted up front, as for bump
-    for key in keys:
-        w.counters.incr(key)
+    if not _charge(w, c, "lint-repair", {keys[0]: MAX_LINT_REPAIR_ATTEMPTS, keys[1]: MAX_LINT_REPAIR_PR_ATTEMPTS}):
+        return None
     return _do_fixlike(w, sv, c, opts, bubble, prompt_file="lint-repair.md", label="lint-repair", charged=keys)
 
 
