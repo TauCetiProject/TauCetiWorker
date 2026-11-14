@@ -59,13 +59,20 @@ for value in (True, 0, -1, 1.2, "128"):
 assert build_parser().parse_args(["work", "--max-open-prs", "128"]).max_open_prs == 128
 
 # Old runtimes persisted a hash without the applied definition. This must still protect paid work.
-from tauceti_worker.worker_manager import _defer_read_policy_reload
+from tauceti_worker.worker_manager import _defer_reload
 
 old = WorkerSpec(id="busy")
 new = WorkerSpec(id="busy", max_open_prs=128)
-assert _defer_read_policy_reload(new, {"spec_hash": old.fingerprint(), "state": "reviewing"})
-assert _defer_read_policy_reload(new, {"applied_spec": old.as_dict(), "state": "reviewing"})
-assert _defer_read_policy_reload(new, {"spec_hash": "unknown", "state": "authoring"})
+assert _defer_reload(new, {"spec_hash": old.fingerprint(), "state": "reviewing"})
+assert _defer_reload(new, {"applied_spec": old.as_dict(), "state": "reviewing"})
+assert _defer_reload(new, {"spec_hash": "unknown", "state": "authoring"})
+# A hash alone cannot say which field changed, so a legacy runner waits for its round boundary
+# whatever the edit, and no longer.
+retuned = WorkerSpec(id="busy", agent="codex", only=("review",))
+assert _defer_reload(retuned, {"spec_hash": old.fingerprint(), "state": "reviewing"})
+assert not _defer_reload(
+    retuned, {"spec_hash": old.fingerprint(), "state": "idle", "next_action_at": time.time() + 3600}
+)
 
 
 class Response(io.BytesIO):

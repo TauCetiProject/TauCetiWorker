@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
@@ -108,17 +109,20 @@ try:
                 next_action_at=time.time() + 60,
             )
             assert wm._detached_usage_supervisor(supervisor.pid)
-            assert not wm._defer_read_policy_reload(new_policy, idle), "the supervisor must not strand a reload"
-            assert wm._defer_read_policy_reload(new_policy, dict(idle, state="running"))
-            assert wm._defer_read_policy_reload(new_policy, dict(idle, next_action_at=time.time() + 1))
+            assert not wm._defer_reload(new_policy, idle), "the supervisor must not strand a reload"
+            retasked = dataclasses.replace(old_policy, only=("review",))
+            assert not wm._defer_reload(retasked, idle), "the supervisor must not strand a phase edit"
+            assert wm._defer_reload(retasked, dict(idle, state="running"))
+            assert wm._defer_reload(new_policy, dict(idle, state="running"))
+            assert wm._defer_reload(new_policy, dict(idle, next_action_at=time.time() + 1))
             registered = wm.read_json(ready)
             stale = {**registered, "owner": {**registered["owner"], "start": "stale"}}
             with patch.object(wm, "read_json", return_value=stale):
-                assert wm._defer_read_policy_reload(new_policy, idle), "the registered birth identity must match"
+                assert wm._defer_reload(new_policy, idle), "the registered birth identity must match"
             with patch.object(wm.os, "getsid", return_value=os.getsid(0)):
-                assert wm._defer_read_policy_reload(new_policy, idle), "the supervisor must have its own session"
+                assert wm._defer_reload(new_policy, idle), "the supervisor must have its own session"
             round_process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-            assert wm._defer_read_policy_reload(new_policy, idle), "an ordinary child must still block the reload"
+            assert wm._defer_reload(new_policy, idle), "an ordinary child must still block the reload"
         finally:
             if round_process is not None:
                 round_process.terminate()
@@ -183,8 +187,8 @@ try:
     assert wm.WorkerSpec.from_dict({"id": "attest", "self_tested": True}, 0).as_dict()["self_tested"] is True
     before = wm.WorkerSpec(id="attest").as_dict()
     desired = wm.WorkerSpec(id="attest", self_tested=True)
-    assert wm._defer_read_policy_reload(desired, {"applied_spec": before, "state": "running"})
-    assert not wm._defer_read_policy_reload(
+    assert wm._defer_reload(desired, {"applied_spec": before, "state": "running"})
+    assert not wm._defer_reload(
         desired,
         {
             "applied_spec": before,
@@ -255,6 +259,68 @@ try:
     # security-audit may accompany any other phases.
     mixed = ["bump", "progress", "security-audit", "overlap-scan", "overlap-fix", "review"]
     assert wm.WorkerSpec.from_dict({"id": "audit", "agent": "codex", "only": mixed}, 0).only == tuple(mixed)
+
+    # --- edits that wait for the round boundary ------------------------------------------------
+    slot = wm.WorkerSpec(id="slot", agent="codex", only=("review",), author_model="gpt-5")
+    in_round = {"applied_spec": slot.as_dict(), "state": "running"}
+    parked = {"applied_spec": slot.as_dict(), "state": "waiting-quota", "next_action_at": time.time() + 3600}
+    unadmitted = {"applied_spec": slot.as_dict(), "state": "waiting-capacity", "next_action_at": time.time() + 5}
+    for retune in (
+        {"agent": "claude", "author_model": None},
+        {"only": ("review", "fix")},
+        {"only": ()},
+        {"author_model": "gpt-5-codex"},
+        {"author_effort": "high"},
+        {"agent": "claude", "only": ("roadmap",), "author_model": None, "max_open_prs": 64},
+    ):
+        retuned = dataclasses.replace(slot, **retune)
+        assert wm._defer_reload(retuned, in_round), retune
+        assert not wm._defer_reload(retuned, parked), retune
+        assert not wm._defer_reload(retuned, unadmitted), retune
+    # Any other field in the same edit keeps the immediate restart.
+    for other in ({"sandbox": "bubble"}, {"roadmap_only": "Algebra"}, {"env": (("A", "b"),)}, {"pace": "0:10"}):
+        assert not wm._defer_reload(dataclasses.replace(slot, agent="claude", author_model=None, **other), in_round)
+    retuned = dataclasses.replace(slot, only=("fix",))
+    storage = {"applied_spec": slot.as_dict(), "state": "waiting-storage", "next_action_at": time.time() + 60}
+    assert not wm._defer_reload(retuned, storage)
+    assert wm._defer_reload(retuned, dict(storage, next_action_at=time.time() + 1))
+
+    # After a productive round with a held edit, the loop pauses long enough for the manager to
+    # take it, whatever TAUCETI_INTERROUND is; with nothing held it keeps its own pause.
+    from tauceti_worker import loop
+
+    for held, interround, pause in ((True, 5, 2 * wm.RELOAD_MARGIN), (False, 5, 5), (True, 60, 60)):
+        status = root / f"loop-{held}-{interround}.json"
+        wm.update_status(
+            status,
+            spec_hash=slot.fingerprint(),
+            applied_spec=slot.as_dict(),
+            pending_read_policy=retuned.fingerprint() if held else None,
+        )
+        published = {}
+
+        def settle(seconds, status=status, published=published):
+            published.update(wm.read_json(status), slept=seconds)
+            raise KeyboardInterrupt
+
+        with (
+            patch.dict(os.environ, {"TAUCETI_RUNTIME_STATUS": str(status)}),
+            patch.object(loop, "INTERROUND", interround),
+            patch.object(loop, "api_mode", return_value=False),
+            patch.object(loop, "choose_model", return_value=("codex", {})),
+            patch("tauceti_worker.github_transport.scope", return_value=None),
+            patch.object(loop, "github_budget", return_value=None),
+            patch.object(loop, "run_round_subprocess", return_value=0),
+            patch.object(loop.time, "sleep", side_effect=settle),
+        ):
+            loop.cmd_loop(
+                SimpleNamespace(ignore_quota=False, bubble=False, quota_cmd=None),
+                SimpleNamespace(wid="slot"),
+                only=["review"],
+                agent="codex",
+            )
+        assert published["state"] == "idle" and published["slept"] == pause, (held, interround, published)
+        assert wm._defer_reload(retuned, published) is (pause < wm.RELOAD_MARGIN), (held, interround)
 
     # Desired fields win over a stale actual status generation in CLI/TUI snapshots.
     wm.update_status(
@@ -463,12 +529,44 @@ worker3 — backing off
 
     # A changed definition restarts only the changed worker.
     current = wm.load_worker_specs(config)
-    wm.save_worker_specs(
-        config,
-        [dataclasses.replace(spec, agent="claude") if spec.id == "worker1" else spec for spec in current],
-    )
+    streamed = dataclasses.replace(current[0], stream=True)
+    wm.save_worker_specs(config, [streamed, *current[1:]])
     assert wm.manager_request("apply")
     wait_for(lambda: wm.runner_status("worker1").get("wrapper_pid") not in (None, pids["worker1"]))
+
+    # An edit to the agent and phases alone leaves the round in flight and lands at its boundary.
+    wait_for(lambda: wm.runner_status("worker1").get("spec_hash") == streamed.fingerprint())
+    in_round_pid = wm.runner_status("worker1")["wrapper_pid"]
+    retuned = dataclasses.replace(streamed, agent="claude", only=("review",))
+    wm.save_worker_specs(config, [retuned, *current[1:]])
+    assert wm.manager_request("apply")
+    wait_for(lambda: wm.runner_status("worker1").get("pending_read_policy") == retuned.fingerprint())
+    time.sleep(0.3)
+    held = wm.runner_status("worker1")
+    assert held["wrapper_pid"] == in_round_pid and held["applied_spec"] == streamed.as_dict()
+    # Reverting the edit withdraws it, so the loop stops holding a boundary open for it.
+    wm.save_worker_specs(config, [streamed, *current[1:]])
+    assert wm.manager_request("apply")
+    wait_for(lambda: wm.runner_status("worker1").get("pending_read_policy") is None)
+    assert wm.runner_status("worker1")["wrapper_pid"] == in_round_pid
+    wm.save_worker_specs(config, [retuned, *current[1:]])
+    assert wm.manager_request("apply")
+    wait_for(lambda: wm.runner_status("worker1").get("pending_read_policy") == retuned.fingerprint())
+    # On Linux the manager lands a held edit only where it can read the child's process tree.
+    if sys.platform != "linux" or Path(f"/proc/{os.getpid()}/task/{os.getpid()}/children").exists():
+        wm.update_status(wm.status_path("worker1"), state="idle", next_action_at=time.time() + 3600)
+        wait_for(lambda: wm.runner_status("worker1").get("spec_hash") == retuned.fingerprint())
+        landed = wm.runner_status("worker1")
+        assert landed["wrapper_pid"] != in_round_pid and landed["pending_read_policy"] is None
+        in_round_pid = landed["wrapper_pid"]
+
+    # An explicit restart does not wait for the boundary.
+    refocused = dataclasses.replace(retuned, only=("fix",))
+    wm.save_worker_specs(config, [refocused, *current[1:]])
+    assert wm.manager_request("apply")
+    wait_for(lambda: wm.runner_status("worker1").get("pending_read_policy") == refocused.fingerprint())
+    assert wm.manager_request("restart", id="worker1")
+    wait_for(lambda: wm.runner_status("worker1").get("wrapper_pid") not in (None, in_round_pid))
 
     # A malformed generation is rejected wholesale; the last good fleet remains alive.
     worker1_pid = wm.runner_status("worker1").get("wrapper_pid")

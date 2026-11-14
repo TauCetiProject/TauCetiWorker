@@ -28,6 +28,7 @@ from .constants import (
     INTERROUND,
     OPENROUTER_MODELS,
     POLL,
+    RELOAD_MARGIN,
 )
 from .fleet_capacity import admission_reason as fleet_admission_reason
 from .github import github_budget
@@ -387,15 +388,20 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             # 3) Settle: productive → short pause; no-progress/timeout/error → escalating back-off.
             if rc == 0:
                 streak = 0
+                pause = INTERROUND
+                applied = runtime_snapshot()
+                if applied.get("pending_read_policy") not in (None, applied.get("spec_hash")):
+                    # The manager restarts a worker on a held edit only this far from its next round.
+                    pause = max(pause, 2 * RELOAD_MARGIN)
                 report_runtime(
                     "idle",
                     detail="round completed",
                     phase=None,
                     target=None,
                     roadmap_focus=None,
-                    next_action_at=time.time() + INTERROUND,
+                    next_action_at=time.time() + pause,
                 )
-                time.sleep(INTERROUND)
+                time.sleep(pause)
             else:
                 streak += 1
                 nap = min(BACKOFF_BASE * (1 << min(streak, 5)), BACKOFF_MAX)

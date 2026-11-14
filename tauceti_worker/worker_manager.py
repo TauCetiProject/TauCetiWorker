@@ -31,7 +31,7 @@ from typing import NoReturn
 
 from . import worker_scopes
 from .config import positive_integer, security_audit_problem, validate_extra_roadmap_prompt
-from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS
+from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS, RELOAD_MARGIN
 from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
 from .quota import parse_pace_curve
@@ -1010,8 +1010,22 @@ def _detached_usage_supervisor(pid: int) -> bool:
         return False
 
 
-def _defer_read_policy_reload(spec: WorkerSpec, live: dict) -> bool:
-    """These read-policy edits can wait for a round boundary instead of killing paid work."""
+# What an operator edits to retune a running fleet: the read policy, and the agent, phases and
+# authoring model of a slot.
+_DEFERRED_FIELDS = (
+    "max_open_prs",
+    "github_state_url",
+    "github_state_token_file",
+    "self_tested",
+    "agent",
+    "only",
+    "author_model",
+    "author_effort",
+)
+
+
+def _defer_reload(spec: WorkerSpec, live: dict) -> bool:
+    """An edit confined to _DEFERRED_FIELDS can wait for a round boundary instead of killing paid work."""
     applied = live.get("applied_spec")
     if not isinstance(applied, dict):
         # Older runners persisted only a hash. Recognize the default read policy by its
@@ -1026,15 +1040,24 @@ def _defer_read_policy_reload(spec: WorkerSpec, live: dict) -> bool:
             applied = previous.as_dict()
     old = dict(applied)
     desired = spec.as_dict()
-    for field in ("max_open_prs", "github_state_url", "github_state_token_file", "self_tested"):
+    for field in _DEFERRED_FIELDS:
         old.pop(field, None)
         desired.pop(field, None)
     if old != desired:
         return False
-    if live.get("state") not in ("idle", "backoff", "waiting-github", "waiting-budget", "waiting-quota"):
-        return True
-    if (live.get("next_action_at") or 0) - time.time() < 15:
-        return True
+    # A worker waiting for fleet admission polls every five seconds and has no round to lose.
+    if live.get("state") != "waiting-capacity":
+        if live.get("state") not in (
+            "idle",
+            "backoff",
+            "waiting-github",
+            "waiting-budget",
+            "waiting-quota",
+            "waiting-storage",
+        ):
+            return True
+        if (live.get("next_action_at") or 0) - time.time() < RELOAD_MARGIN:
+            return True
     pid = live.get("child_pid")
     if sys.platform == "linux" and isinstance(pid, int):
         try:
@@ -1206,9 +1229,11 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     if is_live or not should_run:
                         enable_ids.discard(wid)
                     changed = bool(is_live and spec and live.get("spec_hash") != spec.fingerprint())
-                    if changed and should_run and wid not in restart_ids and _defer_read_policy_reload(spec, live):
+                    if changed and should_run and wid not in restart_ids and _defer_reload(spec, live):
                         StatusPublisher(status_path(wid, state_dir)).update(pending_read_policy=spec.fingerprint())
                         continue
+                    if is_live and not changed and live.get("pending_read_policy"):
+                        StatusPublisher(status_path(wid, state_dir)).update(pending_read_policy=None)
                     if (
                         is_live
                         and not changed

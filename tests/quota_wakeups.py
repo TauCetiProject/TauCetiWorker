@@ -445,9 +445,9 @@ def test_manager_status_and_signal_in_sleep():
         spec = wm.WorkerSpec("test")
         desired = dataclasses.replace(spec, max_open_prs=33)
         live = {"state": "waiting-quota", "applied_spec": spec.as_dict(), "next_action_at": f.wait.recheck_at()}
-        assert not wm._defer_read_policy_reload(desired, live)
+        assert not wm._defer_reload(desired, live)
         live["state"] = "surveying"
-        assert wm._defer_read_policy_reload(desired, live)
+        assert wm._defer_reload(desired, live)
         with patch.object(quota_wait, "report_runtime") as local:
             f.wait.reset()
         assert local.call_args.kwargs == {"quota_local_check_seconds": None, "quota_refresh_at": None}
