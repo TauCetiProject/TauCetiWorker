@@ -425,6 +425,12 @@ with tempfile.TemporaryDirectory() as tmp:
         ("exe", "cache", "unpack!"),
         ("exe", "cache", "--repo=x/y", "get"),
         ("--log-level", "info", "exe", "cache", "unpack"),
+        ("--config", "cfg.json", "exe", "cache", "get"),
+        ("--from-export", "x.json", "exe", "cache", "get"),
+        ("--unknown-value", "v", "exe", "cache", "get"),
+        ("", "exe", "cache", "get"),
+        ("-d=.", "exe", "cache", "get"),
+        ("-d .", "exe", "cache", "get"),
     ):
         refused = lake(*args)
         assert refused.returncode == 0 and "real-lake" not in refused.stdout, (args, refused)
@@ -435,11 +441,14 @@ with tempfile.TemporaryDirectory() as tmp:
     assert elsewhere.returncode == 1, elsewhere
     # `lake env CMD` puts the wrapper back in front of the toolchain's own lake.
     (real / "lake").write_text(
-        '#!/bin/sh\nif [ "$1" = env ]; then shift; PATH="' + str(real) + ':$PATH" exec "$@"; fi\necho real-lake "$@"\n'
+        '#!/bin/sh\ncase " $* " in *" env "*) while [ "$1" != env ]; do shift; done; shift;'
+        ' PATH="' + str(real) + ':$PATH" exec "$@";; esac\necho real-lake "$@"\n'
     )
     nested = lake("env", "lake", "exe", "cache", "get")
     assert nested.returncode == 0 and "real-lake" not in nested.stdout, nested
     assert lake("env", "lake", "build").stdout.strip() == "real-lake build"
+    assert lake("--config", "c.json", "env", "lake", "build").stdout.strip() == "real-lake build"
+    assert lake("env", "", "lake", "build").stdout.strip() == "real-lake build"
     # Aliases of the wrapper's own directory never make it exec itself.
     for alias in (f"{wrapper}/", f"{wrapper}/.", "scripts"):
         looped = lake("build", path=f"{alias}:{real}", view=False, cwd=wrapper.parent if alias == "scripts" else None)

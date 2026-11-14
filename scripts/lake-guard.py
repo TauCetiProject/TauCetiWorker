@@ -23,32 +23,46 @@ WITH_VALUE = {
     *("--platform", "--toolchain", "--rev", "--max-revs", "--log-level", "--fail-level"),
     *("--packages", "--linters", "--lint-only", "--checks", "--only", "--add-downstream"),
     *("--add-public-downstream", "--challenge-from-export", "--solution-from-export"),
+    *("--config", "--from-export"),
 }
 
 
 def parse(args):
-    """(workspace, positions of non-option arguments) for Lake's argv."""
+    """(workspace, positions of the non-option, non-empty arguments) for Lake's argv.
+
+    This errs towards seeing more words than Lake does: an unknown value-taking option makes
+    its value a word, which can only make extraction detection (a subsequence test) stricter."""
     workspace, words, i = ".", [], 0
     while i < len(args):
         arg = args[i]
-        if i == 0 and arg.startswith("+"):  # elan toolchain override
+        if not arg or (i == 0 and arg.startswith("+")):  # Lake skips empties; elan's +toolchain
             pass
         elif arg in ("-d", "--dir") and i + 1 < len(args):
             workspace = args[i + 1]
             i += 1
-        elif arg.startswith("--dir="):
+        elif arg.startswith(("--dir=", "-d=")):
             workspace = arg.split("=", 1)[1]
-        elif arg.startswith("-d") and len(arg) > 2 and not arg.startswith("--"):
-            workspace = arg[2:]
+        elif arg.startswith("-d") and not arg.startswith("--"):
+            workspace = arg[2:].strip()
         elif arg in WITH_VALUE:
             i += 1
         elif arg == "--":
-            words.extend(range(i + 1, len(args)))
+            words.extend(j for j in range(i + 1, len(args)) if args[j])
             break
         elif not arg.startswith("-"):
             words.append(i)
         i += 1
     return Path(workspace), words
+
+
+def extraction(command):
+    """The extraction subcommand if `exe|exec`, `[pkg/]cache`, `get|get!|unpack|unpack!`
+    appear in that order anywhere among the words, else None."""
+    for i, word in enumerate(command):
+        if word in ("exe", "exec") and i + 2 < len(command) and command[i + 1].rsplit("/", 1)[-1] == "cache":
+            if command[i + 2] in EXTRACT:
+                return command[i + 2]
+    return None
 
 
 def pin_matches(workspace):
@@ -66,22 +80,24 @@ def pin_matches(workspace):
 def main(real, wrapper, args):
     workspace, words = parse(args)
     command = [args[i] for i in words]
-    if (
-        len(command) >= 3
-        and command[0] in ("exe", "exec")
-        and command[1].rsplit("/", 1)[-1] == "cache"
-        and command[2] in EXTRACT
-    ):
+    if sub := extraction(command):
         if pin_matches(workspace):
-            print(f"lake exe cache {command[2]}: Mathlib is provided by this host's shared build; nothing to fetch.", file=sys.stderr)
+            print(
+                f"lake exe cache {sub}: Mathlib is provided by this host's shared build; nothing to fetch.",
+                file=sys.stderr,
+            )
             return 0
-        print(f"lake exe cache {command[2]}: this checkout's Mathlib pin no longer matches the host's shared build.", file=sys.stderr)
+        print(
+            f"lake exe cache {sub}: this checkout's Mathlib pin no longer matches the host's shared build.",
+            file=sys.stderr,
+        )
         print("Do not build or fetch Mathlib here. Stop and report that the Mathlib pin changed.", file=sys.stderr)
         return 1
     if command and command[0] == "env" and len(words) > 1:
         cut = words[1]
         shim = 'PATH="$0:$PATH"; export PATH; exec "$@"'
-        os.execv(real, [real, *args[:cut], "/bin/sh", "-c", shim, wrapper, *args[cut:]])
+        # Lake ignores empty leading arguments; dropping them keeps CMD the shim's first word.
+        os.execv(real, [real, *(a for a in args[:cut] if a), "/bin/sh", "-c", shim, wrapper, *args[cut:]])
     os.execv(real, [real, *args])
 
 
