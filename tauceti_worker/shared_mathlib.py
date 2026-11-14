@@ -33,8 +33,16 @@ class Unavailable(RuntimeError):
     pass
 
 
-class PinRefused(Unavailable):
+class NoFallback(Unavailable):
+    """Sharing is impossible for a reason that must never lead to a private Mathlib build."""
+
+
+class PinRefused(NoFallback):
     """The checkout pins a Mathlib revision outside the host's allowed versions."""
+
+
+class CapContention(NoFallback):
+    """Waiting for the version cap took too long; the round stops instead of building privately."""
 
 
 class IntegrityFailure(Unavailable):
@@ -423,14 +431,18 @@ def allowed_revisions(cwd):
         return next((p.get("rev") for p in packages if isinstance(p, dict) and p.get("name") == "mathlib"), None)
 
     # Queue repair and other callers may not have refreshed origin/main; best effort, bounded.
-    with contextlib.suppress(OSError, subprocess.SubprocessError):
-        subprocess.run(
+    try:
+        fetched = subprocess.run(
             ["git", "-C", str(cwd), "fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main"],
             capture_output=True,
             timeout=60,
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
             stdin=subprocess.DEVNULL,
         )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if fetched.returncode:
+        return None  # a stale origin/main must not decide which pins are current
     current = pin("origin/main")
     if not current:
         return None
@@ -441,11 +453,14 @@ def allowed_revisions(cwd):
         text=True,
         timeout=30,
     )
-    for commit in history.stdout.split() if history.returncode == 0 else []:
+    commits = history.stdout.split() if history.returncode == 0 else []
+    for commit in commits:
         revision = pin(commit)
         if revision and revision != current:
             allowed.add(revision)
             return allowed
+    if len(commits) >= 200:
+        return None  # the previous pin lies beyond the search: unknown, never refused
     shallow = subprocess.run(
         ["git", "-C", str(cwd), "rev-parse", "--is-shallow-repository"], capture_output=True, text=True, timeout=30
     )
@@ -472,15 +487,27 @@ def _holders(lock_path):
     return pids
 
 
+def is_round_argv(argv):
+    """`<python> [-I …] -m tauceti_worker _round …`, as spawn_round() invokes a round."""
+    try:
+        index = argv.index("-m")
+    except ValueError:
+        return False
+    return argv[index + 1 : index + 3] == ["tauceti_worker", "_round"] and all(a.startswith("-") for a in argv[1:index])
+
+
 def _owning_round(pid):
-    """The nearest ancestor (or self) that is a worker round, or None."""
+    """The nearest ancestor (or self) that is an isolated worker round, or None.
+
+    A round is its own session and process-group leader (spawn_round uses start_new_session), so
+    signalling its group reaches only that round; anything else is signalled alone."""
     seen = set()
     while pid > 1 and pid not in seen:
         seen.add(pid)
         try:
-            argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-            if b"tauceti_worker" in argv and b"_round" in argv:
-                return pid
+            argv = [a.decode(errors="replace") for a in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if a]
+            if is_round_argv(argv):
+                return pid if os.getpgid(pid) == pid == os.getsid(pid) else None
             pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
         except (OSError, IndexError, ValueError):
             return None
@@ -523,6 +550,19 @@ def _entry_revision(entry):
     return (read_json(entry / "ready.json").get("spec") or {}).get("mathlib")
 
 
+@contextlib.contextmanager
+def _versions_lock(pool):
+    """The pool-wide cap lock; a wait that times out stops the round rather than going private."""
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(key_lock(pool, "versions", exclusive=True, timeout=LOCK_WAIT_SECONDS))
+        except IntegrityFailure:
+            raise
+        except Unavailable as error:
+            raise CapContention(f"waiting for the Mathlib version cap timed out: {error}") from error
+        yield
+
+
 def _other_entries(pool, keep):
     entries_dir = pool / "entries"
     if not entries_dir.is_dir():
@@ -540,7 +580,7 @@ def enforce_version_cap(pool, keep, allowed, env):
     Publication calls ``_evict_excess`` itself while holding the ``versions`` lock throughout."""
     if len(_other_entries(pool, keep)) + 1 <= VERSION_CAP:
         return  # the common case takes no lock
-    with key_lock(pool, "versions", exclusive=True, timeout=LOCK_WAIT_SECONDS):
+    with _versions_lock(pool):
         _evict_excess(pool, keep, allowed, env)
 
 
@@ -1179,7 +1219,7 @@ def view(cwd, env, logdir, fetch):
                         lease_lock(lease, fcntl.LOCK_EX, timeout=LOCK_WAIT_SECONDS)
                         # Admission and publication are one step under `versions`, so concurrent
                         # publishers of different keys can never exceed the cap between them.
-                        with key_lock(pool, "versions", exclusive=True, timeout=LOCK_WAIT_SECONDS):
+                        with _versions_lock(pool):
                             _evict_excess(pool, key, allowed, env)
                             entry, hit = publish(pool, key, spec, cwd, env, logdir, fetch)
                         lease_lock(lease, fcntl.LOCK_SH, timeout=LOCK_WAIT_SECONDS)
@@ -1253,8 +1293,8 @@ def view(cwd, env, logdir, fetch):
             env.pop("TAUCETI_SHARED_MATHLIB_LEASE_FD", None)
             env.pop("TAUCETI_SHARED_MATHLIB_KEY", None)
             env.pop("TAUCETI_SHARED_MATHLIB_PREP_STARTED", None)
-            if isinstance(error, PinRefused):
-                raise  # never a private build for a refused pin
+            if isinstance(error, NoFallback):
+                raise  # never a private build for a refused pin or cap contention
             if selected == "required":
                 raise Unavailable(str(error)) from error
             prefix = []
