@@ -26,6 +26,10 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. A shallow snapshot is stored in worker state, refreshed on later rounds, and mounted read-only in Bubble mode. Requires the roadmap phase to be enabled and one specific `--roadmap-only AREA`; other enabled phases ignore it, and the roadmap and review quality remain authoritative. |
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
 | `--ignore-claims` | Don't avoid targets others have claimed on the intentions board (claim-respect is on by default). |
+| `--progress-strategy threshold` | How progress rounds find a report to write. Unset, the pinned TauCetiProgress's project-wide `due` check and default plan apply. `threshold` plans per roadmap on a timer of the worker's own. See [progress report strategy](#progress-report-strategy). |
+| `--progress-max-open N` | Under `--progress-strategy threshold`, plan no new report while `N` progress reports of this account are open in the roadmap repository (default 2). |
+| `--progress-skip AREA[,AREA...]` | Roadmap areas progress rounds never report on, under either strategy. |
+| `--progress-shepherd` | In progress rounds, dispatch the roadmap repository's merge-gate workflow again for a report of this account that the gate has left open, twice at most, then record the report for a person. See [open progress reports](#open-progress-reports). |
 | `--auto-refresh` | Renew this worker's Claude access token when it expires, instead of reporting Claude unavailable until a human runs `claude` again. Off by default, and only safe when nothing else uses the same credential file — the refresh token is single-use, so the rotation logs out an interactive `claude`, a second refresher, or a copy of the credential elsewhere. See [quota and pacing](quota.md). |
 | `--ignore-quota` | Ignore soft pacing for an explicit `--agent codex\|claude`; unreadable usage and provider hard limits still stop the round. Kiro and OpenRouter agents do not use the subscription pacer. |
 | `--quota-cmd CMD` | External pacer, run as `<cmd> <agent>`: first stdout token = model to run, empty output or nonzero exit = wait. |
@@ -368,6 +372,10 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_EXTRA_ROADMAP_PROMPT` | _(unset)_ | Operator guidance for roadmap rounds, for `--extra-roadmap-prompt`. |
 | `TAUCETI_ROADMAP_EXTRA_IDENTITIES` | _(unset)_ | Comma-separated extra GitHub logins whose claimed intentions count as the worker's own. |
 | `TAUCETI_RESPECT_CLAIMS` | `true` | Whether roadmap workers avoid others' claimed intentions; `false` is the same as `--ignore-claims`. |
+| `TAUCETI_PROGRESS_STRATEGY` | _(unset)_ | `threshold`, for `--progress-strategy`. |
+| `TAUCETI_PROGRESS_MAX_OPEN` | `2` | Open progress reports of this account at which a `threshold` worker stops planning, for `--progress-max-open`. |
+| `TAUCETI_PROGRESS_SKIP` | _(unset)_ | Comma-separated roadmap areas never reported on, for `--progress-skip`. |
+| `TAUCETI_PROGRESS_SHEPHERD` | _(unset)_ | `1` is the same as `--progress-shepherd`. |
 | `TAUCETI_PR` | _(unset)_ | Comma-separated pull request numbers for `--pr`. |
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
 | `TAUCETI_AUTO_REFRESH` | _(unset)_ | `1` is the same as `--auto-refresh`. |
@@ -410,6 +418,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_INTERROUND` | `20` | Minimum gap after a productive round (seconds). |
 | `TAUCETI_BACKOFF_BASE` / `TAUCETI_BACKOFF_MAX` | `30` / `900` | The escalating no-progress back-off (seconds). |
 | `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress prose attempts (seconds; eight hours by default). Mechanical documentation retries do not spend this window. |
+| `TAUCETI_PROGRESS_POLL` | `3600` | Under `--progress-strategy threshold`, the longest wait between two plans when none found a roadmap to report on (seconds). |
 | `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. A loop dedicated to `overlap-scan` requires only REST core. |
 | `TAUCETI_OVERLAP_BATCH_COMMITS` | `160` | First-parent Mathlib commits examined per overlap-scan conversation; `--overlap-batch-commits` overrides it. Calibrated with Codex `gpt-6.1-sol` at high effort. |
 | `TAUCETI_GH_INROUND_WAIT` | `900` | Cap on how long a single `gh` call waits in place for a secondary rate limit to clear (seconds). Primary limits return immediately so the loop can wait for them before another round. |
@@ -417,6 +426,8 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_GITHUB_SHARED_DIR` | `state/github-shared` | Stable cross-worker cache, quota state, host gh wrapper and HTTP accounting directory. |
 | `TAUCETI_GITHUB_CACHE_BYPASS` | _(unset)_ | Set to `1` to bypass shared cached reads for diagnosis. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
+| `TAUCETI_INCIDENTS_DIR` | _(unset)_ | Directory, shared by a fleet's workers, for [incident records](incidents.md): a `rebase`, `fix`, or `fix-ci` round that left nothing on GitHub writes the agent's final message there, a spent attempt budget is noted once per head, and `--progress-shepherd` records a progress report the merge gate keeps open. Unset writes nothing. |
+| `TAUCETI_HOLD_DECLINED` | _(unset)_ | `1` keeps a stage off a pull request head that such a `declined` record names, until the head moves or the record is deleted. Needs `TAUCETI_INCIDENTS_DIR`. |
 | `CLAIM_REPO` | automatic | The repository holding this worker's cooperative claim leases. Without an override it is the shared namespace `TauCetiProject/tauceti-claims` once your account can push there, and your own fork until then. See [the claim namespace](#the-claim-namespace). |
 | `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `1500` / `300` | Branch-claim lease TTL and heartbeat interval (seconds). |
 
@@ -449,6 +460,94 @@ cumulative receipt before resuming; cost-only reconciliation does not restore
 its cumulative accounting baseline.
 See [the complete budget design](api-budget-plan.md) for state paths, recovery,
 and estimated-cost semantics.
+
+### Progress report strategy
+
+By default a progress round starts when TauCetiProgress's `due` check says the project-wide cadence
+has elapsed, and its `plan` then takes the busiest roadmap.
+
+`--progress-strategy threshold` (`progress_strategy = "threshold"` in `workers.toml`) runs
+`plan --strategy threshold` instead, which decides per roadmap from its merged pull requests and
+the days since its last report. That strategy has no `due` check, so the survey asks nothing of
+GitHub and the round's own `plan` is the poll. A plan that chooses nothing records every roadmap's
+standing in `state/progress/table.json`, and the next plan waits for the time that table names,
+at least ten minutes and at most `TAUCETI_PROGRESS_POLL` seconds (new merges can make a roadmap
+qualify sooner than the table could know). The plan keeps its label queries in
+`state/progress/labels.json` between polls.
+
+Before planning, a `threshold` round counts the open pull requests of its GitHub account in the
+roadmap repository whose head branch starts with `progress/`. At `--progress-max-open` (default 2)
+it plans nothing and looks again ten minutes later; the suppression reason names the open reports.
+A report the merge gate never lands holds its place until someone closes it;
+[`--progress-shepherd`](#open-progress-reports) asks the gate again and then tells a person.
+A report that was already written and is waiting to be published is published regardless. A
+published report clears the eight-hour attempt gap, which then spaces only failed attempts. The
+count and the plan run under the same `progress` claim as the default strategy, so workers that
+share a claim namespace take turns and do not write the same report twice.
+
+`--progress-skip` passes `--skip-area` to `plan` under either strategy.
+
+These settings need a TauCetiProgress revision whose `plan` has the flags; set
+`TAUCETI_PROGRESS_REF` (and `TAUCETI_PROGRESS_REPO` for a fork) accordingly. On a revision without
+them the first plan fails with a message naming the revision, and progress rounds stay suppressed
+with that reason until the pin changes, the settings are removed, or the named state file is
+deleted. With all three settings unset the progress phase runs exactly as before.
+
+### Open progress reports
+
+The roadmap repository's merge gate (`progress-merge.yml`) considers a report when its pull request
+is opened, reopened, pushed to or marked ready, and when the workflow is dispatched with the pull
+request's number. The gate TauCetiProgress installs runs on no schedule. A roadmap repository may
+add one: TauCetiRoadmap's runs every twenty minutes, offers again each report it held while the
+merge queue was busy, and offers a report it refused again once that refusal is a day old. Either
+way a report refused for a reason that has since passed, or whose run was lost, can stay open for
+hours or indefinitely, and without this setting the worker does nothing to a report once it is
+open. The setting bounds that wait instead: it asks twice and then hands the report to a person.
+
+With `--progress-shepherd` (`progress_shepherd = true` in `workers.toml`), every progress round
+first lists the open pull requests of its GitHub account in the roadmap repository whose head
+branch starts with `progress/`, and for each one that is not a draft:
+
+1. Two hours after the report opened, it dispatches the workflow for that pull request, and again
+   four hours after the first ask. The gate keeps two reports for one roadmap six hours apart, so
+   the second ask falls after that interval whenever it was the reason.
+2. Before either ask it reads the workflow's runs that this account started since the report
+   opened or was last asked about. While one of them is unfinished, or the runs cannot be read, it
+   asks nothing and reads them again half an hour later, so a queue of waiting runs is not added to.
+3. Four hours after the second ask, with the report still open and no run unfinished, it stops. The
+   log gets one line naming the report, its age and the reason in the gate's newest refusal comment.
+   With `TAUCETI_INCIDENTS_DIR` set it also writes a `progress-stuck`
+   [incident record](incidents.md), and a report that already has one, from any worker sharing
+   the directory, is not asked about.
+
+The dispatch is `POST /repos/<roadmap repository>/actions/workflows/progress-merge.yml/dispatches`
+on `main` with the inputs `pr` and `wait_for_queue: true`, so that the gate holds the report while
+the merge queue is busy as it does on its own runs rather than landing it as a dispatch by hand
+would. A workflow that does not declare `wait_for_queue` (the TauCetiProgress template) has no such
+hold and refuses the input; the dispatch is then sent once more with `pr` alone. It needs write access to the roadmap repository and a token with the fine-grained
+permission "Actions: write" there (the `repo` scope of a classic token). A dispatch that GitHub
+rejects for want of that, or because the workflow has no dispatch trigger, is not repeated: the
+report goes to step 3 at once, with GitHub's answer as the reason.
+
+Each ask is written to `state/progress/shepherd.json` before it is sent and is never handed to the
+publication outbox, so a round that dies or loses GitHub's answer does not send it again; that ask
+counts as made. One stopped by a rate limit or an expired login is not counted and is tried again
+half an hour later. An entry leaves the file when its report is no longer open. The file is per
+worker and per roadmap repository: one other than `TauCetiProject/TauCetiRoadmap` has its own
+`state/progress/shepherd.<digest>.json`, the digest computed as for an
+[incident record's key](incidents.md#keys-and-sources), so a report never inherits the asks of
+another repository's report with its number. Being per worker, it lets each of several workers
+acting as one account make its own asks: set the key on one of them.
+
+The pass costs one listing per progress round, which a `threshold` round then also uses for its
+`--progress-max-open` count: up to 1000 of the account's open pull requests in the roadmap
+repository, read from GitHub itself rather than a state mirror or cache, a page of 100 per request. A listing cut off at 1000, like one that fails, asks about no
+report and leaves the ledger as it is. On top of the listing comes one read of the workflow's runs for each report that has come
+due. It runs only with a progress round, so the times above are the earliest: under
+`--progress-strategy threshold` a round normally starts at least every `TAUCETI_PROGRESS_POLL`
+seconds, and every ten minutes at the open-report limit; under the default strategy one starts only
+when a report is due project-wide; and whatever holds progress rounds back, such as the attempt gap
+after a failed round, holds the asks back with them.
 
 ### Progress documentation deployment waits
 

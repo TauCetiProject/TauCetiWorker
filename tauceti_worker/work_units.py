@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from . import incidents
 from .agents import (
     AuthoringProfile,
     BuildCacheUnavailable,
@@ -36,6 +37,7 @@ from .agents import (
     run_to_logfile,
     scope_policy,
     take_last_agent_infra_failure,
+    take_last_agent_run,
     validate_kiro_model_access,
     wrapper_bin,
 )
@@ -50,6 +52,10 @@ from .config import (
     is_git_url,
     log,
     one_line,
+    progress_max_open,
+    progress_shepherd,
+    progress_skip,
+    progress_strategy,
     respect_claims,
     roadmap_areas,
     roadmap_only,
@@ -63,12 +69,15 @@ from .constants import (
     CONTEST_CLAIM_TTL,
     EX_CLAIM_COLLISION,
     EX_NOPROGRESS,
+    MAX_CI_PR_ATTEMPTS,
     MAX_FIX_ATTEMPTS,
     MAX_INFRA_REFUNDS,
     OPENROUTER_MODELS,
     PR_TASKS,
     PROGRESS_ATTEMPT_GAP,
     PROGRESS_ERROR_KEY,
+    PROGRESS_FLAGS_KEY,
+    PROGRESS_POLL,
     PROGRESS_REF,
     PROGRESS_TOOL_LINE,
     PROGRESS_TOOL_TAIL,
@@ -83,7 +92,17 @@ from .constants import (
     SANDBOX_DEFAULT,
     TAUCETI,
 )
-from .github import GitHub, GitHubError, can_push, claims_repo, ensure_fork, gh_run, me, review_publisher
+from .github import (
+    GitHub,
+    GitHubError,
+    _parse_iso8601,
+    can_push,
+    claims_repo,
+    ensure_fork,
+    gh_run,
+    me,
+    review_publisher,
+)
 from .github_state import enabled as github_state_enabled
 from .intentions import avoid_list
 from .paths import CLAIM_SH, HERE
@@ -113,6 +132,8 @@ from .survey import (
     owns_pr,
     prioritize_review_candidates,
     progress_argv,
+    progress_flags_reason,
+    progress_poll_wait,
     spread_candidates,
     survey,
 )
@@ -568,6 +589,8 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         reason = f"its review has errored {n_err} times without completing a review"
         w.gh.ensure_stuck_issue(pr, reason, diagnostic)
 
+    note_spent_budgets(w, sv, opts)
+
     if global_pick:
         counts = ", ".join(
             f"{stage}={len(sv.kind(stage).actionable)}" for stage in round_stages(opts) if want(opts.only, stage)
@@ -809,6 +832,54 @@ def log_round_file_changes(cfg: Config, pre_head: str | None) -> None:
             log(f"    {ln.strip()}")
         if len(dirty) > _MAX_CHANGED_FILES:
             log(f"    … {len(dirty) - _MAX_CHANGED_FILES} more")
+
+
+def note_spent_budgets(w: Worker, sv: Survey, opts: RoundOpts) -> None:
+    """Leave a `budget-spent` record for each repair candidate the survey suppressed with its
+    attempts used up, within the round's `--pr` scope and not under `--dry-run`."""
+    if incidents.directory() is None or opts.dry_run:
+        return
+    targets = frozenset(getattr(opts, "prs", ()) or ())
+    for stage in incidents.STAGES:
+        for c in sv.kind(stage).suppressed:
+            repository, repository_id = _incident_source(w, c)
+            if (not targets or c.pr in targets) and not incidents.declined(stage, c.pr, c.head, repository):
+                detail = f"{c.reason}; {c.attempts}/{c.budget} attempts used"
+                if stage == "fix-ci":
+                    detail += f" at this head, {w.counters.read(f'ci-pr-{c.pr}')}/{MAX_CI_PR_ATTEMPTS} on the PR"
+                incidents.note_budget_spent(
+                    stage, c.pr, c.head, detail, repository=repository, repository_id=repository_id
+                )
+
+
+def _incident_source(w, c) -> tuple:
+    return (
+        getattr(c, "source_repository", None) or incidents.source_of(getattr(w, "gh", None)),
+        getattr(c, "source_repository_id", None),
+    )
+
+
+def _record_declined(stage: str, w: Worker, sv: Survey, c: Candidate) -> Path | None:
+    # An automatic bump is retried without an attempt budget, so no round on it is its last word.
+    if (
+        stage not in incidents.STAGES
+        or not c.pr
+        or incidents.directory() is None
+        or any(p.number == c.pr and getattr(p, "automatic_bump", False) for p in sv.open_prs)
+    ):
+        return None
+    run = take_last_agent_run() or {}
+    repository, repository_id = _incident_source(w, c)
+    return incidents.record_declined(
+        stage,
+        c.pr,
+        c.head,
+        repository=repository,
+        repository_id=repository_id,
+        reason=c.reason,
+        message=run.get("last_message") or "\n".join(run.get("tail") or ()),
+        transcript=run.get("transcript") or str(w.cfg.logdir),
+    )
 
 
 def _open_pr_numbers(w: Worker) -> set[int] | None:
@@ -1360,6 +1431,14 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         if retained_repair(getattr(w, "cfg", None), getattr(getattr(w, "gh", None), "repo", TAUCETI), c.pr):
             log(f"  #{c.pr}: retained source recovery has priority; selecting unrelated work")
             return None
+    if (
+        c.pr
+        and stage in incidents.STAGES
+        and incidents.hold_declined()
+        and incidents.declined(stage, c.pr, c.head, _incident_source(w, c)[0])
+    ):
+        log(f"  {stage} #{c.pr}: {incidents.HELD}; selecting unrelated work")
+        return None
     from .build_resources import queue_owned
 
     selected = next((p for p in getattr(sv, "open_prs", ()) if p.number == c.pr), None) if c.pr else None
@@ -1543,6 +1622,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             f"{stage}{tgt}: the agent finished but nothing landed on GitHub (no push, new PR, or "
             f"comment or closure). No durable PR outcome was confirmed. Transcript: {w.cfg.logdir}"
         )
+        if recorded := _record_declined(stage, w, sv, c):
+            reason += f"; the agent's final message is recorded at {recorded}"
         if not bubble and _candidate_checkout_unchanged(w.cfg, c):
             log(reason + "; checkout unchanged — selecting another candidate")
             report_runtime(
@@ -1945,6 +2026,14 @@ def _do_fixlike(
             w.counters.write(key, max(0, w.counters.read(key) - 1))
         return None
 
+    # A peer may have recorded its decline between dispatch's check and this claim.
+    if (
+        label in incidents.STAGES
+        and incidents.hold_declined()
+        and incidents.declined(label, pr, head, _incident_source(w, c)[0])
+    ):
+        log(f"  {label} #{pr}: {incidents.HELD}; selecting unrelated work")
+        return decline_repair()
     if label == "fix" or bubble:
         c.progress = _progress_snapshot(w, c)
         live = None
@@ -2039,6 +2128,8 @@ def _do_fixlike(
             else "You may NOT close this PR: it is not your authored PR or has a special repair scope."
         ),
     )
+    if label in incidents.STAGES and incidents.directory() is not None and not getattr(p, "automatic_bump", False):
+        prompt += incidents.PROMPT
     if getattr(c, "final_resolution", False) and may_close:
         prompt += FINAL_ATTEMPT_INSTRUCTION
     if getattr(p, "automatic_bump", False):
@@ -2290,6 +2381,9 @@ def _close_spent_pr(w, sv, c) -> int | None:
     if not w.claims.begin_branch_work(c.pr, c.head, p.head_ref, p.head_owner, p.head_repo):
         return None
     try:
+        if incidents.hold_declined() and incidents.declined("fix", c.pr, c.head, _incident_source(w, c)[0]):
+            log(f"  fix #{c.pr}: {incidents.HELD}; leaving it open")
+            return None
         with read_context(fresh=True, direct=True):
             if not _still_actionable("fix", w, sv, replace(c, partial_history=False)):
                 return None
@@ -2576,6 +2670,80 @@ def _progress_deadline_wait(w):
     )
 
 
+# Open roadmap PRs of the account listed to find its reports: `gh` pages 100 at a time and stops early.
+PROGRESS_REPORT_SCAN = 1000
+
+
+def progress_reports(fields: list[str], account: str) -> list[dict]:
+    """The account's open pull requests in the roadmap repository whose head branch starts with
+    `progress/`, by number, as rows with `fields`. Raises GitHubError when they could not be listed
+    in full."""
+    from .github_transport import read_context
+
+    # A state mirror or cached listing can predate a report this account opened moments ago.
+    with read_context(fresh=True, direct=True, retry=False):
+        rows = GitHub(ROADMAP).pr_list(fields, author=account, limit=PROGRESS_REPORT_SCAN)
+    if len(rows) >= PROGRESS_REPORT_SCAN:
+        raise GitHubError(f"more than {PROGRESS_REPORT_SCAN} open pull requests in the roadmap repository")
+    return sorted(
+        (row for row in rows if str(row.get("headRefName") or "").startswith("progress/")),
+        key=lambda row: row["number"],
+    )
+
+
+def _progress_reports_held(w, reports=None) -> str | None:
+    """Why the threshold strategy may not plan a report now, or None: the account's open reports
+    in the roadmap repository have reached progress_max_open, or could not be counted. `reports` is
+    this round's `progress_reports` where the shepherd already read them."""
+    limit = progress_max_open()
+    try:
+        if reports is None:
+            reports = progress_reports(["number", "headRefName"], me())
+    except GitHubError as exc:
+        reason = f"could not count this account's open reports ({one_line(str(exc), 120)})"
+    else:
+        held = [row["number"] for row in reports]
+        if len(held) < limit:
+            return None
+        reason = (
+            f"{len(held)} report(s) of this account open ({', '.join(f'#{n}' for n in held)}), "
+            f"the limit is {limit}; waiting for one to land or close"
+        )
+    progress_poll_wait(w.cfg, w.counters, PROGRESS_TTL, reason)
+    return reason
+
+
+def _progress_threshold_wait(w, table, proc):
+    """A threshold plan chose nothing: wait until its table says a roadmap qualifies with the pull
+    requests it has now. New merges can bring that forward, hence the PROGRESS_POLL ceiling."""
+    delay = PROGRESS_POLL
+    try:
+        if at := _parse_iso8601(json.loads(table.read_text()).get("next_qualifies_at")):
+            delay = at - time.time()
+    except (OSError, ValueError, AttributeError):
+        pass
+    said = [line.strip() for line in (proc.stderr or proc.stdout or "").splitlines() if line.strip()]
+    w.counters.write("progress-mechanical-retry-at", 0)
+    progress_poll_wait(
+        w.cfg,
+        w.counters,
+        min(PROGRESS_POLL, max(PROGRESS_TTL, delay)),
+        one_line(said[-1].removeprefix("not due: "), 160) if said else "no roadmap qualifies",
+    )
+
+
+def _progress_flags_rejected(w, proc):
+    """A TauCetiProgress pinned before the strategy flags existed stops at its argument parser.
+    Record that against the revision and fail this one round; the survey then holds the phase."""
+    if proc.returncode != 2 or not re.search(r"unrecognized arguments|invalid choice", proc.stderr or ""):
+        return
+    _progress_tool_failed(w, "plan", proc)
+    w.counters.write(PROGRESS_FLAGS_KEY, 1)
+    w.counters.write("progress-mechanical-retry-at", 0)
+    bust_progress_cache(w.cfg)
+    raise Die(f"progress: {progress_flags_reason()}")
+
+
 def _prepare_progress(w, run_tool, roadmap_dir, work):
     """Retry only free mechanical work. Keep the last coherent artifacts until replacement succeeds."""
     from . import progress_publication as publication
@@ -2595,6 +2763,15 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
     reason = ""
     invalid_plan = None
     recovery = False
+    threshold = progress_strategy() == "threshold"
+    table = w.cfg.state / "progress/table.json"
+    if threshold:
+        choice = ["--strategy", "threshold", "--table", str(table)]
+        choice += ["--label-cache", str(w.cfg.state / "progress/labels.json")]
+    else:
+        choice = ["--min-prs", "25"]
+    # One argument each: an area name is operator text and must not read as a flag.
+    choice += [f"--skip-area={area}" for area in progress_skip()]
 
     def source_binding(value):
         # Presence is part of the binding: an explicit null is not the legacy plan that has none.
@@ -2616,6 +2793,8 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
         output.mkdir()
         plan_file, facts_file = output / "plan.json", output / "facts.json"
         plan = {}
+        if threshold:
+            table.unlink(missing_ok=True)  # a plan that stops before its choice must not leave the last table
         # Shared within an attempt, isolated from all other attempts and the global disk cache.
         with tempfile.TemporaryDirectory(prefix="docs-", dir=output) as cache:
             for stage, args in (
@@ -2628,8 +2807,7 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                         "origin/main",
                         "--code-dir",
                         str(w.cfg.checkout),
-                        "--min-prs",
-                        "25",
+                        *choice,
                         "--out",
                         str(plan_file),
                     ),
@@ -2641,9 +2819,14 @@ def _prepare_progress(w, run_tool, roadmap_dir, work):
                     log(f"progress: nothing due after re-checking: {(proc.stderr or proc.stdout or '').strip()}")
                     w.counters.write("progress-docs-waits", 0)
                     w.counters.write("progress-docs-retry-at", 0)
-                    _progress_mechanical_delay(w)
+                    if threshold:
+                        _progress_threshold_wait(w, table, proc)
+                    else:
+                        _progress_mechanical_delay(w)
                     return None
                 if proc.returncode:
+                    if stage == "plan" and (threshold or progress_skip()):
+                        _progress_flags_rejected(w, proc)
                     reason = _progress_tool_failed(w, stage, proc)
                     if proc.returncode == 78:
                         recovery = True
@@ -2728,8 +2911,10 @@ def _install_progress_body(source, target):
 
 
 def _do_progress_inner(w, opts) -> int | None:
+    from . import progress_landing as shepherd
     from . import progress_publication as publication
 
+    open_reports = shepherd.look(w.cfg) if progress_shepherd() else None
     retained = publication.retained(w.cfg)
     marker = w.cfg.state / "progress/work/publication.json"
     if marker.exists() and not retained:
@@ -2745,6 +2930,9 @@ def _do_progress_inner(w, opts) -> int | None:
             w.counters.write(PROGRESS_ERROR_KEY, 0)
             return None
         retained = publication.defer(w.cfg, retained)
+    elif progress_strategy() == "threshold" and (held := _progress_reports_held(w, open_reports)):
+        log(f"progress: {held}")
+        return None
     # Reserve separate mechanical spacing before checkout and every fallible preparation step.
     # Churn, deadline and not-due paths replace this reservation with their own retry delays.
     if not retained:
@@ -3012,6 +3200,10 @@ def _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt):
     if proc.returncode == EX_NOPROGRESS:
         bust_progress_cache(w.cfg)
         raise NoProgress("progress: this window is already in flight or already landed")
+    if progress_strategy() == "threshold":
+        # A published report is paced by progress_max_open. The gap stays for 75: that includes a
+        # window closed unmerged, which the threshold planner can choose again on every poll.
+        w.counters.write("progress-attempt-ts", 0)
 
     # A report landed (as a PR). Clear the error streak, and drop the cached "due" verdict immediately:
     # otherwise this same worker would still read `due` from cache on its next round, minutes from now,

@@ -17,7 +17,8 @@ from pathlib import Path
 
 from tauceti_tools.forge import RepositoryRef
 
-from .config import Config, log, roadmap_only, roadmap_skip
+from . import incidents
+from .config import Config, log, progress_skip, progress_strategy, roadmap_only, roadmap_skip
 from .config import max_open_prs as configured_max_open_prs
 from .constants import (
     AUTO_STAGES,
@@ -40,6 +41,7 @@ from .constants import (
     PROGRESS,
     PROGRESS_ATTEMPT_GAP,
     PROGRESS_ERROR_KEY,
+    PROGRESS_FLAGS_KEY,
     PROGRESS_REF,
     PROGRESS_TTL,
     REVIEW_AFFINITY_GRACE_S,
@@ -677,6 +679,25 @@ def progress_argv(state: Path, *args: str) -> list[str]:
     ]
 
 
+def progress_flags_reason() -> str:
+    return (
+        f"{PROGRESS} at {PROGRESS_REF[:12]} rejected the `plan` flags that progress_strategy and "
+        "progress_skip add; set TAUCETI_PROGRESS_REF to a revision that has them, or unset both "
+        f"settings (not retried on this revision; clear state/{PROGRESS_FLAGS_KEY} to retry)"
+    )
+
+
+def progress_poll_wait(cfg: Config, counters: Counters, delay: float, reason: str) -> None:
+    """Under the threshold strategy, hold the next plan for `delay` seconds and keep why for the survey."""
+    counters.write("progress-poll-at", int(time.time() + delay))
+    try:
+        cache = cfg.state / "cache" / "progress-poll.json"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({"reason": reason}))
+    except OSError:
+        pass
+
+
 def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
     """Is a roadmap progress report due? `(due, reason)`.
 
@@ -710,6 +731,9 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
         return True, "prepared progress report ready to resume publication"
     if (cfg.state / "progress/work/publication.json").exists():
         return False, "prepared progress receipt needs recovery; files preserved"
+    threshold = progress_strategy() == "threshold"
+    if (threshold or progress_skip()) and counters.read(PROGRESS_FLAGS_KEY):
+        return False, progress_flags_reason()
     if (retry_at := counters.read("progress-docs-retry-at")) > time.time():
         when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(retry_at))
         return (
@@ -720,7 +744,7 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
         return False, "progress mechanical work is cooling down; prose cadence remains unspent"
     cache = cfg.state / "cache" / "progress-due.json"
     try:
-        if cache.exists() and (time.time() - cache.stat().st_mtime) < PROGRESS_TTL:
+        if not threshold and cache.exists() and (time.time() - cache.stat().st_mtime) < PROGRESS_TTL:
             d = json.loads(cache.read_text())
             return bool(d.get("due")), str(d.get("reason") or "")
     except (OSError, ValueError):
@@ -738,6 +762,17 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
             f"progress rounds have failed {counters.read(PROGRESS_ERROR_KEY)}x; "
             f"backing off (clear state/{PROGRESS_ERROR_KEY} to retry)"
         )
+
+    if threshold:
+        # No `due` here: the strategy has no project-wide cadence to ask about. The round's `plan` is
+        # the poll, and the round sets when the next one is worth making (progress_poll_wait).
+        if (poll_at := counters.read("progress-poll-at")) > time.time():
+            try:
+                reason = str(json.loads((cfg.state / "cache" / "progress-poll.json").read_text())["reason"])
+            except (OSError, ValueError, KeyError, TypeError):
+                reason = "no roadmap qualified at the last threshold plan"
+            return False, f"{reason}; next plan after {time.strftime('%H:%M UTC', time.gmtime(poll_at))}"
+        return True, "threshold plan: looking for a roadmap to report on"
 
     try:
         proc = subprocess.run(progress_argv(cfg.state, "due"), capture_output=True, text=True, timeout=300)
@@ -962,6 +997,7 @@ def classify_survey(
     from .review_runtime import pending_reviews
 
     enabled = set(enabled)
+    source = incidents.source_of(gh)
     pending = (pending_reviews(cfg) if deep else set()) if pending is None else pending
     prs = sv.open_prs
 
@@ -1094,7 +1130,9 @@ def classify_survey(
             c.reason = f"{reason}; {error}"
             c.attempts = MAX_REBASE_ATTEMPTS
         c.budget = 1 if foreign else MAX_REBASE_ATTEMPTS
-        (sv.rebaseable.suppressed if c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
+        if held := incidents.declined("rebase", p.number, p.head_oid, source):
+            c.reason = incidents.HELD
+        (sv.rebaseable.suppressed if held or c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
 
     # 2) review: non-draft, build-green. Eligible when the head is NOT cleanly reviewed (a new commit
     #    or an errored round → normal review; no round budget here, CI retires a non-converging PR),
@@ -1221,9 +1259,11 @@ def classify_survey(
                         partial_history=True,
                     )
                     c.final_resolution = c.attempts >= c.budget - 1 and sv.owns(p) and not p.automatic_bump
+                    if held := incidents.declined("fix", p.number, p.head_oid, source):
+                        c.reason, c.final_resolution = incidents.HELD, False
                     (
                         sv.needs_fix.suppressed
-                        if c.attempts >= c.budget and not c.final_resolution
+                        if held or (c.attempts >= c.budget and not c.final_resolution)
                         else sv.needs_fix.actionable
                     ).append(c)
                 continue
@@ -1246,6 +1286,12 @@ def classify_survey(
                 unlimited=p.automatic_bump,
             )
             if disp == "skip":
+                continue
+            if disp in ("actionable", "exhausted") and incidents.declined("fix", p.number, p.head_oid, source):
+                sv.fix_waiting.append((p.number, incidents.HELD))
+                sv.needs_fix.suppressed.append(
+                    Candidate(p.number, p.head_oid, incidents.HELD, attempts=per_head, budget=MAX_FIX_ATTEMPTS)
+                )
                 continue
             if disp == "actionable":
                 c = Candidate(
@@ -1281,7 +1327,9 @@ def classify_survey(
         per_head = counters.read(f"ci-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"ci-pr-{p.number}")
         c.attempts, c.budget = per_head, MAX_CI_ATTEMPTS
-        if per_head >= MAX_CI_ATTEMPTS or per_pr >= MAX_CI_PR_ATTEMPTS:
+        if held := incidents.declined("fix-ci", p.number, p.head_oid, source):
+            c.reason = incidents.HELD
+        if held or per_head >= MAX_CI_ATTEMPTS or per_pr >= MAX_CI_PR_ATTEMPTS:
             sv.red_ci.suppressed.append(c)
         else:
             sv.red_ci.actionable.append(c)
