@@ -442,12 +442,16 @@ def _manifest_pin(text):
 _PURPOSE = {}
 
 
-def set_round_purpose(checkout, *, rebase=False, bump=False):
+def set_round_purpose(checkout, *, rebase=False, bump=False, repair=False):
     """Record what the current round in ``checkout`` is for. Keyed by the checkout, so cache
-    preparation for any other directory (verification jobs, recovery) is unaffected."""
+    preparation for any other directory (verification jobs, recovery) is unaffected.
+
+    ``repair`` (fix, fix-ci, lint-repair) prepares main's Mathlib only when the branch's own pin
+    is refused: its agent is then told by ``lake`` to integrate main first, instead of the round
+    backing off on that PR forever."""
     _PURPOSE.clear()
-    if checkout is not None and (rebase or bump):
-        _PURPOSE[Path(checkout).resolve()] = dict(rebase=rebase, bump=bump)
+    if checkout is not None and (rebase or bump or repair):
+        _PURPOSE[Path(checkout).resolve()] = dict(rebase=rebase, bump=bump, repair=repair)
 
 
 def _purpose(cwd):
@@ -478,7 +482,8 @@ def rebase_target(cwd, env):
         restored[0] = True
 
     saved = {}
-    if _purpose(cwd).get("rebase"):
+    purpose = _purpose(cwd)
+    if purpose.get("rebase") or purpose.get("repair"):
         with contextlib.suppress(OSError, subprocess.SubprocessError):
             subprocess.run(
                 ["git", "-C", str(cwd), "fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main"],
@@ -498,12 +503,20 @@ def rebase_target(cwd, env):
         except OSError:
             current = None
         main_pin = target["lake-manifest.json"] and _manifest_pin(target["lake-manifest.json"])
-        if main_pin and _manifest_pin(current) != main_pin:
+        branch_pin = _manifest_pin(current)
+        if main_pin and branch_pin != main_pin and not purpose.get("rebase"):
+            allowed = allowed_revisions(cwd)
+            if allowed is None or branch_pin in allowed | bump_pins(root(env)):
+                main_pin = None  # a repair on an allowed pin keeps its own Mathlib
+        if main_pin and branch_pin != main_pin:
             saved = {name: (cwd / name).read_bytes() if (cwd / name).is_file() else None for name in DEPENDENCY_FILES}
             restored[0] = False
             from .config import log
 
-            log(f"shared Mathlib: preparing main's Mathlib {main_pin[:12]} for this rebase round")
+            log(
+                f"shared Mathlib: preparing main's Mathlib {main_pin[:12]} for this "
+                + ("rebase round" if purpose.get("rebase") else "repair round; its pin is refused")
+            )
             for name, data in target.items():
                 if data is None:
                     (cwd / name).unlink(missing_ok=True)
