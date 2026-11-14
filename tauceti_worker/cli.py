@@ -81,6 +81,7 @@ from .constants import (
     EXPLICIT_TASKS,
     OPENROUTER_MODELS,
     PR_TASKS,
+    SANDBOX_DEFAULT,
     TAUCETI,
     WORK_TASKS,
 )
@@ -90,7 +91,15 @@ from .cost_model import format_report as format_cost_report
 from .github import GitHub, pin_github_account, shared_claims_granted
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file, legacy_data_root
-from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, codex_dir, parse_pace_curve
+from .quota import (
+    Quota,
+    _claude_keychain_creds,
+    _safe_exists,
+    claude_dir,
+    claude_usage_credentials,
+    codex_dir,
+    parse_pace_curve,
+)
 from .review_state import ReviewState
 from .round import Claims, RoundContext, cmd_heartbeat
 from .runtime_status import report_failure, report_runtime
@@ -154,6 +163,7 @@ environment (flags win; full reference linked below):
   TAUCETI_AUTHORING_CLAUDE_MODEL / _EFFORT exact Claude authoring profile
   TAUCETI_STREAM=1       same as --stream
   TAUCETI_AUTO_REFRESH=1 same as --auto-refresh (renew an expired Claude token; see --auto-refresh)
+  TAUCETI_CLAUDE_USAGE_CREDENTIALS  a second Claude login read for usage only (agents on a setup-token)
   TAUCETI_ACCOUNT        default for --account (require a specific Codex account)
   TAUCETI_GITHUB_ACCOUNT default for --github-account (select the GitHub login)
   TAUCETI_OVERLAP_BATCH_COMMITS  commits per scan session (default 160)
@@ -482,6 +492,20 @@ def parse_only(values: list[str], flag: str = "--only") -> list[str]:
                 )  # exit 1; argparse uses 2
             tasks.append(tok)
     return tasks
+
+
+def claude_agent_credential_route(only: list[str], *, bubble: bool) -> str:
+    """How the Claude agents these phases can launch authenticate, strictest first:
+    "access-only" — security-audit runs its agent in a private home with a copy of the credential file
+    stripped of its refresh token; "file" — a Bubble agent, and a TauCetiReview rubric reviewer, which
+    runs in a clean home seeded with the file, are given the file and not $CLAUDE_CODE_OAUTH_TOKEN;
+    "environment" — every launch inherits the worker's environment, token included."""
+    phases = only or ALLOWED_TASKS
+    if "security-audit" in phases:
+        return "access-only"
+    if "review" in phases or (bubble and any(SANDBOX_DEFAULT.get(phase, False) for phase in phases)):
+        return "file"
+    return "environment"
 
 
 def resolve_tasks(only_vals: list[str], skip_vals: list[str]) -> list[str]:
@@ -1359,6 +1383,10 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             "--host is now the default (the agent runs directly on the host); it is a no-op. "
             "Pass --bubble to run inside the sandbox instead"
         )
+    # The pacer reads this to know which Claude credential the agents receive; loop children re-pin it.
+    os.environ["TAUCETI_CLAUDE_AGENT_CREDENTIAL"] = claude_agent_credential_route(
+        only, bubble=getattr(args, "bubble", False)
+    )
     author_model = getattr(args, "author_model", None)
     author_effort = getattr(args, "author_effort", None)
     resolved_author_fallback_model = getattr(args, "resolved_author_fallback_model", None)
@@ -1743,6 +1771,9 @@ def cmd_host_doctor(args) -> int:
         rows.append(
             ("claude creds", _claude_keychain_creds() is not None, 'macOS login Keychain ("Claude Code-credentials")')
         )
+    usage_creds = claude_usage_credentials()
+    if usage_creds is not None:
+        rows.append(("claude usage", _safe_exists(usage_creds), f"{usage_creds} (read for usage only)"))
     kiro_db = kiro_data_dir(cfg.home) / "data.sqlite3"
     rows.append(
         (

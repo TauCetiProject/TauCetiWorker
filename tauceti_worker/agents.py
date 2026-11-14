@@ -3323,6 +3323,10 @@ def isolate_home(wid: str) -> Path:
             os.environ["TAUCETI_KIRO_XDG_DATA_HOME"] = str(iso_kiro_data.parent)
         return home
     real = Path(os.environ.get("HOME", os.path.expanduser("~")))
+    # A `~` in the usage login means the operator's home; pin it before $HOME moves below.
+    usage = os.environ.get("TAUCETI_CLAUDE_USAGE_CREDENTIALS", "").strip()
+    if usage:
+        os.environ["TAUCETI_CLAUDE_USAGE_CREDENTIALS"] = str(Path(usage).expanduser())
     real_claude = claude_dir(real)  # honors the operator's $CLAUDE_CONFIG_DIR before we repoint it
     real_kiro_data = kiro_data_dir(real)
     iso_claude.mkdir(parents=True, exist_ok=True)

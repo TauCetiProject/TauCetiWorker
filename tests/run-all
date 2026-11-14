@@ -153,6 +153,7 @@ RUN_STDLIB=(
   prompt_wrapper_paths.py
   provider_usage.py
   quota_auto_refresh.py
+  quota_usage_credentials.py
   quota_cache_fp.py
   quota_loop_refresh.py
   quota_wakeups.py
