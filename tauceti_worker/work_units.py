@@ -2128,7 +2128,14 @@ def _do_fixlike(
         conversation_scope = dict(repository=TAUCETI, pr=pr, source_round=conversation_round)
         # Capture the checkout's git chatter ("Switched to a new branch …", "set up to track …") instead
         # of letting it spill into the main log; surface a one-line summary, and the stderr only on failure.
-        chk = subprocess.run(["gh", "pr", "checkout", str(pr), "--force"], cwd=str(co), capture_output=True, text=True)
+        from .round_worktrees import enabled as worktree_rounds
+        from .round_worktrees import local_branch
+
+        # Worktrees share branches: a PR's branch name (often `patch-1`) must be this worker's own.
+        unique = ["--branch", local_branch(w.cfg, pr)] if worktree_rounds() else []
+        chk = subprocess.run(
+            ["gh", "pr", "checkout", str(pr), "--force", *unique], cwd=str(co), capture_output=True, text=True
+        )
         if chk.returncode:
             detail = ((chk.stderr or "") + (chk.stdout or "")).strip()[-200:]
             log(f"  {label} #{pr}: gh pr checkout failed — skipping this attempt ({detail})")

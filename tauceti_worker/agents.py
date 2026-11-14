@@ -725,6 +725,19 @@ def prepare_checkout(
 
     sync_mathlib_pool(cfg)
     co = cfg.checkout
+    from . import round_worktrees
+
+    if round_worktrees.enabled():
+        try:
+            work_recovery.detach_handoff_owner(cfg)
+        except OSError as error:
+            log(f"checkout ownership detach deferred: {error}")
+            return False
+        if not round_worktrees.prepare(cfg, checkout_url()):
+            return False
+        return _finish_checkout(cfg, co, work=work, pr=pr, roadmap=roadmap)
+    if not round_worktrees.retire(cfg):
+        return False
 
     def clone(why: str) -> bool:
         co.parent.mkdir(parents=True, exist_ok=True)
@@ -742,6 +755,7 @@ def prepare_checkout(
             return False
     if not (co / ".git").exists() and not clone("first run"):
         return False
+    round_worktrees.restore_parked(cfg)
 
     def g(*a) -> int:
         return subprocess.run(["git", "-C", str(co), *a]).returncode
@@ -787,6 +801,14 @@ def prepare_checkout(
             "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main"),
         ):
             return False
+    g("clean", "-fdxq", "-e", ".lake")
+    return _finish_checkout(cfg, co, work=work, pr=pr, roadmap=roadmap)
+
+
+def _finish_checkout(cfg: Config, co: Path, *, work, pr, roadmap) -> bool:
+    """Shared tail of checkout preparation, once HEAD is canonical main."""
+    from . import work_recovery
+
     # Origin was validated and fetched above, and HEAD is now its main commit.
     # Carry that exact base into verification rather than asking the standalone
     # verifier to rediscover a canonical remote (which defaults to GitHub).
@@ -800,7 +822,6 @@ def prepare_checkout(
     # Compare canonical main, rather than an arbitrary PR branch, and retire old-toolchain artifacts
     # before anything can begin writing this worker's private Lake store again.
     clean_lake_cache_after_toolchain_bump(cfg)
-    g("clean", "-fdxq", "-e", ".lake")
     # Attribution only: a failure is logged by note_owner and never stops the round.
     work_recovery.note_owner(cfg, work=work, pr=pr, roadmap=roadmap)
     return True

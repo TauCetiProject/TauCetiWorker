@@ -61,6 +61,7 @@ def roots(configs, pool):
             yield path
         for name in (".lake", "lake-packages", "build"):
             yield cfg.checkout / name
+        yield cfg.checkout.with_name(cfg.checkout.name + ".lake-between-rounds")
 
 
 def inventory(paths, *, protected=(), owners=None, details=None):

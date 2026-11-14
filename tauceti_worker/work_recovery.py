@@ -1578,9 +1578,12 @@ def _guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI
     LAST_REFUSAL = ""
     indexed = os.environ.get("TAUCETI_WORK_RECOVERY", "").lower() != "off"
     record = None
+    # A worktree is removed after its round, taking its private reflog with it, so a commit an
+    # agent made and then reset away must be saved now: inspect its own history too.
+    history = checkout_kind(repo) == "worktree"
     for _ in range(3):
         try:
-            snap = inspect(repo)
+            snap = inspect(repo, history=history)
         except (OSError, subprocess.SubprocessError, RecordError) as error:
             return _retain(cfg, repo, f"could not inspect {repo} ({error})", record, label, repository=repository)
         if snap.published:
@@ -1620,7 +1623,7 @@ def _guard(cfg, repo: Path, *, label: str = "TauCeti", repository: str = TAUCETI
                 repository=repository,
             )
         try:
-            again = inspect(repo)
+            again = inspect(repo, history=history)
         except (OSError, subprocess.SubprocessError, RecordError) as error:
             return _retain(cfg, repo, f"could not re-inspect {repo} ({error})", record, label, repository=repository)
         if again.fingerprint != snap.fingerprint:

@@ -409,8 +409,10 @@ class Recovery:
                 # A known failed source needs reasoning. Admission waits must not
                 # warm caches or repeat the same expensive failed build each time.
                 b.continuation_admission(self.record, m, j)
-            prior = prior_checkout if prior_checkout.is_dir() else b.w.cfg.checkout
-            if not (prior / ".git").exists():
+            from .round_worktrees import is_clone, recovery_source
+
+            prior = prior_checkout if prior_checkout.is_dir() else recovery_source(b.w.cfg)
+            if not is_clone(prior):
                 # Restoring links from the worker's clone; never download another copy.
                 raise Wait("checkout", "No local TauCeti clone to link recovery objects from")
             b.check_verification_tools(prior)
@@ -768,14 +770,16 @@ class WorkerBackend:
                 self.snapshot_continuation(checkout, record, m, j)
             return checkout
         temp = record / f"restore-{uuid.uuid4().hex}"
-        source = self.w.cfg.checkout
+        from .round_worktrees import is_clone, recovery_source
+
+        source = recovery_source(self.w.cfg)
         archived = (j.get("delta_integration") or {}).get("archived")
         if archived and (Path(archived) / ".git").exists():
             # The normal worker clone may never have seen earlier rewritten
             # targets. Retain their objects/tips when rebuilding derived source.
             source = Path(archived)
         url = repository_url(m["repository"])
-        if not (source / ".git").exists():
+        if not is_clone(source):
             # Never download a second copy of TauCeti's history: the worker's next round
             # recreates its checkout, and recovery links from that.
             raise Wait("checkout", "No local TauCeti clone to link recovery objects from")
