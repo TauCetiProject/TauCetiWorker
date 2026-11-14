@@ -33,6 +33,18 @@ class Unavailable(RuntimeError):
     pass
 
 
+class NoFallback(Unavailable):
+    """Sharing is impossible for a reason that must never lead to a private Mathlib build."""
+
+
+class PinRefused(NoFallback):
+    """The checkout pins a Mathlib revision outside the host's allowed versions."""
+
+
+class CapContention(NoFallback):
+    """Waiting for the version cap took too long; the round stops instead of building privately."""
+
+
 class IntegrityFailure(Unavailable):
     pass
 
@@ -65,24 +77,35 @@ def selection(env):
     policy = read_json(path)
     if path.exists() and (
         not policy
-        or policy.get("mode") not in ("off", "auto", "required")
+        or policy.get("mode", "auto") not in ("off", "auto", "required")
         or not isinstance(policy.get("expires_at", 0), (int, float))
         or not math.isfinite(policy.get("expires_at", 0))
         or policy.get("expiry_mode", "off") not in ("off", "auto", "required")
         or not isinstance(policy.get("workers", []), list)
         or any(not isinstance(worker, str) for worker in policy.get("workers", []))
     ):
-        if env.get("TAUCETI_SHARED_MATHLIB_BUILDS") == "required":
+        # An unreadable opt-in is still an opt-in: block until an operator repairs it.
+        if env.get("TAUCETI_SHARED_MATHLIB_BUILDS", "auto").lower() in ("auto", "required"):
             raise Unavailable("invalid shared Mathlib policy; repair policy.json before requiring sharing")
         return "off", "invalid policy.json; repair before enabling sharing"
     expired = policy.get("expires_at", float("inf")) <= time.time()
+    # A host with no policy.json never opted in, so it keeps private builds. Once a host opted
+    # in, only an explicit operator `off` returns to them: an expired policy, or one whose
+    # mode a safety stop recorded over, still requires sharing.
     value = env.get(
-        "TAUCETI_SHARED_MATHLIB_BUILDS", policy.get("expiry_mode", "off") if expired else policy.get("mode", "off")
+        "TAUCETI_SHARED_MATHLIB_BUILDS",
+        policy.get("expiry_mode", "auto") if expired else policy.get("mode", "auto") if policy else "off",
     ).lower()
     if value not in {"auto", "off", "required"}:
         raise Unavailable("TAUCETI_SHARED_MATHLIB_BUILDS must be auto, off or required")
+    if value == "auto":
+        # Sharing is no longer optional: a round that cannot share stops instead of building a
+        # private copy of Mathlib. Only an explicit operator `off` keeps private builds.
+        value = "required"
     allowed = env.get("TAUCETI_SHARED_MATHLIB_WORKERS", ",".join(policy["workers"]) if "workers" in policy else None)
     if allowed is not None and env.get("TAUCETI_WORKER_ID", "default") not in allowed.split(","):
+        if value == "required":
+            raise Unavailable("worker is not allowlisted for shared Mathlib, which is required; fix the policy")
         return "off", "worker is not allowlisted for shared Mathlib"
     stop_path = pool / "safety-stop.json"
     stop = read_json(stop_path)
@@ -190,7 +213,10 @@ def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
 def capability(directory=None):
     """Exercise the actual filesystem, namespace, OverlayFS and bwrap flag support."""
     if platform.system() != "Linux":
-        return False, "Linux user namespaces and OverlayFS are required; use private builds on this system"
+        return (
+            False,
+            "Linux user namespaces and OverlayFS are required for shared Mathlib; an operator must set mode off on this system",
+        )
     if not shutil.which("bwrap"):
         return False, "install bubblewrap with --overlay support (0.12 or newer) to share extracted Mathlib"
     try:
@@ -295,11 +321,13 @@ def signature(cwd, env):
     for package in packages:
         name = package.get("name")
         if not isinstance(name, str) or not name or Path(name).name != name or package.get("type") != "git":
-            raise Unavailable("shared snapshots require pinned git dependencies; path dependencies use private builds")
+            raise Unavailable(
+                "shared snapshots require pinned git dependencies; path dependencies cannot share Mathlib"
+            )
         source = cwd / ".lake/packages" / name
         revision = git(source, "rev-parse", "HEAD")
         if revision != package.get("rev") or git(source, "status", "--porcelain", "--untracked-files=normal"):
-            raise Unavailable(f"dependency {name} differs from its pinned revision; using private builds")
+            raise Unavailable(f"dependency {name} differs from its pinned revision; restore the pin before building")
         dependencies[name] = revision
         cache_contexts[name] = cache_identity(cache_context(source))
     if "mathlib" not in dependencies:
@@ -388,12 +416,325 @@ def lease_lock(stream, flags, *, timeout=None):
             if deadline is None:
                 raise
             if time.monotonic() >= deadline:
-                raise Unavailable(
-                    "shared Mathlib lock wait timed out; use private mode and inspect publisher/reader leases"
-                ) from None
+                raise Unavailable("shared Mathlib lock wait timed out; inspect publisher/reader leases") from None
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
         except OSError as error:
             raise IntegrityFailure(f"shared Mathlib lease failure: {error}; stop sharing and investigate") from error
+
+
+VERSION_CAP = 2  # Mathlib builds a host may hold at once, counting every entry
+EVICTION_GRACE = 20  # seconds between SIGTERM and SIGKILL for rounds holding an evicted entry
+EVICTION_WAIT = 40  # each of three waits for an evicted entry's exclusive lock
+
+
+DEPENDENCY_FILES = ("lake-manifest.json", "lean-toolchain", "lakefile.toml", "lakefile.lean")
+BUMP_PIN_SECONDS = 7 * 86400
+
+
+def _manifest_pin(text):
+    try:
+        packages = json.loads(text).get("packages", [])
+    except (ValueError, AttributeError, TypeError):
+        return None
+    return next((p.get("rev") for p in packages if isinstance(p, dict) and p.get("name") == "mathlib"), None)
+
+
+_PURPOSE = {}
+
+
+def set_round_purpose(checkout, *, rebase=False, bump=False):
+    """Record what the current round in ``checkout`` is for. Keyed by the checkout, so cache
+    preparation for any other directory (verification jobs, recovery) is unaffected."""
+    _PURPOSE.clear()
+    if rebase or bump:
+        _PURPOSE[Path(checkout).resolve()] = dict(rebase=rebase, bump=bump)
+
+
+def _purpose(cwd):
+    with contextlib.suppress(OSError):
+        return _PURPOSE.get(Path(cwd).resolve(), {})
+    return {}
+
+
+@contextlib.contextmanager
+def rebase_target(cwd, env):
+    """For a round whose job is to rebase onto main, prepare Mathlib for main, not the branch.
+
+    The branch is on an old Mathlib by definition, and that pin is refused. While the shared view
+    is chosen and the dependency checkouts are synchronized, the workspace carries origin/main's
+    dependency files; ``restore()`` puts the branch's own files back before the agent starts.
+    After the agent's rebase the pins agree with the shared build. Until then the agent's
+    ``lake`` refuses to run (scripts/lake-guard.py), so it cannot compile the old Mathlib."""
+    restored = [True]
+
+    def restore():
+        if restored[0]:
+            return
+        for name, data in saved.items():
+            if data is None:
+                (cwd / name).unlink(missing_ok=True)
+            else:
+                (cwd / name).write_bytes(data)
+        restored[0] = True
+
+    saved = {}
+    if _purpose(cwd).get("rebase"):
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(
+                ["git", "-C", str(cwd), "fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+                capture_output=True,
+                timeout=60,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                stdin=subprocess.DEVNULL,
+            )
+        target = {}
+        for name in DEPENDENCY_FILES:
+            shown = subprocess.run(
+                ["git", "-C", str(cwd), "show", f"origin/main:{name}"], capture_output=True, timeout=30
+            )
+            target[name] = shown.stdout if shown.returncode == 0 else None
+        try:
+            current = (cwd / "lake-manifest.json").read_text()
+        except OSError:
+            current = None
+        main_pin = target["lake-manifest.json"] and _manifest_pin(target["lake-manifest.json"])
+        if main_pin and _manifest_pin(current) != main_pin:
+            saved = {name: (cwd / name).read_bytes() if (cwd / name).is_file() else None for name in DEPENDENCY_FILES}
+            restored[0] = False
+            from .config import log
+
+            log(f"shared Mathlib: preparing main's Mathlib {main_pin[:12]} for this rebase round")
+            for name, data in target.items():
+                if data is None:
+                    (cwd / name).unlink(missing_ok=True)
+                else:
+                    (cwd / name).write_bytes(data)
+    try:
+        yield restore
+    finally:
+        restore()
+
+
+def bump_pins(pool):
+    """Mathlib pins that bump rounds used recently: the next main, so never refused or evicted first."""
+    pins = set()
+    with contextlib.suppress(OSError):
+        for path in (pool / "bump-pins").iterdir():
+            with contextlib.suppress(OSError):
+                if time.time() - path.stat().st_mtime < BUMP_PIN_SECONDS:
+                    pins.add(path.name)
+    return pins
+
+
+def allowed_revisions(cwd):
+    """The Mathlib revisions pinned by current origin/main and by the pin before it, or None.
+
+    Read from the checkout's own origin/main, without Lake or network. Rounds pinned elsewhere are
+    refused; a branch behind main is rebased onto it or abandoned."""
+
+    def pin(commit):
+        shown = subprocess.run(
+            ["git", "-C", str(cwd), "show", f"{commit}:lake-manifest.json"], capture_output=True, text=True, timeout=30
+        )
+        if shown.returncode:
+            return None
+        try:
+            packages = json.loads(shown.stdout).get("packages", [])
+        except (ValueError, AttributeError):
+            return None
+        return next((p.get("rev") for p in packages if isinstance(p, dict) and p.get("name") == "mathlib"), None)
+
+    # Queue repair and other callers may not have refreshed origin/main; best effort, bounded.
+    try:
+        fetched = subprocess.run(
+            ["git", "-C", str(cwd), "fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+            capture_output=True,
+            timeout=60,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if fetched.returncode:
+        return None  # a stale origin/main must not decide which pins are current
+    current = pin("origin/main")
+    if not current:
+        return None
+    allowed = {current}
+    history = subprocess.run(
+        ["git", "-C", str(cwd), "log", "--format=%H", "-n", "200", "origin/main", "--", "lake-manifest.json"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    commits = history.stdout.split() if history.returncode == 0 else []
+    for commit in commits:
+        revision = pin(commit)
+        if revision and revision != current:
+            allowed.add(revision)
+            return allowed
+    if len(commits) >= 200:
+        return None  # the previous pin lies beyond the search: unknown, never refused
+    shallow = subprocess.run(
+        ["git", "-C", str(cwd), "rev-parse", "--is-shallow-repository"], capture_output=True, text=True, timeout=30
+    )
+    if history.returncode or shallow.stdout.strip() != "false":
+        return None  # too little history to know the previous pin: refuse nothing, the cap still holds
+    return allowed
+
+
+def _holders(lock_path):
+    """Processes of this user, other than this one, with ``lock_path`` open."""
+    target = os.path.realpath(lock_path)
+    uid, me, pids = os.getuid(), os.getpid(), set()
+    for process in Path("/proc").glob("[0-9]*"):
+        try:
+            if process.stat().st_uid != uid or int(process.name) == me:
+                continue
+            for fd in (process / "fd").iterdir():
+                with contextlib.suppress(OSError):
+                    if os.readlink(fd) == target:
+                        pids.add(int(process.name))
+                        break
+        except (OSError, ValueError):
+            continue
+    return pids
+
+
+def is_round_argv(argv):
+    """`<python> [-I …] -m tauceti_worker _round …`, as spawn_round() invokes a round."""
+    try:
+        index = argv.index("-m")
+    except ValueError:
+        return False
+    return argv[index + 1 : index + 3] == ["tauceti_worker", "_round"] and all(a.startswith("-") for a in argv[1:index])
+
+
+def _owning_round(pid):
+    """The nearest ancestor (or self) that is an isolated worker round, or None.
+
+    A round is its own session and process-group leader (spawn_round uses start_new_session), so
+    signalling its group reaches only that round; anything else is signalled alone."""
+    seen = set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        try:
+            argv = [a.decode(errors="replace") for a in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if a]
+            if is_round_argv(argv):
+                return pid if os.getpgid(pid) == pid == os.getsid(pid) else None
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            return None
+    return None
+
+
+def _kill_holders(pids):
+    """Abandon what uses an evicted entry, TERM then KILL.
+
+    A holder inside a worker round loses its whole round (the round's own session and process
+    group, never the worker loop's). Any other holder, such as a queue service running repairs
+    in-process, is signalled alone, never its group."""
+    import signal
+
+    groups, singles = set(), set()
+    for pid in pids:
+        owner = _owning_round(pid)
+        with contextlib.suppress(OSError):
+            if owner is not None:
+                groups.add(os.getpgid(owner))
+            else:
+                singles.add(pid)
+    groups.discard(os.getpgrp())
+    singles.discard(os.getpid())
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        for group in groups:
+            with contextlib.suppress(OSError):
+                os.killpg(group, signum)
+        for pid in singles:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signum)
+        deadline = time.monotonic() + EVICTION_GRACE
+        while signum == signal.SIGTERM and time.monotonic() < deadline:
+            if not any(Path(f"/proc/{pid}").exists() for pid in pids):
+                return
+            time.sleep(0.5)
+
+
+def _entry_revision(entry):
+    return (read_json(entry / "ready.json").get("spec") or {}).get("mathlib")
+
+
+@contextlib.contextmanager
+def _versions_lock(pool):
+    """The pool-wide cap lock; a wait that times out stops the round rather than going private."""
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(key_lock(pool, "versions", exclusive=True, timeout=LOCK_WAIT_SECONDS))
+        except IntegrityFailure:
+            raise
+        except Unavailable as error:
+            raise CapContention(f"waiting for the Mathlib version cap timed out: {error}") from error
+        yield
+
+
+def _other_entries(pool, keep):
+    entries_dir = pool / "entries"
+    if not entries_dir.is_dir():
+        return []
+    # Staging is not counted: publication is serialized under `versions` and evicts first, and a
+    # crashed publisher's stale staging directory must not force a live entry out.
+    return [e for e in entries_dir.iterdir() if e.is_dir() and not e.is_symlink() and e.name != keep]
+
+
+def enforce_version_cap(pool, keep, allowed, env):
+    """Hold at most VERSION_CAP entries, counting the one about to be used or published.
+
+    Entries for revisions outside ``allowed`` go first, then the oldest. A round holding an evicted
+    entry is killed and abandoned: keeping a third Mathlib build is never the better outcome.
+    Publication calls ``_evict_excess`` itself while holding the ``versions`` lock throughout."""
+    if len(_other_entries(pool, keep)) + 1 <= VERSION_CAP:
+        return  # the common case takes no lock
+    with _versions_lock(pool):
+        _evict_excess(pool, keep, allowed, env)
+
+
+def _evict_excess(pool, keep, allowed, env):
+    """Called holding the ``versions`` lock."""
+    entries = _other_entries(pool, keep)
+    excess = len(entries) + 1 - VERSION_CAP
+    if excess <= 0:
+        return
+
+    def age(entry):
+        with contextlib.suppress(OSError):
+            return entry.stat().st_mtime
+        return 0
+
+    ranked = sorted(entries, key=lambda e: (allowed is None or _entry_revision(e) in allowed, age(e)))
+    for victim in ranked[:excess]:
+        key = victim.name
+        lock_path = pool / "locks" / (key + ".lock")
+        report(pool, env, mode="evicting", key=key, reason="Mathlib version cap")
+        # Hide the entry first: a reader arriving after this finds no entry, so it must publish,
+        # which waits on `versions` (held here) instead of leasing the victim behind our back.
+        trash = pool / "trash"
+        trash.mkdir(parents=True, exist_ok=True)
+        retired = trash / (key + "-" + uuid.uuid4().hex)
+        os.replace(victim, retired)
+        # Overlays already mounted keep their lower through file descriptors: kill those rounds,
+        # rescanning while waiting, then delete under the exclusive key lock.
+        for attempt in range(3):
+            if lock_path.exists():
+                _kill_holders(_holders(lock_path))
+            try:
+                with key_lock(pool, key, exclusive=True, timeout=EVICTION_WAIT):
+                    remove_tree(retired)
+                break
+            except IntegrityFailure:
+                raise
+            except Unavailable as error:
+                if attempt == 2:
+                    raise CapContention(f"evicting Mathlib {key[:12]} timed out: {error}") from error
 
 
 def remove_tree(path):
@@ -622,10 +963,10 @@ def ready_entry(entry, key, spec):
         )
     except (OSError, Unavailable) as error:
         raise IntegrityFailure(
-            f"snapshot integrity failure for {key}: {error}; retain lower and use private mode"
+            f"snapshot integrity failure for {key}: {error}; lower retained for inspection"
         ) from error
     if not valid:
-        raise IntegrityFailure(f"snapshot integrity failure for {key}; retain lower and use private mode")
+        raise IntegrityFailure(f"snapshot integrity failure for {key}; lower retained for inspection")
     return True
 
 
@@ -642,7 +983,9 @@ def stop_sharing(pool, reason):
     try:
         with key_lock(pool, "policy", timeout=1):
             policy = read_json(pool / "policy.json")
-            atomic_json(pool / "policy.json", {**policy, "mode": "off"})
+            # The stop blocks rounds through selection(); rewriting the mode to `off` would make the
+            # next round build Mathlib privately instead.
+            atomic_json(pool / "policy.json", {**policy, "safety_stop": reason})
             recorded = True
     except (OSError, Unavailable) as error:
         log(f"shared Mathlib SAFETY STOP policy could not be written: {error}")
@@ -673,15 +1016,15 @@ def discard_entry(pool, entry):
     remove_tree(retired)
 
 
-def collect(pool, *, protect=(), now=None, max_age=7 * 86400, dry_run=False):
+def collect(pool, *, protect=(), now=None, max_age=7 * 86400, dry_run=False, held=()):
     try:
         with key_lock(pool, "gc", nonblocking=True, readonly=dry_run):
-            return _collect(pool, protect=protect, now=now, max_age=max_age, dry_run=dry_run)
+            return _collect(pool, protect=protect, now=now, max_age=max_age, dry_run=dry_run, held=held)
     except BlockingIOError:
         return []
 
 
-def _collect(pool, *, protect=(), now=None, max_age=7 * 86400, dry_run=False):
+def _collect(pool, *, protect=(), now=None, max_age=7 * 86400, dry_run=False, held=()):
     """Bounded by snapshot count. Locked readers/builders are never reclaimed."""
     now = time.time() if now is None else now
     entries = pool / "entries"
@@ -691,9 +1034,20 @@ def _collect(pool, *, protect=(), now=None, max_age=7 * 86400, dry_run=False):
     else:
         entries.mkdir(parents=True, exist_ok=True)
     for retired in (pool / "trash").glob("*"):
+        # Trash is named <key>-<32 hex>. Its lower may still be mounted by a round that outlived an
+        # eviction; delete it only while holding that key's exclusive lease, and skip it otherwise.
+        key = re.sub(r"-[0-9a-f]{32}$", "", retired.name)
         with contextlib.suppress(FileNotFoundError):
-            if not dry_run:
+            if dry_run:
+                continue
+            if key in held:  # the caller already holds this key's exclusive lease
                 remove_tree(retired)
+                continue
+            try:
+                with key_lock(pool, key, exclusive=True, nonblocking=True):
+                    remove_tree(retired)
+            except (BlockingIOError, Unavailable):
+                continue
     # A killed builder cannot run TemporaryDirectory cleanup. Reclaim its
     # staging tree before evicting useful published snapshots for disk pressure.
     for stage in (pool / "staging").glob("*"):
@@ -747,7 +1101,7 @@ def clone(source, target, revision):
         git(target, "config", f"branch.{context['branch']}.remote", context["tracking"])
     if cache_identity(cache_context(target)) != cache_identity(context):
         raise Unavailable(
-            "Git cache selection context differs in the fresh clone; normalize repository-specific URL rules or use private builds"
+            "Git cache selection context differs in the fresh clone; normalize repository-specific URL rules"
         )
 
 
@@ -772,7 +1126,7 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
     if ready_entry(entry, key, spec):
         os.utime(entry, None)
         return entry, True
-    collect(pool, protect=(key,))
+    collect(pool, protect=(key,), held=(key,))
     usage = shutil.disk_usage(pool)
     if usage.free < disk_reserve(usage):
         raise Unavailable(
@@ -833,11 +1187,11 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
             ready / "ready.json",
             dict(key=key, spec=spec, files_verified=count, inventory=files, published_at=time.time()),
         )
-        collect(pool, protect=(key,))
+        collect(pool, protect=(key,), held=(key,))
         usage = shutil.disk_usage(pool)
         if usage.free < disk_reserve(usage):
             raise Unavailable(
-                "snapshot extraction would leave less than the free-space reserve (10%, capped at 20 GiB); using private builds"
+                "snapshot extraction would leave less than the free-space reserve (10%, capped at 20 GiB)"
             )
         entry.parent.mkdir(parents=True, exist_ok=True)
         os.replace(ready, entry)
@@ -933,6 +1287,27 @@ def summary(env=None, *, scope=None, worker=None):
     )
 
 
+def _names_mathlib(cwd):
+    """False only when a well-formed manifest proves the workspace has no Mathlib anywhere.
+
+    Anything doubtful counts as Mathlib, so the ordinary checks decide (and block) instead of
+    the round getting an unrestricted view: an unreadable or malformed manifest, Mathlib as the
+    root package, or a dependency that looks like a renamed Mathlib (its URL or name)."""
+    try:
+        manifest = json.loads((cwd / "lake-manifest.json").read_text())
+        packages = manifest.get("packages")
+    except (OSError, ValueError, AttributeError):
+        return True
+    if not isinstance(packages, list) or str(manifest.get("name", "")).lower() == "mathlib":
+        return True
+    for package in packages:
+        if not isinstance(package, dict) or not isinstance(package.get("name"), str):
+            return True
+        if "mathlib" in package["name"].lower() or "mathlib" in str(package.get("url", "")).lower():
+            return True
+    return False
+
+
 @contextlib.contextmanager
 def view(cwd, env, logdir, fetch):
     """Yield an argv prefix and keep the lower leased until the whole agent exits."""
@@ -943,6 +1318,11 @@ def view(cwd, env, logdir, fetch):
         report(pool, env, mode="blocked", reason=str(error))
         raise
     started = time.monotonic()
+    if not _names_mathlib(cwd):
+        # Nothing to share and nothing to copy: the project does not depend on Mathlib.
+        report(pool, env, mode="not-applicable", reason="project does not depend on Mathlib")
+        yield []
+        return
     upper = cwd / ".lake/packages/mathlib/.lake/build"
     marker = upper.parent / "tauceti-shared-mathlib.json"
     owned = _build_parent_owned(upper)
@@ -983,6 +1363,21 @@ def view(cwd, env, logdir, fetch):
                     raise IntegrityFailure(reason)
                 raise Unavailable(reason)
             key, spec = signature(cwd, env)
+            allowed = allowed_revisions(cwd)
+            if _purpose(cwd).get("bump") and re.fullmatch(r"[0-9a-f]{40}", spec["mathlib"]):
+                # A bump round adapts TauCeti to the next Mathlib; recording its pin keeps every
+                # round's cap ranking from evicting it as if it were an abandoned old version.
+                bumps = pool / "bump-pins"
+                bumps.mkdir(parents=True, exist_ok=True)
+                (bumps / spec["mathlib"]).touch()
+            if allowed is not None:
+                allowed |= bump_pins(pool)
+            if allowed is not None and spec["mathlib"] not in allowed:
+                report(pool, env, mode="blocked", key=key, reason="Mathlib pin is not current or previous main")
+                raise PinRefused(
+                    f"Mathlib {spec['mathlib'][:12]} is not pinned by current or previous main; rebase onto main"
+                )
+            enforce_version_cap(pool, key, allowed, env)
             report(pool, env, mode="preparing", key=key)
             lease = stack.enter_context(key_lock(pool, key, exclusive=False, timeout=LOCK_WAIT_SECONDS))
             entry = pool / "entries" / key
@@ -999,7 +1394,11 @@ def view(cwd, env, logdir, fetch):
                     if not hit:
                         lease_lock(lease, fcntl.LOCK_UN)
                         lease_lock(lease, fcntl.LOCK_EX, timeout=LOCK_WAIT_SECONDS)
-                        entry, hit = publish(pool, key, spec, cwd, env, logdir, fetch)
+                        # Admission and publication are one step under `versions`, so concurrent
+                        # publishers of different keys can never exceed the cap between them.
+                        with _versions_lock(pool):
+                            _evict_excess(pool, key, allowed, env)
+                            entry, hit = publish(pool, key, spec, cwd, env, logdir, fetch)
                         lease_lock(lease, fcntl.LOCK_SH, timeout=LOCK_WAIT_SECONDS)
             upper.parent.mkdir(parents=True, exist_ok=True)
             ok, reason = capability(upper.parent)
@@ -1071,6 +1470,8 @@ def view(cwd, env, logdir, fetch):
             env.pop("TAUCETI_SHARED_MATHLIB_LEASE_FD", None)
             env.pop("TAUCETI_SHARED_MATHLIB_KEY", None)
             env.pop("TAUCETI_SHARED_MATHLIB_PREP_STARTED", None)
+            if isinstance(error, NoFallback):
+                raise  # never a private build for a refused pin or cap contention
             if selected == "required":
                 raise Unavailable(str(error)) from error
             prefix = []

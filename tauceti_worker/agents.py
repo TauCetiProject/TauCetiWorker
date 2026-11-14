@@ -1506,11 +1506,30 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
     from .build_resources import defaults
 
     defaults(env)
-    if not TAUCETI_CACHE_SERVICE:
-        yield
-        return
     if not any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
         yield
+        return
+    if not TAUCETI_CACHE_SERVICE:
+        # No TauCeti artifact service to warm, but Mathlib must still come from the shared
+        # build: without the view the agent's first `lake build` compiles it privately.
+        from . import shared_mathlib
+
+        try:
+            with (
+                shared_mathlib.rebase_target(cwd, env) as restore,
+                shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix,
+            ):
+                if prefix:
+                    env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
+                try:
+                    restore()
+                    yield prefix
+                finally:
+                    env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)
+        except shared_mathlib.Unavailable as error:
+            raise BuildCacheUnavailable(
+                f"shared Mathlib preparation unavailable: {error}", log_file=logdir / "shared-mathlib-prepare.log"
+            ) from error
         return
     with tempfile.TemporaryDirectory(prefix="tauceti-lake-config-") as tmp:
         config = Path(tmp) / "lake.toml"
@@ -1529,7 +1548,10 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
         report = {}
         mathlib_started = expanded_cache.clock()
         try:
-            with shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix:
+            with (
+                shared_mathlib.rebase_target(cwd, env) as restore,
+                shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix,
+            ):
                 expanded_cache.record_phase(report, "mathlib_view", mathlib_started)
                 if prefix:
                     env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
@@ -1542,6 +1564,7 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
                         raise
                     if prefix:
                         shared_mathlib.preparation_status(env)
+                    restore()  # a rebase round's agent starts on its own branch's files
                     yield prefix
                 finally:
                     env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)
@@ -1679,8 +1702,11 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
     failures stop before an agent starts. Lake verifies and atomically installs artifacts, so retries
     retain successful downloads. All fetches together have one twenty-minute deadline.
     """
+    from . import shared_mathlib
+
     prefix = json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]"))
     max_revs = lake_cache_max_revs(env)
+    has_mathlib = shared_mathlib._names_mathlib(cwd)
     logdir.mkdir(parents=True, exist_ok=True)
     logf = logdir / f"build-cache-{time.strftime('%Y%m%d-%H%M%S')}.log"
     deadline = time.monotonic() + HOST_CACHE_TIMEOUT
@@ -1761,7 +1787,9 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
         raise AssertionError("unreachable")
 
     shared_view = bool(json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]")))
-    if shared_view:
+    if not has_mathlib:
+        log("host build caches: the workspace does not depend on Mathlib; no Mathlib cache to fetch")
+    elif shared_view:
         # The shared entry holds Mathlib's own build. Running `lake exe cache get` inside the view
         # re-extracts every archive, and each new file lands in this checkout's private overlay
         # upper: a full private copy of Mathlib's outputs under a "shared" round. Mathlib's
