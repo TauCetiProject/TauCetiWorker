@@ -225,6 +225,8 @@ other top-level key is an error, as is any unrecognized field inside a
 | `budget` | bool | `false` | Admit API sessions through the shared local grant ledger; active sessions are never cut off by funding |
 | `anthropic_api_key_file` | string | unset | Private key-file path for API mode; otherwise use `ANTHROPIC_API_KEY`; never store a raw key in config |
 | `sandbox` | string | `"host"` | `host` or `bubble`. Progress-report rounds always run on the host |
+| `forges` | string list | `["github"]` | Sources the worker discovers and works on: `github`, `forgejo`, or both. Passed as `--github`/`--no-github` and `--forgejo`; see [Forgejo workers](forgejo-worker.md). A Bubble worker cannot select `forgejo` alone |
+| `new_pr_forge` | string | `"github"` | Destination for new roadmap PRs, passed as `--new-pr-forge`. Must be one of `forges`; a worker on `forges = ["forgejo"]` authors only with `new_pr_forge = "forgejo"`. Not with `sandbox = "bubble"` |
 | `ignore_quota` | bool | `false` | Skip soft pacing. Provider hard limits still apply; an `auto` worker cannot launch with this enabled |
 | `auto_refresh` | bool | `false` | Renew this worker's Claude access token when it expires, instead of parking until a human runs `claude`. Only safe when nothing else uses the same credential file — the refresh token is single-use. See [quota and pacing](quota.md) |
 | `roadmap_only` | string | unset | The single roadmap area for roadmap rounds. `""` means all areas; unset means a fresh random area each round |
@@ -431,8 +433,8 @@ entry with `enabled = true`.
 | `--stream` | `stream` |
 | `--isolate-home` | `isolate_home`; useful when the id is `default` |
 
-`add` cannot set `roadmap_extra_identities`, `respect_claims`, or `restart`, and
-always writes `enabled = true`. Use `workers edit` for those.
+`add` cannot set `forges`, `new_pr_forge`, `roadmap_extra_identities`, `respect_claims`,
+or `restart`, and always writes `enabled = true`. Use `workers edit` for those.
 
 ## Actions
 

@@ -161,6 +161,7 @@ try:
         agent="codex",
         only=("roadmap", "review"),
         sandbox="bubble",
+        forges=("github", "forgejo"),
         ignore_quota=True,
         auto_refresh=True,
         roadmap_only="RepresentationTheory",
@@ -179,6 +180,7 @@ try:
     parsed = build_parser().parse_args(maximal.work_argv()[3:])
     assert parsed.cmd == "work" and parsed.worker_id == "maximal"
     assert parsed.auto_refresh is True
+    assert parsed.github is True and parsed.forgejo is True
     assert parsed.self_tested is True
     assert wm.WorkerSpec.from_dict({"id": "attest", "self_tested": True}, 0).as_dict()["self_tested"] is True
     before = wm.WorkerSpec(id="attest").as_dict()

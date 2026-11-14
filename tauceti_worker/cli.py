@@ -1012,7 +1012,15 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "_fleet-protocol":
         print(
             json.dumps(
-                {"version": 1, "admission": True, "events": True, "activity": 1, "roadmap_focus": 1, "self_tested": 1}
+                {
+                    "version": 1,
+                    "admission": True,
+                    "events": True,
+                    "activity": 1,
+                    "roadmap_focus": 1,
+                    "forges": 1,
+                    "self_tested": 1,
+                }
             )
         )
         return 0

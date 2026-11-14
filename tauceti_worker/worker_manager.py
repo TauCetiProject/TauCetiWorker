@@ -53,6 +53,8 @@ _WORKER_KEYS = {
     "agent",
     "only",
     "sandbox",
+    "forges",
+    "new_pr_forge",
     "ignore_quota",
     "auto_refresh",
     "roadmap_only",
@@ -295,6 +297,42 @@ def _env_pairs(value, where: str) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(pairs))
 
 
+FORGES = ("github", "forgejo")
+
+
+def _forge_selection(
+    raw: dict, index: int, sandbox: str, env: tuple[tuple[str, str], ...]
+) -> tuple[tuple[str, ...], str]:
+    """The `--github/--forgejo` and `--new-pr-forge` choices, refused where `worker_sources.configure`
+    would refuse them, plus the Bubble combinations under which a worker could never run Forgejo work."""
+    where = f"workers[{index}]"
+    named = _strings(raw.get("forges", ["github"]), f"{where}.forges")
+    unknown = sorted({forge for forge in named if forge not in FORGES})
+    if unknown:
+        raise WorkersError(f"{where}.forges has unknown forge(s): {', '.join(unknown)}; use github and/or forgejo")
+    if not named:
+        raise WorkersError(f"{where}.forges must name at least one of github, forgejo")
+    if len(set(named)) != len(named):
+        raise WorkersError(f"{where}.forges names a forge more than once")
+    forges = tuple(forge for forge in FORGES if forge in named)
+    destination = _string(raw.get("new_pr_forge"), f"{where}.new_pr_forge", optional=True)
+    if destination is not None and destination not in FORGES:
+        raise WorkersError(f"{where}.new_pr_forge must be 'github' or 'forgejo'")
+    if destination is not None and destination not in forges:
+        raise WorkersError(f"{where}.new_pr_forge must be one of the forges in {where}.forges")
+    destination = destination or "github"
+    if len(forges) > 1 and dict(env).get("TAUCETI_PR", "").strip():
+        raise WorkersError(f"{where}.env.TAUCETI_PR targets one source: select a single forge in {where}.forges")
+    # `multi_source.run_round` executes Forgejo work only in host mode; with both forges a Bubble worker
+    # still counts Forgejo PRs toward its open-PR limit and duplicate checks while it works on GitHub.
+    if sandbox == "bubble" and (forges == ("forgejo",) or destination == "forgejo"):
+        raise WorkersError(
+            f"{where}: Forgejo rounds run on the host only, so a bubble worker can neither work on Forgejo alone "
+            "nor author new PRs there; use sandbox = 'host'"
+        )
+    return forges, destination
+
+
 @dataclasses.dataclass(frozen=True)
 class WorkerSpec:
     id: str
@@ -307,6 +345,8 @@ class WorkerSpec:
     agent: str = "auto"
     only: tuple[str, ...] = ()
     sandbox: str = "host"
+    forges: tuple[str, ...] = ("github",)
+    new_pr_forge: str = "github"
     ignore_quota: bool = False
     auto_refresh: bool = False
     claude_billing: str = "subscription"
@@ -360,6 +400,8 @@ class WorkerSpec:
             raise WorkersError(f"workers[{index}].max_open_prs {error}") from None
         if not isinstance(raw.get("max_open_prs", MAX_OPEN_PRS), int):
             raise WorkersError(f"workers[{index}].max_open_prs must be an integer")
+        env = _env_pairs(raw.get("env", {}), f"workers[{index}].env")
+        forges, new_pr_forge = _forge_selection(raw, index, sandbox, env)
         spec = WorkerSpec(
             id=wid,
             conf=_string(raw.get("conf"), f"workers[{index}].conf", optional=True),
@@ -373,6 +415,8 @@ class WorkerSpec:
             github_account=_string(raw.get("github_account"), f"workers[{index}].github_account", optional=True),
             only=only,
             sandbox=sandbox,
+            forges=forges,
+            new_pr_forge=new_pr_forge,
             ignore_quota=_boolean(raw.get("ignore_quota", False), f"workers[{index}].ignore_quota"),
             auto_refresh=_boolean(raw.get("auto_refresh", False), f"workers[{index}].auto_refresh"),
             claude_billing=_string(raw.get("claude_billing", "subscription"), f"workers[{index}].claude_billing"),
@@ -397,7 +441,7 @@ class WorkerSpec:
             stream=_boolean(raw.get("stream", False), f"workers[{index}].stream"),
             isolate_home=_boolean(raw.get("isolate_home", False), f"workers[{index}].isolate_home"),
             restart=restart,
-            env=_env_pairs(raw.get("env", {}), f"workers[{index}].env"),
+            env=env,
         )
         if spec.github_account is not None:
             try:
@@ -436,6 +480,10 @@ class WorkerSpec:
             value["only"] = list(self.only)
         if self.sandbox != "host":
             value["sandbox"] = self.sandbox
+        if self.forges != ("github",):
+            value["forges"] = list(self.forges)
+        if self.new_pr_forge != "github":
+            value["new_pr_forge"] = self.new_pr_forge
         if self.ignore_quota:
             value["ignore_quota"] = True
         if self.auto_refresh:
@@ -503,6 +551,10 @@ class WorkerSpec:
             argv += ["--agent", self.agent]
         if self.sandbox == "bubble":
             argv.append("--bubble")
+        if self.forges != ("github",):
+            argv += ["--github" if "github" in self.forges else "--no-github", "--forgejo"]
+        if self.new_pr_forge != "github":
+            argv += ["--new-pr-forge", self.new_pr_forge]
         if self.ignore_quota:
             argv.append("--ignore-quota")
         if self.auto_refresh:
@@ -729,6 +781,8 @@ def worker_snapshots(specs: list[WorkerSpec] | None = None, config: Path | None 
                 "agent": spec.agent if spec else actual.get("agent"),
                 "only": list(spec.only) if spec else actual.get("only", []),
                 "sandbox": spec.sandbox if spec else actual.get("sandbox"),
+                "forges": list(spec.forges) if spec else actual.get("forges", ["github"]),
+                "new_pr_forge": spec.new_pr_forge if spec else actual.get("new_pr_forge", "github"),
             }
         )
     return snapshots
@@ -880,6 +934,8 @@ def cmd_managed_runner(args) -> int:
                 github_account=spec.github_account,
                 only=list(spec.only),
                 sandbox=spec.sandbox,
+                forges=list(spec.forges),
+                new_pr_forge=spec.new_pr_forge,
                 log_file=str(log_path) if logf is not sys.stderr else None,
                 started_at=started,
                 heartbeat_at=time.time(),
@@ -1577,6 +1633,11 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
     github_account = spec.get("github_account") or item.get("github_account")
     if github_account:
         lines.extend(_status_field("github", [str(github_account)], width))
+    if spec.get("forges") or spec.get("new_pr_forge"):
+        forges = [str(forge) for forge in spec.get("forges") or ["github"]]
+        destination = str(spec.get("new_pr_forge") or "github")
+        new_prs = f"new PRs: {destination}" if destination in forges else "new PRs: none (github is not selected)"
+        lines.extend(_status_field("forges", [", ".join(forges), new_prs], width))
 
     pacing = "ignored (--ignore-quota; hard limits still apply)" if spec.get("ignore_quota") else "normal"
     if spec.get("pace"):
