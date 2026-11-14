@@ -79,14 +79,25 @@ def snapshot(root, target, names, *, immutable_packages=None, include_builds=Tru
         raise ValueError("snapshot needs a new owned candidate path")
     marker = state / "verification-copy-incomplete" / f"{target.name}.json"
     atomic(marker, dict(version=1, source=str(root), source_digest=digest(names)))
+    skip_packages = False
     try:
         legacy = root / ".lake/packages/mathlib/.lake/tauceti-shared-mathlib.json"
         if include_builds and legacy.is_file() and not (root / ".lake/packages/mathlib").is_symlink():
             from .config import log
 
-            log("verification: older shared Mathlib layout under this checkout; linking sources only")
+            # Its private Mathlib and closure stay behind: the candidate's own view attaches
+            # the shared sources from the manifest, so nothing of Mathlib enters the candidate.
+            log("verification: older shared Mathlib layout under this checkout; leaving its packages behind")
             include_builds = False
-        return _snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=include_builds)
+            skip_packages = True
+        return _snapshot(
+            root,
+            target,
+            names,
+            immutable_packages=immutable_packages,
+            include_builds=include_builds,
+            skip_packages=skip_packages,
+        )
     except BaseException:
         # Nothing in this directory has become an authoritative workspace. Owner death leaves
         # the same durable construction marker for bounded ordinary collection.
@@ -138,7 +149,7 @@ def _linked(relative, info):
     return info.st_size > COPY_LIMIT and not relative.name.endswith(COPIED)
 
 
-def _link_tree(lake, dest, budget, *, include_builds, immutable_packages, target):
+def _link_tree(lake, dest, budget, *, include_builds, immutable_packages, target, skip_packages=False):
     """Rebuild `.lake` under `dest`: payloads and sources by hard link, small metadata by copy.
 
     Returns `{relative path: [inode, size, mtime_ns]}` of the links, so a continuation can
@@ -159,14 +170,14 @@ def _link_tree(lake, dest, budget, *, include_builds, immutable_packages, target
             if (
                 name in SCRATCH
                 or name in ("build-shared-deltas", META)
-                and here == lake
+                and here.name == ".lake"
                 or here == lake / "packages"
                 and name in shared
                 or target.is_relative_to(path)
                 or not include_builds
                 and name in {"build", "build-before-sharing"}
                 and here.name == ".lake"
-                or immutable_packages is not None
+                or (immutable_packages is not None or skip_packages)
                 and here == lake
                 and name == "packages"
             ):
@@ -199,17 +210,20 @@ def links_intact(root):
     abandoned rather than verified against changed dependencies.
     """
     recorded = read_json(root / ".lake" / LINKS).get("links") or {}
-    for relative, expected in recorded.items():
+    for relative, (inode, size, mtime_ns) in recorded.items():
         try:
             info = (root / ".lake" / relative).lstat()
+        except FileNotFoundError:
+            continue  # removed by the candidate's own build: no longer shared
         except OSError:
             return False
-        if [info.st_ino, info.st_size, info.st_mtime_ns] != expected:
+        # A different inode is Lake's own replacement; only the shared inode changing is a write.
+        if info.st_ino == inode and (info.st_size, info.st_mtime_ns) != (size, mtime_ns):
             return False
     return True
 
 
-def _snapshot(root, target, names, *, immutable_packages=None, include_builds=True):
+def _snapshot(root, target, names, *, immutable_packages=None, include_builds=True, skip_packages=False):
     """Exact sources and index; Git objects and build payloads are hard links, never copies."""
     from .verification import Incomplete
     from .verification_storage import CopyBudget, reserve, settle
@@ -263,6 +277,7 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
                 include_builds=include_builds,
                 immutable_packages=immutable_packages,
                 target=target,
+                skip_packages=skip_packages,
             )
             (target / ".lake" / LINKS).write_text(json.dumps(dict(version=1, links=linked)))
         if immutable_packages is not None:

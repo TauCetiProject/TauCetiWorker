@@ -2956,32 +2956,6 @@ def _review_source_lease(base: Path, rev: str, *, exclusive=False, blocking=True
         yield stream.fileno()
 
 
-def _shared_mathlib_source(rev: str):
-    """A context yielding the shared source tree of Mathlib ``rev`` under a source lease, or None
-    when the host has not published that revision (the review snapshot is used instead)."""
-    from . import shared_mathlib
-
-    P = shared_mathlib.layout(shared_mathlib.root())
-    if shared_mathlib._source_ready(P, rev) is None:
-        return None
-
-    @contextlib.contextmanager
-    def leased():
-        try:
-            lease = shared_mathlib.key_lock(P, "source-" + rev, exclusive=False, timeout=60)
-            lease.__enter__()
-        except (OSError, shared_mathlib.Unavailable):
-            yield None  # eviction holds it: fall back to the review snapshot
-            return
-        try:
-            tree = shared_mathlib.source_dir(P, rev) / "mathlib"
-            yield tree if (tree / "Mathlib.lean").is_file() else None
-        finally:
-            lease.__exit__(None, None, None)
-
-    return leased()
-
-
 @contextlib.contextmanager
 def _review_mathlib_source(cfg: Config, head: str):
     """Mathlib source at the reviewed head's pin, for the reviewers' greps, held while in use.
@@ -3019,13 +2993,6 @@ def _review_mathlib_source(cfg: Config, head: str):
     if not isinstance(rev, str) or not re.fullmatch(r"[0-9a-f]{40}", rev):
         raise NoProgress("review: Mathlib revision is not pinned to a commit; no review started")
     _discard_legacy_review_sources(cfg)
-    shared = _shared_mathlib_source(rev)
-    if shared is not None:
-        # The host's shared Mathlib source tree for this revision, leased while mounted.
-        with shared as tree:
-            if tree is not None:
-                yield tree
-                return
     base = _review_source_base()
     base.mkdir(parents=True, exist_ok=True)
     _prune_review_mathlib_staging(base)
