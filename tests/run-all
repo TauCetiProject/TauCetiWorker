@@ -73,6 +73,7 @@ RUN_STDLIB=(
   queue_repair_cache.py
   queue_claude_stdin.py
   expanded_cache.py
+  canonical_store.py
   cache_storage.py
   local_lint.py
   lean_pressure.py
