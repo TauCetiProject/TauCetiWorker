@@ -859,6 +859,24 @@ class ForgejoLists(Tmp):
         ]
         self.assertEqual(t.landed_pr(item, self.forgejo), 3)
 
+    def test_a_partial_url_with_an_uppercase_scheme_is_still_an_exclusion(self):
+        self.merged_rows = []
+        url = self.repo.pull_url(7)
+        upper = "HTTPS" + url[len("https") :]
+        full = marker("Probability", "truncation-bounds")
+        self.path.write_text(EXAMPLE.replace("in flight: #1234", f"in flight: {url}; partial: {upper}"))
+        self.states = {7: {"state": "MERGED", "body": full, "headRefOid": "a" * 40}}
+        self.assertEqual(self.curate(self.forgejo)[0], 0)
+        self.assertIn(
+            f"- [ ] `truncation-bounds` — variance bounds for truncated variables (needs: none; partial: {upper})",
+            self.path.read_text(),
+        )
+        older = "HTTPS" + self.repo.pull_url(6)[len("https") :]
+        self.path.write_text(EXAMPLE.replace("in flight: #1234", f"in flight: {url}; partial: {older}"))
+        self.states = {7: {"state": "MERGED", "body": marker("Probability", "truncation-bounds", partial=True)}}
+        self.assertEqual(self.curate(self.forgejo)[0], 0)
+        self.assertIn(f"(needs: none; partial: {older}, {url})", self.path.read_text())
+
     def test_a_mixed_worker_settles_items_from_both_forges(self):
         self.path.write_text(EXAMPLE)
         github = self.github({1234: {"state": "MERGED", "body": ""}})

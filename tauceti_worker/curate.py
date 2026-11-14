@@ -44,6 +44,7 @@ from .targets import (
     Key,
     TargetItem,
     Targets,
+    _is_partial,
     eligible_items,
     github_history_enabled,
     inflight_ref,
@@ -190,8 +191,9 @@ def _refs(refs: Iterable[str]) -> str:
 
 
 def _partial_refs(item: TargetItem) -> set[str]:
-    clauses = " ".join(c.partition(":")[2] for c in item.meta if c.partition(":")[0].strip().lower() == "partial")
-    return {f"#{n}" for n in partial_prs(item)} | set(re.findall(r"https?://[^\s,;]+", clauses))
+    """The references an item's `partial:` clause names, read as `targets.landed` reads them."""
+    clauses = " ".join(c.partition(":")[2] for c in item.meta if _is_partial(c))
+    return {f"#{n}" for n in partial_prs(item)} | set(re.findall(r"https?://[^\s,;]+", clauses, re.I))
 
 
 def settle(targets: Targets, seen: Seen) -> tuple[list[Change], list[tuple[TargetItem, str]]]:
