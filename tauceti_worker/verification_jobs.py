@@ -25,10 +25,28 @@ from .runtime_status import read_json, report_runtime
 from .verification_scope import git
 from .verification_storage import Pressure
 
-# Everything under `.lake` is hard-linked from the source workspace, never copied, except small
-# files that Lake or Git rewrite in place, where a link would let the live workspace change the
-# candidate: traces, hashes, manifests and logs, and Git metadata outside its object store.
-COPIED = (".trace", ".hash", ".json", ".toml", ".log", ".lock")
+# Build payloads and sources are hard-linked from the source workspace, never copied: Lake
+# replaces these files (it clears outputs before writing them) and Git checks files out by
+# rename, so a link never sees a write in place. Everything else under `.lake` (traces, hashes,
+# manifests, logs, Git metadata outside the object store) may be rewritten in place, so it is
+# copied, and only while small: a large unrecognised file fails the snapshot instead.
+LINKED = (
+    ".olean",
+    ".olean.server",
+    ".olean.private",
+    ".ilean",
+    ".ir",
+    ".ir.sig",
+    ".c",
+    ".bc",
+    ".ltar",
+    ".o",
+    ".a",
+    ".so",
+    ".dylib",
+    ".lean",
+)
+COPY_LIMIT = 1024**2
 LINKS = "tauceti-links.json"
 FORWARDED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 CONTINUATION = "tauceti-continuation.json"
@@ -109,19 +127,21 @@ def _shared_builds(lake):
     }
 
 
-def _copied(relative):
+def _linked(relative, info):
     parts = relative.parts
     if ".git" in parts:
-        return "objects" not in parts[parts.index(".git") :]
-    return relative.name.endswith(COPIED)
+        return "objects" in parts[parts.index(".git") :]
+    return relative.name.endswith(LINKED) or bool(info.st_mode & 0o111)
 
 
 def _link_tree(lake, dest, budget, *, include_builds, immutable_packages, target):
-    """Rebuild `.lake` under `dest`: everything by hard link except small mutable metadata.
+    """Rebuild `.lake` under `dest`: payloads and sources by hard link, small metadata by copy.
 
     Returns `{relative path: [inode, size, mtime_ns]}` of the links, so a continuation can
     prove that nothing wrote through a shared inode in the meantime.
     """
+    from .verification import Incomplete
+
     shared = _shared_builds(lake)
     linked = {}
     for directory, dirs, files in os.walk(lake, followlinks=True):
@@ -156,13 +176,18 @@ def _link_tree(lake, dest, budget, *, include_builds, immutable_packages, target
             if not stat.S_ISREG(info.st_mode):
                 continue
             relative = source.relative_to(lake)
-            if _copied(relative):
-                budget.charge(source)
-                shutil.copy2(source, out / name)
-            else:
+            if _linked(relative, info):
                 link(source, out / name)
                 linked[str(relative)] = [info.st_ino, info.st_size, info.st_mtime_ns]
                 budget.linked += info.st_size
+            elif info.st_size > COPY_LIMIT:
+                raise Incomplete(
+                    f"candidate preservation would copy {relative} ({info.st_size} bytes); nothing was copied",
+                    reason="preservation",
+                )
+            else:
+                budget.charge(source)
+                shutil.copy2(source, out / name)
     return linked
 
 
