@@ -136,6 +136,33 @@ Invariants 1 to 5 hold because no code path writes a copy. To keep it that way:
   A checkout over a few GiB is reported as a regression in `workers status` and in
   Fleet telemetry.
 
+### Lifecycle of shared state
+
+Shared state is reclaimed by the existing collector. Referenced objects are never
+deleted, unreferenced ones age out, and each store has a budget.
+
+- **Artifact store.** Checkouts reach artifacts by hard link, so an artifact's
+  link count is its reference count. One with `st_nlink == 1` is used by no
+  checkout; finding it takes one `stat`, with no scan of checkouts. Unreferenced
+  artifacts are deleted after a few days, or least recently linked first when the
+  store exceeds its budget. Deleting a checkout or recovery tree drops its links,
+  which is what makes its artifacts collectable.
+- **Mathlib entries and source trees.** A round holds a shared lease on the key
+  lock while its view is in use, and each checkout records its key in a marker.
+  An entry is deleted only when no lease is held, no existing checkout's marker
+  names it, and it is unused for about seven days. The newest entry per toolchain
+  is kept. This extends the existing leases and ready markers in `shared_mathlib`.
+- **Shared git store.** `git worktree prune` and ordinary `git gc`. Checkouts are
+  worktrees, not `clone --shared`, so `gc` sees every checkout's references;
+  pruning a store that alternates clones depend on would corrupt them.
+- **Checkouts.** Small once builds are links. They are deleted as today, when a
+  worker is retired or idle for three days, which also releases their references.
+- **Budgets.** Each store has a cap. Over budget with everything still referenced,
+  the collector deletes nothing referenced. It raises an alarm instead, and the
+  existing disk headroom check defers new rounds rather than letting the disk fill.
+- **Permissions.** Shared files and directories are read-only. Only the collector,
+  holding the store's lock, restores directory write permission to remove an entry.
+
 ### Deletion that cannot stall
 
 - `tauceti-cleanup.service` gets `TimeoutStartSec` and always runs with
