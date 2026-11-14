@@ -1560,18 +1560,31 @@ def materialize_dependencies(cwd: Path, env: dict, logdir: Path, timeout: float 
     package sources (tens of seconds, no builds, no cache downloads), which is what `cache get`
     would have done anyway, only later. Failure is not fatal here: the view reports why it cannot
     share."""
+    from . import processes
+
     try:
-        packages = json.loads((cwd / "lake-manifest.json").read_text()).get("packages", [])
-    except (OSError, ValueError, AttributeError):
+        manifest = json.loads((cwd / "lake-manifest.json").read_text())
+    except (OSError, ValueError):
         return
-    names = {p.get("name") for p in packages if isinstance(p, dict)}
+    packages = manifest.get("packages") if isinstance(manifest, dict) else None
+    if not isinstance(packages, list):
+        return  # malformed manifests reach the ordinary workspace-error and repair paths
+    names = {p["name"] for p in packages if isinstance(p, dict) and isinstance(p.get("name"), str)}
     if "mathlib" not in names or (cwd / ".lake/packages/mathlib").is_dir():
         return
     logdir.mkdir(parents=True, exist_ok=True)
+    quiet = {**env, "GIT_TERMINAL_PROMPT": "0"}  # Git can prompt through /dev/tty despite null stdin
     with open(logdir / "materialize-dependencies.log", "ab") as output:
         try:
-            result = subprocess.run(
-                ["lake", "env", "true"], cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, timeout=timeout
+            # The owned process group takes Lake's Git and SSH children with it on timeout.
+            result = processes.run(
+                ["lake", "env", "true"],
+                cwd=cwd,
+                env=quiet,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             log(f"dependencies: could not materialize Mathlib before sharing ({error})")

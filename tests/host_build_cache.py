@@ -319,14 +319,23 @@ with tempfile.TemporaryDirectory() as tmp:
         (kwargs["cwd"] / ".lake/packages/mathlib").mkdir(parents=True)
         return SimpleNamespace(returncode=0)
 
-    with patch.object(agents.subprocess, "run", side_effect=lake_env):
+    from tauceti_worker import processes
+
+    with patch.object(processes, "run", side_effect=lake_env):
         agents.materialize_dependencies(root, {}, root / "logs")
         agents.materialize_dependencies(root, {}, root / "logs")  # already present: nothing to do
     assert calls == [(["lake", "env", "true"], root)], calls
+    for malformed in ({"packages": None}, {"packages": [{"name": ["mathlib"]}]}, [], "x"):
+        odd = root / f"odd-{len(list(root.glob('odd-*')))}"
+        odd.mkdir()
+        (odd / "lake-manifest.json").write_text(json.dumps(malformed))
+        with patch.object(processes, "run") as run:
+            agents.materialize_dependencies(odd, {}, root / "logs")  # never raises; repair handles it
+        run.assert_not_called()
     other = root / "no-mathlib"
     other.mkdir()
     (other / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "batteries"}]}))
-    with patch.object(agents.subprocess, "run") as run:
+    with patch.object(processes, "run") as run:
         agents.materialize_dependencies(other, {}, root / "logs")
         agents.materialize_dependencies(root / "missing", {}, root / "logs")
     run.assert_not_called()
@@ -334,7 +343,7 @@ with tempfile.TemporaryDirectory() as tmp:
     failing.mkdir()
     (failing / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib"}]}))
     with (
-        patch.object(agents.subprocess, "run", return_value=SimpleNamespace(returncode=1)),
+        patch.object(processes, "run", return_value=SimpleNamespace(returncode=1)),
         contextlib.redirect_stderr(io.StringIO()),
         contextlib.redirect_stdout(io.StringIO()),
     ):
