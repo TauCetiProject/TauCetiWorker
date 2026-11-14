@@ -1330,6 +1330,13 @@ def _check_stage_read_quota(stage):
         raise GitHubUnavailable("GitHub read quota exhausted — waiting for reset", retry_at=max(exhausted.values()))
 
 
+BUBBLE_WORK_REFUSED = (
+    "bubble work rounds are refused: their container would unpack a private Mathlib build and "
+    "build TauCeti privately. Run this worker on the host (drop --bubble, or set sandbox = 'host'), "
+    "where rounds share the host's Mathlib and TauCeti outputs; review rounds may stay in bubble"
+)
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
     """Perform one stage. Return its rc, or None to decline this candidate and try another.
 
@@ -1344,6 +1351,11 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             f"sandbox={'bubble' if bubble else 'host'}"
         )
         return 0
+    if bubble and stage != "review":
+        # Bubble's bootstrap unpacks Mathlib's cache and builds TauCeti inside the container, a
+        # private copy per round. Until Bubble rounds see the host's read-only shared views,
+        # they do not run. Review only greps a shared, read-only Mathlib source.
+        raise NoProgress(BUBBLE_WORK_REFUSED)
     from .github_outbox import pending_for
 
     if (

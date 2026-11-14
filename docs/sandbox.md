@@ -5,6 +5,12 @@
 Progress-report rounds always run on the host. This page describes what the
 container boundary enforces; the README covers when to use it.
 
+Code-writing rounds are currently refused in Bubble: their bootstrap would unpack
+a private Mathlib build and build TauCeti inside the container, while a host keeps
+one shared, read-only copy of each. They run again once Bubble containers see those
+shared views. Review rounds are unaffected: they only read a host-wide, read-only
+Mathlib source snapshot.
+
 ## What happens in the container
 
 The outer worker surveys GitHub, selects a task, and coordinates claims from the

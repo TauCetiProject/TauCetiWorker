@@ -331,6 +331,69 @@ def _rev(repo: Path, name: str) -> str | None:
     return _git(repo, "rev-parse", "-q", "--verify", f"{name}^{{commit}}", check=False, text=True).strip() or None
 
 
+def git_path(repo: Path, name: str) -> Path:
+    """Git's own resolution of `name` inside `repo`'s metadata; works for linked worktrees.
+
+    A linked worktree's `.git` is a file, and its per-worktree files (`index`, `HEAD`, hooks
+    through `core.hooksPath`) live under the common repository, so never join `repo / ".git"`.
+    """
+    value = Path(_git(repo, "rev-parse", "--git-path", name, text=True).strip())
+    return value if value.is_absolute() else repo / value
+
+
+def checkout_kind(repo: Path) -> str | None:
+    """ "standalone" for an ordinary clone, "worktree" for a linked worktree, None otherwise.
+
+    A linked worktree must be the top level of its own work tree and its Git directory must be
+    a `worktrees/<name>` entry of its common repository; a symlinked `.git` is never accepted.
+    """
+    dotgit = repo / ".git"
+    if dotgit.is_symlink():
+        return None
+    if dotgit.is_dir():
+        return "standalone"
+    if not dotgit.is_file():
+        return None
+    try:
+        top, gitdir, common = _git(
+            repo, "rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir", text=True
+        ).splitlines()
+    except (RecordError, ValueError, OSError, subprocess.SubprocessError):
+        return None
+    common_path = Path(common) if Path(common).is_absolute() else repo / common
+    gitdir_path = Path(gitdir)
+    if Path(top).resolve() != repo.resolve() or gitdir_path.resolve().parent != (common_path / "worktrees").resolve():
+        return None
+    return "worktree"
+
+
+def _common_dir(repo: Path) -> Path:
+    value = Path(_git(repo, "rev-parse", "--git-common-dir", text=True).strip())
+    return value if value.is_absolute() else (repo / value).resolve()
+
+
+def other_worktrees(repo: Path) -> list[str]:
+    """Paths of every other worktree that shares `repo`'s object store and refs."""
+    here = repo.resolve()
+    found = []
+    for line in _git(repo, "worktree", "list", "--porcelain", text=True).splitlines():
+        if line.startswith("worktree ") and Path(line[len("worktree ") :]).resolve() != here:
+            found.append(line[len("worktree ") :])
+    return found
+
+
+def _own_history(repo: Path, branch: str | None) -> list[str]:
+    """Commits named by this worktree's own reflogs: HEAD's and its branch's, never others'."""
+    oids = []
+    for ref in ["HEAD", *([branch] if branch else [])]:
+        oids += _git(repo, "log", "--walk-reflogs", "--format=%H", ref, "--", check=False, text=True).split()
+    for line in _git(
+        repo, "for-each-ref", "--format=%(objectname)", "refs/worktree", "refs/bisect", text=True
+    ).splitlines():
+        oids.append(line.strip())
+    return sorted(set(oids))
+
+
 def _excluded(rel: str) -> str | None:
     parts = rel.rstrip("/").split("/")
     name = parts[-1]
@@ -393,7 +456,13 @@ def inspect(repo: Path, preserved: list[str] | None = None, *, history: bool = F
     tips: dict[str, str] = {}
     if head:
         tips["HEAD"] = head
-    for line in _git(repo, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", text=True).splitlines():
+    # Branches are shared by every worktree of one repository: a linked worktree owns only the
+    # branch its HEAD names, and other rounds' branches are theirs to save.
+    linked = checkout_kind(repo) == "worktree"
+    heads = [branch] if linked and branch else [] if linked else ["refs/heads"]
+    for line in (
+        _git(repo, "for-each-ref", "--format=%(objectname) %(refname)", *heads, text=True).splitlines() if heads else []
+    ):
         oid, _, ref = line.partition(" ")
         tips[ref] = oid
     gitdir = Path(_git(repo, "rev-parse", "--absolute-git-dir", text=True).strip())
@@ -407,21 +476,27 @@ def inspect(repo: Path, preserved: list[str] | None = None, *, history: bool = F
     if history:
         # Archive only history outside the source tips already covered by ordinary v1 records.
         # Deduplicate by oid so our own preservation-ref writes cannot change the snapshot.
-        extra = set(
-            _git(
-                repo,
-                "rev-list",
-                "--all",
-                "--reflog",
-                "--not",
-                "--remotes",
-                f"--glob={PUBLISHED}",
-                *sorted(set(tips.values())),
-                text=True,
-            ).split()
+        # A linked worktree owns only its own reflogs: shared branches, their reflogs and other
+        # rounds' preservation refs belong to the rounds that wrote them.
+        own = _own_history(repo, branch) if linked else ["--all", "--reflog"]
+        extra = (
+            set(
+                _git(
+                    repo,
+                    "rev-list",
+                    *own,
+                    "--not",
+                    "--remotes",
+                    f"--glob={PUBLISHED}",
+                    *sorted(set(tips.values())),
+                    text=True,
+                ).split()
+            )
+            if own
+            else set()
         )
         if extra:
-            heads = set(_git(repo, "rev-list", "--no-walk", "--all", "--reflog", text=True).split())
+            heads = set(own) if linked else set(_git(repo, "rev-list", "--no-walk", *own, text=True).split())
             retained = extra & heads
             if len(retained) > MAX_HISTORY_TIPS:
                 raise HistoryLimit("retained history exceeds bounded descriptor tip count")
@@ -1292,6 +1367,10 @@ def _retain(
         with contextlib.suppress(OSError):
             atomic_json(dest.with_name(dest.name + ".owner.json"), owner)
             _fsync_dir(parent)
+        common = None
+        if checkout_kind(repo) == "worktree":
+            with contextlib.suppress(RecordError, OSError, subprocess.SubprocessError):
+                common = _common_dir(repo)
         os.rename(repo, dest)
         _shed_build_state(cfg, dest)
     except OSError as error:
@@ -1304,6 +1383,13 @@ def _retain(
     with contextlib.suppress(OSError):  # durability and attribution are best effort here
         _fsync_dir(parent)
         _fsync_dir(repo.parent)
+    if common is not None:
+        # A moved linked worktree must point at its metadata again, and its metadata at it,
+        # and `git worktree prune` must never discard it while it waits to be saved.
+        for args in (["worktree", "repair", str(dest)], ["worktree", "lock", "--reason", "retained", str(dest)]):
+            done = subprocess.run(["git", f"--git-dir={common}", *args], capture_output=True, text=True)
+            if done.returncode:
+                log(f"recovery: git {' '.join(args[:2])} for retained {dest} failed: {done.stderr.strip()[-200:]}")
     if record is not None:
         _set_status(record, "retained", f"{reason}; checkout moved to {dest}")
     log(f"recovery: {reason}; moved the checkout to {dest} and continuing with a fresh one")
@@ -1359,8 +1445,12 @@ def save_for_cleanup(cfg, repo: Path, *, owner=None, dry_run=False) -> Decision:
     """Save source without moving/resetting a tree; a collector can still evict caches on failure."""
     record = None
     try:
-        if not (repo / ".git").is_dir() or (repo / ".git").is_symlink():
-            return Decision(False, "not a standalone Git checkout; retaining source", state="protected")
+        kind = checkout_kind(repo)
+        if kind is None:
+            return Decision(False, "not a Git checkout or linked worktree; retaining source", state="protected")
+        if kind == "standalone" and other_worktrees(repo):
+            # Its object store and refs hold other worktrees' source; never approve removing it.
+            return Decision(False, "the clone hosts linked worktrees; retaining it", state="protected")
         snap = inspect(repo, history=True)
         if len(snap.untracked) > MAX_UNTRACKED_FILES or snap.archive_bytes > MAX_UNTRACKED_BYTES:
             return Decision(
@@ -1370,23 +1460,29 @@ def save_for_cleanup(cfg, repo: Path, *, owner=None, dry_run=False) -> Decision:
             record = _record(cfg, repo, snap, "TauCeti", TAUCETI, owner=owner)
         if any("credential" in reason for _, reason in snap.excluded):
             return Decision(False, "credential-like files require retaining the checkout", record, "protected")
-        if _git(
-            repo, "for-each-ref", "--format=%(refname)", "refs/stash", "refs/tags", "refs/notes", text=True
-        ).strip():
+        # A linked worktree shares fetched tags with every other worktree; only its own
+        # per-worktree refs and the shared stash and notes (conservatively) need retaining.
+        extra = ["refs/stash", "refs/notes"] + (
+            ["refs/worktree", "refs/bisect"] if kind == "worktree" else ["refs/tags"]
+        )
+        if _git(repo, "for-each-ref", "--format=%(refname)", *extra, text=True).strip():
             return Decision(False, "additional Git refs require retaining the checkout", record, "protected")
         preserved = [f"--glob={PRESERVED}/{record.name}"] if record else []
-        if _git(
-            repo,
-            "rev-list",
-            "--reflog",
-            "--all",
-            "--not",
-            "--branches",
-            "--remotes",
-            f"--glob={PUBLISHED}",
-            *preserved,
-            text=True,
-        ).strip():
+        own = _own_history(repo, snap.branch) if kind == "worktree" else ["--reflog", "--all"]
+        if (
+            own
+            and _git(
+                repo,
+                "rev-list",
+                *own,
+                "--not",
+                "--branches",
+                "--remotes",
+                f"--glob={PUBLISHED}",
+                *preserved,
+                text=True,
+            ).strip()
+        ):
             return Decision(False, "reflog-only commits require retaining the checkout", record, "protected")
         if live_users(repo) or inspect(repo, history=True).fingerprint != snap.fingerprint:
             return Decision(False, "checkout changed or acquired a live user during preservation", record)

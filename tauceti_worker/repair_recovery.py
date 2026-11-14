@@ -201,6 +201,31 @@ def source_tree(checkout):
         Path(name).unlink(missing_ok=True)
 
 
+def local_clone(source, target):
+    """Clone `source` with its own refs and index and a hard-linked object store.
+
+    An explicit `--local` makes Git fail instead of copying when a hard link is unavailable, so
+    recovery never holds an independent copy of TauCeti's history.
+    """
+    try:
+        subprocess.run(
+            ["git", "clone", "--local", "--no-checkout", "--quiet", str(source), str(target)],
+            capture_output=True,
+            check=True,
+            timeout=600,
+        )
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or b"").decode(errors="replace")
+        if "failed to create link" in detail:
+            # A host layout problem, not this record's: wait without consuming an attempt.
+            raise Wait(
+                "checkout-links",
+                f"Recovery needs hard links from {source} (same filesystem); nothing was copied",
+                "Move recovery state onto the checkout's filesystem",
+            ) from error
+        raise
+
+
 def scratch_path(rel):
     path = Path(rel)
     return (
@@ -385,6 +410,9 @@ class Recovery:
                 # warm caches or repeat the same expensive failed build each time.
                 b.continuation_admission(self.record, m, j)
             prior = prior_checkout if prior_checkout.is_dir() else b.w.cfg.checkout
+            if not (prior / ".git").exists():
+                # Restoring links from the worker's clone; never download another copy.
+                raise Wait("checkout", "No local TauCeti clone to link recovery objects from")
             b.check_verification_tools(prior)
             b.acquire(m, facts)
             # No attempt is consumed until a real claim and all prerequisites are available.
@@ -732,7 +760,7 @@ class WorkerBackend:
                 return self.restore(record, m, j)
             if saved.live_users(checkout):
                 raise Wait("continuation-cleanup", "Recovery checkout still has local users")
-            lock = checkout / ".git/index.lock"
+            lock = saved.git_path(checkout, "index.lock")
             if lock.exists() and (j.get("pending_merge_head") or j.get("content_started")):
                 lock.rename(record / f"retained-index-lock-{uuid.uuid4().hex}")
                 saved._fsync_dir(record)
@@ -747,20 +775,13 @@ class WorkerBackend:
             # targets. Retain their objects/tips when rebuilding derived source.
             source = Path(archived)
         url = repository_url(m["repository"])
-        # A private independent clone, never a worktree sharing the active checkout's refs/index.
-        subprocess.run(
-            [
-                "git",
-                "clone",
-                "--no-hardlinks",
-                "--no-checkout",
-                str(source) if (source / ".git").exists() else url,
-                str(temp),
-            ],
-            capture_output=True,
-            check=True,
-            timeout=600,
-        )
+        if not (source / ".git").exists():
+            # Never download a second copy of TauCeti's history: the worker's next round
+            # recreates its checkout, and recovery links from that.
+            raise Wait("checkout", "No local TauCeti clone to link recovery objects from")
+        # Own refs and index, never a worktree sharing the active checkout's; the object store
+        # is hard-linked (an explicit --local clone dies rather than copying when a link fails).
+        local_clone(source, temp)
         saved._git(temp, "remote", "set-url", "origin", url)
         saved._git(temp, "config", "remote.origin.pushurl", "no_push")
         saved._git(
@@ -794,6 +815,10 @@ class WorkerBackend:
         return checkout
 
     def configure_checkout(self, directory, final):
+        # Recovery checkouts are standalone `--local` clones: their hooks and config are their
+        # own. A linked worktree would share both with every other worktree, so never use one here.
+        if saved.checkout_kind(directory) != "standalone":
+            raise RuntimeError("recovery checkouts must be standalone clones with private hooks")
         hook = directory / ".git/hooks/pre-push"
         saved._write(
             hook,
@@ -817,8 +842,8 @@ class WorkerBackend:
         checkout = record / "checkout"
         built = Path(transaction["built"])
         archived = Path(transaction["archived"])
-        marker = checkout / ".git/tauceti-recovery-delta"
-        if not marker.is_file() or marker.read_text() != transaction["id"]:
+        marker = saved.git_path(checkout, "tauceti-recovery-delta") if (checkout / ".git").exists() else None
+        if marker is None or not marker.is_file() or marker.read_text() != transaction["id"]:
             if checkout.exists():
                 if archived.exists():
                     raise RuntimeError("Ambiguous delta checkout handoff; all source directories retained")
@@ -943,12 +968,7 @@ class WorkerBackend:
         patch = Path(transaction["patch"]).read_bytes()
         if hashlib.sha256(patch).hexdigest() != transaction["patch_sha256"]:
             raise RuntimeError("Retained delta payload failed validation")
-        subprocess.run(
-            ["git", "clone", "--no-hardlinks", "--no-checkout", str(checkout), str(built)],
-            capture_output=True,
-            check=True,
-            timeout=600,
-        )
+        local_clone(checkout, built)
         saved._git(
             built, "fetch", str(checkout), f"+refs/remotes/origin/{BASE_BRANCH}:refs/remotes/origin/{BASE_BRANCH}"
         )
@@ -960,7 +980,7 @@ class WorkerBackend:
         saved._git(built, "remote", "set-url", "origin", repository_url(m["repository"]))
         saved._git(built, "config", "remote.origin.pushurl", "no_push")
         self.configure_checkout(built, checkout)
-        saved._write(built / ".git/tauceti-recovery-delta", transaction["id"].encode())
+        saved._write(saved.git_path(built, "tauceti-recovery-delta"), transaction["id"].encode())
         applied = (
             subprocess.run(
                 ["git", "-C", str(built), "apply", "--3way", "--index", str(transaction["patch"])], capture_output=True
@@ -1227,7 +1247,7 @@ class WorkerBackend:
     def verify(self, checkout, m, facts):
         import sys
 
-        from .agents import host_build_cache_context, scope_policy
+        from .agents import host_build_cache_context, relink_build_outputs, scope_policy
         from .paths import HERE
         from .processes import run as run_process
         from .verification import Verification
@@ -1299,6 +1319,8 @@ class WorkerBackend:
                         deadline=self.w.rc.deadline,
                     )
                     result = verifier.run()
+                # H3: a trusted build with no agent alongside; relinking is space, not a verdict.
+                relink_build_outputs(checkout, cache_env, phase="verify")
                 if result.get("status") == "failed" and getattr(self, "record", None):
                     failures = j.get("verification_failures", 0) + 1 if j.get("failed_fingerprint") == current else 1
                     write(
