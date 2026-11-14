@@ -515,8 +515,17 @@ class LegacyDataRoot(unittest.TestCase):
             custom = base / "custom workers.toml"
             custom.write_text('[workers.w.env]\nTAUCETI_LEGACY_DATA_ROOT = "/srv/root-e"\n')
             (units / "tauceti-workers.service").write_text(
-                "[Service]\nEnvironmentFile=%h/.config/tauceti/worker.env\n"
-                f"ExecStart=/opt/tauceti workers --config '{custom}' manager\n"
+                '[Service]\nEnvironmentFile="%h/.config/tauceti/worker.env"\n'
+                f'ExecStart="/opt/tauceti" "workers" "--config" "{custom}" "manager"\n'  # as _systemd_unit writes it
+            )
+            agents = home / "Library/LaunchAgents"
+            agents.mkdir(parents=True)
+            spaced = base / "agent workers.toml"
+            spaced.write_text('[workers.w.env]\nTAUCETI_LEGACY_DATA_ROOT = "/srv/root-f"\n')
+            import plistlib
+
+            (agents / "tauceti.plist").write_bytes(
+                plistlib.dumps({"ProgramArguments": ["/opt/tauceti", "workers", "--config", str(spaced), "manager"]})
             )
             with patch.object(paths, "login_home", return_value=home), patch.dict(os.environ):
                 for name in ("XDG_CONFIG_HOME", "TAUCETI_WORKERS_CONFIG"):
@@ -524,6 +533,7 @@ class LegacyDataRoot(unittest.TestCase):
                 texts = retention._configured_texts()
                 self.assertTrue(any("/srv/root-d" in text for text in texts))
                 self.assertTrue(any("/srv/root-e" in text for text in texts))
+                self.assertTrue(any("/srv/root-f" in text for text in texts))
                 (units / "drop.conf").write_text("[Service]\nEnvironmentFile=%E/tauceti.env\n")
                 self.assertIsNone(retention._configured_texts())  # an unresolvable specifier
 
@@ -539,8 +549,20 @@ class LegacyDataRoot(unittest.TestCase):
             with self.purging(base, home, package):
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(data)  # inherited by this purge
                 self.assertIsNone(purge._busy([data], [data]))
+                bystander = subprocess.Popen(  # merely mentions it, as an editor or a search would
+                    [sys.executable, "-c", "import time; time.sleep(60)", str(package / "paths.py"), "tauceti"],
+                    env={k: v for k, v in os.environ.items() if k != "TAUCETI_LEGACY_DATA_ROOT"},
+                    cwd=base,
+                )
+                self.addCleanup(bystander.wait)
+                self.addCleanup(bystander.kill)
+                time.sleep(0.2)
+                self.assertIsNone(purge._busy([data], [data]))
+                fake = base / "bin/tauceti"
+                fake.parent.mkdir()
+                fake.write_text("import time; time.sleep(60)\n")
                 manager = subprocess.Popen(
-                    [sys.executable, "-c", "import time; time.sleep(60)", "tauceti_worker", "workers", "manager"],
+                    [sys.executable, str(fake), "workers", "--config", "/custom/workers.toml", "manager"],
                     env={k: v for k, v in os.environ.items() if k != "TAUCETI_LEGACY_DATA_ROOT"},
                     cwd=base,
                 )

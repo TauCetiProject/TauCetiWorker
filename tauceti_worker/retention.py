@@ -8,7 +8,6 @@ import fcntl
 import json
 import math
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -1259,6 +1258,13 @@ def _configured_texts():
             raise ValueError(value)  # a specifier we cannot resolve: unknown, never absent
         return Path(value.replace("\0", "%")).expanduser()
 
+    def configs(arguments):
+        for index, argument in enumerate(arguments):
+            if argument == "--config" and index + 1 < len(arguments):
+                yield arguments[index + 1]
+            elif argument.startswith("--config="):
+                yield argument.split("=", 1)[1]
+
     texts, seen = [], set()
     while files:
         path = files.pop()
@@ -1266,17 +1272,28 @@ def _configured_texts():
             continue
         seen.add(path)
         try:
-            text = path.read_text()
+            raw = path.read_bytes()
+            text = raw.decode()
         except (OSError, UnicodeDecodeError):
             return None
         texts.append(text)
         try:
+            if path.suffix == ".plist":
+                import plistlib
+
+                agent = plistlib.loads(raw)
+                files += [
+                    Path(value).expanduser() for value in configs([str(a) for a in agent.get("ProgramArguments", [])])
+                ]
+                texts.append(" ".join(f"{k}={v}" for k, v in (agent.get("EnvironmentVariables") or {}).items()))
+                continue
             for line in text.splitlines():
-                if line.strip().startswith("EnvironmentFile="):
-                    files.append(referenced(line.split("=", 1)[1].strip().lstrip("-")))
-            for match in re.finditer(r"--config(?:=|\s+|</string>\s*<string>)(\"[^\"]+\"|'[^']+'|[^\s<]+)", text):
-                files.append(referenced(shlex.split(match[1])[0]))
-        except ValueError:
+                key, _, value = line.strip().partition("=")
+                if key == "EnvironmentFile":
+                    files += [referenced(token.removeprefix("-")) for token in shlex.split(value)]
+                elif key in ("ExecStart", "ExecStartPre", "ExecStartPost"):
+                    files += [referenced(token) for token in configs(shlex.split(value.lstrip("@-:+!")))]
+        except (ValueError, TypeError, AttributeError):
             return None
     return texts
 
@@ -1305,7 +1322,9 @@ def _retirement_blocker(root, processes, mounts, configured):
             return "selected by a running process"
         if any(path == part or path.startswith(part + os.sep) for path in paths for part in parts):
             return "in use by a running process"
-        if runtime and any(command.startswith(str(runtime) + os.sep) for command in commands):
+        # The executable and argv[0] identify what runs; later arguments are only data (a file
+        # an editor has open there is covered by the open-file check above).
+        if runtime and any(command.startswith(str(runtime) + os.sep) for command in commands[:2]):
             return "its runtime is running"
     return None
 

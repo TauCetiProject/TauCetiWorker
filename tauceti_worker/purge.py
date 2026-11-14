@@ -183,6 +183,19 @@ def stop_services():
     return failures
 
 
+def _runs_worker(argv):
+    """Whether a command line invokes TauCetiWorker: `tauceti …`, `python -m tauceti_worker …`
+    or `python …/tauceti …`. Other arguments that merely mention it (an editor, a search) don't."""
+    if not argv:
+        return False
+    if os.path.basename(argv[0]) == "tauceti":
+        return True
+    if len(argv) >= 3 and argv[1] == "-m" and argv[2].split(".")[0] == "tauceti_worker":
+        return True
+    python = os.path.basename(argv[0]).startswith("python")
+    return python and len(argv) >= 2 and os.path.basename(argv[1]) == "tauceti"
+
+
 def _lineage():
     """This process and its ancestors."""
     pids, pid = set(), os.getpid()
@@ -217,7 +230,7 @@ def _busy(paths, roots):
     for found, selects, commands, pid in processes:
         if pid in ours:
             continue  # this purge and whatever launched it (a shell, `uv run`), which inherit its selection
-        if any("tauceti_worker" in part or os.path.basename(part) == "tauceti" for part in commands):
+        if _runs_worker(commands[1:]):
             # A manager with its own --config and directories holds nothing purge can find.
             return f"a TauCetiWorker process is running (pid {pid})"
         if selects and any(_same(selects, root) or Path(selects) == Path(root) for root in roots):
