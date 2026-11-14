@@ -1384,17 +1384,35 @@ def bump_prs(sv: Survey) -> set[int]:
     return {p.number for p in sv.open_prs if p.automatic_bump}
 
 
-def cascade(sv: Survey, stages) -> list[tuple[str, Candidate]]:
+# Two pools, so that a target list reorders an account's repairs and its reviews of its own pull
+# requests without moving a review ahead of a repair.
+TARGET_FIRST_POOLS = (("rebase", "fix-ci", "fix"), ("review",))
+
+
+def cascade(sv: Survey, stages, listed=frozenset()) -> list[tuple[str, Candidate]]:
     """Actionable (stage, candidate) pairs in the order a round offers them.
 
     Every stage's work on an automatic Mathlib bump comes first, in stage order: its conflicts,
     red build, review findings and pending reviews. Main moves faster than an ordinary queue
     position allows a bump round to start, so a bump that waits behind unrelated work goes stale
     again before it can be admitted. Everything else follows in the usual stage order.
+
+    `listed` names the pull requests that serve an operator's target list. Within each of
+    TARGET_FIRST_POOLS, the positions held by the account's own pull requests are refilled with
+    the listed ones first; both groups keep their order and every other pair keeps its position.
     """
     bumps = bump_prs(sv)
     pairs = [(stage, c) for stage in stages for c in sv.kind(stage).actionable]
-    return [pair for pair in pairs if pair[1].pr in bumps] + [pair for pair in pairs if pair[1].pr not in bumps]
+    pairs = [pair for pair in pairs if pair[1].pr in bumps] + [pair for pair in pairs if pair[1].pr not in bumps]
+    if not listed:
+        return pairs
+    own = {p.number for p in sv.open_prs if sv.owns(p)}
+    for pool in TARGET_FIRST_POOLS:
+        slots = [i for i, (stage, c) in enumerate(pairs) if stage in pool and c.pr in own]
+        ranked = sorted((pairs[i] for i in slots), key=lambda pair: pair[1].pr not in listed)
+        for i, pair in zip(slots, ranked, strict=True):
+            pairs[i] = pair
+    return pairs
 
 
 def _next_auto_stage(sv: Survey) -> str | None:

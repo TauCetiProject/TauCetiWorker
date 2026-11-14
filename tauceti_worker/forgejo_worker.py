@@ -107,6 +107,55 @@ class ForgejoWorkerSource(ForgejoReadSource):
             raise Incomplete("Forgejo PR listing is unavailable")
         return rows
 
+    def merged_prs(self, search, *, limit=200):
+        """`GitHub.merged_prs` on this source: number, title, body and URL of the `limit` most recently
+        created merged pull requests whose body matches the GitHub-style `search` (`body_matches`;
+        its qualifiers are not native and are ignored), among the closed pull requests the client's
+        page bound reaches. One item's search (`landed_pr`) goes to the native keyword search for
+        its slug, which reaches a pull request of any age. Raises SourceUnavailable when it fails."""
+        import urllib.parse
+
+        from .config import SourceUnavailable
+        from .github import BORS_MERGED_PREFIX
+        from .targets import MARKER_TAG, body_matches, search_id, search_phrases
+
+        phrases = search_phrases(search)
+        keyword = search_id(phrases) or next((p for p in phrases if p != MARKER_TAG), None)
+        if keyword is None:
+            path = f"repos/{self.repository.name}/pulls?state=closed"
+        else:
+            query = urllib.parse.urlencode({"type": "pulls", "state": "closed", "q": keyword})
+            path = f"repos/{self.repository.name}/issues?{query}"
+
+        def merged(row):
+            # A pull listing row says `merged`; an issue search row says it under `pull_request`. The
+            # queue lands a pull request by squash and closes it, unmerged, under BORS_MERGED_PREFIX.
+            if (row if keyword is None else row.get("pull_request") or {}).get("merged") is True:
+                return True
+            return row.get("state") == "closed" and str(row.get("title") or "").startswith(BORS_MERGED_PREFIX)
+
+        def fetch():
+            rows = []
+            # Stop at the client's page bound, where `pages` would raise, rather than fail the read.
+            for n, batch in enumerate(self.api.pages(path), 1):
+                rows += [r for r in batch if merged(r) and body_matches(r.get("body") or "", phrases)]
+                if len(rows) >= limit or n >= self.api.max_pages:
+                    break
+            return [
+                {
+                    "number": r["number"],
+                    "title": r.get("title") or "",
+                    "body": r.get("body") or "",
+                    "url": self.repository.pull_url(r["number"]),
+                }
+                for r in rows[:limit]
+            ]
+
+        rows = self._read("merged_prs", [search, limit], fetch)
+        if rows is None:
+            raise SourceUnavailable("Forgejo merged pull request listing is unavailable")
+        return rows
+
     def issue_list(self, repository, **options):
         from .github import GitHub
 

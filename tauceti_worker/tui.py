@@ -9,7 +9,16 @@ import sys
 from pathlib import Path
 
 from .agents import _shq
-from .config import Config, _only_label, _skip_label, extra_roadmap_prompt, roadmap_areas, roadmap_only, roadmap_skip
+from .config import (
+    Config,
+    _only_label,
+    _skip_label,
+    extra_roadmap_prompt,
+    roadmap_areas,
+    roadmap_only,
+    roadmap_skip,
+    roadmap_targets,
+)
 from .constants import ALLOWED_TASKS, KIND_BY_NAME, KIND_KEYS, TAUCETI
 from .github import GitHub
 from .paths import entry_cmd
@@ -858,6 +867,7 @@ def _dashboard_app(cfg, loader=None):
                         roadmap_skip=skip,
                         github_account=os.environ.get("TAUCETI_GITHUB_ACCOUNT"),
                         extra_roadmap_prompt=guidance,
+                        roadmap_targets=str(targets) if (targets := roadmap_targets()) is not None else None,
                     )
                     self.notify(
                         f"saved {spec.id} in {self.workers_config}\nmanager will keep it running",
