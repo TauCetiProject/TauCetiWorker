@@ -2540,6 +2540,11 @@ def run_in_bubble(
     # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
     # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (the claim+heartbeat
     # are host-side; the branch CAS is the [HARD] guarantee and needs no in-container claim).
+    # CLAIM_REPO and TAUCETI_WORKER_ID do cross, for the agent's own [COOP] target claim (roadmap):
+    # without CLAIM_REPO claim.sh falls back to canonical, which the container cannot push to, and
+    # without the worker id every claim.sh call is a new owner (`hostname-$$`), so the agent could not
+    # renew or release what it acquired. The claim reaches the repo only when --allow-push covers it
+    # (the fork, not the shared namespace); otherwise claim.sh exits 2 and the agent proceeds unclaimed.
     tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/round:$PATH TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"
     if api_bridge and _uses_claude_credentials(cred_model):
         tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/api-bin:/opt/round:$PATH TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"
@@ -2567,6 +2572,8 @@ def run_in_bubble(
         "TAUCETI_PUSH_REMOTE",
         "TAUCETI_TARGET_MARKER",
         "TAUCETI_REQUIRE_TARGET_MARKER",
+        "CLAIM_REPO",
+        "TAUCETI_WORKER_ID",
     ):
         val = os.environ.get(var)
         if val:
