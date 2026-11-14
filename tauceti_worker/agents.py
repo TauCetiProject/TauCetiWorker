@@ -1055,6 +1055,8 @@ def run_agent_host(
             from .shared_mathlib import record_result
 
             record_result(env, rc)
+        # H2: the agent's process group has been reaped, so no Lake can be writing the checkout.
+        relink_build_outputs(cwd, env, phase="round-end")
     if rc == 75:
         from .claude_api import blocked_reason
 
@@ -1535,12 +1537,19 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
                 try:
                     try:
                         prepare_host_build_caches(cwd, env, logdir, report=report)
+                    except expanded_cache.Unavailable as error:
+                        if prefix:
+                            shared_mathlib.preparation_status(env, error=error)
+                        message = f"shared build outputs unavailable: {error}; agent not started"
+                        log(message)
+                        raise BuildCacheUnavailable(message) from error
                     except Exception as error:
                         if prefix:
                             shared_mathlib.preparation_status(env, error=error)
                         raise
                     if prefix:
                         shared_mathlib.preparation_status(env)
+                    relink_build_outputs(cwd, env, phase="prepare", prefix=prefix)  # H1
                     yield prefix
                 finally:
                     env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)
@@ -1548,6 +1557,28 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
             raise BuildCacheUnavailable(
                 f"shared Mathlib preparation unavailable: {error}", log_file=logdir / "shared-mathlib-prepare.log"
             ) from error
+
+
+class BuildOutputsRejected(NoProgress):
+    """Round-end relinking failed after the agent ran, e.g. tampered outputs; never refunded."""
+
+
+def relink_build_outputs(cwd: Path, env: dict, *, phase: str, prefix=()) -> dict | None:
+    """Converge the checkout's TauCeti outputs on the host's canonical objects (one inode each).
+
+    `prepare` runs before the agent starts and also probes hard links in its namespace; `round-end`
+    runs once the agent's process group is reaped. Neither may continue on private copies.
+    """
+    from . import canonical_store
+
+    try:
+        return canonical_store.boundary(cwd, env, phase=phase, prefix=prefix or ())
+    except canonical_store.expanded_cache.Unavailable as error:
+        message = f"canonical build outputs ({phase}): {error}"
+        log(message)
+        if phase == "prepare":
+            raise BuildCacheUnavailable(message + "; agent not started") from error
+        raise BuildOutputsRejected(message) from error
 
 
 def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -> None:

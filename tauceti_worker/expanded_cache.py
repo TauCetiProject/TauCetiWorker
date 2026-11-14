@@ -32,6 +32,14 @@ ARTIFACT = re.compile(r"[0-9a-f]{16}\.(?:ltar|olean(?:\.server|\.private)?|ilean
 SCHEMA = "2026-02-25"
 
 
+class Unavailable(RuntimeError):
+    """Shared preparation failed; continuing would leave this round with private copies."""
+
+
+class SharedLinkUnavailable(Unavailable):
+    """A hard link into or out of the pool failed. Copying instead would duplicate the bytes."""
+
+
 class CorruptArchive(ValueError):
     def __init__(self, name):
         self.name = name
@@ -46,7 +54,8 @@ def root(env=None):
 
 
 @contextlib.contextmanager
-def locked(pool, key, *, readonly=False):
+def locked(pool, key, *, readonly=False, deadline=None):
+    """Exclusive entry lock; with a monotonic `deadline`, wait for it instead of failing at once."""
     directory = pool / "locks"
     namespace = "entry" if HASH.fullmatch(key) else key.split("-", 1)[0]
     path = directory / (namespace + "-" + hashlib.sha256(key.encode()).hexdigest()[:3] + ".lock")
@@ -56,7 +65,14 @@ def locked(pool, key, *, readonly=False):
     if not readonly:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     with path.open("r" if readonly else "a+") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        while True:
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if deadline is None or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.2)
         yield
 
 
@@ -74,21 +90,18 @@ def atomic_json(path, value):
 
 
 def link(source, target):
+    """Hard-link, never copy: a copy would be a second private instance of shared bytes.
+
+    A vanished source stays `FileNotFoundError` (a GC race the caller may treat as a miss).
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.link(source, target)
-    except FileExistsError:
-        pass
-    except OSError:
-        # Different filesystems: preserve isolation without depending on hard links.
-        with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as out:
-            temporary = Path(out.name)
-        try:
-            shutil.copyfile(source, temporary)
-            temporary.chmod(0o444)
-            os.replace(temporary, target)
-        finally:
-            temporary.unlink(missing_ok=True)
+    except (FileExistsError, FileNotFoundError) as error:
+        if isinstance(error, FileNotFoundError):
+            raise
+    except OSError as error:
+        raise SharedLinkUnavailable(f"cannot hard-link {source} -> {target}: {error}") from error
 
 
 def native(cwd, env, pool):
@@ -111,7 +124,7 @@ def native(cwd, env, pool):
         return target
     failed = target.with_suffix(".failed.json")
     if read_json(failed).get("until", 0) > time.time():
-        raise OSError("shared-cache helper unavailable for this toolchain; using private cache")
+        raise OSError("shared-cache helper unavailable for this toolchain (retried hourly)")
     with locked(pool, "helper-" + key):
         if target.is_file():
             return target
@@ -261,35 +274,39 @@ def hydrate(entry, private, input_hash, *, private_mappings=None, report=None):
         os.utime(entry / "entry.json", None)
 
 
-def expand(download, private, cwd, env, pool, report, *, manifest=None, private_mappings=None):
+# Bounded by the host's single preparation deadline (agents.HOST_CACHE_TIMEOUT).
+EXPANSION_TIMEOUT = 1200
+
+
+def expand(download, private, cwd, env, pool, report, *, manifest=None, private_mappings=None, deadline=None):
+    """Expand and hydrate every selected archive, or raise: partial hydration is not a fallback."""
     grouped = {}
     for input_hash, archive in entries(download, manifest):
         grouped.setdefault(archive, []).append(input_hash)
     pending = [(inputs, archive) for archive, inputs in grouped.items()]
     if not pending:
         return
-    deadline = time.monotonic() + 120
+    deadline = time.monotonic() + EXPANSION_TIMEOUT if deadline is None else deadline
     program = None
+    completed = 0
     for offset in range(0, len(pending), 128):
-        if time.monotonic() >= deadline:
-            break
         with contextlib.ExitStack() as stack:
             missing = []
             for input_hash, archive in pending[offset : offset + 128]:
                 key = archive[:-5]
                 try:
-                    stack.enter_context(locked(pool, key))
+                    # Another publisher is useful work: wait for it, then hydrate its entry.
+                    stack.enter_context(locked(pool, key, deadline=deadline))
                 except BlockingIOError:
-                    continue  # Another publisher is useful work, not a reason to wait.
+                    raise Unavailable(f"expansion of {archive} still locked at the preparation deadline") from None
                 entry = pool / "entries" / key
                 try:
                     if (entry / "entry.json").is_file():
                         hydrate(entry, private, input_hash, private_mappings=private_mappings, report=report)
                         report["hits"] += 1
+                        completed += 1
                     else:
                         missing.append((input_hash, archive, entry))
-                except OSError as error:
-                    log(f"expanded cache: private hydration unavailable ({error})")
                 except (ValueError, KeyError) as error:
                     log(f"expanded cache: replacing unusable entry {key}: {error}")
                     if entry.is_dir() and not entry.is_symlink():
@@ -365,55 +382,59 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
                     os.replace(publication, entry)
                     hydrate(entry, private, input_hash, private_mappings=private_mappings, report=report)
                     report["expanded"] += 1
+                    completed += 1
+    if completed != len(pending):
+        raise Unavailable(f"expanded {completed} of {len(pending)} selected archives")
 
 
 def transfer(download, private, seeded=(), *, manifest=None, private_mappings=None):
     """Preserve downloads on unsupported toolchains, without linking mutable metadata."""
     manifest = mappings(download) if manifest is None else manifest
     known = {} if private_mappings is None else private_mappings
-    try:
-        wanted = {name for _, name in entries(download, manifest)}
-        for row in manifest.values():
-            if isinstance(row.get("data"), dict):
-                with contextlib.suppress(ValueError):
-                    wanted.update(descriptions(row["data"]))
-        for directory in ("artifacts", "outputs", "revisions"):
-            for source in (download / directory).rglob("*"):
-                if directory == "artifacts" and source.name not in wanted and source.name in seeded:
-                    continue
-                if source.is_symlink() or not source.is_file():
-                    continue
-                target = private / directory / source.relative_to(download / directory)
-                if directory == "artifacts":
-                    link(source, target)
-                    continue
-                if source.suffix != ".json":
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(source, target)
-                    continue
-                key = source.stem if source.parent == download / "outputs/TauCeti" else None
-                before = private_mapping(private, key, known) if key in manifest else read_json(target)
-                if directory == "outputs" and isinstance(before.get("data"), dict):
-                    try:
-                        descriptions(before["data"])
-                        continue  # Preserve this worker's valid expanded native mapping.
-                    except ValueError:
-                        pass  # Repair malformed private mappings using the fresh download.
+    wanted = {name for _, name in entries(download, manifest)}
+    for row in manifest.values():
+        if isinstance(row.get("data"), dict):
+            with contextlib.suppress(ValueError):
+                wanted.update(descriptions(row["data"]))
+    for directory in ("artifacts", "outputs", "revisions"):
+        for source in (download / directory).rglob("*"):
+            if directory == "artifacts" and source.name not in wanted and source.name in seeded:
+                continue
+            if source.is_symlink() or not source.is_file():
+                continue
+            target = private / directory / source.relative_to(download / directory)
+            if directory == "artifacts":
+                link(source, target)
+                continue
+            if source.suffix != ".json":
                 target.parent.mkdir(parents=True, exist_ok=True)
-                data = manifest[key] if key in manifest else read_json(source)
-                if not data:
-                    continue  # Interrupted/malformed fresh metadata must not replace good private state.
-                if before != data:
-                    atomic_json(target, data)
-                if key in manifest:
-                    known[key] = data
-    except (OSError, ValueError) as error:
-        log(f"expanded cache: retaining private fallback after transfer error: {error}")
+                shutil.copyfile(source, target)
+                continue
+            key = source.stem if source.parent == download / "outputs/TauCeti" else None
+            before = private_mapping(private, key, known) if key in manifest else read_json(target)
+            if directory == "outputs" and isinstance(before.get("data"), dict):
+                try:
+                    descriptions(before["data"])
+                    continue  # Preserve this worker's valid expanded native mapping.
+                except ValueError:
+                    pass  # Repair malformed private mappings using the fresh download.
+            target.parent.mkdir(parents=True, exist_ok=True)
+            data = manifest[key] if key in manifest else read_json(source)
+            if not data:
+                continue  # Interrupted/malformed fresh metadata must not replace good private state.
+            if before != data:
+                atomic_json(target, data)
+            if key in manifest:
+                known[key] = data
 
 
 @contextlib.contextmanager
 def preparation(cwd, env, *, refetch=None, report=None):
-    """Use fresh CI metadata, reusing existing archive bytes without trusting agent mappings."""
+    """Use fresh CI metadata, reusing existing archive bytes without trusting agent mappings.
+
+    Every failure after the operator opt-out raises `Unavailable`: a round that silently kept
+    private copies would undo the one-copy-per-host invariant. `CorruptArchive` refetches once.
+    """
     if env.get("TAUCETI_SHARED_ARTIFACTS", "1") == "0" or not env.get("LAKE_CACHE_DIR"):
         yield env
         return
@@ -425,20 +446,21 @@ def preparation(cwd, env, *, refetch=None, report=None):
 
         initialize(pool)
         staging.mkdir(parents=True, exist_ok=True, mode=0o700)
+        same_filesystem(pool, private, cwd)
         temporary = tempfile.TemporaryDirectory(dir=staging, prefix="prepare-")
+    except Unavailable:
+        raise
     except (OSError, ValueError) as error:
-        log(f"expanded cache unavailable; using private cache: {error}")
-        yield env
-        return
+        raise Unavailable(f"expanded cache unavailable: {error}") from error
     started = time.monotonic()
+    deadline = started + EXPANSION_TIMEOUT
     report = {} if report is None else report
     report.update(hits=0, expanded=0)
     with temporary as tmp, contextlib.ExitStack() as leases:
         try:
             leases.enter_context(locked(pool, "download-" + Path(tmp).name))
-        except OSError:
-            yield env
-            return
+        except OSError as error:
+            raise Unavailable(f"expanded cache download lock unavailable: {error}") from error
         download = Path(tmp)
         # Pool contains only previously verified CI artifacts; private .ltars are also
         # candidates, but the native verifier checks their hash before publication.
@@ -461,10 +483,10 @@ def preparation(cwd, env, *, refetch=None, report=None):
             for path in recent:
                 with contextlib.suppress(FileNotFoundError):
                     link(path, download / "revisions/TauCeti" / path.name)
+        except Unavailable:
+            raise
         except (OSError, ValueError) as error:
-            log(f"expanded cache setup unavailable; using private cache ({error})")
-            yield env
-            return
+            raise Unavailable(f"expanded cache setup unavailable: {error}") from error
         record_phase(report, "seed", seed_started)
         report["seeded_artifacts"] = len(seeded)
         warm_env = dict(env, LAKE_CACHE_DIR=str(download))
@@ -474,14 +496,20 @@ def preparation(cwd, env, *, refetch=None, report=None):
                 yield warm_env
             ready = True
         finally:
-            # Even failed/unsupported expansion retains the ordinary verified downloads.
+            # Even failed expansion retains the ordinary verified downloads.
             # Copy mutable metadata, never hard-link it to something Lake may rewrite.
             with measured(report, "manifest"):
                 manifest = mappings(download)
                 report["mappings"] = len(manifest)
             private_mappings = {}
-            with measured(report, "transfer"):
-                transfer(download, private, seeded, manifest=manifest, private_mappings=private_mappings)
+            try:
+                with measured(report, "transfer"):
+                    transfer(download, private, seeded, manifest=manifest, private_mappings=private_mappings)
+            except Exception as error:
+                if ready:
+                    raise Unavailable(f"expanded cache transfer failed: {type(error).__name__}: {error}") from error
+                # The fetch's own failure is the outcome to report, not this one.
+                log(f"expanded cache: transfer after a failed fetch also failed ({type(error).__name__}: {error})")
             if ready:
                 with contextlib.suppress(OSError):
                     for path in (download / "revisions/TauCeti").glob("*.jsonl"):
@@ -503,46 +531,65 @@ def preparation(cwd, env, *, refetch=None, report=None):
                                 report,
                                 manifest=manifest,
                                 private_mappings=private_mappings,
+                                deadline=deadline,
                             )
                     except CorruptArchive as error:
                         # A stale local .ltar must not poison every future round. Detach
                         # the known-bad candidate and let the existing downloader repair it.
                         (download / "artifacts" / error.name).unlink(missing_ok=True)
                         (private / "artifacts" / error.name).unlink(missing_ok=True)
-                        if refetch is not None:
-                            with measured(report, "refetch"):
-                                refetch(warm_env)
-                            with measured(report, "manifest"):
-                                manifest = mappings(download)
-                                report["mappings"] = len(manifest)
-                            with measured(report, "transfer"):
-                                transfer(
-                                    download, private, seeded, manifest=manifest, private_mappings=private_mappings
-                                )
-                            with measured(report, "expand_hydrate"):
-                                expand(
-                                    download,
-                                    private,
-                                    cwd,
-                                    warm_env,
-                                    pool,
-                                    report,
-                                    manifest=manifest,
-                                    private_mappings=private_mappings,
-                                )
+                        if refetch is None:
+                            raise
+                        with measured(report, "refetch"):
+                            refetch(warm_env)
+                        with measured(report, "manifest"):
+                            manifest = mappings(download)
+                            report["mappings"] = len(manifest)
+                        with measured(report, "transfer"):
+                            transfer(download, private, seeded, manifest=manifest, private_mappings=private_mappings)
+                        with measured(report, "expand_hydrate"):
+                            expand(
+                                download,
+                                private,
+                                cwd,
+                                warm_env,
+                                pool,
+                                report,
+                                manifest=manifest,
+                                private_mappings=private_mappings,
+                                deadline=deadline,
+                            )
+                except Unavailable:
+                    raise
                 except Exception as error:
-                    # Sharing is an optimization; report its failure without spending a
-                    # PR attempt or replacing the original host-preparation outcome.
-                    log(f"expanded cache: private fallback ({type(error).__name__}: {error})")
-            report["seconds"] = round(time.monotonic() - started, 3)
-            report["at"] = time.time()
-            status_key = hashlib.sha256(str(private).encode()).hexdigest()
-            with contextlib.suppress(OSError):
-                atomic_json(pool / "status" / (status_key + ".json"), report)
-            env.update({key: value for key, value in warm_env.items() if key.startswith("TAUCETI_PR_CACHE_")})
-            log(
-                f"expanded cache: {report['hits']} reused, {report['expanded']} expanded; {report['seconds']:.1f}s preparation"
-            )
+                    # Partial hydration would leave Lake unpacking private copies (case b).
+                    raise Unavailable(f"expanded cache preparation failed: {type(error).__name__}: {error}") from error
+                finally:
+                    finish(pool, private, report, started, env, warm_env)
+            else:
+                finish(pool, private, report, started, env, warm_env)
+
+
+def finish(pool, private, report, started, env, warm_env):
+    report["seconds"] = round(time.monotonic() - started, 3)
+    report["at"] = time.time()
+    status_key = hashlib.sha256(str(private).encode()).hexdigest()
+    with contextlib.suppress(OSError):
+        atomic_json(pool / "status" / (status_key + ".json"), report)
+    env.update({key: value for key, value in warm_env.items() if key.startswith("TAUCETI_PR_CACHE_")})
+    log(f"expanded cache: {report['hits']} reused, {report['expanded']} expanded; {report['seconds']:.1f}s preparation")
+
+
+def same_filesystem(*paths):
+    """Hard links need one filesystem; fail preparation instead of letting anyone copy."""
+    devices = {}
+    for path in paths:
+        path = Path(path)
+        while not path.exists() and path != path.parent:
+            path = path.parent
+        devices[str(path)] = path.stat().st_dev
+    if len(set(devices.values())) > 1:
+        raise SharedLinkUnavailable(f"build cache paths are on different filesystems: {devices}")
 
 
 def summary():

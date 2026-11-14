@@ -280,6 +280,55 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         assert not any(r["args"] == ["exe", "cache", "clean"] for r in records)
     print("[OK] Mathlib prunes stale private archive links once daily and records current-tree pool reuse")
 
+    # H1 probes hard links in the agent's namespace and relinks before launch; H2 after it exits.
+    import errno
+    import shutil
+
+    from tauceti_worker import canonical_store
+
+    (co / ".lake/build/lib/lean").mkdir(parents=True)
+    phases = []
+    real_boundary = canonical_store.boundary
+
+    def observed(cwd, env, *, phase, prefix=()):
+        phases.append((phase, len(launched)))
+        return real_boundary(cwd, env, phase=phase, prefix=prefix)
+
+    with (
+        patch("tauceti_worker.expanded_cache.preparation", private_preparation),
+        patch.object(canonical_store, "boundary", observed),
+    ):
+        rc, records, text = run(**overrides)
+    assert rc == 0, text
+    assert phases == [("prepare", 0), ("round-end", 1)], phases
+    with (
+        patch("tauceti_worker.expanded_cache.preparation", private_preparation),
+        patch.object(canonical_store.os, "link", side_effect=OSError(errno.EXDEV, "Invalid cross-device link")),
+    ):
+        rc, records, text = run(**overrides)
+    assert rc == 75 and not launched, text
+    assert "hard links unavailable" in text, text
+    print("[OK] relinking brackets the agent; a hard-link preflight failure stops it before launch")
+
+    def tampered(cwd, env, *, phase, prefix=()):
+        if phase == "round-end":
+            raise canonical_store.Tampered("1 build outputs differ from canonical objects of the same name")
+
+    with (
+        patch("tauceti_worker.expanded_cache.preparation", private_preparation),
+        patch.object(canonical_store, "boundary", tampered),
+    ):
+        try:
+            run(**overrides)
+        except agents.BuildOutputsRejected as error:
+            assert not isinstance(error, agents.BuildCacheUnavailable)
+            assert "differ from canonical" in str(error)
+        else:
+            raise AssertionError("tampered outputs must fail the round")
+    assert len(launched) == 1
+    shutil.rmtree(co / ".lake")
+    print("[OK] tampered round-end outputs fail the round without an outage refund")
+
     waits = []
     signals = []
 

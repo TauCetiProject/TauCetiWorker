@@ -291,6 +291,13 @@ def collect(configs, *, dry=False, now=None, opened=...):
                     removed_bytes[info.st_dev] = removed_bytes.get(info.st_dev, 0) + info.st_blocks * 512
             except FileNotFoundError:
                 continue
+    if owned:
+        from .canonical_store import sweep
+
+        # Canonical objects (and their adopted pool alias) go once no checkout or store links them.
+        freed = sweep(pool, report, dry=dry, urgent=urgent, now=now, lifetime=LIFETIME, remove=remove)
+        if not dry:
+            removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + freed
     # One inventory per sweep; update the estimate for known last-link removals.
     # Actual free-space recovery is separately observed with statvfs below.
     after = {

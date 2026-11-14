@@ -168,7 +168,7 @@ class Cache(unittest.TestCase):
                 self.assertEqual((download / "artifacts" / good.name).read_bytes(), b"good")
                 self.assertFalse((download / "artifacts" / vanished.name).exists())
 
-    def test_preparation_lock_contention_falls_back(self):
+    def test_preparation_lock_contention_fails_instead_of_private_fallback(self):
         from contextlib import contextmanager
 
         @contextmanager
@@ -178,16 +178,54 @@ class Cache(unittest.TestCase):
 
         env = dict(LAKE_CACHE_DIR=str(self.root / "private"), TAUCETI_BUILD_CACHE_ROOT=str(self.pool))
         with patch.object(cache, "locked", busy):
-            with cache.preparation(self.root, env) as warm:
-                self.assertIs(warm, env)
+            with self.assertRaises(cache.Unavailable):
+                with cache.preparation(self.root, env):
+                    self.fail("must not run the round on a private cache")
 
-    def test_optional_refetch_failure_does_not_fail_round(self):
+    def test_entry_lock_contention_waits_then_fails_at_the_deadline(self):
+        import fcntl
+        import time
+
+        download = self.root / "download"
+        atomic_json(download / "outputs/TauCeti" / ("b" * 16 + ".json"), dict(data="a" * 16 + ".ltar"))
+        with cache.locked(self.pool, "a" * 16):
+            started = time.monotonic()
+            with self.assertRaisesRegex(cache.Unavailable, "still locked"):
+                cache.expand(
+                    download,
+                    self.root / "private",
+                    self.root,
+                    {},
+                    self.pool,
+                    dict(hits=0, expanded=0),
+                    deadline=time.monotonic() + 0.5,
+                )
+            self.assertGreaterEqual(time.monotonic() - started, 0.4)
+        # Released by a concurrent publisher before the deadline: wait, then hydrate its entry.
+        entry = self.pool / "entries" / ("a" * 16)
+        data = dict(o=["c" * 16 + ".olean"], i="d" * 16 + ".ilean")
+        for name in cache.descriptions(data):
+            (entry / name).parent.mkdir(parents=True, exist_ok=True)
+            (entry / name).write_bytes(b"x")
+        atomic_json(entry / "entry.json", dict(data=data))
+        path = next((self.pool / "locks").glob("entry-*.lock"))
+        holder = path.open("a+")
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        import threading
+
+        threading.Timer(0.3, holder.close).start()
+        report = dict(hits=0, expanded=0)
+        cache.expand(download, self.root / "private", self.root, {}, self.pool, report, deadline=time.monotonic() + 10)
+        self.assertEqual(report["hits"], 1)
+
+    def test_refetch_failure_after_corrupt_archive_fails_preparation(self):
         from tauceti_worker.config import NoProgress
 
         env = dict(LAKE_CACHE_DIR=str(self.root / "private"), TAUCETI_BUILD_CACHE_ROOT=str(self.pool))
         with patch.object(cache, "expand", side_effect=cache.CorruptArchive("a" * 16 + ".ltar")):
-            with cache.preparation(self.root, env, refetch=lambda _: (_ for _ in ()).throw(NoProgress("offline"))):
-                pass
+            with self.assertRaisesRegex(cache.Unavailable, "offline"):
+                with cache.preparation(self.root, env, refetch=lambda _: (_ for _ in ()).throw(NoProgress("offline"))):
+                    pass
 
     def test_hydration_space_error_preserves_good_pool_entry(self):
         entry = self.pool / "entries" / ("a" * 16)
@@ -199,8 +237,64 @@ class Cache(unittest.TestCase):
             patch.object(cache, "hydrate", side_effect=OSError("no space")),
             patch.object(cache, "native", side_effect=AssertionError("must not expand good entry")),
         ):
-            cache.expand(download, self.root / "private", self.root, {}, self.pool, dict(hits=0, expanded=0))
+            with self.assertRaisesRegex(OSError, "no space"):
+                cache.expand(download, self.root / "private", self.root, {}, self.pool, dict(hits=0, expanded=0))
         self.assertTrue((entry / "entry.json").is_file())
+
+    def test_link_failure_raises_instead_of_copying(self):
+        import errno
+
+        source = self.root / "source"
+        source.write_bytes(b"bytes")
+        for code in (errno.EXDEV, errno.EPERM):
+            target = self.root / f"target-{code}"
+            with patch.object(cache.os, "link", side_effect=OSError(code, os.strerror(code))):
+                with self.assertRaises(cache.SharedLinkUnavailable):
+                    cache.link(source, target)
+            self.assertFalse(target.exists())
+        cache.link(source, self.root / "linked")
+        cache.link(source, self.root / "linked")  # An existing link is success.
+        self.assertEqual((self.root / "linked").stat().st_ino, source.stat().st_ino)
+        with self.assertRaises(FileNotFoundError):
+            cache.link(self.root / "vanished", self.root / "never")
+
+    def test_native_helper_failure_fails_partial_expansion(self):
+        download = self.root / "download"
+        for key, archive in (("b", "a"), ("c", "e")):
+            atomic_json(download / "outputs/TauCeti" / (key * 16 + ".json"), dict(data=archive * 16 + ".ltar"))
+        entry = self.pool / "entries" / ("a" * 16)
+        data = dict(o=["c" * 16 + ".olean"], i="d" * 16 + ".ilean")
+        for name in cache.descriptions(data):
+            (entry / name).parent.mkdir(parents=True, exist_ok=True)
+            (entry / name).write_bytes(b"x")
+        atomic_json(entry / "entry.json", dict(data=data))
+        # One archive hydrates from the pool; the other needs the toolchain's hash helper.
+        with (
+            patch.object(cache, "native", side_effect=OSError("helper unavailable")),
+            self.assertRaisesRegex(OSError, "helper unavailable"),
+        ):
+            cache.expand(download, self.root / "private", self.root, {}, self.pool, dict(hits=0, expanded=0))
+        env = dict(LAKE_CACHE_DIR=str(self.root / "private"), TAUCETI_BUILD_CACHE_ROOT=str(self.pool))
+        with patch.object(cache, "native", side_effect=OSError("helper unavailable")):
+            with self.assertRaisesRegex(cache.Unavailable, "helper unavailable"):
+                with cache.preparation(self.root, env) as warm:
+                    shutil.copytree(download / "outputs", Path(warm["LAKE_CACHE_DIR"]) / "outputs")
+
+    def test_preparation_requires_one_filesystem(self):
+        env = dict(LAKE_CACHE_DIR=str(self.root / "private"), TAUCETI_BUILD_CACHE_ROOT=str(self.pool))
+        real_stat = Path.stat
+
+        def elsewhere(path, *args, **kwargs):
+            info = real_stat(path, *args, **kwargs)
+            if path == self.root / "private" or path == self.root:
+                return os.stat_result((info.st_mode, info.st_ino, info.st_dev + 1, *tuple(info)[3:]))
+            return info
+
+        (self.root / "private").mkdir()
+        with patch.object(Path, "stat", elsewhere):
+            with self.assertRaisesRegex(cache.SharedLinkUnavailable, "different filesystems"):
+                with cache.preparation(self.root, env):
+                    self.fail("must not prepare across filesystems")
 
     @unittest.skipUnless(shutil.which("lean") and shutil.which("lake"), "Lean/Lake needed for native fixture")
     def test_real_lake_restores_without_unpack_and_rebuild_preserves_other_worker(self):
