@@ -317,7 +317,8 @@ def validate_shared_views(env, *, enforce: bool) -> dict:
     from . import shared_mathlib
 
     pool = shared_mathlib.root(env)
-    entries = pool / "entries"
+    # Entries live in the current layout's directory (pool/v4/entries), not the legacy pool/entries.
+    entries = shared_mathlib.layout(pool) / "entries"
     entry = entries / key
     problem = None
     try:
