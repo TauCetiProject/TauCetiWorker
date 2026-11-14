@@ -1636,6 +1636,7 @@ def run_repair_agent(
     )
     from tauceti_worker.config import NoProgress
     from tauceti_worker.repair_recovery import environment
+    from tauceti_worker.round_storage import RoundAbandoned
 
     if resume and resume_provider not in PROVIDERS:
         log("the recorded session names no provider; starting afresh")
@@ -1717,6 +1718,9 @@ def run_repair_agent(
                 rc, reason, prework = None, str(error), f"{LAUNCH_FAILURE}: {error}"
             except BuildCacheUnavailable as error:
                 return result("artifacts_unavailable", reason=str(error))
+            except RoundAbandoned as error:
+                # Killed for private build bytes: the agent's own failure, not a reason to try another.
+                return result("failed", reason=str(error))
             except NoProgress as error:
                 if cancel.is_set() and not expired.is_set():
                     return result("cancelled")

@@ -1406,6 +1406,7 @@ class WorkerBackend:
         from .claude_api import api_context, api_mode
         from .config import AdmissionUnavailable
         from .fleet_capacity import admission_unit, unit_admitted
+        from .round_storage import RoundAbandoned
 
         auth, profile, keys = self.continuation_admission(record, m, j)
         scope = dict(repository=m["repository"], pr=m["pr"], source_round=m.get("source_round"))
@@ -1483,6 +1484,9 @@ class WorkerBackend:
                         raise Wait(
                             "worker-resource" if isinstance(error, ResourceUnavailable) else "queue-owned", str(error)
                         ) from error
+                    except RoundAbandoned as error:
+                        # Killed for private build bytes and discarded: never restored and rerun.
+                        raise Obsolete("private-bytes-cap", str(error), "Abandoned; not retried") from error
                     except BuildCacheUnavailable as error:
                         refund_content(known_no_launch=True)
                         raise RuntimeError(
