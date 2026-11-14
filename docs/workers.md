@@ -379,6 +379,19 @@ The pool defaults to `~/.cache/tauceti/builds` under the login user's home. Conf
 cache overrides are preserved. Only directories carrying a valid TauCeti ownership record
 are collected; an arbitrary nonempty directory is never adopted or deleted.
 
+`TAUCETI_ROUND_WORKTREES=1` (off by default; set it in a host's `workers.toml` `env` table)
+makes every round work in its own linked worktree of one bare host clone,
+`<state>/host-repositories/TauCeti.git` (override with `TAUCETI_HOST_REPOSITORIES`). The worktree
+sits at the worker's usual checkout path, detached at `origin/main`; the host clone is fetched at
+most once a minute under `host-repositories/TauCeti.lock`. At round end the worktree's source is
+saved through the recovery save path, history included, and the worktree is removed; its `.lake`
+waits beside it as `checkout.lake-between-rounds`. A crashed round's worktree is saved and removed
+by the next round on the host once its worker's round lock is free. On its first round each worker
+saves and then deletes its old permanent checkout. Shared Git config that could run code for every
+round (hooks, fsmonitor, filters, aliases, credential and URL rewrites, includes) is cleared at each
+round. Turning the flag off again is safe: the next round finds a worktree of a clone it does not
+manage, saves it, and clones an ordinary checkout as before.
+
 The collector measures allocated bytes across shared and worker-private caches, counting
 hard-linked inodes once. Its eviction target defaults to 25% of filesystem capacity;
 `TAUCETI_CACHE_MAX_GIB` sets an explicit target instead. Pressure collection begins when

@@ -319,8 +319,12 @@ def _evict_tree(cfg, tree, anchor, report, *, dry=False, discard=False, owner=No
 
 def evict_workspace(cfg, report, *, dry=False):
     """Only the active generation; unrelated retained history never enters a round-start walk."""
+    from .round_worktrees import parked_lake
+
     anchor = cfg.checkout.parent.parent if legacy_project() else cfg.state
     evict_tree(cfg, cfg.checkout, anchor, report, dry=dry)
+    # Between rounds a worktree host keeps the worker's `.lake` beside its (removed) worktree.
+    evict_tree(cfg, parked_lake(cfg), anchor, report, dry=dry)
     for path, root in cache_roots(cfg):
         remove(path.with_name(path.name + ".retention-deleting"), root, report, dry=dry)
         remove(path, root, report, dry=dry)
@@ -331,7 +335,10 @@ def collect_retired(cfg, report, *, now, dry=False, discard_checkout=False):
 
     anchor = cfg.checkout.parent.parent if legacy_project() else cfg.state
     if discard_checkout:
+        from .round_worktrees import parked_lake
+
         evict_tree(cfg, cfg.checkout, anchor, report, dry=dry, discard=True)
+        remove(parked_lake(cfg), anchor, report, dry=dry)
     # Retained roots have exactly one recursive collector: bounded recovery housekeeping.
     # Registration is constant metadata work and never inspects history on this timer path.
     parent = cfg.checkout.parent / recovery.RETAINED_DIR

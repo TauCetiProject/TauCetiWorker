@@ -1792,7 +1792,7 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     if needs_host_build and not _have("lake") and not opts.dry_run:
         raise Die(
             "preflight: host authoring (the default) needs an elan/lake toolchain on PATH "
-            "(or pass --bubble to build inside the sandbox instead)"
+            "(bubble work rounds are refused: they would build a private Mathlib in the container)"
         )
     # bubble (the --bubble sandbox) runs each model on untrusted PR content inside an Incus container.
     # Without Incus, bubble fails deep in the round with a terse "Incus is required but not installed";

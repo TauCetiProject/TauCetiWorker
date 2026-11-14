@@ -1892,6 +1892,15 @@ class Fixture(unittest.TestCase):
         self.assertTrue(self.run_recovery())
         self.assert_retained()
 
+    def test_restored_checkout_hard_links_the_worker_clone_objects(self):
+        with patch.object(self.backend, "verify", side_effect=RuntimeError("offline")):
+            self.assertFalse(self.run_recovery())
+        restored = self.record / "checkout"
+        source = {p.stat().st_ino for p in (self.co / ".git/objects").rglob("*") if p.is_file()}
+        objects = [p for p in (restored / ".git/objects").rglob("*") if p.is_file() and "info" not in p.parts]
+        self.assertTrue(objects)
+        self.assertTrue(any(p.stat().st_ino in source for p in objects), "recovery objects are links, not copies")
+
     def handoff(self):
         from tauceti_worker.activity import current_round_id
 

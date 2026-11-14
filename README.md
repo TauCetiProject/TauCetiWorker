@@ -599,6 +599,10 @@ they always run on the host. Bubble needs an
 [Incus](https://linuxcontainers.org/incus/) runtime. See
 [the sandbox notes](docs/sandbox.md) for the exact boundary and requirements.
 
+Code-writing rounds in Bubble are currently refused: the container would unpack
+its own Mathlib build and build TauCeti privately, and a host keeps one shared copy
+of each. Review rounds still run in Bubble, against a shared read-only Mathlib source.
+
 The agent's conversation transcript is normalized into readable narration,
 reasoning summaries, tool activity, and results. File edits are listed by path
 instead of repeating full diffs; tool inputs are bounded, and tool results over

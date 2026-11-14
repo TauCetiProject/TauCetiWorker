@@ -1253,17 +1253,58 @@ class SnapshotTests(Fixture):
         self.assertFalse((target / ".lake" / s.META).exists())
         self.assertEqual((target / ".lake/build/TauCeti.olean").read_text(), "tauceti output")
 
-    def test_snapshot_of_an_older_layout_copies_sources_only(self):
+    def test_snapshot_hard_links_tauceti_outputs_and_detects_in_place_writes(self):
+        from tauceti_worker.verification_jobs import links_intact
+
+        self.attach()
+        build = self.cwd / ".lake/build/lib/lean"
+        build.mkdir(parents=True)
+        (build / "TauCeti.olean").write_bytes(b"tauceti output")
+        (build / "TauCeti.trace").write_text('{"depHash": "1"}')
+        (build / "TauCeti.setup.json").write_text("{}")
+        (build / "TauCeti.bc").write_bytes(b"bitcode")
+        target = self.snapshot("d")
+        out = target / ".lake/build/lib/lean"
+        for name in ("TauCeti.olean", "TauCeti.bc"):
+            self.assertEqual((out / name).stat().st_ino, (build / name).stat().st_ino, name)
+        self.assertNotEqual((out / "TauCeti.trace").stat().st_ino, (build / "TauCeti.trace").stat().st_ino)
+        self.assertFalse((out / "TauCeti.setup.json").exists())
+        self.assertTrue(links_intact(target))
+        (build / "TauCeti.bc").unlink()
+        (build / "TauCeti.bc").write_bytes(b"replaced, as Lake replaces outputs")
+        self.assertTrue(links_intact(target), "a replaced output in the source is not a write-through")
+        with (build / "TauCeti.olean").open("ab") as stream:
+            stream.write(b" written in place through the live workspace")
+        self.assertFalse(links_intact(target))
+
+    def test_snapshot_fails_instead_of_copying_when_hard_links_fail(self):
+        from tauceti_worker.verification import Incomplete
+
+        self.attach()
+        (self.cwd / ".lake/build").mkdir()
+        (self.cwd / ".lake/build/TauCeti.olean").write_bytes(b"tauceti output")
+        real = os.link
+
+        def refuse(source, dest, *args, **kwargs):
+            if str(source).endswith(".olean"):
+                raise OSError(18, "Invalid cross-device link")
+            return real(source, dest, *args, **kwargs)
+
+        with patch("tauceti_worker.verification_jobs.os.link", side_effect=refuse):
+            with self.assertRaises(Incomplete) as raised:
+                self.snapshot("e")
+        self.assertIn("hard links", str(raised.exception))
+        self.assertFalse((self.root / "state/verification-candidates" / ("e" * 32)).exists())
+
+    def test_snapshot_of_an_older_layout_leaves_its_private_mathlib_behind(self):
         private = self.cwd / ".lake/packages/mathlib"
         subprocess.run(["git", "clone", "-q", str(self.mathlib_repo), str(private)], check=True)
         (private / ".lake/build").mkdir(parents=True)
         (private / ".lake/build/sparse.olean").write_text("incomplete old upper")
         atomic_json(private / ".lake/tauceti-shared-mathlib.json", dict(key="1" * 64, pool=str(self.pool)))
         target = self.snapshot("b")
-        copied = target / ".lake/packages/mathlib"
-        self.assertTrue((copied / "Mathlib/Test.lean").is_file())
-        self.assertFalse((copied / ".lake/build").exists())
-        self.assertFalse((copied / ".lake/tauceti-shared-mathlib.json").exists())
+        # The private Mathlib stays behind; the candidate's own view attaches the shared sources.
+        self.assertFalse((target / ".lake/packages/mathlib").exists())
 
     def test_snapshot_storage_pressure_remains_retryable(self):
         from tauceti_worker.verification import inventory

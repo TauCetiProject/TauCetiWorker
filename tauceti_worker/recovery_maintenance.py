@@ -581,35 +581,57 @@ def _unarchived_state(tree, snap):
     """v1 captures branch source, but not credentials, native operations or extra Git history."""
     from . import work_recovery as wr
 
-    if not (tree / ".git").is_dir() or (tree / ".git").is_symlink():
+    if wr.checkout_kind(tree) is None:
         return True
     if snap.operations or any("credential" in reason for _, reason in snap.excluded):
         return True
-    if wr._git(tree, "for-each-ref", "--format=%(refname)", "refs/stash", "refs/notes").strip():
+    extra = ["refs/stash", "refs/notes"] + (
+        ["refs/worktree", "refs/bisect"] if wr.checkout_kind(tree) == "worktree" else []
+    )
+    if wr._git(tree, "for-each-ref", "--format=%(refname)", *extra).strip():
         return True
     # The history-aware snapshot includes extra ref/reflog tips in this descriptor's v1 bundle.
     return False
+
+
+def _metadata_dirs(tree):
+    """`(gitdir, common)` read from the files Git writes, without starting Git.
+
+    A linked worktree's `.git` file names its own directory, whose `commondir` names the shared
+    repository; an ordinary clone's `.git` directory is both.
+    """
+    dotgit = tree / ".git"
+    try:
+        if dotgit.is_file() and not dotgit.is_symlink():
+            gitdir = (tree / dotgit.read_text().strip().removeprefix("gitdir: ")).resolve()
+            common = gitdir / (gitdir / "commondir").read_text().strip()
+            return gitdir, common.resolve()
+    except OSError:
+        pass
+    return dotgit, dotgit
 
 
 def _park_signature(tree, sidecar):
     """Constant-size metadata probe; no traversal of parked source or historical payloads."""
     from .work_recovery import _charge
 
+    gitdir, common = _metadata_dirs(tree)
     paths = [
         tree,
         sidecar,
+        gitdir,
+        gitdir / "HEAD",
+        gitdir / "logs/HEAD",
         *(
-            tree / ".git" / name
+            common / name
             for name in (
                 "",
-                "HEAD",
                 "packed-refs",
                 "refs",
                 "refs/tags",
                 "refs/notes",
                 "refs/stash",
                 "logs",
-                "logs/HEAD",
                 "refs/heads",
                 "logs/refs",
                 "info/exclude",
@@ -706,7 +728,7 @@ def _cleanup(state, tree, root, work, observation=None):
             job["retry_at"] = 0  # a metadata change can retry immediately at its last successful allowance
         # Reject failed/incomplete repositories before any process or mount traversal.
         if job["phase"] == "save" or not tree.name.endswith(".deleting"):
-            valid = (tree / ".git").is_dir() and not (tree / ".git").is_symlink()
+            valid = wr.checkout_kind(tree) is not None
             if valid:
                 try:
                     with completed_check():
