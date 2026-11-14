@@ -245,3 +245,41 @@ Concurrency and failure tests, not link-count samples:
   mapping reconstruction and publication no longer need them.
 - Interactive Codex and Claude sessions outside TauCetiWorker are not governed by
   this plan; the same principle should be written into their instructions.
+
+## Implementation status (14 November 2026)
+
+Every step has landed on `main` and is deployed on tauchonki (60 workers) and chungus2
+(7 workers):
+
+| Step | Pull requests |
+| --- | --- |
+| 1. Collector progress | #738 |
+| 2. No build state in recovery | #737 |
+| 3. Shared Mathlib | #736, #739, #740, #741, #743, #746, #749 |
+| 4. TauCeti outputs exist once | #742, #750 |
+| 5. Every producer, then worktrees | #745, #747, #748 |
+| 6. Enforcement | #744 |
+
+Deviations from the plan:
+
+- The per-round cap is 20 GiB, not 6. A full TauCeti build is about 13 to 14 GiB once
+  `.olean.private`, IR and setup files are counted, and rounds that restore TauCeti from
+  `.ltar` archives write that much before round-end relinking shares it. 20 GiB still
+  stops a round that also makes a private Mathlib copy (about 7 GiB with its closure).
+- `off` blocks rounds that need Mathlib rather than building privately; a host with no
+  `policy.json` keeps private builds.
+- Rebase rounds, and repair rounds whose pin is refused, prepare current `main`'s
+  Mathlib, and the agent's `lake` refuses to run until it has integrated `main`. Bump
+  rounds record the next Mathlib so it is allowed and not evicted first.
+- Per-round worktrees are enabled per host with `TAUCETI_ROUND_WORKTREES=1`.
+
+Follow-ups:
+
+- With `LAKE_ARTIFACT_CACHE=1`, Lake copies Mathlib's outputs into each worker's private
+  store once per Mathlib version; publish those mappings with the shared entry.
+- Expanded-cache entry aliases of a CI copy keep their inode until the entry expires;
+  merge them in the background collector.
+- A round can attach a shared source tree while another round is still publishing it,
+  and fail that round; attachment should wait for the source's ready marker.
+- Lake restores `.ltar` archives into private files during a round; hydrating expanded
+  entries before Lake runs would avoid writing them at all.
