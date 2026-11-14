@@ -115,6 +115,11 @@ The directory is removed after the bubble exits, or before the next round if the
 worker was hard-killed. Your `$CLAUDE_CONFIG_DIR` (or `~/.claude`) is never
 created or overwritten.
 
+A worker with a [usage login](quota.md#agents-on-a-setup-token-a-separate-usage-login)
+runs its agents on the token file in `$CLAUDE_CONFIG_DIR`. Its bubble rounds are
+seeded from that file through the same private directory, and the Keychain is
+not read.
+
 Worker versions before this private handoff may already have left a
 `.credentials.json` snapshot in your configured Claude directory. This version
 does not delete that file because it may be operator-owned. If host subscription

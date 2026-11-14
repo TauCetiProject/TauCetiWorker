@@ -371,6 +371,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_PR` | _(unset)_ | Comma-separated pull request numbers for `--pr`. |
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
 | `TAUCETI_AUTO_REFRESH` | _(unset)_ | `1` is the same as `--auto-refresh`. |
+| `TAUCETI_CLAUDE_USAGE_CREDENTIALS` | _(unset)_ | A second Claude login, as a config directory or a credentials file, that the pacer reads usage with. For workers whose agents run on a `claude setup-token` token; see [quota](quota.md#agents-on-a-setup-token-a-separate-usage-login). |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = `60:40`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `TAUCETI_VERIFY_CHECKPOINT_MARGIN` | `600` | Seconds reserved before the round deadline for checkpointing; verification returns incomplete at this boundary. |
