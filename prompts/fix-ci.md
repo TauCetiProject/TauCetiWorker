@@ -4,6 +4,18 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 - See which checks failed and read their logs:
   - `gh pr checks __PR__ --repo TauCetiProject/TauCeti`
   - `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed` (use the run id from the failing check)
+- If the failing stage's log shows a Lean process killed (signal 9, exit code 137), or ends with
+  `The runner has received a shutdown signal` (exit code 143), the build may have run out of memory.
+  A shutdown alone does not show that: runners are also stopped when a job is cancelled or its machine
+  is reclaimed. Measure before you decide. Once a changed file's imports are built,
+  `python3 -c 'import resource, subprocess, sys; subprocess.run(sys.argv[1:], check=True); print(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)' lake lean <path/to/File.lean>`
+  recompiles the file and prints its peak memory (kilobytes on Linux). It fails instead of printing if
+  the compile fails or is killed; a measurement counts only from a compile that succeeded, since a killed
+  one stops below what the file needs. A `lake build` of an already-built module measures only Lake.
+  Compare the number with the runner's memory: the log's `Set up job` step names the machine, and the
+  GitHub and Namespace runners a PR build can land on have 16 GB. If a changed file comes anywhere near
+  that, bring it well under, typically by restructuring a large `decide` over a finite type so that the
+  kernel checks less at once.
 - The `build` check includes source guards, `lake build --iofail`, shim checks,
   the audit driver (global duplicate declarations, then axioms), the module-system audit, the
   environment lint (`lint-env`) and the source style lint (`lint-style`). Find the stage that failed
@@ -25,7 +37,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 ## Fix it on its merits
 - Diagnose the real cause (a broken proof, a renamed/missing Mathlib lemma, a linter error, an axiom-audit failure, a flaky/transient infra error). Fix the underlying problem.
 - If the shim-expiry command fails, its annotations name exact Mathlib replacements and affected sources. Migrate only the superseded declarations/imports, preserve or re-home source-only API, and update `TauCeti/mathlib-shims.json` in the same source-only change. The checker derives each inherited source's declaration surface from the PR merge base and ratchets its probes until that surface is migrated, deleted, or re-homed under an entry preserving those probes, so never make the check green by merely deleting probes or changing an exact target to a speculative/landing sentinel.
-- Only if the logs establish a transient infrastructure failure (e.g. cache fetch timeout), with no actionable source/audit violation, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`). A passing local axiom check is never evidence that a CI audit failure was transient.
+- Only if the logs establish a transient infrastructure failure (e.g. cache fetch timeout), with no actionable source/audit violation, push an empty commit to re-trigger CI (`git commit --allow-empty -m "chore: re-trigger CI"`). A killed build or runner shutdown counts as transient only once every changed file measures well under the runner's memory as above. A passing local axiom check is never evidence that a CI audit failure was transient.
 - Prefer the smallest correct fix. If a declaration is unsalvageable, it is better to remove it than to leave the PR red — but never gut the PR into vacuity; if nothing useful survives, follow the durable PR outcome rules below rather than pushing an empty shell. Partial overlap does not justify deleting valuable remaining work.
 
 ## Rules of the repo (hard constraints)
