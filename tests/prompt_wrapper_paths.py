@@ -46,7 +46,8 @@ WRAPPERS = ("git-safe-push", "gh-safe-pr-create", "claim.sh")
 # The keys each call site passes, so a prompt that grows a placeholder without a substitution fails
 # here rather than reaching an agent. Mirrors work_units._do_fixlike / do_roadmap.
 VERIFY = dict(LOCAL_VERIFICATION="(local verification rules)")
-FIXLIKE = dict(PR=123, AGENT="Claude Code", BIN="/bin", SCOPE_POLICY="ordinary", **VERIFY)
+QUALITY = dict(QUALITY_SCOPE="(quality scope)")
+FIXLIKE = dict(PR=123, AGENT="Claude Code", BIN="/bin", SCOPE_POLICY="ordinary", **VERIFY, **QUALITY)
 CALL_SITES = {
     "pr-outcome.md": dict(
         PR=123,
@@ -54,7 +55,9 @@ CALL_SITES = {
         CLOSE_AUTHORITY="Closure authority is pinned by the worker.",
     ),
     "overlap-scan.md": dict(BATCH="/tmp/batch.json", RESULT="/tmp/result.json"),
-    "overlap-fix.md": dict(ISSUE=123, BODY="Evidence", FORK="alice/TauCeti", FORK_OWNER="alice", BIN="/bin", **VERIFY),
+    "overlap-fix.md": dict(
+        ISSUE=123, BODY="Evidence", FORK="alice/TauCeti", FORK_OWNER="alice", BIN="/bin", **VERIFY, **QUALITY
+    ),
     "fix.md": FIXLIKE,
     "fix-ci.md": FIXLIKE,
     "rebase.md": FIXLIKE,
@@ -75,6 +78,7 @@ CALL_SITES = {
         EXTRA_ROADMAP_PROMPT="",
         BIN="/bin",
         **VERIFY,
+        **QUALITY,
     ),
 }
 NO_WRAPPER = {"overlap-scan.md", "pr-outcome.md", "local-verification.md"}
@@ -225,6 +229,24 @@ def main():
             for directory in (PROMPTS, PROMPTS / "v0")
         ]
         check(f"{name}: both variants say the same about the quality pass", lines[0] and lines[0] == lines[1])
+
+    # 8) Agents run Q1, Q2 and Q5 and decline the other checks unless the operator chose
+    # --full-quality (TAUCETI_FULL_QUALITY=1), in every quality-pass prompt of either variant.
+    for full in (None, "0", "1"):
+        environment = {k: v for k, v in os.environ.items() if k != "TAUCETI_FULL_QUALITY"}
+        if full is not None:
+            environment["TAUCETI_FULL_QUALITY"] = full
+        for helper in ("0", "1"):
+            environment["TAUCETI_VERIFY_HELPER"] = helper
+            with patch.dict(os.environ, environment, clear=True):
+                scope = tc.agents.quality_scope()
+                for name in QUALITY_PASS:
+                    text = fill_prompt(PROMPTS / name, **dict(CALL_SITES[name], QUALITY_SCOPE=scope))
+                    if full == "1":
+                        ok = "Run every check." in text and "Run only" not in text
+                    else:
+                        ok = "Run only Q1, Q2 and Q5" in text and "`declined — not run`" in text
+                    check(f"{name}: quality scope (TAUCETI_FULL_QUALITY={full}, TAUCETI_VERIFY_HELPER={helper})", ok)
 
     print("FAIL" if fails else "PASS")
     return 1 if fails else 0

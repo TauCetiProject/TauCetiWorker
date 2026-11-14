@@ -561,7 +561,15 @@ def do_scan(w, sv, c, opts, bubble):
 
 
 def do_fix(w, sv, c, opts, bubble):
-    from .agents import fill_prompt, local_verification, prepare_checkout, run_agent_host, run_in_bubble, wrapper_bin
+    from .agents import (
+        fill_prompt,
+        local_verification,
+        prepare_checkout,
+        quality_scope,
+        run_agent_host,
+        run_in_bubble,
+        wrapper_bin,
+    )
     from .work_units import _effective_authoring_profile
 
     require_shared()
@@ -589,6 +597,7 @@ def do_fix(w, sv, c, opts, bubble):
             FORK_OWNER=fork.split("/", 1)[0],
             BIN=wrapper_bin(bubble=bubble),
             LOCAL_VERIFICATION=local_verification("ordinary", bubble),
+            QUALITY_SCOPE=quality_scope(),
         )
         with environment(
             {

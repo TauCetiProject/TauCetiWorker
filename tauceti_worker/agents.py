@@ -533,6 +533,13 @@ def self_tested_guidance(policy: str) -> str:
     )
 
 
+def quality_scope() -> str:
+    """Which quality-pass checks agents run: all of them under `--full-quality`, else Q1, Q2 and Q5."""
+    if os.environ.get("TAUCETI_FULL_QUALITY", "0") == "1":
+        return "Run every check."
+    return "Run only Q1, Q2 and Q5 (the duplicate and proof-length checks); each other line reads `declined — not run`."
+
+
 def local_verification(policy: str, bubble: bool = False) -> str:
     """The shared verification rules and scope recipe every authoring/repair prompt embeds."""
     if policy not in {"ordinary", "full-lint", "lint-repair", "bump"}:

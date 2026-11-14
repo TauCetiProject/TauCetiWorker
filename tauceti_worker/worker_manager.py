@@ -61,6 +61,7 @@ _WORKER_KEYS = {
     "respect_claims",
     "extra_roadmap_prompt",
     "self_tested",
+    "full_quality",
     "source",
     "author_model",
     "author_effort",
@@ -318,6 +319,7 @@ class WorkerSpec:
     respect_claims: bool = True
     extra_roadmap_prompt: str | None = None
     self_tested: bool = False
+    full_quality: bool = False
     source: str | None = None
     author_model: str | None = None
     author_effort: str | None = None
@@ -386,6 +388,7 @@ class WorkerSpec:
                 raw.get("roadmap_extra_identities", []), f"workers[{index}].roadmap_extra_identities"
             ),
             self_tested=_boolean(raw.get("self_tested", False), f"workers[{index}].self_tested"),
+            full_quality=_boolean(raw.get("full_quality", False), f"workers[{index}].full_quality"),
             respect_claims=_boolean(raw.get("respect_claims", True), f"workers[{index}].respect_claims"),
             extra_roadmap_prompt=_extra_roadmap_prompt(
                 raw.get("extra_roadmap_prompt"), f"workers[{index}].extra_roadmap_prompt"
@@ -454,6 +457,8 @@ class WorkerSpec:
             value["roadmap_extra_identities"] = list(self.roadmap_extra_identities)
         if self.self_tested:
             value["self_tested"] = True
+        if self.full_quality:
+            value["full_quality"] = True
         if not self.respect_claims:
             value["respect_claims"] = False
         for name in (
@@ -528,6 +533,8 @@ class WorkerSpec:
                 argv += [flag, field]
         if self.self_tested:
             argv.append("--self-tested")
+        if self.full_quality:
+            argv.append("--full-quality")
         if self.extra_roadmap_prompt is not None:
             # One argument: free text may begin with `-`, which argparse would otherwise read as a flag.
             argv.append(f"--extra-roadmap-prompt={self.extra_roadmap_prompt}")
@@ -1026,7 +1033,7 @@ def _defer_read_policy_reload(spec: WorkerSpec, live: dict) -> bool:
             applied = previous.as_dict()
     old = dict(applied)
     desired = spec.as_dict()
-    for field in ("max_open_prs", "github_state_url", "github_state_token_file", "self_tested"):
+    for field in ("max_open_prs", "github_state_url", "github_state_token_file", "self_tested", "full_quality"):
         old.pop(field, None)
         desired.pop(field, None)
     if old != desired:
@@ -2073,7 +2080,15 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
         for token in flags:
             if token in ("--loop", "--host"):
                 continue
-            if token in ("--ignore-quota", "--auto-refresh", "--stream", "--isolate-home", "--bubble", "--self-tested"):
+            if token in (
+                "--ignore-quota",
+                "--auto-refresh",
+                "--stream",
+                "--isolate-home",
+                "--bubble",
+                "--self-tested",
+                "--full-quality",
+            ):
                 values[
                     {
                         "--ignore-quota": "ignore_quota",
@@ -2082,6 +2097,7 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
                         "--isolate-home": "isolate_home",
                         "--bubble": "bubble",
                         "--self-tested": "self_tested",
+                        "--full-quality": "full_quality",
                     }[token]
                 ] = True
                 continue
@@ -2188,6 +2204,7 @@ def add_workers_parser(subparsers) -> None:
         "(see `tauceti work --help`)",
     )
     add.add_argument("--self-tested", action="store_true", help="apply the self-tested label after local verification")
+    add.add_argument("--full-quality", action="store_true", help="run all five quality-pass checks, not Q1, Q2, Q5")
     add.add_argument("--roadmap-only", help="pin roadmap rounds to one area")
     add.add_argument("--roadmap-skip", default="", help="comma-separated roadmap areas to exclude")
     add.add_argument("--extra-roadmap-prompt", help="extra guidance for roadmap rounds, appended to the agent's prompt")
@@ -2276,6 +2293,7 @@ def cmd_workers(args) -> int:
                     "ignore_quota": args.ignore_quota,
                     "auto_refresh": args.auto_refresh,
                     "self_tested": args.self_tested,
+                    "full_quality": args.full_quality,
                     "roadmap_skip": [item for item in args.roadmap_skip.split(",") if item],
                     "stream": args.stream,
                     "isolate_home": args.isolate_home,
