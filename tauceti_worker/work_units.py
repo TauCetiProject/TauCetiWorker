@@ -402,6 +402,31 @@ class NoEligibleWork(NoProgress):
     """Selection exhausted its candidates without launching a paid unit."""
 
 
+def backlog_current(sv) -> bool:
+    """Whether a survey may publish its account's backlog: a current inventory read as an account.
+    A retained snapshot is older, and anonymous Forgejo discovery has no account to count for."""
+    return not (
+        sv.dependency_wait
+        or sv.github_failed
+        or getattr(sv, "_retained_snapshot", False)
+        or (hasattr(sv, "source_actor") and sv.source_actor is None)
+    )
+
+
+def publish_backlog(surveys: dict, *, complete: bool) -> None:
+    """Publish each forge's backlog under `backlog_by_forge`, and the account-wide totals only when
+    `surveys` covers every forge the worker reads, so a total never omits an unavailable forge."""
+    now = time.time()
+    fresh = {name: {**sv.backlog_counts(), "survey_at": now} for name, sv in surveys.items()}
+    previous = runtime_snapshot().get("backlog_by_forge")
+    changes = {"backlog_by_forge": {**(previous if isinstance(previous, dict) else {}), **fresh}}
+    if complete:
+        for key in ("mine_open", "mine_awaiting_author", "mine_needs_fix"):
+            changes[key] = sum(entry[key] for entry in fresh.values())
+        changes["survey_at"] = now
+    report_runtime(**changes)
+
+
 def round_scope(w, opts, use_fleet_focus=True):
     scope = roadmap_only()
     global_pick = focused_round = False
@@ -505,6 +530,13 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             # silently fall back to thousands of direct comment requests.
             cached_only=global_pick and github_state_enabled(),
         )
+        # The published backlog describes this worker's configured roadmap scope from a current
+        # inventory. Named PRs and a Fleet focus area are narrower and a retained snapshot is older,
+        # so those rounds leave it as the last such survey reported it. Special-task rounds reach this
+        # GitHub-only survey with Forgejo selected too; their counts are then GitHub's share alone.
+        forges = os.environ.get("TAUCETI_WORKER_FORGES", "github")
+        if forges != "forgejo" and not (focused_round or getattr(opts, "prs", ())) and backlog_current(sv):
+            publish_backlog({"github": sv}, complete=forges == "github")
     if sv.dependency_wait:
         # Unknown global coverage is neither an empty backlog nor a failed round. Nothing is selected,
         # so no PR repair allowance is charged; the loop resumes at the circuit's retry time.

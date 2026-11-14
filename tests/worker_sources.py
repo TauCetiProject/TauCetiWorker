@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Cross-forge routing, independent outages, identities and budgets."""
 
+import contextlib
 import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -16,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_tools.ci_candidate import RepositoryIdentity
 from tauceti_tools.forge import GITHUB, Forge, RepositoryRef
 
-from tauceti_worker.config import Config, Die
+from tauceti_worker.config import Config, Die, NoProgress
 from tauceti_worker.multi_source import collect, deduplicate
 from tauceti_worker.review_state import Meta
 from tauceti_worker.source_cli import api_command
@@ -69,7 +71,7 @@ class Sources(unittest.TestCase):
             "updatedAt": "2026-11-11T00:00:00Z",
         }
 
-    def native_survey(self, rows, *, blocking=False, metadata=None):
+    def native_survey(self, rows, *, blocking=False, metadata=None, roadmap="any", skip=()):
         self.source.open_prs.return_value = rows
         rs = Mock()
         if metadata is None and blocking:
@@ -84,8 +86,8 @@ class Sources(unittest.TestCase):
             self.source,
             rs,
             Counters(cfg),
-            roadmap="any",
-            skip=[],
+            roadmap=roadmap,
+            skip=list(skip),
             deep=True,
             stages=["review", "fix", "rebase"],
             numbers=(),
@@ -651,6 +653,91 @@ ci="one/project"
             self.assertEqual(run_round(None, options), 0)
         self.assertEqual(execute.call_args.args[1].only, ["roadmap"])
         self.assertIsNone(observations[1][2].dependency_wait)
+
+    def published_backlog(self, observations, *, prs=(), previous=None):
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import RoundOpts
+
+        for _, worker, _ in observations:
+            if worker is not None:
+                worker.cfg = self.cfg
+        options = RoundOpts(only=["review"], agent="auto", work_model="auto", sandbox_host=True, dry_run=True, prs=prs)
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.work_units.runtime_snapshot", return_value=previous or {}),
+            patch("tauceti_worker.work_units.report_runtime") as runtime,
+            patch("tauceti_worker.multi_source.activate", return_value=contextlib.nullcontext()),
+            patch("tauceti_worker.work_units.run_round", return_value=0),
+            contextlib.suppress(NoProgress),
+        ):
+            run_round(None, options)
+        return [call.kwargs for call in runtime.call_args_list if "backlog_by_forge" in call.kwargs]
+
+    def backlog_sources(self):
+        labelled = [self.row(1, head="a" * 40), self.row(2, head="b" * 40), self.row(3, author=4, head="c" * 40)]
+        names = (["awaiting-author", "ci-failed"], ["ci-failed", "roadmap/Algebra"], ["awaiting-author"])
+        for row, labels in zip(labelled, names, strict=True):
+            row["labels"] = [{"name": label} for label in labels]
+        native = self.native_survey(labelled)
+        github = Survey(worker_id="test", me_login="worker")
+        mine = PRInfo(9, "d" * 40, "work", "one", "project", False, "MERGEABLE", "worker", True, False)
+        github._mine_open_prs, github.n_mine_open = [replace(mine, labels=("awaiting-author",))], 1
+        github.open_prs = list(github._mine_open_prs)
+        return [
+            ("github", SimpleNamespace(gh=SimpleNamespace(repo="one/project")), github),
+            ("forgejo", SimpleNamespace(gh=self.source), native),
+        ]
+
+    def test_forgejo_backlog_counts_native_labels(self):
+        _, forgejo = self.backlog_sources()
+        (published,) = self.published_backlog([forgejo])
+        counts = {"mine_open": 1, "mine_awaiting_author": 1, "mine_needs_fix": 2}
+        self.assertEqual(published["backlog_by_forge"], {"forgejo": {**counts, "survey_at": published["survey_at"]}})
+        self.assertEqual({key: published[key] for key in counts}, counts)
+
+    def test_mixed_backlog_sums_both_forges(self):
+        (published,) = self.published_backlog(self.backlog_sources())
+        self.assertEqual(
+            {key: published[key] for key in ("mine_open", "mine_awaiting_author", "mine_needs_fix")},
+            {"mine_open": 2, "mine_awaiting_author": 2, "mine_needs_fix": 3},
+        )
+        self.assertEqual(published["backlog_by_forge"]["github"]["mine_needs_fix"], 1)
+        self.assertEqual(published["backlog_by_forge"]["forgejo"]["mine_needs_fix"], 2)
+        # Named PRs and a focused round are narrower than the configured scope.
+        self.assertEqual(self.published_backlog(self.backlog_sources(), prs=(1,)), [])
+        focused = self.backlog_sources()
+        for _, _, value in focused:
+            value._round_scope = (False, True)
+        self.assertEqual(self.published_backlog(focused), [])
+
+    def test_native_backlog_labels_follow_the_roadmap_scope(self):
+        rows = [self.row(1, head="a" * 40), self.row(2, head="b" * 40), self.row(3, head="c" * 40)]
+        for row, labels in zip(
+            rows,
+            (["roadmap/Algebra"], ["roadmap/Topology", "awaiting-author"], ["roadmap/Topology", "ci-failed"]),
+            strict=True,
+        ):
+            row["labels"] = [{"name": label} for label in labels]
+        for roadmap, skip in (("Algebra", ()), ("auto", ("Topology",))):
+            counts = self.native_survey(rows, roadmap=roadmap, skip=skip).backlog_counts()
+            self.assertEqual((counts["mine_awaiting_author"], counts["mine_needs_fix"]), (0, 0), roadmap)
+
+    def test_unavailable_forge_keeps_totals_and_its_last_breakdown(self):
+        earlier = {"mine_open": 5, "mine_awaiting_author": 0, "mine_needs_fix": 0, "survey_at": 1.0}
+        github, forgejo = self.backlog_sources()
+        failed = Survey(worker_id="test", github_failed=True)
+        for observations, current, missing in (
+            ([("github", github[1], failed), forgejo], "forgejo", "github"),
+            ([github, ("forgejo", None, failed)], "github", "forgejo"),
+        ):
+            (published,) = self.published_backlog(observations, previous={"backlog_by_forge": {missing: earlier}})
+            self.assertNotIn("mine_open", published)
+            self.assertNotIn("survey_at", published)
+            self.assertEqual(published["backlog_by_forge"][missing], earlier)
+            self.assertIn(current, published["backlog_by_forge"])
+        anonymous = forgejo[2]
+        anonymous.source_actor = None
+        self.assertEqual(self.published_backlog([("forgejo", forgejo[1], anonymous)]), [])
 
     def test_multi_source_fleet_backpressure_falls_back_to_global_maintenance(self):
         from tauceti_worker.multi_source import run_round

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import shlex
 import shutil
@@ -528,6 +529,13 @@ worker3 — backing off
     probe_runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
     probe = root / "env-probe.txt"
     probe_spec = wm.WorkerSpec(id="envprobe", restart="never", env=(("LAKE_ARTIFACT_CACHE", "1"),))
+    # A backlog surveyed under an earlier configuration of this worker ID describes another account
+    # or scope; the new start must not publish it beside the new account.
+    backlog = {"mine_open": 42, "mine_awaiting_author": 7, "mine_needs_fix": 11, "survey_at": time.time()}
+    backlog["backlog_by_forge"] = {"github": dict(backlog)}
+    wm.status_path(probe_spec.id, probe_state).write_text(
+        json.dumps({"github_account": "previous", "spec_hash": "previous", **backlog})
+    )
     runner_env = worker_paths.self_env()
     # Write the value to a temporary file and rename it into place: `probe.exists()` must not become
     # true between creating the file and writing its contents, or this reads an empty string.
@@ -563,6 +571,9 @@ worker3 — backing off
         assert probe.exists(), "the runner never started its worker child"
         seen = probe.read_text()
         assert seen == "1", f"worker child saw LAKE_ARTIFACT_CACHE={seen!r}"
+        started = json.loads(wm.status_path(probe_spec.id, probe_state).read_text())
+        assert started["spec_hash"] == probe_spec.fingerprint(), started
+        assert all(started.get(key) is None for key in backlog), started
     finally:
         runner.terminate()
         try:

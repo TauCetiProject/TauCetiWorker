@@ -887,6 +887,11 @@ def cmd_managed_runner(args) -> int:
                 restart_count=restart_count,
                 exit_code=None,
                 stopped_at=None,
+                # The backlog belongs to the account and scope of the start that surveyed it, and a
+                # `conf` file can change that scope without changing the spec hash.
+                **dict.fromkeys(
+                    ("mine_open", "mine_awaiting_author", "mine_needs_fix", "survey_at", "backlog_by_forge")
+                ),
                 **isolation,
             )
             test_command = os.environ.get("TAUCETI_MANAGER_TEST_COMMAND")
