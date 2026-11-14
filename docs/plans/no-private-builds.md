@@ -138,30 +138,39 @@ Invariants 1 to 5 hold because no code path writes a copy. To keep it that way:
 
 ### Lifecycle of shared state
 
-Shared state is reclaimed by the existing collector. Referenced objects are never
-deleted, unreferenced ones age out, and each store has a budget.
+Deletion is the default. The only thing that keeps shared state alive is a live
+round using it right now, shown by a `flock` lease that the kernel releases when
+the process exits, so a reference can never leak. Checkout markers, idle
+checkouts, old branches and recovery records protect nothing.
 
-- **Artifact store.** Checkouts reach artifacts by hard link, so an artifact's
-  link count is its reference count. One with `st_nlink == 1` is used by no
-  checkout; finding it takes one `stat`, with no scan of checkouts. Unreferenced
-  artifacts are deleted after a few days, or least recently linked first when the
-  store exceeds its budget. Deleting a checkout or recovery tree drops its links,
-  which is what makes its artifacts collectable.
-- **Mathlib entries and source trees.** A round holds a shared lease on the key
-  lock while its view is in use, and each checkout records its key in a marker.
-  An entry is deleted only when no lease is held, no existing checkout's marker
-  names it, and it is unused for about seven days. The newest entry per toolchain
-  is kept. This extends the existing leases and ready markers in `shared_mathlib`.
+- **Mathlib entries and source trees: a fixed, small set.** Per toolchain, the
+  host keeps the version current TauCeti `main` pins plus the one before it.
+  Every other version is deleted as soon as no live round holds its lease, and
+  this happens straight after a new version is published, not on a later sweep.
+  A round that needs an evicted version (an old branch, say) republishes it,
+  which is slower, and is told to rebase onto current `main`; the republished
+  copy is then subject to the same limit.
+- **Checkouts hold no references between rounds.** At the end of every round the
+  checkout's `.lake` links into shared state are removed. Re-linking at the next
+  round start is cheap. So outside active rounds nothing references the artifact
+  store or a Mathlib entry.
+- **Artifact store: link count is exact.** With checkouts unlinked between
+  rounds, an artifact with `st_nlink == 1` is unused. The collector deletes
+  unused artifacts older than a day, and oldest first whenever the store exceeds
+  its budget.
 - **Shared git store.** `git worktree prune` and ordinary `git gc`. Checkouts are
-  worktrees, not `clone --shared`, so `gc` sees every checkout's references;
-  pruning a store that alternates clones depend on would corrupt them.
-- **Checkouts.** Small once builds are links. They are deleted as today, when a
-  worker is retired or idle for three days, which also releases their references.
-- **Budgets.** Each store has a cap. Over budget with everything still referenced,
-  the collector deletes nothing referenced. It raises an alarm instead, and the
-  existing disk headroom check defers new rounds rather than letting the disk fill.
+  worktrees, not `clone --shared`, so `gc` sees every checkout's references.
+- **Checkouts.** Small (source plus nothing between rounds), deleted when a
+  worker is retired or idle for three days.
+- **Excess is an error.** More Mathlib versions than allowed, or a store over its
+  budget, is reported as a regression in `workers status` and Fleet telemetry, not
+  only as a warning. If live rounds alone exceed the budget, new rounds wait for
+  space rather than letting the disk fill.
 - **Permissions.** Shared files and directories are read-only. Only the collector,
   holding the store's lock, restores directory write permission to remove an entry.
+- **Races.** Linking into a checkout and evicting both take the entry's lock: a
+  round links only under its shared lease, and eviction needs the exclusive lock,
+  so an artifact or entry cannot disappear under a round that holds it.
 
 ### Deletion that cannot stall
 
