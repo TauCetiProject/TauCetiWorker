@@ -15,6 +15,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import agents, config, paths, retention, work_recovery
 
 
+def _parent(pid):
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        try:
+            import psutil
+
+            return psutil.Process(pid).ppid()
+        except Exception:
+            return None
+
+
 class LegacyDataRoot(unittest.TestCase):
     def test_code_upgrade_reuses_data_and_cleanup_inventory(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -326,6 +338,18 @@ class LegacyDataRoot(unittest.TestCase):
         stack.enter_context(patch.object(retention, "_configured_texts", return_value=[]))
         stack.enter_context(patch.object(purge, "VERIFY_TMP", base / "tmp"))
         stack.enter_context(patch.object(purge, "stop_services", return_value=[]))
+        # Only this test's processes: real workers running on the host must not affect fixtures.
+        real = retention._processes
+        mine = {os.getpid()}
+
+        def fixture_processes():
+            observed = real()
+            if observed is None:
+                return None
+            children = {pid for *_rest, pid in observed if _parent(pid) in mine}
+            return [entry for entry in observed if entry[3] in mine | children]
+
+        stack.enter_context(patch.object(retention, "_processes", side_effect=fixture_processes))
         return stack
 
     def test_purge_removes_only_what_is_provably_ours(self):
@@ -479,6 +503,51 @@ class LegacyDataRoot(unittest.TestCase):
                 if os.access(environment, os.R_OK):
                     self.skipTest("running as a user that can read mode-0 files")
                 self.assertIsNone(retention._configured_texts())
+
+    def test_configuration_follows_home_specifiers_and_unit_config_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            home = base / "home"
+            units = home / ".config/systemd/user"
+            units.mkdir(parents=True)
+            (home / ".config/tauceti").mkdir(parents=True)
+            (home / ".config/tauceti/worker.env").write_text("TAUCETI_LEGACY_DATA_ROOT=/srv/root-d\n")
+            custom = base / "custom workers.toml"
+            custom.write_text('[workers.w.env]\nTAUCETI_LEGACY_DATA_ROOT = "/srv/root-e"\n')
+            (units / "tauceti-workers.service").write_text(
+                "[Service]\nEnvironmentFile=%h/.config/tauceti/worker.env\n"
+                f"ExecStart=/opt/tauceti workers --config '{custom}' manager\n"
+            )
+            with patch.object(paths, "login_home", return_value=home), patch.dict(os.environ):
+                for name in ("XDG_CONFIG_HOME", "TAUCETI_WORKERS_CONFIG"):
+                    os.environ.pop(name, None)
+                texts = retention._configured_texts()
+                self.assertTrue(any("/srv/root-d" in text for text in texts))
+                self.assertTrue(any("/srv/root-e" in text for text in texts))
+                (units / "drop.conf").write_text("[Service]\nEnvironmentFile=%E/tauceti.env\n")
+                self.assertIsNone(retention._configured_texts())  # an unresolvable specifier
+
+    def test_purge_ignores_its_own_lineage_but_not_other_workers(self):
+        from tauceti_worker import purge
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            home = base / "home"
+            package = base / "venv/site-packages/tauceti_worker"
+            data = self.stable_root(home)
+            self.retired_fixture(data)
+            with self.purging(base, home, package):
+                os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(data)  # inherited by this purge
+                self.assertIsNone(purge._busy([data], [data]))
+                manager = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)", "tauceti_worker", "workers", "manager"],
+                    env={k: v for k, v in os.environ.items() if k != "TAUCETI_LEGACY_DATA_ROOT"},
+                    cwd=base,
+                )
+                self.addCleanup(manager.wait)
+                self.addCleanup(manager.kill)
+                time.sleep(0.2)
+                self.assertIn("TauCetiWorker process", purge._busy([data], [data]))
 
     def test_drain_honours_an_expired_deadline_for_directories_only(self):
         with tempfile.TemporaryDirectory() as temporary:

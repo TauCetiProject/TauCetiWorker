@@ -103,12 +103,15 @@ def _older_generation_live(root: Path) -> bool:
     held = held_lock_files()
     if held is None:
         return True
+    # On overlayfs, stat() can report a layer's device while /proc/locks reports the overlay's,
+    # so an inode number alone also counts; a false match only keeps the old root selected.
+    inodes = {ino for _dev, ino in held}
     for lock in locks:
         try:
             info = lock.stat()
         except OSError:
             continue
-        if (info.st_dev, info.st_ino) in held:
+        if (info.st_dev, info.st_ino) in held or info.st_ino in inodes:
             return True
     return False
 

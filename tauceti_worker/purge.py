@@ -183,6 +183,24 @@ def stop_services():
     return failures
 
 
+def _lineage():
+    """This process and its ancestors."""
+    pids, pid = set(), os.getpid()
+    while pid > 1 and pid not in pids:
+        pids.add(pid)
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            try:
+                import psutil
+
+                pids.update(parent.pid for parent in psutil.Process(pid).parents())
+            except Exception:
+                pass
+            break
+    return pids
+
+
 def _busy(paths, roots):
     from .retention import _processes
     from .worker_manager import _live_manager_pointer, _manager_lock_held, default_workers_config
@@ -195,7 +213,13 @@ def _busy(paths, roots):
     processes = _processes()
     if processes is None:
         return "running processes cannot be inspected"
-    for found, selects, _commands in processes:
+    ours = _lineage()
+    for found, selects, commands, pid in processes:
+        if pid in ours:
+            continue  # this purge and whatever launched it (a shell, `uv run`), which inherit its selection
+        if any("tauceti_worker" in part or os.path.basename(part) == "tauceti" for part in commands):
+            # A manager with its own --config and directories holds nothing purge can find.
+            return f"a TauCetiWorker process is running (pid {pid})"
         if selects and any(_same(selects, root) or Path(selects) == Path(root) for root in roots):
             return f"a running process selects {selects}"
         for path in paths:

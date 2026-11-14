@@ -8,6 +8,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1108,7 +1109,7 @@ def _linux_process(process, uid):
         (
             "cmdline",
             lambda: commands.extend(
-                part.decode(errors="replace") for part in (process / "cmdline").read_bytes().split(b"\0")[:2] if part
+                part.decode(errors="replace") for part in (process / "cmdline").read_bytes().split(b"\0") if part
             ),
         ),
     )
@@ -1151,14 +1152,14 @@ def _linux_process(process, uid):
         if not (helper and not paths):
             raise PermissionError(f"cannot inspect {process}")
         return None
-    return paths, selects, commands
+    return paths, selects, commands, int(process.name)
 
 
 def _processes():
-    """This user's processes as (paths, selected root, commands), or None if any is unknown.
+    """This user's processes as (paths, selected root, commands, pid), or None if any is unknown.
 
-    Paths are working directories and open files; commands are the executable and first
-    arguments. A process that exits mid-scan, or a zombie, is skipped. One that refuses
+    Paths are working directories and open files; commands are the executable and the full
+    command line. A process that exits mid-scan, or a zombie, is skipped. One that refuses
     inspection makes the observation unavailable, unless it is a known session helper or
     operating-system agent that cannot use worker data."""
     uid = os.getuid()
@@ -1203,7 +1204,7 @@ def _mac_process(psutil, process, uid):
         paths.append(process.cwd())
 
     def command():
-        commands.extend([process.exe(), *process.cmdline()[:2]])
+        commands.extend([process.exe(), *process.cmdline()])
 
     def environment():
         nonlocal selects
@@ -1226,13 +1227,16 @@ def _mac_process(psutil, process, uid):
         if agent and not paths:
             return None
         raise PermissionError(f"cannot inspect process {process.pid}")
-    return paths, selects, [c for c in commands if c]
+    return paths, selects, [c for c in commands if c], process.pid
 
 
 def _configured_texts():
     """Text of everything that can select a data root without a process running right now:
     systemd user units and drop-ins with their EnvironmentFile=s, LaunchAgents, and the worker
-    configuration files. None if any of it exists but cannot be read."""
+    configuration files, including any `--config` a unit names. None if any of it exists but
+    cannot be read, or names a file through a systemd specifier other than %h or %%."""
+    import shlex
+
     from .paths import login_home
     from .worker_manager import default_workers_config
 
@@ -1248,6 +1252,13 @@ def _configured_texts():
         files.append(default_workers_config())
     if configured := os.environ.get("TAUCETI_WORKERS_CONFIG"):
         files.append(Path(configured).expanduser())
+
+    def referenced(value):
+        value = value.replace("%h", str(home)).replace("%%", "\0")
+        if "%" in value:
+            raise ValueError(value)  # a specifier we cannot resolve: unknown, never absent
+        return Path(value.replace("\0", "%")).expanduser()
+
     texts, seen = [], set()
     while files:
         path = files.pop()
@@ -1259,9 +1270,14 @@ def _configured_texts():
         except (OSError, UnicodeDecodeError):
             return None
         texts.append(text)
-        for line in text.splitlines():
-            if line.strip().startswith("EnvironmentFile="):
-                files.append(Path(line.split("=", 1)[1].strip().lstrip("-")))
+        try:
+            for line in text.splitlines():
+                if line.strip().startswith("EnvironmentFile="):
+                    files.append(referenced(line.split("=", 1)[1].strip().lstrip("-")))
+            for match in re.finditer(r"--config(?:=|\s+|</string>\s*<string>)(\"[^\"]+\"|'[^']+'|[^\s<]+)", text):
+                files.append(referenced(shlex.split(match[1])[0]))
+        except ValueError:
+            return None
     return texts
 
 
@@ -1284,7 +1300,7 @@ def _retirement_blocker(root, processes, mounts, configured):
         return "selected by a service or worker configuration"
     parts = [os.path.join(str(root), part) for part in RETIRED_PARTS]
     runtime = _venv(root) if root != HERE.resolve() else None
-    for paths, selects, commands in processes:
+    for paths, selects, commands, _pid in processes:
         if selects and (_same_file(selects, root) or Path(selects).resolve() == root):
             return "selected by a running process"
         if any(path == part or path.startswith(part + os.sep) for path in paths for part in parts):
@@ -1353,10 +1369,14 @@ def _drain(path, deadline=None):
             except FileNotFoundError:
                 pass
         for name in dirs:
+            if expired():
+                return False
             directory = os.path.join(base, name)
             if not os.path.islink(directory):
                 with contextlib.suppress(OSError):
                     os.rmdir(directory)
+    if expired():
+        return False
     try:
         os.rmdir(path)
     except FileNotFoundError:
