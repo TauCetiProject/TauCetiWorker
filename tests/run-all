@@ -142,6 +142,7 @@ RUN_STDLIB=(
   observability_failures.py
   open_pr_pages.py
   overlaps.py
+  own_branches.py
   pace_curve.py
   pr_targeting.py
   preflight_review_lake.py

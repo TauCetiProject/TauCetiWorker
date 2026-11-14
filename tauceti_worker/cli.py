@@ -61,6 +61,7 @@ from .config import (
     extra_roadmap_prompt,
     is_git_url,
     log,
+    own_branches,
     roadmap_only,
     sanitize_wid,
     security_audit_problem,
@@ -393,6 +394,18 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         default=None,
         help="opt OUT of avoiding roadmap targets other contributors have claimed on the "
         "intentions board (claim-respect is on by default). Sets $TAUCETI_RESPECT_CLAIMS=false",
+    )
+    p.add_argument(
+        "--own-branches",
+        dest="own_branches",
+        default=None,
+        metavar="REGEX",
+        help="maintain only pull requests whose head branch name the regular expression matches "
+        "anywhere (re.search): rebase, fix, fix-ci, bump and lint-repair take no other, and only "
+        "those of your own count toward --max-open-prs. For one login shared by several operators, "
+        "e.g. --own-branches='-(alpha|beta)$' for the workers `alpha` and `beta`, since roadmap "
+        "branches end in -<worker id>. Reviews are unaffected. Overrides $TAUCETI_OWN_BRANCHES for "
+        "this run",
     )
     p.add_argument(
         "--auto-refresh",
@@ -1406,6 +1419,12 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         os.environ["TAUCETI_ROADMAP_EXTRA_IDENTITIES"] = args.roadmap_extra_identities
     if getattr(args, "respect_claims", None) is False:
         os.environ["TAUCETI_RESPECT_CLAIMS"] = "false"
+    if getattr(args, "own_branches", None) is not None:
+        os.environ["TAUCETI_OWN_BRANCHES"] = args.own_branches
+    try:
+        own_branches()
+    except re.error as e:
+        raise Die(f"--own-branches / $TAUCETI_OWN_BRANCHES: not a regular expression ({e})") from None
     # --auto-refresh likewise, so a loop child renews on the same authority the driver was given.
     if getattr(args, "auto_refresh", None):
         os.environ["TAUCETI_AUTO_REFRESH"] = "1"

@@ -167,6 +167,7 @@ try:
         roadmap_skip=("Algebra",),
         roadmap_extra_identities=("Maintainer",),
         respect_claims=False,
+        own_branches="-(alpha|beta)$",
         extra_roadmap_prompt="Work on the material relevant to Higher Topos Theory",
         self_tested=True,
         source="https://example.invalid/source",
@@ -199,6 +200,14 @@ try:
     assert "--auto-refresh" not in wm.WorkerSpec(id="plain").work_argv()
     assert wm.WorkerSpec.from_dict({"id": "plain"}, 0).auto_refresh is False
     assert wm.WorkerSpec.from_dict({"id": "opted", "auto_refresh": True}, 0).as_dict()["auto_refresh"] is True
+    assert parsed.own_branches == "-(alpha|beta)$", "a pattern beginning with `-` survives argparse"
+    assert "own_branches" not in wm.WorkerSpec(id="plain").as_dict()
+    try:
+        wm.WorkerSpec.from_dict({"id": "scoped", "own_branches": "-(alpha"}, 0)
+    except wm.WorkersError as error:
+        assert "workers[0].own_branches: not a regular expression" in str(error)
+    else:
+        raise AssertionError("a malformed own_branches pattern must fail at the configuration boundary")
 
     # --- per-worker environment ---------------------------------------------------------------
     # It reaches the worker's process tree (so a build setting can be A/B'd on one worker), survives
@@ -321,6 +330,7 @@ try:
                         "roadmap_skip": ["Algebra"],
                         "roadmap_extra_identities": ["maintainer"],
                         "respect_claims": False,
+                        "own_branches": "-(alpha|beta)$",
                         "extra_roadmap_prompt": "Work on the material relevant to Higher Topos Theory",
                         "source": "https://example.invalid/source",
                         "author_model": "claude-opus-5",
@@ -372,6 +382,7 @@ worker3 — backing off
             also treat as self: maintainer
             claims: ignored
   guidance: Work on the material relevant to Higher Topos Theory
+  branches: only those matching -(alpha|beta)$
   source:   https://example.invalid/source
   author:   model claude-opus-5 · high effort
   options:  stream output

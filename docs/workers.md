@@ -232,6 +232,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `roadmap_extra_identities` | string list | `[]` | Extra GitHub logins whose claimed intentions count as this worker's own |
 | `extra_roadmap_prompt` | string | unset | Operator guidance rendered into the roadmap prompt, steering target choice within the designated roadmap. Not blank, at most 4096 characters; other phases ignore it |
 | `respect_claims` | bool | `true` | Whether to avoid intentions others have claimed |
+| `own_branches` | string | unset | Regular expression searched in a pull request's head branch name. When set, `rebase`, `fix`, `fix-ci`, `bump`, and `lint-repair` take only matching pull requests, and `max_open_prs` counts only this account's matching ones; reviews are unaffected. For an account that several operators share: roadmap branches end in `-<worker id>`, so `-(alpha\|beta)$` selects the work of the workers `alpha` and `beta`. Rejected by `apply --check` if malformed |
 | `source` | string | unset | Supplementary repository directory or URL. Requires `roadmap` in `only` and a non-empty `roadmap_only` |
 | `author_model` | string | unset | Exact authoring model. Requires an `agent` other than `auto` |
 | `author_effort` | string | unset | Authoring reasoning effort for Codex, Claude, or Kiro. Requires an explicit `agent` |
@@ -431,7 +432,7 @@ entry with `enabled = true`.
 | `--stream` | `stream` |
 | `--isolate-home` | `isolate_home`; useful when the id is `default` |
 
-`add` cannot set `roadmap_extra_identities`, `respect_claims`, or `restart`, and
+`add` cannot set `roadmap_extra_identities`, `respect_claims`, `own_branches`, or `restart`, and
 always writes `enabled = true`. Use `workers edit` for those.
 
 ## Actions

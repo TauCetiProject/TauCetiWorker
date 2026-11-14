@@ -59,6 +59,7 @@ _WORKER_KEYS = {
     "roadmap_skip",
     "roadmap_extra_identities",
     "respect_claims",
+    "own_branches",
     "extra_roadmap_prompt",
     "self_tested",
     "source",
@@ -235,6 +236,16 @@ def _extra_roadmap_prompt(value, where: str) -> str | None:
         raise WorkersError(f"{where}: {e}") from None
 
 
+def _own_branches(value, where: str) -> str | None:
+    pattern = _string(value, where, optional=True)
+    if pattern is not None:
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            raise WorkersError(f"{where}: not a regular expression ({e})") from None
+    return pattern
+
+
 def _pace(value, where: str) -> str | None:
     """A pacing curve, checked here at the CONFIGURATION boundary. Without this a typo passes `workers
     apply --check`, and the manager discovers it only by launching a worker that rejects its own --pace
@@ -316,6 +327,7 @@ class WorkerSpec:
     roadmap_skip: tuple[str, ...] = ()
     roadmap_extra_identities: tuple[str, ...] = ()
     respect_claims: bool = True
+    own_branches: str | None = None
     extra_roadmap_prompt: str | None = None
     self_tested: bool = False
     source: str | None = None
@@ -387,6 +399,7 @@ class WorkerSpec:
             ),
             self_tested=_boolean(raw.get("self_tested", False), f"workers[{index}].self_tested"),
             respect_claims=_boolean(raw.get("respect_claims", True), f"workers[{index}].respect_claims"),
+            own_branches=_own_branches(raw.get("own_branches"), f"workers[{index}].own_branches"),
             extra_roadmap_prompt=_extra_roadmap_prompt(
                 raw.get("extra_roadmap_prompt"), f"workers[{index}].extra_roadmap_prompt"
             ),
@@ -461,6 +474,7 @@ class WorkerSpec:
             "conf",
             "github_state_url",
             "github_state_token_file",
+            "own_branches",
             "extra_roadmap_prompt",
             "source",
             "author_model",
@@ -531,6 +545,9 @@ class WorkerSpec:
         if self.extra_roadmap_prompt is not None:
             # One argument: free text may begin with `-`, which argparse would otherwise read as a flag.
             argv.append(f"--extra-roadmap-prompt={self.extra_roadmap_prompt}")
+        if self.own_branches is not None:
+            # One argument, for the same reason: a pattern such as `-alpha$` begins with `-`.
+            argv.append(f"--own-branches={self.own_branches}")
         if self.stream:
             argv.append("--stream")
         if self.isolate_home:
@@ -1606,6 +1623,9 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
             guidance += " (unused: the roadmap phase is not enabled)"
         lines.extend(_status_field("guidance", [guidance], width))
 
+    if spec.get("own_branches"):
+        lines.extend(_status_field("branches", [f"only those matching {spec['own_branches']}"], width))
+
     if spec.get("source"):
         lines.extend(_status_field("source", [str(spec["source"])], width))
 
@@ -1765,6 +1785,7 @@ def add_dashboard_worker(
     roadmap_skip: str | None,
     github_account: str | None = None,
     extra_roadmap_prompt: str | None = None,
+    own_branches: str | None = None,
 ) -> WorkerSpec:
     with _config_lock(config):
         try:
@@ -1782,6 +1803,7 @@ def add_dashboard_worker(
             roadmap_only=roadmap_only,
             roadmap_skip=tuple(part.strip() for part in (roadmap_skip or "").split(",") if part.strip()),
             extra_roadmap_prompt=extra_roadmap_prompt,
+            own_branches=own_branches,
         )
         _write_worker_specs(config, [*specs, spec])
     ensure_manager(config)

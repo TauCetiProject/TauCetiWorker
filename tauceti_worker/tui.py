@@ -206,6 +206,8 @@ def launch_cmd(
         cmd += ["--roadmap-skip", roadmap_skip]
     if extra_roadmap_prompt is not None:
         cmd.append(f"--extra-roadmap-prompt={extra_roadmap_prompt}")  # one argument: the text may start with `-`
+    if (branches := os.environ.get("TAUCETI_OWN_BRANCHES")) is not None:
+        cmd.append(f"--own-branches={branches}")
     return cmd
 
 
@@ -858,6 +860,7 @@ def _dashboard_app(cfg, loader=None):
                         roadmap_skip=skip,
                         github_account=os.environ.get("TAUCETI_GITHUB_ACCOUNT"),
                         extra_roadmap_prompt=guidance,
+                        own_branches=os.environ.get("TAUCETI_OWN_BRANCHES"),
                     )
                     self.notify(
                         f"saved {spec.id} in {self.workers_config}\nmanager will keep it running",
