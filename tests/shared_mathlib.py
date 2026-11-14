@@ -1649,6 +1649,86 @@ class VersionCapTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "main"], check=True)
         self.assertEqual(s.allowed_revisions(repo), {"bbb2", "bbb"})
 
+    def repo_with_main(self, main_pin):
+        repo = self.root / "checkout"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        for args in (["user.name", "t"], ["user.email", "t@example.com"], ["commit.gpgsign", "false"]):
+            subprocess.run(["git", "-C", str(repo), "config", *args], check=True)
+        (repo / "lean-toolchain").write_text("old-toolchain\n")
+        self.manifest(repo, "old" * 13 + "o")
+        subprocess.run(["git", "-C", str(repo), "switch", "-q", "-c", "branch"], check=True)
+        subprocess.run(["git", "-C", str(repo), "switch", "-q", "main"], check=True)
+        (repo / "lean-toolchain").write_text("main-toolchain\n")
+        (repo / "lakefile.toml").write_text('name = "main"\n')
+        self.manifest(repo, main_pin)
+        origin = self.root / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(origin)], check=True)
+        subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "main"], check=True)
+        subprocess.run(["git", "-C", str(repo), "switch", "-q", "branch"], check=True)
+        return repo
+
+    def test_rebase_round_prepares_mains_mathlib_and_restores_the_branch(self):
+        main_pin = "c" * 40
+        repo = self.repo_with_main(main_pin)
+        branch_manifest = (repo / "lake-manifest.json").read_bytes()
+        self.addCleanup(s.set_round_purpose, repo)
+        # Without a rebase purpose nothing changes.
+        with s.rebase_target(repo, {}) as restore:
+            self.assertEqual((repo / "lake-manifest.json").read_bytes(), branch_manifest)
+            restore()
+        s.set_round_purpose(repo, rebase=True)
+        with s.rebase_target(repo, {}) as restore:
+            self.assertEqual(s._manifest_pin((repo / "lake-manifest.json").read_text()), main_pin)
+            self.assertEqual((repo / "lean-toolchain").read_text(), "main-toolchain\n")
+            self.assertTrue((repo / "lakefile.toml").is_file())
+            restore()  # the agent starts on its own branch's files
+            self.assertEqual((repo / "lake-manifest.json").read_bytes(), branch_manifest)
+            self.assertEqual((repo / "lean-toolchain").read_text(), "old-toolchain\n")
+            self.assertFalse((repo / "lakefile.toml").exists())
+        status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True)
+        self.assertEqual(status.stdout, "")
+        # A failure while preparing restores the branch too.
+        with self.assertRaises(RuntimeError):
+            with s.rebase_target(repo, {}):
+                raise RuntimeError("preparation failed")
+        self.assertEqual((repo / "lake-manifest.json").read_bytes(), branch_manifest)
+        # Another directory (a verification job) is never affected by this round's purpose.
+        other = self.root / "other"
+        other.mkdir()
+        (other / "lake-manifest.json").write_bytes(branch_manifest)
+        with s.rebase_target(other, {}):
+            self.assertEqual((other / "lake-manifest.json").read_bytes(), branch_manifest)
+        s.set_round_purpose(repo)
+        self.assertEqual(s._purpose(repo), {})
+
+    def test_repair_round_moves_to_mains_mathlib_only_when_its_pin_is_refused(self):
+        main_pin = "c" * 40
+        repo = self.repo_with_main(main_pin)
+        self.addCleanup(s.set_round_purpose, None)
+        s.set_round_purpose(repo, repair=True)
+        # The branch is on main's previous pin, which is still allowed: it keeps its Mathlib.
+        allowed_branch = (repo / "lake-manifest.json").read_bytes()
+        with s.rebase_target(repo, {"TAUCETI_SHARED_MATHLIB_ROOT": str(self.root / "pool")}):
+            self.assertEqual((repo / "lake-manifest.json").read_bytes(), allowed_branch)
+        # A pin main never had is refused, so the round prepares main's Mathlib instead.
+        self.manifest(repo, "f" * 40)
+        with s.rebase_target(repo, {"TAUCETI_SHARED_MATHLIB_ROOT": str(self.root / "pool")}) as restore:
+            self.assertEqual(s._manifest_pin((repo / "lake-manifest.json").read_text()), main_pin)
+            restore()
+            self.assertEqual(s._manifest_pin((repo / "lake-manifest.json").read_text()), "f" * 40)
+
+    def test_bump_pins_are_allowed_for_a_week(self):
+        pool = self.root / "pool"
+        self.assertEqual(s.bump_pins(pool), set())
+        (pool / "bump-pins").mkdir(parents=True)
+        (pool / "bump-pins" / ("d" * 40)).touch()
+        old = pool / "bump-pins" / ("e" * 40)
+        old.touch()
+        os.utime(old, (time.time() - s.BUMP_PIN_SECONDS - 1,) * 2)
+        self.assertEqual(s.bump_pins(pool), {"d" * 40})
+
     def entry(self, pool, key, revision, age):
         entry = pool / "entries" / key
         (entry / "build").mkdir(parents=True)
