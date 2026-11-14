@@ -351,6 +351,49 @@ class ActivityTests(unittest.TestCase):
         request.assert_called_once()
         self.assertTrue(a.cached()["available"])
 
+    def test_without_collector_refresh_runs_a_collector_slice(self):
+        from tauceti_worker import retention, work_recovery
+
+        with (
+            patch.object(work_recovery, "housekeep", return_value=dict(cleanup_pending=True)) as cleanup,
+            patch.object(retention, "request_cleanup") as request,
+        ):
+            a.prepare(now=self.now)
+        cleanup.assert_called_once_with(cleanup=True, **retention.COLLECTOR_SLICE)
+        request.assert_not_called()
+        self.assertTrue(a.cached()["available"])
+
+    def discarded_tree(self, files):
+        from tauceti_worker import work_recovery
+
+        tree = work_recovery._state_root() / "worker1" / "recovery-cleanup" / "discarded" / "abandoned-fixture"
+        (tree / ".lake" / "build").mkdir(parents=True)
+        for index in range(files):
+            (tree / ".lake" / "build" / f"{index}.olean").write_bytes(b"x" * 65536)
+        return tree
+
+    def test_without_collector_refresh_drains_discarded_trees_past_the_tick_budget(self):
+        # 6000 entries and ~390 MiB exceed one default tick (4096 entries, 256 MiB).
+        tree = self.discarded_tree(6000)
+        a.prepare(now=self.now)
+        self.assertFalse(tree.exists())
+        self.assertTrue(a.cached()["available"])
+
+    def test_without_collector_refresh_honors_the_recovery_rollback_switch(self):
+        tree = self.discarded_tree(3)
+        with patch.dict(os.environ, {"TAUCETI_WORK_RECOVERY": "off"}):
+            a.prepare(now=self.now)
+        self.assertTrue(tree.exists())
+
+    def test_installed_collector_leaves_discarded_trees_to_the_collector(self):
+        from tauceti_worker import retention
+
+        tree = self.discarded_tree(3)
+        a.atomic_json(a.root() / "cleanup-service.json", dict(installed=True))
+        with patch.object(retention, "request_cleanup"):
+            a.prepare(now=self.now)
+        self.assertTrue(tree.exists())
+
     def test_current_work_counts_distinct_workers_not_unfinished_receipts(self):
         a.prepare(now=self.now)
         with contextlib.closing(a._connect()) as db, db:

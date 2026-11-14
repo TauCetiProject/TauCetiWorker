@@ -646,6 +646,11 @@ tauceti workers service status
 This installs a systemd user service on Linux or a LaunchAgent on macOS. Omit
 the first command when no detached manager is running.
 
+Rounds clean up after themselves in every mode, starting a low-priority
+collector at most hourly. To remove all TauCetiWorker data before uninstalling,
+run `tauceti workers manager-stop`, then `tauceti purge --yes`, then
+`uv tool uninstall tauceti`; see [cleanup and uninstalling](docs/workers.md#cleanup-and-uninstalling).
+
 Every worker needs a unique id, which `add` assigns for you. The id namespaces
 that worker's state, checkout, review store, and logs, and isolates its mutable
 agent credentials where the platform allows, so credential refreshes don't race.

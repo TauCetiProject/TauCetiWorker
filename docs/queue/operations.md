@@ -150,7 +150,7 @@ its source (`default`, `file`, `env:VARIABLE`, `hostname`) and the problems that
 | `review_app_id` | `3947238` | identifies legacy automatic publications so policy mode can ignore late output; pre-cutover eligibility mode trusts this App |
 | `admission_source` | `policy` | primary policy intake; `eligibility` is only the explicit pre-cutover configuration |
 | `admission_lean_root` | `TauCeti` | trusted project root, converted to the allowed Lean path prefix |
-| `admission_rubrics` | the ten standard rubrics | required review rubrics, comma separated; trusted service configuration |
+| `admission_rubrics` | the ten standard rubrics | required review rubrics, comma separated; trusted service configuration. A rubric the pinned review policy is phasing in (`PHASED_RUBRICS`) is also required, of PRs above its cutoff for their source repository: GitHub and Forgejo number their PRs separately, so each has its own |
 | `admission_extra_files` | empty | extra allowed repository paths, comma separated, beyond the configured root file, Lake pins and bibliography |
 | `[settings] insertion_age_window` | `16` | initial runtime control (plan, "Runtime controls") |
 | `[settings] repair_concurrency` | `1` | initial runtime control |

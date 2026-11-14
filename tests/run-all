@@ -24,6 +24,9 @@ cd "$(dirname "$0")/.." || exit 1
 # Unit fixtures use their mocked transport, never the public production mirror.
 # Service tests explicitly override this; default-resolution tests remove it.
 export TAUCETI_GITHUB_STATE_URL=""
+# Rounds start a background cleanup collector on hosts without the systemd timer. Fixtures and
+# lifecycle scripts must never launch one against the checkout's or the host's real data.
+export TAUCETI_BACKGROUND_CLEANUP=off
 
 FAIL_FAST=0
 JOBS=1
