@@ -1036,6 +1036,8 @@ def run_agent_host(
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
     _LAST_AGENT_FAILURE = None
+    from . import round_storage
+
     with host_build_cache_context(cwd, env, logdir) as prefix:
         if not cache_note:
             env.pop("TAUCETI_PR_CACHE_MISS", None)  # the convention belongs to the appendix left out
@@ -1050,13 +1052,19 @@ def run_agent_host(
             session_path=session_path,
             quota_cfg=quota_cfg,
             stdin_text=stdin_text,
+            # Before launch, after preparation: the baseline is the build state the round inherits.
+            storage=round_storage.start(cwd, env, quota_cfg),
         )
         if env.get("TAUCETI_SHARED_MATHLIB_KEY"):
             from .shared_mathlib import record_result
 
             record_result(env, rc)
         # H2: the agent's process group has been reaped, so no Lake can be writing the checkout.
-        relink_build_outputs(cwd, env, phase="round-end")
+        # Exit 70 is the guardian's "child lifetime cleanup incomplete": no quiescent boundary.
+        if rc == 70:
+            log("canonical store (round-end): agent cleanup incomplete; relinking left for the next round")
+        else:
+            relink_build_outputs(cwd, env, phase="round-end")
     if rc == 75:
         from .claude_api import blocked_reason
 
@@ -1200,6 +1208,7 @@ def run_agent_proc(
     session_path=None,
     quota_cfg=None,
     stdin_text: str | None = None,
+    storage=None,
 ) -> int:
     """Run an agent subprocess through its readable transcript renderer.
 
@@ -1208,6 +1217,8 @@ def run_agent_proc(
     failures aren't silent. ``stdin_text`` (a prompt too long for argv, see ``host_agent_launch``) is
     written to the process's stdin from a separate thread, so a prompt larger than the pipe buffer
     cannot deadlock against the transcript being read here, and stdin is closed once it is delivered.
+    ``storage`` (a ``round_storage.RoundStorage``) watches the round's private bytes while the agent
+    runs; past its cap it kills the group and, once the group is reaped, raises ``RoundAbandoned``.
     """
     global _LAST_AGENT_FAILURE, _LAST_AGENT_RUN
     _LAST_AGENT_FAILURE = None
@@ -1295,6 +1306,8 @@ def run_agent_proc(
                 thread = threading.Thread(target=cancel_on_lease_loss, daemon=True)
                 thread.start()
                 monitor = thread
+            if storage is not None:
+                storage.watch(proc, finished)
             for line in proc.stdout:
                 if session_path:
                     try:
@@ -1331,6 +1344,10 @@ def run_agent_proc(
                     monitor.join(3)
                 if feeder is not None:
                     feeder.join(3)
+                if storage is not None:
+                    # The group is reaped. Also on an exceptional exit, so a killed round is
+                    # still abandoned; past the cap this raises RoundAbandoned.
+                    storage.conclude(proc.returncode)
         from .overlap_support import atomic
 
         telemetry = {
@@ -1508,11 +1525,30 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
     from .build_resources import defaults
 
     defaults(env)
-    if not TAUCETI_CACHE_SERVICE:
-        yield
-        return
     if not any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
         yield
+        return
+    if not TAUCETI_CACHE_SERVICE:
+        # No TauCeti artifact service to warm, but Mathlib must still come from the shared
+        # build: without the view the agent's first `lake build` compiles it privately.
+        from . import shared_mathlib
+
+        try:
+            with (
+                shared_mathlib.rebase_target(cwd, env) as restore,
+                shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix,
+            ):
+                if prefix:
+                    env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
+                try:
+                    restore()
+                    yield prefix
+                finally:
+                    env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)
+        except shared_mathlib.Unavailable as error:
+            raise BuildCacheUnavailable(
+                f"shared Mathlib preparation unavailable: {error}", log_file=logdir / "shared-mathlib-prepare.log"
+            ) from error
         return
     with tempfile.TemporaryDirectory(prefix="tauceti-lake-config-") as tmp:
         config = Path(tmp) / "lake.toml"
@@ -1527,10 +1563,14 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
         env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
         from . import expanded_cache, shared_mathlib
 
+        materialize_dependencies(cwd, env, logdir)
         report = {}
         mathlib_started = expanded_cache.clock()
         try:
-            with shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix:
+            with (
+                shared_mathlib.rebase_target(cwd, env) as restore,
+                shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix,
+            ):
                 expanded_cache.record_phase(report, "mathlib_view", mathlib_started)
                 if prefix:
                     env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
@@ -1549,6 +1589,7 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
                         raise
                     if prefix:
                         shared_mathlib.preparation_status(env)
+                    restore()  # a rebase round's agent starts on its own branch's files
                     relink_build_outputs(cwd, env, phase="prepare", prefix=prefix)  # H1
                     yield prefix
                 finally:
@@ -1557,6 +1598,48 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
             raise BuildCacheUnavailable(
                 f"shared Mathlib preparation unavailable: {error}", log_file=logdir / "shared-mathlib-prepare.log"
             ) from error
+
+
+def materialize_dependencies(cwd: Path, env: dict, logdir: Path, timeout: float = 900) -> None:
+    """Clone missing dependency sources before shared Mathlib is chosen.
+
+    `shared_mathlib.view()` can only share a Mathlib build once `.lake/packages/mathlib` exists. In
+    a fresh checkout it did not, so the round chose a private build and `lake cache get` then unpacked
+    a full private copy of Mathlib's outputs. Lake's ordinary workspace load clones the manifest's
+    package sources (tens of seconds, no builds, no cache downloads), which is what `cache get`
+    would have done anyway, only later. Failure is not fatal here: the view reports why it cannot
+    share."""
+    from . import processes
+
+    try:
+        manifest = json.loads((cwd / "lake-manifest.json").read_text())
+    except (OSError, ValueError):
+        return
+    packages = manifest.get("packages") if isinstance(manifest, dict) else None
+    if not isinstance(packages, list):
+        return  # malformed manifests reach the ordinary workspace-error and repair paths
+    names = {p["name"] for p in packages if isinstance(p, dict) and isinstance(p.get("name"), str)}
+    if "mathlib" not in names or (cwd / ".lake/packages/mathlib").is_dir():
+        return
+    logdir.mkdir(parents=True, exist_ok=True)
+    quiet = {**env, "GIT_TERMINAL_PROMPT": "0"}  # Git can prompt through /dev/tty despite null stdin
+    with open(logdir / "materialize-dependencies.log", "ab") as output:
+        try:
+            # The owned process group takes Lake's Git and SSH children with it on timeout.
+            result = processes.run(
+                ["lake", "env", "true"],
+                cwd=cwd,
+                env=quiet,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            log(f"dependencies: could not materialize Mathlib before sharing ({error})")
+            return
+    if result.returncode:
+        log(f"dependencies: lake env exited {result.returncode}; shared Mathlib may be skipped")
 
 
 def relink_build_outputs(cwd: Path, env: dict, *, phase: str, prefix=()) -> dict | None:
@@ -1664,8 +1747,11 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
     failures stop before an agent starts. Lake verifies and atomically installs artifacts, so retries
     retain successful downloads. All fetches together have one twenty-minute deadline.
     """
+    from . import shared_mathlib
+
     prefix = json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]"))
     max_revs = lake_cache_max_revs(env)
+    has_mathlib = shared_mathlib._names_mathlib(cwd)
     logdir.mkdir(parents=True, exist_ok=True)
     logf = logdir / f"build-cache-{time.strftime('%Y%m%d-%H%M%S')}.log"
     deadline = time.monotonic() + HOST_CACHE_TIMEOUT
@@ -1745,7 +1831,17 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
             unavailable(f"{label} build cache download failed")
         raise AssertionError("unreachable")
 
-    if fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
+    shared_view = bool(json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]")))
+    if not has_mathlib:
+        log("host build caches: the workspace does not depend on Mathlib; no Mathlib cache to fetch")
+    elif shared_view:
+        # The shared entry holds Mathlib's own build. Running `lake exe cache get` inside the view
+        # re-extracts every archive, and each new file lands in this checkout's private overlay
+        # upper: a full private copy of Mathlib's outputs under a "shared" round. Mathlib's
+        # dependencies (Batteries, Aesop, ...) are not in the entry yet; Lake restores or builds
+        # them in the checkout until the entry carries the whole dependency tree.
+        log("host build caches: Mathlib comes from the shared build; not fetching it again")
+    elif fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
         return
     # Mathlib itself knows which compressed archives the selected dependency tree
     # needs. Prune stale private links daily so pool GC can actually release them;

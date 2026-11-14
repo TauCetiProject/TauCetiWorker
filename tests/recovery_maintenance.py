@@ -318,6 +318,38 @@ class RecoveryMaintenance(unittest.TestCase):
         allow_cleanup(self.cfg, self.co)
         return tree
 
+    def test_retained_tree_sheds_build_state_at_once(self):
+        self.dirty()
+        for name in (".lake/packages/mathlib/.lake/build", "lake-packages/x"):
+            (self.co / name).mkdir(parents=True)
+            (self.co / name / "A.olean").write_bytes(b"olean")
+        tree = Path(wr.retain(self.cfg, self.co, "fixture").details["retained"])
+        self.assertFalse((tree / ".lake").exists())
+        self.assertFalse((tree / "lake-packages").exists())
+        self.assertTrue((tree / ".git").is_dir())  # source stays protected
+        discarded = sorted(p.name for p in (self.cfg.state / "recovery-cleanup/discarded").iterdir())
+        self.assertEqual(len(discarded), 2)
+        self.assertTrue(all(name.startswith("build-" + tree.name) for name in discarded), discarded)
+
+    def test_retained_tree_keeps_tracked_or_mounted_build_directories(self):
+        from tauceti_worker import retention
+
+        (self.co / ".lake").mkdir()
+        (self.co / ".lake/tracked.txt").write_text("source")
+        git(self.co, "add", "-f", ".lake/tracked.txt")
+        git(self.co, "commit", "-qm", "tracked build-named file")
+        (self.co / "lake-packages/x").mkdir(parents=True)
+        retained = self.co.parent / wr.RETAINED_DIR
+
+        def mounted():  # a mount moves with the tree, so it is seen under the retained path
+            return [Path(os.path.realpath(p)) / "lake-packages/x" for p in retained.glob("*") if p.is_dir()]
+
+        with patch.object(retention, "mount_points", side_effect=mounted):
+            tree = Path(wr.retain(self.cfg, self.co, "fixture").details["retained"])
+        self.assertEqual((tree / ".lake/tracked.txt").read_text(), "source")
+        self.assertTrue((tree / "lake-packages/x").is_dir())
+        self.assertFalse((self.cfg.state / "recovery-cleanup/discarded").exists())
+
     def test_slow_safety_finishes_and_reclaims_cache_before_yielding(self):
         self.dirty()
         cache = self.co / ".lake" / "generated"

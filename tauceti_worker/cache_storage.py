@@ -64,7 +64,11 @@ def roots(configs, pool):
 
 
 def inventory(paths, *, protected=(), owners=None, details=None):
-    """Allocated bytes, deduplicated by inode across both pool and private hard links."""
+    """Allocated bytes, deduplicated by inode across both pool and private hard links.
+
+    `named_bytes` counts every name, as `du --count-links` would: hard-linked files count once per
+    link there, so it overstates what the disk holds. `managed_bytes` counts each inode once, and
+    `unique_inodes` is how many inodes that is."""
     seen = {}
     owners = owners or {}
     for root in paths:
@@ -93,8 +97,13 @@ def inventory(paths, *, protected=(), owners=None, details=None):
         details.update(seen)
     result = {}
     for (device, _), (size, count, links, busy, _) in seen.items():
-        row = result.setdefault(device, dict(managed_bytes=0, externally_linked_bytes=0, protected_bytes=0))
+        row = result.setdefault(
+            device,
+            dict(managed_bytes=0, externally_linked_bytes=0, protected_bytes=0, named_bytes=0, unique_inodes=0),
+        )
         row["managed_bytes"] += size
+        row["named_bytes"] += size * count
+        row["unique_inodes"] += 1
         if busy:
             row["protected_bytes"] += size
         if links > count:
@@ -174,6 +183,10 @@ def collect(configs, *, dry=False, now=None, opened=...):
         for name in (".lake", "lake-packages", "build")
     }
     owners = {path: cfg.wid for cfg in configs for path, _ in cache_roots(cfg)}
+    from .canonical_store import Guard
+
+    # Pool copies are deleted only while no process holds them open (open fds add no link).
+    guard = Guard(opened=opened or ())
     details = {}
     before = inventory(paths, protected=protected, owners=owners, details=details)
     private_candidates = {}
@@ -257,9 +270,16 @@ def collect(configs, *, dry=False, now=None, opened=...):
                 if not disposable_stage and any(details.get((i.st_dev, i.st_ino), [0, 0, 0, False])[3] for i in infos):
                     note(report, "protected", str(entry))
                     continue
-                # Pool-only bundles have an entry and canonical link. Private links
-                # cannot be reclaimed by deleting a pool name, so don't churn warm entries.
-                reclaimable = sum(i.st_blocks * 512 for i in infos if i.st_nlink <= (2 if entry.is_dir() else 1))
+                # Pool-only bundles are linked only by pool names: the entry alias, the legacy
+                # artifacts/ copy and the canonical object. Private links cannot be reclaimed by
+                # deleting a pool name, so don't churn warm entries.
+                from .canonical_store import pool_aliases, release
+
+                reclaimable = sum(
+                    i.st_blocks * 512
+                    for p, i in zip(payload, infos, strict=True)
+                    if i.st_nlink <= (1 if entry.is_dir() else 0) + max(1, len(pool_aliases(pool, p.name, i)))
+                )
                 if not disposable_stage and urgent and now - stamp((clock, entry, key)) < LIFETIME and not reclaimable:
                     continue
                 unique = sum(p.stat().st_blocks * 512 for p in names if p.is_file() and p.stat().st_nlink == 1)
@@ -268,14 +288,14 @@ def collect(configs, *, dry=False, now=None, opened=...):
                     remaining -= unique
                     removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + unique
                     for old in names:
-                        shared = pool / ("archives" if old.name.endswith(".ltar") else "artifacts") / old.name
-                        # A relink adopting this pool copy holds the object lock while it hashes and links.
-                        with contextlib.suppress(BlockingIOError), legacy_lock(pool, old.name):
-                            if shared.is_file() and not shared.is_symlink() and shared.stat().st_nlink == 1:
-                                size = shared.stat().st_blocks * 512
-                                remaining -= size
-                                removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + size
-                                shared.unlink()
+                        if old.name == "entry.json" or not expanded_cache.ARTIFACT.fullmatch(old.name):
+                            continue
+                        # The legacy copy and canonical object go together once only they link it;
+                        # a relink holding the object lock while it adopts the copy wins.
+                        with contextlib.suppress(BlockingIOError):
+                            size = release(pool, old.name, guard)
+                            remaining -= size
+                            removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + size
         except BlockingIOError:
             note(report, "protected", str(entry))
         except FileNotFoundError:
@@ -298,8 +318,12 @@ def collect(configs, *, dry=False, now=None, opened=...):
                 if path.is_symlink() or info.st_nlink != 1:
                     continue
                 with legacy_lock(pool, path.name, dry=dry):
-                    if path.lstat().st_nlink != 1:
+                    info = path.lstat()
+                    if info.st_nlink != 1:
                         continue  # Adopted as a canonical object since the first look.
+                    if not guard.idle((path, info), recent_ok=True):
+                        note(report, "protected", str(path))
+                        continue
                     remove(path, pool, report, dry=dry, check_users=False, mounts=[])
                 if not dry and not path.exists():
                     removed_bytes[info.st_dev] = removed_bytes.get(info.st_dev, 0) + info.st_blocks * 512
@@ -311,7 +335,9 @@ def collect(configs, *, dry=False, now=None, opened=...):
         from .canonical_store import sweep
 
         # Canonical objects (and their adopted pool alias) go once no checkout or store links them.
-        freed = sweep(pool, report, dry=dry, urgent=urgent, now=now, lifetime=LIFETIME, remove=remove)
+        freed = sweep(
+            pool, report, dry=dry, urgent=urgent, now=now, lifetime=LIFETIME, remove=remove, opened=opened or ()
+        )
         if not dry:
             removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + freed
     # One inventory per sweep; update the estimate for known last-link removals.
@@ -332,6 +358,8 @@ def collect(configs, *, dry=False, now=None, opened=...):
             )
         )
     report["managed_bytes"] = sum(row["managed_bytes"] for row in report["filesystems"])
+    report["named_bytes"] = sum(row.get("named_bytes", 0) for row in report["filesystems"])
+    report["unique_inodes"] = sum(row.get("unique_inodes", 0) for row in report["filesystems"])
     report["protected_bytes"] = sum(row.get("protected_bytes", 0) for row in report["filesystems"])
     report["reclaimed_bytes"] = sum(row["reclaimed_bytes"] for row in report["filesystems"])
     pressured = [

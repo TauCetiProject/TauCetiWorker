@@ -82,6 +82,10 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         "CACHE_TEST_CALLS": str(calls),
         "TAUCETI_SHARED_ARTIFACTS": "0",
         "TAUCETI_SHARED_MATHLIB_ROOT": str(root / "shared-pool"),
+        # Pinned so no run can reach the host's real build pool, home or activity store.
+        "TAUCETI_BUILD_CACHE_ROOT": str(root / "base-pool"),
+        "TAUCETI_ACTIVITY_DIR": str(root / "activity"),
+        "HOME": str(root / "home"),
         "LAKE_CACHE_DIR": str(root / "private-lake-store"),
         "LAKE_ARTIFACT_CACHE": "1",
         "LAKE_RESTORE_ARTIFACTS": "1",
@@ -99,6 +103,10 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         return 0
 
     def run(mode="", cwd=co, **extra):
+        from tauceti_worker import expanded_cache
+
+        assert expanded_cache.root({**env, **extra}) != expanded_cache.root({"HOME": os.environ["HOME"]})
+        assert str(expanded_cache.root({**env, **extra})).startswith(str(root)), "unisolated test"
         calls.unlink(missing_ok=True)
         launched.clear()
         output = io.StringIO()
@@ -328,6 +336,26 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
             rc, records, text = run(**overrides)
         assert rc == 0 and len(launched) == 1, (failure, text)
         assert ("skipped" if failure == "busy" else "deferred") in text, text
+
+    # Exit 70 is the guardian's "cleanup incomplete": not a quiescent boundary, so no H2.
+    phases.clear()
+    launched.clear()
+    real_launch = launch
+
+    def incomplete(*args, **kwargs):
+        real_launch(*args, **kwargs)
+        return 70
+
+    with (
+        patch("tauceti_worker.expanded_cache.preparation", private_preparation),
+        patch.object(canonical_store, "boundary", observed),
+        patch.object(agents, "run_agent_proc", incomplete),
+    ):
+        overrides_env = {**env, "CACHE_TEST_MODE": "", **overrides}
+        with patch.dict(os.environ, overrides_env, clear=True), contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = agents.run_agent_host(co, "prompt", "claude", root / "logs")
+    assert rc == 70 and phases == [("prepare", 0)], (rc, phases)
+    assert "cleanup incomplete" in err.getvalue()
     shutil.rmtree(co / ".lake")
     print("[OK] busy or failing round-end relinking keeps the agent's successful result")
 
@@ -357,3 +385,252 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert signals == [(12345, agents.signal.SIGTERM), (12345, agents.signal.SIGKILL)]
     assert waits[1]["timeout"] == 35  # Let the guardian reap detached descendants before the fallback.
     print("[OK] round interruption cleans up the complete downloader process group")
+
+# Without a TauCeti cache service the round must still enter the shared Mathlib view.
+with tempfile.TemporaryDirectory() as tmp:
+    co = Path(tmp)
+    (co / "lakefile.toml").write_text('name = "fixture"\n')
+    entered = []
+
+    @contextlib.contextmanager
+    def fake_view(cwd, env, logdir, fetch):
+        entered.append(cwd)
+        yield ["bwrap", "fixture"]
+
+    from tauceti_worker import shared_mathlib
+
+    with (
+        patch.object(agents, "TAUCETI_CACHE_SERVICE", ""),
+        patch.object(shared_mathlib, "view", fake_view),
+    ):
+        env = {}
+        with agents.host_build_cache_context(co, env, co / "logs") as prefix:
+            assert prefix == ["bwrap", "fixture"], prefix
+            assert json.loads(env["TAUCETI_SHARED_MATHLIB_VIEW"]) == prefix
+        assert "TAUCETI_SHARED_MATHLIB_VIEW" not in env
+
+        @contextlib.contextmanager
+        def refused(cwd, env, logdir, fetch):
+            raise shared_mathlib.Unavailable("fixture refusal")
+            yield
+
+        with patch.object(shared_mathlib, "view", refused):
+            try:
+                with agents.host_build_cache_context(co, {}, co / "logs"):
+                    raise AssertionError("round started without shared Mathlib")
+            except agents.BuildCacheUnavailable as error:
+                assert "fixture refusal" in str(error)
+    assert entered == [co]
+print("[OK] a round without the TauCeti cache service still requires the shared Mathlib view")
+
+# A workspace without Mathlib never runs Mathlib's cache executable.
+with tempfile.TemporaryDirectory() as tmp:
+    co = Path(tmp)
+    (co / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "batteries", "url": "x"}]}))
+    commands = []
+
+    def record(command, *args, **kwargs):
+        commands.append(list(command))
+        return 0
+
+    with patch.object(agents, "_cache_fetch", record):
+        try:
+            agents.warm_host_build_caches(co, {}, co / "logs")
+        except Exception:
+            pass  # later TauCeti steps need a real workspace; only the Mathlib step matters here
+    assert not any(c[-4:] == ["lake", "exe", "cache", "get"] for c in commands), commands
+print("[OK] a workspace without Mathlib skips Mathlib's cache fetch")
+
+# A rebase round chooses the shared view on main's pins, and the agent starts on its branch's files.
+with tempfile.TemporaryDirectory() as tmp:
+    from tauceti_worker import shared_mathlib
+
+    co = Path(tmp)
+    git = ["git", "-C", str(co)]
+    agents.subprocess.run([*git, "init", "-q", "-b", "main"], check=True)
+    for key, value in (("user.name", "t"), ("user.email", "t@example.com"), ("commit.gpgsign", "false")):
+        agents.subprocess.run([*git, "config", key, value], check=True)
+
+    def commit(pin):
+        (co / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib", "rev": pin}]}))
+        (co / "lakefile.toml").write_text('name = "fixture"\n')
+        agents.subprocess.run([*git, "add", "-A"], check=True)
+        agents.subprocess.run([*git, "commit", "-qm", pin], check=True)
+
+    commit("o" * 40)
+    agents.subprocess.run([*git, "switch", "-q", "-c", "branch"], check=True)
+    agents.subprocess.run([*git, "switch", "-q", "main"], check=True)
+    commit("m" * 40)
+    agents.subprocess.run([*git, "update-ref", "refs/remotes/origin/main", "main"], check=True)
+    agents.subprocess.run([*git, "switch", "-q", "branch"], check=True)
+    seen = []
+
+    @contextlib.contextmanager
+    def pin_view(cwd, env, logdir, fetch):
+        seen.append(shared_mathlib._manifest_pin((cwd / "lake-manifest.json").read_text()))
+        yield ["bwrap", "fixture"]
+
+    shared_mathlib.set_round_purpose(co, rebase=True)
+    try:
+        with patch.object(agents, "TAUCETI_CACHE_SERVICE", ""), patch.object(shared_mathlib, "view", pin_view):
+            with agents.host_build_cache_context(co, {}, co / "logs") as prefix:
+                assert prefix == ["bwrap", "fixture"]
+                assert shared_mathlib._manifest_pin((co / "lake-manifest.json").read_text()) == "o" * 40
+    finally:
+        shared_mathlib.set_round_purpose(co)
+    assert seen == ["m" * 40], seen
+    assert agents.subprocess.run([*git, "status", "--porcelain"], capture_output=True, text=True).stdout == ""
+print("[OK] a rebase round prepares main's Mathlib and hands the agent its own branch")
+# A fresh checkout has no .lake/packages/mathlib yet. Shared Mathlib can only be chosen once it exists, so
+# the dependency sources are materialized first; otherwise every fresh round unpacked a private Mathlib build.
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    (root / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib"}, {"name": "batteries"}]}))
+    calls = []
+
+    def lake_env(argv, **kwargs):
+        calls.append((argv, kwargs["cwd"]))
+        (kwargs["cwd"] / ".lake/packages/mathlib").mkdir(parents=True)
+        return SimpleNamespace(returncode=0)
+
+    from tauceti_worker import processes
+
+    with patch.object(processes, "run", side_effect=lake_env):
+        agents.materialize_dependencies(root, {}, root / "logs")
+        agents.materialize_dependencies(root, {}, root / "logs")  # already present: nothing to do
+    assert calls == [(["lake", "env", "true"], root)], calls
+    for malformed in ({"packages": None}, {"packages": [{"name": ["mathlib"]}]}, [], "x"):
+        odd = root / f"odd-{len(list(root.glob('odd-*')))}"
+        odd.mkdir()
+        (odd / "lake-manifest.json").write_text(json.dumps(malformed))
+        with patch.object(processes, "run") as run:
+            agents.materialize_dependencies(odd, {}, root / "logs")  # never raises; repair handles it
+        run.assert_not_called()
+    other = root / "no-mathlib"
+    other.mkdir()
+    (other / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "batteries"}]}))
+    with patch.object(processes, "run") as run:
+        agents.materialize_dependencies(other, {}, root / "logs")
+        agents.materialize_dependencies(root / "missing", {}, root / "logs")
+    run.assert_not_called()
+    failing = root / "failing"
+    failing.mkdir()
+    (failing / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib"}]}))
+    with (
+        patch.object(processes, "run", return_value=SimpleNamespace(returncode=1)),
+        contextlib.redirect_stderr(io.StringIO()),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        agents.materialize_dependencies(failing, {}, root / "logs")  # logged, never raised
+print("[OK] fresh checkouts materialize Mathlib's source before shared Mathlib is chosen")
+
+# Inside a shared Mathlib view the published entry is already a complete `lake exe cache get` result.
+# Fetching again re-extracted every archive into the checkout's private overlay upper.
+for shared in (True, False):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        commands = []
+
+        def recording(command, cwd, env, output, timeout, commands=commands):
+            commands.append(command)
+            return 0
+
+        env = {
+            "HOME": str(root / "home"),
+            "MATHLIB_CACHE_DIR": str(root / "mathlib"),
+            "TAUCETI_BUILD_CACHE_ROOT": str(root / "builds"),
+        }
+        if shared:
+            env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(["bwrap-prefix"])
+        with (
+            patch.object(agents, "_cache_fetch", side_effect=recording),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            try:
+                agents.warm_host_build_caches(root, env, root / "logs")
+            except Exception:
+                pass  # later TauCeti steps need a real workspace; only the Mathlib decision matters here
+        mathlib = [c for c in commands if c[-4:] == ["lake", "exe", "cache", "get"]]
+        assert bool(mathlib) is not shared, (shared, commands)
+print("[OK] a shared Mathlib view never re-fetches Mathlib's cache into the checkout")
+
+# The agent-facing `lake` wrapper refuses Mathlib cache fetches inside a shared view.
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    real = root / "bin"
+    real.mkdir()
+    (real / "lake").write_text('#!/bin/sh\necho real-lake "$@"\n')
+    (real / "lake").chmod(0o755)
+    wrapper = Path(__file__).resolve().parents[1] / "scripts"
+    co = root / "co"
+    marker = co / ".lake/packages/mathlib/.lake/tauceti-shared-mathlib.json"
+    marker.parent.mkdir(parents=True)
+    pool = root / "pool"
+    (pool / "entries/k").mkdir(parents=True)
+    (pool / "entries/k/ready.json").write_text(json.dumps({"spec": {"mathlib": "abc"}}))
+    marker.write_text(json.dumps({"pool": str(pool), "key": "k"}))
+
+    def lake(*args, view=True, pin="abc", path=None, cwd=None):
+        (co / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib", "rev": pin}]}))
+        path = path or f"{wrapper}:{real}"
+        env = {**os.environ, "PATH": f"{path}:{os.environ['PATH']}", "TAUCETI_VERIFY_PYTHON": sys.executable}
+        env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)
+        if view:
+            env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(["bwrap"])
+        return agents.subprocess.run(
+            [str(wrapper / "lake"), *args], cwd=cwd or co, env=env, capture_output=True, text=True, timeout=30
+        )
+
+    same = lake("exe", "cache", "get")
+    assert same.returncode == 0 and "real-lake" not in same.stdout, same
+    moved = lake("exe", "cache", "get", pin="def")
+    assert moved.returncode == 1 and "pin no longer matches" in moved.stderr, moved
+    assert lake("exe", "cache", "get", view=False).stdout.strip() == "real-lake exe cache get"
+    assert lake("build", "Foo").stdout.strip() == "real-lake build Foo"
+    # On a pin the shared build does not carry (a rebase round before it integrates main),
+    # every lake command is refused rather than compiling that Mathlib privately.
+    behind = lake("build", "Foo", pin="def")
+    assert behind.returncode == 1 and "Integrate origin/main" in behind.stderr and not behind.stdout, behind
+    assert lake("--version", pin="def").stdout.strip() == "real-lake --version"
+    assert lake("build", "Foo", pin="def", view=False).stdout.strip() == "real-lake build Foo"
+    assert lake("exe", "cache", "clean").stdout.strip() == "real-lake exe cache clean"
+    # Every spelling of the extraction is refused: options, aliases, qualified names, forced unpack.
+    for args in (
+        ("-q", "exe", "cache", "get"),
+        ("exe", "-q", "cache", "get"),
+        ("exec", "cache", "get"),
+        ("exe", "mathlib/cache", "get"),
+        ("+leanprover/lean4:v4.36.0", "exe", "cache", "get!"),
+        ("exe", "cache", "unpack!"),
+        ("exe", "cache", "--repo=x/y", "get"),
+        ("--log-level", "info", "exe", "cache", "unpack"),
+        ("--config", "cfg.json", "exe", "cache", "get"),
+        ("--from-export", "x.json", "exe", "cache", "get"),
+        ("--unknown-value", "v", "exe", "cache", "get"),
+        ("", "exe", "cache", "get"),
+        ("-d=.", "exe", "cache", "get"),
+        ("-d .", "exe", "cache", "get"),
+    ):
+        refused = lake(*args)
+        assert refused.returncode == 0 and "real-lake" not in refused.stdout, (args, refused)
+    # `-d DIR` selects the workspace whose pin is checked, wherever lake is run from.
+    remote = lake("-d", str(co), "exe", "cache", "get", cwd=root)
+    assert remote.returncode == 0 and "real-lake" not in remote.stdout, remote
+    elsewhere = lake("exe", "cache", "get", cwd=root)
+    assert elsewhere.returncode == 1, elsewhere
+    # `lake env CMD` puts the wrapper back in front of the toolchain's own lake.
+    (real / "lake").write_text(
+        '#!/bin/sh\ncase " $* " in *" env "*) while [ "$1" != env ]; do shift; done; shift;'
+        ' PATH="' + str(real) + ':$PATH" exec "$@";; esac\necho real-lake "$@"\n'
+    )
+    nested = lake("env", "lake", "exe", "cache", "get")
+    assert nested.returncode == 0 and "real-lake" not in nested.stdout, nested
+    assert lake("env", "lake", "build").stdout.strip() == "real-lake build"
+    assert lake("--config", "c.json", "env", "lake", "build").stdout.strip() == "real-lake build"
+    assert lake("env", "", "lake", "build").stdout.strip() == "real-lake build"
+    # Aliases of the wrapper's own directory never make it exec itself.
+    for alias in (f"{wrapper}/", f"{wrapper}/.", "scripts"):
+        looped = lake("build", path=f"{alias}:{real}", view=False, cwd=wrapper.parent if alias == "scripts" else None)
+        assert looped.stdout.strip() == "real-lake build", (alias, looped)
+print("[OK] the agent's lake wrapper refuses Mathlib cache fetches inside a shared view")

@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import shared_mathlib as s
-from tauceti_worker.runtime_status import atomic_json
+from tauceti_worker.runtime_status import atomic_json, read_json
 
 
 def git(repo, *args):
@@ -124,7 +124,7 @@ class SharedTests(unittest.TestCase):
         status.mkdir(parents=True)
         s.atomic_json(status / "live.json", dict(supervisor=s.process_identity(os.getpid()), containment_mode="legacy"))
         (status / "broken.json").write_text("{broken")
-        self.assertEqual(s.mode(self.env), "auto")
+        self.assertEqual(s.mode(self.env), "required")
         self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
         with patch.object(s, "capability", side_effect=AssertionError("private round probed namespaces")):
             with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
@@ -370,16 +370,18 @@ class SharedTests(unittest.TestCase):
                     if damage == "symlink":
                         artifact.symlink_to(self.library / "Init.olean")
                 before = self.downloads
-                with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                    self.assertEqual(prefix, [])
-                self.assertIn("integrity", " ".join(s.summary(self.env)["reasons"]))
+                self.assert_blocked("integrity")
                 self.assertEqual(self.downloads, before)
                 self.assertTrue(artifact.parent.exists())
-                self.assertEqual(s.mode(self.env), "off")
+                # The latched stop keeps later rounds blocked instead of private.
+                with self.assertRaisesRegex(s.Unavailable, "safety stop"):
+                    s.mode(self.env)
                 self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
                 with self.assertRaisesRegex(s.Unavailable, "integrity"):
                     with s.view(self.cwd, self.env, self.root / "logs", self.extract):
                         self.fail("required sharing started with a corrupt snapshot")
+                self.assertEqual(self.downloads, before)
+                self.assertTrue(artifact.parent.exists())
                 self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "auto"
 
     def test_local_clone_preserves_fork_cache_identity_and_disables_push(self):
@@ -526,12 +528,10 @@ class SharedTests(unittest.TestCase):
                 future.result(timeout=5)
         self.assertEqual(self.downloads, 1)
 
-    def test_insufficient_disk_fails_private_or_required_without_publication(self):
+    def test_insufficient_disk_blocks_auto_or_required_without_publication(self):
         self.require_overlay()
         with patch.object(s.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100, 95, 5)):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
-            self.assertIn("10%", " ".join(s.summary(self.env)["reasons"]))
+            self.assert_blocked("10%")
             self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
             with self.assertRaisesRegex(s.Unavailable, "10%"):
                 with s.view(self.cwd, self.env, self.root / "logs", self.extract):
@@ -593,20 +593,43 @@ class SharedTests(unittest.TestCase):
 
     def test_missing_corrupt_policy_and_independent_safety_latch(self):
         self.env.pop("TAUCETI_SHARED_MATHLIB_BUILDS")
-        self.assertEqual(s.mode(self.env), "off")
+        default = "required"
+        self.assertEqual(s.mode(self.env), "off")  # a host with no policy never opted in
         self.pool.mkdir()
         (self.pool / "policy.json").write_text("{")
-        self.assertEqual(s.mode(self.env), "off")
+        with self.assertRaisesRegex(s.Unavailable, "invalid shared Mathlib policy"):
+            s.mode(self.env)  # an unreadable opt-in blocks instead of building privately
+        self.assertEqual(s.mode({**self.env, "TAUCETI_SHARED_MATHLIB_BUILDS": "off"}), "off")
+        for build in ("auto", "required"):
+            with self.assertRaisesRegex(s.Unavailable, "invalid shared Mathlib policy"):
+                s.mode({**self.env, "TAUCETI_SHARED_MATHLIB_BUILDS": build})
+        # An expired policy without an expiry mode falls back to the default, not to `off`.
+        atomic_json(self.pool / "policy.json", dict(mode="auto", expires_at=1))
+        self.assertEqual(s.mode(self.env), default)
         atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"]))
-        self.assertEqual(s.mode(self.env), "auto")
+        self.assertEqual(s.mode(self.env), "required")
+        # A worker left off the allowlist is blocked, not given a private build.
+        with self.assertRaisesRegex(s.Unavailable, "not allowlisted"):
+            s.mode({**self.env, "TAUCETI_WORKER_ID": "not-allowlisted"})
+        s.stop_sharing(self.pool, "fixture integrity failure")
+        # The stop latches through the policy file alone (no environment override), and the
+        # policy's mode is left as it was rather than rewritten to `off`.
+        self.assertEqual(read_json(self.pool / "policy.json")["mode"], "auto")
+        with self.assertRaisesRegex(s.Unavailable, "safety stop"):
+            s.mode(self.env)
+        (self.pool / "safety-stop.json").unlink()
+        with self.assertRaisesRegex(s.Unavailable, "safety stop"):
+            s.mode(self.env)  # the policy's own record still latches it
+        atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"]))
         s.stop_sharing(self.pool, "fixture integrity failure")
         atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"]))
-        self.assertEqual(s.mode(self.env), "off")
+        with self.assertRaisesRegex(s.Unavailable, "safety stop"):
+            s.mode(self.env)
         self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
         with self.assertRaisesRegex(s.Unavailable, "safety stop"):
             s.mode(self.env)
-        self.env["TAUCETI_WORKER_ID"] = "not-allowlisted"
-        self.assertEqual(s.mode(self.env), "off")
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
+        self.assertEqual(s.mode(self.env), "off")  # only an explicit operator `off` builds privately
 
     def test_reused_upper_whiteout_recovers_without_global_safety_stop(self):
         self.require_overlay()
@@ -666,14 +689,44 @@ class SharedTests(unittest.TestCase):
             self.assertEqual((self.pool / "safety-stop.json").exists(), "safety-stop.json" not in failed_names)
             self.assertEqual((self.pool / "policy.json").exists(), "policy.json" not in failed_names)
 
-    def test_busy_exclusive_lease_has_bounded_auto_fallback(self):
+    def test_busy_exclusive_lease_blocks_auto_after_bounded_wait(self):
         self.require_overlay()
         key, _ = s.signature(self.cwd, self.env)
         with s.key_lock(self.pool, key), patch.object(s, "LOCK_WAIT_SECONDS", 0.02):
+            with self.assertRaisesRegex(s.Unavailable, "lock wait timed out"):
+                with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+                    self.fail("round started without shared Mathlib")
+            self.assertEqual(s.summary(self.env)["blocked"], 1)
+            self.assertNotIn("TAUCETI_SHARED_MATHLIB_LEASE_FD", self.env)
+        # The view released its own lease attempt: the key is free once the holder exits.
+        with s.key_lock(self.pool, key, nonblocking=True):
+            pass
+        self.assertEqual(self.downloads, 0)
+
+    def test_project_without_mathlib_dependency_has_nothing_to_share(self):
+        (self.cwd / "lake-manifest.json").write_text(json.dumps(dict(packages=[dict(name="batteries")])))
+        with patch.object(s, "capability", side_effect=AssertionError("probed sharing without Mathlib")):
             with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
                 self.assertEqual(prefix, [])
-        self.assertIn("lock wait timed out", " ".join(s.summary(self.env)["reasons"]))
+        summary = s.summary(self.env)
+        self.assertEqual(summary["blocked"], 0)
         self.assertEqual(self.downloads, 0)
+        rows = [read_json(p) for p in (self.pool / "status").glob("*.json")]
+        self.assertEqual([r["mode"] for r in rows], ["not-applicable"])
+
+    def test_doubtful_manifests_count_as_mathlib(self):
+        for manifest in (
+            dict(name="mathlib", packages=[dict(name="batteries")]),  # Mathlib is the root package
+            dict(packages=[dict(name="mathlib-fork")]),
+            dict(packages=[dict(name="ml", url="https://github.com/someone/mathlib4")]),
+            dict(packages=[None, {}]),
+            dict(packages=[{}]),
+            dict(packages="nope"),
+        ):
+            (self.cwd / "lake-manifest.json").write_text(json.dumps(manifest))
+            self.assertTrue(s._names_mathlib(self.cwd), manifest)
+        (self.cwd / "lake-manifest.json").write_text(json.dumps(dict(packages=[dict(name="batteries", url="x")])))
+        self.assertFalse(s._names_mathlib(self.cwd))
 
     def test_required_missing_mathlib_reports_blocked_before_inference(self):
         shutil.rmtree(self.mathlib)
@@ -693,9 +746,9 @@ class SharedTests(unittest.TestCase):
             return real_run(command, *args, **kwargs)
 
         with patch.object(s.subprocess, "run", side_effect=run):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
+            self.assert_blocked("fixture mount failure")
         self.assertFalse((self.pool / "safety-stop.json").exists())
+        self.assertEqual(s.mode(self.env), "required")
 
     def test_verified_lower_missing_in_fresh_mount_latches_stop(self):
         self.require_overlay()
@@ -707,9 +760,10 @@ class SharedTests(unittest.TestCase):
             return real_run(command, *args, **kwargs)
 
         with patch.object(s.subprocess, "run", side_effect=run):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
-        self.assertEqual(s.mode(self.env), "off")
+            self.assert_blocked("verified lower missing")
+        self.assertTrue((self.pool / "safety-stop.json").exists())
+        with self.assertRaisesRegex(s.Unavailable, "safety stop"):
+            s.mode(self.env)
 
     def test_lease_failure_latches_stop_without_deleting_lower(self):
         self.require_overlay()
@@ -726,9 +780,9 @@ class SharedTests(unittest.TestCase):
             real_lock(stream, flags, timeout=timeout)
 
         with patch.object(s, "lease_lock", side_effect=lock):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
-        self.assertEqual(s.mode(self.env), "off")
+            self.assert_blocked("fixture lease failure")
+        with self.assertRaisesRegex(s.Unavailable, "safety stop"):
+            s.mode(self.env)
         self.assertEqual(len(list((self.pool / "entries").iterdir())), 1)
 
     def test_cleanup_failure_preserves_invocation_result_and_records_failure(self):
@@ -752,11 +806,9 @@ class SharedTests(unittest.TestCase):
         self.assertEqual(receipts[-1]["cleanup_error"], "fixture cleanup failure")
         self.assertFalse(receipts[-1]["cleanup_success"])
 
-    def test_auto_fallback_and_required_fail_before_body(self):
+    def test_auto_and_required_fail_before_body(self):
         with patch.object(s, "capability", return_value=(False, "enable user namespaces")):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
-            self.assertIn("enable user namespaces", s.summary(self.env)["reasons"])
+            self.assert_blocked("enable user namespaces")
             self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
             with (
                 self.assertRaisesRegex(s.Unavailable, "enable user namespaces"),
@@ -766,22 +818,54 @@ class SharedTests(unittest.TestCase):
         self.assertEqual(self.downloads, 0)
 
     def test_body_failure_is_not_caught_or_retried(self):
-        with patch.object(s, "capability", return_value=(False, "unsupported")):
-            with (
-                self.assertRaisesRegex(ValueError, "body"),
-                s.view(self.cwd, self.env, self.root / "logs", self.extract),
-            ):
-                raise ValueError("body")
+        # A failing body propagates once, from the private path and (where the host
+        # can mount overlays) from the shared path, which wraps a preparation handler.
+        for build in ["off"] + (["auto"] if s.capability(self.root)[0] else []):
+            with self.subTest(build=build):
+                self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = build
+                runs = 0
+                with (
+                    self.assertRaisesRegex(ValueError, "body"),
+                    s.view(self.cwd, self.env, self.root / "logs", self.extract),
+                ):
+                    runs += 1
+                    raise ValueError("body")
+                self.assertEqual(runs, 1)
 
     def test_canary_allowlist_and_private_rollback(self):
         self.env["TAUCETI_SHARED_MATHLIB_WORKERS"] = "one,two"
-        self.assertEqual(s.mode(self.env), "off")
+        with self.assertRaisesRegex(s.Unavailable, "not allowlisted"):
+            s.mode(self.env)  # required sharing: an unlisted worker is blocked, never private
         self.env["TAUCETI_WORKER_ID"] = "one"
-        self.assertEqual(s.mode(self.env), "auto")
+        self.assertEqual(s.mode(self.env), "required")
         self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
         with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
             self.assertEqual(prefix, [])
         self.assertEqual(self.downloads, 0)
+
+    def build_files(self):
+        upper = self.mathlib / ".lake/build"
+        return sorted(str(p.relative_to(upper)) for p in upper.rglob("*")) if upper.is_dir() else []
+
+    def assert_blocked(self, pattern):
+        """The round stops before its body: no private build, status blocked, leases released."""
+        before = self.build_files()
+        with self.assertRaisesRegex(s.Unavailable, pattern):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+                self.fail("round started without shared Mathlib")
+        self.assertEqual(self.build_files(), before)
+        summary = s.summary(self.env)
+        self.assertEqual(summary["blocked"], 1)
+        self.assertRegex(" ".join(summary["reasons_by_mode"]["blocked"]), pattern)
+        self.assertNotIn("private", summary["reasons_by_mode"])
+        for name in ("LEASE_FD", "KEY", "PREP_STARTED"):
+            self.assertNotIn("TAUCETI_SHARED_MATHLIB_" + name, self.env)
+        try:
+            key = s.signature(self.cwd, self.env)[0]
+        except s.Unavailable:
+            return  # no identity, so the view never took a lease
+        with s.key_lock(self.pool, key, nonblocking=True):
+            pass
 
     def require_overlay(self):
         ok, reason = s.capability(self.root)
@@ -901,9 +985,12 @@ class SharedTests(unittest.TestCase):
         self.env.pop("TAUCETI_SHARED_MATHLIB_BUILDS")
         self.pool.mkdir()
         atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"], expires_at=time.time() + 60))
-        self.assertEqual(s.mode(self.env), "auto")
+        self.assertEqual(s.mode(self.env), "required")
         atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"], expires_at=time.time() - 1))
-        self.assertEqual(s.mode(self.env), "off")
+        self.assertEqual(s.mode(self.env), "required")
+        expiry = dict(mode="auto", workers=["fixture"], expires_at=time.time() - 1, expiry_mode="off")
+        atomic_json(self.pool / "policy.json", expiry)
+        self.assertEqual(s.mode(self.env), "off")  # an explicit operator expiry mode still applies
 
     def test_real_overlay_remounts_after_key_change(self):
         self.require_overlay()
@@ -1047,8 +1134,8 @@ class SharedTests(unittest.TestCase):
         (private / "build-before-sharing").mkdir()
         (self.mathlib / ".lake").symlink_to(private)
         with patch.object(s, "capability", side_effect=AssertionError("symlinked layout probed sharing")):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
+            self.assert_blocked("Mathlib dependency is not available for sharing")
+        self.assertTrue((self.mathlib / ".lake").is_symlink())
         self.assertTrue((private / "build-before-sharing").is_dir())
 
     def test_marked_upper_generation_cleanup_failure_still_allows_private_warming(self):
@@ -1149,12 +1236,11 @@ class SharedTests(unittest.TestCase):
             return original(lower, candidate_upper, work, target, pool, **kwargs)
 
         with patch.object(s, "overlay_command", side_effect=fail_view):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
-                self.assertEqual((upper / "private.olean").read_text(), "previous complete private build")
-                self.assertFalse(upper.with_name("build-before-sharing").exists())
-                self.assertFalse(upper.with_name("tauceti-shared-mathlib.json").exists())
-                self.assertFalse(upper.with_name("tauceti-overlay-work").exists())
+            self.assert_blocked("shared Mathlib view unavailable")
+        self.assertEqual((upper / "private.olean").read_text(), "previous complete private build")
+        self.assertFalse(upper.with_name("build-before-sharing").exists())
+        self.assertFalse(upper.with_name("tauceti-shared-mathlib.json").exists())
+        self.assertFalse(upper.with_name("tauceti-overlay-work").exists())
 
     def test_uncertain_legacy_work_is_parked_before_a_new_shared_view(self):
         self.require_overlay()
@@ -1269,15 +1355,10 @@ class SharedTests(unittest.TestCase):
         )
         self.assertTrue(upper.with_name("tauceti-shared-mathlib.json").exists())
 
-    def test_auto_fallback_releases_snapshot_lock_before_private_round(self):
+    def test_failed_publication_blocks_auto_and_releases_snapshot_lock(self):
         self.require_overlay()
-        key, _ = s.signature(self.cwd, self.env)
         with patch.object(s, "publish", side_effect=s.Unavailable("download interrupted")):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
-                with s.key_lock(self.pool, key, nonblocking=True):
-                    pass
-                self.assertNotIn("TAUCETI_SHARED_MATHLIB_LEASE_FD", self.env)
+            self.assert_blocked("download interrupted")
 
     @unittest.skipUnless(sys.platform == "linux", "Linux process identity")
     def test_killed_cache_parent_terminates_detached_downloader_group(self):
@@ -1497,6 +1578,242 @@ class SharedTests(unittest.TestCase):
                 p.stdin.close()
                 p.wait(timeout=5)
                 p.stdout.close()
+
+
+class VersionCapTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+
+    def manifest(self, repo, revision):
+        (repo / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib", "rev": revision}]}))
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", revision], check=True)
+
+    def test_allowed_revisions_are_current_and_previous_main_pins(self):
+        repo = self.root / "checkout"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        for args in (["user.name", "t"], ["user.email", "t@example.com"]):
+            subprocess.run(["git", "-C", str(repo), "config", *args], check=True)
+        self.assertIsNone(s.allowed_revisions(repo))  # no origin/main: unknown
+        for revision in ("aaa", "bbb", "bbb2"):
+            self.manifest(repo, revision)
+        (repo / "README").write_text("unrelated")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "docs"], check=True)
+        origin = self.root / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(origin)], check=True)
+        subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "main"], check=True)
+        self.assertEqual(s.allowed_revisions(repo), {"bbb2", "bbb"})
+
+    def repo_with_main(self, main_pin):
+        repo = self.root / "checkout"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        for args in (["user.name", "t"], ["user.email", "t@example.com"], ["commit.gpgsign", "false"]):
+            subprocess.run(["git", "-C", str(repo), "config", *args], check=True)
+        (repo / "lean-toolchain").write_text("old-toolchain\n")
+        self.manifest(repo, "old" * 13 + "o")
+        subprocess.run(["git", "-C", str(repo), "switch", "-q", "-c", "branch"], check=True)
+        subprocess.run(["git", "-C", str(repo), "switch", "-q", "main"], check=True)
+        (repo / "lean-toolchain").write_text("main-toolchain\n")
+        (repo / "lakefile.toml").write_text('name = "main"\n')
+        self.manifest(repo, main_pin)
+        origin = self.root / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(origin)], check=True)
+        subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "main"], check=True)
+        subprocess.run(["git", "-C", str(repo), "switch", "-q", "branch"], check=True)
+        return repo
+
+    def test_rebase_round_prepares_mains_mathlib_and_restores_the_branch(self):
+        main_pin = "c" * 40
+        repo = self.repo_with_main(main_pin)
+        branch_manifest = (repo / "lake-manifest.json").read_bytes()
+        self.addCleanup(s.set_round_purpose, repo)
+        # Without a rebase purpose nothing changes.
+        with s.rebase_target(repo, {}) as restore:
+            self.assertEqual((repo / "lake-manifest.json").read_bytes(), branch_manifest)
+            restore()
+        s.set_round_purpose(repo, rebase=True)
+        with s.rebase_target(repo, {}) as restore:
+            self.assertEqual(s._manifest_pin((repo / "lake-manifest.json").read_text()), main_pin)
+            self.assertEqual((repo / "lean-toolchain").read_text(), "main-toolchain\n")
+            self.assertTrue((repo / "lakefile.toml").is_file())
+            restore()  # the agent starts on its own branch's files
+            self.assertEqual((repo / "lake-manifest.json").read_bytes(), branch_manifest)
+            self.assertEqual((repo / "lean-toolchain").read_text(), "old-toolchain\n")
+            self.assertFalse((repo / "lakefile.toml").exists())
+        status = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True)
+        self.assertEqual(status.stdout, "")
+        # A failure while preparing restores the branch too.
+        with self.assertRaises(RuntimeError):
+            with s.rebase_target(repo, {}):
+                raise RuntimeError("preparation failed")
+        self.assertEqual((repo / "lake-manifest.json").read_bytes(), branch_manifest)
+        # Another directory (a verification job) is never affected by this round's purpose.
+        other = self.root / "other"
+        other.mkdir()
+        (other / "lake-manifest.json").write_bytes(branch_manifest)
+        with s.rebase_target(other, {}):
+            self.assertEqual((other / "lake-manifest.json").read_bytes(), branch_manifest)
+        s.set_round_purpose(repo)
+        self.assertEqual(s._purpose(repo), {})
+
+    def test_repair_round_moves_to_mains_mathlib_only_when_its_pin_is_refused(self):
+        main_pin = "c" * 40
+        repo = self.repo_with_main(main_pin)
+        self.addCleanup(s.set_round_purpose, None)
+        s.set_round_purpose(repo, repair=True)
+        # The branch is on main's previous pin, which is still allowed: it keeps its Mathlib.
+        allowed_branch = (repo / "lake-manifest.json").read_bytes()
+        with s.rebase_target(repo, {"TAUCETI_SHARED_MATHLIB_ROOT": str(self.root / "pool")}):
+            self.assertEqual((repo / "lake-manifest.json").read_bytes(), allowed_branch)
+        # A pin main never had is refused, so the round prepares main's Mathlib instead.
+        self.manifest(repo, "f" * 40)
+        with s.rebase_target(repo, {"TAUCETI_SHARED_MATHLIB_ROOT": str(self.root / "pool")}) as restore:
+            self.assertEqual(s._manifest_pin((repo / "lake-manifest.json").read_text()), main_pin)
+            restore()
+            self.assertEqual(s._manifest_pin((repo / "lake-manifest.json").read_text()), "f" * 40)
+
+    def test_bump_pins_are_allowed_for_a_week(self):
+        pool = self.root / "pool"
+        self.assertEqual(s.bump_pins(pool), set())
+        (pool / "bump-pins").mkdir(parents=True)
+        (pool / "bump-pins" / ("d" * 40)).touch()
+        old = pool / "bump-pins" / ("e" * 40)
+        old.touch()
+        os.utime(old, (time.time() - s.BUMP_PIN_SECONDS - 1,) * 2)
+        self.assertEqual(s.bump_pins(pool), {"d" * 40})
+
+    def entry(self, pool, key, revision, age):
+        entry = pool / "entries" / key
+        (entry / "build").mkdir(parents=True)
+        (entry / "ready.json").write_text(json.dumps({"key": key, "spec": {"mathlib": revision}}))
+        os.utime(entry, (time.time() - age, time.time() - age))
+        return entry
+
+    def holder(self, pool, key):
+        (pool / "locks").mkdir(parents=True, exist_ok=True)
+        lock = pool / "locks" / (key + ".lock")
+        script = "import fcntl,sys,time; f=open(sys.argv[1],'a+'); fcntl.flock(f, fcntl.LOCK_SH); print('ok', flush=True); time.sleep(120)"
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(lock)], stdout=subprocess.PIPE, text=True, start_new_session=True
+        )
+        self.addCleanup(lambda: (process.kill(), process.wait()))
+        self.assertEqual(process.stdout.readline().strip(), "ok")
+        return process
+
+    def test_cap_evicts_disallowed_versions_first_and_kills_their_rounds(self):
+        if not Path("/proc/self/fd").is_dir():
+            self.skipTest("holder discovery uses /proc")
+        pool = self.root / "pool"
+        old = self.entry(pool, "k-old", "zzz", age=100)
+        current = self.entry(pool, "k-current", "bbb", age=500)
+        using_old = self.holder(pool, "k-old")
+        using_current = self.holder(pool, "k-current")
+        with patch.object(s, "EVICTION_GRACE", 5):
+            s.enforce_version_cap(pool, "k-new", {"bbb", "aaa"}, {})
+        self.assertFalse(old.exists())
+        self.assertTrue(current.exists())
+        self.assertIsNotNone(using_old.wait(timeout=10))  # its round was killed
+        self.assertIsNone(using_current.poll())
+        s.enforce_version_cap(pool, "k-current", {"bbb", "aaa"}, {})  # within the cap
+        self.assertTrue(current.exists())
+
+    def test_round_detection_matches_the_real_invocation_only(self):
+        self.assertTrue(s.is_round_argv(["/rt/bin/python", "-m", "tauceti_worker", "_round", "--worker-id", "w"]))
+        self.assertTrue(s.is_round_argv(["python3", "-I", "-m", "tauceti_worker", "_round"]))
+        self.assertFalse(s.is_round_argv(["python", "-c", "x", "tauceti_worker", "_round"]))
+        self.assertFalse(s.is_round_argv(["python", "-m", "tauceti_worker", "work", "--loop"]))
+
+    def test_eviction_kills_the_whole_round_that_holds_an_entry(self):
+        if not Path("/proc/self/fd").is_dir():
+            self.skipTest("holder discovery uses /proc")
+        pool = self.root / "pool"
+        old = self.entry(pool, "k-old", "zzz", age=100)
+        self.entry(pool, "k-current", "bbb", age=500)
+        (pool / "locks").mkdir(parents=True, exist_ok=True)
+        lock = pool / "locks/k-old.lock"
+        child = (
+            "import fcntl,sys,time; f=open(sys.argv[1],'a+'); fcntl.flock(f, fcntl.LOCK_SH); "
+            "print('ok', flush=True); time.sleep(120)"
+        )
+        parent = "import subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]]); time.sleep(120)"
+        round_ = subprocess.Popen([sys.executable, "-c", parent, child, str(lock)], start_new_session=True)
+        self.addCleanup(lambda: (round_.kill(), round_.wait()))
+        deadline = time.time() + 10
+        while not s._holders(lock) and time.time() < deadline:
+            time.sleep(0.1)
+        # The parent stands in for an isolated round: session and group leader, as spawn_round makes it.
+        with (
+            patch.object(s, "EVICTION_GRACE", 5),
+            patch.object(s, "_owning_round", side_effect=lambda pid: round_.pid),
+        ):
+            s.enforce_version_cap(pool, "k-new", {"bbb"}, {})
+        self.assertFalse(old.exists())
+        self.assertIsNotNone(round_.wait(timeout=10))  # the round itself, not only the holder
+
+    def test_unfetchable_main_or_a_long_history_leave_pins_unknown(self):
+        repo = self.root / "checkout"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        for args in (["user.name", "t"], ["user.email", "t@example.com"]):
+            subprocess.run(["git", "-C", str(repo), "config", *args], check=True)
+        self.manifest(repo, "aaa")
+        subprocess.run(["git", "-C", str(repo), "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(self.root / "missing")], check=True)
+        self.assertIsNone(s.allowed_revisions(repo))  # fetch fails: a stale origin/main decides nothing
+
+    def test_shallow_history_leaves_the_previous_pin_unknown(self):
+        source = self.root / "source"
+        source.mkdir()
+        subprocess.run(["git", "-C", str(source), "init", "-q", "-b", "main"], check=True)
+        for args in (["user.name", "t"], ["user.email", "t@example.com"]):
+            subprocess.run(["git", "-C", str(source), "config", *args], check=True)
+        for revision in ("aaa", "bbb"):
+            self.manifest(source, revision)
+        shallow = self.root / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{source}", str(shallow)], check=True)
+        self.assertIsNone(s.allowed_revisions(shallow))
+
+    def test_an_unkillable_holder_stops_the_round_instead_of_a_private_build(self):
+        pool = self.root / "pool"
+        victim = self.entry(pool, "k-old", "zzz", age=100)
+        self.entry(pool, "k-current", "bbb", age=500)
+        holder = self.holder(pool, "k-old")
+        with (
+            patch.object(s, "_kill_holders"),  # a holder this process cannot end
+            patch.object(s, "EVICTION_WAIT", 0.2),
+            self.assertRaises(s.CapContention),
+        ):
+            s.enforce_version_cap(pool, "k-new", {"bbb"}, {})
+        self.assertFalse(victim.exists())  # hidden at once, so no new reader can lease it
+        self.assertIsInstance(s.CapContention("x"), s.NoFallback)
+        self.assertIsNone(holder.poll())
+
+    def test_collect_keeps_trash_whose_key_is_still_leased(self):
+        pool = self.root / "pool"
+        trash = pool / "trash" / ("k-old-" + "a" * 32)
+        (trash / "build").mkdir(parents=True)
+        holder = self.holder(pool, "k-old")
+        s.collect(pool, max_age=10**9)
+        self.assertTrue(trash.exists())  # a round that outlived eviction still mounts this lower
+        holder.kill()
+        holder.wait()
+        s.collect(pool, max_age=10**9)
+        self.assertFalse(trash.exists())
+
+    def test_cap_evicts_the_oldest_allowed_entry_when_all_are_allowed(self):
+        pool = self.root / "pool"
+        older = self.entry(pool, "k-a", "aaa", age=900)
+        newer = self.entry(pool, "k-b", "bbb", age=10)
+        s.enforce_version_cap(pool, "k-c", {"aaa", "bbb"}, {})
+        self.assertFalse(older.exists())
+        self.assertTrue(newer.exists())
 
 
 if __name__ == "__main__":

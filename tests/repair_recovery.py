@@ -3300,6 +3300,15 @@ class ConversationIsolation(unittest.TestCase):
 
 
 class RealVerifierIntegration(unittest.TestCase):
+    def setUp(self):
+        # The real cache context reads the shared Mathlib pool; never the host's real one.
+        pool = tempfile.TemporaryDirectory(prefix="tauceti-shared-mathlib-")
+        self.addCleanup(pool.cleanup)
+        environment = patch.dict(os.environ, {"TAUCETI_SHARED_MATHLIB_ROOT": pool.name})
+        environment.start()
+        self.addCleanup(environment.stop)
+        assert os.environ["TAUCETI_SHARED_MATHLIB_ROOT"] == pool.name
+
     def test_shared_view_uses_the_existing_verifier_cli_and_resolved_base(self):
         from verification import Receipts
 
