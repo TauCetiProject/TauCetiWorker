@@ -543,7 +543,7 @@ def local_verification(policy: str, bubble: bool = False) -> str:
             HERE / "prompts" / "local-verification.md",
             SCOPE_POLICY=policy,
             LOCAL_CHECKS=f'"{python}" "{wrapper_bin(bubble)}/tauceti-local-checks"',
-        )
+        ) + _mathlib_store_note(bubble)
     python = "/usr/bin/python3" if bubble else sys.executable
     helper = f'"{python}" "{wrapper_bin(bubble)}/tauceti-verify"'
     return self_tested_guidance(policy) + (
@@ -568,7 +568,7 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "transitive axiom and global duplicate checks run in CI. No local whole-library audit fallback. "
         "These are local checks, not full CI.\n"
         f"```bash\n{helper}\n```\n"
-    )
+    ) + _mathlib_store_note(bubble)
 
 
 def sync_mathlib_pool(cfg: Config) -> None:
@@ -2255,7 +2255,46 @@ def agent_inner_cmd(profile: AuthoringProfile | str) -> str:
     )
 
 
-def bubble_work_cmd(inner: str, *, verify_helper=False) -> str:
+MATHLIB_STORE_MOUNT = "/opt/mathlib-store"
+MATHLIB_STORE_LINKER = "/opt/round/tauceti-mathlib-store"
+
+
+def mathlib_store_dir() -> Path | None:
+    """The host directory `TAUCETI_MATHLIB_STORE` offers work rounds, or None (docs/mathlib-store.md)."""
+    store = Path(os.environ.get("TAUCETI_MATHLIB_STORE", "").strip() or ".")
+    return store.resolve() if store.is_absolute() and store.is_dir() else None
+
+
+def _mathlib_store_note(bubble: bool) -> str:
+    if not bubble or mathlib_store_dir() is None:
+        return ""
+    return (
+        f"\nMathlib's build in this checkout may be a read-only link into `{MATHLIB_STORE_MOUNT}`. "
+        "If the Lake pins change, for example by merging a `main` that moved them, run "
+        f"`{MATHLIB_STORE_LINKER}` before `lake exe cache get`.\n"
+    )
+
+
+def mathlib_store_fetch(fetch: str, store: str = MATHLIB_STORE_MOUNT, linker: str = MATHLIB_STORE_LINKER) -> str:
+    """The Mathlib step of a round that mounts the store: link the entry the checkout pins and let
+    `lake exe cache get` confirm it, or run `fetch` as a round without the store does."""
+    link = f"python3 {_shq(linker)}"
+    store = _shq(store)
+    return (
+        # Lake clones the packages here, so the links are in place before anything writes a build.
+        "lake env true >/dev/null 2>&1 || true; "
+        f"if (unset LAKE_ARTIFACT_CACHE; {link} {store} && lake exe cache get); then "
+        "unset LAKE_ARTIFACT_CACHE; "
+        # Bubble's profile exports the variable again in every login shell the agent opens.
+        "for rc in ~/.profile ~/.bashrc; do echo 'unset LAKE_ARTIFACT_CACHE' >> \"$rc\"; done; "
+        "else "
+        f"{link} --unlink {store} || true; "
+        f"{fetch}"
+        "fi; "
+    )
+
+
+def bubble_work_cmd(inner: str, *, verify_helper=False, mathlib_store=False) -> str:
     """Trusted bootstrap run before the work agent inside Bubble.
 
     Bubble's noninteractive `--command` mode deliberately does not run a hook-generated build, so do
@@ -2277,12 +2316,15 @@ def bubble_work_cmd(inner: str, *, verify_helper=False) -> str:
         if verify_helper
         else "timeout 1800 lake build"
     )
+    mathlib = "lake exe cache get || lake exe cache get; "
+    if mathlib_store:
+        mathlib = mathlib_store_fetch(mathlib)
     if not TAUCETI_CACHE_SERVICE:
-        return f"set -e; lake exe cache get || lake exe cache get; {preliminary} || true; exec {inner}"
+        return f"set -e; {mathlib}{preliminary} || true; exec {inner}"
     fetch = f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI}"
     return (
         "set -e; "
-        "lake exe cache get || lake exe cache get; "
+        f"{mathlib}"
         'tc_log="$(mktemp)"; tc_hit=0; tc_cold=0; '
         # Two attempts, because a dropped connection is worth one retry, but stop immediately when
         # Lake reports the revision simply is not cached: retrying cannot change that answer.
@@ -2519,6 +2561,13 @@ def run_in_bubble(
         ]
     for m in mounts or []:
         mount_flags += ["--mount", m]
+    mathlib_store = mathlib_store_dir() if inner_cmd is None else None
+    if mathlib_store is not None:
+        shutil.copy(HERE / "scripts" / "tauceti-mathlib-store", rounddir / "tauceti-mathlib-store")
+        (rounddir / "tauceti-mathlib-store").chmod(0o755)
+        mount_flags += ["--mount", f"{mathlib_store}:{MATHLIB_STORE_MOUNT}:ro"]
+    elif inner_cmd is None and os.environ.get("TAUCETI_MATHLIB_STORE", "").strip():
+        log("mathlib store: TAUCETI_MATHLIB_STORE is not an absolute path to a directory; not mounted")
     import tauceti_tools
 
     mount_flags += ["--mount", f"{Path(tauceti_tools.__file__).parent}:/opt/tools/tauceti_tools:ro"]
@@ -2607,7 +2656,8 @@ def run_in_bubble(
             tcenv += f" {key}={shlex.quote(value)}"
     command_inner = inner_cmd if inner_cmd is not None else agent_inner_cmd(profile)
     if inner_cmd is None:
-        command_inner = f"bash -c {shlex.quote(bubble_work_cmd(command_inner, verify_helper=helper_on))}"
+        bootstrap = bubble_work_cmd(command_inner, verify_helper=helper_on, mathlib_store=mathlib_store is not None)
+        command_inner = f"bash -c {shlex.quote(bootstrap)}"
     if helper_on:
         # Resolve the canonical local main once after Bubble has checked out the target.
         setup = (

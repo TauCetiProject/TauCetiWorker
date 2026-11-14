@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""tauceti-mathlib-store [--unlink] [STORE]: in the Lake workspace in the current directory, link
+Mathlib's build directory, and those of the dependencies pinned alike, to the entry of the read-only
+Mathlib store at STORE (default /opt/mathlib-store) that matches the workspace's pins. Links that
+no longer match are removed first, so it can be run again after the pins move; --unlink only removes.
+Exit 0 when Mathlib's build is a link into the store afterwards. docs/mathlib-store.md has the layout.
+
+Standard library only: it runs on the sandbox image's python3."""
+
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+READY = ".tauceti-store-ready"
+
+
+def pins(checkout):
+    try:
+        packages = json.loads((checkout / "lake-manifest.json").read_text())["packages"]
+        pinned = {p["name"]: p["rev"] for p in packages if p.get("type") == "git"}
+        return {name: rev for name, rev in pinned.items() if isinstance(name, str) and isinstance(rev, str)}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def matching_builds(store, workspace):
+    """({package: its build directory in the store}, a description of what was looked for)."""
+    mine = pins(workspace)
+    rev = mine.get("mathlib", "")
+    if not re.fullmatch("[0-9a-f]{40}", rev):
+        return {}, "a workspace with no pinned Mathlib"
+    entry = store / rev
+    try:
+        toolchain = (workspace / "lean-toolchain").read_text().strip()
+        built = (entry / "lean-toolchain").read_text().strip()
+    except OSError:
+        return {}, rev[:12]
+    wanted = f"{rev[:12]} on {toolchain}"
+    if built != toolchain or not (entry / READY).is_file() or not (entry / ".lake" / "build").is_dir():
+        return {}, wanted
+    builds = {"mathlib": entry / ".lake" / "build"}
+    for name, pinned in pins(entry).items():
+        build = entry / ".lake" / "packages" / name / ".lake" / "build"
+        if name != "mathlib" and Path(name).name == name and mine.get(name) == pinned and build.is_dir():
+            builds[name] = build
+    return builds, wanted
+
+
+def main(argv):
+    unlink = "--unlink" in argv
+    paths = [a for a in argv if a != "--unlink"]
+    store, workspace = Path(paths[0] if paths else "/opt/mathlib-store"), Path.cwd()
+    builds, wanted = ({}, "") if unlink else matching_builds(store, workspace)
+    if builds and "LAKE_ARTIFACT_CACHE" in os.environ:
+        # Lake copies replayed outputs into a writable artifact cache, which a read-only build refuses.
+        print("mathlib store: LAKE_ARTIFACT_CACHE is set; not linking")
+        builds = {}
+    packages = workspace / ".lake" / "packages"
+    names = sorted(p.name for p in packages.iterdir() if p.is_dir()) if packages.is_dir() else []
+    linked = []
+    # Mathlib first: a dependency is linked only beside a linked Mathlib.
+    for name in sorted(names, key=lambda n: n != "mathlib"):
+        build = packages / name / ".lake" / "build"
+        target = builds.get(name) if name == "mathlib" or "mathlib" in linked else None
+        current = Path(os.readlink(build)) if build.is_symlink() else None
+        if current is not None and current != target and store in current.parents:
+            build.unlink()
+            current = None
+        if target is not None and current is None and not build.exists():
+            build.parent.mkdir(exist_ok=True)
+            build.symlink_to(target)
+            current = target
+        if target is not None and current == target:
+            linked.append(name)
+    if unlink:
+        return 1
+    if linked:
+        print(f"mathlib store: {wanted}: linked {', '.join(linked)}")
+    else:
+        print(f"mathlib store: no usable entry for {wanted}; unpacking as usual")
+    return 0 if "mathlib" in linked else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

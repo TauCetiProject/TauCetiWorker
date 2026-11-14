@@ -39,7 +39,7 @@ packages = ["tauceti_worker", "tauceti_queue"]
 target-version = "py311"
 line-length = 120
 # `tauceti` is the program but has no .py extension, so ruff won't pick it up by default.
-extend-include = ["tauceti", "scripts/tauceti-local-axioms", "scripts/tauceti-local-lint", "scripts/tauceti-local-checks", "scripts/tauceti-lean"]
+extend-include = ["tauceti", "scripts/tauceti-local-axioms", "scripts/tauceti-local-lint", "scripts/tauceti-local-checks", "scripts/tauceti-lean", "scripts/tauceti-mathlib-store"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]

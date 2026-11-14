@@ -404,6 +404,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `PI_RUN` | `~/.claude/skills/pi/scripts/run.sh` | The `pi` runner for OpenRouter agents on the host. |
 | `TAUCETI_BUBBLE` | `bubble` (else `uvx` for dry-run probes only) | Override the Bubble executable. |
 | `TAUCETI_BUBBLE_HOME` | per-worker cache dir | Override the private bubble home. |
+| `TAUCETI_MATHLIB_STORE` | _(unset)_ | Absolute path of a [read-only Mathlib store](mathlib-store.md). Bubble work rounds mount it and link the build their checkout pins in place of unpacking it; with a linked build they run with `LAKE_ARTIFACT_CACHE` unset. |
 | `TAUCETI_REVIEW_ENGINE_DIR` | — | Use a local `tauceti-review` checkout instead of fetching the engine. |
 | `TAUCETI_POLL` | `300` | Seconds between quota checks while the loop waits. |
 | `TAUCETI_ROUND_TIMEOUT` | `5400` | Hard cap per round (seconds). |
