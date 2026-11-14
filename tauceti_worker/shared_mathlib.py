@@ -206,7 +206,7 @@ def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
 def capability(directory=None):
     """Exercise the actual filesystem, namespace, OverlayFS and bwrap flag support."""
     if platform.system() != "Linux":
-        return False, "Linux user namespaces and OverlayFS are required; use private builds on this system"
+        return False, "Linux user namespaces and OverlayFS are required for shared Mathlib; an operator must set mode off on this system"
     if not shutil.which("bwrap"):
         return False, "install bubblewrap with --overlay support (0.12 or newer) to share extracted Mathlib"
     try:
@@ -311,11 +311,11 @@ def signature(cwd, env):
     for package in packages:
         name = package.get("name")
         if not isinstance(name, str) or not name or Path(name).name != name or package.get("type") != "git":
-            raise Unavailable("shared snapshots require pinned git dependencies; path dependencies use private builds")
+            raise Unavailable("shared snapshots require pinned git dependencies; path dependencies cannot share Mathlib")
         source = cwd / ".lake/packages" / name
         revision = git(source, "rev-parse", "HEAD")
         if revision != package.get("rev") or git(source, "status", "--porcelain", "--untracked-files=normal"):
-            raise Unavailable(f"dependency {name} differs from its pinned revision; using private builds")
+            raise Unavailable(f"dependency {name} differs from its pinned revision; restore the pin before building")
         dependencies[name] = revision
         cache_contexts[name] = cache_identity(cache_context(source))
     if "mathlib" not in dependencies:
@@ -405,7 +405,7 @@ def lease_lock(stream, flags, *, timeout=None):
                 raise
             if time.monotonic() >= deadline:
                 raise Unavailable(
-                    "shared Mathlib lock wait timed out; use private mode and inspect publisher/reader leases"
+                    "shared Mathlib lock wait timed out; inspect publisher/reader leases"
                 ) from None
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
         except OSError as error:
@@ -854,10 +854,10 @@ def ready_entry(entry, key, spec):
         )
     except (OSError, Unavailable) as error:
         raise IntegrityFailure(
-            f"snapshot integrity failure for {key}: {error}; retain lower and use private mode"
+            f"snapshot integrity failure for {key}: {error}; lower retained for inspection"
         ) from error
     if not valid:
-        raise IntegrityFailure(f"snapshot integrity failure for {key}; retain lower and use private mode")
+        raise IntegrityFailure(f"snapshot integrity failure for {key}; lower retained for inspection")
     return True
 
 
@@ -990,7 +990,7 @@ def clone(source, target, revision):
         git(target, "config", f"branch.{context['branch']}.remote", context["tracking"])
     if cache_identity(cache_context(target)) != cache_identity(context):
         raise Unavailable(
-            "Git cache selection context differs in the fresh clone; normalize repository-specific URL rules or use private builds"
+            "Git cache selection context differs in the fresh clone; normalize repository-specific URL rules"
         )
 
 
@@ -1080,7 +1080,7 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
         usage = shutil.disk_usage(pool)
         if usage.free < disk_reserve(usage):
             raise Unavailable(
-                "snapshot extraction would leave less than the free-space reserve (10%, capped at 20 GiB); using private builds"
+                "snapshot extraction would leave less than the free-space reserve (10%, capped at 20 GiB)"
             )
         entry.parent.mkdir(parents=True, exist_ok=True)
         os.replace(ready, entry)
