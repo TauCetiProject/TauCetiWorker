@@ -422,6 +422,15 @@ def allowed_revisions(cwd):
             return None
         return next((p.get("rev") for p in packages if isinstance(p, dict) and p.get("name") == "mathlib"), None)
 
+    # Queue repair and other callers may not have refreshed origin/main; best effort, bounded.
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(
+            ["git", "-C", str(cwd), "fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+            capture_output=True,
+            timeout=60,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            stdin=subprocess.DEVNULL,
+        )
     current = pin("origin/main")
     if not current:
         return None
@@ -436,7 +445,12 @@ def allowed_revisions(cwd):
         revision = pin(commit)
         if revision and revision != current:
             allowed.add(revision)
-            break
+            return allowed
+    shallow = subprocess.run(
+        ["git", "-C", str(cwd), "rev-parse", "--is-shallow-repository"], capture_output=True, text=True, timeout=30
+    )
+    if history.returncode or shallow.stdout.strip() != "false":
+        return None  # too little history to know the previous pin: refuse nothing, the cap still holds
     return allowed
 
 
@@ -458,19 +472,46 @@ def _holders(lock_path):
     return pids
 
 
+def _owning_round(pid):
+    """The nearest ancestor (or self) that is a worker round, or None."""
+    seen = set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        try:
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if b"tauceti_worker" in argv and b"_round" in argv:
+                return pid
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            return None
+    return None
+
+
 def _kill_holders(pids):
-    """Abandon the rounds using an evicted entry: their process groups, TERM then KILL."""
+    """Abandon what uses an evicted entry, TERM then KILL.
+
+    A holder inside a worker round loses its whole round (the round's own session and process
+    group, never the worker loop's). Any other holder, such as a queue service running repairs
+    in-process, is signalled alone, never its group."""
     import signal
 
-    groups = set()
+    groups, singles = set(), set()
     for pid in pids:
+        owner = _owning_round(pid)
         with contextlib.suppress(OSError):
-            groups.add(os.getpgid(pid))
+            if owner is not None:
+                groups.add(os.getpgid(owner))
+            else:
+                singles.add(pid)
     groups.discard(os.getpgrp())
+    singles.discard(os.getpid())
     for signum in (signal.SIGTERM, signal.SIGKILL):
         for group in groups:
             with contextlib.suppress(OSError):
                 os.killpg(group, signum)
+        for pid in singles:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signum)
         deadline = time.monotonic() + EVICTION_GRACE
         while signum == signal.SIGTERM and time.monotonic() < deadline:
             if not any(Path(f"/proc/{pid}").exists() for pid in pids):
@@ -482,34 +523,48 @@ def _entry_revision(entry):
     return (read_json(entry / "ready.json").get("spec") or {}).get("mathlib")
 
 
+def _other_entries(pool, keep):
+    entries_dir = pool / "entries"
+    if not entries_dir.is_dir():
+        return []
+    # Staging is not counted: publication is serialized under `versions` and evicts first, and a
+    # crashed publisher's stale staging directory must not force a live entry out.
+    return [e for e in entries_dir.iterdir() if e.is_dir() and not e.is_symlink() and e.name != keep]
+
+
 def enforce_version_cap(pool, keep, allowed, env):
     """Hold at most VERSION_CAP entries, counting the one about to be used or published.
 
     Entries for revisions outside ``allowed`` go first, then the oldest. A round holding an evicted
-    entry is killed and abandoned: keeping a third Mathlib build is never the better outcome."""
-    entries_dir = pool / "entries"
-    if not entries_dir.is_dir():
-        return
+    entry is killed and abandoned: keeping a third Mathlib build is never the better outcome.
+    Publication calls ``_evict_excess`` itself while holding the ``versions`` lock throughout."""
+    if len(_other_entries(pool, keep)) + 1 <= VERSION_CAP:
+        return  # the common case takes no lock
     with key_lock(pool, "versions", exclusive=True, timeout=LOCK_WAIT_SECONDS):
-        entries = [e for e in entries_dir.iterdir() if e.is_dir() and not e.is_symlink() and e.name != keep]
-        excess = len(entries) + 1 - VERSION_CAP
-        if excess <= 0:
-            return
+        _evict_excess(pool, keep, allowed, env)
 
-        def age(entry):
-            with contextlib.suppress(OSError):
-                return entry.stat().st_mtime
-            return 0
 
-        ranked = sorted(entries, key=lambda e: (allowed is None or _entry_revision(e) in allowed, age(e)))
-        for victim in ranked[:excess]:
-            lock_path = pool / "locks" / (victim.name + ".lock")
-            report(pool, env, mode="evicting", key=victim.name, reason="Mathlib version cap")
-            if lock_path.exists():
-                _kill_holders(_holders(lock_path))
-            with key_lock(pool, victim.name, exclusive=True, timeout=120):
-                if victim.exists():
-                    discard_entry(pool, victim)  # renames into trash, then removes it
+def _evict_excess(pool, keep, allowed, env):
+    """Called holding the ``versions`` lock."""
+    entries = _other_entries(pool, keep)
+    excess = len(entries) + 1 - VERSION_CAP
+    if excess <= 0:
+        return
+
+    def age(entry):
+        with contextlib.suppress(OSError):
+            return entry.stat().st_mtime
+        return 0
+
+    ranked = sorted(entries, key=lambda e: (allowed is None or _entry_revision(e) in allowed, age(e)))
+    for victim in ranked[:excess]:
+        lock_path = pool / "locks" / (victim.name + ".lock")
+        report(pool, env, mode="evicting", key=victim.name, reason="Mathlib version cap")
+        if lock_path.exists():
+            _kill_holders(_holders(lock_path))
+        with key_lock(pool, victim.name, exclusive=True, timeout=120):
+            if victim.exists():
+                discard_entry(pool, victim)  # renames into trash, then removes it
 
 
 def remove_tree(path):
@@ -1122,7 +1177,11 @@ def view(cwd, env, logdir, fetch):
                     if not hit:
                         lease_lock(lease, fcntl.LOCK_UN)
                         lease_lock(lease, fcntl.LOCK_EX, timeout=LOCK_WAIT_SECONDS)
-                        entry, hit = publish(pool, key, spec, cwd, env, logdir, fetch)
+                        # Admission and publication are one step under `versions`, so concurrent
+                        # publishers of different keys can never exceed the cap between them.
+                        with key_lock(pool, "versions", exclusive=True, timeout=LOCK_WAIT_SECONDS):
+                            _evict_excess(pool, key, allowed, env)
+                            entry, hit = publish(pool, key, spec, cwd, env, logdir, fetch)
                         lease_lock(lease, fcntl.LOCK_SH, timeout=LOCK_WAIT_SECONDS)
             upper.parent.mkdir(parents=True, exist_ok=True)
             ok, reason = capability(upper.parent)
@@ -1194,6 +1253,8 @@ def view(cwd, env, logdir, fetch):
             env.pop("TAUCETI_SHARED_MATHLIB_LEASE_FD", None)
             env.pop("TAUCETI_SHARED_MATHLIB_KEY", None)
             env.pop("TAUCETI_SHARED_MATHLIB_PREP_STARTED", None)
+            if isinstance(error, PinRefused):
+                raise  # never a private build for a refused pin
             if selected == "required":
                 raise Unavailable(str(error)) from error
             prefix = []

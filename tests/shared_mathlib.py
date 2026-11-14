@@ -1600,6 +1600,45 @@ class VersionCapTests(unittest.TestCase):
         s.enforce_version_cap(pool, "k-current", {"bbb", "aaa"}, {})  # within the cap
         self.assertTrue(current.exists())
 
+    def test_eviction_kills_the_whole_round_that_holds_an_entry(self):
+        if not Path("/proc/self/fd").is_dir():
+            self.skipTest("holder discovery uses /proc")
+        pool = self.root / "pool"
+        old = self.entry(pool, "k-old", "zzz", age=100)
+        self.entry(pool, "k-current", "bbb", age=500)
+        (pool / "locks").mkdir(parents=True, exist_ok=True)
+        lock = pool / "locks/k-old.lock"
+        child = (
+            "import fcntl,sys,time; f=open(sys.argv[1],'a+'); fcntl.flock(f, fcntl.LOCK_SH); "
+            "print('ok', flush=True); time.sleep(120)"
+        )
+        parent = "import subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]]); time.sleep(120)"
+        # argv marks the parent as a worker round, the way `python -m tauceti_worker _round` does.
+        round_ = subprocess.Popen(
+            [sys.executable, "-c", parent, child, str(lock), "tauceti_worker", "_round"],
+            start_new_session=True,
+        )
+        self.addCleanup(lambda: (round_.kill(), round_.wait()))
+        deadline = time.time() + 10
+        while not s._holders(lock) and time.time() < deadline:
+            time.sleep(0.1)
+        with patch.object(s, "EVICTION_GRACE", 5):
+            s.enforce_version_cap(pool, "k-new", {"bbb"}, {})
+        self.assertFalse(old.exists())
+        self.assertIsNotNone(round_.wait(timeout=10))  # the round itself, not only the holder
+
+    def test_shallow_history_leaves_the_previous_pin_unknown(self):
+        source = self.root / "source"
+        source.mkdir()
+        subprocess.run(["git", "-C", str(source), "init", "-q", "-b", "main"], check=True)
+        for args in (["user.name", "t"], ["user.email", "t@example.com"]):
+            subprocess.run(["git", "-C", str(source), "config", *args], check=True)
+        for revision in ("aaa", "bbb"):
+            self.manifest(source, revision)
+        shallow = self.root / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{source}", str(shallow)], check=True)
+        self.assertIsNone(s.allowed_revisions(shallow))
+
     def test_cap_evicts_the_oldest_allowed_entry_when_all_are_allowed(self):
         pool = self.root / "pool"
         older = self.entry(pool, "k-a", "aaa", age=900)
