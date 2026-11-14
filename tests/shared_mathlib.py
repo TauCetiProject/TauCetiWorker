@@ -1539,5 +1539,161 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
                 p.stdout.close()
 
 
+class VersionCapTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+
+    def manifest(self, repo, revision):
+        (repo / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib", "rev": revision}]}))
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", revision], check=True)
+
+    def test_allowed_revisions_are_current_and_previous_main_pins(self):
+        repo = self.root / "checkout"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        for args in (["user.name", "t"], ["user.email", "t@example.com"]):
+            subprocess.run(["git", "-C", str(repo), "config", *args], check=True)
+        self.assertIsNone(s.allowed_revisions(repo))  # no origin/main: unknown
+        for revision in ("aaa", "bbb", "bbb2"):
+            self.manifest(repo, revision)
+        (repo / "README").write_text("unrelated")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "docs"], check=True)
+        origin = self.root / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(origin)], check=True)
+        subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "main"], check=True)
+        self.assertEqual(s.allowed_revisions(repo), {"bbb2", "bbb"})
+
+    def entry(self, pool, key, revision, age):
+        entry = pool / "entries" / key
+        (entry / "build").mkdir(parents=True)
+        (entry / "ready.json").write_text(json.dumps({"key": key, "spec": {"mathlib": revision}}))
+        os.utime(entry, (time.time() - age, time.time() - age))
+        return entry
+
+    def holder(self, pool, key):
+        (pool / "locks").mkdir(parents=True, exist_ok=True)
+        lock = pool / "locks" / (key + ".lock")
+        script = "import fcntl,sys,time; f=open(sys.argv[1],'a+'); fcntl.flock(f, fcntl.LOCK_SH); print('ok', flush=True); time.sleep(120)"
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(lock)], stdout=subprocess.PIPE, text=True, start_new_session=True
+        )
+        self.addCleanup(lambda: (process.kill(), process.wait()))
+        self.assertEqual(process.stdout.readline().strip(), "ok")
+        return process
+
+    def test_cap_evicts_disallowed_versions_first_and_kills_their_rounds(self):
+        if not Path("/proc/self/fd").is_dir():
+            self.skipTest("holder discovery uses /proc")
+        pool = self.root / "pool"
+        old = self.entry(pool, "k-old", "zzz", age=100)
+        current = self.entry(pool, "k-current", "bbb", age=500)
+        using_old = self.holder(pool, "k-old")
+        using_current = self.holder(pool, "k-current")
+        with patch.object(s, "EVICTION_GRACE", 5):
+            s.enforce_version_cap(pool, "k-new", {"bbb", "aaa"}, {})
+        self.assertFalse(old.exists())
+        self.assertTrue(current.exists())
+        self.assertIsNotNone(using_old.wait(timeout=10))  # its round was killed
+        self.assertIsNone(using_current.poll())
+        s.enforce_version_cap(pool, "k-current", {"bbb", "aaa"}, {})  # within the cap
+        self.assertTrue(current.exists())
+
+    def test_round_detection_matches_the_real_invocation_only(self):
+        self.assertTrue(s.is_round_argv(["/rt/bin/python", "-m", "tauceti_worker", "_round", "--worker-id", "w"]))
+        self.assertTrue(s.is_round_argv(["python3", "-I", "-m", "tauceti_worker", "_round"]))
+        self.assertFalse(s.is_round_argv(["python", "-c", "x", "tauceti_worker", "_round"]))
+        self.assertFalse(s.is_round_argv(["python", "-m", "tauceti_worker", "work", "--loop"]))
+
+    def test_eviction_kills_the_whole_round_that_holds_an_entry(self):
+        if not Path("/proc/self/fd").is_dir():
+            self.skipTest("holder discovery uses /proc")
+        pool = self.root / "pool"
+        old = self.entry(pool, "k-old", "zzz", age=100)
+        self.entry(pool, "k-current", "bbb", age=500)
+        (pool / "locks").mkdir(parents=True, exist_ok=True)
+        lock = pool / "locks/k-old.lock"
+        child = (
+            "import fcntl,sys,time; f=open(sys.argv[1],'a+'); fcntl.flock(f, fcntl.LOCK_SH); "
+            "print('ok', flush=True); time.sleep(120)"
+        )
+        parent = "import subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]]); time.sleep(120)"
+        round_ = subprocess.Popen([sys.executable, "-c", parent, child, str(lock)], start_new_session=True)
+        self.addCleanup(lambda: (round_.kill(), round_.wait()))
+        deadline = time.time() + 10
+        while not s._holders(lock) and time.time() < deadline:
+            time.sleep(0.1)
+        # The parent stands in for an isolated round: session and group leader, as spawn_round makes it.
+        with (
+            patch.object(s, "EVICTION_GRACE", 5),
+            patch.object(s, "_owning_round", side_effect=lambda pid: round_.pid),
+        ):
+            s.enforce_version_cap(pool, "k-new", {"bbb"}, {})
+        self.assertFalse(old.exists())
+        self.assertIsNotNone(round_.wait(timeout=10))  # the round itself, not only the holder
+
+    def test_unfetchable_main_or_a_long_history_leave_pins_unknown(self):
+        repo = self.root / "checkout"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        for args in (["user.name", "t"], ["user.email", "t@example.com"]):
+            subprocess.run(["git", "-C", str(repo), "config", *args], check=True)
+        self.manifest(repo, "aaa")
+        subprocess.run(["git", "-C", str(repo), "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(self.root / "missing")], check=True)
+        self.assertIsNone(s.allowed_revisions(repo))  # fetch fails: a stale origin/main decides nothing
+
+    def test_shallow_history_leaves_the_previous_pin_unknown(self):
+        source = self.root / "source"
+        source.mkdir()
+        subprocess.run(["git", "-C", str(source), "init", "-q", "-b", "main"], check=True)
+        for args in (["user.name", "t"], ["user.email", "t@example.com"]):
+            subprocess.run(["git", "-C", str(source), "config", *args], check=True)
+        for revision in ("aaa", "bbb"):
+            self.manifest(source, revision)
+        shallow = self.root / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{source}", str(shallow)], check=True)
+        self.assertIsNone(s.allowed_revisions(shallow))
+
+    def test_an_unkillable_holder_stops_the_round_instead_of_a_private_build(self):
+        pool = self.root / "pool"
+        victim = self.entry(pool, "k-old", "zzz", age=100)
+        self.entry(pool, "k-current", "bbb", age=500)
+        holder = self.holder(pool, "k-old")
+        with (
+            patch.object(s, "_kill_holders"),  # a holder this process cannot end
+            patch.object(s, "EVICTION_WAIT", 0.2),
+            self.assertRaises(s.CapContention),
+        ):
+            s.enforce_version_cap(pool, "k-new", {"bbb"}, {})
+        self.assertFalse(victim.exists())  # hidden at once, so no new reader can lease it
+        self.assertIsInstance(s.CapContention("x"), s.NoFallback)
+        self.assertIsNone(holder.poll())
+
+    def test_collect_keeps_trash_whose_key_is_still_leased(self):
+        pool = self.root / "pool"
+        trash = pool / "trash" / ("k-old-" + "a" * 32)
+        (trash / "build").mkdir(parents=True)
+        holder = self.holder(pool, "k-old")
+        s.collect(pool, max_age=10**9)
+        self.assertTrue(trash.exists())  # a round that outlived eviction still mounts this lower
+        holder.kill()
+        holder.wait()
+        s.collect(pool, max_age=10**9)
+        self.assertFalse(trash.exists())
+
+    def test_cap_evicts_the_oldest_allowed_entry_when_all_are_allowed(self):
+        pool = self.root / "pool"
+        older = self.entry(pool, "k-a", "aaa", age=900)
+        newer = self.entry(pool, "k-b", "bbb", age=10)
+        s.enforce_version_cap(pool, "k-c", {"aaa", "bbb"}, {})
+        self.assertFalse(older.exists())
+        self.assertTrue(newer.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
