@@ -63,6 +63,13 @@ PROGRESS_ERROR_KEY = f"progress-err-{_PROGRESS_ERROR_REF}"
 PROGRESS_TTL = int(os.environ.get("TAUCETI_PROGRESS_TTL", "600"))  # seconds a `due` verdict stays fresh
 MAX_PROGRESS_ERRORS = 3  # consecutive failed progress rounds before backing off
 PROGRESS_ATTEMPT_GAP = int(os.environ.get("TAUCETI_PROGRESS_GAP", "28800"))  # min seconds between attempts
+# The `threshold` progress strategy has no cheap due-check, so the round's own `plan` is the poll.
+# A poll that finds nothing waits for the time its table names, at least PROGRESS_TTL and at most this.
+PROGRESS_POLL = int(os.environ.get("TAUCETI_PROGRESS_POLL", "3600"))
+PROGRESS_MAX_OPEN = 2  # default for progress_max_open
+# Set when this TauCetiProgress revision rejected the flags the strategy settings add to `plan`.
+# Keyed by revision like the error counter, so a new pin is tried without anyone clearing a file.
+PROGRESS_FLAGS_KEY = f"progress-plan-flags-{_PROGRESS_ERROR_REF}"
 # Lines of a failing `tauceti-progress` subcommand echoed into the main log. The whole output is
 # saved to a file regardless; this is only how much of it a reader sees without opening that file.
 # Matches the 20 lines `agents.run_to_logfile` tails for the review engine.

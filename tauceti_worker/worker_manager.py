@@ -30,8 +30,8 @@ from pathlib import Path
 from typing import NoReturn
 
 from . import worker_scopes
-from .config import positive_integer, security_audit_problem, validate_extra_roadmap_prompt
-from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS
+from .config import PROGRESS_STRATEGIES, positive_integer, security_audit_problem, validate_extra_roadmap_prompt
+from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS, PROGRESS_MAX_OPEN
 from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
 from .quota import parse_pace_curve
@@ -59,6 +59,9 @@ _WORKER_KEYS = {
     "roadmap_skip",
     "roadmap_extra_identities",
     "respect_claims",
+    "progress_strategy",
+    "progress_max_open",
+    "progress_skip",
     "extra_roadmap_prompt",
     "self_tested",
     "source",
@@ -316,6 +319,9 @@ class WorkerSpec:
     roadmap_skip: tuple[str, ...] = ()
     roadmap_extra_identities: tuple[str, ...] = ()
     respect_claims: bool = True
+    progress_strategy: str | None = None
+    progress_max_open: int | None = None
+    progress_skip: tuple[str, ...] = ()
     extra_roadmap_prompt: str | None = None
     self_tested: bool = False
     source: str | None = None
@@ -360,6 +366,12 @@ class WorkerSpec:
             raise WorkersError(f"workers[{index}].max_open_prs {error}") from None
         if not isinstance(raw.get("max_open_prs", MAX_OPEN_PRS), int):
             raise WorkersError(f"workers[{index}].max_open_prs must be an integer")
+        strategy = _string(raw.get("progress_strategy"), f"workers[{index}].progress_strategy", optional=True)
+        if strategy is not None and strategy not in PROGRESS_STRATEGIES:
+            raise WorkersError(f"workers[{index}].progress_strategy must be one of: {', '.join(PROGRESS_STRATEGIES)}")
+        reports = raw.get("progress_max_open")
+        if reports is not None and (isinstance(reports, bool) or not isinstance(reports, int) or reports < 1):
+            raise WorkersError(f"workers[{index}].progress_max_open must be a positive integer")
         spec = WorkerSpec(
             id=wid,
             conf=_string(raw.get("conf"), f"workers[{index}].conf", optional=True),
@@ -387,6 +399,9 @@ class WorkerSpec:
             ),
             self_tested=_boolean(raw.get("self_tested", False), f"workers[{index}].self_tested"),
             respect_claims=_boolean(raw.get("respect_claims", True), f"workers[{index}].respect_claims"),
+            progress_strategy=strategy,
+            progress_max_open=reports,
+            progress_skip=_strings(raw.get("progress_skip", []), f"workers[{index}].progress_skip"),
             extra_roadmap_prompt=_extra_roadmap_prompt(
                 raw.get("extra_roadmap_prompt"), f"workers[{index}].extra_roadmap_prompt"
             ),
@@ -456,11 +471,16 @@ class WorkerSpec:
             value["self_tested"] = True
         if not self.respect_claims:
             value["respect_claims"] = False
+        if self.progress_max_open is not None:
+            value["progress_max_open"] = self.progress_max_open
+        if self.progress_skip:
+            value["progress_skip"] = list(self.progress_skip)
         for name in (
             "github_account",
             "conf",
             "github_state_url",
             "github_state_token_file",
+            "progress_strategy",
             "extra_roadmap_prompt",
             "source",
             "author_model",
@@ -515,6 +535,13 @@ class WorkerSpec:
             argv += ["--roadmap-extra-identities", ",".join(self.roadmap_extra_identities)]
         if not self.respect_claims:
             argv.append("--ignore-claims")
+        if self.progress_strategy is not None:
+            argv += ["--progress-strategy", self.progress_strategy]
+        if self.progress_max_open is not None:
+            argv += ["--progress-max-open", str(self.progress_max_open)]
+        if self.progress_skip:
+            # One argument: an area list is operator text and must not read as a flag.
+            argv.append(f"--progress-skip={','.join(self.progress_skip)}")
         for field, flag in (
             (self.github_account, "--github-account"),
             (self.github_state_url, "--github-state-url"),
@@ -1605,6 +1632,16 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
         if "roadmap" not in phases:
             guidance += " (unused: the roadmap phase is not enabled)"
         lines.extend(_status_field("guidance", [guidance], width))
+
+    reports = []
+    if spec.get("progress_strategy"):
+        reports.append(f"{spec['progress_strategy']} strategy")
+        reports.append(f"at most {spec.get('progress_max_open', PROGRESS_MAX_OPEN)} open")
+    skips = spec.get("progress_skip")
+    if isinstance(skips, list) and skips:
+        reports.append("skip: " + ", ".join(map(str, skips)))
+    if reports:
+        lines.extend(_status_field("reports", reports, width))
 
     if spec.get("source"):
         lines.extend(_status_field("source", [str(spec["source"])], width))

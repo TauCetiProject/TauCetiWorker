@@ -17,7 +17,7 @@ from pathlib import Path
 
 from tauceti_tools.forge import RepositoryRef
 
-from .config import Config, log, roadmap_only, roadmap_skip
+from .config import Config, log, progress_skip, progress_strategy, roadmap_only, roadmap_skip
 from .config import max_open_prs as configured_max_open_prs
 from .constants import (
     AUTO_STAGES,
@@ -40,6 +40,7 @@ from .constants import (
     PROGRESS,
     PROGRESS_ATTEMPT_GAP,
     PROGRESS_ERROR_KEY,
+    PROGRESS_FLAGS_KEY,
     PROGRESS_REF,
     PROGRESS_TTL,
     REVIEW_AFFINITY_GRACE_S,
@@ -677,6 +678,25 @@ def progress_argv(state: Path, *args: str) -> list[str]:
     ]
 
 
+def progress_flags_reason() -> str:
+    return (
+        f"{PROGRESS} at {PROGRESS_REF[:12]} rejected the `plan` flags that progress_strategy and "
+        "progress_skip add; set TAUCETI_PROGRESS_REF to a revision that has them, or unset both "
+        f"settings (not retried on this revision; clear state/{PROGRESS_FLAGS_KEY} to retry)"
+    )
+
+
+def progress_poll_wait(cfg: Config, counters: Counters, delay: float, reason: str) -> None:
+    """Under the threshold strategy, hold the next plan for `delay` seconds and keep why for the survey."""
+    counters.write("progress-poll-at", int(time.time() + delay))
+    try:
+        cache = cfg.state / "cache" / "progress-poll.json"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({"reason": reason}))
+    except OSError:
+        pass
+
+
 def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
     """Is a roadmap progress report due? `(due, reason)`.
 
@@ -710,6 +730,9 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
         return True, "prepared progress report ready to resume publication"
     if (cfg.state / "progress/work/publication.json").exists():
         return False, "prepared progress receipt needs recovery; files preserved"
+    threshold = progress_strategy() == "threshold"
+    if (threshold or progress_skip()) and counters.read(PROGRESS_FLAGS_KEY):
+        return False, progress_flags_reason()
     if (retry_at := counters.read("progress-docs-retry-at")) > time.time():
         when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(retry_at))
         return (
@@ -720,7 +743,7 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
         return False, "progress mechanical work is cooling down; prose cadence remains unspent"
     cache = cfg.state / "cache" / "progress-due.json"
     try:
-        if cache.exists() and (time.time() - cache.stat().st_mtime) < PROGRESS_TTL:
+        if not threshold and cache.exists() and (time.time() - cache.stat().st_mtime) < PROGRESS_TTL:
             d = json.loads(cache.read_text())
             return bool(d.get("due")), str(d.get("reason") or "")
     except (OSError, ValueError):
@@ -738,6 +761,17 @@ def progress_due(cfg: Config, counters: Counters) -> tuple[bool, str]:
             f"progress rounds have failed {counters.read(PROGRESS_ERROR_KEY)}x; "
             f"backing off (clear state/{PROGRESS_ERROR_KEY} to retry)"
         )
+
+    if threshold:
+        # No `due` here: the strategy has no project-wide cadence to ask about. The round's `plan` is
+        # the poll, and the round sets when the next one is worth making (progress_poll_wait).
+        if (poll_at := counters.read("progress-poll-at")) > time.time():
+            try:
+                reason = str(json.loads((cfg.state / "cache" / "progress-poll.json").read_text())["reason"])
+            except (OSError, ValueError, KeyError, TypeError):
+                reason = "no roadmap qualified at the last threshold plan"
+            return False, f"{reason}; next plan after {time.strftime('%H:%M UTC', time.gmtime(poll_at))}"
+        return True, "threshold plan: looking for a roadmap to report on"
 
     try:
         proc = subprocess.run(progress_argv(cfg.state, "due"), capture_output=True, text=True, timeout=300)

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .constants import MAX_OPEN_PRS, ROADMAP, ROADMAP_DIR, TAUCETI
+from .constants import MAX_OPEN_PRS, PROGRESS_MAX_OPEN, ROADMAP, ROADMAP_DIR, TAUCETI
 from .paths import HERE, legacy_data_root
 
 _SCP_GIT_URL_RE = re.compile(r"^[^/@\s]+@[^:\s]+:.+$")
@@ -77,6 +77,36 @@ def roadmap_skip() -> list[str]:
     result is deduped and sorted. Returns [] when unset/blank. Shapes the auto-random pick and the
     "all areas" (any) case; an explicit --roadmap-only area takes precedence over it (see do_roadmap)."""
     raw = os.environ.get("TAUCETI_ROADMAP_SKIP", "")
+    return sorted({tok for tok in (t.strip() for t in raw.split(",")) if tok})
+
+
+PROGRESS_STRATEGIES = ("threshold",)
+
+
+def progress_strategy() -> str | None:
+    """How the progress phase finds a report to write, read live from TAUCETI_PROGRESS_STRATEGY so
+    --progress-strategy is inherited by loop children. None when unset or blank: TauCetiProgress's
+    `due` check and default plan. The CLI and workers.toml reject any other name than those in
+    PROGRESS_STRATEGIES; this reader never raises, because the survey calls it."""
+    return os.environ.get("TAUCETI_PROGRESS_STRATEGY", "").strip() or None
+
+
+def validate_progress_strategy(value: str) -> str:
+    if value not in PROGRESS_STRATEGIES:
+        raise ValueError(f"must be one of: {', '.join(PROGRESS_STRATEGIES)}")
+    return value
+
+
+def progress_max_open() -> int:
+    """Under the threshold strategy, how many of the account's progress reports may be open in the
+    roadmap repository before the worker stops planning another."""
+    return positive_integer(os.environ.get("TAUCETI_PROGRESS_MAX_OPEN", PROGRESS_MAX_OPEN))
+
+
+def progress_skip() -> list[str]:
+    """Roadmap areas the progress phase never reports on, from TAUCETI_PROGRESS_SKIP; parsed as
+    roadmap_skip() parses its list."""
+    raw = os.environ.get("TAUCETI_PROGRESS_SKIP", "")
     return sorted({tok for tok in (t.strip() for t in raw.split(",")) if tok})
 
 

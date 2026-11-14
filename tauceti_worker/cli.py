@@ -49,6 +49,7 @@ from .budget_cli import add_budget_parser, cmd_budget
 from .claude_api import api_mode, configure_api
 from .config import (
     EXTRA_ROADMAP_PROMPT_MAX_CHARS,
+    PROGRESS_STRATEGIES,
     AdmissionUnavailable,
     ClaimCollision,
     Config,
@@ -61,11 +62,14 @@ from .config import (
     extra_roadmap_prompt,
     is_git_url,
     log,
+    progress_max_open,
+    progress_strategy,
     roadmap_only,
     sanitize_wid,
     security_audit_problem,
     set_log_file,
     validate_extra_roadmap_prompt,
+    validate_progress_strategy,
     warn_red,
 )
 from .constants import (
@@ -81,6 +85,7 @@ from .constants import (
     EXPLICIT_TASKS,
     OPENROUTER_MODELS,
     PR_TASKS,
+    PROGRESS_MAX_OPEN,
     TAUCETI,
     WORK_TASKS,
 )
@@ -109,7 +114,8 @@ the cascade (priority order; a round does the first that applies):
   rebase    bring our open PRs up to date with their base branch
   bump      adapt a red bump-mathlib PR (the worker never authors one)
   lint-repair  fix what TauCeti's daily full lint found on main, on its red lint-repair PR
-  progress  write a roadmap's STATUS.md / PROGRESS.md report (globally paced at 8h)
+  progress  write a roadmap's STATUS.md / PROGRESS.md report (globally paced at 8h, or per
+            roadmap with --progress-strategy threshold)
   fix-ci    fix red CI on one of our PRs
   fix       address review feedback on one of our PRs
   review    review an open PR (runs the tauceti-review engine)
@@ -146,6 +152,7 @@ environment (flags win; full reference linked below):
   TAUCETI_WORKER_ID      pins the worker id (else `work` auto-assigns worker1, worker2, ...)
   TAUCETI_ROADMAP_ONLY   single roadmap area (unset = a fresh random area each round; "" = all areas)
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
+  TAUCETI_PROGRESS_STRATEGY / _MAX_OPEN / _SKIP   defaults for the --progress-* flags
   TAUCETI_EXTRA_ROADMAP_PROMPT   extra guidance for roadmap rounds; default for --extra-roadmap-prompt
   TAUCETI_PR             comma-separated PR numbers; default for --pr
   TAUCETI_QUOTA_CMD      default for --quota-cmd
@@ -358,6 +365,36 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--roadmap-skip OneParameterSemigroups. Excludes them from the auto-random pick and the "
         "all-areas case; --roadmap-only takes precedence if it names a skipped area. Overrides "
         "$TAUCETI_ROADMAP_SKIP for this run",
+    )
+    p.add_argument(
+        "--progress-strategy",
+        dest="progress_strategy",
+        default=None,
+        choices=PROGRESS_STRATEGIES,
+        help="for progress rounds, how a report is found. Unset: TauCetiProgress's project-wide `due` "
+        "check, then its default plan. `threshold`: no due check; the round runs `plan --strategy "
+        "threshold`, which takes a roadmap on its own merged PRs and days since its last report, and "
+        "waits for the time that plan names (at most $TAUCETI_PROGRESS_POLL seconds) when none "
+        "qualifies. Needs a TauCetiProgress revision that has the strategy ($TAUCETI_PROGRESS_REF). "
+        "Overrides $TAUCETI_PROGRESS_STRATEGY for this run",
+    )
+    p.add_argument(
+        "--progress-max-open",
+        dest="progress_max_open",
+        type=positive_integer,
+        default=None,
+        metavar="N",
+        help="under --progress-strategy threshold, plan no new report while N progress reports of "
+        f"this account are open in the roadmap repository (default {PROGRESS_MAX_OPEN}). Overrides "
+        "$TAUCETI_PROGRESS_MAX_OPEN for this run",
+    )
+    p.add_argument(
+        "--progress-skip",
+        dest="progress_skip",
+        default=None,
+        metavar="AREA[,AREA...]",
+        help="for progress rounds, a comma-separated list of roadmap areas never to report on, passed "
+        "to `plan` as --skip-area under either strategy. Overrides $TAUCETI_PROGRESS_SKIP for this run",
     )
     p.add_argument(
         "--self-tested",
@@ -1377,6 +1414,22 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     # roadmap_skip()).
     if getattr(args, "roadmap_skip", None) is not None:
         os.environ["TAUCETI_ROADMAP_SKIP"] = args.roadmap_skip
+    for flag, variable in (
+        ("progress_strategy", "TAUCETI_PROGRESS_STRATEGY"),
+        ("progress_max_open", "TAUCETI_PROGRESS_MAX_OPEN"),
+        ("progress_skip", "TAUCETI_PROGRESS_SKIP"),
+    ):
+        if getattr(args, flag, None) is not None:
+            os.environ[variable] = str(getattr(args, flag))
+    try:
+        if progress_strategy() is not None:
+            validate_progress_strategy(progress_strategy())
+    except ValueError as e:
+        raise Die(f"--progress-strategy / $TAUCETI_PROGRESS_STRATEGY {e}") from None
+    try:
+        progress_max_open()
+    except ValueError as e:
+        raise Die(f"--progress-max-open / $TAUCETI_PROGRESS_MAX_OPEN {e}") from None
     # Persist the operator's choice into loop children and recovery rounds.
     if getattr(args, "self_tested", None) is not None:
         os.environ["TAUCETI_SELF_TESTED"] = "1" if args.self_tested else "0"
