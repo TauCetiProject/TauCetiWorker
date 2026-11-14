@@ -1067,6 +1067,33 @@ class Wiring(unittest.TestCase):
         argv = spec.work_argv()
         self.assertEqual(argv[argv.index("--roadmap-targets") + 1], "/srv/targets.md")
 
+    def test_copied_dashboard_commands_carry_the_list(self):
+        """Copy exports commands meant for another shell, which has neither the list's variable nor
+        the dashboard's directory."""
+        tui = importlib.import_module("tauceti_worker.tui")
+        app = tui._dashboard_app(SimpleNamespace(logdir=Path("/nonexistent"), home=Path("/nonexistent")))
+        copied = []
+        fake = SimpleNamespace(
+            view="tasks", model_dial="auto", bubble=False, copy_to_clipboard=copied.append, push_screen=Mock()
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            cwd = os.getcwd()
+            os.chdir(root)
+            try:
+                with patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS": "my targets.md"}):
+                    type(app).action_copy_cmd(fake)
+            finally:
+                os.chdir(cwd)
+        (one,) = copied
+        loop = next(
+            a for a in fake.push_screen.call_args.args[0].__dict__.values() if isinstance(a, str) and "--loop" in a
+        )
+        for command in (one, loop):
+            argv = shlex.split(command)
+            self.assertEqual(argv[argv.index("--roadmap-targets") + 1], str(root / "my targets.md"))
+        self.assertNotIn("--roadmap-targets", tui.launch_cmd(None, "auto", False, False))
+
     def test_a_dashboard_list_given_relative_is_saved_absolute(self):
         tui = importlib.import_module("tauceti_worker.tui")
         app = tui._dashboard_app(SimpleNamespace(logdir=Path("/nonexistent"), home=Path("/nonexistent")))
