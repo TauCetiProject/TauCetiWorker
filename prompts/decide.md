@@ -18,6 +18,9 @@ one subdirectory per roadmap, each holding a README.md that states its
 milestones in order. `target_list` is the file of milestones this fleet's
 authors are working through: `[ ]` open, `[~]` in flight, `[x]` done. An empty
 value means that source is unavailable.
+`target_statuses` gives each of its items' status (`open`, `inflight`, `done`)
+as the worker sees it now, from the file and the pull requests that carry an
+item's marker; where it differs from the file's box, it is the one to go by.
 
 For each case choose one ruling from that case's `allowed` list:
 

@@ -164,7 +164,9 @@ that message names (at most six), the six latest comments, the earlier ruling
 if there was one, and the rulings it may choose from. Every text is cut to a
 fixed length.
 The file also names a read-only checkout of the roadmaps and the target list
-file, when those are available.
+file, when those are available, and gives every item of the list its status as
+the worker reads it, with the open and merged pull requests carrying its marker
+applied; that overlay is not written to the list.
 
 The answer is `{"rulings": [...]}` with one object per case: `case`, `ruling`,
 `note`, and exactly the fields of that ruling.

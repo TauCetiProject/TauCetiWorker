@@ -1022,6 +1022,23 @@ def test_prerequisite(tmp):
             ("retry", "recheck", True),
         )
 
+    root = tmp / "prerequisite-effective"
+    path.write_text(LIST)
+    landed = targets_module.target_markers(parse_targets(LIST).find("strong-law"))[0]
+
+    class Landed(Hub):
+        def merged_prs(self, search, limit=200):
+            return [{"number": 99, "title": "", "body": landed}]
+
+    with settings(root, TAUCETI_ROADMAP_TARGETS=str(path)):
+        declined(4)
+        statuses = rounds(tmp, Landed(p4={}), {"rulings": []})["packet"].get("target_statuses")
+    check(
+        "the packet gives each item's status as the worker sees it, past the file's own box",
+        (statuses, "[ ] `strong-law`" in path.read_text()),
+        ({"borel-cantelli": "done", "strong-law": "done"}, True),
+    )
+
     root = tmp / "prerequisite-relative"
     path.write_text(LIST)
     cwd = os.getcwd()
