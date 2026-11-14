@@ -347,6 +347,7 @@ class Candidate:
     rebase_budget_key: str = ""  # immutable budget chosen by this survey, including its verified progress epoch
     foreign_repair_base: str = ""  # explicit one-PR operator scope; never adds the fork to other stages
     bump_integration_failure: bool = False
+    bump_pending: bool = False  # an automatic bump taken before its build finished
     final_resolution: bool = False  # existing own-PR fix budget is spent; resolve or close
     partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
     source_repository: RepositoryRef | None = None
@@ -907,7 +908,18 @@ def survey(
     # reads no review state at all and its callers need not supply one.
     if rs is not None:
         rs.observe(prs)
-    classify_survey(cfg, gh, rs, counters, sv, enabled=enabled, deep=deep, compact=compact, cached_only=cached_only)
+    classify_survey(
+        cfg,
+        gh,
+        rs,
+        counters,
+        sv,
+        enabled=enabled,
+        deep=deep,
+        compact=compact,
+        cached_only=cached_only,
+        allow_queue_owned=bool(numbers),
+    )
     if deep:
         from .github_transport import event
 
@@ -940,6 +952,7 @@ def classify_survey(
     review_without_ci=False,
     supports_external_repair=True,
     pending=None,
+    allow_queue_owned=False,
 ):
     """One scheduling policy over normalized inventory and source capabilities.
 
@@ -978,6 +991,7 @@ def classify_survey(
         for p in nondraft
         if (sv.owns(p) or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER))
         and not {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
+        and (allow_queue_owned or "bors-staging" not in {label.lower() for label in p.labels})
     ]
     facts = {row["pr"]["number"]: row["review"] for row in compact or []}
     gaps: set[int] = set()
@@ -1276,11 +1290,15 @@ def classify_survey(
     #    out from under the last-known-good bump and TauCeti/ needs adapting. We adapt it; we never
     #    author a bump (the bot owns opening them, CI owns merging the green ones). This is the
     #    bump-specific CI-fixer: fix-ci defers a red bump PR here (rebase still owns its conflicts and
-    #    fix still owns its review findings).
+    #    fix still owns its review findings). An automatic bump is also taken while its build is
+    #    still PENDING: a full rebuild against a new Mathlib takes hours of CI, and a worker with a
+    #    warm cache finds the breakage in minutes. It stays actionable until CI is green or a round
+    #    has verified the head locally (`self-tested`).
     for p in tended if "bump" in enabled else []:
         integration = p.build_success and p.bump_integration_failed
         branch = p.head_ref.startswith(BUMP_HEAD_PREFIX) or (integration and p.head_ref == "hopscotch/lkg-bump")
-        if not (branch and (p.needs_ci_repair or integration)):
+        pending = p.automatic_bump and not (p.build_success or p.build_failed or p.self_tested)
+        if not (branch and (p.needs_ci_repair or integration or pending)):
             continue
         if {label.lower() for label in p.labels} & {
             "keep",
@@ -1295,13 +1313,21 @@ def classify_survey(
         c = Candidate(
             p.number,
             p.head_oid,
-            "bump-mathlib, singleton integration failed" if integration else "bump-mathlib, build red",
+            "bump-mathlib, singleton integration failed"
+            if integration
+            else "bump-mathlib, build pending"
+            if pending
+            else "bump-mathlib, build red",
             bump_integration_failure=integration,
+            bump_pending=pending,
         )
         per_head = counters.read(f"bump-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"bump-pr-{p.number}")
         c.attempts, c.budget = per_head, MAX_BUMP_ATTEMPTS
-        if not p.automatic_bump and (per_head >= MAX_BUMP_ATTEMPTS or per_pr >= MAX_BUMP_PR_ATTEMPTS):
+        # One round per pending head; once CI fails, the ordinary red-build retries apply.
+        if (pending and per_head) or (
+            not p.automatic_bump and (per_head >= MAX_BUMP_ATTEMPTS or per_pr >= MAX_BUMP_PR_ATTEMPTS)
+        ):
             sv.bump.suppressed.append(c)
         else:
             sv.bump.actionable.append(c)

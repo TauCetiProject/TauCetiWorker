@@ -417,14 +417,18 @@ def _find_fork() -> str | None:
     return None
 
 
-@functools.lru_cache(maxsize=1)
 def ensure_fork() -> str:
     """The contributor's own fork of TAUCETI (`owner/repo`), creating it if absent. The worker pushes
     authored branches here and opens PRs from it, so it never needs write access to canonical. Fails
     closed if the resolved fork can't be pushed to (e.g. a token scoped only to the base repo)."""
     from .worker_sources import current
 
-    source = current()
+    return _source_fork(current())
+
+
+@functools.lru_cache(maxsize=4)
+def _source_fork(source) -> str:
+    # Keyed by the selected source: a round can resolve its GitHub claim fork and its native fork.
     if source is not None:
         return source.writable_repository().name
 
@@ -435,6 +439,9 @@ def ensure_fork() -> str:
             f"push to your fork (a token scoped only to {TAUCETI} is not enough), or set TAUCETI_FORK."
         )
     return fork
+
+
+ensure_fork.cache_clear = _source_fork.cache_clear
 
 
 def _resolve_fork() -> str:
@@ -1235,7 +1242,8 @@ class GitHub:
         per guarded round per PR, so collapsing ~5 REST calls into 1 GraphQL call is the bulk of the
         round's GitHub spend. None on any failure (caller treats that as 'can't tell'). Review threads are
         fetched first:100; on the rare PR with more, we fall back to the exact paginated REST count so the
-        guard never undercounts a comment that landed on a later thread."""
+        guard never undercounts a comment that landed on a later thread. `edited` is when the description
+        was last replaced (None: never), which lets the guard see a description repair."""
         from .github_state import read
 
         available, row = read(self.repo, "progress", number=pr)
@@ -1244,8 +1252,8 @@ class GitHub:
         owner, _, name = self.repo.partition("/")
         q = (
             "query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){"
-            "pullRequest(number:$pr){headRefOid state isDraft labels(first:100){nodes{name}} comments{totalCount}"
-            "reviewThreads(first:100){totalCount nodes{comments{totalCount}}}}}}"
+            "pullRequest(number:$pr){headRefOid state isDraft lastEditedAt labels(first:100){nodes{name}} "
+            "comments{totalCount} reviewThreads(first:100){totalCount nodes{comments{totalCount}}}}}}"
         )
         p = self._gh(
             ["api", "graphql", "-f", f"query={q}", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"pr={pr}"]
@@ -1270,8 +1278,47 @@ class GitHub:
                     if "isDraft" in d and "labels" in d
                     else {}
                 ),
+                **({"edited": d["lastEditedAt"]} if "lastEditedAt" in d else {}),
             }
         except (json.JSONDecodeError, KeyError, TypeError):
+            return None
+
+    def pr_description_repair(self, pr: int, edited: str | None, ncomments: int) -> bool | None:
+        """Whether this account replaced the PR description after `edited`, its earlier edit time, and
+        wrote one of the comments added since the PR had `ncomments`. Read from the PR in one request,
+        because the mutation journal that records the same is optional. A peer's edit or reply is not
+        this account's. None when it cannot be told: a failed read, or more review threads or new
+        comments than the request shows."""
+        owner, _, name = self.repo.partition("/")
+        q = (
+            "query($owner:String!,$name:String!,$pr:Int!){viewer{login} repository(owner:$owner,name:$name){"
+            "pullRequest(number:$pr){lastEditedAt editor{login} "
+            "comments(last:10){totalCount nodes{createdAt author{login}}} reviewThreads(first:100){totalCount "
+            "nodes{comments(last:10){totalCount nodes{createdAt author{login}}}}}}}}"
+        )
+        p = self._gh(
+            ["api", "graphql", "-f", f"query={q}", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"pr={pr}"]
+        )
+        if p.returncode != 0:
+            return None
+        try:
+            payload = json.loads(p.stdout)
+            if payload.get("errors"):
+                return None
+            me = payload["data"]["viewer"]["login"].lower()
+            d = payload["data"]["repository"]["pullRequest"]
+            threads = d["reviewThreads"]
+            if threads["totalCount"] > 100:
+                return None
+            written = [d["comments"], *(t["comments"] for t in threads["nodes"])]
+            new = sum(c["totalCount"] for c in written) - ncomments
+            if d["lastEditedAt"] in (None, edited) or ((d["editor"] or {}).get("login") or "").lower() != me or new < 1:
+                return False
+            if new > 10:
+                return None
+            newest = sorted((n for c in written for n in c["nodes"]), key=lambda n: n["createdAt"], reverse=True)
+            return any(((n["author"] or {}).get("login") or "").lower() == me for n in newest[:new])
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
             return None
 
     def _pr_progress_state_rest(self, pr: int, head: str, state: str | None = None) -> dict | None:

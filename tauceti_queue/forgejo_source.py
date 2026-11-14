@@ -108,6 +108,8 @@ class NativeAdmissionPolicy(AdmissionPolicy):
     def __init__(self, publishers, *, clock=time.time, pending_timeout_seconds=21600, base_branch="main", **kwargs):
         if not isinstance(publishers, NativePublishers):
             raise ValueError("native admission requires explicit publisher identities")
+        # Each forge numbers its own PRs, so a rubric being phased in has a cutoff for this source.
+        kwargs.setdefault("repository", publishers.source.repository.key)
         super().__init__(**kwargs)
         if type(pending_timeout_seconds) is not int or not 1 <= pending_timeout_seconds <= 86400 or not base_branch:
             raise ValueError("native admission needs a bounded review wait and base branch")

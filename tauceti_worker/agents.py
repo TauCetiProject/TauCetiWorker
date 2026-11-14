@@ -465,8 +465,19 @@ def fill_prompt(path: Path, **subs) -> str:
     source = current()
     if source is not None:
         host_repo = source.repository.forge.url.split("://", 1)[1] + "/" + source.repo
-        text = text.replace("https://github.com/" + TAUCETI, source.repository.url)
-        text = text.replace("--repo " + TAUCETI, "--repo " + host_repo)
+        # Match a complete repository token. Shared repositories such as
+        # TauCetiRoadmap have the content repository's name as a prefix.
+        boundary = r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_.-])"
+        text = re.sub(
+            re.escape("https://github.com/" + TAUCETI) + r"(\.git)?" + boundary,
+            lambda match: source.repository.url + (match[1] or ""),
+            text,
+        )
+        text = re.sub(
+            re.escape("--repo " + TAUCETI) + boundary,
+            lambda _: "--repo " + host_repo,
+            text,
+        )
     # An unfilled placeholder ships literal `__BIN__/git-safe-push` to the agent, which is the
     # command-not-found failure wrapper_bin exists to end. Fail here instead, but only for the
     # prompts we ship: the progress prompt is served by the pinned TauCetiProgress build (written
@@ -543,7 +554,7 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "module-system, lint and shim-expiry phases. It prints `scope:`, phase exits and a durable receipt path. "
         "For diagnosis, use `--stage build|axioms|module-system|lint|shim-expiry`; final verification uses all stages. "
         "Exact-input phase receipts avoid repeated successful work; use `--no-reuse` only to investigate evidence. "
-        "Claude shell commands run in the foreground with a ten-minute limit, or the shorter remaining round. "
+        "Foreground verification may use the remaining round budget; do not impose a ten-minute timeout. "
         "If an interrupted helper hands verification to a supervisor continuation, let it finish there. "
         "If Codex returns an execution session ID, keep waiting on that same session with write_stdin until it exits. "
         "Write diagnostic logs and module lists outside the checkout (the helper already keeps logs in worker state). "
@@ -829,24 +840,21 @@ def fetch_git_source(url: str, dir: Path) -> bool:
     return _fetch_shallow(url, dir)
 
 
-SHELL_LIMIT_SECONDS = 600  # an authoring round's foreground shell limit
-
-
 def _foreground_shell_env(deadline: float, limit_seconds: float | None = None) -> dict[str, str]:
-    # A shell command is not a whole round. Background tasks can retain the CLI
-    # after its final answer and overlap later builds in the same checkout.
-    # ``TAUCETI_SHELL_LIMIT_SECONDS`` lets a launcher with its own budget (the queue's repair task,
-    # whose agent runs whole-library builds in the foreground) lengthen the limit for its agent.
+    # Keep commands in the foreground, bounded by the round rather than an unrelated
+    # ten-minute ceiling: waiting for compiler capacity consumes wall time too.
+    # Launchers may still request a shorter command budget explicitly.
     if limit_seconds is None:
         try:
-            limit_seconds = float(os.environ.get("TAUCETI_SHELL_LIMIT_SECONDS") or SHELL_LIMIT_SECONDS)
+            value = os.environ.get("TAUCETI_SHELL_LIMIT_SECONDS")
+            limit_seconds = float(value) if value else None
         except ValueError:
-            limit_seconds = SHELL_LIMIT_SECONDS
-    limit_ms = max(1000, int(limit_seconds * 1000))
+            limit_seconds = None
     remaining_ms = max(1000, int((deadline - time.time()) * 1000))
+    timeout_ms = remaining_ms if limit_seconds is None else min(remaining_ms, max(1000, int(limit_seconds * 1000)))
     return {
-        "BASH_DEFAULT_TIMEOUT_MS": str(min(limit_ms, remaining_ms)),
-        "BASH_MAX_TIMEOUT_MS": str(min(limit_ms, remaining_ms)),
+        "BASH_DEFAULT_TIMEOUT_MS": str(timeout_ms),
+        "BASH_MAX_TIMEOUT_MS": str(timeout_ms),
         "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
     }
 
@@ -883,7 +891,9 @@ def host_agent_argv(
 
     With ``prompt_on_stdin`` the prompt is left out of argv (Claude) or replaced by ``-`` (Codex) and
     the caller writes it to the process's stdin; see ``host_agent_launch``."""
-    env = {**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"}
+    from .build_resources import defaults
+
+    env = defaults({**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"})
     env["TAUCETI_VERIFY_PYTHON"] = sys.executable
     env.update(_foreground_shell_env(float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200)))
     profile = _authoring_profile(profile)
@@ -1493,6 +1503,9 @@ def lake_cache_max_revs(env: dict) -> str:
 @contextlib.contextmanager
 def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
     """Keep the public service available through repairs, merges and dependency changes."""
+    from .build_resources import defaults
+
+    defaults(env)
     if not TAUCETI_CACHE_SERVICE:
         yield
         return
@@ -2354,6 +2367,12 @@ def run_in_bubble(
     (rounddir / "lean").chmod(0o755)
     (rounddir / "tauceti-tools").write_text('#!/bin/sh\nexec python3 -m tauceti_tools "$@"\n')
     (rounddir / "tauceti-tools").chmod(0o755)
+    shutil.copy(
+        HERE / "verification_resources.py"
+        if (HERE / "verification_resources.py").exists()
+        else HERE / "tauceti_worker/verification_resources.py",
+        rounddir / "verification_resources.py",
+    )
     # Cheap V0 diagnostics also need these; do not tie them to the helper canary opt-in.
     from tauceti_tools.templates import ASSETS
 
@@ -2484,7 +2503,16 @@ def run_in_bubble(
         if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
             tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
     tcenv += " TAUCETI_LOCAL_LINT_CACHE=/opt/local-lint-cache TAUCETI_VERIFY_PYTHON=/usr/bin/python3"
+    if resource_wait := os.environ.get("TAUCETI_BUILD_RESOURCE_WAIT"):
+        wait_path = Path(resource_wait)
+        wait_path.parent.mkdir(parents=True, exist_ok=True)
+        mount_flags += ["--mount", f"{wait_path.parent}:/opt/resource-waits:rw"]
+        tcenv += " TAUCETI_BUILD_RESOURCE_WAIT=/opt/resource-waits/" + shlex.quote(wait_path.name)
     tcenv += " LAKE_OVERRIDE_LEAN=true LEAN=/opt/round/tauceti-lean"
+    from .build_resources import DEFAULTS
+
+    for name, value in DEFAULTS.items():
+        tcenv += f" {name}={shlex.quote(os.environ.get(name, value))}"
     if inner_cmd is None:
         for key, value in _foreground_shell_env(
             getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)
@@ -3036,8 +3064,9 @@ _WORKER_SKILL = "pi"
 # from host_agent_argv, so they are deliberately absent rather than a second source of truth.
 _WORKER_CLAUDE_SETTINGS = {
     # The isolated .claude/projects/*.jsonl is the only per-turn record of what a claude round did;
-    # the worker's own logs/agent-*.log is a rendered summary. Keep both.
-    "cleanupPeriodDays": 36500,
+    # the worker's own logs/agent-*.log is a rendered summary. Keep a month of transcripts
+    # (retention.TRANSCRIPT_LIFETIME, which also bounds Codex sessions): unbounded, they filled disks.
+    "cleanupPeriodDays": 30,
     "permissions": {"defaultMode": "bypassPermissions"},
     # An unattended round has no one to show an artifact to, and publishing one is outward-facing.
     "enableArtifact": False,
@@ -3049,6 +3078,9 @@ _WORKER_CLAUDE_SETTINGS = {
     # production.
     "skipDangerousModePermissionPrompt": True,
 }
+# Earlier generated versions. A settings.json still exactly equal to one of them was never edited
+# by the operator, so it is upgraded in place (and discarded like the current one).
+_PREVIOUS_WORKER_CLAUDE_SETTINGS = ({**_WORKER_CLAUDE_SETTINGS, "cleanupPeriodDays": 36500},)
 
 
 def _config_sources(real_claude: Path | None, iso_claude: Path) -> tuple[Path, ...]:
@@ -3153,9 +3185,15 @@ def seed_worker_claude_config(real_claude: Path | None, iso_claude: Path) -> Non
         except OSError:
             pass
 
-    # Written once, so an operator can tune a worker by editing it in place.
+    # Written once, so an operator can tune a worker by editing it in place; a file still exactly
+    # as an earlier version generated it is brought up to date.
     settings = iso_claude / "settings.json"
-    if not settings.exists() and not settings.is_symlink():
+    try:
+        stale = settings.is_file() and not settings.is_symlink()
+        stale = stale and json.loads(settings.read_text()) in _PREVIOUS_WORKER_CLAUDE_SETTINGS
+    except (OSError, ValueError):
+        stale = False
+    if stale or (not settings.exists() and not settings.is_symlink()):
         try:
             _write_json_atomic(settings, _WORKER_CLAUDE_SETTINGS)
         except OSError:
@@ -3171,7 +3209,7 @@ def _discard_generated(iso_claude: Path) -> None:
     settings = iso_claude / "settings.json"
     try:
         if settings.is_file() and not settings.is_symlink():
-            if json.loads(settings.read_text()) == _WORKER_CLAUDE_SETTINGS:
+            if json.loads(settings.read_text()) in (_WORKER_CLAUDE_SETTINGS, *_PREVIOUS_WORKER_CLAUDE_SETTINGS):
                 settings.unlink()
     except (OSError, ValueError):
         pass

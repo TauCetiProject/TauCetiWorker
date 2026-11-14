@@ -35,6 +35,20 @@ class SourceGit(unittest.TestCase):
         )
         self.source = ForgejoGitSource(self.identity, self.api, self.clone, token="fixture-source-token")
 
+    def test_mergeability_distinguishes_a_proved_conflict_from_tool_failure(self):
+        for status, output, expected in (
+            (0, b"c" * 40 + b"\n", "MERGEABLE"),
+            (1, b"c" * 40 + "\nconflict: é\n".encode(), "CONFLICTING"),
+        ):
+            with patch.object(self.source, "_git", return_value=subprocess.CompletedProcess([], status, output, b"")):
+                self.assertEqual(self.source.mergeability("team/Math", "a" * 40, "b" * 40), expected)
+        for status, output in ((1, b"failed\n"), (128, b""), (0, b"")):
+            with (
+                patch.object(self.source, "_git", return_value=subprocess.CompletedProcess([], status, output, b"")),
+                self.assertRaises(Incomplete),
+            ):
+                self.source.mergeability("team/Math", "a" * 40, "b" * 40)
+
     def test_credentials_are_scoped_and_do_not_inherit_execution_or_trace_environment(self):
         with patch.dict(
             os.environ, GH_TOKEN="ci-only-token", GIT_TRACE="1", GIT_CONFIG_COUNT="99", GIT_SSL_NO_VERIFY="1"
