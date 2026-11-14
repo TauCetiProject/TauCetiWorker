@@ -566,11 +566,29 @@ def referenced_attempt(cfg, attempt):
     return False
 
 
-def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_configs=None):
+def past(deadline):
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def remaining(deadline, cap):
+    """A phase's time slice: at most ``cap`` seconds, and never past the run's deadline."""
+    return cap if deadline is None else max(0.0, min(cap, deadline - time.monotonic()))
+
+
+def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_configs=None, deadline=None):
+    """``deadline`` (time.monotonic()) bounds the whole sweep: each phase checks it before
+    starting and the remaining phases are reported as deferred to the next run."""
     from . import activity, shared_mathlib
 
     now = time.time() if now is None else now
     report = fresh_report(now)
+
+    def defer(phase):
+        if not past(deadline):
+            return False
+        report.setdefault("deferred", []).append(phase)
+        return True
+
     opened = open_files()
     mounts = mount_points()
     configs = list(worker_configs())
@@ -579,27 +597,30 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
 
         # Already-retired data needs no source archival. Use the existing collector
         # and deletion cursors instead of the activity preparer's tiny foreground slice.
-        if not dry:
+        if not dry and not defer("retained-cleanup"):
             try:
                 # Retained trees need the existing background collector too;
                 # activity preparation only inventories and requests this work.
                 report["retained_cleanup"] = recovery_maintenance.prepare(
                     worker_state_root().resolve(),
-                    seconds=30,
+                    seconds=remaining(deadline, 30),
                     entries=262144,
                     bytes=1024**3,
                     removal_bytes=32 * 1024**3,
                 )
             except Exception as error:
                 note(report, "errors", f"retained cache cleanup: {error}")
+        if not dry and not defer("recovery-trash"):
             try:
-                trash = recovery_maintenance.collect_discarded(worker_state_root().resolve())
+                trash = recovery_maintenance.collect_discarded(
+                    worker_state_root().resolve(), seconds=remaining(deadline, 30)
+                )
                 report["recovery_trash"] = trash
                 for error in trash.get("errors", []):
                     note(report, "errors", "recovery trash: " + error)
             except Exception as error:
                 note(report, "errors", f"recovery trash cleanup: {error}")
-        if shared:
+        if shared and not defer("shared-caches"):
             from .cache_storage import collect
 
             try:
@@ -628,11 +649,16 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
         from . import verification_storage
 
         states = [state for cfg in configs for state in (cfg.state, cfg.state / "verification-state")]
-        report["verification_storage"] = (
-            read_json(verification_storage.root() / "status.json") if dry else verification_storage.housekeep(states)
-        )
+        if not defer("verification-storage"):
+            report["verification_storage"] = (
+                read_json(verification_storage.root() / "status.json")
+                if dry
+                else verification_storage.housekeep(states)
+            )
 
     for cfg in configs:
+        if defer(f"worker {cfg.wid}"):
+            continue
         collect_review_scratch(cfg, report, dry=dry)
         try:
             if not safe(cfg.state, cfg.state.parent):
@@ -1014,7 +1040,7 @@ def run(*, dry=False, diagnostics_only=False, deadline=None):
     pin_root()
     with locked(root() / "cleanup.lock", dry=dry), root_lock(worker_state_root(), dry=dry):
         before = free_bytes(worker_state_root())
-        report = sweep(dry=dry, diagnostics_only=diagnostics_only)
+        report = sweep(dry=dry, diagnostics_only=diagnostics_only, deadline=deadline)
         if not diagnostics_only:
             retire_roots(report, dry=dry, deadline=deadline)
         report["free_before_bytes"] = before
@@ -1595,7 +1621,7 @@ def run_all(*, dry=False, deadline=None):
             for index, path in enumerate(paths):
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
                 try:
-                    result = sweep(dry=dry, shared=index == 0, shared_configs=configs)
+                    result = sweep(dry=dry, shared=index == 0, shared_configs=configs, deadline=deadline)
                 except Exception as error:
                     result = fresh_report()
                     note(result, "errors", str(error))

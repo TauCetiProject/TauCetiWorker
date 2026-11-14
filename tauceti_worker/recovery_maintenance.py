@@ -1303,23 +1303,26 @@ def _drain_discarded(base, errors):
             directory = parent / "discarded"
             if parent.is_symlink() or directory.is_symlink() or not directory.is_dir():
                 continue
-            entries = list(directory.iterdir())
+            # Enumerate lazily: each entry is charged as it is read, so a huge queue
+            # cannot spend the run's time or memory before the first budget check.
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    work.charge(entries=1)
+                    path = Path(entry.path)
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            _drain_entry(path, work)
+                        elif path.suffix in (".json", ".lock"):
+                            _drop_orphan_sidecars(path.with_suffix(""))
+                    except wr.BudgetExhausted:
+                        raise
+                    except (OSError, ValueError, TypeError, KeyError) as error:
+                        errors.append(str(error)[:200])
         except OSError as error:
             errors.append(f"{state.name}: {error}"[:200])
             continue  # one unreadable queue must not stop the others
-        for path in entries:
-            work.charge(entries=1)
-            try:
-                if path.is_symlink():
-                    continue
-                if path.is_dir():
-                    _drain_entry(path, work)
-                elif path.suffix in (".json", ".lock"):
-                    _drop_orphan_sidecars(path.with_suffix(""))
-            except wr.BudgetExhausted:
-                raise
-            except (OSError, ValueError, TypeError, KeyError) as error:
-                errors.append(str(error)[:200])
 
 
 def _drop_orphan_sidecars(path):
