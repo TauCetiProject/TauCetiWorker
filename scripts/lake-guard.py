@@ -2,7 +2,8 @@
 
 argv: REAL_LAKE WRAPPER_DIR LAKE_ARGS...
 
-Refuses every spelling of Mathlib's archive extraction (`lake [opts] exe|exec [opts]
+Refuses `lake update` (dependency resolution belongs to the worker's trusted publisher, and the
+shared sources are read-only) and every spelling of Mathlib's archive extraction (`lake [opts] exe|exec [opts]
 [pkg/]cache [opts] get|get!|unpack|unpack!`): if the workspace's Mathlib pin still matches the
 shared entry there is nothing to fetch (exit 0); if it has moved, building would compile Mathlib
 privately, so the agent must stop and report (exit 1). `lake env CMD...` would put the
@@ -68,12 +69,10 @@ def extraction(command):
 def pins(workspace):
     """(checkout's Mathlib pin, shared build's pin), or None when either cannot be read."""
     try:
-        marker = workspace / ".lake/packages/mathlib/.lake/tauceti-shared-mathlib.json"
-        marker = json.loads(marker.read_text())
-        ready = json.loads((Path(marker["pool"]) / "entries" / marker["key"] / "ready.json").read_text())
+        marker = json.loads((workspace / ".lake/tauceti-mathlib/view.json").read_text())
         packages = json.loads((workspace / "lake-manifest.json").read_text()).get("packages", [])
         rev = next(p.get("rev") for p in packages if p.get("name") == "mathlib")
-        return rev, ready["spec"]["mathlib"]
+        return rev, marker["rev"]
     except Exception:
         return None
 
@@ -98,6 +97,14 @@ def main(real, wrapper, args):
             file=sys.stderr,
         )
         print("Do not build or fetch Mathlib here. Stop and report that the Mathlib pin changed.", file=sys.stderr)
+        return 1
+    if command[:1] == ["update"] and pins(workspace) is not None:
+        # Resolution rewrites lake-manifest.json and fetches into the shared, read-only sources.
+        print(
+            "lake update: Mathlib and its dependencies come from this host's shared build, which only the"
+            " worker resolves. Do not change dependencies in this round; stop and report what needs to change.",
+            file=sys.stderr,
+        )
         return 1
     found = pins(workspace)
     if found and found[0] != found[1] and not ({"--version", "-h", "--help"} & set(args) or command[:1] == ["help"]):

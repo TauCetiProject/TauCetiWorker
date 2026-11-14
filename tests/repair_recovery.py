@@ -3291,6 +3291,15 @@ class ConversationIsolation(unittest.TestCase):
 
 
 class RealVerifierIntegration(unittest.TestCase):
+    def setUp(self):
+        # The real cache context reads the shared Mathlib pool; never the host's real one.
+        pool = tempfile.TemporaryDirectory(prefix="tauceti-shared-mathlib-")
+        self.addCleanup(pool.cleanup)
+        environment = patch.dict(os.environ, {"TAUCETI_SHARED_MATHLIB_ROOT": pool.name})
+        environment.start()
+        self.addCleanup(environment.stop)
+        assert os.environ["TAUCETI_SHARED_MATHLIB_ROOT"] == pool.name
+
     def test_shared_view_uses_the_existing_verifier_cli_and_resolved_base(self):
         from verification import Receipts
 
@@ -3333,7 +3342,16 @@ class RealVerifierIntegration(unittest.TestCase):
         backend = rr.WorkerBackend(w, SimpleNamespace())
         facts = dict(labels=[], ref="repair", head=case.base, repository="alice/repo")
         manifest = dict(id="real-receipt", authorization={})
-        with patch("tauceti_worker.agents.prepare_host_build_caches") as warm:
+        import contextlib
+
+        @contextlib.contextmanager
+        def shared_view(cwd, env, logdir, fetch):
+            yield ["env"]  # a transparent stand-in for the shared Mathlib namespace prefix
+
+        with (
+            patch("tauceti_worker.agents.prepare_host_build_caches") as warm,
+            patch("tauceti_worker.shared_mathlib.view", shared_view),
+        ):
             first = backend.verify(case.root, manifest, facts)
             self.assertEqual(first["status"], "success", first.get("error"))
             second = backend.verify(case.root, manifest, facts)

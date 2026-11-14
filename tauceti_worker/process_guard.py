@@ -138,7 +138,7 @@ def main():
                 env=environment,
                 close_fds=True,
                 start_new_session=not subreaper,
-                pass_fds=(int(lease),) if lease else (),
+                pass_fds=tuple(int(fd) for fd in lease.split(",") if fd) if lease else (),
             )
         except OSError:
             print("owned tool could not start", file=sys.stderr, flush=True)
