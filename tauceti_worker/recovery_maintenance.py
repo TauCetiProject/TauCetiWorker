@@ -1051,21 +1051,7 @@ class Sweep:
                 row["cleanup_oldest_at"] = min(row["cleanup_oldest_at"] or oldest, oldest)
             return
         if kind == "discarded":
-            if not path.is_dir() or path.is_symlink():
-                return
-            cursor = path.with_name(path.name + ".json")
-            job = read_json(cursor)
-            if not job:
-                info = path.stat()
-                job = dict(tree_identity=[info.st_dev, info.st_ino])
-            try:
-                if _remove(path, job, work):
-                    cursor.unlink(missing_ok=True)
-                    return
-            finally:
-                if path.exists():
-                    atomic_json(cursor, job)
-            return
+            return  # drained by prepare() after the housekeeping lock is released
         if kind == "registration":
             self.current_registration = {}
             registry = _metadata(path)
@@ -1262,6 +1248,63 @@ class Sweep:
                 row["cleanup_actions"][action] = row["cleanup_actions"].get(action, 0) + 1
 
 
+def _drain_entry(path, work):
+    """Delete one discarded tree under its own lock; skip it while another drainer holds it."""
+    lock_path = path.with_name(path.name + ".lock")
+    with lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        if not path.is_dir() or path.is_symlink():
+            lock_path.unlink(missing_ok=True)
+            return True
+        cursor = path.with_name(path.name + ".json")
+        job = read_json(cursor)
+        info = path.stat()
+        if (
+            job.get("tree_identity") != [info.st_dev, info.st_ino]
+            or not isinstance(job.get("stack", []), list)
+            or any(not isinstance(part, str) for part in job.get("stack", []))
+        ):
+            job = dict(tree_identity=[info.st_dev, info.st_ino])
+        try:
+            if _remove(path, job, work):
+                cursor.unlink(missing_ok=True)
+                lock_path.unlink(missing_ok=True)
+                return True
+        finally:
+            if path.exists():
+                atomic_json(cursor, job)
+    return False
+
+
+def _drain_discarded(base, errors):
+    """Delete detached discarded trees, each under its own lock and never the housekeeping lock,
+    so a deletion stuck in kernel I/O blocks only that entry while everything else progresses."""
+    from . import work_recovery as wr
+
+    work = wr._WORK.get()
+    for state in base.iterdir():
+        work.charge(entries=1)
+        if state.is_symlink() or not state.is_dir():
+            continue
+        parent = state / "recovery-cleanup"
+        directory = parent / "discarded"
+        if parent.is_symlink() or directory.is_symlink() or not directory.is_dir():
+            continue
+        for path in directory.iterdir():
+            work.charge(entries=1)
+            if path.is_symlink() or not path.is_dir():
+                continue
+            try:
+                _drain_entry(path, work)
+            except wr.BudgetExhausted:
+                raise
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                errors.append(str(error)[:200])
+
+
 def collect_discarded(base, *, seconds=30, entries=262144, removal_bytes=32 * 1024**3):
     """The low-priority collector drains retired trash, independently of source recovery."""
     from . import work_recovery as wr
@@ -1273,40 +1316,7 @@ def collect_discarded(base, *, seconds=30, entries=262144, removal_bytes=32 * 10
     try:
         if not base.is_dir():
             return dict(removed_bytes=0, errors=[])
-        with (base / ".recovery-housekeeping.lock").open("a+") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return dict(busy=True)
-            for state in base.iterdir():
-                work.charge(entries=1)
-                if state.is_symlink() or not state.is_dir():
-                    continue
-                parent = state / "recovery-cleanup"
-                directory = parent / "discarded"
-                if parent.is_symlink() or directory.is_symlink() or not directory.is_dir():
-                    continue
-                for path in directory.iterdir():
-                    work.charge(entries=1)
-                    if path.is_symlink() or not path.is_dir():
-                        continue
-                    cursor = path.with_name(path.name + ".json")
-                    job = read_json(cursor)
-                    info = path.stat()
-                    if (
-                        job.get("tree_identity") != [info.st_dev, info.st_ino]
-                        or not isinstance(job.get("stack", []), list)
-                        or any(not isinstance(part, str) for part in job.get("stack", []))
-                    ):
-                        job = dict(tree_identity=[info.st_dev, info.st_ino])
-                    try:
-                        if _remove(path, job, work):
-                            cursor.unlink(missing_ok=True)
-                    except (OSError, ValueError, TypeError, KeyError) as error:
-                        errors.append(str(error)[:200])
-                    finally:
-                        if path.exists():
-                            atomic_json(cursor, job)
+        _drain_discarded(base, errors)
     except wr.BudgetExhausted:
         pass
     except OSError as error:
@@ -1314,6 +1324,10 @@ def collect_discarded(base, *, seconds=30, entries=262144, removal_bytes=32 * 10
     finally:
         wr._WORK.reset(token)
     return dict(work.report(), errors=errors[:10])
+
+
+class _HousekeepingBusy(Exception):
+    """Another process holds the housekeeping lock; detached trash is still drained."""
 
 
 def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup=True, removal_bytes=None):
@@ -1334,6 +1348,7 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup
     checks = Checks(base)
     checks_token = _CHECKS.set(checks if cleanup else None)
     sweep = None
+    busy = False
     try:
         base.mkdir(parents=True, exist_ok=True)
         if adaptive:
@@ -1345,7 +1360,7 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                return dict(busy=True)
+                raise _HousekeepingBusy() from None
             key = base if cleanup else (base, "inventory")
             sweep = _SWEEPS.setdefault(key, Sweep(base, cleanup=cleanup))
             # Reserve most of every budget for inventory and deletion too. A
@@ -1406,6 +1421,8 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup
                     if item[1] in {"tree", "cache", "retained-entry", "cache-entry", "discarded"}:
                         sweep.pending = None
                 sweep.pending = None
+    except _HousekeepingBusy:
+        busy = True
     except wr.BudgetExhausted:
         pass
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError, wr.RecordError):
@@ -1414,6 +1431,27 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup
         wr._WORK.reset(token)
         _CHECKS.reset(checks_token)
     report = work.report()
+    if busy:
+        report["busy"] = True
+    if cleanup and base.is_dir():
+        # Outside the housekeeping lock, with the same allowance again: detached trash never
+        # waits behind inventory, and a stuck deletion cannot hold up the next sweep.
+        trash = wr.Work(seconds=seconds, entries=entries, bytes=bytes, removal_bytes=work.removal_bytes)
+        trash_token = wr._WORK.set(trash)
+        trash_errors = []
+        try:
+            _drain_discarded(base, trash_errors)
+        except wr.BudgetExhausted:
+            pass
+        except OSError as error:
+            trash_errors.append(str(error)[:200])
+        finally:
+            wr._WORK.reset(trash_token)
+        drained = trash.report()
+        for key in ("removed_bytes", "removed_entries"):
+            report[key] = report.get(key, 0) + drained.get(key, 0)
+        if trash_errors:
+            report["trash_errors"] = trash_errors[:10]
     report.update(
         safety_seconds=checks.seconds,
         process_scans=checks.scans,

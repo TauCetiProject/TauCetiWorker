@@ -1453,6 +1453,20 @@ print('{"result":"kept on protocol stdout"}', flush=True)
         with patch.dict(sys.modules, {"psutil": fake([Process(mine, [held]), Process(mine, denied=True)])}):
             self.assertIsNone(retention._open_files_psutil())
 
+    def test_timer_unit_bounds_each_run(self):
+        directory = self.root / "config/systemd/user"
+        with (
+            patch.object(retention.sys, "platform", "linux"),
+            patch("tauceti_worker.worker_manager._service_path", return_value=directory / "tauceti-workers.service"),
+            patch.object(subprocess, "run"),
+        ):
+            retention.install_timer()
+        unit = (directory / "tauceti-cleanup.service").read_text()
+        self.assertIn(f"TimeoutStartSec={retention.TIMER_TIMEOUT}", unit)
+        self.assertIn(f'"--max-seconds" "{retention.TIMER_SECONDS}"', unit)
+        self.assertLess(retention.TIMER_SECONDS, retention.TIMER_TIMEOUT)
+        self.assertLess(retention.TIMER_TIMEOUT, 3600)
+
 
 if __name__ == "__main__":
     unittest.main()

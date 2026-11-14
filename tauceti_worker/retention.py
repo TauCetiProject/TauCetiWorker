@@ -756,6 +756,8 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
 
 
 FALLBACK_INTERVAL = 3600  # the installed timer's cadence
+TIMER_SECONDS = 2400  # an installed timer run's deletion budget, inside its hour
+TIMER_TIMEOUT = 3300  # systemd stops a run that has not finished by then
 FALLBACK_RETRY = 300  # after a start that never reported back
 FALLBACK_SECONDS = 900  # one fallback run's budget; durable cursors resume the rest next hour
 FALLBACK_LOG_BYTES = 1024**2
@@ -1045,8 +1047,9 @@ def install_timer():
     )
     (directory / "tauceti-cleanup.service").write_text(
         "[Unit]\nDescription=Reclaim retired TauCeti worker data\n[Service]\nType=oneshot\nNice=10\n"
-        "IOSchedulingClass=idle\nExecStart="
-        + " ".join(map(quote, self_argv("cleanup", "--all-data-roots")))
+        # Bounded runs: one stalled in kernel I/O must not stop the timer from ever firing again.
+        f"IOSchedulingClass=idle\nTimeoutStartSec={TIMER_TIMEOUT}\nExecStart="
+        + " ".join(map(quote, self_argv("cleanup", "--all-data-roots", "--max-seconds", TIMER_SECONDS)))
         + "\n"
         + extra
     )
