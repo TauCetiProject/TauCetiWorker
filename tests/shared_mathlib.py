@@ -124,7 +124,7 @@ class SharedTests(unittest.TestCase):
         status.mkdir(parents=True)
         s.atomic_json(status / "live.json", dict(supervisor=s.process_identity(os.getpid()), containment_mode="legacy"))
         (status / "broken.json").write_text("{broken")
-        self.assertEqual(s.mode(self.env), "auto")
+        self.assertEqual(s.mode(self.env), "required")
         self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
         with patch.object(s, "capability", side_effect=AssertionError("private round probed namespaces")):
             with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
@@ -410,16 +410,18 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
                     if damage == "symlink":
                         artifact.symlink_to(self.library / "Init.olean")
                 before = self.downloads
-                with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                    self.assertEqual(prefix, [])
-                self.assertIn("integrity", " ".join(s.summary(self.env)["reasons"]))
+                self.assert_blocked("integrity")
                 self.assertEqual(self.downloads, before)
                 self.assertTrue(artifact.parent.exists())
-                self.assertEqual(s.mode(self.env), "off")
+                # The latched stop keeps later rounds blocked instead of private.
+                with self.assertRaisesRegex(s.Unavailable, "safety stop"):
+                    s.mode(self.env)
                 self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
                 with self.assertRaisesRegex(s.Unavailable, "integrity"):
                     with s.view(self.cwd, self.env, self.root / "logs", self.extract):
                         self.fail("required sharing started with a corrupt snapshot")
+                self.assertEqual(self.downloads, before)
+                self.assertTrue(artifact.parent.exists())
                 self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "auto"
 
     def test_local_clone_preserves_fork_cache_identity_and_disables_push(self):
@@ -566,12 +568,10 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
                 future.result(timeout=5)
         self.assertEqual(self.downloads, 1)
 
-    def test_insufficient_disk_fails_private_or_required_without_publication(self):
+    def test_insufficient_disk_blocks_auto_or_required_without_publication(self):
         self.require_overlay()
         with patch.object(s.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100, 95, 5)):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
-            self.assertIn("10%", " ".join(s.summary(self.env)["reasons"]))
+            self.assert_blocked("10%")
             self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
             with self.assertRaisesRegex(s.Unavailable, "10%"):
                 with s.view(self.cwd, self.env, self.root / "logs", self.extract):
@@ -637,11 +637,15 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
         self.pool.mkdir()
         (self.pool / "policy.json").write_text("{")
         self.assertEqual(s.mode(self.env), "off")
+        for build in ("auto", "required"):
+            with self.assertRaisesRegex(s.Unavailable, "invalid shared Mathlib policy"):
+                s.mode({**self.env, "TAUCETI_SHARED_MATHLIB_BUILDS": build})
         atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"]))
-        self.assertEqual(s.mode(self.env), "auto")
+        self.assertEqual(s.mode(self.env), "required")
         s.stop_sharing(self.pool, "fixture integrity failure")
         atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"]))
-        self.assertEqual(s.mode(self.env), "off")
+        with self.assertRaisesRegex(s.Unavailable, "safety stop"):
+            s.mode(self.env)
         self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
         with self.assertRaisesRegex(s.Unavailable, "safety stop"):
             s.mode(self.env)
@@ -706,13 +710,26 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
             self.assertEqual((self.pool / "safety-stop.json").exists(), "safety-stop.json" not in failed_names)
             self.assertEqual((self.pool / "policy.json").exists(), "policy.json" not in failed_names)
 
-    def test_busy_exclusive_lease_has_bounded_auto_fallback(self):
+    def test_busy_exclusive_lease_blocks_auto_after_bounded_wait(self):
         self.require_overlay()
         key, _ = s.signature(self.cwd, self.env)
         with s.key_lock(self.pool, key), patch.object(s, "LOCK_WAIT_SECONDS", 0.02):
+            with self.assertRaisesRegex(s.Unavailable, "lock wait timed out"):
+                with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+                    self.fail("round started without shared Mathlib")
+            self.assertEqual(s.summary(self.env)["blocked"], 1)
+            self.assertNotIn("TAUCETI_SHARED_MATHLIB_LEASE_FD", self.env)
+        # The view released its own lease attempt: the key is free once the holder exits.
+        with s.key_lock(self.pool, key, nonblocking=True):
+            pass
+        self.assertEqual(self.downloads, 0)
+
+    def test_project_without_mathlib_dependency_has_nothing_to_share(self):
+        (self.cwd / "lake-manifest.json").write_text(json.dumps(dict(packages=[dict(name="batteries")])))
+        with patch.object(s, "capability", side_effect=AssertionError("probed sharing without Mathlib")):
             with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
                 self.assertEqual(prefix, [])
-        self.assertIn("lock wait timed out", " ".join(s.summary(self.env)["reasons"]))
+        self.assertEqual(s.summary(self.env)["blocked"], 0)
         self.assertEqual(self.downloads, 0)
 
     def test_required_missing_mathlib_reports_blocked_before_inference(self):
@@ -733,9 +750,9 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
             return real_run(command, *args, **kwargs)
 
         with patch.object(s.subprocess, "run", side_effect=run):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
+            self.assert_blocked("fixture mount failure")
         self.assertFalse((self.pool / "safety-stop.json").exists())
+        self.assertEqual(s.mode(self.env), "required")
 
     def test_verified_lower_missing_in_fresh_mount_latches_stop(self):
         self.require_overlay()
@@ -747,9 +764,10 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
             return real_run(command, *args, **kwargs)
 
         with patch.object(s.subprocess, "run", side_effect=run):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
-        self.assertEqual(s.mode(self.env), "off")
+            self.assert_blocked("verified lower missing")
+        self.assertTrue((self.pool / "safety-stop.json").exists())
+        with self.assertRaisesRegex(s.Unavailable, "safety stop"):
+            s.mode(self.env)
 
     def test_lease_failure_latches_stop_without_deleting_lower(self):
         self.require_overlay()
@@ -766,9 +784,9 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
             real_lock(stream, flags, timeout=timeout)
 
         with patch.object(s, "lease_lock", side_effect=lock):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
-        self.assertEqual(s.mode(self.env), "off")
+            self.assert_blocked("fixture lease failure")
+        with self.assertRaisesRegex(s.Unavailable, "safety stop"):
+            s.mode(self.env)
         self.assertEqual(len(list((self.pool / "entries").iterdir())), 1)
 
     def test_cleanup_failure_preserves_invocation_result_and_records_failure(self):
@@ -792,11 +810,9 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
         self.assertEqual(receipts[-1]["cleanup_error"], "fixture cleanup failure")
         self.assertFalse(receipts[-1]["cleanup_success"])
 
-    def test_auto_fallback_and_required_fail_before_body(self):
+    def test_auto_and_required_fail_before_body(self):
         with patch.object(s, "capability", return_value=(False, "enable user namespaces")):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
-            self.assertIn("enable user namespaces", s.summary(self.env)["reasons"])
+            self.assert_blocked("enable user namespaces")
             self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
             with (
                 self.assertRaisesRegex(s.Unavailable, "enable user namespaces"),
@@ -806,22 +822,53 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
         self.assertEqual(self.downloads, 0)
 
     def test_body_failure_is_not_caught_or_retried(self):
-        with patch.object(s, "capability", return_value=(False, "unsupported")):
-            with (
-                self.assertRaisesRegex(ValueError, "body"),
-                s.view(self.cwd, self.env, self.root / "logs", self.extract),
-            ):
-                raise ValueError("body")
+        # A failing body propagates once, from the private path and (where the host
+        # can mount overlays) from the shared path, which wraps a preparation handler.
+        for build in ["off"] + (["auto"] if s.capability(self.root)[0] else []):
+            with self.subTest(build=build):
+                self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = build
+                runs = 0
+                with (
+                    self.assertRaisesRegex(ValueError, "body"),
+                    s.view(self.cwd, self.env, self.root / "logs", self.extract),
+                ):
+                    runs += 1
+                    raise ValueError("body")
+                self.assertEqual(runs, 1)
 
     def test_canary_allowlist_and_private_rollback(self):
         self.env["TAUCETI_SHARED_MATHLIB_WORKERS"] = "one,two"
         self.assertEqual(s.mode(self.env), "off")
         self.env["TAUCETI_WORKER_ID"] = "one"
-        self.assertEqual(s.mode(self.env), "auto")
+        self.assertEqual(s.mode(self.env), "required")
         self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
         with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
             self.assertEqual(prefix, [])
         self.assertEqual(self.downloads, 0)
+
+    def build_files(self):
+        upper = self.mathlib / ".lake/build"
+        return sorted(str(p.relative_to(upper)) for p in upper.rglob("*")) if upper.is_dir() else []
+
+    def assert_blocked(self, pattern):
+        """The round stops before its body: no private build, status blocked, leases released."""
+        before = self.build_files()
+        with self.assertRaisesRegex(s.Unavailable, pattern):
+            with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+                self.fail("round started without shared Mathlib")
+        self.assertEqual(self.build_files(), before)
+        summary = s.summary(self.env)
+        self.assertEqual(summary["blocked"], 1)
+        self.assertRegex(" ".join(summary["reasons_by_mode"]["blocked"]), pattern)
+        self.assertNotIn("private", summary["reasons_by_mode"])
+        for name in ("LEASE_FD", "KEY", "PREP_STARTED"):
+            self.assertNotIn("TAUCETI_SHARED_MATHLIB_" + name, self.env)
+        try:
+            key = s.signature(self.cwd, self.env)[0]
+        except s.Unavailable:
+            return  # no identity, so the view never took a lease
+        with s.key_lock(self.pool, key, nonblocking=True):
+            pass
 
     def require_overlay(self):
         ok, reason = s.capability(self.root)
@@ -941,7 +988,7 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
         self.env.pop("TAUCETI_SHARED_MATHLIB_BUILDS")
         self.pool.mkdir()
         atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"], expires_at=time.time() + 60))
-        self.assertEqual(s.mode(self.env), "auto")
+        self.assertEqual(s.mode(self.env), "required")
         atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"], expires_at=time.time() - 1))
         self.assertEqual(s.mode(self.env), "off")
 
@@ -1087,8 +1134,8 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
         (private / "build-before-sharing").mkdir()
         (self.mathlib / ".lake").symlink_to(private)
         with patch.object(s, "capability", side_effect=AssertionError("symlinked layout probed sharing")):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
+            self.assert_blocked("Mathlib dependency is not available for sharing")
+        self.assertTrue((self.mathlib / ".lake").is_symlink())
         self.assertTrue((private / "build-before-sharing").is_dir())
 
     def test_marked_upper_generation_cleanup_failure_still_allows_private_warming(self):
@@ -1189,12 +1236,11 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
             return original(lower, candidate_upper, work, target, pool, **kwargs)
 
         with patch.object(s, "overlay_command", side_effect=fail_view):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
-                self.assertEqual((upper / "private.olean").read_text(), "previous complete private build")
-                self.assertFalse(upper.with_name("build-before-sharing").exists())
-                self.assertFalse(upper.with_name("tauceti-shared-mathlib.json").exists())
-                self.assertFalse(upper.with_name("tauceti-overlay-work").exists())
+            self.assert_blocked("shared Mathlib view unavailable")
+        self.assertEqual((upper / "private.olean").read_text(), "previous complete private build")
+        self.assertFalse(upper.with_name("build-before-sharing").exists())
+        self.assertFalse(upper.with_name("tauceti-shared-mathlib.json").exists())
+        self.assertFalse(upper.with_name("tauceti-overlay-work").exists())
 
     def test_uncertain_legacy_work_is_parked_before_a_new_shared_view(self):
         self.require_overlay()
@@ -1309,15 +1355,10 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
         )
         self.assertTrue(upper.with_name("tauceti-shared-mathlib.json").exists())
 
-    def test_auto_fallback_releases_snapshot_lock_before_private_round(self):
+    def test_failed_publication_blocks_auto_and_releases_snapshot_lock(self):
         self.require_overlay()
-        key, _ = s.signature(self.cwd, self.env)
         with patch.object(s, "publish", side_effect=s.Unavailable("download interrupted")):
-            with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-                self.assertEqual(prefix, [])
-                with s.key_lock(self.pool, key, nonblocking=True):
-                    pass
-                self.assertNotIn("TAUCETI_SHARED_MATHLIB_LEASE_FD", self.env)
+            self.assert_blocked("download interrupted")
 
     @unittest.skipUnless(sys.platform == "linux", "Linux process identity")
     def test_killed_cache_parent_terminates_detached_downloader_group(self):
