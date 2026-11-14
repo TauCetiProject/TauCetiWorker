@@ -332,7 +332,9 @@ class Canonical(unittest.TestCase):
         self.addCleanup(held.close)
         report = self.relink(first)
         self.assertNotIn("published_ci", report)
-        self.assertNotEqual((objects / name).stat().st_ino if (objects / name).exists() else None, pool_copy.stat().st_ino)
+        self.assertNotEqual(
+            (objects / name).stat().st_ino if (objects / name).exists() else None, pool_copy.stat().st_ino
+        )
         self.assertGreaterEqual(report["deferred_busy"], 1)
         # Quarantine: a damaged pool copy held open stays where it is.
         second = self.checkout("second", "TauCeti.B", seed="b")
@@ -370,7 +372,9 @@ class Canonical(unittest.TestCase):
 
         def unshared():
             return sum(
-                1 for p, n in paths(checkout) if not (objects / n).exists() or p.stat().st_ino != (objects / n).stat().st_ino
+                1
+                for p, n in paths(checkout)
+                if not (objects / n).exists() or p.stat().st_ino != (objects / n).stat().st_ino
             )
 
         def slow(program, paths, directory):
@@ -399,6 +403,91 @@ class Canonical(unittest.TestCase):
         self.assertEqual(report["outputs"], len(found))
         self.assertEqual(report["published_local"], len(found) - 1)
         self.assertNotIn("incomplete", report)
+
+    def test_reconcile_never_spreads_or_records_a_writable_inode(self):
+        checkout = self.checkout("w", "TauCeti.A")
+        self.relink(checkout)
+        olean, name = next((p, n) for p, n in paths(checkout) if p.name == "A.olean")
+        alias = self.pool / "artifacts" / name
+        alias.parent.mkdir(parents=True)
+        shutil.copyfile(olean, alias)
+        directory = canonical.store(self.pool)
+        canonical.sidecar(directory, name).unlink()
+        for target in (olean, alias):  # Either side held open for writing blocks it.
+            os.chmod(target, 0o644)
+            held = open(target, "r+b")
+            try:
+                self.assertFalse(canonical.reconcile(self.pool, name, alias))
+            finally:
+                held.close()
+            self.assertNotEqual(alias.stat().st_ino, olean.stat().st_ino)
+            self.assertFalse(canonical.sidecar(directory, name).exists())  # Not healed while writable.
+        self.assertTrue(canonical.reconcile(self.pool, name, alias))
+        self.assertEqual(alias.stat().st_ino, olean.stat().st_ino)
+
+    def test_corrupt_shared_inode_also_loses_its_private_store_alias(self):
+        checkout = self.checkout("w", "TauCeti.A")
+        store = self.root / "w-store"
+        (store / "artifacts").mkdir(parents=True)
+        olean, name = next((p, n) for p, n in paths(checkout) if p.name == "A.olean")
+        os.link(olean, store / "artifacts" / name)  # As Lake's saveArtifact does.
+        canonical.relink(checkout, store, self.pool, sweep_private=True)
+        objects = canonical.store(self.pool) / "objects"
+        self.assertEqual((store / "artifacts" / name).stat().st_ino, (objects / name).stat().st_ino)
+        os.chmod(olean, 0o644)
+        olean.write_bytes(b"x" * olean.stat().st_size)  # Corrupts all three names at once.
+        os.utime(olean, (time.time() - 60,) * 2)
+        report = canonical.relink(checkout, store, self.pool, sweep_private=True)
+        self.assertEqual(report["integrity_failures"], [name])
+        self.assertFalse((objects / name).exists())
+        self.assertFalse(olean.exists())
+        self.assertFalse((store / "artifacts" / name).exists())  # Lake cannot restore the bad bytes.
+        self.assertTrue((olean.parent / "A.trace").exists())
+
+    def test_sweep_protects_objects_held_open(self):
+        from tauceti_worker import retention
+
+        checkout = self.checkout("w", "TauCeti.A")
+        self.relink(checkout)
+        objects = canonical.store(self.pool) / "objects"
+        name = paths(checkout)[0][1]
+        shutil.rmtree(checkout)
+        for lease in (canonical.store(self.pool) / "uses").glob("*"):
+            lease.unlink()
+        info = (objects / name).stat()
+
+        def sweep(opened):
+            canonical.sweep(
+                self.pool, retention.fresh_report(time.time()), lifetime=1, remove=retention.remove, opened=opened
+            )
+
+        sweep({(info.st_dev, info.st_ino)})
+        self.assertTrue((objects / name).exists())
+        self.assertTrue(canonical.sidecar(canonical.store(self.pool), name).exists())
+        sweep(set())
+        self.assertFalse((objects / name).exists())
+
+    def test_hashing_that_outlasts_the_grace_still_makes_progress(self):
+        modules = [f"TauCeti.M{i}" for i in range(8)]
+        checkout = self.checkout("w", *modules)
+        objects = canonical.store(self.pool) / "objects"
+
+        def slow(program, paths, directory):
+            time.sleep(0.3)  # Each helper call outlasts the whole grace window.
+            return fake_hashes(program, paths, directory)
+
+        def unshared():
+            return sum(1 for p, n in paths(checkout) if not (objects / n).exists())
+
+        remaining = [unshared()]
+        with patch.object(canonical, "GRACE", 0.2), patch.object(cache, "hashes", slow):
+            for _ in range(40):
+                report = self.relink(checkout, budget=0)
+                remaining.append(unshared())
+                if not report.get("incomplete"):
+                    break
+        self.assertEqual(remaining[-1], 0)
+        self.assertTrue(all(a > b for a, b in zip(remaining, remaining[1:], strict=False)), remaining)
 
     def test_sweep_skips_busy_shards_instead_of_waiting(self):
         from tauceti_worker import retention

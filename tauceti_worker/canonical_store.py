@@ -357,8 +357,86 @@ def probe(checkout, private_store, directory, *, prefix=(), env=None):
         raise Unavailable(f"hard links unavailable in the agent namespace: {detail}")
 
 
+class Guard:
+    """The one gate for mutating a shared name.
+
+    Every link, rename or unlink of a canonical object, pool artifact, private-store alias or
+    checkout output goes through a guard. It proceeds only if each affected inode is not open for
+    writing by this user's processes (one lazy `/proc` scan per guard), is not in `opened` (inodes
+    a collector saw open at all), was not modified after `not_after`, and still has the
+    fingerprint it had when it was inspected, re-checked immediately before the system call.
+    Otherwise the mutation is deferred and `deferred_busy` / `deferred_changed` counted.
+    Only our own temporary files, cursors, leases and sidecars bypass it.
+    """
+
+    def __init__(self, *, writable=None, opened=(), not_after=None, report=None):
+        self._writable = writable
+        self.opened = set(opened or ())
+        self.not_after = not_after
+        self.report = {} if report is None else report
+
+    @property
+    def writable(self):
+        if self._writable is None:
+            self._writable = open_for_writing()
+        return self._writable
+
+    def _count(self, key):
+        self.report[key] = self.report.get(key, 0) + 1
+
+    def busy(self, info):
+        key = info.st_dev, info.st_ino
+        return key in self.opened or key in self.writable
+
+    def idle(self, *pairs, recent_ok=False):
+        """True if every `(path, inspected_info)` is quiescent right now."""
+        for path, before in pairs:
+            if self.busy(before) or (not recent_ok and self.not_after is not None and before.st_mtime > self.not_after):
+                self._count("deferred_busy")
+                return False
+            try:
+                now = path.lstat()
+            except FileNotFoundError:
+                return False
+            if fingerprint(now) != fingerprint(before):
+                self._count("deferred_changed")
+                return False
+        return True
+
+    def unlink(self, path, before, *, recent_ok=False):
+        if not self.idle((path, before), recent_ok=recent_ok):
+            return False
+        path.unlink(missing_ok=True)
+        return True
+
+    def link(self, source, before, target, *, recent_ok=False):
+        """`os.link(source, target)`; FileExistsError and other OSErrors reach the caller."""
+        if not self.idle((source, before), recent_ok=recent_ok):
+            return False
+        os.link(source, target)
+        return True
+
+    def replace(self, source, source_info, path, path_info, *, recent_ok=False):
+        """Atomically make `path` a link to `source`, if both are quiescent."""
+        if not self.idle((source, source_info), recent_ok=True) or not self.idle(
+            (path, path_info), recent_ok=recent_ok
+        ):
+            return False
+        replace(source, path)
+        return True
+
+    def chmod(self, path, before, mode):
+        if not self.idle((path, before)):
+            return False
+        os.chmod(path, mode)
+        return True
+
+
 def replace(canonical, path):
-    """Atomically make `path` a link to `canonical`; a concurrent reader never sees it missing."""
+    """Atomically make `path` a link to `canonical`; a concurrent reader never sees it missing.
+
+    Callers go through `Guard.replace`; the temporary name is ours alone.
+    """
     temporary = path.parent / f".relink-{secrets.token_hex(6)}"
     try:
         os.link(canonical, temporary)
@@ -393,13 +471,16 @@ class Pass:
         self.report = report
         self.deadline = deadline
         self.not_after = not_after
-        self.writable = open_for_writing()
+        self.guard = Guard(writable=open_for_writing(), not_after=not_after, report=report)
+        self.writable = self.guard.writable
         self.shas = {}
         self.lakes = {}
+        self.seen = set()  # Fingerprints asked about this pass: what the persisted cache keeps.
         self.program = None
         self.helper_failed = False
         self.trace_of = {}
-        for name in ("objects", "meta", "locks", "uses", "cursors"):
+        self.suspect = set()  # Names whose bytes failed here: their private aliases get checked.
+        for name in ("objects", "meta", "locks", "uses", "cursors", "hashes"):
             (self.directory / name).mkdir(parents=True, exist_ok=True, mode=0o700)
 
     def count(self, key, amount=1):
@@ -407,17 +488,7 @@ class Pass:
 
     def quiescent(self, path, before):
         """Unchanged since inspected, not open for writing, not modified since the boundary began."""
-        try:
-            now = path.lstat()
-        except FileNotFoundError:
-            return False
-        if fingerprint(now) != fingerprint(before):
-            self.count("deferred_changed")
-            return False
-        if (now.st_dev, now.st_ino) in self.writable or now.st_mtime > self.not_after:
-            self.count("deferred_busy")
-            return False
-        return True
+        return self.guard.idle((path, before))
 
     def sha(self, path, info):
         key = fingerprint(info)
@@ -436,6 +507,7 @@ class Pass:
 
     def prefetch(self, items):
         """Lake-hash `(path, name, info)` items in one helper call; unknown stays unknown."""
+        self.seen.update(fingerprint(i) for _, _, i in items)
         items = [(p, n, i) for p, n, i in items if fingerprint(i) not in self.lakes]
         if not items or time.monotonic() >= self.deadline or self.helper() is None:
             return
@@ -452,6 +524,7 @@ class Pass:
 
     def lake(self, path, name, info):
         """True if the bytes hash to `name`, False if not, None if unknown."""
+        self.seen.add(fingerprint(info))
         if fingerprint(info) not in self.lakes:
             self.prefetch([(path, name, info)])
         computed = self.lakes.get(fingerprint(info))
@@ -464,45 +537,54 @@ class Pass:
         so one missing output already forces a rebuild, and the trace still lists the module's
         unfinished siblings for the next relink pass.
         """
-        if not self.quiescent(path, info):
+        self.suspect.add(name)
+        if not private:
+            self.drop_private_alias(name, info)
+        if not self.guard.unlink(path, info):
             return
-        path.unlink(missing_ok=True)
         if private:
             self.count("stale_store_files")
             return
+        # Lake's per-checkout `.hash` sidecar: never shared, and Lake rewrites it on restore.
         path.with_name(path.name + ".hash").unlink(missing_ok=True)
         self.count("invalidated_outputs")
         log(f"canonical store: {path} fails its Lake hash {name}; removed it so Lake rebuilds its module")
 
     def idle(self, path, info):
         """A pool file may be published, quarantined or evicted only while nothing can write it."""
-        if (info.st_dev, info.st_ino) in self.writable:
-            self.count("deferred_busy")
-            return False
-        try:
-            return fingerprint(path.lstat()) == fingerprint(info)
-        except FileNotFoundError:
-            return False
+        return self.guard.idle((path, info), recent_ok=True)
+
+    def drop_private_alias(self, name, info):
+        """The private store's link to bad bytes would let Lake restore them: remove it too."""
+        if self.private is None:
+            return
+        alias = self.private / name
+        with contextlib.suppress(FileNotFoundError):
+            alias_info = alias.lstat()
+            if (alias_info.st_dev, alias_info.st_ino) == (info.st_dev, info.st_ino):
+                if self.guard.unlink(alias, alias_info, recent_ok=True):
+                    self.count("stale_store_files")
 
     def evict(self, name, info, reason):
-        if not self.idle(self.objects / name, info):
-            return False
         canonical = self.objects / name
         aliases = [canonical]
         old = legacy(self.pool, name)
         with contextlib.suppress(FileNotFoundError):
             if old.lstat().st_ino == info.st_ino:
                 aliases.append(old)
+        if not self.guard.idle(*((alias, info) for alias in aliases), recent_ok=True):
+            return False
         for alias in aliases:
-            alias.unlink(missing_ok=True)
-        sidecar(self.directory, name).unlink(missing_ok=True)
+            self.guard.unlink(alias, info, recent_ok=True)
+        sidecar(self.directory, name).unlink(missing_ok=True)  # Our metadata for the evicted name.
+        self.suspect.add(name)
+        self.drop_private_alias(name, info)
         self.report.setdefault("integrity_failures", []).append(name)
         log(f"canonical store: INTEGRITY FAILURE: object {name} {reason}; evicted")
         return True
 
-    def link_in(self, canonical, path, info, private):
-        if self.quiescent(path, info):
-            replace(canonical, path)
+    def link_in(self, canonical, canonical_info, path, info, private):
+        if self.guard.replace(canonical, canonical_info, path, info):
             self.count("relinked_private" if private else "relinked")
 
     def decide(self, path, name, private):
@@ -531,7 +613,7 @@ class Pass:
                 if canonical_info.st_ino == info.st_ino:
                     return
                 if info.st_size == size and self.sha(path, info) == (sha, size):
-                    self.link_in(canonical, path, info, private)
+                    self.link_in(canonical, canonical_info, path, info, private)
                     return
                 self.differs(path, name, info, private)
                 return
@@ -572,9 +654,9 @@ class Pass:
                     if not self.idle(old, pool_info):
                         return None
                     sha, size = self.sha(old, pool_info)
-                    if not self.idle(old, pool_info):
-                        return None  # Changed while hashing: not the bytes that were verified.
-                    os.link(old, canonical)
+                    # Re-checked inside: changed while hashing means not the bytes that were verified.
+                    if not self.guard.link(old, pool_info, canonical, recent_ok=True):
+                        return None
                 except FileExistsError:
                     return "again"
                 except FileNotFoundError:
@@ -591,13 +673,16 @@ class Pass:
                 log(f"canonical store: pool copy of {name} fails its Lake hash, and so does {path}; leaving it")
                 return None
             # The checkout's bytes are right and the pool's are not: quarantine the pool copy.
-            if not self.idle(old, pool_info):
+            if not self.guard.unlink(old, pool_info, recent_ok=True):
                 return None
-            old.unlink(missing_ok=True)
             self.count("pool_quarantined")
             log(f"canonical store: pool copy of {name} fails its Lake hash; removed it")
-        elif private:
+        elif private and name not in self.suspect:
             return None  # Private-store-only names are Lake's metadata; not hashed.
+        elif private:
+            if self.lake(path, name, info) is False:
+                self.invalidate(path, name, info, private)  # A corrupt alias Lake could restore.
+            return None
         if verdict is None:
             verdict = self.lake(path, name, info)
         if verdict is False:
@@ -609,11 +694,12 @@ class Pass:
         if not self.quiescent(path, info):
             return None
         mode = 0o555 if info.st_mode & 0o111 else 0o444
-        if stat.S_IMODE(info.st_mode) != mode:
-            os.chmod(path, mode)
+        if stat.S_IMODE(info.st_mode) != mode and not self.guard.chmod(path, info, mode):
+            return None
         sha, size = self.sha(path, info)
         try:
-            os.link(path, canonical)
+            if not self.guard.link(path, info, canonical):
+                return None
         except FileExistsError:
             return "again"
         except OSError as error:
@@ -666,9 +752,7 @@ def relink(
             report["skipped"] = f"{slots} relinks already running on this host"
             return report
         started = time.monotonic()
-        work = Pass(
-            checkout, pool, private_store, env, report, deadline=started + budget, not_after=time.time()
-        )
+        work = Pass(checkout, pool, private_store, env, report, deadline=started + budget, not_after=time.time())
         _relink(work, build, sweep_private, delete_setup, limit)
         report["seconds"] = round(time.monotonic() - started, 3)
         return report
@@ -722,29 +806,57 @@ def _relink(work, build, sweep_private, delete_setup, limit):
     done = 0
     last = None
     deadline = work.deadline
+    # Lake hashes computed by earlier passes, keyed by fingerprint: a pass that ran out of time
+    # while hashing leaves that work for the next one instead of discarding it.
+    hashes_path = work.directory / "hashes" / (key + ".json")
+    for raw_key, value in read_json(hashes_path).items():
+        with contextlib.suppress(ValueError):
+            work.lakes[tuple(int(part) for part in raw_key.split(":"))] = value
+    reserve = min(30.0, max(0.5, 0.2 * (deadline - time.monotonic())))  # Kept for converging.
+    per_file = None
     # Every pass finishes at least one file, so even an exhausted budget makes progress.
     work.deadline = max(deadline, time.monotonic() + GRACE)
     try:
-        for offset in range(0, len(order), BATCH):
+        offset = 0
+        while offset < len(order):
             batch = order[offset : offset + BATCH]
             if limit is not None:
                 batch = batch[: max(0, limit - done)]
             if not batch or time.monotonic() >= work.deadline:
                 raise TimeoutError("relink budget reached")
             # Hash what this batch needs to decide new names, then converge this batch.
-            fetch, names = [], set()
+            fetch, names, sizes = [], set(), []
             for name, raw, _ in batch:
-                if (work.objects / name).exists():
-                    continue
-                candidates = [Path(raw)] + ([legacy(work.pool, name)] if name not in names else [])
-                names.add(name)
-                for candidate in candidates:
-                    with contextlib.suppress(FileNotFoundError):
-                        info = candidate.lstat()
-                        if stat.S_ISREG(info.st_mode):
-                            fetch.append((candidate, name, info))
+                before = len(fetch)
+                if not (work.objects / name).exists():
+                    candidates = [Path(raw)] + ([legacy(work.pool, name)] if name not in names else [])
+                    names.add(name)
+                    for candidate in candidates:
+                        with contextlib.suppress(FileNotFoundError):
+                            info = candidate.lstat()
+                            if not stat.S_ISREG(info.st_mode):
+                                continue
+                            work.seen.add(fingerprint(info))
+                            if fingerprint(info) not in work.lakes:
+                                fetch.append((candidate, name, info))
+                sizes.append(len(fetch) - before)
+            if done and per_file:
+                # Shrink the batch so its hashing leaves time to converge it.
+                allowed = (work.deadline - time.monotonic() - reserve) / per_file
+                keep, used = 0, 0
+                while keep < len(batch) and used + sizes[keep] <= allowed:
+                    used += sizes[keep]
+                    keep += 1
+                if keep == 0:
+                    raise TimeoutError("relink budget reached")
+                batch, fetch = batch[:keep], fetch[:used]
+            started = time.monotonic()
             for start in range(0, len(fetch), HASH_BATCH):
                 work.prefetch(fetch[start : start + HASH_BATCH])
+            if fetch:
+                per_file = max(1e-4, (time.monotonic() - started) / len(fetch))
+            if not done:
+                work.deadline = max(deadline, time.monotonic() + GRACE)  # Grace covers converging, too.
             index = 0
             while index < len(batch):
                 name = batch[index][0]
@@ -761,8 +873,15 @@ def _relink(work, build, sweep_private, delete_setup, limit):
                         last = (name, raw)
                         work.deadline = deadline  # The first file's grace is over.
                 index += len(group)
+            offset += len(batch)
     except TimeoutError:
         pass
+    finally:
+        with contextlib.suppress(OSError):
+            expanded_cache.atomic_json(
+                hashes_path,
+                {":".join(map(str, k)): v for k, v in work.lakes.items() if v is not None and k in work.seen},
+            )
     work.deadline = deadline
     complete = done >= len(order)
     report["remaining"] = len(order) - done
@@ -777,20 +896,18 @@ def _relink(work, build, sweep_private, delete_setup, limit):
         for path in setups:
             with contextlib.suppress(FileNotFoundError):
                 info = path.lstat()
-                if (info.st_dev, info.st_ino) in work.writable or info.st_mtime > work.not_after:
-                    continue
-                report["setup_bytes"] = report.get("setup_bytes", 0) + info.st_blocks * 512
-                path.unlink()
-                removed += 1
+                if work.guard.unlink(path, info):
+                    report["setup_bytes"] = report.get("setup_bytes", 0) + info.st_blocks * 512
+                    removed += 1
         report["setup_removed"] = removed
     used = sorted({name for pairs in modules.values() for _, name in pairs})
     lease = work.directory / "uses" / (key + ".list")
     with tempfile.NamedTemporaryFile("w", dir=lease.parent, delete=False) as out:
         out.write("\n".join(used) + ("\n" if used else ""))
-    os.replace(out.name, lease)
+    os.replace(out.name, lease)  # Our lease file; no build output.
 
 
-def reconcile(pool, name, path, *, blocking=True):
+def reconcile(pool, name, path, *, blocking=True, guard=None):
     """Make a pool alias of `name` (an entry file, `artifacts/`) the canonical inode, if identical.
 
     Expansion publishes CI outputs independently; this keeps one inode when a local publication
@@ -799,20 +916,23 @@ def reconcile(pool, name, path, *, blocking=True):
     directory = store(pool)
     canonical = directory / "objects" / name
     try:
-        if canonical.stat().st_ino == path.stat().st_ino:
+        canonical_info = canonical.stat()
+        info = path.lstat()
+        if canonical_info.st_ino == info.st_ino:
             return True
     except FileNotFoundError:
         return False
+    guard = Guard() if guard is None else guard
     try:
         with object_lock(directory, name, blocking=blocking):
+            if guard.busy(canonical_info) or guard.busy(info):
+                return False  # Neither spread nor re-record an inode someone may be writing.
             sha, size, intact = expected(directory, name)
             if not intact:
                 return False  # The next relink evicts it; never spread a damaged object.
-            info = path.stat()
             if info.st_size != size or digest(path) != (sha, size):
                 return False
-            replace(canonical, path)
-            return True
+            return guard.replace(canonical, canonical_info, path, info, recent_ok=True)
     except (OSError, Unavailable):
         return False
 
@@ -869,7 +989,7 @@ def boundary(checkout, env, *, phase, prefix=()):
     return report
 
 
-def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, reconcile_budget=60):
+def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, reconcile_budget=60, opened=()):
     """Evict canonical objects only their own pool names link to, under the exclusive object lock.
 
     Link counts are evidence, not a refcount: a checkout or private store that links an object
@@ -884,6 +1004,8 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, 
         return 0
     leased = None
     freed = 0
+    # Open descriptors add no link: protect every inode the collector saw open.
+    guard = Guard(opened=opened)
     reconciling_until = time.monotonic() + reconcile_budget
     for lease in (directory / "uses").glob("*.list"):
         with contextlib.suppress(FileNotFoundError):
@@ -902,7 +1024,7 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, 
                     old.lstat().st_ino != info.st_ino
                     and not dry
                     and time.monotonic() < reconciling_until
-                    and reconcile(pool, name, old, blocking=False)  # Busy shards wait for the next sweep.
+                    and reconcile(pool, name, old, blocking=False, guard=guard)  # Busy shards wait for the next sweep.
                 ):
                     info = path.lstat()  # Expansion had published a second inode; now one.
                 if old.lstat().st_ino == info.st_ino:
@@ -921,12 +1043,15 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, 
                 info = path.lstat()
                 if info.st_nlink > len(aliases):
                     continue  # A relink linked it after the first look.
+                if not guard.idle(*((alias, info) for alias in aliases), recent_ok=True):
+                    note(report, "protected", str(path))
+                    continue
                 if dry:
                     freed += info.st_blocks * 512
                     continue
                 for alias in aliases:
-                    alias.unlink(missing_ok=True)
-                sidecar(directory, name).unlink(missing_ok=True)
+                    guard.unlink(alias, info, recent_ok=True)
+                sidecar(directory, name).unlink(missing_ok=True)  # Our metadata for the evicted name.
                 freed += info.st_blocks * 512
         except BlockingIOError:
             note(report, "protected", str(path))

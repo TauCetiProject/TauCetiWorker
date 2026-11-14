@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import stat
 import time
 from pathlib import Path
 
@@ -174,6 +175,10 @@ def collect(configs, *, dry=False, now=None, opened=...):
         for name in (".lake", "lake-packages", "build")
     }
     owners = {path: cfg.wid for cfg in configs for path, _ in cache_roots(cfg)}
+    from .canonical_store import Guard
+
+    # Pool copies are deleted only while no process holds them open (open fds add no link).
+    guard = Guard(opened=opened or ())
     details = {}
     before = inventory(paths, protected=protected, owners=owners, details=details)
     private_candidates = {}
@@ -270,12 +275,15 @@ def collect(configs, *, dry=False, now=None, opened=...):
                     for old in names:
                         shared = pool / ("archives" if old.name.endswith(".ltar") else "artifacts") / old.name
                         # A relink adopting this pool copy holds the object lock while it hashes and links.
-                        with contextlib.suppress(BlockingIOError), legacy_lock(pool, old.name):
-                            if shared.is_file() and not shared.is_symlink() and shared.stat().st_nlink == 1:
-                                size = shared.stat().st_blocks * 512
-                                remaining -= size
-                                removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + size
-                                shared.unlink()
+                        with contextlib.suppress(BlockingIOError, FileNotFoundError), legacy_lock(pool, old.name):
+                            info = shared.lstat()
+                            if (
+                                stat.S_ISREG(info.st_mode)
+                                and info.st_nlink == 1
+                                and guard.unlink(shared, info, recent_ok=True)
+                            ):
+                                remaining -= info.st_blocks * 512
+                                removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + info.st_blocks * 512
         except BlockingIOError:
             note(report, "protected", str(entry))
         except FileNotFoundError:
@@ -298,8 +306,12 @@ def collect(configs, *, dry=False, now=None, opened=...):
                 if path.is_symlink() or info.st_nlink != 1:
                     continue
                 with legacy_lock(pool, path.name, dry=dry):
-                    if path.lstat().st_nlink != 1:
+                    info = path.lstat()
+                    if info.st_nlink != 1:
                         continue  # Adopted as a canonical object since the first look.
+                    if not guard.idle((path, info), recent_ok=True):
+                        note(report, "protected", str(path))
+                        continue
                     remove(path, pool, report, dry=dry, check_users=False, mounts=[])
                 if not dry and not path.exists():
                     removed_bytes[info.st_dev] = removed_bytes.get(info.st_dev, 0) + info.st_blocks * 512
@@ -311,7 +323,9 @@ def collect(configs, *, dry=False, now=None, opened=...):
         from .canonical_store import sweep
 
         # Canonical objects (and their adopted pool alias) go once no checkout or store links them.
-        freed = sweep(pool, report, dry=dry, urgent=urgent, now=now, lifetime=LIFETIME, remove=remove)
+        freed = sweep(
+            pool, report, dry=dry, urgent=urgent, now=now, lifetime=LIFETIME, remove=remove, opened=opened or ()
+        )
         if not dry:
             removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + freed
     # One inventory per sweep; update the estimate for known last-link removals.
