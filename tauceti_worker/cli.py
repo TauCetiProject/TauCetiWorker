@@ -90,7 +90,16 @@ from .cost_model import format_report as format_cost_report
 from .github import GitHub, pin_github_account, shared_claims_granted
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file, legacy_data_root
-from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, codex_dir, parse_pace_curve
+from .quota import (
+    PACE_PROVIDERS,
+    Quota,
+    _claude_keychain_creds,
+    _safe_exists,
+    claude_dir,
+    codex_dir,
+    pace_env,
+    parse_pace_curve,
+)
 from .review_state import ReviewState
 from .round import Claims, RoundContext, cmd_heartbeat
 from .runtime_status import report_failure, report_runtime
@@ -150,6 +159,7 @@ environment (flags win; full reference linked below):
   TAUCETI_PR             comma-separated PR numbers; default for --pr
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_PACE           pacing curve "t:b,..." (default = 60:40); see --pace
+  TAUCETI_PACE_CLAUDE / _CODEX   pacing curve for one provider's windows (default = TAUCETI_PACE)
   TAUCETI_AUTHORING_CODEX_MODEL / _EFFORT   exact Codex authoring profile
   TAUCETI_AUTHORING_CLAUDE_MODEL / _EFFORT exact Claude authoring profile
   TAUCETI_STREAM=1       same as --stream
@@ -446,6 +456,16 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "by the reset; `0:0,100:100` restores the plain used%% < elapsed%% rule. Overrides "
         "$TAUCETI_PACE for this run (inherited by loop children)",
     )
+    for provider in PACE_PROVIDERS:
+        p.add_argument(
+            f"--pace-{provider}",
+            dest=f"pace_{provider}",
+            default=None,
+            metavar="T:B[,T:B...]",
+            help=f"pacing curve for {provider}'s windows only, in the form --pace takes; a provider "
+            f"without one of its own follows --pace. Overrides ${pace_env(provider)} for this run "
+            "(inherited by loop children)",
+        )
     p.add_argument(
         "--worker-id",
         dest="worker_id",
@@ -934,17 +954,24 @@ def resolve_pace(cmd: str | None, args) -> None:
     records a curve for a worker launched later, leaves this environment alone, and is validated as
     configuration (see WorkerSpec.from_dict).
 
+    The per-provider curves ($TAUCETI_PACE_CLAUDE / --pace-claude, and the same for codex) are settled
+    the same way, each flag against its own variable.
+
     Validation and installation live together, one step before dispatch, so no code can run against a
     curve that has been checked but not applied — or applied but not checked."""
-    override = getattr(args, "pace", None) if cmd in ("work", "_round") else None
-    spec, source = (override, "--pace") if override is not None else (os.environ.get("TAUCETI_PACE"), "$TAUCETI_PACE")
-    if spec is not None:
-        try:
-            parse_pace_curve(spec)
-        except ValueError as e:
-            raise Die(f"{source}: {e}") from None
-    if override is not None:
-        os.environ["TAUCETI_PACE"] = override
+    overrides = {}
+    for dest, var in (("pace", "TAUCETI_PACE"), *((f"pace_{p}", pace_env(p)) for p in PACE_PROVIDERS)):
+        override = getattr(args, dest, None) if cmd in ("work", "_round") else None
+        flag = "--" + dest.replace("_", "-")
+        spec, source = (override, flag) if override is not None else (os.environ.get(var), f"${var}")
+        if spec is not None:
+            try:
+                parse_pace_curve(spec)
+            except ValueError as e:
+                raise Die(f"{source}: {e}") from None
+        if override is not None:
+            overrides[var] = override
+    os.environ.update(overrides)
 
 
 def main(argv: list[str] | None = None) -> int:

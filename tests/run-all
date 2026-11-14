@@ -143,6 +143,7 @@ RUN_STDLIB=(
   open_pr_pages.py
   overlaps.py
   pace_curve.py
+  pace_per_provider.py
   pr_targeting.py
   preflight_review_lake.py
   prices.py

@@ -326,6 +326,7 @@ try:
                         "author_model": "claude-opus-5",
                         "author_effort": "high",
                         "pace": "50%@1h",
+                        "pace_claude": "0:100",
                         "stream": True,
                         "isolate_home": True,
                         "restart": "on-failure",
@@ -366,7 +367,7 @@ worker2 — running
 worker3 — backing off
   phases:   roadmap, fix, fix-ci
   agent:    claude · bubble sandbox
-  pacing:   normal · curve 50%@1h
+  pacing:   normal · curve 50%@1h · claude curve 0:100
   roadmap:  RepresentationTheory
             skip: Algebra
             also treat as self: maintainer

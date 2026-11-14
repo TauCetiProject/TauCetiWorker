@@ -34,7 +34,7 @@ from .config import positive_integer, security_audit_problem, validate_extra_roa
 from .constants import AGENTS, ALLOWED_TASKS, EXPLICIT_TASKS, MAX_OPEN_PRS
 from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
-from .quota import parse_pace_curve
+from .quota import PACE_PROVIDERS, parse_pace_curve
 from .round import signal_group
 from .runtime_status import STATUS_ENV, StatusPublisher, atomic_json, read_json
 from .runtime_status import update_status as update_status
@@ -65,6 +65,8 @@ _WORKER_KEYS = {
     "author_model",
     "author_effort",
     "pace",
+    "pace_claude",
+    "pace_codex",
     "stream",
     "isolate_home",
     "restart",
@@ -322,6 +324,8 @@ class WorkerSpec:
     author_model: str | None = None
     author_effort: str | None = None
     pace: str | None = None
+    pace_claude: str | None = None
+    pace_codex: str | None = None
     stream: bool = False
     isolate_home: bool = False
     restart: str = "always"
@@ -394,6 +398,8 @@ class WorkerSpec:
             author_model=_string(raw.get("author_model"), f"workers[{index}].author_model", optional=True),
             author_effort=_string(raw.get("author_effort"), f"workers[{index}].author_effort", optional=True),
             pace=_pace(raw.get("pace"), f"workers[{index}].pace"),
+            pace_claude=_pace(raw.get("pace_claude"), f"workers[{index}].pace_claude"),
+            pace_codex=_pace(raw.get("pace_codex"), f"workers[{index}].pace_codex"),
             stream=_boolean(raw.get("stream", False), f"workers[{index}].stream"),
             isolate_home=_boolean(raw.get("isolate_home", False), f"workers[{index}].isolate_home"),
             restart=restart,
@@ -411,7 +417,8 @@ class WorkerSpec:
         if spec.claude_billing not in ("subscription", "api"):
             raise WorkersError("claude_billing must be subscription or api")
         if spec.claude_billing == "api":
-            if spec.agent != "claude" or spec.ignore_quota or spec.auto_refresh or spec.pace:
+            paced = spec.pace or spec.pace_claude or spec.pace_codex
+            if spec.agent != "claude" or spec.ignore_quota or spec.auto_refresh or paced:
                 raise WorkersError("Claude API workers require agent=claude and no subscription quota overrides")
         elif spec.budget or spec.anthropic_api_key_file:
             raise WorkersError("budget and anthropic_api_key_file require claude_billing=api")
@@ -466,6 +473,8 @@ class WorkerSpec:
             "author_model",
             "author_effort",
             "pace",
+            "pace_claude",
+            "pace_codex",
         ):
             item = getattr(self, name)
             if item is not None:
@@ -523,6 +532,8 @@ class WorkerSpec:
             (self.author_model, "--author-model"),
             (self.author_effort, "--author-effort"),
             (self.pace, "--pace"),
+            (self.pace_claude, "--pace-claude"),
+            (self.pace_codex, "--pace-codex"),
         ):
             if field is not None:
                 argv += [flag, field]
@@ -1581,6 +1592,9 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
     pacing = "ignored (--ignore-quota; hard limits still apply)" if spec.get("ignore_quota") else "normal"
     if spec.get("pace"):
         pacing += f" · curve {spec['pace']}"
+    for provider in PACE_PROVIDERS:
+        if spec.get(f"pace_{provider}"):
+            pacing += f" · {provider} curve {spec[f'pace_{provider}']}"
     lines.extend(_status_field("pacing", [pacing], width))
 
     # Worth stating rather than leaving implicit: this worker rotates the operator's Claude credential.
@@ -2195,6 +2209,8 @@ def add_workers_parser(subparsers) -> None:
     add.add_argument("--author-model", help="exact authoring model; needs an explicit --agent")
     add.add_argument("--author-effort", help="reasoning effort for an explicit codex/claude/kiro agent")
     add.add_argument("--pace", help="soft pacing curve as time%%:budget%% points, e.g. 0:10,50:70,90:90")
+    for provider in PACE_PROVIDERS:
+        add.add_argument(f"--pace-{provider}", help=f"soft pacing curve for {provider}'s windows only")
     add.add_argument("--stream", action="store_true", help="keep the agent transcript in the console log")
     add.add_argument(
         "--isolate-home",
@@ -2295,6 +2311,8 @@ def cmd_workers(args) -> int:
                     "author_model",
                     "author_effort",
                     "pace",
+                    "pace_claude",
+                    "pace_codex",
                 ):
                     value = getattr(args, key, None)
                     if value is not None:
