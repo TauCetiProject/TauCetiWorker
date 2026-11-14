@@ -60,8 +60,8 @@ def module(checkout, name, seed, *, setup=True):
 
 
 def paths(checkout):
-    found, _ = canonical.outputs(checkout / ".lake/build")
-    return found
+    modules, _ = canonical.outputs(checkout / ".lake/build")
+    return [pair for pairs in modules.values() for pair in pairs]
 
 
 class Canonical(unittest.TestCase):
@@ -70,6 +70,13 @@ class Canonical(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.pool = self.root / "pool"
+        # Never let a default root reach the host's real pool or activity store.
+        isolation = patch.dict(
+            os.environ,
+            {"TAUCETI_BUILD_CACHE_ROOT": str(self.pool), "TAUCETI_ACTIVITY_DIR": str(self.root / "activity")},
+        )
+        isolation.start()
+        self.addCleanup(isolation.stop)
         cache_storage.initialize(self.pool)
         if self._testMethodName.startswith("test_real_lake"):
             return  # The real toolchain computes the Lake hashes.
@@ -150,36 +157,153 @@ class Canonical(unittest.TestCase):
         self.assertEqual(path.stat().st_ino, winner.stat().st_ino)
         self.assertEqual(winner.stat().st_ino, (first / path.relative_to(second)).stat().st_ino)
 
-    def test_sha256_mismatch_fails_without_replacing_the_file(self):
+    def test_stale_bytes_beside_an_old_trace_are_rebuilt_not_shared(self):
         good = self.checkout("good", "TauCeti.A", "TauCeti.B")
         self.relink(good)
         bad = self.checkout("bad", "TauCeti.A", "TauCeti.B")
+        # An interrupted rebuild: Lake wrote new bytes, then died before replacing the old trace.
         target = bad / ".lake/build/lib/lean/TauCeti/A.olean"
-        original = target.read_bytes()
-        forged = bytes(reversed(original))
-        target.write_bytes(forged)  # Same name in the trace, different bytes, same size.
-        before = target.stat().st_ino
-        with self.assertRaisesRegex(canonical.Tampered, "differ from canonical"):
-            self.relink(bad)
-        self.assertEqual(target.read_bytes(), forged)
-        self.assertEqual(target.stat().st_ino, before)
-        # Everything else still converged before the round failed.
-        self.assertEqual(
-            (bad / ".lake/build/lib/lean/TauCeti/B.olean").stat().st_ino,
-            (good / ".lake/build/lib/lean/TauCeti/B.olean").stat().st_ino,
-        )
+        target.write_bytes(bytes(reversed(target.read_bytes())))
+        report = self.relink(bad)
+        self.assertEqual(report["invalidated_modules"], 1)
+        lib = bad / ".lake/build/lib/lean/TauCeti"
+        self.assertFalse((lib / "A.trace").exists())
+        self.assertFalse(any(lib.glob("A.*")))
+        self.assertFalse(any((bad / ".lake/build/ir/TauCeti").glob("A.*")))
+        # The canonical object is untouched and the other module still converged.
         objects = canonical.store(self.pool) / "objects"
-        self.assertEqual((objects / next(n for p, n in paths(good) if p.name == "A.olean")).read_bytes(), original)
+        name = next(n for p, n in paths(good) if p.name == "A.olean")
+        self.assertEqual((objects / name).read_bytes(), (good / ".lake/build/lib/lean/TauCeti/A.olean").read_bytes())
+        self.assertEqual((lib / "B.olean").stat().st_ino, (good / ".lake/build/lib/lean/TauCeti/B.olean").stat().st_ino)
+        # The next round rebuilds the module (here: rewrites it) and relinks it normally.
+        module(bad, "TauCeti.A", "same")
+        report = self.relink(bad)
+        self.assertNotIn("invalidated_modules", report)
+        self.assert_one_inode(good, bad)
 
-    def test_unverifiable_name_is_never_published(self):
+    def test_corrupted_canonical_object_is_evicted_and_republished(self):
+        good = self.checkout("good", "TauCeti.A")
+        self.relink(good)
+        objects = canonical.store(self.pool) / "objects"
+        name = next(n for p, n in paths(good) if p.name == "A.olean")
+        # Someone wrote the shared inode in place: every link now sees the bad bytes.
+        os.chmod(objects / name, 0o644)
+        (objects / name).write_bytes(b"x" * (objects / name).stat().st_size)
+        fresh = self.checkout("fresh", "TauCeti.A")
+        report = self.relink(fresh)
+        self.assertEqual(report["integrity_failures"], [name])
+        olean = fresh / ".lake/build/lib/lean/TauCeti/A.olean"
+        self.assertEqual((objects / name).stat().st_ino, olean.stat().st_ino)
+        self.assertEqual(lake_hash(olean.read_bytes()), name.split(".")[0])
+        # The checkout still linking the corrupt inode is invalidated at its next relink.
+        report = self.relink(good)
+        self.assertEqual(report["invalidated_modules"], 1)
+        self.assertFalse((good / ".lake/build/lib/lean/TauCeti/A.trace").exists())
+
+    def test_unverifiable_outputs_are_removed_not_kept_private(self):
         checkout = self.checkout("w", "TauCeti.A")
         target = checkout / ".lake/build/lib/lean/TauCeti/A.ilean"
         target.write_bytes(b"not what the trace hashed")
-        report = self.relink(checkout)
-        self.assertEqual(report["unverified"], 1)
         name = next(n for p, n in paths(checkout) if p == target)
+        report = self.relink(checkout)
+        self.assertEqual(report["invalidated_modules"], 1)
         self.assertFalse((canonical.store(self.pool) / "objects" / name).exists())
-        self.assertEqual(target.stat().st_nlink, 1)
+        self.assertFalse(target.exists())
+        self.assertFalse((checkout / ".lake/build/lib/lean/TauCeti/A.trace").exists())
+
+    def test_files_still_open_for_writing_or_changed_are_not_published(self):
+        checkout = self.checkout("w", "TauCeti.A")
+        found = paths(checkout)
+        held = found[0][0]
+        stream = open(held, "r+b")  # A writer the process scan cannot see.
+        self.addCleanup(stream.close)
+        later = found[1][0]
+        os.utime(later, (time.time() + 3600,) * 2)  # Changed after the boundary began.
+        report = self.relink(checkout)
+        objects = canonical.store(self.pool) / "objects"
+        self.assertEqual(report["deferred_busy"], 2)
+        self.assertFalse((objects / found[0][1]).exists())
+        self.assertFalse((objects / found[1][1]).exists())
+        self.assertTrue(held.exists() and later.exists())
+        self.assertEqual(report["published_local"], len(found) - 2)
+
+    def test_budget_and_host_slots_bound_relinking_and_it_resumes(self):
+        modules = [f"TauCeti.M{i}" for i in range(4)]
+        checkout = self.checkout("w", *modules)
+        report = self.relink(checkout, budget=0)
+        self.assertTrue(report["incomplete"])
+        self.assertNotIn("setup_removed", report)  # Setup files go only with a complete pass.
+        self.assertNotIn("published_local", report)
+        directory = canonical.store(self.pool)
+        with canonical.slot(directory, count=1, wait=0) as held:
+            self.assertTrue(held)
+            report = self.relink(checkout, slots=1, slot_wait=0.2)
+            self.assertIn("relinks already running", report["skipped"])
+        report = self.relink(checkout, slots=1)
+        self.assertEqual(report["published_local"], len(paths(checkout)))
+        self.assertEqual(report["setup_removed"], 4)
+
+    def test_legacy_copy_collected_mid_adoption_is_a_retryable_miss(self):
+        checkout = self.checkout("w", "TauCeti.A")
+        olean, name = next((p, n) for p, n in paths(checkout) if p.name == "A.olean")
+        legacy = self.pool / "artifacts" / name
+        legacy.parent.mkdir(parents=True)
+        shutil.copyfile(olean, legacy)
+        real_digest = canonical.digest
+
+        def collected(path):
+            if Path(path) == legacy:
+                legacy.unlink()  # Pool GC won the race.
+                raise FileNotFoundError(path)
+            return real_digest(path)
+
+        with patch.object(canonical, "digest", collected):
+            report = self.relink(checkout)
+        self.assertGreaterEqual(report["deferred"], 1)
+        self.assertTrue(olean.exists())
+        report = self.relink(checkout)  # Next boundary: verified and published locally.
+        self.assertEqual((canonical.store(self.pool) / "objects" / name).stat().st_ino, olean.stat().st_ino)
+
+    def test_legacy_gc_waits_for_the_object_lock(self):
+        name = "a" * 16 + ".olean"
+        legacy = self.pool / "artifacts" / name
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b"pool copy")
+        os.utime(legacy, (0, 0))
+        from tauceti_worker import retention
+
+        self.assertEqual(cache.root(), self.pool)
+        with (
+            patch.object(retention, "open_files", return_value=set()),
+            canonical.object_lock(canonical.store(self.pool), name, exclusive=True),
+        ):
+            cache_storage.collect([], opened=set())
+        self.assertTrue(legacy.exists())
+        cache_storage.collect([], opened=set())
+        self.assertFalse(legacy.exists())
+
+    def test_local_first_then_ci_expansion_keeps_one_inode(self):
+        checkout = self.checkout("w", "TauCeti.A")
+        self.relink(checkout)
+        olean, name = next((p, n) for p, n in paths(checkout) if p.name == "A.olean")
+        # CI later publishes the same bytes as a second inode: a pool alias and an entry alias.
+        entry = self.pool / "entries" / ("e" * 16)
+        entry.mkdir(parents=True)
+        outputs = json.loads((checkout / ".lake/build/lib/lean/TauCeti/A.trace").read_text())["outputs"]
+        for path, descriptor in paths(checkout):
+            shutil.copyfile(path, entry / descriptor)
+        (self.pool / "artifacts").mkdir(exist_ok=True)
+        shutil.copyfile(olean, self.pool / "artifacts" / name)
+        cache.atomic_json(entry / "entry.json", dict(data=outputs))
+        private = self.root / "other-store"
+        cache.hydrate(entry, private, "d" * 16)
+        inode = olean.stat().st_ino
+        self.assertEqual((entry / name).stat().st_ino, inode)
+        self.assertEqual((private / "artifacts" / name).stat().st_ino, inode)
+        from tauceti_worker import retention
+
+        canonical.sweep(self.pool, retention.fresh_report(time.time()), lifetime=3 * 86400, remove=retention.remove)
+        self.assertEqual((self.pool / "artifacts" / name).stat().st_ino, inode)
 
     def test_idempotent_and_deletes_setup_files(self):
         checkout = self.checkout("w", "TauCeti.A", "TauCeti.B")
@@ -227,16 +351,16 @@ class Canonical(unittest.TestCase):
             json.loads(canonical.sidecar(canonical.store(self.pool), name).read_text())["provenance"], "ci"
         )
 
-    def test_tampered_private_store_fails(self):
+    def test_corrupt_private_store_file_is_removed(self):
         checkout = self.checkout("w", "TauCeti.A")
         self.relink(checkout)
         store = self.root / "w-store"
         name = paths(checkout)[0][1]
         (store / "artifacts").mkdir(parents=True, exist_ok=True)
         (store / "artifacts" / name).write_bytes(b"forged")
-        with self.assertRaises(canonical.Tampered):
-            canonical.relink(checkout, store, self.pool, sweep_private=True)
-        self.assertEqual((store / "artifacts" / name).read_bytes(), b"forged")
+        report = canonical.relink(checkout, store, self.pool, sweep_private=True)
+        self.assertEqual(report["stale_store_files"], 1)
+        self.assertFalse((store / "artifacts" / name).exists())
 
     def test_link_failure_is_fatal(self):
         first = self.checkout("first", "TauCeti.A")
@@ -261,30 +385,43 @@ class Canonical(unittest.TestCase):
         self.assertFalse(list((self.root / "store/artifacts").glob(".link-probe-*")))
 
     @unittest.skipUnless(sys.platform == "linux", "process discovery uses /proc")
-    def test_running_lake_in_the_checkout_refuses_relinking(self):
+    def test_lake_writers_skip_relinking_but_servers_do_not(self):
         checkout = self.checkout("w", "TauCeti.A")
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+
+        def named(name, *args, cwd):
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    f"import time, ctypes; ctypes.CDLL(None).prctl(15, b'{name}', 0, 0, 0); time.sleep(30)",
+                    *args,
+                ],
+                cwd=cwd,
+            )
+            self.addCleanup(process.wait)
+            self.addCleanup(process.kill)
+            return process
+
+        server = named("lean", "--server", cwd=checkout)
         bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=checkout)
         self.addCleanup(bystander.wait)
         self.addCleanup(bystander.kill)
-        # A fake `lake` (PR_SET_NAME) with its cwd in the checkout, as an unreaped build would be.
-        holder = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                "import time, ctypes; ctypes.CDLL(None).prctl(15, b'lake', 0, 0, 0); time.sleep(30)",
-            ],
-            cwd=checkout,
-        )
-        self.addCleanup(holder.wait)
-        self.addCleanup(holder.kill)
+        time.sleep(0.3)
+        self.assertEqual(canonical.writers(checkout), [])
+        self.assertNotIn("skipped", self.relink(checkout))
+        # `lake -d <checkout>` from elsewhere names the checkout by argument, not cwd.
+        builder = named("lake", "-d", str(checkout), "build", cwd=elsewhere)
         for _ in range(100):
-            if holder.pid in canonical.writers(checkout):
+            if builder.pid in canonical.writers(checkout):
                 break
             time.sleep(0.05)
-        self.assertNotIn(bystander.pid, canonical.writers(checkout))
-        with self.assertRaises(canonical.Busy):
-            self.relink(checkout)
-        self.assertFalse((canonical.store(self.pool) / "objects").exists())
+        self.assertNotIn(server.pid, canonical.writers(checkout))
+        module(checkout, "TauCeti.B", "same")
+        report = self.relink(checkout)
+        self.assertIn("name the checkout", report["skipped"])
+        self.assertFalse(any(n.startswith(lake_hash(b"")) for n in os.listdir(canonical.store(self.pool) / "objects")))
 
     def test_eviction_respects_links_leases_and_the_object_lock(self):
         from tauceti_worker import retention
@@ -335,13 +472,23 @@ class Canonical(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("lean") and shutil.which("lake"), "Lean/Lake needed for native fixture")
     def test_real_lake_stays_up_to_date_after_relinking(self):
-        prefix = Path(subprocess.check_output(["lean", "--print-prefix"], text=True).strip())
+        # Pin the production toolchain where elan has it, so this exercises the deployed Lake.
+        toolchain = os.environ.get("TAUCETI_TEST_LEAN_TOOLCHAIN", "leanprover/lean4:v4.36.0-rc2")
+        try:
+            prefix = Path(
+                subprocess.check_output(
+                    ["lean", "+" + toolchain, "--print-prefix"], text=True, stderr=subprocess.DEVNULL, timeout=60
+                ).strip()
+            )
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest(f"toolchain {toolchain} unavailable")
         env = dict(os.environ, PATH=str(prefix / "bin") + ":" + os.environ["PATH"], LAKE_ARTIFACT_CACHE="1")
 
         def project(name):
             path = self.root / name
             (path / "Fx").mkdir(parents=True)
             (path / "lakefile.toml").write_text('name = "fx"\n[[lean_lib]]\nname = "Fx"\n')
+            (path / "lean-toolchain").write_text(toolchain + "\n")
             (path / "Fx/A.lean").write_text("module\npublic def a : Nat := 1\n")
             (path / "Fx.lean").write_text("module\npublic import Fx.A\npublic def b : Nat := a + 1\n")
             return path
@@ -376,6 +523,7 @@ class Canonical(unittest.TestCase):
             result = lake(path, "build", "--no-build", "Fx")
             self.assertEqual(result.returncode, 0, result.stdout)
             result = lake(path, "build", "Fx")
+            self.assertEqual(result.returncode, 0, result.stdout)
             self.assertNotIn("Built", result.stdout)
             self.assertNotIn("Unpacked", result.stdout)
         # A rebuild in one checkout never writes the shared inode in place.

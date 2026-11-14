@@ -218,6 +218,64 @@ class Cache(unittest.TestCase):
         cache.expand(download, self.root / "private", self.root, {}, self.pool, report, deadline=time.monotonic() + 10)
         self.assertEqual(report["hits"], 1)
 
+    def warm_entries(self, keys, download):
+        for index, key in enumerate(keys):
+            entry = self.pool / "entries" / key
+            data = dict(o=[f"{index:016x}.olean"], i=f"{index:016x}.ilean")
+            entry.mkdir(parents=True)
+            for name in cache.descriptions(data):
+                (entry / name).write_bytes(key.encode())
+            atomic_json(entry / "entry.json", dict(data=data))
+            atomic_json(download / "outputs/TauCeti" / (f"{index + 1:016x}" + ".json"), dict(data=key + ".ltar"))
+
+    def test_entry_lock_shard_collisions_within_a_batch_do_not_self_deadlock(self):
+        import time
+
+        keys = ["0000000000000036", "000000000000005b"]
+        self.assertEqual(cache.lock_path(self.pool, keys[0]), cache.lock_path(self.pool, keys[1]))
+        download = self.root / "download"
+        self.warm_entries(keys, download)
+        report = dict(hits=0, expanded=0)
+        started = time.monotonic()
+        cache.expand(download, self.root / "private", self.root, {}, self.pool, report, deadline=started + 5)
+        self.assertEqual(report["hits"], 2)
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_reversed_batches_on_two_workers_do_not_deadlock(self):
+        import threading
+        import time
+
+        keys = [f"{n:016x}" for n in range(0, 4000, 7)][:128]
+        forward, backward = self.root / "forward", self.root / "backward"
+        self.warm_entries(keys, forward)
+        for index, key in enumerate(reversed(keys)):
+            atomic_json(backward / "outputs/TauCeti" / (f"{index + 1:016x}" + ".json"), dict(data=key + ".ltar"))
+        reports, errors = {}, []
+
+        def run(download):
+            try:
+                report = reports[download.name] = dict(hits=0, expanded=0)
+                for _ in range(5):
+                    cache.expand(
+                        download,
+                        self.root / ("private-" + download.name),
+                        self.root,
+                        {},
+                        self.pool,
+                        report,
+                        deadline=time.monotonic() + 10,
+                    )
+            except Exception as error:  # noqa: BLE001 - asserted below
+                errors.append(error)
+
+        threads = [threading.Thread(target=run, args=(d,)) for d in (forward, backward)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual({r["hits"] for r in reports.values()}, {5 * len(keys)})
+
     def test_refetch_failure_after_corrupt_archive_fails_preparation(self):
         from tauceti_worker.config import NoProgress
 

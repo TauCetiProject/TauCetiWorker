@@ -1559,15 +1559,12 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
             ) from error
 
 
-class BuildOutputsRejected(NoProgress):
-    """Round-end relinking failed after the agent ran, e.g. tampered outputs; never refunded."""
-
-
 def relink_build_outputs(cwd: Path, env: dict, *, phase: str, prefix=()) -> dict | None:
     """Converge the checkout's TauCeti outputs on the host's canonical objects (one inode each).
 
-    `prepare` runs before the agent starts and also probes hard links in its namespace; `round-end`
-    runs once the agent's process group is reaped. Neither may continue on private copies.
+    `prepare` runs before the agent starts and probes hard links in its namespace: a failed probe
+    stops the round, because Lake would silently copy. Relinking itself is maintenance: failures
+    are logged and retried at the next boundary, never allowed to discard or block a round.
     """
     from . import canonical_store
 
@@ -1578,7 +1575,7 @@ def relink_build_outputs(cwd: Path, env: dict, *, phase: str, prefix=()) -> dict
         log(message)
         if phase == "prepare":
             raise BuildCacheUnavailable(message + "; agent not started") from error
-        raise BuildOutputsRejected(message) from error
+        return None
 
 
 def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -> None:

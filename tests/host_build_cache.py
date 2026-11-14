@@ -310,24 +310,26 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert "hard links unavailable" in text, text
     print("[OK] relinking brackets the agent; a hard-link preflight failure stops it before launch")
 
-    def tampered(cwd, env, *, phase, prefix=()):
-        if phase == "round-end":
-            raise canonical_store.Tampered("1 build outputs differ from canonical objects of the same name")
+    # Round-end relinking is maintenance: a busy checkout or an I/O failure keeps the agent's result.
+    real_relink = canonical_store.relink
+    for failure in ("busy", "io"):
 
-    with (
-        patch("tauceti_worker.expanded_cache.preparation", private_preparation),
-        patch.object(canonical_store, "boundary", tampered),
-    ):
-        try:
-            run(**overrides)
-        except agents.BuildOutputsRejected as error:
-            assert not isinstance(error, agents.BuildCacheUnavailable)
-            assert "differ from canonical" in str(error)
-        else:
-            raise AssertionError("tampered outputs must fail the round")
-    assert len(launched) == 1
+        def round_end(checkout, *args, failure=failure, **kwargs):
+            if kwargs.get("sweep_private"):
+                return real_relink(checkout, *args, **kwargs)  # H1 is unaffected.
+            if failure == "busy":
+                return {"skipped": "Lake or Lean processes [1] name the checkout"}
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with (
+            patch("tauceti_worker.expanded_cache.preparation", private_preparation),
+            patch.object(canonical_store, "relink", round_end),
+        ):
+            rc, records, text = run(**overrides)
+        assert rc == 0 and len(launched) == 1, (failure, text)
+        assert ("skipped" if failure == "busy" else "deferred") in text, text
     shutil.rmtree(co / ".lake")
-    print("[OK] tampered round-end outputs fail the round without an outage refund")
+    print("[OK] busy or failing round-end relinking keeps the agent's successful result")
 
     waits = []
     signals = []

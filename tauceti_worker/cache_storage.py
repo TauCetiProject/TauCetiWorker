@@ -43,6 +43,15 @@ def initialize(pool):
         raise ValueError(f"build cache must be an owned directory, not a symlink: {pool}")
 
 
+def legacy_lock(pool, name, *, dry=False):
+    """The canonical object lock, exclusive and non-blocking, before deleting a pool copy."""
+    from .canonical_store import object_lock, store
+
+    if dry:
+        return contextlib.nullcontext()
+    return object_lock(store(pool), name, exclusive=True, blocking=False)
+
+
 def roots(configs, pool):
     from .retention import cache_roots
 
@@ -260,11 +269,13 @@ def collect(configs, *, dry=False, now=None, opened=...):
                     removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + unique
                     for old in names:
                         shared = pool / ("archives" if old.name.endswith(".ltar") else "artifacts") / old.name
-                        if shared.is_file() and not shared.is_symlink() and shared.stat().st_nlink == 1:
-                            size = shared.stat().st_blocks * 512
-                            remaining -= size
-                            removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + size
-                            shared.unlink()
+                        # A relink adopting this pool copy holds the object lock while it hashes and links.
+                        with contextlib.suppress(BlockingIOError), legacy_lock(pool, old.name):
+                            if shared.is_file() and not shared.is_symlink() and shared.stat().st_nlink == 1:
+                                size = shared.stat().st_blocks * 512
+                                remaining -= size
+                                removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + size
+                                shared.unlink()
         except BlockingIOError:
             note(report, "protected", str(entry))
         except FileNotFoundError:
@@ -286,9 +297,14 @@ def collect(configs, *, dry=False, now=None, opened=...):
                 info = path.lstat()
                 if path.is_symlink() or info.st_nlink != 1:
                     continue
-                remove(path, pool, report, dry=dry, check_users=False, mounts=[])
+                with legacy_lock(pool, path.name, dry=dry):
+                    if path.lstat().st_nlink != 1:
+                        continue  # Adopted as a canonical object since the first look.
+                    remove(path, pool, report, dry=dry, check_users=False, mounts=[])
                 if not dry and not path.exists():
                     removed_bytes[info.st_dev] = removed_bytes.get(info.st_dev, 0) + info.st_blocks * 512
+            except BlockingIOError:
+                note(report, "protected", str(path))
             except FileNotFoundError:
                 continue
     if owned:

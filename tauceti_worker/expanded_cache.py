@@ -53,12 +53,44 @@ def root(env=None):
     )
 
 
+def lock_path(pool, key):
+    namespace = "entry" if HASH.fullmatch(key) else key.split("-", 1)[0]
+    return pool / "locks" / (namespace + "-" + hashlib.sha256(key.encode()).hexdigest()[:3] + ".lock")
+
+
+@contextlib.contextmanager
+def locked_all(pool, keys, *, deadline):
+    """Hold the exclusive locks of many keys: each shard once, in one global order.
+
+    Keys share 4096 shards, so one batch often maps two keys to one shard; taking that shard
+    twice through two descriptors would wait on itself, and unordered batches can form cycles.
+    """
+    with contextlib.ExitStack() as stack:
+        for path in sorted({lock_path(pool, key) for key in keys}):
+            stack.enter_context(_flock(path, deadline=deadline))
+        yield
+
+
+@contextlib.contextmanager
+def _flock(path, *, deadline):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with path.open("a+") as stream:
+        while True:
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if deadline is None or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.2)
+        yield
+
+
 @contextlib.contextmanager
 def locked(pool, key, *, readonly=False, deadline=None):
     """Exclusive entry lock; with a monotonic `deadline`, wait for it instead of failing at once."""
     directory = pool / "locks"
-    namespace = "entry" if HASH.fullmatch(key) else key.split("-", 1)[0]
-    path = directory / (namespace + "-" + hashlib.sha256(key.encode()).hexdigest()[:3] + ".lock")
+    path = lock_path(pool, key)
     if readonly and not path.exists():
         yield
         return
@@ -258,6 +290,11 @@ def hydrate(entry, private, input_hash, *, private_mappings=None, report=None):
     keys = input_hash if isinstance(input_hash, list) else [input_hash]
     known = {} if private_mappings is None else private_mappings
     changed = [key for key in keys if private_mapping(private, key, known) != desired]
+    from .canonical_store import reconcile
+
+    for name in names:
+        # A local publication may have made this name canonical first: keep one inode.
+        reconcile(entry.parent.parent, name, entry / name)
     missing = [name for name in names if not (private / "artifacts" / name).is_file()]
     started = clock()
     for name in missing:
@@ -292,13 +329,14 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
     for offset in range(0, len(pending), 128):
         with contextlib.ExitStack() as stack:
             missing = []
-            for input_hash, archive in pending[offset : offset + 128]:
+            batch = pending[offset : offset + 128]
+            try:
+                # Another publisher is useful work: wait for it, then hydrate its entry.
+                stack.enter_context(locked_all(pool, [archive[:-5] for _, archive in batch], deadline=deadline))
+            except BlockingIOError:
+                raise Unavailable("expansion entries still locked at the preparation deadline") from None
+            for input_hash, archive in batch:
                 key = archive[:-5]
-                try:
-                    # Another publisher is useful work: wait for it, then hydrate its entry.
-                    stack.enter_context(locked(pool, key, deadline=deadline))
-                except BlockingIOError:
-                    raise Unavailable(f"expansion of {archive} still locked at the preparation deadline") from None
                 entry = pool / "entries" / key
                 try:
                     if (entry / "entry.json").is_file():
@@ -347,6 +385,8 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
                     capture_output=True,
                     timeout=60,
                 )
+                from .canonical_store import reconcile
+
                 files = [p for p in work.rglob("*") if p.is_file() and p.suffix not in (".trace", ".hash", ".json")]
                 computed = hashes(program, files, work)
                 for input_hash, archive, entry in missing:
@@ -369,11 +409,14 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
                     for name in names:
                         # Deduplicate identical outputs across archive bundles as well as workers.
                         shared = pool / ("archives" if name.endswith(".ltar") else "artifacts") / name
+                        # An identical canonical object (a local build published first) wins.
+                        reconcile(pool, name, artifacts[name])
                         # Create a publication link FIRST, so a newly published canonical
                         # artifact never appears to GC as an unreferenced single link.
                         link(artifacts[name], publication / name)
                         link(publication / name, shared)
                         shared.chmod(0o444)
+                        reconcile(pool, name, shared)
                         if shared.stat().st_ino != (publication / name).stat().st_ino:
                             (publication / name).unlink()
                             link(shared, publication / name)
