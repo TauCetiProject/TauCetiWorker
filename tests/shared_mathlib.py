@@ -1659,6 +1659,21 @@ class VersionCapTests(unittest.TestCase):
         subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{source}", str(shallow)], check=True)
         self.assertIsNone(s.allowed_revisions(shallow))
 
+    def test_an_unkillable_holder_stops_the_round_instead_of_a_private_build(self):
+        pool = self.root / "pool"
+        victim = self.entry(pool, "k-old", "zzz", age=100)
+        self.entry(pool, "k-current", "bbb", age=500)
+        holder = self.holder(pool, "k-old")
+        with (
+            patch.object(s, "_kill_holders"),  # a holder this process cannot end
+            patch.object(s, "EVICTION_WAIT", 0.2),
+            self.assertRaises(s.CapContention),
+        ):
+            s.enforce_version_cap(pool, "k-new", {"bbb"}, {})
+        self.assertFalse(victim.exists())  # hidden at once, so no new reader can lease it
+        self.assertIsInstance(s.CapContention("x"), s.NoFallback)
+        self.assertIsNone(holder.poll())
+
     def test_cap_evicts_the_oldest_allowed_entry_when_all_are_allowed(self):
         pool = self.root / "pool"
         older = self.entry(pool, "k-a", "aaa", age=900)

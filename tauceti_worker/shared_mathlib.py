@@ -410,6 +410,7 @@ def lease_lock(stream, flags, *, timeout=None):
 
 VERSION_CAP = 2  # Mathlib builds a host may hold at once, counting every entry
 EVICTION_GRACE = 20  # seconds between SIGTERM and SIGKILL for rounds holding an evicted entry
+EVICTION_WAIT = 40  # each of three waits for an evicted entry's exclusive lock
 
 
 def allowed_revisions(cwd):
@@ -598,13 +599,29 @@ def _evict_excess(pool, keep, allowed, env):
 
     ranked = sorted(entries, key=lambda e: (allowed is None or _entry_revision(e) in allowed, age(e)))
     for victim in ranked[:excess]:
-        lock_path = pool / "locks" / (victim.name + ".lock")
-        report(pool, env, mode="evicting", key=victim.name, reason="Mathlib version cap")
-        if lock_path.exists():
-            _kill_holders(_holders(lock_path))
-        with key_lock(pool, victim.name, exclusive=True, timeout=120):
-            if victim.exists():
-                discard_entry(pool, victim)  # renames into trash, then removes it
+        key = victim.name
+        lock_path = pool / "locks" / (key + ".lock")
+        report(pool, env, mode="evicting", key=key, reason="Mathlib version cap")
+        # Hide the entry first: a reader arriving after this finds no entry, so it must publish,
+        # which waits on `versions` (held here) instead of leasing the victim behind our back.
+        trash = pool / "trash"
+        trash.mkdir(parents=True, exist_ok=True)
+        retired = trash / (key + "-" + uuid.uuid4().hex)
+        os.replace(victim, retired)
+        # Overlays already mounted keep their lower through file descriptors: kill those rounds,
+        # rescanning while waiting, then delete under the exclusive key lock.
+        for attempt in range(3):
+            if lock_path.exists():
+                _kill_holders(_holders(lock_path))
+            try:
+                with key_lock(pool, key, exclusive=True, timeout=EVICTION_WAIT):
+                    remove_tree(retired)
+                break
+            except IntegrityFailure:
+                raise
+            except Unavailable as error:
+                if attempt == 2:
+                    raise CapContention(f"evicting Mathlib {key[:12]} timed out: {error}") from error
 
 
 def remove_tree(path):
