@@ -119,6 +119,11 @@ def main():
         subprocess.run(["git", f"--git-dir={clone}", "config", "core.fsmonitor", "/tmp/evil"], check=True)
         (clone / "hooks").mkdir(exist_ok=True)
         (clone / "hooks/pre-commit").write_text("#!/bin/sh\nexit 1\n")
+        subprocess.run(["git", f"--git-dir={clone}", "config", "remote.origin.url", "/tmp/a-fork"], check=True)
+        subprocess.run(["git", f"--git-dir={clone}", "config", "gpg.program", "/tmp/evil"], check=True)
+        planted = rw.root() / "no-hooks"
+        planted.chmod(0o700)
+        (planted / "post-checkout").write_text("#!/bin/sh\nexit 1\n")
         two = worker(root, "w2")
         crashed = (two.state / "round.lock").open("a+")
         fcntl.flock(crashed, fcntl.LOCK_EX)
@@ -127,6 +132,9 @@ def main():
         config = subprocess.run(["git", f"--git-dir={clone}", "config", "--list"], capture_output=True, text=True)
         check("fsmonitor was removed", "core.fsmonitor" not in config.stdout)
         check("hooks were removed", not (clone / "hooks/pre-commit").exists())
+        check("the hooks target is empty again", not any(planted.iterdir()))
+        check("gpg.program was removed", "gpg.program" not in config.stdout)
+        check("origin is canonical again", f"remote.origin.url={origin}" in config.stdout)
         check("hooksPath points at an empty directory", "core.hookspath=" in config.stdout.lower())
         trees = [
             ln for ln in git(one.checkout, "worktree", "list", "--porcelain").splitlines() if ln.startswith("worktree ")

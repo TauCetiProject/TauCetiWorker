@@ -31,7 +31,10 @@ from pathlib import Path
 
 from .config import log
 
+# Every checkout this process prepared (worker and source checkouts), released at round end.
+PREPARED = []
 FETCH_INTERVAL = 60
+FETCH_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
 # Shared-config keys that could run code or redirect traffic for every round on the host. An agent
 # writing `git config` in its worktree writes the shared file, so they are cleared at every round.
 # core.hooksPath is not listed: it is set to an empty directory at every round instead.
@@ -44,6 +47,11 @@ UNSAFE_CONFIG = (
     r"^credential\.",
     r"^alias\.",
     r"^(uploadpack|protocol|url|http)\.",
+    r"^diff\.external$",
+    r"^gpg\.",
+    r"^sequence\.editor$",
+    # Per-worktree config files would escape this check; keep them disabled.
+    r"^extensions\.worktreeconfig$",
 )
 
 
@@ -59,8 +67,14 @@ def root() -> Path:
     return Path(os.environ.get("TAUCETI_HOST_REPOSITORIES") or worker_state_root().parent / "host-repositories")
 
 
-def host_clone() -> Path:
-    return root() / "TauCeti.git"
+def host_clone(url=None) -> Path:
+    """One bare clone per repository identity (GitHub and Forgejo sources never share one)."""
+    import hashlib
+
+    from .agents import checkout_url
+
+    identity = hashlib.sha256((url or checkout_url()).strip().rstrip("/").removesuffix(".git").encode())
+    return root() / f"TauCeti-{identity.hexdigest()[:12]}.git"
 
 
 def is_clone(path: Path) -> bool:
@@ -118,7 +132,7 @@ def _ensure_clone(url):
     staging = clone.with_name(clone.name + f".tmp-{os.getpid()}")
     subprocess.run(["git", "clone", "--bare", "--quiet", "--", url, str(staging)], check=True, timeout=1800)
     git = ["git", f"--git-dir={staging}"]
-    subprocess.run([*git, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], check=True)
+    subprocess.run([*git, "config", "remote.origin.fetch", FETCH_REFSPEC], check=True)
     subprocess.run([*git, "fetch", "--quiet", "--prune", "origin"], check=True, timeout=1800)
     # No local branches: a branch can be checked out in only one worktree at a time.
     heads = subprocess.run(
@@ -130,9 +144,15 @@ def _ensure_clone(url):
     log(f"worktrees: created the host clone {clone}")
 
 
-def harden():
-    """Clear shared-config keys and hooks that would act on every round; point hooks at nothing."""
+def harden(url):
+    """Clear shared-config keys and hooks that would act on every round; point hooks at nothing.
+
+    `origin` is reset to the canonical repository and fetch mapping, so an agent that repoints it
+    cannot change every later round's `origin/main`.
+    """
     clone = host_clone()
+    _git("config", "--file", clone / "config", "remote.origin.url", url)
+    _git("config", "--file", clone / "config", "--replace-all", "remote.origin.fetch", FETCH_REFSPEC)
     listed = _git("config", "--file", clone / "config", "--name-only", "--list", check=False).stdout.split()
     import re
 
@@ -141,7 +161,15 @@ def harden():
             _git("config", "--file", clone / "config", "--unset-all", key, check=False)
             log(f"worktrees: removed shared Git config {key}")
     empty = root() / "no-hooks"
+    if empty.is_symlink() or empty.is_file():
+        empty.unlink()
+    elif empty.is_dir() and any(empty.iterdir()):
+        import shutil
+
+        empty.chmod(0o700)
+        shutil.rmtree(empty)
     empty.mkdir(exist_ok=True, mode=0o500)
+    empty.chmod(0o500)
     _git("config", "--file", clone / "config", "core.hooksPath", empty)
     hooks = clone / "hooks"
     if hooks.is_dir():
@@ -156,29 +184,6 @@ def _fetch():
         if time.time() - marker.stat().st_mtime < FETCH_INTERVAL:
             return  # another worker's round fetched just now
     _git("fetch", "--quiet", "--prune", "origin")
-
-
-def _lock_held(path: Path) -> bool:
-    """Whether any process holds a lock on `path`, from /proc/locks; unknown counts as held."""
-    try:
-        info = path.stat()
-    except FileNotFoundError:
-        return False
-    try:
-        text = Path("/proc/locks").read_text()
-    except OSError:
-        return True
-    for line in text.splitlines():
-        fields = line.split()
-        if len(fields) > 5 and fields[5].count(":") == 2:
-            major, minor, inode = fields[5].split(":")
-            with contextlib.suppress(ValueError):
-                if int(inode) == info.st_ino and (int(major, 16), int(minor, 16)) == (
-                    os.major(info.st_dev),
-                    os.minor(info.st_dev),
-                ):
-                    return True
-    return False
 
 
 def _worktrees():
@@ -214,11 +219,10 @@ def _discard(path: Path):
         log(f"worktrees: deletion deferred: {error}")
 
 
-def _remove(tree: Path, branch: str | None):
-    _git("worktree", "remove", "--force", tree)
-    if branch:
-        # The round's PR branch lives in the shared refs; its source was saved above.
-        _git("update-ref", "-d", branch, check=False)
+def _remove(tree: Path, common: Path | None = None):
+    """Remove a saved worktree. Branches stay: another round may already own one."""
+    git = ["git", f"--git-dir={common or host_clone()}"]
+    subprocess.run([*git, "worktree", "remove", "--force", str(tree)], check=True, capture_output=True, text=True)
 
 
 def _save(cfg, tree: Path):
@@ -233,15 +237,17 @@ def _save(cfg, tree: Path):
     return decision.ok
 
 
-def _branch(tree: Path) -> str | None:
-    result = subprocess.run(
-        ["git", "-C", str(tree), "symbolic-ref", "-q", "HEAD"], capture_output=True, text=True, timeout=60
-    )
-    return result.stdout.strip() or None if result.returncode == 0 else None
+def _round_lock(tree: Path) -> Path | None:
+    """The round lock of the worker whose checkout this is: beside it, or above a source checkout
+    (`state/sources/<hash>/checkout`). None for any other layout."""
+    for parent in list(tree.parents)[:4]:
+        if (parent / "round.lock").is_file():
+            return parent / "round.lock"
+    return None
 
 
 def sweep(current: Path):
-    """Remove worktrees of crashed rounds: no lease, no user, and a successful save first."""
+    """Remove worktrees of crashed rounds: holding their worker's round lock, after a save."""
     from types import SimpleNamespace
 
     from .work_recovery import live_users
@@ -250,18 +256,24 @@ def sweep(current: Path):
     for tree in _worktrees():
         if tree.resolve() == current.resolve() or not tree.exists():
             continue
-        state = tree.parent
-        # Only a worker's own checkout path has a round lock beside it; anything else (a retained
-        # tree, an unknown layout) is the retention collector's to judge.
-        if not (state / "round.lock").is_file() or _lock_held(state / "round.lock") or live_users(tree):
-            continue
-        owner = SimpleNamespace(wid=state.name, state=state, checkout=tree, data_home=state / "home")
-        if _save(owner, tree):
-            branch = _branch(tree)
-            with contextlib.suppress(OSError):
-                _park(owner, tree)
-            _remove(tree, branch)
-            log(f"worktrees: removed the crashed round's worktree {tree}")
+        lock = _round_lock(tree)
+        if lock is None:
+            continue  # a retained tree or unknown layout: the retention collector's to judge
+        with lock.open("a+") as stream:
+            try:
+                # Held through the save and removal, so no new round can take this checkout now.
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue  # a live round
+            if live_users(tree):
+                continue
+            state = lock.parent
+            owner = SimpleNamespace(wid=state.name, state=state, checkout=tree, data_home=state / "home")
+            if _save(owner, tree):
+                with contextlib.suppress(OSError):
+                    _park(owner, tree)
+                _remove(tree)
+                log(f"worktrees: removed the crashed round's worktree {tree}")
 
 
 def prepare(cfg, url) -> bool:
@@ -282,11 +294,9 @@ def prepare(cfg, url) -> bool:
             log(f"worktrees: deleted the old permanent checkout {co} after saving it")
         elif not work_recovery.retain(cfg, co, "an old checkout could not be saved before deletion").ok:
             return False
-    elif kind == "worktree":
-        # A worktree that outlived its round (a crash): save it, history included, then replace it.
-        decision = work_recovery.guard(cfg, co)
-        if not decision.ok:
-            log(f"worktrees: preparation refused: {decision.reason}")
+    elif kind == "worktree" and not _save(cfg, co):
+        # A worktree that outlived its round and cannot be archived: keep it whole, aside.
+        if not work_recovery.retain(cfg, co, "a leftover worktree could not be saved before removal").ok:
             return False
     elif co.exists():
         if not work_recovery.retain(cfg, co, "the checkout has no git metadata").ok:
@@ -294,55 +304,71 @@ def prepare(cfg, url) -> bool:
     try:
         with host_lock():
             _ensure_clone(url)
-            harden()
+            harden(url)
             _fetch()
             if co.exists() and owns(co):
-                branch = _branch(co)
                 with contextlib.suppress(OSError):
                     _park(cfg, co)
-                _remove(co, branch)
+                _remove(co)
             sweep(co)
             co.parent.mkdir(parents=True, exist_ok=True)
-            _git("worktree", "add", "--quiet", "--detach", co, "refs/remotes/origin/main")
+            base = os.environ.get("TAUCETI_BASE_BRANCH", "main")
+            _git("worktree", "add", "--quiet", "--detach", co, f"refs/remotes/origin/{base}")
     except (OSError, subprocess.SubprocessError) as error:
         detail = getattr(error, "stderr", "") or ""
         log(f"worktrees: preparation failed: {error} {detail.strip()[-300:]}")
         return False
     _unpark(cfg, co)
+    PREPARED.append(cfg)
     return True
 
 
 def release(cfg) -> None:
-    """At round end: save the worktree, then remove it. Never raises."""
-    co = getattr(cfg, "checkout", None)
-    try:
-        if not enabled() or co is None or not co.exists() or not owns(co):
-            return
-        if not _save(cfg, co):
-            return
-        branch = _branch(co)
-        _park(cfg, co)
-        with host_lock():
-            _remove(co, branch)
-    except Exception as error:  # noqa: BLE001 - round cleanup must not fail the round
-        log(f"worktrees: release deferred ({type(error).__name__}: {error}); the next round saves it")
+    """At round end: save each worktree this round prepared, then remove it. Never raises."""
+    state = Path(getattr(cfg, "state", "/nonexistent")).resolve()
+
+    def own(other):
+        # Only this worker's checkouts: its own, or a source checkout under its state.
+        return other is cfg or Path(other.checkout).resolve().is_relative_to(state)
+
+    configs = [cfg, *(c for c in PREPARED if c is not cfg and own(c))]
+    PREPARED[:] = [c for c in PREPARED if c is not cfg and not own(c)]
+    seen = set()
+    for current in configs:
+        co = getattr(current, "checkout", None)
+        if co is None or co in seen:
+            continue
+        seen.add(co)
+        try:
+            if not enabled() or not co.exists() or not owns(co):
+                continue
+            if not _save(current, co):
+                continue
+            _park(current, co)
+            with host_lock():
+                _remove(co)
+        except Exception as error:  # noqa: BLE001 - round cleanup must not fail the round
+            log(f"worktrees: release deferred ({type(error).__name__}: {error}); the next round saves it")
 
 
 def retire(cfg) -> bool:
     """With the flag turned off again: save and remove this worker's worktree, keeping `.lake`.
 
-    Returns False when the worktree could not be saved; it is then left for the retention path.
+    Any linked worktree counts, whatever host root it came from: its own common directory is the
+    evidence. One that cannot be saved is moved aside whole, and the transition continues.
     """
+    from .work_recovery import _common_dir, checkout_kind, retain
+
     co = cfg.checkout
     try:
-        if not owns(co):
+        if not co.exists() or checkout_kind(co) != "worktree":
             return True
+        common = _common_dir(co)
         if not _save(cfg, co):
-            return False
-        branch = _branch(co)
+            return retain(cfg, co, "a worktree could not be saved when worktree rounds were turned off").ok
         _park(cfg, co)
         with host_lock():
-            _remove(co, branch)
+            _remove(co, common)
         log(f"worktrees: retired {co}; this worker uses an ordinary checkout again")
         return True
     except (OSError, subprocess.SubprocessError) as error:
@@ -354,3 +380,8 @@ def restore_parked(cfg) -> None:
     """Give an ordinary checkout back the `.lake` its worker's last worktree round left."""
     with contextlib.suppress(OSError):
         _unpark(cfg, cfg.checkout)
+
+
+def local_branch(cfg, pr) -> str:
+    """A PR branch name no other worker's worktree can hold (branches are shared by worktrees)."""
+    return f"tauceti/{cfg.wid}/pr-{pr}"
