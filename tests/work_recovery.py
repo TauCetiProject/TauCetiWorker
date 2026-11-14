@@ -787,6 +787,26 @@ def test_linked_worktrees(root):
     decision = wr.save_for_cleanup(cfg, mine)
     check(f"a worktree with fetched tags is saved, not retained whole ({decision.reason})", decision.ok)
     check("its record exists", decision.record is not None and wr._complete(decision.record) is not None)
+    git(theirs, "switch", "-q", "-c", "round-b-branch")
+    (theirs / "B.lean").write_text("theorem branch : True := trivial\n")
+    git(theirs, "commit", "-qam", "another round on a branch")
+    branch_tip = git(theirs, "rev-parse", "HEAD").strip()
+    check(
+        "another round's shared branch is not this worktree's history",
+        branch_tip not in wr.inspect(mine, history=True).tips.values(),
+    )
+    hosted = wr.save_for_cleanup(cfg, co)
+    check(f"a clone hosting worktrees is never approved for removal ({hosted.reason})", not hosted.ok)
+    moved = wr.retain(cfg, mine, "test retention")
+    dest = Path(moved.details["retained"]) if moved.ok else None
+    check(
+        "a retained worktree still resolves its own metadata", dest is not None and wr.checkout_kind(dest) == "worktree"
+    )
+    listing = git(co, "worktree", "list", "--porcelain") if dest else ""
+    check(
+        "a retained worktree is registered at its new path and locked",
+        f"worktree {dest}" in listing and "locked" in listing,
+    )
 
 
 def main():

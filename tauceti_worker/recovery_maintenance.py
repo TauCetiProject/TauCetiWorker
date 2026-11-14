@@ -585,7 +585,10 @@ def _unarchived_state(tree, snap):
         return True
     if snap.operations or any("credential" in reason for _, reason in snap.excluded):
         return True
-    if wr._git(tree, "for-each-ref", "--format=%(refname)", "refs/stash", "refs/notes").strip():
+    extra = ["refs/stash", "refs/notes"] + (
+        ["refs/worktree", "refs/bisect"] if wr.checkout_kind(tree) == "worktree" else []
+    )
+    if wr._git(tree, "for-each-ref", "--format=%(refname)", *extra).strip():
         return True
     # The history-aware snapshot includes extra ref/reflog tips in this descriptor's v1 bundle.
     return False
