@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -318,9 +319,18 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         rc, records, text = run(**overrides)
     assert rc == 0, text
     assert phases == [("prepare", 0), ("round-end", 1)], phases
+    # EXDEV both in-process and inside the agent's namespace (the shared Mathlib view's prefix).
+    real_run = canonical_store.subprocess.run
+
+    def exdev_in_namespace(argv, *args, **kwargs):
+        if canonical_store.PROBE in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "Invalid cross-device link")
+        return real_run(argv, *args, **kwargs)
+
     with (
         patch("tauceti_worker.expanded_cache.preparation", private_preparation),
         patch.object(canonical_store.os, "link", side_effect=OSError(errno.EXDEV, "Invalid cross-device link")),
+        patch.object(canonical_store.subprocess, "run", side_effect=exdev_in_namespace),
     ):
         rc, records, text = run(**overrides)
     assert rc == 75 and not launched, text
@@ -359,6 +369,7 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         patch("tauceti_worker.expanded_cache.preparation", private_preparation),
         patch.object(canonical_store, "boundary", observed),
         patch.object(agents, "run_agent_proc", incomplete),
+        patch.object(shared_mathlib, "view", shared_view),
     ):
         overrides_env = {**env, "CACHE_TEST_MODE": "", **overrides}
         with patch.dict(os.environ, overrides_env, clear=True), contextlib.redirect_stderr(io.StringIO()) as err:
