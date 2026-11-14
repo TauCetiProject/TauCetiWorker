@@ -290,7 +290,7 @@ def private_mapping(private, key, known):
     return known[key]
 
 
-def hydrate(entry, private, input_hash, *, private_mappings=None, report=None, guard=None):
+def hydrate(entry, private, input_hash, *, private_mappings=None, report=None, guard=None, refused=None):
     row = read_json(entry / "entry.json")
     names = list(dict.fromkeys(descriptions(row["data"])))
     try:
@@ -302,16 +302,15 @@ def hydrate(entry, private, input_hash, *, private_mappings=None, report=None, g
     keys = input_hash if isinstance(input_hash, list) else [input_hash]
     known = {} if private_mappings is None else private_mappings
     changed = [key for key in keys if private_mapping(private, key, known) != desired]
-    from .canonical_store import Guard, fingerprint, reconcile, rejected
+    from .canonical_store import Guard, fingerprint, rejected
 
     guard = Guard() if guard is None else guard
-    refused = rejected(entry.parent.parent)
+    refused = rejected(entry.parent.parent) if refused is None else refused
     if refused and any(fingerprint((entry / name).lstat()) in refused for name in names):
         # Relinking proved these bytes wrong: re-expand the entry from its verified archive.
         raise ValueError("entry holds bytes relinking rejected")
-    for name in names:
-        # A local publication may have made this name canonical first: keep one inode.
-        reconcile(entry.parent.parent, name, entry / name, guard=guard)
+    # No reconcile here: hydration runs under exclusive batch locks for every round on the host,
+    # and reconciling hashes whole files. The pool collector's sweep merges duplicate inodes.
     missing = [name for name in names if not (private / "artifacts" / name).is_file()]
     started = clock()
     for name in missing:
@@ -347,6 +346,9 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
     from .canonical_store import Guard, reconcile
 
     guard = Guard()  # One lazy /proc scan for every alias this expansion may replace.
+    from .canonical_store import rejected
+
+    refused = rejected(pool)  # read once per expansion, not once per entry
     for offset in range(0, len(pending), 128):
         with contextlib.ExitStack() as stack:
             missing = []
@@ -362,7 +364,13 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
                 try:
                     if (entry / "entry.json").is_file():
                         hydrate(
-                            entry, private, input_hash, private_mappings=private_mappings, report=report, guard=guard
+                            entry,
+                            private,
+                            input_hash,
+                            private_mappings=private_mappings,
+                            report=report,
+                            guard=guard,
+                            refused=refused,
                         )
                         report["hits"] += 1
                         completed += 1
@@ -446,7 +454,15 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
                     atomic_json(publication / "entry.json", dict(data=data))
                     entry.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(publication, entry)  # A new entry name from our staging directory.
-                    hydrate(entry, private, input_hash, private_mappings=private_mappings, report=report, guard=guard)
+                    hydrate(
+                        entry,
+                        private,
+                        input_hash,
+                        private_mappings=private_mappings,
+                        report=report,
+                        guard=guard,
+                        refused=refused,
+                    )
                     report["expanded"] += 1
                     completed += 1
     if completed != len(pending):
