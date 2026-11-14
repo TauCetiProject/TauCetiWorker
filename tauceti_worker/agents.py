@@ -1036,6 +1036,8 @@ def run_agent_host(
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
     _LAST_AGENT_FAILURE = None
+    from . import round_storage
+
     with host_build_cache_context(cwd, env, logdir) as prefix:
         if not cache_note:
             env.pop("TAUCETI_PR_CACHE_MISS", None)  # the convention belongs to the appendix left out
@@ -1050,6 +1052,8 @@ def run_agent_host(
             session_path=session_path,
             quota_cfg=quota_cfg,
             stdin_text=stdin_text,
+            # Before launch, after preparation: the baseline is the build state the round inherits.
+            storage=round_storage.start(cwd, env, quota_cfg),
         )
         if env.get("TAUCETI_SHARED_MATHLIB_KEY"):
             from .shared_mathlib import record_result
@@ -1198,6 +1202,7 @@ def run_agent_proc(
     session_path=None,
     quota_cfg=None,
     stdin_text: str | None = None,
+    storage=None,
 ) -> int:
     """Run an agent subprocess through its readable transcript renderer.
 
@@ -1206,6 +1211,8 @@ def run_agent_proc(
     failures aren't silent. ``stdin_text`` (a prompt too long for argv, see ``host_agent_launch``) is
     written to the process's stdin from a separate thread, so a prompt larger than the pipe buffer
     cannot deadlock against the transcript being read here, and stdin is closed once it is delivered.
+    ``storage`` (a ``round_storage.RoundStorage``) watches the round's private bytes while the agent
+    runs; past its cap it kills the group and, once the group is reaped, raises ``RoundAbandoned``.
     """
     global _LAST_AGENT_FAILURE, _LAST_AGENT_RUN
     _LAST_AGENT_FAILURE = None
@@ -1293,6 +1300,8 @@ def run_agent_proc(
                 thread = threading.Thread(target=cancel_on_lease_loss, daemon=True)
                 thread.start()
                 monitor = thread
+            if storage is not None:
+                storage.watch(proc, finished)
             for line in proc.stdout:
                 if session_path:
                     try:
@@ -1351,6 +1360,8 @@ def run_agent_proc(
         }
         if provider in {"codex", "claude"} and not renderer.active:
             write_rendered(destination, f"[warning] no structured {provider} events were recognized\n")
+        if storage is not None:
+            storage.conclude(rc)  # the group is reaped; raises RoundAbandoned past the cap
         return rc
 
     def classify_rendered_failure() -> str | None:

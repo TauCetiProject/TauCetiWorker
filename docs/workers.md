@@ -405,6 +405,53 @@ walking cache trees. Space held by active work, preserved source or unrelated pr
 be reclaimed to enforce an eviction target; this is not a filesystem quota. Retained source,
 usage/accounting records and credentials are never disposable cache data.
 
+The collector also reports storage three ways, because hard-linked files still count in `du`:
+named bytes (every link counted, as `du --count-links` would), bytes allocated in unique inodes,
+and filesystem free space. `status` prints all three; checkout size alone proves nothing.
+
+### Per-round private-bytes cap
+
+A host round's private bytes are the bytes of files whose links all lie inside the round's own
+writable roots: its checkout (including `.lake` and the shared-Mathlib overlay upper), the
+worker's `LAKE_CACHE_DIR` and `MATHLIB_CACHE_DIR`, and a private `TMPDIR`. A file hard-linked to a
+shared store is not private; a file written, unpacked or copied there is. A walk before the agent
+starts records the baseline the round inherits. While the agent runs, a monitor thread measures
+again every 30 seconds, and sooner when the worker scope's cgroup `io.stat` write bytes jump. Each
+pass lstats every directory but rereads only directories whose mtime changed, a rotating eighth of
+the rest, and files changed during the round. Filesystem quotas are not used: hard links fail
+across XFS project IDs and bind mounts, which would make Lake copy instead of link.
+
+| Setting | Values | Default |
+| --- | --- | --- |
+| `TAUCETI_ROUND_PRIVATE_BYTES`, or `mode` | `off`, `report` (measure only), `enforce` | `off` |
+| `TAUCETI_ROUND_PRIVATE_CAP_GIB`, or `cap_gib` | new private GiB allowed per round | `6` |
+| `TAUCETI_ROUND_PRIVATE_SCAN_SECONDS`, or `scan_seconds` | seconds between passes | `30` |
+
+The environment overrides the per-host file `round-storage.json` in the workers state directory
+(`~/.local/state/tauceti/workers/` on Linux), for example `{"mode": "enforce", "cap_gib": 6}`.
+Each round reads it again, so enabling a host needs no restart. An invalid value fails the round.
+
+In `enforce`, a round whose new private bytes exceed the cap has its agent's process group killed.
+Once the group is reaped, its checkout is moved whole into `recovery-cleanup/discarded/` without
+saving anything (no recovery record, no retained tree) and deleted by the ordinary collector, which
+never follows links or crosses filesystems. The round ends as no progress, and the PR attempt stays
+charged. While enabled, round start also checks the leased shared Mathlib entry against its
+`ready.json` inventory. A mismatch stops the round before the agent starts and records a shared
+Mathlib safety stop; it never deletes through the shared path. `report` logs the same findings and
+keeps the round.
+
+Each measurement is published as `round_storage` in the runtime status and as `private_storage`
+in the round's `resources.jsonl` record. A finished invocation also writes
+`state/<worker-id>/round-storage.json` and a `round_storage` activity event. Bubble rounds,
+verification jobs and review rounds are not measured.
+
+The plan is to enable `enforce` on a host once authoring, verification, recovery and review rounds
+keep completing, deletion keeps progressing, and private copies do not regrow. Until shared
+Mathlib is required and TauCeti outputs are relinked to one canonical copy, rounds that rebuild or
+fetch Mathlib privately exceed the cap by design. Run `report` first to see which rounds would be
+killed. The baseline walk costs a few seconds per round for a fully built checkout, and memory of
+about 8 bytes per file plus a dictionary entry per hard-linked file.
+
 ## `workers add` flags
 
 `add` takes an optional id, defaulting to the next free `workerN`, and writes an
