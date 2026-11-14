@@ -1539,5 +1539,75 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
                 p.stdout.close()
 
 
+class VersionCapTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+
+    def manifest(self, repo, revision):
+        (repo / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib", "rev": revision}]}))
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", revision], check=True)
+
+    def test_allowed_revisions_are_current_and_previous_main_pins(self):
+        repo = self.root / "checkout"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        for args in (["user.name", "t"], ["user.email", "t@example.com"]):
+            subprocess.run(["git", "-C", str(repo), "config", *args], check=True)
+        self.assertIsNone(s.allowed_revisions(repo))  # no origin/main: unknown
+        for revision in ("aaa", "bbb", "bbb2"):
+            self.manifest(repo, revision)
+        (repo / "README").write_text("unrelated")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "docs"], check=True)
+        subprocess.run(["git", "-C", str(repo), "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
+        self.assertEqual(s.allowed_revisions(repo), {"bbb2", "bbb"})
+
+    def entry(self, pool, key, revision, age):
+        entry = pool / "entries" / key
+        (entry / "build").mkdir(parents=True)
+        (entry / "ready.json").write_text(json.dumps({"key": key, "spec": {"mathlib": revision}}))
+        os.utime(entry, (time.time() - age, time.time() - age))
+        return entry
+
+    def holder(self, pool, key):
+        (pool / "locks").mkdir(parents=True, exist_ok=True)
+        lock = pool / "locks" / (key + ".lock")
+        script = "import fcntl,sys,time; f=open(sys.argv[1],'a+'); fcntl.flock(f, fcntl.LOCK_SH); print('ok', flush=True); time.sleep(120)"
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(lock)], stdout=subprocess.PIPE, text=True, start_new_session=True
+        )
+        self.addCleanup(lambda: (process.kill(), process.wait()))
+        self.assertEqual(process.stdout.readline().strip(), "ok")
+        return process
+
+    def test_cap_evicts_disallowed_versions_first_and_kills_their_rounds(self):
+        if not Path("/proc/self/fd").is_dir():
+            self.skipTest("holder discovery uses /proc")
+        pool = self.root / "pool"
+        old = self.entry(pool, "k-old", "zzz", age=100)
+        current = self.entry(pool, "k-current", "bbb", age=500)
+        using_old = self.holder(pool, "k-old")
+        using_current = self.holder(pool, "k-current")
+        with patch.object(s, "EVICTION_GRACE", 5):
+            s.enforce_version_cap(pool, "k-new", {"bbb", "aaa"}, {})
+        self.assertFalse(old.exists())
+        self.assertTrue(current.exists())
+        self.assertIsNotNone(using_old.wait(timeout=10))  # its round was killed
+        self.assertIsNone(using_current.poll())
+        s.enforce_version_cap(pool, "k-current", {"bbb", "aaa"}, {})  # within the cap
+        self.assertTrue(current.exists())
+
+    def test_cap_evicts_the_oldest_allowed_entry_when_all_are_allowed(self):
+        pool = self.root / "pool"
+        older = self.entry(pool, "k-a", "aaa", age=900)
+        newer = self.entry(pool, "k-b", "bbb", age=10)
+        s.enforce_version_cap(pool, "k-c", {"aaa", "bbb"}, {})
+        self.assertFalse(older.exists())
+        self.assertTrue(newer.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

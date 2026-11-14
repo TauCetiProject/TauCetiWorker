@@ -33,6 +33,10 @@ class Unavailable(RuntimeError):
     pass
 
 
+class PinRefused(Unavailable):
+    """The checkout pins a Mathlib revision outside the host's allowed versions."""
+
+
 class IntegrityFailure(Unavailable):
     pass
 
@@ -394,6 +398,118 @@ def lease_lock(stream, flags, *, timeout=None):
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
         except OSError as error:
             raise IntegrityFailure(f"shared Mathlib lease failure: {error}; stop sharing and investigate") from error
+
+
+VERSION_CAP = 2  # Mathlib builds a host may hold at once, counting every entry
+EVICTION_GRACE = 20  # seconds between SIGTERM and SIGKILL for rounds holding an evicted entry
+
+
+def allowed_revisions(cwd):
+    """The Mathlib revisions pinned by current origin/main and by the pin before it, or None.
+
+    Read from the checkout's own origin/main, without Lake or network. Rounds pinned elsewhere are
+    refused; a branch behind main is rebased onto it or abandoned."""
+
+    def pin(commit):
+        shown = subprocess.run(
+            ["git", "-C", str(cwd), "show", f"{commit}:lake-manifest.json"], capture_output=True, text=True, timeout=30
+        )
+        if shown.returncode:
+            return None
+        try:
+            packages = json.loads(shown.stdout).get("packages", [])
+        except (ValueError, AttributeError):
+            return None
+        return next((p.get("rev") for p in packages if isinstance(p, dict) and p.get("name") == "mathlib"), None)
+
+    current = pin("origin/main")
+    if not current:
+        return None
+    allowed = {current}
+    history = subprocess.run(
+        ["git", "-C", str(cwd), "log", "--format=%H", "-n", "200", "origin/main", "--", "lake-manifest.json"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    for commit in history.stdout.split() if history.returncode == 0 else []:
+        revision = pin(commit)
+        if revision and revision != current:
+            allowed.add(revision)
+            break
+    return allowed
+
+
+def _holders(lock_path):
+    """Processes of this user, other than this one, with ``lock_path`` open."""
+    target = os.path.realpath(lock_path)
+    uid, me, pids = os.getuid(), os.getpid(), set()
+    for process in Path("/proc").glob("[0-9]*"):
+        try:
+            if process.stat().st_uid != uid or int(process.name) == me:
+                continue
+            for fd in (process / "fd").iterdir():
+                with contextlib.suppress(OSError):
+                    if os.readlink(fd) == target:
+                        pids.add(int(process.name))
+                        break
+        except (OSError, ValueError):
+            continue
+    return pids
+
+
+def _kill_holders(pids):
+    """Abandon the rounds using an evicted entry: their process groups, TERM then KILL."""
+    import signal
+
+    groups = set()
+    for pid in pids:
+        with contextlib.suppress(OSError):
+            groups.add(os.getpgid(pid))
+    groups.discard(os.getpgrp())
+    for signum in (signal.SIGTERM, signal.SIGKILL):
+        for group in groups:
+            with contextlib.suppress(OSError):
+                os.killpg(group, signum)
+        deadline = time.monotonic() + EVICTION_GRACE
+        while signum == signal.SIGTERM and time.monotonic() < deadline:
+            if not any(Path(f"/proc/{pid}").exists() for pid in pids):
+                return
+            time.sleep(0.5)
+
+
+def _entry_revision(entry):
+    return (read_json(entry / "ready.json").get("spec") or {}).get("mathlib")
+
+
+def enforce_version_cap(pool, keep, allowed, env):
+    """Hold at most VERSION_CAP entries, counting the one about to be used or published.
+
+    Entries for revisions outside ``allowed`` go first, then the oldest. A round holding an evicted
+    entry is killed and abandoned: keeping a third Mathlib build is never the better outcome."""
+    entries_dir = pool / "entries"
+    if not entries_dir.is_dir():
+        return
+    with key_lock(pool, "versions", exclusive=True, timeout=LOCK_WAIT_SECONDS):
+        entries = [e for e in entries_dir.iterdir() if e.is_dir() and not e.is_symlink() and e.name != keep]
+        excess = len(entries) + 1 - VERSION_CAP
+        if excess <= 0:
+            return
+
+        def age(entry):
+            with contextlib.suppress(OSError):
+                return entry.stat().st_mtime
+            return 0
+
+        ranked = sorted(entries, key=lambda e: (allowed is None or _entry_revision(e) in allowed, age(e)))
+        for victim in ranked[:excess]:
+            lock_path = pool / "locks" / (victim.name + ".lock")
+            report(pool, env, mode="evicting", key=victim.name, reason="Mathlib version cap")
+            if lock_path.exists():
+                _kill_holders(_holders(lock_path))
+            with key_lock(pool, victim.name, exclusive=True, timeout=120):
+                if victim.exists():
+                    discard_entry(pool, victim)  # renames into trash, then removes it
 
 
 def remove_tree(path):
@@ -983,6 +1099,13 @@ def view(cwd, env, logdir, fetch):
                     raise IntegrityFailure(reason)
                 raise Unavailable(reason)
             key, spec = signature(cwd, env)
+            allowed = allowed_revisions(cwd)
+            if allowed is not None and spec["mathlib"] not in allowed:
+                report(pool, env, mode="blocked", key=key, reason="Mathlib pin is not current or previous main")
+                raise PinRefused(
+                    f"Mathlib {spec['mathlib'][:12]} is not pinned by current or previous main; rebase onto main"
+                )
+            enforce_version_cap(pool, key, allowed, env)
             report(pool, env, mode="preparing", key=key)
             lease = stack.enter_context(key_lock(pool, key, exclusive=False, timeout=LOCK_WAIT_SECONDS))
             entry = pool / "entries" / key
