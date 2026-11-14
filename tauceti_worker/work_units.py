@@ -1994,9 +1994,14 @@ def _do_fixlike(
     # branch is about to move to, and a bump may use the next Mathlib it pins.
     from . import shared_mathlib
 
+    bump = label == "bump" or getattr(p, "automatic_bump", False)
     shared_mathlib.set_round_purpose(
-        getattr(getattr(w, "cfg", None), "checkout", None), rebase=label == "rebase", bump=label == "bump" or getattr(p, "automatic_bump", False)
+        getattr(getattr(w, "cfg", None), "checkout", None),
+        rebase=label == "rebase",
+        bump=bump,
+        repair=not bump and label in ("fix", "fix-ci", "lint-repair"),
     )
+
     prompt = fill_prompt(
         HERE / "prompts" / prompt_file,
         PR=pr,

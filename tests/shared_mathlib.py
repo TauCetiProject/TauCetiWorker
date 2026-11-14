@@ -1703,6 +1703,22 @@ class VersionCapTests(unittest.TestCase):
         s.set_round_purpose(repo)
         self.assertEqual(s._purpose(repo), {})
 
+    def test_repair_round_moves_to_mains_mathlib_only_when_its_pin_is_refused(self):
+        main_pin = "c" * 40
+        repo = self.repo_with_main(main_pin)
+        self.addCleanup(s.set_round_purpose, None)
+        s.set_round_purpose(repo, repair=True)
+        # The branch is on main's previous pin, which is still allowed: it keeps its Mathlib.
+        allowed_branch = (repo / "lake-manifest.json").read_bytes()
+        with s.rebase_target(repo, {"TAUCETI_SHARED_MATHLIB_ROOT": str(self.root / "pool")}):
+            self.assertEqual((repo / "lake-manifest.json").read_bytes(), allowed_branch)
+        # A pin main never had is refused, so the round prepares main's Mathlib instead.
+        self.manifest(repo, "f" * 40)
+        with s.rebase_target(repo, {"TAUCETI_SHARED_MATHLIB_ROOT": str(self.root / "pool")}) as restore:
+            self.assertEqual(s._manifest_pin((repo / "lake-manifest.json").read_text()), main_pin)
+            restore()
+            self.assertEqual(s._manifest_pin((repo / "lake-manifest.json").read_text()), "f" * 40)
+
     def test_bump_pins_are_allowed_for_a_week(self):
         pool = self.root / "pool"
         self.assertEqual(s.bump_pins(pool), set())
