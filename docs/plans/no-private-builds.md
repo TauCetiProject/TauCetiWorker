@@ -49,11 +49,13 @@ The problem is that each of them is optional and has a private fallback.
 
 ## Invariants
 
-1. **One Mathlib build per key.** For each `shared_mathlib.signature()` key, the
-   host has one immutable, read-only extracted build in the pool
-   (`~/.cache/tauceti/mathlib-builds/entries/<key>`). A checkout's
-   `.lake/packages/mathlib/.lake/build` is a view of it, never a copy. If a view
-   cannot be made, the round does not start.
+1. **At most two Mathlib versions per host, ever.** A version is one immutable,
+   read-only extracted build in the pool
+   (`~/.cache/tauceti/mathlib-builds/entries/<key>`) plus its source tree and
+   archives. The host holds the version current TauCeti `main` pins and the one
+   before it, and never a third, not even briefly. A checkout's
+   `.lake/packages/mathlib/.lake/build` is a view of one of them, never a copy. If
+   a view cannot be made, the round does not start.
 2. **One Mathlib source tree per revision.** `.lake/packages/mathlib` is a
    read-only shared source tree for that revision, never a fresh clone per checkout.
 3. **TauCeti build outputs are content-addressed.** Restored and built `.olean`
@@ -143,13 +145,18 @@ round using it right now, shown by a `flock` lease that the kernel releases when
 the process exits, so a reference can never leak. Checkout markers, idle
 checkouts, old branches and recovery records protect nothing.
 
-- **Mathlib entries and source trees: a fixed, small set.** Per toolchain, the
-  host keeps the version current TauCeti `main` pins plus the one before it.
-  Every other version is deleted as soon as no live round holds its lease, and
-  this happens straight after a new version is published, not on a later sweep.
-  A round that needs an evicted version (an old branch, say) republishes it,
-  which is slower, and is told to rebase onto current `main`; the republished
-  copy is then subject to the same limit.
+- **Mathlib: a hard cap of two versions, enforced before publication.** Per host
+  (not per toolchain), only the version current TauCeti `main` pins and the one
+  before it may exist: entry, source tree and archives together. Publishing a
+  third version first evicts the oldest. Any round holding a lease on it is
+  killed and abandoned with no recovery (no source record, no retry), and the
+  version is then deleted. Only after that does publication start. Abandoned work
+  is an accepted cost; holding a third version is not.
+- **Other versions are refused, not rebuilt.** A round whose checkout pins any
+  Mathlib version outside the two is not run: it neither republishes nor builds
+  that version, and the task is dropped with that reason. A branch behind `main`
+  is rebased onto current `main` (which needs only the current version) or
+  abandoned.
 - **Checkouts hold no references between rounds.** At the end of every round the
   checkout's `.lake` links into shared state are removed. Re-linking at the next
   round start is cheap. So outside active rounds nothing references the artifact
@@ -168,9 +175,11 @@ checkouts, old branches and recovery records protect nothing.
   space rather than letting the disk fill.
 - **Permissions.** Shared files and directories are read-only. Only the collector,
   holding the store's lock, restores directory write permission to remove an entry.
-- **Races.** Linking into a checkout and evicting both take the entry's lock: a
-  round links only under its shared lease, and eviction needs the exclusive lock,
-  so an artifact or entry cannot disappear under a round that holds it.
+- **Races.** A round links a Mathlib entry only under its shared lease. Eviction
+  takes the exclusive lock, killing any round that still holds a shared one, so a
+  version never survives eviction because a round was using it. For the artifact
+  store, an eviction racing a new link only costs the store its name for that
+  file; the checkout's link stays valid and the next round re-fetches it.
 
 ### Deletion that cannot stall
 
@@ -184,8 +193,9 @@ checkouts, old branches and recovery records protect nothing.
 
 ## Migration
 
-1. **Stop the bleeding.** Fix the `view()` ordering bug and make sharing
-   `required` on Fleet hosts first. Add the round-start detection, in report-only
+1. **Stop the bleeding.** Fix the `view()` ordering bug, make sharing `required`
+   on Fleet hosts, and enforce the two-version cap (with eviction killing leased
+   rounds) first. Add the round-start detection, in report-only
    mode. Bound the collector. These are small and can ship at once.
 2. **Content-addressed TauCeti builds** on all hosts. Measure link counts and
    checkout sizes before and after.
