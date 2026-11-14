@@ -1709,6 +1709,7 @@ def run_repair_agent(
                         session_actor="queue-repair-task",
                         session_scope=task.task_id,
                         cache_note=False,
+                        queue_mathlib=True,  # this service prepares its own Mathlib until it shares too
                     )
             except AgentLaunchUnavailable as error:
                 # Its own outcome, not the cache's: the artifacts were ready and the process never existed,

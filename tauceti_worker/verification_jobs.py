@@ -423,14 +423,15 @@ def _mathlib_view(stack, root, env, state):
     """The shared Mathlib view prefix for a continuation in ``root`` (``[]`` without Mathlib)."""
     from . import shared_mathlib
 
-    if not shared_mathlib._names_mathlib(root):
-        return []
+    lake_project = any((root / name).is_file() for name in ("lakefile.toml", "lakefile.lean"))
+    if not lake_project or not shared_mathlib._names_mathlib(root):
+        return []  # as host_build_cache_context: only Lake projects that need Mathlib get a view
     from .agents import _cache_fetch
 
     try:
         prefix = stack.enter_context(shared_mathlib.view(root, env, state / "verification-cache-prepare", _cache_fetch))
-    except shared_mathlib.PinRefused:
-        raise
+    except (shared_mathlib.PinRefused, shared_mathlib.LayoutRefused):
+        raise  # permanent for this candidate: retrying cannot change the answer
     except shared_mathlib.Unavailable as error:
         raise Pressure(f"shared Mathlib view pending: {error}", reason="cache") from error
     if prefix:

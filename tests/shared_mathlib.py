@@ -331,7 +331,7 @@ class AttachTests(Fixture):
         meta.rename(self.root / "moved-meta")
         meta.symlink_to(self.root / "moved-meta")
         self.assertFalse(s.layout_ok(self.cwd, self.P, self.rev, names))
-        with self.assertRaisesRegex(s.Unavailable, "symlink"):
+        with self.assertRaisesRegex(s.LayoutRefused, "symlink"):
             s.attach(self.cwd, self.P, self.rev, read_json(self.source / "source.json")["packages"])
 
     def test_a_different_dependency_pin_or_url_fails_instead_of_falling_back(self):
@@ -362,6 +362,17 @@ class AttachTests(Fixture):
         )
         with self.assertRaisesRegex(s.Unavailable, "pinned to a full commit"):
             s.resolve(self.cwd, self.env)
+
+    def test_layouts_lake_would_load_elsewhere_are_refused_before_any_lake_run(self):
+        manifest = json.loads((self.cwd / "lake-manifest.json").read_text())
+        commit(self.cwd, {"lake-manifest.json": json.dumps({**manifest, "packagesDir": "vendor"})})
+        with self.assertRaisesRegex(s.LayoutRefused, "packagesDir"):
+            s.resolve(self.cwd, self.env)
+        commit(self.cwd, {"lake-manifest.json": json.dumps(manifest)})
+        (self.cwd / ".lake").mkdir()
+        (self.cwd / ".lake/package-overrides.json").write_text("{}")
+        with patch.object(s, "run_process", side_effect=AssertionError("Lake ran")):
+            self.assert_blocked("overrides dependency packages")
 
     def test_url_map_selects_the_origin_lake_expects(self):
         mirror = self.root / "mirror"
@@ -726,9 +737,12 @@ class ViewTests(Fixture):
             self.assertEqual(self.run_in(prefix, "cat", str(file)).stdout, b"copyup")
             lower = self.P / "entries" / key / "build/mathlib/lib/lean/Mathlib.olean"
             self.assertEqual(lower.read_bytes(), self.artifact)
-            # The source is read-only inside the view as well, and a second reader can enter at once.
-            edit = self.run_in(prefix, "sh", "-c", 'printf x > "$1"', "sh", str(self.source / "mathlib/Mathlib.lean"))
-            self.assertNotEqual(edit.returncode, 0)
+            # Lake's writes beside sources (input-file `.hash` files) land in the round's own upper;
+            # the shared source never changes. A second reader can enter at once.
+            hashed = self.source / "batteries/Batteries.lean.hash"
+            edit = self.run_in(prefix, "sh", "-c", 'printf 123 > "$1" && cat "$1"', "sh", str(hashed))
+            self.assertEqual(edit.stdout, b"123", edit.stderr)
+            self.assertFalse(hashed.exists())
             with s.key_lock(self.P, key, exclusive=False, nonblocking=True):
                 pass
             generation = self.cwd / ".lake" / s.META / s.view_marker(self.cwd)["generation"]
@@ -1010,6 +1024,28 @@ class ViewTests(Fixture):
             time.sleep(0.02)
         self.assertEqual(removed, [str(entry)])
 
+    def test_cache_fetch_and_owned_tools_inherit_every_view_lease(self):
+        from tauceti_worker import agents, processes
+
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract):
+            fds = s.lease_fds(self.env)
+            self.assertEqual(len(fds), 3)  # build, source and generation
+            check = "import os,sys; [os.fstat(int(fd)) for fd in sys.argv[1].split(',')]"
+            with (self.root / "fetch.log").open("wb") as output:
+                # Through the parent-bound guard (bwrap itself keeps its --sync-fd out of the child).
+                rc = agents._cache_fetch(
+                    [sys.executable, "-c", check, self.env["TAUCETI_SHARED_MATHLIB_LEASE_FD"]],
+                    self.cwd,
+                    self.env,
+                    output,
+                    60,
+                )
+            self.assertEqual(rc, 0, (self.root / "fetch.log").read_text())
+            result = processes.run(
+                [sys.executable, "-c", check, self.env["TAUCETI_SHARED_MATHLIB_LEASE_FD"]], env=self.env, timeout=60
+            )
+            self.assertEqual(result.returncode, 0)
+
     def test_parent_bound_cancellation_wrapper_preserves_sandbox_lease(self):
         from tauceti_worker import agents
 
@@ -1223,7 +1259,10 @@ class SnapshotTests(Fixture):
             env["TAUCETI_SHARED_MATHLIB_LEASE_FD"] = "7,8"
             yield ["bwrap", "fixture"]
 
+        prose = self.root / "prose"
+        prose.mkdir()
         with contextlib.ExitStack() as stack, patch.object(s, "view", view):
+            self.assertEqual(vj._mathlib_view(stack, prose, {}, self.root / "state"), [])  # not a Lake project
             env = {}
             self.assertEqual(vj._mathlib_view(stack, self.cwd, env, self.root / "state"), ["bwrap", "fixture"])
             self.assertEqual(json.loads(env["TAUCETI_SHARED_MATHLIB_VIEW"]), ["bwrap", "fixture"])

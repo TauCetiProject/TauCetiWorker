@@ -45,6 +45,11 @@ class Receipts(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        # The fixture's placeholder manifest counts as "may need Mathlib"; these tests are about
+        # verification itself, so continuations run without the shared Mathlib view.
+        view = patch("tauceti_worker.verification_jobs._mathlib_view", return_value=[])
+        view.start()
+        self.addCleanup(view.stop)
         self.home = Path(self.tmp.name)
         self.root = self.home / "source"
         self.root.mkdir()

@@ -47,16 +47,18 @@ def owned_process(argv, **kwargs):
             environment = os.environ if environment is None else environment
             lease = environment.get("TAUCETI_SHARED_MATHLIB_LEASE_FD")
             if lease is not None:
+                # A view leases its build, source and generation: a comma-separated list.
                 try:
-                    lease_fd = int(lease)
-                    os.fstat(lease_fd)
+                    lease_fds = tuple(int(fd) for fd in lease.split(",") if fd)
+                    for lease_fd in lease_fds:
+                        os.fstat(lease_fd)
                 except (OSError, ValueError):
                     # Intermediate shells may close inherited descriptors. A stale
                     # optional lease hint must not prevent ordinary tool execution.
                     kwargs["env"] = dict(environment)
                     kwargs["env"].pop("TAUCETI_SHARED_MATHLIB_LEASE_FD", None)
                 else:
-                    extra_fds = tuple(dict.fromkeys((*extra_fds, lease_fd)))
+                    extra_fds = tuple(dict.fromkeys((*extra_fds, *lease_fds)))
             process = subprocess.Popen(
                 [sys.executable, "-I", "-c", PARENT_BOUND_AGENT, str(reader), *argv],
                 start_new_session=True,

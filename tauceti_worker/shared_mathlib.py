@@ -62,6 +62,10 @@ class CapContention(NoFallback):
     """Waiting for the version cap took too long; the round stops instead of building privately."""
 
 
+class LayoutRefused(NoFallback):
+    """The checkout's .lake cannot carry the shared layout (a linked directory); it never will."""
+
+
 class Disabled(NoFallback):
     """An operator switched sharing off: rounds that need Mathlib do not run on this host."""
 
@@ -352,8 +356,18 @@ def expected_url(name, url, env):
 
 
 def resolve(cwd, env):
-    """Mathlib's pin from the checkout's tracked lake-manifest.json: no Lake, no network."""
+    """Mathlib's pin from the checkout's tracked lake-manifest.json: no Lake, no network.
+
+    Only the layout attachment produces is accepted: packages under ``.lake/packages`` and no
+    workspace override for any package (Lake would then load that one instead)."""
     data, packages = _manifest(cwd)
+    if data.get("packagesDir") not in (None, ".lake/packages"):
+        raise LayoutRefused(
+            "lake-manifest.json moves packagesDir away from .lake/packages; shared Mathlib cannot attach"
+        )
+    overrides = Path(cwd) / ".lake/package-overrides.json"
+    if overrides.exists() or overrides.is_symlink():
+        raise LayoutRefused(f"{overrides} overrides dependency packages; remove it to use shared Mathlib")
     if "mathlib" not in packages:
         raise Unavailable("lake-manifest.json names no Mathlib package; shared Mathlib cannot attach")
     revision = _pinned(packages["mathlib"], "mathlib")
@@ -950,7 +964,7 @@ def attach(cwd, P, revision, closure):
     packages = lake / "packages"
     for directory in (lake, packages, meta):
         if directory.is_symlink():
-            raise Unavailable(f"{directory} is a symlink; shared Mathlib needs the checkout's own .lake")
+            raise LayoutRefused(f"{directory} is a symlink; shared Mathlib needs the checkout's own .lake")
         directory.mkdir(exist_ok=True)
     source = source_dir(P, revision)
     for name in closure:
@@ -1454,6 +1468,7 @@ def _stage_root(project, graph, closure, source):
     manifest = {
         **graph["manifest"],
         "name": "tauceti_mathlib_stage",
+        "packagesDir": ".lake/packages",
         "packages": [graph["packages"][name] for name in closure],
     }
     (project / "lake-manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
@@ -1750,8 +1765,19 @@ def view(cwd, env, logdir, fetch):
             source = source_dir(P, revision)
             layers = []
             for name in closure:
-                (generation / name / "upper").mkdir(parents=True)
-                (generation / name / "work").mkdir()
+                for part in ("source-upper", "source-work", "upper", "work"):
+                    (generation / name / part).mkdir(parents=True)
+                # The package's source first: Lake writes `.hash` files beside input files (such as
+                # ProofWidgets' widget/package-lock.json), so the round gets a private upper over
+                # the immutable tree. Then its build, mounted inside that view.
+                layers.append(
+                    (
+                        source / name,
+                        generation / name / "source-upper",
+                        generation / name / "source-work",
+                        source / name,
+                    )
+                )
                 layers.append(
                     (
                         entry / "build" / name,
