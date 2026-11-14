@@ -84,7 +84,7 @@ def selection(env):
         or not isinstance(policy.get("workers", []), list)
         or any(not isinstance(worker, str) for worker in policy.get("workers", []))
     ):
-        if env.get("TAUCETI_SHARED_MATHLIB_BUILDS") == "required":
+        if env.get("TAUCETI_SHARED_MATHLIB_BUILDS", "").lower() in ("auto", "required"):
             raise Unavailable("invalid shared Mathlib policy; repair policy.json before requiring sharing")
         return "off", "invalid policy.json; repair before enabling sharing"
     expired = policy.get("expires_at", float("inf")) <= time.time()
