@@ -1705,14 +1705,15 @@ def view(cwd, env, logdir, fetch):
             report(pool, env, mode="preparing", reason="checking namespace capability and dependency identity")
             pool.mkdir(parents=True, exist_ok=True, mode=0o700)
             P.mkdir(exist_ok=True)
+            # Resolve Mathlib from the tracked manifest and attach the shared source before any Lake
+            # run: Lake then never clones Mathlib or its dependencies into this checkout. A manifest
+            # or layout this host cannot share is reported as such, ahead of host capability.
+            graph = resolve(cwd, env)
             ok, reason = capability(pool)
             if not ok:
                 if reason.startswith("isolation failure"):
                     raise IntegrityFailure(reason)
                 raise Unavailable(reason)
-            # Resolve Mathlib from the tracked manifest and attach the shared source before any Lake
-            # run: Lake then never clones Mathlib or its dependencies into this checkout.
-            graph = resolve(cwd, env)
             revision = graph["rev"]
             allowed = allowed_revisions(cwd)
             if _purpose(cwd).get("bump"):
