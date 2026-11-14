@@ -790,12 +790,13 @@ def clear_worker_halt(config: Path, wid: str) -> int:
         raise WorkersError(f"unknown worker: {wid}")
     # The worker resolves its data root from the manager's launch environment, which this caller
     # may not share; the path it published is the record that stopped it, when the runner that
-    # published it was launched from this configuration (state directories can be shared).
+    # published it was launched from this configuration (state directories can be shared). It stays
+    # the destination once cleared: this caller's environment may resolve another worker's record.
     status = runner_status(wid)
     reported = status.get("halt_file")
     if isinstance(reported, str) and status.get("workers_config") == str(Path(config).expanduser().resolve()):
         path = Path(reported)
-        if path.is_absolute() and path.name == "halt.json" and path.parent.name == wid and path.exists():
+        if path.is_absolute() and path.name == "halt.json" and path.parent.name == wid:
             from .identity import clear_halt
 
             return clear_halt(path)

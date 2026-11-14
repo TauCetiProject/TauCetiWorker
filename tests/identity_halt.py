@@ -317,6 +317,23 @@ class IdentityHaltTests(unittest.TestCase):
             self.assertIn("github:identity-mismatch", shown.stdout)
             self.assertFalse(record.exists())
 
+        # Another configuration's worker with the same id halted under the operator's own data root.
+        # Repeating the clear stays on the reported path, already absent, and leaves that record alone.
+        other = self.root / "state" / "w1" / "halt.json"
+        other.parent.mkdir(parents=True)
+        other.write_text(json.dumps({"reason": "github:invalid-credentials", "detail": "other", "at": "then"}))
+        repeat = subprocess.run(
+            [sys.executable, "-m", "tauceti_worker", "workers", "--config", str(config), "clear-halt", "w1"],
+            cwd=REPO,
+            env={**os.environ, "TAUCETI_WORKERS_STATE_DIR": str(state)},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(repeat.returncode, 0, repeat.stderr)
+        self.assertIn(f"no halt file at {record}", repeat.stdout)
+        self.assertTrue(other.exists())
+
     def test_workers_clear_halt_ignores_another_configurations_status(self):
         state = self.root / "workers"
         state.mkdir()
