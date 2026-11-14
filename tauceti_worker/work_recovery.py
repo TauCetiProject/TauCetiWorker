@@ -1320,15 +1320,29 @@ def _shed_build_state(cfg, tree: Path) -> None:
     Recovery needs only source; keeping `.lake` with a retained checkout held a full private Mathlib
     and TauCeti build for a day or more. Each directory becomes its own `discarded/` entry, deleted by
     the ordinary collector. A rename that fails leaves the directory with the tree, as before."""
+    from .retention import mount_points
+
     trash = cfg.state / "recovery-cleanup" / "discarded"
+    mounts = None
     for name in BUILD_STATE:
         path = tree / name
         try:
             if path.is_symlink() or not path.is_dir():
                 continue
+            # Tracked bytes stay source whatever their directory is called, and Git must be able to
+            # say so; a mount inside would move with the directory and be deleted with it.
+            tracked = _git(tree, "ls-files", "-z", "--", name)
+            if tracked:
+                continue
+            if mounts is None:
+                mounts = mount_points()
+            target = Path(os.path.realpath(path))
+            if mounts is None or any(point == target or point.is_relative_to(target) for point in mounts):
+                log(f"recovery: kept {path} with the retained tree (mounts inside or unobservable)")
+                continue
             trash.mkdir(parents=True, exist_ok=True)
             path.rename(trash / f"build-{tree.name}-{name.lstrip('.')}-{secrets.token_hex(8)}")
-        except OSError as error:
+        except (OSError, RecordError, subprocess.SubprocessError) as error:
             log(f"recovery: kept {path} with the retained tree ({error})")
             continue
     with contextlib.suppress(OSError):
