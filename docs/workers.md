@@ -140,6 +140,7 @@ tauceti workers disable reviewer   # persist desired stopped state
 tauceti workers enable reviewer    # and start it again
 tauceti workers restart reviewer   # without changing desired state
 tauceti workers remove reviewer    # drop the definition and stop it
+tauceti workers clear-halt reviewer  # after an identity halt; see below
 ```
 
 ## Editing the file directly
@@ -216,7 +217,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `id` | string | required | `[a-z0-9-]+`, at most 40 characters; namespaces the worker's state, checkout, review store, and logs |
 | `enabled` | bool | `true` | Desired running state. `false` stops the worker without forgetting it |
 | `agent` | string | `"auto"` | `auto`, `codex`, `claude`, `kiro`, `deepseek`, or `minimax` |
-| `github_account` | string | unset | GitHub login to select and verify for this worker. Independent of the agent account; changing it restarts the worker. Requires that account's stored gh credential or a matching environment token |
+| `github_account` | string | unset | GitHub login to select and verify for this worker. Independent of the agent account; changing it restarts the worker. Requires that account's stored gh credential or a matching environment token. A wrong login, a rejected credential, or a suspended account is an [identity halt](#identity-halt) |
 | `max_open_prs` | positive integer | `32` | Open-PR cutoff for roadmap authoring. CLI `--max-open-prs` and `TAUCETI_MAX_OPEN_PRS` also configure it. Science-account workers use `128`. |
 | `github_state_url` | string | public Tau Ceti mirror | Shared GitHub state service. Clients use its newest available data, with direct fallback on unavailable coverage or transport. See [service operations](../services/github-state/README.md). |
 | `github_state_token_file` | string | unset | Private client-token file for the service; installation credentials stay on the server. |
@@ -244,6 +245,75 @@ other top-level key is an error, as is any unrecognized field inside a
 The manager fingerprints each definition. It stops a worker when `enabled`
 becomes false and restarts an enabled worker when any other field changes,
 without disturbing unchanged workers.
+
+### Identity halt
+
+Each selected source with a configured identity is asked which account its
+credential belongs to before the loop starts and once at the start of every
+round, one request each time: GitHub's `GET /user` for a worker with
+`github_account`, and the Forgejo source's `GET /api/v1/user` for a worker with
+`--forgejo` and `TAUCETI_FORGEJO_USER_ID` in its environment. `workers.toml`
+has no source selection yet, so a managed worker is checked on GitHub only.
+Three answers stop the worker until a person intervenes:
+
+| Reason | GitHub's answer | Forgejo's answer |
+| --- | --- | --- |
+| `<forge>:identity-mismatch` | A login other than `github_account` | A native user ID other than `TAUCETI_FORGEJO_USER_ID` |
+| `<forge>:invalid-credentials` | HTTP 401 | HTTP 401 |
+| `<forge>:account-halt` | HTTP 403 stating that the account is suspended or locked | HTTP 403 |
+
+`<forge>` is `github` or `forgejo`. Forgejo answers `GET /user` with 403 for a
+suspended, login-prohibited or unactivated account and for a token without the
+`read:user` scope; the worker cannot tell these apart, and none of them changes
+on a retry.
+
+The worker writes the reason, the forge, a description naming the forge, and
+the time to `state/<worker-id>/halt.json`:
+
+```json
+{"reason": "forgejo:invalid-credentials", "forge": "forgejo", "detail": "Forgejo https://git.example.org rejected the credential for user 3 (HTTP 401); issue a new token", "at": "2026-11-11T03:09:11Z"}
+```
+
+It exits with status 84. Its loop ends without backoff or another round, and
+the manager leaves it stopped under every `restart` policy. The status record
+carries `state = "halted"`, `halt_reason` (the reason above) and
+`failure_reason` (the description); `workers status` shows the worker as
+`halted` with that reason. While the file exists, `tauceti work` for that
+worker id exits 84 again before it reads a credential or contacts either forge.
+Once the account is in order, read and remove the record, then start the
+worker:
+
+```bash
+tauceti workers clear-halt reviewer
+tauceti workers restart reviewer
+```
+
+`workers clear-halt` removes the record the worker reported in its status when
+it halted, provided that status came from a manager running the same
+configuration file; the record may lie under a data root inherited from the
+manager's launch environment; otherwise it runs `tauceti work --worker-id reviewer --clear-halt`
+with the worker's own `conf` and `env`. For a worker the manager does not run, use
+that `work` command directly.
+
+Rate limits, other GitHub 403 responses such as a missing scope or SSO
+enforcement, server errors, and network failures are not halts. On GitHub,
+before the loop they are retried or waited out, and one that persists is an
+ordinary failure; at the start of a round the round proceeds on the loop's
+earlier verification. On Forgejo the round proceeds and discovery reports the
+source unavailable, but no Forgejo work runs as anyone else: binding the source
+for execution compares its actor with `TAUCETI_FORGEJO_USER_ID` again and halts
+on a different user, and the round's Git credential helper and `gh` and claim
+wrappers use a private copy of the token it verified, so a token file replaced
+during the round is not used until the next round checks it. A halt belongs to a worker id, so a start that fails before
+`work` has auto-assigned one exits 84 without writing a file. A source without
+a configured identity is never checked or halted.
+
+A worker with `--no-github --forgejo` still uses GitHub for shared coordination
+(author target leases, the review archive, roadmap issues), so with
+`github_account` it is checked and halted on GitHub as well; that coordination
+then uses only the verified `github_account` credential, never `gh`'s active
+login. Without `github_account` it uses `gh`'s active login, unchecked, as
+before.
 
 `env` exists for running one worker differently from its peers when the
 difference has no flag: an A/B of a build setting, for instance. It is part of

@@ -107,6 +107,7 @@ RUN_STDLIB=(
   forgejo_reads.py
   github_accounts.py
   github_failure_reason.py
+  identity_halt.py
   github_ratelimit.py
   github_shared_transport.py
   github_cli_metadata.py

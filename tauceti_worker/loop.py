@@ -22,6 +22,7 @@ from .constants import (
     EX_CLAIM_COLLISION,
     EX_DOCUMENTATION_WAIT,
     EX_GITHUB_WAIT,
+    EX_HALTED,
     EX_NOPROGRESS,
     EX_RECOVERY_IDLE,
     GH_MIN_BUDGET,
@@ -305,6 +306,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             rc = run_round_subprocess(tail)
             if recovery_only:
                 recovery_probe_at = time.time() + 300  # At most one quota-independent probe per five minutes.
+            if rc == EX_HALTED:
+                # The round recorded why in halt.json; another round would ask GitHub the same question.
+                log("round halted on its GitHub identity — stopping the loop")
+                return EX_HALTED
             if rc == EX_RECOVERY_IDLE:
                 # Busy claims and other unavailable recovery records already have local retry
                 # scheduling. They must not delay unrelated reviews, fixes or roadmap work.

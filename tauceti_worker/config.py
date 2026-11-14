@@ -421,6 +421,18 @@ class Die(Exception):
     """Fatal error → exit 1."""
 
 
+class Halted(Die):
+    """Forge identity no retry can fix → exit EX_HALTED (84) from `work`; the loop and manager stay stopped.
+
+    `reason` is `<forge>:<verdict>`, e.g. `forgejo:invalid-credentials`; a refusal re-raises a recorded one.
+    """
+
+    def __init__(self, reason: str, message: str, *, forge: str | None = None):
+        super().__init__(message)
+        self.forge = forge or reason.partition(":")[0]
+        self.reason = f"{forge}:{reason}" if forge else reason
+
+
 class NoProgress(Exception):
     """Round did no productive work → exit EX_NOPROGRESS (75)."""
 

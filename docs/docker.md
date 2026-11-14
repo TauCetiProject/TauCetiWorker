@@ -110,6 +110,19 @@ docker compose down -v
 This is destructive and requires fresh logins and dependency downloads on the
 next start.
 
+With `--github-account` in `TAUCETI_WORKER_ARGS` (or `--forgejo` there and
+`TAUCETI_FORGEJO_USER_ID` in the container's environment), an
+[identity halt](workers.md#identity-halt) stops the worker, and Compose's
+restart brings the container back. The entrypoint then finds the halt record,
+logs it with the commands that clear it, and idles without contacting a forge,
+so the container stays up and is not restarted again. Once the account is in
+order:
+
+```bash
+docker compose exec tauceti ./tauceti work --worker-id docker --clear-halt
+docker compose restart tauceti
+```
+
 ## Persistent storage
 
 | Volume | Contents |
