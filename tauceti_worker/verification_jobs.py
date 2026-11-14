@@ -27,9 +27,9 @@ from .verification_storage import Pressure
 
 # Build payloads and sources are hard-linked from the source workspace, never copied: Lake
 # replaces these files (it clears outputs before writing them) and Git checks files out by
-# rename, so a link never sees a write in place. Everything else under `.lake` (traces, hashes,
-# manifests, logs, Git metadata outside the object store) may be rewritten in place, so it is
-# copied, and only while small: a large unrecognised file fails the snapshot instead.
+# rename, so a link never sees a write in place. Small metadata (traces, hashes, manifests,
+# logs, Git metadata outside the object store, and other small files a build may append to)
+# is copied. Any other large file is linked too, so nothing large is ever copied.
 LINKED = (
     ".olean",
     ".olean.server",
@@ -46,7 +46,8 @@ LINKED = (
     ".dylib",
     ".lean",
 )
-COPY_LIMIT = 1024**2
+COPY_LIMIT = 64 * 1024
+COPIED = (".trace", ".hash", ".json", ".toml", ".log", ".lock")
 LINKS = "tauceti-links.json"
 FORWARDED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 CONTINUATION = "tauceti-continuation.json"
@@ -131,7 +132,9 @@ def _linked(relative, info):
     parts = relative.parts
     if ".git" in parts:
         return "objects" in parts[parts.index(".git") :]
-    return relative.name.endswith(LINKED) or bool(info.st_mode & 0o111)
+    if relative.name.endswith(LINKED) or info.st_mode & 0o111:
+        return True
+    return info.st_size > COPY_LIMIT and not relative.name.endswith(COPIED)
 
 
 def _link_tree(lake, dest, budget, *, include_builds, immutable_packages, target):
@@ -140,8 +143,6 @@ def _link_tree(lake, dest, budget, *, include_builds, immutable_packages, target
     Returns `{relative path: [inode, size, mtime_ns]}` of the links, so a continuation can
     prove that nothing wrote through a shared inode in the meantime.
     """
-    from .verification import Incomplete
-
     shared = _shared_builds(lake)
     linked = {}
     for directory, dirs, files in os.walk(lake, followlinks=True):
@@ -180,11 +181,6 @@ def _link_tree(lake, dest, budget, *, include_builds, immutable_packages, target
                 link(source, out / name)
                 linked[str(relative)] = [info.st_ino, info.st_size, info.st_mtime_ns]
                 budget.linked += info.st_size
-            elif info.st_size > COPY_LIMIT:
-                raise Incomplete(
-                    f"candidate preservation would copy {relative} ({info.st_size} bytes); nothing was copied",
-                    reason="preservation",
-                )
             else:
                 budget.charge(source)
                 shutil.copy2(source, out / name)
