@@ -2843,11 +2843,43 @@ def _review_mathlib_staging(base):
         _prune_review_mathlib_staging(base)
 
 
-def _review_mathlib_source(cfg: Config, head: str) -> Path | None:
-    """Mathlib source at the reviewed head's pin, for the reviewers' greps. Staged host-side
-    because the bubble's repo-scoped proxy cannot reach mathlib4; one snapshot per revision, the
-    two newest kept. None means the manifest declares no Mathlib dependency; staging failures
-    stop the round before a reviewer can run without required sources."""
+def _review_source_base() -> Path:
+    """One host-wide directory of exact Mathlib sources for Bubble reviewers, shared by workers."""
+    from .shared_repositories import root
+
+    return root() / "mathlib-sources-v1"
+
+
+def _discard_legacy_review_sources(cfg: Config) -> None:
+    """Delete the per-worker snapshots earlier workers kept under their own state."""
+    legacy = cfg.state / "refs"
+    with contextlib.suppress(OSError):
+        _prune_review_mathlib_staging(legacy)
+        for old in legacy.glob("mathlib-src-*"):
+            if not old.name.startswith("mathlib-src-tmp-") and old.is_dir() and not old.is_symlink():
+                shutil.rmtree(old, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _review_source_lease(base: Path, rev: str, *, exclusive=False, blocking=True):
+    locks = base / "locks"
+    locks.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (locks / f"{rev}.lock").open("a+") as stream:
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(stream, mode | (0 if blocking else fcntl.LOCK_NB))
+        yield stream.fileno()
+
+
+@contextlib.contextmanager
+def _review_mathlib_source(cfg: Config, head: str):
+    """Mathlib source at the reviewed head's pin, for the reviewers' greps, held while in use.
+
+    Staged host-side because the bubble's repo-scoped proxy cannot reach mathlib4. One read-only
+    snapshot per revision for the whole host, the two newest kept; a review holds a shared lease
+    on its revision, so pruning never removes a mounted snapshot. Yields None when the manifest
+    declares no Mathlib dependency; staging failures stop the round before a reviewer can run
+    without required sources.
+    """
     from .github import gh_run
 
     got = gh_run(
@@ -2867,59 +2899,81 @@ def _review_mathlib_source(cfg: Config, head: str) -> Path | None:
             raise ValueError("invalid package list")
         mathlib = next((p for p in packages if p.get("name") == "mathlib"), None)
         if mathlib is None:
-            return None
+            yield None
+            return
         rev = mathlib["rev"]
     except (ValueError, KeyError, TypeError) as error:
         raise NoProgress("review: invalid exact-head dependency manifest; no review started") from error
     if not isinstance(rev, str) or not re.fullmatch(r"[0-9a-f]{40}", rev):
         raise NoProgress("review: Mathlib revision is not pinned to a commit; no review started")
-    base = cfg.state / "refs"
+    _discard_legacy_review_sources(cfg)
+    base = _review_source_base()
+    base.mkdir(parents=True, exist_ok=True)
     _prune_review_mathlib_staging(base)
     src = base / f"mathlib-src-{rev}"
-    if (src / "Mathlib.lean").is_file():
-        return src
-    base.mkdir(parents=True, exist_ok=True)
-    with _review_mathlib_staging(base) as (tmp, lease_fd):
-        steps = (
-            ["git", "init", "-q", str(tmp)],
-            [
-                "git",
-                "-C",
-                str(tmp),
-                "fetch",
-                "-q",
-                "--depth",
-                "1",
-                "https://github.com/leanprover-community/mathlib4",
-                rev,
-            ],
-            ["git", "-C", str(tmp), "checkout", "-q", "FETCH_HEAD"],
+    with _review_source_lease(base, rev):
+        if not (src / "Mathlib.lean").is_file():
+            with _review_mathlib_staging(base) as (tmp, lease_fd):
+                steps = (
+                    ["git", "init", "-q", str(tmp)],
+                    [
+                        "git",
+                        "-C",
+                        str(tmp),
+                        "fetch",
+                        "-q",
+                        "--depth",
+                        "1",
+                        "https://github.com/leanprover-community/mathlib4",
+                        rev,
+                    ],
+                    ["git", "-C", str(tmp), "checkout", "-q", "FETCH_HEAD"],
+                )
+                try:
+                    failed = any(subprocess.run(step, timeout=600, pass_fds=(lease_fd,)).returncode for step in steps)
+                except (OSError, subprocess.TimeoutExpired):
+                    failed = True
+                if failed:
+                    raise NoProgress("review: could not stage the pinned Mathlib sources; no review started")
+                shutil.rmtree(tmp / ".git", ignore_errors=True)
+                # Shared by every worker on the host: nobody writes the published files.
+                for directory, _, files in os.walk(tmp):
+                    for name in files:
+                        path = Path(directory, name)
+                        if not path.is_symlink():
+                            path.chmod(0o444)
+                try:
+                    tmp.rename(src)
+                except OSError:  # a concurrent worker staged the same revision first
+                    pass  # This producer's private staging is removed before releasing its lease.
+        if not (src / "Mathlib.lean").is_file():
+            raise NoProgress("review: the pinned Mathlib source snapshot is incomplete; no review started")
+        os.utime(src)
+        snapshots = sorted(
+            (p for p in base.glob("mathlib-src-*") if not p.name.startswith("mathlib-src-tmp-")),
+            key=lambda p: p.stat().st_mtime,
         )
-        try:
-            failed = any(subprocess.run(step, timeout=600, pass_fds=(lease_fd,)).returncode for step in steps)
-        except (OSError, subprocess.TimeoutExpired):
-            failed = True
-        if failed:
-            raise NoProgress("review: could not stage the pinned Mathlib sources; no review started")
-        shutil.rmtree(tmp / ".git", ignore_errors=True)
-        try:
-            tmp.rename(src)
-        except OSError:  # a concurrent worker staged the same revision first
-            pass  # This producer's private staging is removed before releasing its lease.
-    snapshots = sorted(
-        (p for p in base.glob("mathlib-src-*") if not p.name.startswith("mathlib-src-tmp-")),
-        key=lambda p: p.stat().st_mtime,
-    )
-    for old in snapshots[:-2]:
-        if old != src:
-            shutil.rmtree(old, ignore_errors=True)
-    if not (src / "Mathlib.lean").is_file():
-        raise NoProgress("review: the pinned Mathlib source snapshot is incomplete; no review started")
-    return src
+        for old in snapshots[:-2]:
+            if old == src:
+                continue
+            try:
+                with _review_source_lease(base, old.name.removeprefix("mathlib-src-"), exclusive=True, blocking=False):
+                    shutil.rmtree(old, ignore_errors=True)
+            except BlockingIOError:
+                pass  # Another worker's reviewer still mounts it; a later review prunes it.
+        yield src
 
 
 def _review_in_bubble(
     w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts, *, result_file: Path | None = None
+) -> int:
+    # The Mathlib source lease lasts as long as the container that mounts it.
+    with contextlib.ExitStack() as stack:
+        return _review_in_bubble_with(stack, w, pr, head, reviewers, opts, result_file=result_file)
+
+
+def _review_in_bubble_with(
+    stack, w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts, *, result_file: Path | None = None
 ) -> int:
     """Run the tauceti-review engine INSIDE bubble — a hard container boundary around an engine that
     reads an untrusted PR diff and runs a model on it (and, once review gains tool use, runs that
@@ -2952,7 +3006,7 @@ def _review_in_bubble(
         mounts.append(f"{result_file.parent}:/opt/review-result:rw")
     # The reuse rubric greps Mathlib, and the merge gate does not count an approval whose judge
     # says Mathlib was missing from its checkout.
-    mathlib = _review_mathlib_source(cfg, head)
+    mathlib = stack.enter_context(_review_mathlib_source(cfg, head))
     if mathlib is not None:
         mounts.append(f"{mathlib}:/opt/mathlib:ro")
     mathlib_flag = "--mathlib-dir /opt/mathlib" if mathlib is not None else "--no-mathlib"

@@ -31,6 +31,29 @@ def hash_cache_entries(payload):
 
 class Recovery(Receipts):
     # Reuse the private Git/fake-verifier fixture; load_tests collects only these audit cases.
+    def test_continuation_waits_for_the_shared_build_view_instead_of_building_privately(self):
+        from tauceti_worker import agents
+        from tauceti_worker import verification_jobs as jobs
+
+        unavailable = agents.BuildCacheUnavailable("shared Mathlib view unavailable")
+        with (
+            patch.object(agents, "host_build_cache_context", side_effect=unavailable),
+            patch.dict(os.environ, TAUCETI_VERIFY_STATE=str(self.state)),
+            patch.object(jobs.os, "dup", return_value=1),
+            patch.object(jobs.os, "dup2"),
+            patch.object(jobs.subprocess, "run", side_effect=AssertionError("verified without the view")),
+        ):
+            self.assertEqual(jobs.continue_command(["true"]), 75)
+        path = self.state / "verification-pending" / ("a" * 32 + ".json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        job = dict(id="a" * 32, status="running", next_at=0)
+        path.write_text(json.dumps(job))
+        before = time.time()
+        jobs._settle_child(self.state, path, job, SimpleNamespace(wait=lambda: None, returncode=75), path.parent / "r")
+        pending = json.loads(path.read_text())
+        self.assertEqual(pending["status"], "pending")
+        self.assertGreater(pending["next_at"], before + 30)
+
     def test_persisted_hash_cache_migrates_once_without_immutable_inventory_growth(self):
         import hashlib
 

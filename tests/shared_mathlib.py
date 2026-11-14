@@ -149,7 +149,16 @@ class SharedTests(unittest.TestCase):
         self.assertFalse(hit)
         self.assertTrue((entry / "ready.json").is_file())
 
-    def test_host_snapshot_materializes_merged_cache_after_agent_view_exits(self):
+    def roomy(self):
+        """Verification storage settings that the fixture's patched disk usage satisfies."""
+        return {
+            **self.env,
+            "TAUCETI_VERIFY_STORAGE_DIR": str(self.root / "verify-ledger"),
+            "TAUCETI_VERIFY_MIN_FREE_BYTES": "1",
+            "TAUCETI_VERIFY_MIN_FREE_PERCENT": "0",
+        }
+
+    def test_host_snapshot_links_sources_and_never_copies_the_shared_build(self):
         self.require_overlay()
         from tauceti_worker.verification import inventory
         from tauceti_worker.verification_jobs import snapshot
@@ -168,17 +177,57 @@ class SharedTests(unittest.TestCase):
                 check=True,
                 pass_fds=s.lease_fds(self.env),
             )
-        self.assertFalse((build / "lib/lean/Mathlib.ilean").exists())
+        tauceti = self.cwd / ".lake/build/lib/lean"
+        tauceti.mkdir(parents=True)
+        (tauceti / "Fixture.olean").write_bytes(b"tauceti output")
+        (tauceti / "Fixture.trace").write_text('{"depHash": "1"}')
+        (tauceti / "Fixture.setup.json").write_text("{}")
         target = self.root / "state/verification-candidates" / ("a" * 32)
         target.parent.mkdir(parents=True)
-        with patch.dict(os.environ, self.env):
+        with (
+            patch.dict(os.environ, self.roomy()),
+            patch("tauceti_worker.agents.host_build_cache_context", side_effect=AssertionError("rehydrated")),
+        ):
             snapshot(self.cwd, target, inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")))
-        copied = target / ".lake/packages/mathlib/.lake"
-        self.assertEqual((copied / "build/lib/lean/Mathlib.olean").read_bytes(), b"private")
-        self.assertEqual((copied / "build/lib/lean/Mathlib.ilean").read_bytes(), b"verified artifact")
-        self.assertFalse((copied / "build/lib/lean/Mathlib/Test.olean").exists())
-        self.assertFalse((copied / "tauceti-overlay-work").exists())
-        self.assertFalse((copied / "tauceti-shared-mathlib.json").exists())
+        copied = target / ".lake/packages/mathlib"
+        # The shared Mathlib build stays in the host's view; the continuation attaches it again.
+        self.assertFalse((copied / ".lake/build").exists())
+        self.assertFalse((copied / ".lake/tauceti-overlay-work").exists())
+        self.assertFalse((copied / ".lake/tauceti-shared-mathlib.json").exists())
+        source = self.mathlib / "Mathlib/Test.lean"
+        self.assertEqual((copied / "Mathlib/Test.lean").stat().st_ino, source.stat().st_ino)
+        out = target / ".lake/build/lib/lean"
+        self.assertEqual((out / "Fixture.olean").stat().st_ino, (tauceti / "Fixture.olean").stat().st_ino)
+        self.assertNotEqual((out / "Fixture.trace").stat().st_ino, (tauceti / "Fixture.trace").stat().st_ino)
+        self.assertFalse((out / "Fixture.setup.json").exists())
+        packs = list((self.cwd / ".git/objects").rglob("*"))
+        linked = [p for p in packs if p.is_file() and p.stat().st_nlink > 1]
+        self.assertTrue(linked, "the candidate's Git objects are hard links")
+
+    def test_snapshot_fails_instead_of_copying_when_hard_links_fail(self):
+        from tauceti_worker.verification import Incomplete, inventory
+        from tauceti_worker.verification_jobs import snapshot
+
+        tauceti = self.cwd / ".lake/build/lib/lean"
+        tauceti.mkdir(parents=True)
+        (tauceti / "Fixture.olean").write_bytes(b"tauceti output")
+        target = self.root / "state/verification-candidates" / ("f" * 32)
+        target.parent.mkdir(parents=True)
+        real = os.link
+
+        def refuse(source, dest, *args, **kwargs):
+            if str(source).endswith(".olean"):
+                raise OSError(18, "Invalid cross-device link")
+            return real(source, dest, *args, **kwargs)
+
+        with (
+            patch.dict(os.environ, self.roomy()),
+            patch("tauceti_worker.verification_jobs.os.link", side_effect=refuse),
+        ):
+            with self.assertRaises(Incomplete) as raised:
+                snapshot(self.cwd, target, inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")))
+        self.assertIn("hard links", str(raised.exception))
+        self.assertFalse(target.exists())
 
     def test_disposable_overlay_is_volatile_without_leaking_the_mount_helper(self):
         self.require_overlay()
@@ -189,14 +238,11 @@ class SharedTests(unittest.TestCase):
                 prefix + [sys.executable, "-c", code, str(upper)], check=True, pass_fds=s.lease_fds(self.env)
             )
 
-    def test_snapshot_storage_pressure_remains_retryable_across_mount_subprocess(self):
-        self.require_overlay()
+    def test_snapshot_storage_pressure_remains_retryable(self):
         from tauceti_worker.verification import inventory
         from tauceti_worker.verification_jobs import snapshot
         from tauceti_worker.verification_storage import Pressure
 
-        with s.view(self.cwd, self.env, self.root / "logs", self.extract):
-            pass
         target = self.root / "state/verification-candidates" / ("b" * 32)
         target.parent.mkdir(parents=True)
         with patch.dict(os.environ, {**self.env, "TAUCETI_VERIFY_MIN_FREE_BYTES": str(10**30)}):
@@ -206,99 +252,13 @@ class SharedTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.assertTrue((self.cwd / "lakefile.toml").is_file())
 
-    def test_snapshot_discards_pre_reboot_volatile_cache_and_prepares_fresh_view(self):
-        self.require_overlay()
+    def test_snapshot_leaves_a_stale_view_alone_and_never_rehydrates(self):
         from tauceti_worker.verification import inventory
         from tauceti_worker.verification_jobs import snapshot
 
-        build = self.mathlib / ".lake/build"
-        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-            subprocess.run(
-                prefix + ["sh", "-c", 'printf torn > "$1/lib/lean/Mathlib.olean"', "sh", str(build)],
-                check=True,
-                pass_fds=s.lease_fds(self.env),
-            )
-        marker = build.parent / "tauceti-shared-mathlib.json"
-        row = json.loads(marker.read_text())
-        row["boot_id"] = "old-boot"
-        marker.write_text(json.dumps(row))
-
-        @contextlib.contextmanager
-        def prepare(cwd, env, logdir):
-            with s.view(cwd, self.env, logdir, self.extract) as prefix:
-                yield prefix
-
-        target = self.root / "state/verification-candidates" / ("c" * 32)
-        target.parent.mkdir(parents=True)
-        with (
-            patch.dict(os.environ, self.env),
-            patch("tauceti_worker.agents.host_build_cache_context", side_effect=prepare),
-        ):
-            snapshot(self.cwd, target, inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")))
-        self.assertEqual(
-            (target / ".lake/packages/mathlib/.lake/build/lib/lean/Mathlib.olean").read_bytes(), b"verified artifact"
-        )
-
-    def test_stale_marker_under_linked_readonly_packages_preserves_private_sources_without_recursion(self):
-        from tauceti_worker.verification import inventory
-        from tauceti_worker.verification_jobs import snapshot
-
-        packages = self.cwd / ".lake/packages"
-        external = self.root / "caller-owned-packages"
-        packages.rename(external)
-        packages.symlink_to(external, target_is_directory=True)
         build = self.mathlib / ".lake/build"
         build.mkdir(parents=True)
         (build / "sparse.olean").write_text("incomplete old upper")
-        marker = build.with_name("tauceti-shared-mathlib.json")
-        atomic_json(marker, dict(key="1" * 64, pool=str(self.pool), boot_id="old-boot"))
-        (self.mathlib / "Mathlib/Test.lean").write_text("def private_edit := 2\n")
-        directories = [external, *(p for p in external.rglob("*") if p.is_dir())]
-        for path in directories:
-            path.chmod(0o555)
-        target = self.root / "state/verification-candidates" / ("d" * 32)
-        target.parent.mkdir(parents=True)
-        try:
-            with (
-                patch.dict(
-                    os.environ,
-                    {
-                        **self.env,
-                        "TAUCETI_VERIFY_STORAGE_DIR": str(self.root / "verify-ledger"),
-                        "TAUCETI_VERIFY_MIN_FREE_BYTES": "1",
-                        "TAUCETI_VERIFY_MIN_FREE_PERCENT": "0",
-                    },
-                ),
-                patch("tauceti_worker.agents.host_build_cache_context", side_effect=AssertionError("repeated warming")),
-            ):
-                snapshot(
-                    self.cwd,
-                    target,
-                    inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")),
-                    immutable_packages=external,
-                )
-            copied = target / ".lake/packages/mathlib"
-            self.assertFalse((target / ".lake/packages").is_symlink())
-            self.assertEqual((copied / "Mathlib/Test.lean").read_text(), "def private_edit := 2\n")
-            self.assertFalse((copied / ".lake/build").exists())
-            self.assertFalse((copied / ".lake/tauceti-shared-mathlib.json").exists())
-            (copied / ".lake/build").mkdir()
-            (copied / ".git/index.lock").write_text("private Git metadata")
-            self.assertTrue(marker.is_file())
-            self.assertEqual((build / "sparse.olean").read_text(), "incomplete old upper")
-            self.assertEqual((self.mathlib / ".lake").stat().st_mode & 0o777, 0o555)
-            self.assertFalse((self.mathlib / ".git/index.lock").exists())
-        finally:
-            for path in directories:
-                path.chmod(0o755)
-
-    def test_snapshot_detachment_failure_remains_a_retryable_cache_wait(self):
-        from tauceti_worker.verification import inventory
-        from tauceti_worker.verification_jobs import snapshot
-        from tauceti_worker.verification_storage import Pressure
-
-        build = self.mathlib / ".lake/build"
-        build.mkdir(parents=True)
         atomic_json(
             build.with_name("tauceti-shared-mathlib.json"),
             dict(key="1" * 64, pool=str(self.pool), boot_id="old-boot"),
@@ -306,48 +266,40 @@ class SharedTests(unittest.TestCase):
         target = self.root / "state/verification-candidates" / ("e" * 32)
         target.parent.mkdir(parents=True)
         with (
-            patch.dict(os.environ, {**self.env, "TAUCETI_VERIFY_STORAGE_DIR": str(self.root / "verify-ledger")}),
-            patch.object(s, "detach_upper", side_effect=s.Unavailable("detachment unavailable")),
+            patch.dict(os.environ, self.roomy()),
+            patch.object(s, "detach_upper", side_effect=AssertionError("detached")),
+            patch("tauceti_worker.agents.host_build_cache_context", side_effect=AssertionError("rehydrated")),
         ):
-            with self.assertRaises(Pressure) as raised:
-                snapshot(self.cwd, target, inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")))
-        self.assertEqual(raised.exception.reason, "cache")
-        self.assertFalse(target.exists())
-        self.assertTrue((self.cwd / "lakefile.toml").is_file())
+            snapshot(self.cwd, target, inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")))
+        self.assertFalse((target / ".lake/packages/mathlib/.lake/build").exists())
+        self.assertEqual((build / "sparse.olean").read_text(), "incomplete old upper")
 
-    def test_merged_copy_resolves_private_and_lower_backing_files_for_reflink(self):
-        self.require_overlay()
-        build = self.mathlib / ".lake/build"
-        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
-            lower = self.pool / "entries" / self.env["TAUCETI_SHARED_MATHLIB_KEY"] / "build"
-            code = """import sys
-from pathlib import Path
-sys.path.insert(0,sys.argv[1])
-from tauceti_worker.verification_jobs import backing_source,copy_file
-build,lower,output=map(Path,sys.argv[2:])
-(build/'lib/lean/Mathlib.olean').write_bytes(b'private')
-for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified artifact')]:
- source=backing_source(build/'lib/lean'/name,build,lower)
- assert not source.is_relative_to(build),source
- copy_file(source,output/name)
- assert (output/name).read_bytes()==expected
-"""
-            output = self.root / "copied"
-            output.mkdir()
-            subprocess.run(
-                prefix
-                + [
-                    sys.executable,
-                    "-c",
-                    code,
-                    str(Path(__file__).resolve().parents[1]),
-                    str(build),
-                    str(lower),
-                    str(output),
-                ],
-                check=True,
-                pass_fds=s.lease_fds(self.env),
+    def test_immutable_installation_is_referenced_not_copied(self):
+        from tauceti_worker.verification import inventory
+        from tauceti_worker.verification_jobs import snapshot
+
+        packages = self.cwd / ".lake/packages"
+        external = self.root / "caller-owned-packages"
+        packages.rename(external)
+        packages.symlink_to(external, target_is_directory=True)
+        target = self.root / "state/verification-candidates" / ("d" * 32)
+        target.parent.mkdir(parents=True)
+        with patch.dict(
+            os.environ,
+            {
+                **self.env,
+                "TAUCETI_VERIFY_STORAGE_DIR": str(self.root / "verify-ledger"),
+                "TAUCETI_VERIFY_MIN_FREE_BYTES": "1",
+                "TAUCETI_VERIFY_MIN_FREE_PERCENT": "0",
+            },
+        ):
+            snapshot(
+                self.cwd,
+                target,
+                inventory(self.cwd, git(self.cwd, "rev-parse", "HEAD")),
+                immutable_packages=external,
             )
+        self.assertEqual((target / ".lake/packages").resolve(), external.resolve())
 
     def test_signature_binds_external_lake_config_by_content_and_cache_selection(self):
         config = self.root / "lake.toml"

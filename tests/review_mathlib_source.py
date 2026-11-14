@@ -31,19 +31,57 @@ def test_sources_match_the_reviewed_head_and_cached_snapshots_are_reused():
     manifest = SimpleNamespace(returncode=0, stdout=json.dumps({"packages": [{"name": "mathlib", "rev": REV}]}))
     with (
         tempfile.TemporaryDirectory() as tmp,
+        patch.dict(os.environ, TAUCETI_SHARED_REPOSITORIES_DIR=str(Path(tmp) / "shared")),
         patch.object(github, "gh_run", return_value=manifest) as api,
         patch.object(agents.subprocess, "run", side_effect=git),
     ):
-        cfg = SimpleNamespace(state=Path(tmp))
-        source = agents._review_mathlib_source(cfg, HEAD)
-        assert source == Path(tmp) / "refs" / f"mathlib-src-{REV}"
-        assert (source / "Mathlib.lean").is_file() and not (source / ".git").exists()
-        assert not (source / agents._REVIEW_SOURCE_STAGING).exists()
-        assert source.stat().st_mode & 0o777 == 0o700
-        assert f"?ref={HEAD}" in api.call_args.args[0][2]
-        assert any(command[-1] == REV and "fetch" in command for command in calls)
-        assert agents._review_mathlib_source(cfg, HEAD) == source
+        legacy = Path(tmp) / "worker/refs" / f"mathlib-src-{REV}"
+        legacy.mkdir(parents=True)
+        (legacy / "Mathlib.lean").write_text("-- old per-worker snapshot\n")
+        cfg = SimpleNamespace(state=Path(tmp) / "worker")
+        other = SimpleNamespace(state=Path(tmp) / "other-worker")
+        with agents._review_mathlib_source(cfg, HEAD) as source:
+            # One snapshot per host, shared by every worker; the per-worker copy is deleted.
+            assert source == Path(tmp) / "shared/mathlib-sources-v1" / f"mathlib-src-{REV}"
+            assert not legacy.exists()
+            assert (source / "Mathlib.lean").is_file() and not (source / ".git").exists()
+            assert (source / "Mathlib.lean").stat().st_mode & 0o222 == 0
+            assert not (source / agents._REVIEW_SOURCE_STAGING).exists()
+            assert source.stat().st_mode & 0o777 == 0o700
+            assert f"?ref={HEAD}" in api.call_args.args[0][2]
+            assert any(command[-1] == REV and "fetch" in command for command in calls)
+            with agents._review_mathlib_source(other, HEAD) as again:
+                assert again == source
         assert len(calls) == 3
+
+
+def test_pruning_keeps_a_snapshot_another_reviewer_holds():
+    def git(command, **kwargs):
+        if "checkout" in command:
+            (Path(command[2]) / "Mathlib.lean").write_text("-- pinned sources\n")
+        return SimpleNamespace(returncode=0)
+
+    revs = ["c" * 40, "d" * 40, "e" * 40]
+    with (
+        tempfile.TemporaryDirectory() as tmp,
+        patch.dict(os.environ, TAUCETI_SHARED_REPOSITORIES_DIR=str(Path(tmp) / "shared")),
+        patch.object(agents.subprocess, "run", side_effect=git),
+    ):
+        cfg = SimpleNamespace(state=Path(tmp) / "worker")
+
+        def manifest(rev):
+            body = json.dumps({"packages": [{"name": "mathlib", "rev": rev}]})
+            return patch.object(github, "gh_run", return_value=SimpleNamespace(returncode=0, stdout=body))
+
+        with manifest(revs[0]), agents._review_mathlib_source(cfg, HEAD) as held:
+            for index, rev in enumerate(revs[1:], 1):
+                with manifest(rev), agents._review_mathlib_source(cfg, HEAD) as source:
+                    os.utime(source, (time.time() + index,) * 2)
+            assert (held / "Mathlib.lean").is_file()  # oldest, but leased
+        with manifest(revs[2]), agents._review_mathlib_source(cfg, HEAD):
+            pass
+        names = sorted(p.name for p in (Path(tmp) / "shared/mathlib-sources-v1").glob("mathlib-src-*"))
+        assert names == [f"mathlib-src-{rev}" for rev in revs[1:]]
 
 
 def test_staging_errors_stop_review_instead_of_omitting_required_sources():
@@ -62,6 +100,7 @@ def test_staging_errors_stop_review_instead_of_omitting_required_sources():
         response = SimpleNamespace(returncode=rc, stdout=body)
         with (
             tempfile.TemporaryDirectory() as tmp,
+            patch.dict(os.environ, TAUCETI_SHARED_REPOSITORIES_DIR=str(Path(tmp) / "shared")),
             patch.object(github, "gh_run", return_value=response),
             patch.object(agents.subprocess, "run") as git,
         ):
@@ -70,18 +109,20 @@ def test_staging_errors_stop_review_instead_of_omitting_required_sources():
             else:
                 git.return_value = SimpleNamespace(returncode=git_result)
             try:
-                agents._review_mathlib_source(SimpleNamespace(state=Path(tmp)), HEAD)
+                with agents._review_mathlib_source(SimpleNamespace(state=Path(tmp)), HEAD):
+                    pass
             except NoProgress as error:
                 assert "no review started" in str(error)
             else:
                 raise AssertionError("missing required sources did not stop the review")
-            assert not list(Path(tmp).glob("refs/mathlib-src-tmp-*"))
+            assert not list(Path(tmp).glob("shared/mathlib-sources-v1/mathlib-src-tmp-*"))
 
 
 def test_projects_without_mathlib_can_review_without_a_mathlib_mount():
     response = SimpleNamespace(returncode=0, stdout='{"packages": []}')
     with patch.object(github, "gh_run", return_value=response), patch.object(agents.subprocess, "run") as git:
-        assert agents._review_mathlib_source(SimpleNamespace(state=Path("/unused")), HEAD) is None
+        with agents._review_mathlib_source(SimpleNamespace(state=Path("/unused")), HEAD) as source:
+            assert source is None
         git.assert_not_called()
 
 
