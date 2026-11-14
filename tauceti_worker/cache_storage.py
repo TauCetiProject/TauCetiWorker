@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
-import stat
 import time
 from pathlib import Path
 
@@ -262,9 +261,16 @@ def collect(configs, *, dry=False, now=None, opened=...):
                 if not disposable_stage and any(details.get((i.st_dev, i.st_ino), [0, 0, 0, False])[3] for i in infos):
                     note(report, "protected", str(entry))
                     continue
-                # Pool-only bundles have an entry and canonical link. Private links
-                # cannot be reclaimed by deleting a pool name, so don't churn warm entries.
-                reclaimable = sum(i.st_blocks * 512 for i in infos if i.st_nlink <= (2 if entry.is_dir() else 1))
+                # Pool-only bundles are linked only by pool names: the entry alias, the legacy
+                # artifacts/ copy and the canonical object. Private links cannot be reclaimed by
+                # deleting a pool name, so don't churn warm entries.
+                from .canonical_store import pool_aliases, release
+
+                reclaimable = sum(
+                    i.st_blocks * 512
+                    for p, i in zip(payload, infos, strict=True)
+                    if i.st_nlink <= (1 if entry.is_dir() else 0) + max(1, len(pool_aliases(pool, p.name, i)))
+                )
                 if not disposable_stage and urgent and now - stamp((clock, entry, key)) < LIFETIME and not reclaimable:
                     continue
                 unique = sum(p.stat().st_blocks * 512 for p in names if p.is_file() and p.stat().st_nlink == 1)
@@ -273,17 +279,14 @@ def collect(configs, *, dry=False, now=None, opened=...):
                     remaining -= unique
                     removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + unique
                     for old in names:
-                        shared = pool / ("archives" if old.name.endswith(".ltar") else "artifacts") / old.name
-                        # A relink adopting this pool copy holds the object lock while it hashes and links.
-                        with contextlib.suppress(BlockingIOError, FileNotFoundError), legacy_lock(pool, old.name):
-                            info = shared.lstat()
-                            if (
-                                stat.S_ISREG(info.st_mode)
-                                and info.st_nlink == 1
-                                and guard.unlink(shared, info, recent_ok=True)
-                            ):
-                                remaining -= info.st_blocks * 512
-                                removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + info.st_blocks * 512
+                        if old.name == "entry.json" or not expanded_cache.ARTIFACT.fullmatch(old.name):
+                            continue
+                        # The legacy copy and canonical object go together once only they link it;
+                        # a relink holding the object lock while it adopts the copy wins.
+                        with contextlib.suppress(BlockingIOError):
+                            size = release(pool, old.name, guard)
+                            remaining -= size
+                            removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + size
         except BlockingIOError:
             note(report, "protected", str(entry))
         except FileNotFoundError:

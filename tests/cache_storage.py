@@ -26,10 +26,18 @@ class Storage(unittest.TestCase):
         self.pool = self.root / "pool"
         self.env = patch.dict(
             os.environ,
-            {"TAUCETI_BUILD_CACHE_ROOT": str(self.pool), "TAUCETI_ACTIVITY_DIR": str(self.root / "activity")},
+            {
+                "TAUCETI_BUILD_CACHE_ROOT": str(self.pool),
+                "TAUCETI_ACTIVITY_DIR": str(self.root / "activity"),
+                "TAUCETI_SHARED_MATHLIB_ROOT": str(self.root / "mathlib-builds"),
+                "HOME": str(self.root / "home"),
+            },
         )
         self.env.start()
         self.addCleanup(self.env.stop)
+        from tauceti_worker import activity
+
+        assert cache.root() == self.pool and activity.root() == self.root / "activity", "unisolated test"
         storage.initialize(self.pool)
         real_usage = shutil.disk_usage(self.root)
         usage = shutil._ntuple_diskusage(real_usage.total, real_usage.total // 2, real_usage.total // 2)
@@ -88,6 +96,51 @@ class Storage(unittest.TestCase):
         self.assertFalse(old.exists())
         self.assertIn("managed_bytes", result)
         self.assertIn("free_bytes", result["filesystems"][0])
+
+    def test_pressure_reclaims_payloads_linked_only_by_pool_names(self):
+        from tauceti_worker import canonical_store
+
+        for disabled in (False, True):
+            key = ("b" if disabled else "a") * 16
+            name = ("d" if disabled else "c") * 16 + ".olean"
+            entry = self.pool / "entries" / key
+            entry.mkdir(parents=True)
+            (entry / name).write_bytes(b"x" * 8192)
+            atomic_json(entry / "entry.json", {"data": {}})
+            legacy = self.pool / "artifacts" / name
+            canonical = canonical_store.store(self.pool) / "objects" / name
+            for alias in (legacy, canonical):
+                alias.parent.mkdir(parents=True, exist_ok=True)
+                os.link(entry / name, alias)  # Entry, legacy copy and canonical object: 3 links.
+            if disabled:
+                (canonical_store.store(self.pool) / "disabled").touch()  # Must not strand links.
+            self.assertEqual(legacy.stat().st_nlink, 3)
+            with patch.dict(os.environ, {"TAUCETI_CACHE_MAX_GIB": "0.000001"}):
+                storage.collect([], opened=set())
+            self.assertFalse(entry.exists(), disabled)
+            self.assertFalse(legacy.exists(), disabled)
+            self.assertFalse(canonical.exists(), disabled)
+
+    def test_pool_names_survive_while_a_worker_links_the_payload(self):
+        from tauceti_worker import canonical_store
+
+        entry = self.pool / "entries" / ("a" * 16)
+        entry.mkdir(parents=True)
+        name = "c" * 16 + ".olean"
+        (entry / name).write_bytes(b"x" * 8192)
+        atomic_json(entry / "entry.json", {"data": {}})
+        os.utime(entry / "entry.json", (time.time() - 4 * 86400,) * 2)
+        legacy = self.pool / "artifacts" / name
+        canonical = canonical_store.store(self.pool) / "objects" / name
+        for alias in (legacy, canonical):
+            alias.parent.mkdir(parents=True, exist_ok=True)
+            os.link(entry / name, alias)
+        worker = self.root / "worker-store/artifacts"
+        worker.mkdir(parents=True)
+        os.link(entry / name, worker / name)
+        storage.collect([], opened=set())
+        self.assertFalse(entry.exists())  # The aged entry goes,
+        self.assertTrue(canonical.exists() and legacy.exists())  # but a linked object stays.
 
     def test_dry_run_does_not_create_locks_or_change_files(self):
         self.entry(age=4 * 86400)
