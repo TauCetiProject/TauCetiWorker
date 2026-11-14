@@ -34,8 +34,9 @@ from .config import log
 FETCH_INTERVAL = 60
 # Shared-config keys that could run code or redirect traffic for every round on the host. An agent
 # writing `git config` in its worktree writes the shared file, so they are cleared at every round.
+# core.hooksPath is not listed: it is set to an empty directory at every round instead.
 UNSAFE_CONFIG = (
-    r"^core\.(hookspath|fsmonitor|sshcommand|pager|editor|askpass|gitproxy|worktree|attributesfile|excludesfile)$",
+    r"^core\.(fsmonitor|sshcommand|pager|editor|askpass|gitproxy|worktree|attributesfile|excludesfile)$",
     r"^(include|includeif)\.",
     r"^filter\.",
     r"^diff\..*\.(textconv|command)$",

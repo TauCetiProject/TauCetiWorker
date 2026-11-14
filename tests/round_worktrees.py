@@ -91,6 +91,9 @@ def main():
         (one.checkout / ".lake/build").mkdir(parents=True)
         (one.checkout / ".lake/build/A.olean").write_text("warm build")
         os.environ["TAUCETI_ROUND_WORKTREES"] = "1"
+        # A live round holds its worker's round lock, as RoundContext does.
+        live = (one.state / "round.lock").open("a+")
+        fcntl.flock(live, fcntl.LOCK_EX)
         check("first round prepares", agents.prepare_checkout(one, work="fix", pr=1))
         check("the checkout is now a worktree of the host clone", rw.owns(one.checkout))
         check("detached at origin/main", git(one.checkout, "rev-parse", "HEAD").strip() == main_oid)
@@ -117,7 +120,10 @@ def main():
         (clone / "hooks").mkdir(exist_ok=True)
         (clone / "hooks/pre-commit").write_text("#!/bin/sh\nexit 1\n")
         two = worker(root, "w2")
+        crashed = (two.state / "round.lock").open("a+")
+        fcntl.flock(crashed, fcntl.LOCK_EX)
         check("a second worker prepares its own worktree", agents.prepare_checkout(two, work="fix", pr=2))
+        check("another live round's worktree is untouched", rw.owns(one.checkout))
         config = subprocess.run(["git", f"--git-dir={clone}", "config", "--list"], capture_output=True, text=True)
         check("fsmonitor was removed", "core.fsmonitor" not in config.stdout)
         check("hooks were removed", not (clone / "hooks/pre-commit").exists())
@@ -131,11 +137,10 @@ def main():
         identity(two.checkout)
         (two.checkout / "Crash.lean").write_text("unsaved work of a crashed round\n")
         if Path("/proc/locks").exists():
-            with (two.state / "round.lock").open("a+") as held:
-                fcntl.flock(held, fcntl.LOCK_EX)
-                rw.release(one)
-                agents.prepare_checkout(one, work="fix", pr=1)
-                check("a held round lock protects a live round's worktree", two.checkout.exists())
+            rw.release(one)
+            agents.prepare_checkout(one, work="fix", pr=1)
+            check("a held round lock protects a live round's worktree", two.checkout.exists())
+            crashed.close()  # the round dies without its cleanup
             rw.release(one)
             check("the next round prepares", agents.prepare_checkout(one, work="fix", pr=1))
             check("a crashed round's worktree is removed", not two.checkout.exists())
@@ -154,6 +159,7 @@ def main():
         check("flag off prepares", agents.prepare_checkout(one, work="fix", pr=1))
         check("an ordinary clone again", wr.checkout_kind(one.checkout) == "standalone")
         check(".lake kept across the switch", (one.checkout / ".lake/build/A.olean").is_file())
+        live.close()
     print("PASS" if not fails else f"FAIL ({fails})")
     return 1 if fails else 0
 
