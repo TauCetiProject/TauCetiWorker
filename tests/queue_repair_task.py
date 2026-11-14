@@ -4999,6 +4999,30 @@ class WorkerAudits(Fixture):
             with patch.object(repair_audit, "available_memory", return_value=40 * 1024**3):
                 self.assertFalse(repair_audit.can_overlap(logdir, "key"))
 
+    def test_memory_headroom_uses_capped_ancestors_with_an_uncapped_host_root(self):
+        files = {
+            "/proc/meminfo": "MemAvailable: 33554432 kB\n",
+            "/proc/self/cgroup": "0::/worker/repair\n",
+            "/sys/fs/cgroup/worker/repair/memory.max": "max\n",
+            "/sys/fs/cgroup/worker/memory.max": str(8 * 1024**3),
+            "/sys/fs/cgroup/worker/memory.current": str(3 * 1024**3),
+        }
+
+        def read(path):
+            try:
+                return files[str(path)]
+            except KeyError:
+                raise FileNotFoundError(path) from None
+
+        with patch.object(Path, "read_text", autospec=True, side_effect=read):
+            self.assertEqual(repair_audit.available_memory(), 5 * 1024**3)
+            # A cgroup namespace can expose its own cap at the visible root.
+            files["/sys/fs/cgroup/memory.max"] = str(4 * 1024**3)
+            files["/sys/fs/cgroup/memory.current"] = str(2 * 1024**3)
+            self.assertEqual(repair_audit.available_memory(), 2 * 1024**3)
+            del files["/sys/fs/cgroup/worker/memory.max"]
+            self.assertEqual(repair_audit.available_memory(), 0)
+
     def test_lost_push_response_reconciles_the_remote_without_rebuilding(self):
         cfg = self.config(poll_seconds=0)
         client = self.client(cfg)

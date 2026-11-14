@@ -343,7 +343,12 @@ def available_memory() -> int:
         for ancestor in (group, *group.parents):
             if not ancestor.is_relative_to(root):
                 break
-            maximum = (ancestor / "memory.max").read_text().strip()
+            try:
+                maximum = (ancestor / "memory.max").read_text().strip()
+            except FileNotFoundError:
+                if ancestor == root:
+                    continue  # Linux does not expose memory.max at the host cgroup root.
+                raise
             if maximum != "max":
                 available = min(available, int(maximum) - int((ancestor / "memory.current").read_text()))
         return max(available, 0)
