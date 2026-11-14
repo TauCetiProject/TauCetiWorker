@@ -224,6 +224,18 @@ if mode.startswith("copy"):
     if mode == "copy":
         time.sleep(120)  # only reached if the cap never fires
     time.sleep(1)
+elif mode in ("grow", "store"):
+    # grow: append to the inherited build file in place; store: fill the private Lake store,
+    # which did not exist when the round started.
+    target = cwd / ".lake/build/lib/Base.olean" if mode == "grow" else store.parent / "lake-store/a/b.bin"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "ab") as out:
+        for _ in range(24):
+            out.write(b"g" * (1 << 20))
+            out.flush()
+            os.fsync(out.fileno())
+            time.sleep(0.02)
+    time.sleep(120 if mode == "store" else 0.5)
 elif mode == "link":
     for index, source in enumerate(sorted((store / "objects").iterdir()) * 4):
         target = cwd / ".lake/build/lib" / f"L{index}.olean"
@@ -246,9 +258,11 @@ def round_tests():
     state = base / "state" / "w1"
     state.mkdir(parents=True)
     cfg = SimpleNamespace(state=state, wid="w1")
+    runs = []
 
-    def run(mode, setting, *, cap_mib=16):
-        checkout = base / f"checkout-{mode}-{setting}"
+    def run(mode, setting, *, cap_mib=16, scan="0.3", patches=()):
+        runs.append(mode)
+        checkout = base / f"checkout-{mode}-{setting}-{len(runs)}"
         write(checkout / ".lake/build/lib/Base.olean", 8 * MIB)  # inherited build state: baseline
         (checkout / "Main.lean").write_text("-- source\n")
         env = {
@@ -262,7 +276,7 @@ def round_tests():
             "TAUCETI_CLAUDE_BILLING": "api",
             "TAUCETI_ROUND_PRIVATE_BYTES": setting,
             "TAUCETI_ROUND_PRIVATE_CAP_GIB": str(cap_mib / 1024),
-            "TAUCETI_ROUND_PRIVATE_SCAN_SECONDS": "0.3",
+            "TAUCETI_ROUND_PRIVATE_SCAN_SECONDS": scan,
             "LAKE_CACHE_DIR": str(base / "lake-store"),
         }
 
@@ -273,6 +287,7 @@ def round_tests():
         started = time.monotonic()
         error = None
         with (
+            contextlib.ExitStack() as stack,
             patch.dict(os.environ, env, clear=True),
             patch.object(agents, "host_agent_launch", launch),
             patch.object(round_storage, "TICK_SECONDS", 0.1),
@@ -280,6 +295,8 @@ def round_tests():
             contextlib.redirect_stdout(output),
             contextlib.redirect_stderr(output),
         ):
+            for extra in patches:
+                stack.enter_context(extra)
             assert_pinned()
             try:
                 rc = agents.run_agent_host(checkout, "prompt", "claude", base / "logs", quota_cfg=cfg)
@@ -313,6 +330,45 @@ def round_tests():
     assert report["exceeded"] and not report["killed"] and checkout.is_dir(), report
     assert "report mode" in text
     print("[OK] report mode measures and reports the excess without killing")
+
+    checkout, rc, error, report, elapsed, text = run("link", "enforce", cap_mib=4)
+    assert error is None and rc == 0 and not report["exceeded"], report
+    assert report["baseline_private_bytes"] > 4 * MIB
+    print("[OK] inherited private bytes above the cap are the baseline, not an excess")
+
+    checkout, rc, error, report, elapsed, text = run("grow", "enforce", scan="1000")
+    assert error is not None and not report["killed"] and report["new_private_bytes"] > 16 * MIB, report
+    assert not checkout.exists()
+    print("[OK] the final full walk sees an inherited file grown in place, and abandons the round")
+
+    checkout, rc, error, report, elapsed, text = run("store", "enforce")
+    assert error is not None and report["killed"] and elapsed < 60, report
+    assert str(base / "lake-store") in report["roots"]
+    print("[OK] a private store created during the round is measured")
+
+    def failing_telemetry(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    checkout, rc, error, report, elapsed, text = run(
+        "copy", "enforce", patches=[patch("tauceti_worker.overlap_support.atomic", failing_telemetry)]
+    )
+    assert error is not None and report["killed"] and not checkout.exists(), report
+    print("[OK] a write failure after the kill still abandons the round")
+
+    from tauceti_worker import retention
+
+    name = f"checkout-copy-enforce-{len(runs) + 1}"
+    queued = len(list((state / "recovery-cleanup" / "discarded").iterdir()))
+    checkout, rc, error, report, elapsed, text = run(
+        "copy",
+        "enforce",
+        patches=[patch.object(retention, "mount_points", lambda: [base / name / ".lake/mounted"])],
+    )
+    assert error is not None and not checkout.exists(), text
+    hidden = [path for path in base.iterdir() if path.name.startswith(f".{name}.abandoned-")]
+    assert len(hidden) == 1 and "operator removal" in str(error), (hidden, error)
+    assert len(list((state / "recovery-cleanup" / "discarded").iterdir())) == queued  # never queued with a mount
+    print("[OK] a checkout with a mount inside is moved aside, never queued for deletion")
 
     # The shared view check runs before the baseline; a mismatch never launches the agent.
     pool, entry = publish_entry("k2")

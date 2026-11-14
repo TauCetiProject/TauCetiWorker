@@ -418,7 +418,9 @@ shared store is not private; a file written, unpacked or copied there is. A walk
 starts records the baseline the round inherits. While the agent runs, a monitor thread measures
 again every 30 seconds, and sooner when the worker scope's cgroup `io.stat` write bytes jump. Each
 pass lstats every directory but rereads only directories whose mtime changed, a rotating eighth of
-the rest, and files changed during the round. Filesystem quotas are not used: hard links fail
+the rest, and files changed during the round; the pass after the agent exits is a full walk.
+Rounds get no private `TMPDIR` yet, so writes under `/tmp` are not measured. Filesystem quotas are
+not used: hard links fail
 across XFS project IDs and bind mounts, which would make Lake copy instead of link.
 
 | Setting | Values | Default |
@@ -434,8 +436,10 @@ Each round reads it again, so enabling a host needs no restart. An invalid value
 In `enforce`, a round whose new private bytes exceed the cap has its agent's process group killed.
 Once the group is reaped, its checkout is moved whole into `recovery-cleanup/discarded/` without
 saving anything (no recovery record, no retained tree) and deleted by the ordinary collector, which
-never follows links or crosses filesystems. The round ends as no progress, and the PR attempt stays
-charged. While enabled, round start also checks the leased shared Mathlib entry against its
+never follows links or crosses filesystems. A checkout with a mount inside, or one that cannot be
+moved there, is renamed to a hidden `.<name>.abandoned-<id>` sibling for an operator to remove,
+never queued for deletion. The round ends as no progress, and the PR attempt stays charged; a
+recovery continuation becomes obsolete instead of being retried, and a queue repair task fails. While enabled, round start also checks the leased shared Mathlib entry against its
 `ready.json` inventory. A mismatch stops the round before the agent starts and records a shared
 Mathlib safety stop; it never deletes through the shared path. `report` logs the same findings and
 keeps the round.

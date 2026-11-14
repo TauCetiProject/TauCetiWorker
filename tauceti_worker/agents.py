@@ -1338,6 +1338,10 @@ def run_agent_proc(
                     monitor.join(3)
                 if feeder is not None:
                     feeder.join(3)
+                if storage is not None:
+                    # The group is reaped. Also on an exceptional exit, so a killed round is
+                    # still abandoned; past the cap this raises RoundAbandoned.
+                    storage.conclude(proc.returncode)
         from .overlap_support import atomic
 
         telemetry = {
@@ -1360,8 +1364,6 @@ def run_agent_proc(
         }
         if provider in {"codex", "claude"} and not renderer.active:
             write_rendered(destination, f"[warning] no structured {provider} events were recognized\n")
-        if storage is not None:
-            storage.conclude(rc)  # the group is reaped; raises RoundAbandoned past the cap
         return rc
 
     def classify_rendered_failure() -> str | None:

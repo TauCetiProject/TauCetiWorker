@@ -126,7 +126,9 @@ def round_roots(cwd: Path, env) -> list[Path]:
             continue
         path = Path(raw)
         try:
-            if path.is_symlink() or not path.is_dir():
+            # A configured store that does not exist yet stays a root: each pass starts at the
+            # roots, so a directory the agent creates there later is measured. Symlinks are not.
+            if path.is_symlink() or (path.exists() and not path.is_dir()):
                 continue
             real = path.resolve()
         except OSError:
@@ -386,7 +388,7 @@ class RoundStorage:
         guard.scanner.since_ns = time.time_ns()
         guard.measure(full=True)
         guard.baseline = guard.private
-        guard.peak = 0
+        guard.peak, guard.exceeded = 0, None  # inherited bytes are the baseline, never an excess
         guard.publish()
         log(
             f"round storage ({guard.mode}): baseline {guard.baseline / GIB:.2f} GiB private in "
@@ -458,7 +460,8 @@ class RoundStorage:
                 self.publish()
             last, written = time.monotonic(), current
             if self.exceeded and self.mode == "enforce":
-                self._kill(proc, finished)
+                if not finished.is_set():
+                    self._kill(proc, finished)
                 return
 
     def _kill(self, proc, finished):
@@ -467,11 +470,15 @@ class RoundStorage:
             f"round storage: {self.new_bytes / GIB:.2f} GiB of new private bytes exceeds the "
             f"{self.cap / GIB:.2f} GiB cap; killing the agent's process group"
         )
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(proc.pid, signal.SIGTERM)
-        if not finished.wait(KILL_GRACE):
+        # The guardian leads its own session, so its pid is the group id while it is unreaped.
+        # Once it is reaped the pid may be reused: owned_process then sweeps the group itself.
+        for sig, grace in ((signal.SIGTERM, KILL_GRACE), (signal.SIGKILL, 0)):
+            if proc.poll() is not None:
+                return
             with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(proc.pid, signal.SIGKILL)
+                os.killpg(proc.pid, sig)
+            if finished.wait(grace):
+                return
 
     def conclude(self, rc) -> None:
         """After the agent's group is reaped: final measurement, report, and abandonment."""
@@ -479,7 +486,8 @@ class RoundStorage:
             self.thread.join(KILL_GRACE + 60)
         if self.thread is None or not self.thread.is_alive():
             with self.lock:
-                self.measure()
+                # Writers have stopped: a full walk also sees inherited files grown in place.
+                self.measure(full=True)
         self.publish()
         report = dict(self.summary(), exit_code=rc)
         with contextlib.suppress(Exception):
@@ -507,36 +515,69 @@ class RoundStorage:
         )
 
     def abandon(self) -> str:
-        """Move the checkout whole into the discard queue: no recovery record, nothing retained."""
-        state = getattr(self.cfg, "state", None)
-        if state is None:
-            return "no worker state to discard into; checkout left in place"
+        """Move the checkout whole out of its place: no recovery record, nothing retained.
+
+        The discard queue is preferred: its collector deletes without following links or crossing
+        filesystems. A checkout with a mount inside, or one that cannot be moved there, is renamed
+        to a hidden sibling instead, which no collector deletes: callers then find no checkout to
+        preserve, and an operator removes the sibling. Nothing is deleted here.
+        """
+        from .retention import mount_points
+
         cwd = self.cwd
         try:
             if cwd.is_symlink() or not cwd.is_dir():
                 return f"{cwd} is not a directory; left in place"
-            if _overlaps(cwd.resolve(), _shared_roots(self.env)):
+            real = cwd.resolve()
+            if _overlaps(real, _shared_roots(self.env)):
                 return f"{cwd} overlaps shared state; left in place"
+        except OSError as error:
+            return f"{cwd} could not be inspected ({error}); left in place"
+        problem = None
+        state = getattr(self.cfg, "state", None)
+        mounts = mount_points()
+        if state is None:
+            # Queue repair tasks own their worktrees and their cleanup; the caller ends the task.
+            return "no worker discard queue; the caller's worktree is left to its owner"
+        if mounts is None:
+            problem = "mounts are unobservable"
+        elif any(point == real or point.is_relative_to(real) for point in mounts):
+            problem = "a mount lies inside it"
+        else:
             trash = Path(state) / "recovery-cleanup" / "discarded"
-            trash.mkdir(parents=True, exist_ok=True)
             target = trash / f"abandoned-{cwd.name}-{secrets.token_hex(8)}"
+            try:
+                trash.mkdir(parents=True, exist_ok=True)
+                os.rename(cwd, target)
+            except OSError as error:
+                problem = f"moving it to the discard queue failed ({error})"
+            else:
+                _sync(cwd.parent, trash)
+                with contextlib.suppress(Exception):
+                    from .retention import request_cleanup
+
+                    request_cleanup()
+                log(f"round storage: moved {cwd} to {target} for deletion, unsaved")
+                return f"checkout moved to {target}"
+        target = cwd.with_name(f".{cwd.name}.abandoned-{secrets.token_hex(8)}")
+        try:
             os.rename(cwd, target)
         except OSError as error:
-            log(f"round storage: could not discard {cwd}: {error}")
-            return f"discarding {cwd} failed: {error}"
-        for directory in (cwd.parent, trash):
-            with contextlib.suppress(OSError):
-                fd = os.open(directory, os.O_RDONLY)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-        with contextlib.suppress(Exception):
-            from .retention import request_cleanup
+            log(f"round storage: WARNING: {problem}, and {cwd} could not be moved aside ({error})")
+            return f"{problem}; moving it aside failed ({error}); left in place"
+        _sync(cwd.parent)
+        log(f"round storage: WARNING: {problem}; moved {cwd} to {target}, which needs operator removal")
+        return f"{problem}; checkout moved aside to {target} for operator removal"
 
-            request_cleanup()
-        log(f"round storage: moved {cwd} to {target} for deletion, unsaved")
-        return f"checkout moved to {target}"
+
+def _sync(*directories) -> None:
+    for directory in directories:
+        with contextlib.suppress(OSError):
+            fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
 
 def start(cwd: Path, env, cfg=None) -> RoundStorage | None:
