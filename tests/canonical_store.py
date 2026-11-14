@@ -594,6 +594,30 @@ class Canonical(unittest.TestCase):
         cursor = next((canonical.store(self.pool) / "cursors").glob("*.json"))
         self.assertIn(str(stuck), json.loads(cursor.read_text())["slow"])
 
+    def test_retried_slow_file_keeps_its_longer_allowance(self):
+        good = self.checkout("good", "TauCeti.A")
+        self.relink(good)
+        checkout = self.checkout("w", "TauCeti.A")
+        objects = canonical.store(self.pool) / "objects"
+        stuck, stuck_name = sorted(paths(checkout), key=lambda pair: pair[1])[0]
+        real_digest = canonical.digest
+
+        def slow(path, deadline=None):
+            if Path(path) == stuck and deadline is not None:
+                finish = time.monotonic() + 0.4  # Longer than GRACE, shorter than 3 * GRACE.
+                while time.monotonic() < finish:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("hashing reached the relink deadline")
+                    time.sleep(0.01)
+            return real_digest(path)
+
+        with patch.object(canonical, "GRACE", 0.2), patch.object(canonical, "digest", slow):
+            first = self.relink(checkout, budget=0)  # Budget exhausted before any work.
+            self.assertEqual(first["deferred_slow"], 1)
+            second = self.relink(checkout, budget=0)  # The retry gets 3 * GRACE and finishes.
+        self.assertNotIn("deferred_slow", second)
+        self.assertEqual(stuck.stat().st_ino, (objects / stuck_name).stat().st_ino)
+
     def test_operator_switches_disable_relinking_immediately(self):
         checkout = self.checkout("w", "TauCeti.A")
         env = dict(os.environ, LAKE_CACHE_DIR=str(self.root / "w-store"))

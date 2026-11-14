@@ -895,7 +895,9 @@ def _relink(work, build, sweep_private, delete_setup, limit):
             if fetch:
                 per_file = max(1e-4, (time.monotonic() - started) / len(fetch))
             if not done:
-                work.deadline = max(deadline, time.monotonic() + GRACE)  # Grace covers converging, too.
+                # Grace covers converging, too; a retried slow file keeps its longer allowance.
+                allowance = 3 * GRACE if retry is not None else GRACE
+                work.deadline = max(work.deadline, deadline, time.monotonic() + allowance)
             index = 0
             while index < len(batch):
                 name = batch[index][0]
@@ -965,6 +967,50 @@ def _relink(work, build, sweep_private, delete_setup, limit):
     with tempfile.NamedTemporaryFile("w", dir=lease.parent, delete=False) as out:
         out.write("\n".join(used) + ("\n" if used else ""))
     os.replace(out.name, lease)  # Our lease file; no build output.
+
+
+def pool_aliases(pool, name, info):
+    """The pool-owned names of `info`'s inode: its legacy `artifacts/` copy and canonical object.
+
+    An entry alias is the caller's own. Collectors reclaim an inode once its link count equals
+    the pool names they can account for, so canonical adoption never strands a third link.
+    """
+    found = []
+    for path in (legacy(pool, name), store(pool) / "objects" / name):
+        with contextlib.suppress(FileNotFoundError):
+            alias = path.lstat()
+            if stat.S_ISREG(alias.st_mode) and (alias.st_dev, alias.st_ino) == (info.st_dev, info.st_ino):
+                found.append(path)
+    return found
+
+
+def release(pool, name, guard, *, dry=False):
+    """Remove `name`'s pool-owned names once nothing else links them; returns bytes freed.
+
+    Takes the object lock without waiting (a relink holding it wins) and goes through `guard`.
+    Works with relinking disabled, so the switch never strands canonical links.
+    """
+    directory = store(pool)
+    freed = 0
+    candidates = [legacy(pool, name), directory / "objects" / name]
+    with object_lock(directory, name, exclusive=True, blocking=False):
+        for path in candidates:
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            aliases = pool_aliases(pool, name, info)
+            if info.st_nlink != len(aliases) or not guard.idle(*((a, info) for a in aliases), recent_ok=True):
+                continue
+            if not dry:
+                for alias in aliases:
+                    guard.unlink(alias, info, recent_ok=True)
+                if directory / "objects" / name in aliases:
+                    sidecar(directory, name).unlink(missing_ok=True)  # Our metadata for the evicted name.
+            freed += info.st_blocks * 512
+    return freed
 
 
 def reconcile(pool, name, path, *, blocking=True, guard=None):
