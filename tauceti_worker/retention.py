@@ -1128,11 +1128,18 @@ def _linux_process(process, uid):
         return None
 
     def gone():
-        try:
-            state = (process / "stat").read_text().rsplit(")", 1)[1].split()[0]
-        except (OSError, IndexError):
-            return True
-        return state in ("Z", "X")  # a zombie has no files, working directory or future
+        # An exiting process drops its working directory and executable links before it shows
+        # as a zombie; look again after a moment before calling it unreadable.
+        for attempt in range(3):
+            try:
+                state = (process / "stat").read_text().rsplit(")", 1)[1].split()[0]
+            except (OSError, IndexError):
+                return True
+            if state in ("Z", "X"):
+                return True  # a zombie has no files, working directory or future
+            if attempt < 2:
+                time.sleep(0.05)
+        return False
 
     paths, commands, selects, denied = [], [], None, False
     readers = (
