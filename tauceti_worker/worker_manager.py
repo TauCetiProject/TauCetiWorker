@@ -140,16 +140,24 @@ def rotate_log(path: Path, limit: int = MANAGER_LOG_BYTES) -> None:
     """Keep one previous generation of the log this process writes to, once it passes ``limit``.
 
     Called by the manager while it holds manager.lock, so concurrent starters cannot rotate the
-    winner's log. Only when stdout is that very file are stdout and stderr moved to a fresh one."""
+    winner's log. Each of stdout and stderr moves to the fresh file only if it wrote the old one."""
     try:
-        info, out = path.stat(), os.fstat(1)
-        if (info.st_dev, info.st_ino) != (out.st_dev, out.st_ino) or info.st_size <= limit:
+        info = path.stat()
+        if info.st_size <= limit:
+            return
+        streams = []
+        for stream in (1, 2):
+            with contextlib.suppress(OSError):
+                current = os.fstat(stream)
+                if (current.st_dev, current.st_ino) == (info.st_dev, info.st_ino):
+                    streams.append(stream)
+        if not streams:
             return
         path.replace(path.with_name(path.name + ".1"))
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
         try:
-            os.dup2(fd, 1)
-            os.dup2(fd, 2)
+            for stream in streams:
+                os.dup2(fd, stream)
         finally:
             os.close(fd)
     except OSError:

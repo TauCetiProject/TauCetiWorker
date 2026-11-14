@@ -1225,6 +1225,17 @@ print('{"result":"kept on protocol stdout"}', flush=True)
             subprocess.run([sys.executable, "-c", script, str(log)], stdout=output, stderr=output, check=True)
         self.assertEqual((self.root / "manager.log.1").read_bytes(), b"x" * 11)
         self.assertEqual(log.read_text(), "after\nagain\n")
+        # stderr going elsewhere (a journal, another file) stays there.
+        log.write_bytes(b"z" * 11)
+        errors = self.root / "errors.log"
+        script_err = (
+            "import sys; from pathlib import Path; from tauceti_worker import worker_manager as m\n"
+            "m.rotate_log(Path(sys.argv[1]), limit=10); print('out', flush=True); print('err', file=sys.stderr)\n"
+        )
+        with log.open("ab") as output, errors.open("ab") as error_output:
+            subprocess.run([sys.executable, "-c", script_err, str(log)], stdout=output, stderr=error_output, check=True)
+        self.assertEqual(log.read_text(), "out\n")
+        self.assertEqual(errors.read_text(), "err\n")
         other = self.root / "other.log"
         other.write_bytes(b"y" * 11)
         from tauceti_worker import worker_manager
