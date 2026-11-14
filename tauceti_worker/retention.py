@@ -53,9 +53,9 @@ def open_files():
     return opened
 
 
-# Read-only system volume (SIP). Its agents run as the user yet refuse inspection; none of them
-# can be a worker, Lake, Git or agent process, which always run from writable locations.
-_PLATFORM_EXECUTABLES = ("/System/", "/usr/libexec/", "/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/")
+# macOS system agents that run as the user yet refuse inspection, and cannot use worker data.
+# Not /usr/bin or /bin in general: git, sh and python live there.
+_PLATFORM_EXECUTABLES = ("/System/", "/usr/libexec/", "/usr/bin/login")
 
 
 def _open_files_psutil():
