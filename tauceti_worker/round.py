@@ -114,6 +114,10 @@ class RoundContext:
                 fn()
             except Exception as e:
                 log(f"cleanup step failed: {e}")
+        # Still under the round lock: save the round's worktree, then remove it (opt-in per host).
+        from .round_worktrees import release
+
+        release(self.cfg)
         if self._fd is not None:
             try:
                 if self.record_activity:

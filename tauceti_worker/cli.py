@@ -1717,7 +1717,13 @@ def cmd_host_doctor(args) -> int:
     from . import shared_mathlib
 
     shared_ok, shared_note = shared_mathlib.capability()
-    rows.append(("shared Mathlib", shared_ok, shared_note + "; TAUCETI_SHARED_MATHLIB_BUILDS=auto|off|required"))
+    rows.append(
+        (
+            "shared Mathlib",
+            shared_ok,
+            shared_note + "; required for rounds that need Mathlib (TAUCETI_SHARED_MATHLIB_BUILDS=off blocks them)",
+        )
+    )
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
     rows.append(("kiro-cli", _have("kiro-cli"), "for --agent kiro"))
     rows.append(("tmux", _have("tmux"), "optional `tauceti workers tmux` log workspace"))
@@ -1786,7 +1792,7 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     if needs_host_build and not _have("lake") and not opts.dry_run:
         raise Die(
             "preflight: host authoring (the default) needs an elan/lake toolchain on PATH "
-            "(or pass --bubble to build inside the sandbox instead)"
+            "(bubble work rounds are refused: they would build a private Mathlib in the container)"
         )
     # bubble (the --bubble sandbox) runs each model on untrusted PR content inside an Incus container.
     # Without Incus, bubble fails deep in the round with a terse "Incus is required but not installed";

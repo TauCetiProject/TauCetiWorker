@@ -89,6 +89,36 @@ class Retention(unittest.TestCase):
         self.assertIn("removed_count", result)
         self.assertIn("protected_count", result)
 
+    def test_expired_deadline_defers_every_sweep_phase(self):
+        from tauceti_worker import cache_storage, recovery_maintenance, verification_storage
+
+        with (
+            patch.object(recovery_maintenance, "prepare") as prepare,
+            patch.object(recovery_maintenance, "collect_discarded") as discarded,
+            patch.object(cache_storage, "collect") as collect,
+            patch.object(verification_storage, "housekeep") as housekeep,
+            patch.object(retention, "recycle") as recycle,
+        ):
+            report = retention.sweep(now=self.clock, deadline=time.monotonic() - 1)
+        for call in (prepare, discarded, collect, housekeep, recycle):
+            call.assert_not_called()
+        self.assertEqual(
+            report["deferred"],
+            ["retained-cleanup", "recovery-trash", "shared-caches", "verification-storage", "worker retired"],
+        )
+
+    def test_run_all_starts_no_sweep_work_after_its_deadline(self):
+        from tauceti_worker import cache_storage
+
+        with (
+            patch.object(retention, "data_roots", return_value=[self.root]),
+            patch.object(retention, "drain_pending"),
+            patch.object(cache_storage, "collect") as collect,
+        ):
+            report = retention.run_all(deadline=time.monotonic() - 1)
+        collect.assert_not_called()
+        self.assertIn("shared-caches", report["roots"][0]["deferred"])
+
     def test_review_source_collection_is_wired_to_sweep_and_dry_run(self):
         from runner import source_cache
 
@@ -1452,6 +1482,20 @@ print('{"result":"kept on protocol stdout"}', flush=True)
             self.assertEqual(retention._open_files_psutil(), {(info.st_dev, info.st_ino)})
         with patch.dict(sys.modules, {"psutil": fake([Process(mine, [held]), Process(mine, denied=True)])}):
             self.assertIsNone(retention._open_files_psutil())
+
+    def test_timer_unit_bounds_each_run(self):
+        directory = self.root / "config/systemd/user"
+        with (
+            patch.object(retention.sys, "platform", "linux"),
+            patch("tauceti_worker.worker_manager._service_path", return_value=directory / "tauceti-workers.service"),
+            patch.object(subprocess, "run"),
+        ):
+            retention.install_timer()
+        unit = (directory / "tauceti-cleanup.service").read_text()
+        self.assertIn(f"TimeoutStartSec={retention.TIMER_TIMEOUT}", unit)
+        self.assertIn(f'"--max-seconds" "{retention.TIMER_SECONDS}"', unit)
+        self.assertLess(retention.TIMER_SECONDS, retention.TIMER_TIMEOUT)
+        self.assertLess(retention.TIMER_TIMEOUT, 3600)
 
 
 if __name__ == "__main__":

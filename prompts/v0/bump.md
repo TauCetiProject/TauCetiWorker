@@ -6,8 +6,8 @@ You are adapting TauCetiProject/TauCeti, an AIs-welcome Lean 4 library downstrea
 
 ## Reproduce and adapt
 Read the failing CI log first and reproduce the stage that failed, not every check. The usual
-failure is the build: run `lake exe cache get` only if preparation has not already fetched
-Mathlib, then `lake build --iofail`. If the expired-shim check failed, run the shared phase:
+failure is the build: preparation already provided the bumped Mathlib, so run `lake build --iofail`
+(not `lake exe cache get` or `lake update`). If the expired-shim check failed, run the shared phase:
 ```
 "$TAUCETI_VERIFY_PYTHON" "__BIN__/tauceti-local-checks" shim-expiry --policy bump
 ```

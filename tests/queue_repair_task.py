@@ -2240,7 +2240,8 @@ class QueueCacheNote(Fixture):
         from tauceti_worker import agents
 
         @contextlib.contextmanager
-        def missed(cwd, env, logdir):
+        def missed(cwd, env, logdir, *, queue_mathlib=False):
+            self.assertTrue(queue_mathlib)  # the queue keeps its own Mathlib until it shares too
             env["TAUCETI_PR_CACHE_MISS"] = "1"  # what the host preparation does on that miss
             yield None
 

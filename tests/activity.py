@@ -338,16 +338,17 @@ class ActivityTests(unittest.TestCase):
         self.assertTrue(a.cached()["available"])
         self.assertTrue(any("Recovery housekeeping deferred" in error for error in value["errors"]))
 
-    def test_installed_collector_keeps_destructive_cleanup_out_of_reporting(self):
+    def test_installed_collector_does_not_stop_refresh_from_deleting(self):
         from tauceti_worker import retention, work_recovery
 
+        # A stalled timer run once stopped all deletion for a day; refresh keeps deleting regardless.
         a.atomic_json(a.root() / "cleanup-service.json", dict(installed=True))
         with (
-            patch.object(work_recovery, "housekeep", return_value=dict(cleanup_pending=True)) as inventory,
+            patch.object(work_recovery, "housekeep", return_value=dict(cleanup_pending=True)) as cleanup,
             patch.object(retention, "request_cleanup") as request,
         ):
             a.prepare(now=self.now)
-        inventory.assert_called_once_with(cleanup=False)
+        cleanup.assert_called_once_with(cleanup=True, **retention.COLLECTOR_SLICE)
         request.assert_called_once()
         self.assertTrue(a.cached()["available"])
 
@@ -385,14 +386,70 @@ class ActivityTests(unittest.TestCase):
             a.prepare(now=self.now)
         self.assertTrue(tree.exists())
 
-    def test_installed_collector_leaves_discarded_trees_to_the_collector(self):
+    def test_installed_collector_still_lets_refresh_drain_discarded_trees(self):
         from tauceti_worker import retention
 
         tree = self.discarded_tree(3)
         a.atomic_json(a.root() / "cleanup-service.json", dict(installed=True))
         with patch.object(retention, "request_cleanup"):
             a.prepare(now=self.now)
-        self.assertTrue(tree.exists())
+        self.assertFalse(tree.exists())
+
+    def test_discarded_trees_drain_while_another_process_holds_housekeeping(self):
+        import fcntl
+
+        from tauceti_worker import work_recovery
+
+        tree = self.discarded_tree(3)
+        base = work_recovery._state_root()
+        with open(base / ".recovery-housekeeping.lock", "a+") as held:  # e.g. a collector stuck in I/O
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            a.prepare(now=self.now)
+        self.assertFalse(tree.exists())
+
+    def test_a_locked_discarded_entry_blocks_only_itself(self):
+        import fcntl
+
+        from tauceti_worker import work_recovery
+
+        stuck = self.discarded_tree(3)
+        other = stuck.with_name("abandoned-other")
+        (other / ".lake").mkdir(parents=True)
+        (other / ".lake/A.olean").write_bytes(b"x")
+        with open(stuck.with_name(stuck.name + ".lock"), "a+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            work_recovery.housekeep(cleanup=True, seconds=5, entries=100000)
+        self.assertTrue(stuck.exists())
+        self.assertFalse(other.exists())
+
+    def test_locked_discarded_entries_stay_reported_as_backlog(self):
+        import fcntl
+
+        from tauceti_worker import work_recovery
+
+        stuck = self.discarded_tree(3)
+        with open(stuck.with_name(stuck.name + ".lock"), "a+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            report = work_recovery.housekeep(cleanup=True, seconds=5, entries=100000)
+        self.assertTrue(report["cleanup_pending"])
+
+    def test_orphan_sidecars_are_dropped_and_a_bad_queue_blocks_no_other(self):
+        from tauceti_worker import work_recovery
+
+        tree = self.discarded_tree(3)
+        queue = tree.parent
+        (queue / "gone-entry.json").write_text("{}")  # its tree was removed, the cursor survived
+        (queue / "gone-entry.lock").write_text("")
+        broken = work_recovery._state_root() / "worker0" / "recovery-cleanup" / "discarded"
+        broken.mkdir(parents=True)
+        broken.chmod(0)  # an unreadable queue, sorted before worker1
+        try:
+            work_recovery.housekeep(cleanup=True, seconds=5, entries=100000)
+        finally:
+            broken.chmod(0o700)
+        self.assertFalse(tree.exists())
+        self.assertFalse((queue / "gone-entry.json").exists())
+        self.assertFalse((queue / "gone-entry.lock").exists())
 
     def test_current_work_counts_distinct_workers_not_unfinished_receipts(self):
         a.prepare(now=self.now)
