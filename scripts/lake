@@ -1,0 +1,29 @@
+#!/bin/sh
+# TauCetiWorker's `lake` wrapper, first on the agent's PATH.
+#
+# Inside a shared Mathlib view, Mathlib's build comes from the host's shared entry. Running
+# `lake exe cache get` there re-extracts every archive into this checkout's private overlay
+# upper, a full private copy of Mathlib, so lake-guard.py refuses it. Outside a shared view
+# every invocation runs the real `lake` unchanged.
+self=$(cd -P "$(dirname "$0")" && pwd -P)
+real=
+old_ifs=$IFS
+IFS=:
+for dir in $PATH; do
+  [ -n "$dir" ] || dir=.
+  # Skip every alias of this directory (relative, trailing slash, symlink), never recursing.
+  [ -x "$dir/lake" ] || continue
+  [ "$dir/lake" -ef "$self/lake" ] && continue
+  [ "$(cd -P "$dir" 2>/dev/null && pwd -P)" = "$self" ] && continue
+  real=$dir/lake
+  break
+done
+IFS=$old_ifs
+if [ -z "$real" ]; then
+  echo "lake: not found on PATH" >&2
+  exit 127
+fi
+if [ -n "${TAUCETI_SHARED_MATHLIB_VIEW:-}" ] && [ "${TAUCETI_SHARED_MATHLIB_VIEW}" != "[]" ]; then
+  exec "${TAUCETI_VERIFY_PYTHON:-python3}" -I "$self/lake-guard.py" "$real" "$self" "$@"
+fi
+exec "$real" "$@"
