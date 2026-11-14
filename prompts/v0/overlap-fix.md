@@ -21,6 +21,11 @@ conclusion is additional mathematics; preserve it and use Mathlib in its proof.
 Preserve existing executable computations as well as theorem statements; an
 abstract transport must not make a computable operation noncomputable.
 
+If `.github/pull_request_template.md` in this checkout has a `Quality pass:` block, run its
+checks, which the template explains, over every declaration you add or change. Fix what they
+find and fill in the block's lines, one per check, for the PR body. If the template has no
+such block, skip this.
+
 Keep one coherent topic per PR. For each removed public declaration explain
 whether Mathlib supplies it, a representation change replaces it, or surviving
 Tau Ceti API preserves it. A green build is insufficient to justify removing
@@ -35,6 +40,8 @@ Publish using these quoted, absolute wrapper paths:
 Include `Fixes #__ISSUE__`, the
 exact tauceti-mathlib-overlap marker from the issue, and a standalone `Roadmap:`
 attribution (use the motivating canonical roadmap, or none for general work).
+When `.github/pull_request_template.md` has a `Quality pass:` block, the body
+carries it completed, one line per check in the template's format.
 Describe what remains additional. Do not merge the PR or close the issue while
 its repair is unmerged; existing review/fix/CI phases own that lifecycle.
 If another account already opened a repair PR, post its URL on this issue before stopping, unless a comment already links that repair. Leave the issue open until its repair merges; a final transcript is not a notification. If the issue

@@ -134,6 +134,37 @@ def default_workers_config() -> Path:
     return Path(override).expanduser() if override else config_home() / "workers.toml"
 
 
+MANAGER_LOG_BYTES = 16 * 1024**2
+
+
+def rotate_log(path: Path, limit: int = MANAGER_LOG_BYTES) -> None:
+    """Keep one previous generation of the log this process writes to, once it passes ``limit``.
+
+    Called by the manager while it holds manager.lock, so concurrent starters cannot rotate the
+    winner's log. Each of stdout and stderr moves to the fresh file only if it wrote the old one."""
+    try:
+        info = path.stat()
+        if info.st_size <= limit:
+            return
+        streams = []
+        for stream in (1, 2):
+            with contextlib.suppress(OSError):
+                current = os.fstat(stream)
+                if (current.st_dev, current.st_ino) == (info.st_dev, info.st_ino):
+                    streams.append(stream)
+        if not streams:
+            return
+        path.replace(path.with_name(path.name + ".1"))
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            for stream in streams:
+                os.dup2(fd, stream)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass  # a missing or unmovable log never prevents running the manager
+
+
 def workers_state_dir() -> Path:
     override = os.environ.get("TAUCETI_WORKERS_STATE_DIR")
     if override:
@@ -1037,6 +1068,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             workers_die("another worker manager is already running")
+        rotate_log(workers_state_dir() / "manager.log")
         pointer = manager_pointer(config)
         try:
             atomic_json(
@@ -1919,6 +1951,11 @@ def _service_environment() -> dict[str, str]:
         # The unit may outlive a Nix store path. Preserve it as a candidate, not as the final
         # SSL_CERT_FILE, so cli_main revalidates it and can fall back or warn after collection.
         service_env["NIX_SSL_CERT_FILE"] = advertised_path
+    from .paths import INSTALLED, legacy_data_root
+
+    if INSTALLED or os.environ.get("TAUCETI_LEGACY_DATA_ROOT"):
+        # The unit must keep this installation's data root, including an XDG_DATA_HOME choice.
+        service_env["TAUCETI_LEGACY_DATA_ROOT"] = str(legacy_data_root().resolve())
     return service_env
 
 

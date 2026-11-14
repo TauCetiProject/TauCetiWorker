@@ -60,6 +60,19 @@ def emit(kind, *, key=None, origin=None, **fields):
         pass  # Statistics never change whether a GitHub mutation succeeds.
 
 
+def _replaces_description(args, method):
+    """`gh pr edit` with a body, or the REST call that does the same: the description was replaced."""
+    if args[:2] == ["pr", "edit"]:
+        return any(
+            arg in ("--body", "-b", "--body-file", "-F") or arg.startswith(("--body=", "--body-file=")) for arg in args
+        )
+    return (
+        method == "PATCH"
+        and any(re.fullmatch(r"/?repos/[^/]+/[^/]+/(?:issues|pulls)/\d+", arg.split("?", 1)[0]) for arg in args)
+        and any(arg.startswith("body=") for arg in args)
+    )
+
+
 def mutation(value, result):
     args = value.get("argv", [])
     origin = value.get("context", {}).get("activity", {})
@@ -84,6 +97,8 @@ def mutation(value, result):
         method = next((arg.split("=", 1)[1] for arg in args if arg.startswith("--method=")), method).upper()
         if args[:2] == ["pr", "close"]:
             publication = "closure"
+        elif _replaces_description(args, method):
+            publication = "description"
         elif method in ("", "POST") and (
             args[:2] == ["pr", "comment"]
             and not {"--edit-last", "--delete-last"}.intersection(args)

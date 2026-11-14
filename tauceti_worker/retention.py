@@ -8,10 +8,12 @@ import fcntl
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -20,6 +22,9 @@ from .paths import HERE, canonical_candidate, legacy_data_root, self_env
 from .runtime_status import atomic_json, read_json
 
 LIFETIME = 3 * 86400
+# Agent transcripts are the per-turn record of a round; keep a month of them. Claude prunes its own
+# (cleanupPeriodDays in the isolated settings); Codex keeps every session forever.
+TRANSCRIPT_LIFETIME = 30 * 86400
 
 
 def safe(path, root):
@@ -39,7 +44,7 @@ def safe(path, root):
 def open_files():
     """One /proc pass per daily sweep, rather than one pass per old log file."""
     if not Path("/proc/self/fd").is_dir():
-        return None  # Missing observations never mean that diagnostics are unused.
+        return _open_files_psutil() if sys.platform == "darwin" else None
     opened = set()
     for process in Path("/proc").glob("[0-9]*"):
         try:
@@ -49,6 +54,47 @@ def open_files():
                     opened.add((info.st_dev, info.st_ino))
         except OSError:
             continue
+    return opened
+
+
+# macOS system agents that run as the user yet refuse inspection, and cannot use worker data.
+# Not /usr/bin or /bin in general: git, sh and python live there.
+_PLATFORM_EXECUTABLES = ("/System/", "/usr/libexec/", "/usr/bin/login")
+
+
+def _open_files_psutil():
+    """macOS has no /proc: observe this user's processes through psutil. Only this user can hold
+    this user's private data open. A process that refuses inspection makes the observation
+    unavailable, unless it is an operating-system binary that cannot be one of ours."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    uid = os.getuid()
+    opened = set()
+    for process in psutil.process_iter():
+        try:
+            if process.uids().real != uid:
+                continue
+            paths = [item.path for item in process.open_files()]
+        except psutil.NoSuchProcess:
+            continue
+        except (psutil.Error, OSError):
+            try:
+                if process.exe().startswith(_PLATFORM_EXECUTABLES):
+                    continue
+            except psutil.NoSuchProcess:
+                continue
+            except (psutil.Error, OSError):
+                pass
+            return None  # Missing observations never mean that diagnostics are unused.
+        with contextlib.suppress(psutil.Error, OSError, TypeError):
+            if cwd := process.cwd():
+                paths.append(cwd)
+        for path in paths:
+            with contextlib.suppress(OSError):
+                info = os.stat(path)
+                opened.add((info.st_dev, info.st_ino))
     return opened
 
 
@@ -173,17 +219,58 @@ def fresh_report(now=None):
     return dict(at=now if now is not None else time.time(), removed=[], protected=[], errors=[])
 
 
-def cache_roots(cfg):
-    # Never traverse arbitrary caches in the login home or operator-supplied cache overrides.
+def worker_home(cfg):
+    """(isolated home, anchor) of a worker, or None. Never the login home itself."""
     home, anchor = cfg.state / "home", cfg.state
     if sys.platform == "darwin" and legacy_project():
         from .agents import _worker_iso_home
 
         home = _worker_iso_home(cfg.wid, _base=cfg.home)
         if not safe(home, cfg.home):
-            return []
+            return None
         anchor = home
+    return home, anchor
+
+
+def cache_roots(cfg):
+    # Never traverse arbitrary caches in the login home or operator-supplied cache overrides.
+    located = worker_home(cfg)
+    if located is None:
+        return []
+    home, anchor = located
     return [(home / ".cache" / name, anchor) for name in ("lake", "mathlib")]
+
+
+def expire_transcripts(cfg, report, *, now, dry=False, opened=None, mounts=...):
+    """Codex sessions in a worker's isolated home older than TRANSCRIPT_LIFETIME."""
+    located = worker_home(cfg)
+    if located is None:
+        return
+    home, anchor = located
+    sessions = home / ".codex" / "sessions"
+    try:
+        if sessions.is_symlink() or not sessions.is_dir() or not safe(sessions, anchor):
+            return
+    except OSError as error:
+        note(report, "errors", f"{sessions}: {error}")
+        return
+    for base, _dirs, files in os.walk(
+        sessions, topdown=False, onerror=lambda error: note(report, "errors", str(error))
+    ):
+        directory = Path(base)
+        for name in files:
+            path = directory / name
+            try:
+                if path.is_symlink() or now - path.lstat().st_mtime < TRANSCRIPT_LIFETIME:
+                    continue
+                remove(path, sessions, report, dry=dry, opened=opened, mounts=mounts)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                note(report, "errors", f"{path}: {error}")
+        if directory != sessions and not dry:
+            with contextlib.suppress(OSError):
+                directory.rmdir()  # only once empty: the date directories Codex leaves behind
 
 
 def merge_report(report, result):
@@ -575,6 +662,7 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
                 note(report, "protected", str(cfg.state))
         except (OSError, ValueError, TypeError) as error:
             note(report, "errors", f"{cfg.wid}: {error}")
+        expire_transcripts(cfg, report, now=now, dry=dry, opened=opened, mounts=mounts)
         # Diagnostic paths have their own independent references and leases. One disappearing
         # telemetry file or inaccessible directory must not skip other roots or workers.
         for root in (cfg.logdir, cfg.state / "verification", cfg.state / "verification-state" / "verification"):
@@ -667,14 +755,62 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
     return report
 
 
-def request_cleanup():
-    """Ask the installed project collector to run asynchronously, without a disk scan."""
+FALLBACK_INTERVAL = 3600  # the installed timer's cadence
+FALLBACK_RETRY = 300  # after a start that never reported back
+FALLBACK_SECONDS = 900  # one fallback run's budget; durable cursors resume the rest next hour
+FALLBACK_LOG_BYTES = 1024**2
+# The installed timer's environment: project selection and shared roots, nothing worker-specific.
+COLLECTOR_ENV = frozenset(
+    {
+        "PYTHONPATH",
+        "TAUCETI_PROJECT_STATE",
+        "TAUCETI_LEGACY_DATA_ROOT",
+        "TAUCETI_REPO",
+        "TAUCETI_ACTIVITY_DIR",
+        "TAUCETI_SHARED_MATHLIB_ROOT",
+        "TAUCETI_REVIEW_MATHLIB_CACHE",
+        "TAUCETI_SHARED_REPOSITORIES_DIR",
+        "TAUCETI_GITHUB_SHARED_DIR",
+        "TAUCETI_WORKERS_STATE_DIR",
+        "XDG_STATE_HOME",
+        "PATH",
+        "TAUCETI_BUILD_CACHE_ROOT",
+        "TAUCETI_CACHE_MAX_GIB",
+    }
+)
+# Beyond the timer's set: what a user session supplies to a systemd unit implicitly.
+_SESSION_ENV = ("USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR")
+
+
+def _covered_root():
+    return str(legacy_data_root().resolve())
+
+
+def _stamp(value):
+    """A recorded time, or 0 when missing, malformed, non-finite or in the future."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return 0
+    return value if 0 <= value <= time.time() + 60 else 0
+
+
+def request_cleanup(*, fallback=False):
+    """Ask the collector to run asynchronously, without a disk scan.
+
+    Most installations have no collector service (macOS, Docker, one-off rounds, Linux without
+    `workers service install`). With ``fallback`` the caller accepts starting the collector as a
+    detached low-priority process instead, at most once per FALLBACK_INTERVAL for its data root."""
     from .activity import root
 
     directory = root()
     try:
-        if not read_json(directory / "cleanup-service.json").get("installed"):
+        service = read_json(directory / "cleanup-service.json")
+        if not service.get("installed"):
+            if fallback:
+                _fallback_collector(directory)
             return  # Do not invoke a global unit for an uninstalled/isolated project.
+        if fallback and service.get("root") != _covered_root():
+            # The unit runs for whichever installation installed it; also cover this one.
+            _fallback_collector(directory)
         with locked(directory / "cleanup-request.lock"):
             marker = directory / "cleanup-request.json"
             previous = read_json(marker)
@@ -691,8 +827,77 @@ def request_cleanup():
                 timeout=3,
                 check=False,
             )
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass  # The hourly collector remains independent of ordinary worker progress.
+    except Exception:
+        pass  # Best effort: cleanup scheduling never affects ordinary worker progress.
+
+
+def _fallback_marker(directory):
+    import hashlib
+
+    key = hashlib.sha256(_covered_root().encode()).hexdigest()[:16]
+    return directory / f"cleanup-fallback-{key}.json"
+
+
+def _collector_env(directory):
+    """Reproduce the timer's context rather than the calling worker's isolated one."""
+    import pwd
+
+    source = self_env()
+    env = {key: value for key, value in source.items() if key in COLLECTOR_ENV or key in _SESSION_ENV}
+    env["HOME"] = pwd.getpwuid(os.getuid()).pw_dir  # the worker may run with an isolated HOME
+    env["TAUCETI_ACTIVITY_DIR"] = str(directory)
+    env["TAUCETI_LEGACY_DATA_ROOT"] = _covered_root()
+    return env
+
+
+def _fallback_collector(directory):
+    """Start `cleanup --all-data-roots` like the timer would: hourly, niced, idle I/O, bounded.
+
+    cleanup.lock still serialises collectors, so a start racing a running one exits at once.
+    A start counts only once the collector reports back; until then it is retried after
+    FALLBACK_RETRY, so one failed launch cannot suppress cleanup for an hour."""
+    if os.environ.get("TAUCETI_BACKGROUND_CLEANUP", "").lower() == "off":
+        return
+    marker = _fallback_marker(directory)
+    with locked(directory / "cleanup-request.lock"):
+        now = time.time()
+        row = read_json(marker)
+        completed, attempted = _stamp(row.get("completed_at")), _stamp(row.get("attempted_at"))
+        if now - completed < FALLBACK_INTERVAL or now - attempted < FALLBACK_RETRY:
+            return
+        atomic_json(marker, {**row, "attempted_at": now})
+    from .paths import self_argv
+
+    argv = self_argv("cleanup", "--all-data-roots", "--max-seconds", FALLBACK_SECONDS, "--fallback-marker", marker)
+    if sys.platform == "linux" and shutil.which("ionice"):
+        argv = ["ionice", "-c3", *argv]
+    if shutil.which("nice"):
+        argv = ["nice", "-n", "10", *argv]
+    log_path = directory / "cleanup-fallback.log"
+    with contextlib.suppress(OSError):
+        if log_path.stat().st_size > FALLBACK_LOG_BYTES:
+            log_path.replace(log_path.with_suffix(".log.1"))
+    with log_path.open("ab") as output:
+        child = subprocess.Popen(
+            argv,
+            env=_collector_env(directory),
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=output,
+            start_new_session=True,
+            close_fds=True,
+        )
+    # Reap the child whenever it exits, even in a long-lived `work --loop` or manager.
+    threading.Thread(target=child.wait, name="cleanup-fallback-reaper", daemon=True).start()
+
+
+def report_fallback(marker, report):
+    """Called by the collector a fallback started, once its run finished."""
+    if marker is None:
+        return
+    row = read_json(marker)
+    errors = len(report.get("errors", [])) if isinstance(report, dict) else 0
+    atomic_json(marker, {**row, "completed_at": time.time(), "errors": errors})
 
 
 def pressure_cleanup():
@@ -725,8 +930,15 @@ def pending_work(base):
     return result
 
 
-def drain_pending(reports, *, once=False):
-    """Round-robin existing deletion slices without repeating expensive inventories."""
+# One collector slice of recovery housekeeping. Activity refresh reuses it on hosts
+# without an installed collector, where it is the only path that deletes anything.
+COLLECTOR_SLICE = dict(seconds=30, entries=262144, bytes=1024**3, removal_bytes=32 * 1024**3)
+
+
+def drain_pending(reports, *, once=False, deadline=None):
+    """Round-robin existing deletion slices without repeating expensive inventories.
+
+    ``deadline`` (time.monotonic()) ends the run after the current slice; cursors resume later."""
     from . import recovery_maintenance, verification_storage
     from .activity import root
 
@@ -738,19 +950,16 @@ def drain_pending(reports, *, once=False):
         while pending:
             again = []
             for path, report in pending:
+                if deadline is not None and time.monotonic() >= deadline:
+                    again = []
+                    break
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
                 totals = report.setdefault("drain", dict(slices=0, removed_bytes=0, removed_entries=0))
                 try:
                     states = [
                         member for cfg in worker_configs() for member in (cfg.state, cfg.state / "verification-state")
                     ]
-                    recovery = recovery_maintenance.prepare(
-                        worker_state_root().resolve(),
-                        seconds=30,
-                        entries=262144,
-                        bytes=1024**3,
-                        removal_bytes=32 * 1024**3,
-                    )
+                    recovery = recovery_maintenance.prepare(worker_state_root().resolve(), **COLLECTOR_SLICE)
                     trash = recovery_maintenance.collect_discarded(worker_state_root().resolve())
                     verification = verification_storage.housekeep(
                         states,
@@ -774,7 +983,7 @@ def drain_pending(reports, *, once=False):
                     report["free_bytes"] = shutil.disk_usage(worker_state_root()).free
                 except Exception as error:
                     note(report, "errors", f"{path}: {error}")
-            if once:
+            if once or (deadline is not None and time.monotonic() >= deadline):
                 break
             requested = read_json(root() / "cleanup-request.json").get("at", 0)
             if requested > requested_at and (again or not extra_requested):
@@ -790,16 +999,25 @@ def drain_pending(reports, *, once=False):
             os.environ["TAUCETI_LEGACY_DATA_ROOT"] = previous
 
 
-def run(*, dry=False, diagnostics_only=False):
+def root_lock(state_root, *, dry=False):
+    """cleanup.lock is per activity directory. Installations sharing a data root through different
+    activity directories must still never collect it concurrently, so each collected worker-state
+    root carries its own lock too; run_all() takes them in sorted order, so none can deadlock."""
+    return locked(Path(state_root).resolve() / ".cleanup.lock", dry=dry)
+
+
+def run(*, dry=False, diagnostics_only=False, deadline=None):
     from .activity import pin_root, root
 
     pin_root()
-    with locked(root() / "cleanup.lock", dry=dry):
+    with locked(root() / "cleanup.lock", dry=dry), root_lock(worker_state_root(), dry=dry):
         before = free_bytes(worker_state_root())
         report = sweep(dry=dry, diagnostics_only=diagnostics_only)
+        if not diagnostics_only:
+            retire_roots(report, dry=dry, deadline=deadline)
         report["free_before_bytes"] = before
         if not dry and not diagnostics_only:
-            drain_pending([(legacy_data_root(HERE), report)])
+            drain_pending([(legacy_data_root(HERE), report)], deadline=deadline)
             report["pending_work"] = pending_work(worker_state_root())
             report["free_bytes"] = free_bytes(worker_state_root())
             atomic_json(root() / "cleanup.json", report)
@@ -820,27 +1038,10 @@ def install_timer():
     def quote(value):
         return _systemd_quote(str(value))
 
+    legacy_data_root()  # resolves and exports this installation's data root for the unit
     environment = self_env()
     extra = "".join(
-        "Environment=" + quote(key + "=" + value) + "\n"
-        for key, value in environment.items()
-        if key
-        in {
-            "PYTHONPATH",
-            "TAUCETI_PROJECT_STATE",
-            "TAUCETI_LEGACY_DATA_ROOT",
-            "TAUCETI_REPO",
-            "TAUCETI_ACTIVITY_DIR",
-            "TAUCETI_SHARED_MATHLIB_ROOT",
-            "TAUCETI_REVIEW_MATHLIB_CACHE",
-            "TAUCETI_SHARED_REPOSITORIES_DIR",
-            "TAUCETI_GITHUB_SHARED_DIR",
-            "TAUCETI_WORKERS_STATE_DIR",
-            "XDG_STATE_HOME",
-            "PATH",
-            "TAUCETI_BUILD_CACHE_ROOT",
-            "TAUCETI_CACHE_MAX_GIB",
-        }
+        "Environment=" + quote(key + "=" + value) + "\n" for key, value in environment.items() if key in COLLECTOR_ENV
     )
     (directory / "tauceti-cleanup.service").write_text(
         "[Unit]\nDescription=Reclaim retired TauCeti worker data\n[Service]\nType=oneshot\nNice=10\n"
@@ -864,7 +1065,8 @@ def install_timer():
             raise Die(f"cleanup timer installation failed: {detail or error}") from None
     from .activity import root
 
-    atomic_json(root() / "cleanup-service.json", dict(installed=True))
+    # Record which installation the unit collects for; others keep their fallback.
+    atomic_json(root() / "cleanup-service.json", dict(installed=True, root=_covered_root()))
 
 
 def data_roots():
@@ -892,20 +1094,493 @@ def data_roots():
     return [selected, *sorted(roots - {selected})]
 
 
-def run_all(*, dry=False):
+RETIRED_PARTS = ("state", "checkouts", "logs")
+RETIRED_TRASH = ".tauceti-retired-"
+# Processes that refuse inspection yet cannot use worker data. Anything else that refuses blocks
+# retirement and purge: unreadable never means unused.
+_SESSION_HELPERS = frozenset({"(sd-pam)", "sd-pam", "sshd-session", "systemd"})
+_SYSTEM_AGENTS = ("/usr/libexec/", "/System/", "/usr/bin/login")
+
+
+_PYTHON_VALUE_OPTIONS = frozenset({"-W", "-X", "-Q", "--check-hash-based-pycs"})
+
+
+def invocation(argv):
+    """What a command line runs: (argv[0], the Python module or script it runs, or None).
+
+    Interpreter options are skipped, so `python3 -u -m tauceti_worker` and `python3 -I script`
+    identify the module or script; arguments after it are data, not the code being executed."""
+    if not argv:
+        return None, None
+    program = argv[0]
+    if not os.path.basename(program).startswith("python"):
+        return program, None
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "-m":
+            return program, ("-m", argv[index + 1]) if index + 1 < len(argv) else None
+        if argument.startswith("-m") and len(argument) > 2:
+            return program, ("-m", argument[2:])
+        if argument in ("-c", "-"):
+            return program, None
+        if argument in _PYTHON_VALUE_OPTIONS:
+            index += 2
+            continue
+        if argument.startswith("-"):
+            index += 1
+            continue
+        return program, ("script", argument)
+    return program, None
+
+
+def _same_file(first, second):
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
+def retired_roots():
+    """Candidate roots no configuration of this process selects: this installed package's own
+    directory (the pre-user_data_root location) and, on Fleet hosts, other runtimes' roots.
+    retire_roots() still requires positive evidence that nothing else selects or uses them."""
+    from .paths import INSTALLED
+
+    selected = legacy_data_root().resolve()
+    candidates = set(data_roots()[1:]) if legacy_project() else set()
+    if INSTALLED:
+        candidates.add(HERE.resolve())
+    return sorted(
+        root
+        for root in candidates
+        if not _same_file(root, selected)
+        and not selected.is_relative_to(root)
+        and not root.is_relative_to(selected)
+        and (
+            any((root / part).is_dir() and not (root / part).is_symlink() for part in RETIRED_PARTS)
+            or any(root.glob(RETIRED_TRASH + "*"))
+        )
+    )
+
+
+def _linux_process(process, uid):
+    """(paths, selected root, commands) of one /proc entry; None to skip it; raises if unknown."""
+    try:
+        if process.stat().st_uid != uid:
+            return None
+    except FileNotFoundError:
+        return None
+
+    def gone():
+        # An exiting process drops its working directory and executable links before it shows
+        # as a zombie; look again after a moment before calling it unreadable.
+        for attempt in range(3):
+            try:
+                state = (process / "stat").read_text().rsplit(")", 1)[1].split()[0]
+            except (OSError, IndexError):
+                return True
+            if state in ("Z", "X"):
+                return True  # a zombie has no files, working directory or future
+            if attempt < 2:
+                time.sleep(0.05)
+        return False
+
+    paths, commands, selects, denied = [], [], None, False
+    readers = (
+        ("cwd", lambda: paths.append(os.readlink(process / "cwd"))),
+        ("exe", lambda: commands.append(os.readlink(process / "exe"))),
+        (
+            "cmdline",
+            lambda: commands.extend(
+                part.decode(errors="replace") for part in (process / "cmdline").read_bytes().split(b"\0") if part
+            ),
+        ),
+    )
+    for _name, read in readers:
+        try:
+            read()
+        except FileNotFoundError:
+            if gone():
+                return None
+            denied = True
+        except OSError:
+            denied = True
+    try:
+        for fd in (process / "fd").iterdir():
+            # A descriptor can close between listing and reading it, including the one this listing
+            # itself uses; that never means the whole process is gone.
+            with contextlib.suppress(FileNotFoundError):
+                paths.append(os.readlink(fd))
+    except FileNotFoundError:
+        if gone():
+            return None
+        denied = True
+    except OSError:
+        denied = True
+    try:
+        for value in (process / "environ").read_bytes().split(b"\0"):
+            if value.startswith(b"TAUCETI_LEGACY_DATA_ROOT="):
+                selects = value.split(b"=", 1)[1].decode(errors="replace")
+    except FileNotFoundError:
+        if gone():
+            return None
+        denied = True
+    except OSError:
+        denied = True
+    if denied:
+        try:
+            helper = (process / "comm").read_text().strip() in _SESSION_HELPERS
+        except OSError:
+            helper = False
+        if not (helper and not paths):
+            raise PermissionError(f"cannot inspect {process}")
+        return None
+    return paths, selects, commands, int(process.name)
+
+
+def _processes():
+    """This user's processes as (paths, selected root, commands, pid), or None if any is unknown.
+
+    Paths are working directories and open files; commands are the executable and the full
+    command line. A process that exits mid-scan, or a zombie, is skipped. One that refuses
+    inspection makes the observation unavailable, unless it is a known session helper or
+    operating-system agent that cannot use worker data."""
+    uid = os.getuid()
+    observed = []
+    if Path("/proc/self/fd").is_dir():
+        try:
+            for process in Path("/proc").glob("[0-9]*"):
+                if (entry := _linux_process(process, uid)) is not None:
+                    observed.append(entry)
+        except OSError:
+            return None
+        return observed
+    if sys.platform != "darwin":
+        return None
+    try:
+        import psutil
+    except ImportError:
+        return None
+    for process in psutil.process_iter():
+        try:
+            entry = _mac_process(psutil, process, uid)
+        except (psutil.Error, OSError):
+            return None
+        if entry is not None:
+            observed.append(entry)
+    return observed
+
+
+def _mac_process(psutil, process, uid):
+    """(paths, selected root, commands) of one process; None to skip it; raises if unknown."""
+    try:
+        if process.uids().real != uid:
+            return None
+    except psutil.NoSuchProcess:
+        return None
+    paths, commands, selects, denied = [], [], None, False
+
+    def files():
+        paths.extend(item.path for item in process.open_files())
+
+    def directory():
+        paths.append(process.cwd())
+
+    def command():
+        commands.extend([process.exe(), *process.cmdline()])
+
+    def environment():
+        nonlocal selects
+        selects = process.environ().get("TAUCETI_LEGACY_DATA_ROOT")
+
+    for read in (files, directory, command, environment):
+        try:
+            read()
+        except psutil.NoSuchProcess:
+            return None
+        except psutil.AccessDenied:
+            denied = True
+    if denied:
+        try:
+            agent = process.exe().startswith(_SYSTEM_AGENTS)
+        except psutil.NoSuchProcess:
+            return None
+        except (psutil.Error, OSError):
+            agent = False
+        if agent and not paths:
+            return None
+        raise PermissionError(f"cannot inspect process {process.pid}")
+    return paths, selects, [c for c in commands if c], process.pid
+
+
+def _configured_texts():
+    """Text of everything that can select a data root without a process running right now:
+    systemd user units and drop-ins with their EnvironmentFile=s, LaunchAgents, and the worker
+    configuration files, including any `--config` a unit names. None if any of it exists but
+    cannot be read, or names a file through a systemd specifier other than %h or %%."""
+    import shlex
+
+    from .paths import login_home
+    from .worker_manager import default_workers_config
+
+    home = login_home()
+    directories = [home / ".config/systemd/user", home / "Library/LaunchAgents"]
+    if xdg := os.environ.get("XDG_CONFIG_HOME"):
+        directories.append(Path(xdg) / "systemd/user")
+    files = []
+    for directory in directories:
+        for base, _dirs, names in os.walk(directory):
+            files += [Path(base) / n for n in names if n.endswith((".service", ".timer", ".conf", ".plist"))]
+    with contextlib.suppress(Exception):
+        files.append(default_workers_config())
+    if configured := os.environ.get("TAUCETI_WORKERS_CONFIG"):
+        files.append(Path(configured).expanduser())
+
+    def unescape(token):
+        """systemd C-style escapes, as _systemd_unit's json.dumps() writes non-ASCII paths."""
+
+        def decode(match):
+            code = match[1]
+            if code[0] in "uUx":
+                return chr(int(code[1:], 16))
+            return {"n": "\n", "t": "\t", "\\": "\\", '"': '"', "'": "'"}[code]
+
+        decoded = re.sub(r"\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|x[0-9a-fA-F]{2}|[nt\\\"'])", decode, token)
+        if "\\" in decoded:
+            raise ValueError(token)  # an escape we cannot interpret: unknown, never absent
+        return decoded
+
+    def split(value):
+        # Keep backslashes for unescape(): posix shlex would drop them outside quotes.
+        lexer = shlex.shlex(value.replace("\\", "\0"), posix=True)
+        lexer.whitespace_split = True
+        lexer.escape = ""
+        return [unescape(token.replace("\0", "\\")) for token in lexer]
+
+    def referenced(value):
+        value = value.replace("%h", str(home)).replace("%%", "\0")
+        if "%" in value:
+            raise ValueError(value)  # a specifier we cannot resolve: unknown, never absent
+        return Path(value.replace("\0", "%")).expanduser()
+
+    def configs(arguments):
+        for index, argument in enumerate(arguments):
+            if argument == "--config" and index + 1 < len(arguments):
+                yield arguments[index + 1]
+            elif argument.startswith("--config="):
+                yield argument.split("=", 1)[1]
+
+    texts, seen = [], set()
+    while files:
+        path = files.pop()
+        if path in seen or not (path.exists() or path.is_symlink()):
+            continue
+        seen.add(path)
+        try:
+            raw = path.read_bytes()
+            text = raw.decode()
+        except (OSError, UnicodeDecodeError):
+            return None
+        texts.append(text)
+        try:
+            if path.suffix == ".plist":
+                import plistlib
+
+                agent = plistlib.loads(raw)
+                files += [
+                    Path(value).expanduser() for value in configs([str(a) for a in agent.get("ProgramArguments", [])])
+                ]
+                texts.append(" ".join(f"{k}={v}" for k, v in (agent.get("EnvironmentVariables") or {}).items()))
+                continue
+            for line in text.splitlines():
+                key, _, value = line.strip().partition("=")
+                if key == "EnvironmentFile":
+                    files += [referenced(token.removeprefix("-")) for token in split(value)]
+                elif key in ("ExecStart", "ExecStartPre", "ExecStartPost"):
+                    files += [referenced(token) for token in configs(split(value.lstrip("@-:+!")))]
+        except (ValueError, TypeError, AttributeError):
+            return None
+    return texts
+
+
+def _venv(root):
+    return next((parent for parent in root.parents if (parent / "pyvenv.cfg").is_file()), None)
+
+
+def _retirement_blocker(root, processes, mounts, configured):
+    """Why ``root`` must be kept for now, or None when it is provably retired."""
+    if processes is None:
+        return "process observation unavailable"
+    if mounts is None:
+        return "mount observation unavailable"
+    if configured is None:
+        return "service or worker configuration unreadable"
+    target = canonical_candidate(root)
+    if any(point == target or point.is_relative_to(target) for point in mounts):
+        return "contains a mount"
+    if any(str(root) in text for text in configured):
+        return "selected by a service or worker configuration"
+    parts = [os.path.join(str(root), part) for part in RETIRED_PARTS]
+    runtime = _venv(root) if root != HERE.resolve() else None
+    for paths, selects, commands, _pid in processes:
+        if selects and (_same_file(selects, root) or Path(selects).resolve() == root):
+            return "selected by a running process"
+        if any(path == part or path.startswith(part + os.sep) for path in paths for part in parts):
+            return "in use by a running process"
+        # The executable, argv[0] and a Python script identify what runs; other arguments are
+        # data (a file an editor has open there is covered by the open-file check above).
+        program, code = invocation(commands[1:])
+        running = [commands[0] if commands else "", program or ""]
+        if code and code[0] == "script":
+            running.append(code[1])
+        if runtime and any(command.startswith(str(runtime) + os.sep) for command in running):
+            return "its runtime is running"
+    return None
+
+
+@contextlib.contextmanager
+def _idle_root(root):
+    """Hold every worker slot and round lock of a root, or yield False if any is in use.
+
+    Older runtimes keep these flocks for the life of a worker or round, so holding them all
+    while the root is renamed away excludes every process that could still be writing there."""
+    held = []
+    try:
+        for lock in sorted([*root.glob("state/*/instance.lock"), *root.glob("state/*/round.lock")]):
+            if lock.is_symlink():
+                yield False
+                return
+            fd = os.open(lock, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            held.append(fd)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+        yield True
+    finally:
+        for fd in held:
+            os.close(fd)
+
+
+def _drain(path, deadline=None):
+    """Delete a staged tree bottom-up, stopping at ``deadline``; True once it is gone.
+
+    Lake and Git leave read-only directories, which regain owner write permission first."""
+
+    def writable(directory):
+        with contextlib.suppress(OSError):
+            os.chmod(directory, os.stat(directory, follow_symlinks=False).st_mode | 0o700)
+
+    def unreadable(error):
+        if error.filename:
+            writable(error.filename)
+
+    def expired():
+        return deadline is not None and time.monotonic() >= deadline
+
+    if expired():
+        return False
+    for base, dirs, files in os.walk(path, topdown=False, onerror=unreadable):
+        if expired():
+            return False
+        for name in [*files, *(d for d in dirs if os.path.islink(os.path.join(base, d)))]:
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            target = os.path.join(base, name)
+            try:
+                os.unlink(target)
+            except PermissionError:
+                writable(base)
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(target)
+            except FileNotFoundError:
+                pass
+        for name in dirs:
+            if expired():
+                return False
+            directory = os.path.join(base, name)
+            if not os.path.islink(directory):
+                with contextlib.suppress(OSError):
+                    os.rmdir(directory)
+    if expired():
+        return False
+    try:
+        os.rmdir(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False  # an unreadable corner; the next run retries it
+    return True
+
+
+def retire_roots(report, *, dry=False, deadline=None):
+    """Delete worker data left by earlier installations and runtimes, once nothing uses it.
+
+    Nothing migrates such data, so it is deleted outright: checkouts, caches, logs and
+    unpublished recovery records alike. A root is staged (renamed aside, which is instant) only
+    while every worker and round lock in it is held and no process, service unit or mount refers
+    to it; its contents are then deleted in deadline-bounded passes that resume on later runs.
+    An older runtime's worker starting a new worker id at the instant of staging is not fenced:
+    such code predates this protocol."""
+    roots = retired_roots()
+    if not roots:
+        return
+    processes, mounts, configured = _processes(), mount_points(), _configured_texts()
+    for root in roots:
+        try:
+            if any((root / part).is_dir() for part in RETIRED_PARTS):
+                if reason := _retirement_blocker(root, processes, mounts, configured):
+                    note(report, "protected", f"{root}: {reason}")
+                    continue
+                if dry:
+                    for part in RETIRED_PARTS:
+                        if (root / part).is_dir():
+                            note(report, "removed", str(root / part))
+                    continue
+                with _idle_root(root) as idle:
+                    if not idle:
+                        note(report, "protected", f"{root}: a worker or round holds its lock")
+                        continue
+                    for part in RETIRED_PARTS:
+                        path = root / part
+                        if path.is_dir() and not path.is_symlink():
+                            path.rename(root / f"{RETIRED_TRASH}{part}-{os.getpid()}-{time.time_ns()}")
+            if dry:
+                continue
+            for trash in sorted(root.glob(RETIRED_TRASH + "*")):
+                if trash.is_symlink() or not trash.is_dir():
+                    continue
+                target = canonical_candidate(trash)
+                if mounts is None or any(point == target or point.is_relative_to(target) for point in mounts):
+                    note(report, "protected", f"{trash}: contains a mount")
+                    continue
+                if _drain(trash, deadline):
+                    note(report, "removed", str(trash))
+                else:
+                    note(report, "protected", f"{trash}: deletion continues next run")
+        except OSError as error:
+            note(report, "errors", f"{root}: {error}")
+
+
+def run_all(*, dry=False, deadline=None):
     """One collector covers current and retired roots, with fair deletion slices."""
     from .activity import pin_root, root
 
     if not legacy_project():
-        return run(dry=dry)
+        return run(dry=dry, deadline=deadline)
     pin_root()
     previous = os.environ.get("TAUCETI_LEGACY_DATA_ROOT")
     report = fresh_report()
     report["roots"] = []
     report["free_before_bytes"] = free_bytes(worker_state_root())
-    with locked(root() / "cleanup.lock", dry=dry):
+    with locked(root() / "cleanup.lock", dry=dry), contextlib.ExitStack() as roots:
         try:
+            retire_roots(report, dry=dry, deadline=deadline)
             paths = data_roots()
+            for path in sorted(paths):
+                roots.enter_context(root_lock(path / "state", dry=dry))
             configs = []
             for path in paths:
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
@@ -913,7 +1588,7 @@ def run_all(*, dry=False):
             initial = {path: dict(free_before_bytes=free_bytes(path)) for path in paths}
             if not dry:
                 # Exact queued disposal must not wait behind shared-cache inventory.
-                drain_pending(list(initial.items()), once=True)
+                drain_pending(list(initial.items()), once=True, deadline=deadline)
             for index, path in enumerate(paths):
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
                 try:
@@ -926,7 +1601,7 @@ def run_all(*, dry=False):
                     result["drain"] = initial[path]["drain"]
                 report["roots"].append(dict(path=str(path), **result))
             if not dry:
-                drain_pending([(Path(result["path"]), result) for result in report["roots"]])
+                drain_pending([(Path(result["path"]), result) for result in report["roots"]], deadline=deadline)
             for result in report["roots"]:
                 base = Path(result["path"]) / "state"
                 try:
@@ -950,9 +1625,13 @@ def cmd_cleanup(args):
     if args.install_timer:
         install_timer()
         return 0
+    seconds = getattr(args, "max_seconds", None)
+    deadline = time.monotonic() + seconds if seconds else None
     try:
-        report = (run_all if args.all_data_roots else run)(dry=args.dry_run)
+        report = (run_all if args.all_data_roots else run)(dry=args.dry_run, deadline=deadline)
     except BlockingIOError:
         raise Die("cleanup is already running") from None
+    if not args.dry_run:
+        report_fallback(getattr(args, "fallback_marker", None), report)
     print(json.dumps(report, indent=2))
     return int(bool(report["errors"]))
