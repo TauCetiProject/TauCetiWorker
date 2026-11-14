@@ -292,6 +292,33 @@ class Cache(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual({r["hits"] for r in reports.values()}, {5 * len(keys)})
 
+    def test_hydrating_a_published_entry_never_waits_for_another_hydration(self):
+        import fcntl
+        import time
+
+        keys = [f"{n:016x}" for n in range(0, 2000, 13)][:64]
+        download = self.root / "download"
+        self.warm_entries(keys, download)
+        # Another round is hydrating the same entries: it holds their shard locks SHARED.
+        paths = sorted({cache.lock_path(self.pool, key) for key in keys})
+        paths[0].parent.mkdir(parents=True, exist_ok=True)
+        held = [path.open("a+") for path in paths]
+        for stream in held:
+            fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        try:
+            report = dict(hits=0, expanded=0)
+            started = time.monotonic()
+            cache.expand(download, self.root / "reader", self.root, {}, self.pool, report, deadline=started + 3)
+            self.assertEqual(report["hits"], len(keys))
+            self.assertLess(time.monotonic() - started, 2)
+            # A publisher or collector still needs the exclusive lock, which readers exclude.
+            with self.assertRaises(BlockingIOError):
+                with cache.locked_all(self.pool, keys[:1], deadline=time.monotonic()):
+                    pass
+        finally:
+            for stream in held:
+                stream.close()
+
     def test_refetch_failure_after_corrupt_archive_fails_preparation(self):
         from tauceti_worker.config import NoProgress
 

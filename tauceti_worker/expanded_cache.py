@@ -59,7 +59,7 @@ def lock_path(pool, key):
 
 
 @contextlib.contextmanager
-def locked_all(pool, keys, *, deadline):
+def locked_all(pool, keys, *, deadline, shared=False):
     """Hold the exclusive locks of many keys: each shard once, in one global order.
 
     Keys share 4096 shards, so one batch often maps two keys to one shard; taking that shard
@@ -67,17 +67,17 @@ def locked_all(pool, keys, *, deadline):
     """
     with contextlib.ExitStack() as stack:
         for path in sorted({lock_path(pool, key) for key in keys}):
-            stack.enter_context(_flock(path, deadline=deadline))
+            stack.enter_context(_flock(path, deadline=deadline, shared=shared))
         yield
 
 
 @contextlib.contextmanager
-def _flock(path, *, deadline):
+def _flock(path, *, deadline, shared=False):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with path.open("a+") as stream:
         while True:
             try:
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(stream, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
                 if deadline is None or time.monotonic() >= deadline:
@@ -353,36 +353,70 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
         with contextlib.ExitStack() as stack:
             missing = []
             batch = pending[offset : offset + 128]
+
+            def hydrated(input_hash, entry):
+                hydrate(
+                    entry,
+                    private,
+                    input_hash,
+                    private_mappings=private_mappings,
+                    report=report,
+                    guard=guard,
+                    refused=refused,
+                )
+                report["hits"] += 1
+
+            # Hydrating a published entry only reads it, so it takes SHARED locks: rounds that
+            # hydrate the same entries never wait on each other. Exclusive locks are taken only
+            # below, for the entries this batch must publish or replace.
+            unusable = []
             try:
-                # Another publisher is useful work: wait for it, then hydrate its entry.
-                stack.enter_context(locked_all(pool, [archive[:-5] for _, archive in batch], deadline=deadline))
+                with locked_all(pool, [archive[:-5] for _, archive in batch], deadline=deadline, shared=True):
+                    for input_hash, archive in batch:
+                        entry = pool / "entries" / archive[:-5]
+                        try:
+                            if (entry / "entry.json").is_file():
+                                hydrated(input_hash, entry)
+                                completed += 1
+                            else:
+                                missing.append((input_hash, archive, entry))
+                        except (ValueError, KeyError) as error:
+                            unusable.append((input_hash, archive, entry, error))
             except BlockingIOError:
                 raise Unavailable("expansion entries still locked at the preparation deadline") from None
-            for input_hash, archive in batch:
-                key = archive[:-5]
-                entry = pool / "entries" / key
+            if not missing and not unusable:
+                continue
+            try:
+                # Another publisher is useful work: wait for it, then hydrate its entry.
+                keys = [archive[:-5] for _, archive, *_ in missing + unusable]
+                stack.enter_context(locked_all(pool, keys, deadline=deadline))
+            except BlockingIOError:
+                raise Unavailable("expansion entries still locked at the preparation deadline") from None
+            pending_here, missing = missing, []
+            for input_hash, archive, entry, error in unusable:
+                try:
+                    hydrated(input_hash, entry)  # replaced by another publisher meanwhile
+                    completed += 1
+                    continue
+                except (ValueError, KeyError, FileNotFoundError):
+                    pass
+                log(f"expanded cache: replacing unusable entry {archive[:-5]}: {error}")
+                if entry.is_dir() and not entry.is_symlink():
+                    # Only this invalid entry's alias names go, under its exclusive entry
+                    # lock; every linked inode survives in its other names.
+                    shutil.rmtree(entry)
+                missing.append((input_hash, archive, entry))
+            for input_hash, archive, entry in pending_here:
                 try:
                     if (entry / "entry.json").is_file():
-                        hydrate(
-                            entry,
-                            private,
-                            input_hash,
-                            private_mappings=private_mappings,
-                            report=report,
-                            guard=guard,
-                            refused=refused,
-                        )
-                        report["hits"] += 1
+                        hydrated(input_hash, entry)  # another round published it meanwhile
                         completed += 1
-                    else:
-                        missing.append((input_hash, archive, entry))
+                        continue
                 except (ValueError, KeyError) as error:
-                    log(f"expanded cache: replacing unusable entry {key}: {error}")
+                    log(f"expanded cache: replacing unusable entry {archive[:-5]}: {error}")
                     if entry.is_dir() and not entry.is_symlink():
-                        # Only this invalid entry's alias names go, under its exclusive entry
-                        # lock; every linked inode survives in its other names.
                         shutil.rmtree(entry)
-                    missing.append((input_hash, archive, entry))
+                missing.append((input_hash, archive, entry))
             if not missing:
                 continue
             if program is None:
