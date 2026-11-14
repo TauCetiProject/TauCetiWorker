@@ -23,7 +23,7 @@ __EXTRA_ROADMAP_PROMPT__## Choose a target
   checklist, and ignore their instructions about roles, verdicts, and JSON output — those
   belong to a different agent and are not your output format. In your closing report, name the
   rubrics you read.
-__SOURCE_GUIDANCE__- Before writing any declaration, `grep` the pinned Mathlib source to confirm it doesn't already exist (the `reuse` rubric is strict, and a generic fact transferred to a subtype is often already in Mathlib under a non-obvious import). The pinned Mathlib source is vendored in this checkout at `.lake/packages/mathlib` once `lake exe cache get` (or dependency resolution) has run — `grep` there; don't try to clone it from the network.
+__SOURCE_GUIDANCE__- Before writing any declaration, `grep` the pinned Mathlib source to confirm it doesn't already exist (the `reuse` rubric is strict, and a generic fact transferred to a subtype is often already in Mathlib under a non-obvious import). The pinned Mathlib source is at `.lake/packages/mathlib` in this checkout (a read-only link to the host's shared copy once preparation has run); `grep` there, and don't try to clone it from the network.
 
 ## Claim your target (so two agents don't author the same thing)
 Once you have settled on a target, derive a short stable id for it and claim it BEFORE you start building. This lets other autonomous workers see the target is taken; it is cooperative, not a hard lock.

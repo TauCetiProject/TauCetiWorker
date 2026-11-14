@@ -121,13 +121,25 @@ def atomic_json(path, value):
         temporary.unlink(missing_ok=True)
 
 
-def link(source, target):
+class LinkDeferred(Unavailable):
+    """A payload's source may still be written: spreading it now could spread later writes."""
+
+
+def link(source, target, guard=None):
     """Hard-link, never copy: a copy would be a second private instance of shared bytes.
 
     A vanished source stays `FileNotFoundError` (a GC race the caller may treat as a miss).
+    It only creates a new name (an existing target is kept). Build-output payloads pass a
+    `canonical_store.Guard`, so a source open for writing, or changed since inspected, is never
+    spread (`LinkDeferred`); seeded downloads and revision maps (metadata) pass none.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
+        if guard is not None:
+            before = source.lstat()
+            if not guard.link(source, before, target, recent_ok=True):
+                raise LinkDeferred(f"{source} is in use or changed; not linking it into {target}")
+            return
         os.link(source, target)
     except (FileExistsError, FileNotFoundError) as error:
         if isinstance(error, FileNotFoundError):
@@ -193,7 +205,7 @@ def native(cwd, env, pool):
                     capture_output=True,
                     timeout=30,
                 )
-                os.replace(work / "hash", target)
+                os.replace(work / "hash", target)  # Our helper binary; no build output.
         except (OSError, subprocess.SubprocessError):
             atomic_json(failed, dict(until=time.time() + 3600))
             raise
@@ -278,7 +290,7 @@ def private_mapping(private, key, known):
     return known[key]
 
 
-def hydrate(entry, private, input_hash, *, private_mappings=None, report=None):
+def hydrate(entry, private, input_hash, *, private_mappings=None, report=None, guard=None):
     row = read_json(entry / "entry.json")
     names = list(dict.fromkeys(descriptions(row["data"])))
     try:
@@ -290,15 +302,21 @@ def hydrate(entry, private, input_hash, *, private_mappings=None, report=None):
     keys = input_hash if isinstance(input_hash, list) else [input_hash]
     known = {} if private_mappings is None else private_mappings
     changed = [key for key in keys if private_mapping(private, key, known) != desired]
-    from .canonical_store import reconcile
+    from .canonical_store import Guard, fingerprint, reconcile, rejected
 
+    guard = Guard() if guard is None else guard
+    refused = rejected(entry.parent.parent)
+    if refused and any(fingerprint((entry / name).lstat()) in refused for name in names):
+        # Relinking proved these bytes wrong: re-expand the entry from its verified archive.
+        raise ValueError("entry holds bytes relinking rejected")
     for name in names:
         # A local publication may have made this name canonical first: keep one inode.
-        reconcile(entry.parent.parent, name, entry / name)
+        reconcile(entry.parent.parent, name, entry / name, guard=guard)
     missing = [name for name in names if not (private / "artifacts" / name).is_file()]
     started = clock()
     for name in missing:
-        link(entry / name, private / "artifacts" / name)
+        # Deferred links stop here, before any mapping names these artifacts.
+        link(entry / name, private / "artifacts" / name, guard)
     for key in changed:
         atomic_json(private / "outputs/TauCeti" / (key + ".json"), desired)
         known[key] = desired
@@ -326,6 +344,9 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
     deadline = time.monotonic() + EXPANSION_TIMEOUT if deadline is None else deadline
     program = None
     completed = 0
+    from .canonical_store import Guard, reconcile
+
+    guard = Guard()  # One lazy /proc scan for every alias this expansion may replace.
     for offset in range(0, len(pending), 128):
         with contextlib.ExitStack() as stack:
             missing = []
@@ -340,7 +361,9 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
                 entry = pool / "entries" / key
                 try:
                     if (entry / "entry.json").is_file():
-                        hydrate(entry, private, input_hash, private_mappings=private_mappings, report=report)
+                        hydrate(
+                            entry, private, input_hash, private_mappings=private_mappings, report=report, guard=guard
+                        )
                         report["hits"] += 1
                         completed += 1
                     else:
@@ -348,6 +371,8 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
                 except (ValueError, KeyError) as error:
                     log(f"expanded cache: replacing unusable entry {key}: {error}")
                     if entry.is_dir() and not entry.is_symlink():
+                        # Only this invalid entry's alias names go, under its exclusive entry
+                        # lock; every linked inode survives in its other names.
                         shutil.rmtree(entry)
                     missing.append((input_hash, archive, entry))
             if not missing:
@@ -385,8 +410,6 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
                     capture_output=True,
                     timeout=60,
                 )
-                from .canonical_store import reconcile
-
                 files = [p for p in work.rglob("*") if p.is_file() and p.suffix not in (".trace", ".hash", ".json")]
                 computed = hashes(program, files, work)
                 for input_hash, archive, entry in missing:
@@ -410,30 +433,33 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
                         # Deduplicate identical outputs across archive bundles as well as workers.
                         shared = pool / ("archives" if name.endswith(".ltar") else "artifacts") / name
                         # An identical canonical object (a local build published first) wins.
-                        reconcile(pool, name, artifacts[name])
+                        reconcile(pool, name, artifacts[name], guard=guard)
                         # Create a publication link FIRST, so a newly published canonical
                         # artifact never appears to GC as an unreferenced single link.
-                        link(artifacts[name], publication / name)
-                        link(publication / name, shared)
-                        shared.chmod(0o444)
-                        reconcile(pool, name, shared)
+                        link(artifacts[name], publication / name, guard)
+                        link(publication / name, shared, guard)
+                        shared.chmod(0o444)  # Only ever removes write permission.
+                        reconcile(pool, name, shared, guard=guard)
                         if shared.stat().st_ino != (publication / name).stat().st_ino:
-                            (publication / name).unlink()
-                            link(shared, publication / name)
+                            (publication / name).unlink()  # Our staging name.
+                            link(shared, publication / name, guard)
                     atomic_json(publication / "entry.json", dict(data=data))
                     entry.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(publication, entry)
-                    hydrate(entry, private, input_hash, private_mappings=private_mappings, report=report)
+                    os.replace(publication, entry)  # A new entry name from our staging directory.
+                    hydrate(entry, private, input_hash, private_mappings=private_mappings, report=report, guard=guard)
                     report["expanded"] += 1
                     completed += 1
     if completed != len(pending):
         raise Unavailable(f"expanded {completed} of {len(pending)} selected archives")
 
 
-def transfer(download, private, seeded=(), *, manifest=None, private_mappings=None):
+def transfer(download, private, seeded=(), *, manifest=None, private_mappings=None, guard=None):
     """Preserve downloads on unsupported toolchains, without linking mutable metadata."""
     manifest = mappings(download) if manifest is None else manifest
     known = {} if private_mappings is None else private_mappings
+    from .canonical_store import Guard
+
+    guard = Guard() if guard is None else guard
     wanted = {name for _, name in entries(download, manifest)}
     for row in manifest.values():
         if isinstance(row.get("data"), dict):
@@ -447,7 +473,7 @@ def transfer(download, private, seeded=(), *, manifest=None, private_mappings=No
                 continue
             target = private / directory / source.relative_to(download / directory)
             if directory == "artifacts":
-                link(source, target)
+                link(source, target, guard)
                 continue
             if source.suffix != ".json":
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -560,7 +586,7 @@ def preparation(cwd, env, *, refetch=None, report=None):
                             link(path, pool / "revisions/TauCeti" / path.name)
                     revisions = sorted((pool / "revisions/TauCeti").glob("*.jsonl"), key=revision_mtime, reverse=True)
                     for old in revisions[64:]:
-                        old.unlink(missing_ok=True)
+                        old.unlink(missing_ok=True)  # Revision maps: metadata, not build outputs.
             if ready and env.get("LAKE_ARTIFACT_CACHE", "1").lower() not in ("0", "false", "off"):
                 try:
                     try:
@@ -579,8 +605,13 @@ def preparation(cwd, env, *, refetch=None, report=None):
                     except CorruptArchive as error:
                         # A stale local .ltar must not poison every future round. Detach
                         # the known-bad candidate and let the existing downloader repair it.
-                        (download / "artifacts" / error.name).unlink(missing_ok=True)
-                        (private / "artifacts" / error.name).unlink(missing_ok=True)
+                        (download / "artifacts" / error.name).unlink(missing_ok=True)  # Our download.
+                        from .canonical_store import Guard
+
+                        alias = private / "artifacts" / error.name
+                        with contextlib.suppress(FileNotFoundError):
+                            if not Guard().unlink(alias, alias.lstat(), recent_ok=True):
+                                raise Unavailable(f"corrupt archive {alias} is in use; not removing it") from error
                         if refetch is None:
                             raise
                         with measured(report, "refetch"):

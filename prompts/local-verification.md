@@ -13,7 +13,8 @@ axiom diagnostics, the module-system audit, source style and changed-module envi
 It calculates scope from local Git state, including your uncommitted and newly created files;
 do not fetch or query GitHub to calculate scope. Unknown scope is incomplete verification.
 
-Run `lake exe cache get` only if preparation has not already fetched Mathlib, or the pins changed.
+Preparation already provided Mathlib and its dependencies; do not run `lake exe cache get` or
+`lake update`. If the Mathlib pin changes under you, stop and report instead of fetching or building Mathlib.
 Do not run the old scope recipe, `scripts/lint-scope.sh`, `scripts/lint-env.sh` or `lake exe axioms`
 alongside the shared checks. Local axiom diagnostics check direct references in changed modules;
 full transitive axiom and global declaration-ownership audits remain in CI.

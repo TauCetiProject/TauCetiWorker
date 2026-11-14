@@ -1278,9 +1278,13 @@ class WorkerBackend:
                     # The supervisor is outside the agent's mount namespace. Run
                     # the existing verifier inside the same merged Mathlib view,
                     # rather than rehydrating another full private dependency build.
-                    env = dict(cache_env, TAUCETI_VERIFY_STATE=str(self.w.cfg.state), TAUCETI_VERIFY_POLICY=policy)
-                    if os.environ.get("LAKE_CONFIG"):
-                        env["LAKE_CONFIG"] = os.environ["LAKE_CONFIG"]
+                    # The same environment as the in-process verifier below, plus only the view's
+                    # own keys: cache preparation's defaults (LEAN_NUM_THREADS, cache settings) are
+                    # verification inputs, and prepare() fingerprints without them.
+                    view = {k: v for k, v in cache_env.items() if k.startswith("TAUCETI_SHARED_MATHLIB_")}
+                    env = dict(
+                        os.environ, **view, TAUCETI_VERIFY_STATE=str(self.w.cfg.state), TAUCETI_VERIFY_POLICY=policy
+                    )
                     if self.w.rc.deadline is not None:
                         env["TAUCETI_ROUND_DEADLINE"] = str(self.w.rc.deadline)
                     logpath = self.w.cfg.logdir / "recovery-verification.log"
@@ -1424,6 +1428,7 @@ class WorkerBackend:
         from .claude_api import api_context, api_mode
         from .config import AdmissionUnavailable
         from .fleet_capacity import admission_unit, unit_admitted
+        from .round_storage import RoundAbandoned
 
         auth, profile, keys = self.continuation_admission(record, m, j)
         scope = dict(repository=m["repository"], pr=m["pr"], source_round=m.get("source_round"))
@@ -1501,6 +1506,9 @@ class WorkerBackend:
                         raise Wait(
                             "worker-resource" if isinstance(error, ResourceUnavailable) else "queue-owned", str(error)
                         ) from error
+                    except RoundAbandoned as error:
+                        # Killed for private build bytes and discarded: never restored and rerun.
+                        raise Obsolete("private-bytes-cap", str(error), "Abandoned; not retried") from error
                     except BuildCacheUnavailable as error:
                         refund_content(known_no_launch=True)
                         raise RuntimeError(
