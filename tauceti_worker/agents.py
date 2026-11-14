@@ -1525,6 +1525,7 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
         env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
         from . import expanded_cache, shared_mathlib
 
+        materialize_dependencies(cwd, env, logdir)
         report = {}
         mathlib_started = expanded_cache.clock()
         try:
@@ -1548,6 +1549,35 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
             raise BuildCacheUnavailable(
                 f"shared Mathlib preparation unavailable: {error}", log_file=logdir / "shared-mathlib-prepare.log"
             ) from error
+
+
+def materialize_dependencies(cwd: Path, env: dict, logdir: Path, timeout: float = 900) -> None:
+    """Clone missing dependency sources before shared Mathlib is chosen.
+
+    `shared_mathlib.view()` can only share a Mathlib build once `.lake/packages/mathlib` exists. In
+    a fresh checkout it did not, so the round chose a private build and `lake cache get` then unpacked
+    a full private copy of Mathlib's outputs. Lake's ordinary workspace load clones the manifest's
+    package sources (tens of seconds, no builds, no cache downloads), which is what `cache get`
+    would have done anyway, only later. Failure is not fatal here: the view reports why it cannot
+    share."""
+    try:
+        packages = json.loads((cwd / "lake-manifest.json").read_text()).get("packages", [])
+    except (OSError, ValueError, AttributeError):
+        return
+    names = {p.get("name") for p in packages if isinstance(p, dict)}
+    if "mathlib" not in names or (cwd / ".lake/packages/mathlib").is_dir():
+        return
+    logdir.mkdir(parents=True, exist_ok=True)
+    with open(logdir / "materialize-dependencies.log", "ab") as output:
+        try:
+            result = subprocess.run(
+                ["lake", "env", "true"], cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, timeout=timeout
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            log(f"dependencies: could not materialize Mathlib before sharing ({error})")
+            return
+    if result.returncode:
+        log(f"dependencies: lake env exited {result.returncode}; shared Mathlib may be skipped")
 
 
 def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -> None:
