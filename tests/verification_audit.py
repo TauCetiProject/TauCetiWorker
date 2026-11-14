@@ -41,9 +41,14 @@ class Recovery(Receipts):
             patch.dict(os.environ, TAUCETI_VERIFY_STATE=str(self.state)),
             patch.object(jobs.os, "dup", return_value=1),
             patch.object(jobs.os, "dup2"),
-            patch.object(jobs.subprocess, "run", side_effect=AssertionError("verified without the view")),
+            patch.object(jobs.subprocess, "Popen", side_effect=AssertionError("verified without the view")),
+            patch.object(jobs.os, "execve", side_effect=AssertionError("verified without the view")),
         ):
-            self.assertEqual(jobs.continue_command(["true"]), 75)
+            candidate = self.state / "candidate-needing-view"
+            (candidate / ".lake").mkdir(parents=True)
+            (candidate / ".lake" / jobs.CONTINUATION).write_text(json.dumps(dict(shared_view=True)))
+            with patch.object(jobs.Path, "cwd", return_value=candidate):
+                self.assertEqual(jobs.continue_command(["true"]), 75)
         path = self.state / "verification-pending" / ("a" * 32 + ".json")
         path.parent.mkdir(parents=True, exist_ok=True)
         job = dict(id="a" * 32, status="running", next_at=0)
@@ -174,7 +179,14 @@ class Recovery(Receipts):
         with patch.object(hashlib, "file_digest", side_effect=measured):
             result = self.verify(stage="build")
         self.assertEqual(result["status"], "success", result.get("error"))
-        self.assertNotIn(dependency, hashed, "the original workspace still imports its legacy hashes")
+        # The candidate hard-links the dependency instead of copying it. A link changes the shared
+        # inode's ctime, so the original workspace hashes that file once more, and only once.
+        candidate = self.state / "verification-candidates" / pending.stem / ".lake/packages/mathlib/Extra.lean"
+        self.assertEqual(candidate.stat().st_ino, dependency.stat().st_ino)
+        hashed.clear()
+        with patch.object(hashlib, "file_digest", side_effect=measured):
+            self.assertEqual(self.verify(stage="build")["status"], "success")
+        self.assertNotIn(dependency, hashed, "the original workspace keeps its rehashed entries")
 
     def test_concurrent_cache_saves_merge_entries_and_root_migrations(self):
         first = v._HashCache(self.state, self.root)

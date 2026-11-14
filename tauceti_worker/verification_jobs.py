@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -42,7 +43,16 @@ LINKED = (
     ".lean",
 )
 # Overlay scratch and markers of an agent's shared Mathlib view; never part of a candidate.
+FORWARDED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+CONTINUATION = "tauceti-continuation.json"
+# Imports this package by path, so the verifier's environment (PYTHONPATH included) is unchanged.
+CONTINUE = (
+    "import sys; sys.path.insert(0, sys.argv[1]); "
+    "from tauceti_worker.verification_jobs import continue_command; "
+    "raise SystemExit(continue_command(sys.argv[2:]))"
+)
 SCRATCH = {
+    CONTINUATION,
     "__pycache__",
     "tauceti-scope",
     "tauceti-overlay-work",
@@ -50,7 +60,6 @@ SCRATCH = {
     "tauceti-shared-mathlib.json",
     "build-before-sharing",
     "build-shared-delta",
-    "build-shared-deltas",
 }
 
 
@@ -125,6 +134,8 @@ def _link_tree(lake, dest, budget, *, include_builds, immutable_packages, target
             path = here / name
             if (
                 name in SCRATCH
+                or name == "build-shared-deltas"
+                and here.name == ".lake"
                 or path in shared
                 or target.is_relative_to(path)
                 or not include_builds
@@ -207,6 +218,10 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
                 immutable_packages=immutable_packages,
                 target=target,
             )
+        if lake.exists() and _shared_builds(lake) and include_builds:
+            # The continuation must attach the host's shared Mathlib view to build here.
+            (target / ".lake").mkdir(exist_ok=True)
+            (target / ".lake" / CONTINUATION).write_text(json.dumps(dict(shared_view=True)))
         if immutable_packages is not None:
             (target / ".lake").mkdir(exist_ok=True)
             (target / ".lake/packages").symlink_to(immutable_packages, target_is_directory=True)
@@ -217,6 +232,27 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
         raise Incomplete(f"candidate preservation incomplete: {error} {detail}", reason="preservation") from error
     except OSError as error:
         raise Incomplete(f"candidate preservation incomplete: {error}", reason="preservation") from error
+
+
+def _job_fds(env):
+    return (int(env["TAUCETI_VERIFY_JOB_FD"]),) if env.get("TAUCETI_VERIFY_JOB_FD") else ()
+
+
+def _rebaseline(verification):
+    """Accept our own links: a hard link changes only the source inode's ctime and link count.
+
+    Any change to content, size, mtime, inode or mode still fails the final watch.
+    """
+    from .verification import stamps
+
+    before = getattr(verification, "static_stamps", None)
+    if not before:
+        return
+    now = stamps(before)
+    for path, old in before.items():
+        new = now.get(path)
+        if old and new and [*old[:4], *old[5:7]] == [*new[:4], *new[5:7]]:
+            before[path] = new
 
 
 def continue_command(argv):
@@ -231,22 +267,49 @@ def continue_command(argv):
 
     root = Path.cwd()
     env = dict(os.environ)
+    if not read_json(root / ".lake" / CONTINUATION).get("shared_view"):
+        # The candidate holds everything it builds against: become the verifier, unchanged.
+        os.execve(argv[0], argv, env)
     logdir = Path(env["TAUCETI_VERIFY_STATE"]) / "verification-cache-prepare"
     logdir.mkdir(parents=True, exist_ok=True)
-    keep = [int(env["TAUCETI_VERIFY_JOB_FD"])] if env.get("TAUCETI_VERIFY_JOB_FD") else []
+    keep = _job_fds(env)
     # Only the verifier's JSON receipt may reach stdout; preparation chatter goes to stderr.
     receipt = os.dup(1)
     os.dup2(2, 1)
     try:
         with host_build_cache_context(root, env, logdir) as prefix:
-            result = subprocess.run(
-                [*(prefix or []), *argv], env=env, stdout=receipt, pass_fds=(*keep, *lease_fds(env))
-            )
+            # The supervisor stops a continuation by signalling this wrapper: pass it on, so
+            # the verifier and its tools stop with it instead of outliving their owner.
+            pending, children = [], []
+
+            def relay(number, _frame):
+                pending.append(number)
+                for child in children:
+                    child.send_signal(number)
+
+            forward = {sig: signal.signal(sig, relay) for sig in FORWARDED}
+            try:
+                children.append(
+                    subprocess.Popen(
+                        [*(prefix or []), *argv], env=env, stdout=receipt, pass_fds=(*keep, *lease_fds(env))
+                    )
+                )
+                for number in pending:
+                    children[0].send_signal(number)
+                returncode = children[0].wait()
+            finally:
+                for sig, previous in forward.items():
+                    signal.signal(sig, previous)
+            if returncode < 0 or pending:
+                # Die the way the verifier did, so the supervisor sees a stopped continuation.
+                number = -returncode if returncode < 0 else pending[0]
+                signal.signal(number, signal.SIG_DFL)
+                os.kill(os.getpid(), number)
             relink_build_outputs(root, env, phase="verify")
     except BuildCacheUnavailable as error:
         print(f"verification continuation: shared build view unavailable: {error}", file=sys.stderr)
         return 75
-    return result.returncode
+    return returncode
 
 
 def prepare_job(verification, inputs):
@@ -337,6 +400,7 @@ def preserve_candidate(verification, *, disposable_only=False):
         inventory(verification.root, verification.base),
         immutable_packages=immutable_packages,
     )
+    _rebaseline(verification)
     if digest(inventory(verification.root, verification.base)) != job["source_digest"]:
         raise ValueError("candidate changed while preserving verification job")
     if digest(inventory(target, verification.base)) != job["source_digest"]:
@@ -632,11 +696,11 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                         # The candidate has no Mathlib build of its own: the wrapper attaches
                         # the host's shared view, then runs the installed helper inside it.
                         package = str(Path(__file__).resolve().parent.parent)
-                        env["PYTHONPATH"] = package + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
                         argv = [
                             sys.executable,
-                            "-m",
-                            "tauceti_worker.verification_jobs",
+                            "-c",
+                            CONTINUE,
+                            package,
                             sys.executable,
                             str(HERE / "scripts/tauceti-verify"),
                             "--base",
@@ -722,7 +786,3 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                         report_runtime("verification-incomplete", detail=str(error), verification_job=job["id"])
                     return True
     return False
-
-
-if __name__ == "__main__":
-    raise SystemExit(continue_command(sys.argv[1:]))
