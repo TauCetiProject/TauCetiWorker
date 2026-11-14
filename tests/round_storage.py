@@ -175,7 +175,8 @@ def policy_tests():
 
 def publish_entry(key):
     pool = shared_mathlib.root()
-    entry = pool / "entries" / key
+    # Published where shared_mathlib publishes: the current layout's entries directory.
+    entry = shared_mathlib.layout(pool) / "entries" / key
     write(entry / "build/lib/lean/Mathlib.olean", 4096)
     (entry / "ready.json").write_text(json.dumps(dict(key=key, inventory=shared_mathlib.inventory(entry / "build"))))
     return pool, entry
@@ -186,6 +187,10 @@ def view_tests():
     pool, entry = publish_entry("k1")
     env = {"TAUCETI_SHARED_MATHLIB_KEY": "k1", "TAUCETI_SHARED_MATHLIB_ROOT": str(pool)}
     assert round_storage.validate_shared_views(env, enforce=True) == dict(shared_mathlib="matches ready.json")
+    # A healthy entry must not be judged by a legacy pool/entries directory that no longer holds it.
+    (pool / "entries").mkdir(exist_ok=True)
+    assert round_storage.validate_shared_views(env, enforce=True) == dict(shared_mathlib="matches ready.json")
+    assert not (pool / "safety-stop.json").exists()
     with open(entry / "build/lib/lean/Mathlib.olean", "ab") as out:
         out.write(b"tampered")
     output = io.StringIO()
