@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import hashlib
+import json
 import os
 import secrets
 import stat
@@ -240,14 +241,26 @@ class Relinker:
         if isinstance(row.get("sha256"), str) and row.get("size") == info.st_size and row.get("ino") == info.st_ino:
             return row["sha256"], row["size"]
         sha, size = digest(canonical)
-        self.record(name, sha, size, row.get("provenance", "unknown"), canonical.stat().st_ino)
+        # A missing sidecar may belong to a publisher that has linked but not yet recorded;
+        # create it only if still absent, so the publisher's provenance wins either way.
+        self.record(name, sha, size, row.get("provenance", "unknown"), info.st_ino, exclusive=not row)
         return sha, size
 
-    def record(self, name, sha, size, provenance, inode):
-        expanded_cache.atomic_json(
-            sidecar(self.directory, name),
-            dict(sha256=sha, size=size, provenance=provenance, published_at=time.time(), ino=inode),
-        )
+    def record(self, name, sha, size, provenance, inode, *, exclusive=False):
+        path = sidecar(self.directory, name)
+        value = dict(sha256=sha, size=size, provenance=provenance, published_at=time.time(), ino=inode)
+        if not exclusive:
+            expanded_cache.atomic_json(path, value)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as out:
+            json.dump(value, out)
+        try:
+            os.link(out.name, path)
+        except FileExistsError:
+            pass
+        finally:
+            os.unlink(out.name)
 
     def digest(self, path, info):
         """sha256 once per inode: a build file and its private-store link are often one file."""
