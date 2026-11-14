@@ -395,6 +395,23 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "intentions board (claim-respect is on by default). Sets $TAUCETI_RESPECT_CLAIMS=false",
     )
     p.add_argument(
+        "--no-reactions",
+        dest="reactions",
+        action="store_false",
+        default=None,
+        help="keep this worker's claim on an author contest off GitHub: instead of a 👀 on the "
+        "contesting reply, the claim is a file that workers sharing this host's GitHub state "
+        "directory honour. Sets $TAUCETI_REACTIONS=0",
+    )
+    p.add_argument(
+        "--no-stuck-issues",
+        dest="stuck_issues",
+        action="store_false",
+        default=None,
+        help='do not open or update "Review stuck" tracking issues, or post the stuck comment on a '
+        "Forgejo pull request; the per-round warning still prints. Sets $TAUCETI_STUCK_ISSUES=0",
+    )
+    p.add_argument(
         "--auto-refresh",
         dest="auto_refresh",
         action="store_true",
@@ -1337,6 +1354,11 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         if problem:
             raise Die(problem)
         require_admin()  # Before quota/model selection, including on the loop-driver path.
+    # Before the outbox drain: replaying retained publications honours both switches.
+    if getattr(args, "reactions", None) is False:
+        os.environ["TAUCETI_REACTIONS"] = "0"
+    if getattr(args, "stuck_issues", None) is False:
+        os.environ["TAUCETI_STUCK_ISSUES"] = "0"
     if one_round and not getattr(args, "dry_run", False):
         from .github_outbox import drain
 

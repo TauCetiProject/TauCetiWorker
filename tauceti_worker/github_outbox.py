@@ -787,6 +787,28 @@ def reconcile(value, env):
     return None
 
 
+def suppressed(value, env):
+    """The switch that turns off this retained worker-owned publication, or None if it may go out."""
+    from .config import reactions_enabled, stuck_issues_enabled
+    from .constants import CONTEST_CLAIM_EMOJI
+
+    args = value["argv"]
+    if (
+        not reactions_enabled(env)
+        and args[:3] == ["api", "-X", "POST"]
+        and len(args) > 3
+        and re.fullmatch(r"/?repos/[^/]+/[^/]+/pulls/comments/\d+/reactions", args[3])
+        and "content=" + CONTEST_CLAIM_EMOJI in args
+    ):
+        return "TAUCETI_REACTIONS"
+    if not stuck_issues_enabled(env) and (
+        (args[:2] == ["issue", "create"] and re.fullmatch(r"Review stuck: PR #\d+", _flag(args, "--title", "-t") or ""))
+        or (args[:2] == ["issue", "edit"] and "<!--tauceti-review-stuck:" in str(value.get("context", {}).get("body")))
+    ):
+        return "TAUCETI_STUCK_ISSUES"
+    return None
+
+
 def drain(env=None):
     env = dict(os.environ if env is None else env)
     remaining = []
@@ -819,6 +841,12 @@ def drain(env=None):
             ):
                 remaining.append(path.stem)
                 continue  # Preserve malformed legacy evidence without blocking other repairs.
+            switch = suppressed(value, env)
+            if switch:
+                # Dropped, not held: a later round re-posts the claim or files the issue if wanted.
+                path.unlink()
+                tr.event({"kind": "publication_suppressed", "intent": path.stem, "switch": switch})
+                continue
             destination = target(value)
             if value.get("retry_at", 0) > time.time():
                 remaining.append(path.stem)

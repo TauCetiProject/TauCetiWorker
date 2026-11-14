@@ -494,6 +494,35 @@ ci="one/project"
         self.assertIn("--post", command)
         self.assertIn("--no-sync", command)
 
+    def test_stuck_diagnostic_and_contest_claims_on_forgejo(self):
+        from tauceti_worker.forgejo_worker import ForgejoWorkerSource
+
+        for value, posted in ((None, True), ("0", False)):
+            source = ForgejoWorkerSource(
+                self.identity, Mock(forge=self.repo.forge, _token="t"), token_file=self.root / "token"
+            )
+            source.issue_comments = Mock(return_value=[])
+            env = {} if value is None else {"TAUCETI_STUCK_ISSUES": value}
+            with (
+                patch.dict(os.environ, env),
+                patch("tauceti_tools.forge_write.ForgejoWriter.comment") as comment,
+            ):
+                if value is None:
+                    os.environ.pop("TAUCETI_STUCK_ISSUES", None)
+                source.ensure_stuck_issue(1, "its review errored")
+            self.assertEqual(comment.called, posted)
+            self.assertEqual(source.issue_comments.called, posted)
+        # Leases coordinate contests here: no reaction and no local claim with either setting.
+        for value in ("1", "0"):
+            with (
+                tempfile.TemporaryDirectory() as shared,
+                patch.dict(os.environ, {"TAUCETI_REACTIONS": value, "TAUCETI_GITHUB_SHARED_DIR": shared}),
+            ):
+                self.assertIs(source.add_reaction(5), False)
+                self.assertIsNone(source.fresh_claim_age(5))
+                self.assertEqual(list(Path(shared).rglob("*")), [])
+        source.api.request.assert_not_called()
+
     def test_numeric_target_with_inherited_both_still_defaults_to_github(self):
         with patch.dict(os.environ, {"TAUCETI_WORKER_FORGES": "both"}, clear=True):
             configure(SimpleNamespace(pr=["1"]))

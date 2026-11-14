@@ -1594,7 +1594,11 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         # before the new scoreboard lands skips it (cross-fleet dedup). The engine auto-detects the
         # contest from the thread reply (no extra flag); a contest-only round is recorded as a reply
         # round, so it does not consume the review-round budget.
-        if reaction_claim and not w.gh.add_reaction(c.contest_reply_id):
+        claimed = w.gh.add_reaction(c.contest_reply_id) if reaction_claim else True
+        if claimed is None:
+            log(f"  review #{pr}: a peer on this host claimed this contest — selecting other work")
+            return None
+        if not claimed:
             log(f"  review #{pr}: contest claim (👀) failed to post — a peer may double-review")
         log(f"  review #{pr}: author contest on {c.contest} @ {head[:12]}, reviewers={reviewers}")
     else:

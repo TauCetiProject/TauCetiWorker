@@ -59,6 +59,8 @@ _WORKER_KEYS = {
     "roadmap_skip",
     "roadmap_extra_identities",
     "respect_claims",
+    "reactions",
+    "stuck_issues",
     "extra_roadmap_prompt",
     "self_tested",
     "source",
@@ -316,6 +318,8 @@ class WorkerSpec:
     roadmap_skip: tuple[str, ...] = ()
     roadmap_extra_identities: tuple[str, ...] = ()
     respect_claims: bool = True
+    reactions: bool = True
+    stuck_issues: bool = True
     extra_roadmap_prompt: str | None = None
     self_tested: bool = False
     source: str | None = None
@@ -387,6 +391,8 @@ class WorkerSpec:
             ),
             self_tested=_boolean(raw.get("self_tested", False), f"workers[{index}].self_tested"),
             respect_claims=_boolean(raw.get("respect_claims", True), f"workers[{index}].respect_claims"),
+            reactions=_boolean(raw.get("reactions", True), f"workers[{index}].reactions"),
+            stuck_issues=_boolean(raw.get("stuck_issues", True), f"workers[{index}].stuck_issues"),
             extra_roadmap_prompt=_extra_roadmap_prompt(
                 raw.get("extra_roadmap_prompt"), f"workers[{index}].extra_roadmap_prompt"
             ),
@@ -456,6 +462,10 @@ class WorkerSpec:
             value["self_tested"] = True
         if not self.respect_claims:
             value["respect_claims"] = False
+        if not self.reactions:
+            value["reactions"] = False
+        if not self.stuck_issues:
+            value["stuck_issues"] = False
         for name in (
             "github_account",
             "conf",
@@ -515,6 +525,10 @@ class WorkerSpec:
             argv += ["--roadmap-extra-identities", ",".join(self.roadmap_extra_identities)]
         if not self.respect_claims:
             argv.append("--ignore-claims")
+        if not self.reactions:
+            argv.append("--no-reactions")
+        if not self.stuck_issues:
+            argv.append("--no-stuck-issues")
         for field, flag in (
             (self.github_account, "--github-account"),
             (self.github_state_url, "--github-state-url"),
@@ -1624,6 +1638,10 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
         options.append("isolated home")
     if spec.get("restart") and spec["restart"] != "always":
         options.append(f"restart: {spec['restart']}")
+    if spec.get("reactions", True) is False:
+        options.append("no reactions")
+    if spec.get("stuck_issues", True) is False:
+        options.append("no stuck-review issues")
     if options:
         lines.extend(_status_field("options", options, width))
     # Show extra environment: a worker configured differently from its peers is otherwise

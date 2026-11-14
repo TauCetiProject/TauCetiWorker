@@ -167,6 +167,8 @@ try:
         roadmap_skip=("Algebra",),
         roadmap_extra_identities=("Maintainer",),
         respect_claims=False,
+        reactions=False,
+        stuck_issues=False,
         extra_roadmap_prompt="Work on the material relevant to Higher Topos Theory",
         self_tested=True,
         source="https://example.invalid/source",
@@ -179,6 +181,20 @@ try:
     parsed = build_parser().parse_args(maximal.work_argv()[3:])
     assert parsed.cmd == "work" and parsed.worker_id == "maximal"
     assert parsed.auto_refresh is True
+    assert parsed.reactions is False and parsed.stuck_issues is False
+    quiet = wm.WorkerSpec.from_dict({"id": "quiet", "reactions": False, "stuck_issues": False}, 0)
+    assert quiet.as_dict() == {"id": "quiet", "enabled": True, "reactions": False, "stuck_issues": False}
+    assert {"--no-reactions", "--no-stuck-issues"} <= set(quiet.work_argv())
+    plain = wm.WorkerSpec.from_dict({"id": "plain", "reactions": True, "stuck_issues": True}, 0)
+    assert plain == wm.WorkerSpec(id="plain") and not any(a.startswith("--no-") for a in plain.work_argv())
+    assert build_parser().parse_args(plain.work_argv()[3:]).reactions is None
+    for key in ("reactions", "stuck_issues"):
+        try:
+            wm.WorkerSpec.from_dict({"id": "typo", key: "0"}, 0)
+        except wm.WorkersError as error:
+            assert f"workers[0].{key} must be true or false" in str(error)
+        else:
+            raise AssertionError(f"{key} accepted a string")
     assert parsed.self_tested is True
     assert wm.WorkerSpec.from_dict({"id": "attest", "self_tested": True}, 0).as_dict()["self_tested"] is True
     before = wm.WorkerSpec(id="attest").as_dict()
@@ -329,6 +345,8 @@ try:
                         "stream": True,
                         "isolate_home": True,
                         "restart": "on-failure",
+                        "reactions": False,
+                        "stuck_issues": False,
                     },
                     "detail": "rc=1",
                     "log_file": str(legacy_log),
@@ -377,6 +395,8 @@ worker3 — backing off
   options:  stream output
             isolated home
             restart: on-failure
+            no reactions
+            no stuck-review issues
   activity: —
   reason:   claude agent: API Error: 529 Overloaded. This is a temporary
             server-side issue.
