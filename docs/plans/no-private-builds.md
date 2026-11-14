@@ -68,7 +68,11 @@ The problem is that each of them is optional and has a private fallback.
    patches and bounded untracked files. It never materializes or retains a checkout,
    and never retains `.lake`. Once the source is saved, the tree is deleted
    immediately instead of being kept for 24 hours.
-6. **Deletion cannot stall.** No collector run, and no holder of the housekeeping
+6. **TauCeti versions are bounded by running rounds.** Long-lived TauCeti state is
+   one object store and two read-only reference builds: current `main` and the
+   previous `main`. Every other TauCeti worktree and every branch-specific build
+   output exists only while a round uses it.
+7. **Deletion cannot stall.** No collector run, and no holder of the housekeeping
    lock, can block deletion for longer than a bounded lease.
 
 ## Design
@@ -100,6 +104,34 @@ The problem is that each of them is optional and has a private fallback.
   checkout.
 - A round's own new outputs go to the store through Lake as usual, so two branches
   share every module they have in common.
+
+### TauCeti versions
+
+Many TauCeti versions are in flight at once, one per branch, but almost all of
+their build is shared with `main`.
+
+- **Source.** One object store per host. A worktree exists only for the duration
+  of a round: `git worktree add` at round start, removed at round end. Two
+  read-only reference worktrees track current `main` and the previous `main`. At
+  most (running rounds + 2) TauCeti source trees exist, against 93 permanent
+  checkouts on tauchonki today.
+- **Builds.** The two reference worktrees are the only long-lived TauCeti builds.
+  Their `.lake` links the artifact store, so `main`'s modules keep a link count of
+  at least 2 and stay. When `main` advances, the older reference is dropped and
+  its modules become collectable unless the new `main` still uses them.
+- **Branch deltas.** A round links `main`'s modules and builds only what its branch
+  changes. Those outputs are referenced by that round alone; when its worktree is
+  removed their link count drops to 1 and the collector deletes them at once. The
+  next round on the same PR rebuilds its changed modules.
+- **Downloads** of a PR revision's outputs from the CI cache go into the same store
+  and follow the same rule.
+- **Bound.** Two full TauCeti builds plus the deltas of running rounds. A delta is
+  at worst a full rebuild (5.4 GiB on 14 November), so with 30 concurrent rounds
+  the ceiling is about 11 + 30 × 5.4 ≈ 170 GiB, against about 500 GiB of private
+  TauCeti builds on tauchonki that day.
+- **Per-round cap.** A round whose new artifacts exceed a limit (for example
+  6 GiB) is killed and abandoned, like a holder of an evicted Mathlib version, so
+  the ceiling is a guarantee rather than an expectation.
 
 ### Checkouts and clones
 
