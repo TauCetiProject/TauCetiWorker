@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from . import incidents
 from .agents import (
     AuthoringProfile,
     BuildCacheUnavailable,
@@ -36,6 +37,7 @@ from .agents import (
     run_to_logfile,
     scope_policy,
     take_last_agent_infra_failure,
+    take_last_agent_run,
     validate_kiro_model_access,
     wrapper_bin,
 )
@@ -54,6 +56,7 @@ from .config import (
     roadmap_areas,
     roadmap_only,
     roadmap_skip,
+    roadmap_targets,
     warn_red,
 )
 from .constants import (
@@ -63,6 +66,8 @@ from .constants import (
     CONTEST_CLAIM_TTL,
     EX_CLAIM_COLLISION,
     EX_NOPROGRESS,
+    EXPLICIT_TASKS,
+    MAX_CI_PR_ATTEMPTS,
     MAX_FIX_ATTEMPTS,
     MAX_INFRA_REFUNDS,
     OPENROUTER_MODELS,
@@ -116,6 +121,21 @@ from .survey import (
     spread_candidates,
     survey,
 )
+from .targets import (
+    GitHubMarkerReads,
+    TargetItem,
+    Targets,
+    candidates,
+    github_history_enabled,
+    inventory_keys,
+    landed_pr,
+    live_targets,
+    load_targets,
+    open_pr,
+    overlay_live,
+    render_assignment,
+    target_markers,
+)
 from .worker_sources import pull_url as source_pull_url
 from .worker_sources import repository_url as source_repository_url
 
@@ -137,7 +157,7 @@ def want(only: list[str], task: str) -> bool:
             return False
         if task == "security-audit" and not project.feature("security_audit"):
             return False
-    if task == "security-audit":
+    if task in EXPLICIT_TASKS:
         return task in only
     return (not only) or (task in only)
 
@@ -408,7 +428,8 @@ def round_scope(w, opts, use_fleet_focus=True):
     if getattr(opts, "prs", ()):
         scope = "any"  # explicit targets override the ambient roadmap
     else:
-        if use_fleet_focus and scope in (None, "auto"):
+        # A target list names its own areas, so its worker takes no fleet focus.
+        if use_fleet_focus and scope in (None, "auto") and roadmap_targets() is None:
             from .fleet_capacity import roadmap_focus
 
             focus = roadmap_focus(w.cfg.wid)
@@ -476,6 +497,32 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         from .review_diagnostics import refund_stale_head_errors
 
         refund_stale_head_errors(w.cfg.state, w.counters)
+    if "decide" in opts.only:
+        # Ahead of the survey, so a hold that a `retry` ruling lifts is already gone from it.
+        from . import decide
+
+        ready, why = (
+            (False, "it takes no --pr") if getattr(opts, "prs", ()) else decide.due(source=incidents.source_of(w.gh))
+        )
+        if ready:
+            # The phase rules on the records of the source it runs on, so it is bound to that source
+            # as a pull request candidate is, and passes the source's own authorization.
+            identity = getattr(w.gh, "identity", None)
+            candidate = Candidate(
+                0,
+                "",
+                why,
+                source_repository=incidents.repository_ref(incidents.source_of(w.gh)),
+                source_repository_id=getattr(identity, "native_id", None),
+            )
+            rc = dispatch("decide", w, Survey(worker_id=w.cfg.wid), candidate, opts)
+            if rc is not None:
+                return rc
+            why = "nothing to put to the model this round"
+        other_tasks = [task for task in opts.only if task != "decide"]
+        if not other_tasks:
+            raise NoProgress(f"decide: {why}")
+        opts = replace(opts, only=other_tasks)
     w.selection_changed = False
     global_pick = False
     focused_round = False
@@ -567,6 +614,8 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         diagnostic = public_review_failure(retained)
         reason = f"its review has errored {n_err} times without completing a review"
         w.gh.ensure_stuck_issue(pr, reason, diagnostic)
+
+    note_spent_budgets(w, sv, opts)
 
     if global_pick:
         counts = ", ".join(
@@ -690,7 +739,7 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             )
         if global_pick:
             log("No available maintenance or reviews; proceeding to roadmap authoring")
-            if scope in (None, "auto") and not opts.dry_run:
+            if scope in (None, "auto") and not opts.dry_run and roadmap_targets() is None:
                 sv.roadmap_only = random_roadmap_area(w, focus=[])
                 log(f"Authoring roadmap: {sv.roadmap_only} (selected after existing PR work)")
         rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
@@ -809,6 +858,54 @@ def log_round_file_changes(cfg: Config, pre_head: str | None) -> None:
             log(f"    {ln.strip()}")
         if len(dirty) > _MAX_CHANGED_FILES:
             log(f"    … {len(dirty) - _MAX_CHANGED_FILES} more")
+
+
+def note_spent_budgets(w: Worker, sv: Survey, opts: RoundOpts) -> None:
+    """Leave a `budget-spent` record for each repair candidate the survey suppressed with its
+    attempts used up, within the round's `--pr` scope and not under `--dry-run`."""
+    if incidents.directory() is None or opts.dry_run:
+        return
+    targets = frozenset(getattr(opts, "prs", ()) or ())
+    for stage in incidents.STAGES:
+        for c in sv.kind(stage).suppressed:
+            repository, repository_id = _incident_source(w, c)
+            if (not targets or c.pr in targets) and not incidents.declined(stage, c.pr, c.head, repository):
+                detail = f"{c.reason}; {c.attempts}/{c.budget} attempts used"
+                if stage == "fix-ci":
+                    detail += f" at this head, {w.counters.read(f'ci-pr-{c.pr}')}/{MAX_CI_PR_ATTEMPTS} on the PR"
+                incidents.note_budget_spent(
+                    stage, c.pr, c.head, detail, repository=repository, repository_id=repository_id
+                )
+
+
+def _incident_source(w, c) -> tuple:
+    return (
+        getattr(c, "source_repository", None) or incidents.source_of(getattr(w, "gh", None)),
+        getattr(c, "source_repository_id", None),
+    )
+
+
+def _record_declined(stage: str, w: Worker, sv: Survey, c: Candidate) -> Path | None:
+    # An automatic bump is retried without an attempt budget, so no round on it is its last word.
+    if (
+        stage not in incidents.STAGES
+        or not c.pr
+        or incidents.directory() is None
+        or any(p.number == c.pr and getattr(p, "automatic_bump", False) for p in sv.open_prs)
+    ):
+        return None
+    run = take_last_agent_run() or {}
+    repository, repository_id = _incident_source(w, c)
+    return incidents.record_declined(
+        stage,
+        c.pr,
+        c.head,
+        repository=repository,
+        repository_id=repository_id,
+        reason=c.reason,
+        message=run.get("last_message") or "\n".join(run.get("tail") or ()),
+        transcript=run.get("transcript") or str(w.cfg.logdir),
+    )
 
 
 def _open_pr_numbers(w: Worker) -> set[int] | None:
@@ -1360,6 +1457,14 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         if retained_repair(getattr(w, "cfg", None), getattr(getattr(w, "gh", None), "repo", TAUCETI), c.pr):
             log(f"  #{c.pr}: retained source recovery has priority; selecting unrelated work")
             return None
+    if (
+        c.pr
+        and stage in incidents.STAGES
+        and incidents.hold_declined()
+        and incidents.declined(stage, c.pr, c.head, _incident_source(w, c)[0])
+    ):
+        log(f"  {stage} #{c.pr}: {incidents.HELD}; selecting unrelated work")
+        return None
     from .build_resources import queue_owned
 
     selected = next((p for p in getattr(sv, "open_prs", ()) if p.number == c.pr), None) if c.pr else None
@@ -1445,6 +1550,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         "roadmap": do_roadmap,
         "overlap-scan": do_overlap_scan,
         "overlap-fix": do_overlap_fix,
+        "decide": do_decide,
     }[stage]
     # Announce the round up front so the log says what was chosen, on which PR (as a clickable URL),
     # with which agent and sandbox — the same line for every stage.
@@ -1546,6 +1652,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             f"{stage}{tgt}: the agent finished but nothing landed on GitHub (no push, new PR, or "
             f"comment or closure). No durable PR outcome was confirmed. Transcript: {w.cfg.logdir}"
         )
+        if recorded := _record_declined(stage, w, sv, c):
+            reason += f"; the agent's final message is recorded at {recorded}"
         if not bubble and _candidate_checkout_unchanged(w.cfg, c):
             log(reason + "; checkout unchanged — selecting another candidate")
             report_runtime(
@@ -1577,6 +1685,12 @@ def do_overlap_fix(w, sv, c, opts, bubble):
     from .overlaps import do_fix
 
     return do_fix(w, sv, c, opts, bubble)
+
+
+def do_decide(w, sv, c, opts, bubble):
+    from .decide import run
+
+    return run(w, opts)
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int | None:
@@ -1948,6 +2062,14 @@ def _do_fixlike(
             w.counters.write(key, max(0, w.counters.read(key) - 1))
         return None
 
+    # A peer may have recorded its decline between dispatch's check and this claim.
+    if (
+        label in incidents.STAGES
+        and incidents.hold_declined()
+        and incidents.declined(label, pr, head, _incident_source(w, c)[0])
+    ):
+        log(f"  {label} #{pr}: {incidents.HELD}; selecting unrelated work")
+        return decline_repair()
     if label == "fix" or bubble:
         c.progress = _progress_snapshot(w, c)
         live = None
@@ -2054,6 +2176,11 @@ def _do_fixlike(
             else "You may NOT close this PR: it is not your authored PR or has a special repair scope."
         ),
     )
+    if label in incidents.STAGES and incidents.directory() is not None and not getattr(p, "automatic_bump", False):
+        prompt += incidents.PROMPT
+        from .decide import retry_note
+
+        prompt += retry_note(label, pr, head, _incident_source(w, c)[0])
     if getattr(c, "final_resolution", False) and may_close:
         prompt += FINAL_ATTEMPT_INSTRUCTION
     if getattr(p, "automatic_bump", False):
@@ -2305,6 +2432,9 @@ def _close_spent_pr(w, sv, c) -> int | None:
     if not w.claims.begin_branch_work(c.pr, c.head, p.head_ref, p.head_owner, p.head_repo):
         return None
     try:
+        if incidents.hold_declined() and incidents.declined("fix", c.pr, c.head, _incident_source(w, c)[0]):
+            log(f"  fix #{c.pr}: {incidents.HELD}; leaving it open")
+            return None
         with read_context(fresh=True, direct=True):
             if not _still_actionable("fix", w, sv, replace(c, partial_history=False)):
                 return None
@@ -3104,11 +3234,117 @@ def random_roadmap_area(w, *, focus=None, fallback=True) -> str | None:
     return random.choice(areas) if areas else "any"
 
 
+MAX_TARGET_TRIES = 8  # per round; each one is a search and a push to the claim repository
+
+
+class _SharedGitHubReads:
+    """A GitHub client's target-list reads from inside a Forgejo round, whose `gh` on PATH is the
+    source-bound wrapper."""
+
+    def __init__(self, gh):
+        self.gh = gh
+
+    def open_prs(self):
+        from .worker_sources import shared_github_environment
+
+        with shared_github_environment():
+            return self.gh.open_prs()
+
+    def merged_prs(self, search, *, limit):
+        from .worker_sources import shared_github_environment
+
+        with shared_github_environment():
+            return self.gh.merged_prs(search, limit=limit)
+
+
+def _target_reads(source):
+    from .worker_sources import current
+
+    native = getattr(source, "direct_source", False)
+    return source if native or current() is None else _SharedGitHubReads(source)
+
+
+def target_read_sources(w) -> list:
+    """The sources a round reads a target list's live statuses from: the worker's own and the
+    others a multi-source round hands it, and, in a round with no GitHub source, the GitHub
+    repository's marked pull requests unless TAUCETI_ROADMAP_TARGETS_GITHUB is 0."""
+    seen = (w.gh, *getattr(w, "target_sources", ()))
+    sources = [_target_reads(source) for source in seen]
+    if all(getattr(source, "direct_source", False) for source in seen) and github_history_enabled():
+        sources.append(GitHubMarkerReads())
+    return sources
+
+
+def _pull_link(source, number: int | None) -> str | None:
+    if number is None:
+        return None
+    return source.repository.pull_url(number) if getattr(source, "direct_source", False) else f"#{number}"
+
+
+def _landed_link(item, source) -> str | None:
+    return _pull_link(source, landed_pr(item, source))
+
+
+def _open_link(item, source) -> str | None:
+    return _pull_link(source, open_pr(item, source))
+
+
+def assign_target(w, path: Path, only: str, skip: list[str]) -> tuple[Targets, TargetItem]:
+    """Choose and claim this round's item of the operator's target list (docs/target-lists.md).
+    Returns the list under its live statuses and the item; NoProgress when there is none to take."""
+    from .config import SourceUnavailable
+
+    listed = load_targets(path)
+    claims = getattr(w, "claims", None)
+    sources = target_read_sources(w)
+    try:
+        live = live_targets(listed, sources[0], sources[1:])
+        # A multi-source round's inventory also names the other forge's open pull requests.
+        live = overlay_live(live, inventory_keys(getattr(w, "cross_source_targets", None) or ()), set())
+        offered = candidates(live, only, skip)
+        for item in offered[:MAX_TARGET_TRIES]:
+            name = f"{item.area}/{item.slug}"
+            merged = next((link for source in sources if (link := _landed_link(item, source)) is not None), None)
+            if merged is not None:
+                log(f"target {name} landed in {merged}; mark it `[x]` in {path.name} — trying the next")
+                continue
+            opened = next((link for source in sources if (link := _open_link(item, source)) is not None), None)
+            if opened is not None:
+                log(f"target {name} is open in {opened} — trying the next")
+                continue
+            rc = claims.begin_target_work(item.area, item.slug) if claims is not None else 2
+            if rc == 1:
+                log(f"target {name} is claimed by another worker — trying the next")
+                continue
+            if rc != 0:
+                log(
+                    f"claim acquire author/{name} errored (rc={rc}) against {claims_repo()} — proceeding "
+                    f"unclaimed. If this repeats, this account cannot push there; set CLAIM_REPO=<a repo your "
+                    f"whole fleet can push to> to pick the namespace yourself."
+                )
+            log(f"→ ROADMAP target: {name} ({len(offered)} eligible in {path.name})")
+            return live, item
+    except (GitHubError, SourceUnavailable) as e:
+        raise NoProgress(f"roadmap: cannot read pull requests for the target list ({e})") from None
+    raise NoProgress(
+        f"roadmap: none of the {min(len(offered), MAX_TARGET_TRIES)} eligible target(s) of {path.name} tried this "
+        f"round can be taken ({len(offered)} eligible; each is claimed by another worker or has landed)"
+    )
+
+
 def do_roadmap(w, sv, c, opts, bubble) -> int:
     os.environ["TAUCETI_VERIFY_POLICY"] = "ordinary"
     only = c.reason or "any"
     skip = roadmap_skip()
-    if only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
+    assignment = ""
+    targets_path = roadmap_targets()
+    if targets_path is not None:
+        live, item = assign_target(w, targets_path, only, skip)
+        only = item.area
+        assignment = render_assignment(live, item)
+        os.environ["TAUCETI_TARGET_MARKER"] = "\n".join(target_markers(item))
+        report_runtime(target=f"new PR (target: {only}/{item.slug})", roadmap_target=f"{only}/{item.slug}")
+    elif only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
         only = random_roadmap_area(w, focus=[])
         log(f"→ ROADMAP area: {only} (auto-picked, skipping {len(skip)})")
     elif only not in ("any", "") and only in skip:  # --roadmap-only wins over an overlapping skip
@@ -3215,6 +3451,7 @@ other contributors' claims, or the hard rules of the repo.
                 ),
                 SOURCE_GUIDANCE=source_guidance,
                 EXTRA_ROADMAP_PROMPT=extra_guidance,
+                TARGET_LIST=assignment,
                 LOCAL_VERIFICATION=local_verification("ordinary", bubble),
                 BIN=wrapper_bin(bubble=True),
             ),
@@ -3239,6 +3476,7 @@ other contributors' claims, or the hard rules of the repo.
         RUBRICS=(str(bundle) if bundle is not None else f"{refs / 'review' / 'rubrics'} (read every .md file in it)"),
         SOURCE_GUIDANCE=source_guidance,
         EXTRA_ROADMAP_PROMPT=extra_guidance,
+        TARGET_LIST=assignment,
         LOCAL_VERIFICATION=local_verification("ordinary", bubble),
         BIN=wrapper_bin(),
     )

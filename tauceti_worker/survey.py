@@ -17,6 +17,7 @@ from pathlib import Path
 
 from tauceti_tools.forge import RepositoryRef
 
+from . import incidents
 from .config import Config, log, roadmap_only, roadmap_skip
 from .config import max_open_prs as configured_max_open_prs
 from .constants import (
@@ -962,6 +963,7 @@ def classify_survey(
     from .review_runtime import pending_reviews
 
     enabled = set(enabled)
+    source = incidents.source_of(gh)
     pending = (pending_reviews(cfg) if deep else set()) if pending is None else pending
     prs = sv.open_prs
 
@@ -1094,7 +1096,9 @@ def classify_survey(
             c.reason = f"{reason}; {error}"
             c.attempts = MAX_REBASE_ATTEMPTS
         c.budget = 1 if foreign else MAX_REBASE_ATTEMPTS
-        (sv.rebaseable.suppressed if c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
+        if held := incidents.declined("rebase", p.number, p.head_oid, source):
+            c.reason = incidents.HELD
+        (sv.rebaseable.suppressed if held or c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
 
     # 2) review: non-draft, build-green. Eligible when the head is NOT cleanly reviewed (a new commit
     #    or an errored round → normal review; no round budget here, CI retires a non-converging PR),
@@ -1221,9 +1225,11 @@ def classify_survey(
                         partial_history=True,
                     )
                     c.final_resolution = c.attempts >= c.budget - 1 and sv.owns(p) and not p.automatic_bump
+                    if held := incidents.declined("fix", p.number, p.head_oid, source):
+                        c.reason, c.final_resolution = incidents.HELD, False
                     (
                         sv.needs_fix.suppressed
-                        if c.attempts >= c.budget and not c.final_resolution
+                        if held or (c.attempts >= c.budget and not c.final_resolution)
                         else sv.needs_fix.actionable
                     ).append(c)
                 continue
@@ -1246,6 +1252,12 @@ def classify_survey(
                 unlimited=p.automatic_bump,
             )
             if disp == "skip":
+                continue
+            if disp in ("actionable", "exhausted") and incidents.declined("fix", p.number, p.head_oid, source):
+                sv.fix_waiting.append((p.number, incidents.HELD))
+                sv.needs_fix.suppressed.append(
+                    Candidate(p.number, p.head_oid, incidents.HELD, attempts=per_head, budget=MAX_FIX_ATTEMPTS)
+                )
                 continue
             if disp == "actionable":
                 c = Candidate(
@@ -1281,7 +1293,9 @@ def classify_survey(
         per_head = counters.read(f"ci-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"ci-pr-{p.number}")
         c.attempts, c.budget = per_head, MAX_CI_ATTEMPTS
-        if per_head >= MAX_CI_ATTEMPTS or per_pr >= MAX_CI_PR_ATTEMPTS:
+        if held := incidents.declined("fix-ci", p.number, p.head_oid, source):
+            c.reason = incidents.HELD
+        if held or per_head >= MAX_CI_ATTEMPTS or per_pr >= MAX_CI_PR_ATTEMPTS:
             sv.red_ci.suppressed.append(c)
         else:
             sv.red_ci.actionable.append(c)

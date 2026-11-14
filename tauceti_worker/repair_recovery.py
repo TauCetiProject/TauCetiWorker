@@ -623,6 +623,12 @@ class WorkerBackend:
                 "pr-held",
                 "Current PR is draft or has a protected hold label",
             )
+        from . import incidents
+
+        if incidents.hold_declined() and incidents.declined(
+            m.get("work") or "", m["pr"], facts["head"], incidents.source_of(self.w.gh)
+        ):
+            raise Wait("declined-hold", incidents.HELD, "Retry when the head moves or the record is deleted")
         if facts["base"] != BASE_BRANCH:
             raise Block(
                 "base-policy",

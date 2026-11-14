@@ -688,6 +688,17 @@ _OPEN_PRS_QUERY = """query($owner:String!,$repo:String!,$n:Int!,$cursor:String){
 }"""
 
 
+BORS_MERGED_PREFIX = "[Merged by Bors] - "
+
+
+def normalize_merged(d: dict) -> dict:
+    """`d` with a Bors landing reported as any other merge. Bors lands a squash on main and closes
+    the pull request under a `[Merged by Bors] - ` title, which GitHub reports as CLOSED."""
+    if d.get("state") == "CLOSED" and str(d.get("title") or "").startswith(BORS_MERGED_PREFIX):
+        d["state"] = "MERGED"
+    return d
+
+
 def _pr_json_from_graphql(node: dict) -> dict:
     """One GraphQL PR node in `gh pr list --json` shape, so PRInfo.from_json stays the single place
     that decides what a PR's fields MEAN.
@@ -859,6 +870,34 @@ class GitHub:
             raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
         return json.loads(p.stdout or "[]")
 
+    def merged_prs(self, search: str, *, limit: int = 200) -> list[dict]:
+        """Number, title and body of the merged pull requests among the first `limit` closed ones a
+        search returns, Bors landings included (see `normalize_merged`)."""
+        args = ["pr", "list", "--repo", self.repo, "--state", "closed", "--search", search, "--limit", str(limit)]
+
+        def fetch():
+            p = self._gh([*args, "--json", "number,title,body,state"])
+            if p.returncode != 0:
+                raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
+            return [d for d in map(normalize_merged, json.loads(p.stdout or "[]")) if d.get("state") == "MERGED"]
+
+        return transport.shared_read(["merged_prs", self.repo, search, limit], fetch, ttl=120)
+
+    def target_marker_prs(self, *, limit: int = 200, search: str = "") -> list[dict]:
+        """Number, title, body, head (`headRefOid`) and state (OPEN, CLOSED or MERGED, Bors landings included) of the
+        `limit` most recently updated pull requests in any state whose body carries a target
+        marker and matches the extra `search` terms: one search request, shared for two minutes."""
+        query = f'{search} "tauceti-target:v1" in:body sort:updated-desc'.strip()
+        args = ["pr", "list", "--repo", self.repo, "--state", "all", "--search", query, "--limit", str(limit)]
+
+        def fetch():
+            p = self._gh([*args, "--json", "number,title,body,state,headRefOid"])
+            if p.returncode != 0:
+                raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
+            return [normalize_merged(d) for d in json.loads(p.stdout or "[]")]
+
+        return transport.shared_read(["target_marker_prs", self.repo, limit, search], fetch, ttl=120)
+
     def issue_list(
         self, repo: str, *, labels: list[str] | None = None, fields: list[str], state: str = "open", limit: int = 200
     ) -> list[dict]:
@@ -897,6 +936,28 @@ class GitHub:
         if p.returncode != 0:
             return None
         return json.loads(p.stdout or "{}")
+
+    def pr_diff(self, pr: int) -> str | None:
+        """The pull request's unified diff, open or closed; None when unreadable."""
+        p = self._gh(["pr", "diff", str(pr), "--repo", self.repo])
+        return p.stdout if p.returncode == 0 else None
+
+    def close_pr(self, pr: int, comment: str) -> bool:
+        """Close the pull request with a comment; True once a fresh read shows it closed. The command
+        is not kept in the publication outbox: a closure that does not complete here is reported as
+        not made, and is never replayed later without the checks and claim its caller made first."""
+        previous = os.environ.get("TAUCETI_GITHUB_EPHEMERAL")
+        os.environ["TAUCETI_GITHUB_EPHEMERAL"] = "1"
+        try:
+            self._gh(["pr", "close", str(pr), "--repo", self.repo, "--comment", comment])
+        finally:
+            if previous is None:
+                os.environ.pop("TAUCETI_GITHUB_EPHEMERAL", None)
+            else:
+                os.environ["TAUCETI_GITHUB_EPHEMERAL"] = previous
+        with transport.read_context(fresh=True, direct=True):
+            after = self.pr_view(pr, ["state"])
+        return bool(after) and after.get("state") in ("CLOSED", "MERGED")
 
     def live_pull(self, pr: int) -> dict | None:
         """The PR as GitHub reports it now, bypassing shared and cached state; None when unreadable."""

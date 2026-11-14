@@ -57,6 +57,7 @@ _WORKER_KEYS = {
     "auto_refresh",
     "roadmap_only",
     "roadmap_skip",
+    "roadmap_targets",
     "roadmap_extra_identities",
     "respect_claims",
     "extra_roadmap_prompt",
@@ -223,6 +224,13 @@ def _strings(value, where: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _roadmap_targets(value, where: str) -> str | None:
+    path = _string(value, where, optional=True)
+    if path is not None and not Path(path).is_absolute():
+        raise WorkersError(f"{where} must be an absolute path")
+    return path
+
+
 def _extra_roadmap_prompt(value, where: str) -> str | None:
     """Operator guidance for roadmap rounds, checked at the configuration boundary like `pace`: a blank
     or oversized value is a bad line in workers.toml, not a worker that dies on launch."""
@@ -314,6 +322,7 @@ class WorkerSpec:
     anthropic_api_key_file: str | None = None
     roadmap_only: str | None = None
     roadmap_skip: tuple[str, ...] = ()
+    roadmap_targets: str | None = None
     roadmap_extra_identities: tuple[str, ...] = ()
     respect_claims: bool = True
     extra_roadmap_prompt: str | None = None
@@ -382,6 +391,7 @@ class WorkerSpec:
             ),
             roadmap_only=_string(raw.get("roadmap_only"), f"workers[{index}].roadmap_only", optional=True),
             roadmap_skip=_strings(raw.get("roadmap_skip", []), f"workers[{index}].roadmap_skip"),
+            roadmap_targets=_roadmap_targets(raw.get("roadmap_targets"), f"workers[{index}].roadmap_targets"),
             roadmap_extra_identities=_strings(
                 raw.get("roadmap_extra_identities", []), f"workers[{index}].roadmap_extra_identities"
             ),
@@ -463,6 +473,7 @@ class WorkerSpec:
             "github_state_token_file",
             "extra_roadmap_prompt",
             "source",
+            "roadmap_targets",
             "author_model",
             "author_effort",
             "pace",
@@ -519,6 +530,7 @@ class WorkerSpec:
             (self.github_account, "--github-account"),
             (self.github_state_url, "--github-state-url"),
             (self.github_state_token_file, "--github-state-token-file"),
+            (self.roadmap_targets, "--roadmap-targets"),
             (self.source, "--source"),
             (self.author_model, "--author-model"),
             (self.author_effort, "--author-effort"),
@@ -1594,6 +1606,8 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
         skips = spec.get("roadmap_skip")
         if isinstance(skips, list) and skips:
             roadmap_values.append("skip: " + ", ".join(map(str, skips)))
+        if spec.get("roadmap_targets"):
+            roadmap_values.append("targets: " + str(spec["roadmap_targets"]))
         identities = spec.get("roadmap_extra_identities")
         if isinstance(identities, list) and identities:
             roadmap_values.append("also treat as self: " + ", ".join(map(str, identities)))
@@ -1765,6 +1779,7 @@ def add_dashboard_worker(
     roadmap_skip: str | None,
     github_account: str | None = None,
     extra_roadmap_prompt: str | None = None,
+    roadmap_targets: str | None = None,
 ) -> WorkerSpec:
     with _config_lock(config):
         try:
@@ -1782,6 +1797,9 @@ def add_dashboard_worker(
             roadmap_only=roadmap_only,
             roadmap_skip=tuple(part.strip() for part in (roadmap_skip or "").split(",") if part.strip()),
             extra_roadmap_prompt=extra_roadmap_prompt,
+            roadmap_targets=_roadmap_targets(
+                str(Path(roadmap_targets).expanduser().resolve()) if roadmap_targets else None, "roadmap_targets"
+            ),
         )
         _write_worker_specs(config, [*specs, spec])
     ensure_manager(config)
@@ -2190,6 +2208,7 @@ def add_workers_parser(subparsers) -> None:
     add.add_argument("--self-tested", action="store_true", help="apply the self-tested label after local verification")
     add.add_argument("--roadmap-only", help="pin roadmap rounds to one area")
     add.add_argument("--roadmap-skip", default="", help="comma-separated roadmap areas to exclude")
+    add.add_argument("--roadmap-targets", metavar="FILE", help="operator target list that roadmap rounds author from")
     add.add_argument("--extra-roadmap-prompt", help="extra guidance for roadmap rounds, appended to the agent's prompt")
     add.add_argument("--source", help="source repository; requires roadmap in --only and one pinned roadmap area")
     add.add_argument("--author-model", help="exact authoring model; needs an explicit --agent")
@@ -2277,6 +2296,9 @@ def cmd_workers(args) -> int:
                     "auto_refresh": args.auto_refresh,
                     "self_tested": args.self_tested,
                     "roadmap_skip": [item for item in args.roadmap_skip.split(",") if item],
+                    "roadmap_targets": str(Path(args.roadmap_targets).expanduser().resolve())
+                    if args.roadmap_targets
+                    else None,
                     "stream": args.stream,
                     "isolate_home": args.isolate_home,
                     "claude_billing": args.claude_billing,

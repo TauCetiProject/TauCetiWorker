@@ -22,6 +22,7 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
 | `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
 | `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
+| `--roadmap-targets FILE` | Author only from an operator [target list](target-lists.md): each roadmap round takes one open item whose prerequisites have landed, claims it, and assigns it to the agent; with nothing eligible the round authors nothing. `--roadmap-only` and `--roadmap-skip` narrow the areas it draws from. Re-read every round; an empty value means no list. |
 | `--extra-roadmap-prompt TEXT` | Operator guidance rendered into the roadmap prompt as its own section, steering the choice of target within the designated roadmap (and of area under `--roadmap-only ""`; an unpinned worker still draws its area at random first). It cannot override `--roadmap-skip`, others' claims, or the repository's rules; other phases ignore it. At most 4096 characters, not blank. |
 | `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. A shallow snapshot is stored in worker state, refreshed on later rounds, and mounted read-only in Bubble mode. Requires the roadmap phase to be enabled and one specific `--roadmap-only AREA`; other enabled phases ignore it, and the roadmap and review quality remain authoritative. |
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
@@ -365,6 +366,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_FORK` | auto-created | Point at an existing fork instead of the one the worker creates. |
 | `TAUCETI_ROADMAP_ONLY` | _(unset)_ | The single roadmap area for `--roadmap-only`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
 | `TAUCETI_ROADMAP_SKIP` | _(unset)_ | Comma-separated roadmap areas to exclude, for `--roadmap-skip`. |
+| `TAUCETI_ROADMAP_TARGETS` | _(unset)_ | Path of the operator target list, for `--roadmap-targets`; blank means no list. |
 | `TAUCETI_EXTRA_ROADMAP_PROMPT` | _(unset)_ | Operator guidance for roadmap rounds, for `--extra-roadmap-prompt`. |
 | `TAUCETI_ROADMAP_EXTRA_IDENTITIES` | _(unset)_ | Comma-separated extra GitHub logins whose claimed intentions count as the worker's own. |
 | `TAUCETI_RESPECT_CLAIMS` | `true` | Whether roadmap workers avoid others' claimed intentions; `false` is the same as `--ignore-claims`. |
@@ -417,6 +419,10 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_GITHUB_SHARED_DIR` | `state/github-shared` | Stable cross-worker cache, quota state, host gh wrapper and HTTP accounting directory. |
 | `TAUCETI_GITHUB_CACHE_BYPASS` | _(unset)_ | Set to `1` to bypass shared cached reads for diagnosis. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
+| `TAUCETI_INCIDENTS_DIR` | _(unset)_ | Directory, shared by a fleet's workers, for [incident records](incidents.md): a `rebase`, `fix`, or `fix-ci` round that left nothing on GitHub writes the agent's final message there, and a spent attempt budget is noted once per head. Unset writes nothing. |
+| `TAUCETI_HOLD_DECLINED` | _(unset)_ | `1` keeps a stage off a pull request head that such a `declined` record names, until the head moves or the record is deleted. Needs `TAUCETI_INCIDENTS_DIR`. |
+| `TAUCETI_DECIDE_GAP` / `TAUCETI_DECIDE_MAX_CASES` | `600` / `6` | For a worker whose `--only` names [`decide`](decide.md): seconds between its rounds on one incident directory, and incidents put to the model in one round. |
+| `TAUCETI_DECIDE_CLOSE` / `TAUCETI_DECIDE_MAX_CLOSES_PER_DAY` | _(unset)_ / `3` | `1` lets a `close` ruling close the account's own pull request after [its checks](decide.md#what-close-checks), at most that many times per UTC day. |
 | `CLAIM_REPO` | automatic | The repository holding this worker's cooperative claim leases. Without an override it is the shared namespace `TauCetiProject/tauceti-claims` once your account can push there, and your own fork until then. See [the claim namespace](#the-claim-namespace). |
 | `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `1500` / `300` | Branch-claim lease TTL and heartbeat interval (seconds). |
 

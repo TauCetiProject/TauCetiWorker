@@ -37,7 +37,8 @@ and `fractional_percent` for a fractional slot. Designated workers select an
 area before their survey from the intersection of that list and their eligible
 live areas, then run the normal maintenance, review, and authoring cascade within
 that area. The fractional slot takes that draw with the supplied integer
-percentage each round. Other workers retain the full random draw. Explicit `--roadmap-only` and
+percentage each round. Other workers retain the full random draw, and a worker with a
+[target list](target-lists.md) draws from its list instead. Explicit `--roadmap-only` and
 `--roadmap-skip` settings retain precedence; the usual maintenance and review
 priorities apply within the chosen area. Stale/malformed focus or no remaining
 eligible focus areas falls back to ordinary selection. Fleet controls this live through
@@ -220,7 +221,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `max_open_prs` | positive integer | `32` | Open-PR cutoff for roadmap authoring. CLI `--max-open-prs` and `TAUCETI_MAX_OPEN_PRS` also configure it. Science-account workers use `128`. |
 | `github_state_url` | string | public Tau Ceti mirror | Shared GitHub state service. Clients use its newest available data, with direct fallback on unavailable coverage or transport. See [service operations](../services/github-state/README.md). |
 | `github_state_token_file` | string | unset | Private client-token file for the service; installation credentials stay on the server. |
-| `only` | string list | `[]` | Work phases: `rebase`, `bump`, `progress`, `fix-ci`, `fix`, `review`, `roadmap`, `lint-repair`, `overlap-scan`, `overlap-fix`. Empty means the automatic cascade. Set `TAUCETI_OVERLAP_BATCH_COMMITS` through `env` to override the calibrated 160-commit scan batch. |
+| `only` | string list | `[]` | Work phases: `rebase`, `bump`, `progress`, `fix-ci`, `fix`, `review`, `roadmap`, `lint-repair`, `overlap-scan`, `overlap-fix`. Empty means the automatic cascade. `decide`, which rules on [incident records](decide.md), runs only when named here. Set `TAUCETI_OVERLAP_BATCH_COMMITS` through `env` to override the calibrated 160-commit scan batch. |
 | `claude_billing` | string | `"subscription"` | `"api"` requires `agent = "claude"`; API mode bypasses subscription quota polling |
 | `budget` | bool | `false` | Admit API sessions through the shared local grant ledger; active sessions are never cut off by funding |
 | `anthropic_api_key_file` | string | unset | Private key-file path for API mode; otherwise use `ANTHROPIC_API_KEY`; never store a raw key in config |
@@ -229,6 +230,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `auto_refresh` | bool | `false` | Renew this worker's Claude access token when it expires, instead of parking until a human runs `claude`. Only safe when nothing else uses the same credential file — the refresh token is single-use. See [quota and pacing](quota.md) |
 | `roadmap_only` | string | unset | The single roadmap area for roadmap rounds. `""` means all areas; unset means a fresh random area each round |
 | `roadmap_skip` | string list | `[]` | Roadmap areas to exclude. `roadmap_only` wins on overlap |
+| `roadmap_targets` | string | unset | Absolute path of an operator [target list](target-lists.md). Roadmap rounds author only its open items whose prerequisites have landed, one claimed item per round. Several workers may name the same file |
 | `roadmap_extra_identities` | string list | `[]` | Extra GitHub logins whose claimed intentions count as this worker's own |
 | `extra_roadmap_prompt` | string | unset | Operator guidance rendered into the roadmap prompt, steering target choice within the designated roadmap. Not blank, at most 4096 characters; other phases ignore it |
 | `respect_claims` | bool | `true` | Whether to avoid intentions others have claimed |
@@ -474,6 +476,7 @@ entry with `enabled = true`.
 | `--auto-refresh` | `auto_refresh` |
 | `--roadmap-only AREA` | `roadmap_only` |
 | `--roadmap-skip AREAS` | `roadmap_skip`, as a comma-separated list |
+| `--roadmap-targets FILE` | `roadmap_targets`, made absolute |
 | `--extra-roadmap-prompt TEXT` | `extra_roadmap_prompt` |
 | `--source PATH_OR_URL` | `source`; also requires `roadmap` in `--only` and a non-empty `--roadmap-only` |
 | `--author-model MODEL` | `author_model` |

@@ -160,7 +160,7 @@ def deduplicate(observations):
 def run_round(w, opts, *, use_fleet_focus=True):
     import os
 
-    from .work_units import NoEligibleWork, want
+    from .work_units import NoEligibleWork, note_spent_budgets, want
     from .work_units import run_round as ordinary_round
 
     observations = collect(w, opts, use_fleet_focus=use_fleet_focus)
@@ -188,10 +188,32 @@ def run_round(w, opts, *, use_fleet_focus=True):
                 waits.append(
                     SharedStateUnavailable("; ".join(result.errors) or f"{name} unavailable", result.dependency_wait)
                 )
+    for _, worker, result in healthy:
+        note_spent_budgets(worker, result, opts)
     if not healthy:
         if waits:
             raise waits[0]
         raise NoProgress("all selected source surveys are unavailable")
+    if "decide" in opts.only:
+        # Each source's incident records are ruled on by a round on that source, once a round and
+        # ahead of any source's work; a hold a ruling lifts is gone from the next survey.
+        from .config import SourceUnavailable
+
+        said = []
+        for name, worker, result in sorted(healthy, key=lambda row: row[0] != "github"):
+            worker.target_sources = [other.gh for _, other, _ in healthy if other is not worker]
+            selected = dataclasses.replace(opts, only=["decide"])
+            try:
+                if name == "github":
+                    return ordinary_round(worker, selected, prepared_survey=result)
+                with activate(worker.gh, worker.cfg):
+                    return ordinary_round(worker, selected, prepared_survey=result)
+            except (NoProgress, SourceUnavailable, ForgeError) as error:
+                said.append(f"{name}: {error}")
+        if opts.only == ["decide"]:
+            raise NoProgress("; ".join(said))
+        log(f"{'; '.join(said)}; going on to the other selected work")
+        opts = dataclasses.replace(opts, only=[task for task in opts.only if task != "decide"])
     executable = [(name, worker, result) for name, worker, result in healthy if name == "github" or opts.sandbox_host]
     if len(executable) != len(healthy):
         log("Forgejo agent rounds currently require host mode")
@@ -251,6 +273,7 @@ def run_round(w, opts, *, use_fleet_focus=True):
             and not opts.prs
         ):
             worker.cross_source_targets = inventory
+            worker.target_sources = [other.gh for _, other, _ in healthy if other is not worker]
             selected = dataclasses.replace(opts, only=["roadmap"])
             if name == "github":
                 return ordinary_round(worker, selected, prepared_survey=result)

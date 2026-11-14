@@ -290,7 +290,7 @@ ALLOWED_TASKS = [
     "overlap-fix",
 ]
 
-EXPLICIT_TASKS = ("security-audit",)
+EXPLICIT_TASKS = ("security-audit", "decide")
 WORK_TASKS = [*ALLOWED_TASKS, *EXPLICIT_TASKS]
 
 # Priority for an unrestricted round. Resolve conflicts and adapt a broken Mathlib bump first, then
@@ -321,6 +321,7 @@ SANDBOX_DEFAULT = {t: True for t in WORK_TASKS}
 # bounded by the merge gate, which only ever admits two markdown files in one directory.
 SANDBOX_DEFAULT["progress"] = False
 SANDBOX_DEFAULT["overlap-scan"] = False  # host investigation; publication stays outside the model
+SANDBOX_DEFAULT["decide"] = False  # bounded text in, a checked answer file out; every write is the host's
 
 
 AGENTS = ["auto", "codex", "claude", "kiro", "deepseek", "minimax"]
