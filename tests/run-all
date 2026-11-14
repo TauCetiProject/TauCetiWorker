@@ -249,6 +249,7 @@ RUN_STDLIB=(
   ssl_cert_file.py
   staging_journal_report.py
   status_labels.py
+  target_list.py
   tend_bot_permissions.py
   worker_claude_config.py
   worker_manager.py
@@ -275,7 +276,7 @@ NATIVE_FS=(queue_repair_cache.py cache_storage.py shared_mathlib.py verification
 # Modules that read README.md, docs/*.md or workers.toml.example and assert on their contents. A
 # change that touches only documentation can break these and nothing else, so CI runs just this
 # group for it. The guard below keeps the list honest.
-DOCS_CONTRACT=(pr_targeting.py review_throttles.py forge_contracts.py)
+DOCS_CONTRACT=(pr_targeting.py review_throttles.py forge_contracts.py target_list.py)
 
 pass=0; fail=0; failed=()
 

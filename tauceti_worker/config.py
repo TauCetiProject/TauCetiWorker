@@ -80,6 +80,14 @@ def roadmap_skip() -> list[str]:
     return sorted({tok for tok in (t.strip() for t in raw.split(",")) if tok})
 
 
+def roadmap_targets() -> Path | None:
+    """The operator's target list for roadmap rounds (see docs/target-lists.md), read live from
+    TAUCETI_ROADMAP_TARGETS so --roadmap-targets is inherited by loop children. None when unset or
+    blank: roadmap rounds choose their own target. The file itself is read once per round."""
+    raw = os.environ.get("TAUCETI_ROADMAP_TARGETS", "").strip()
+    return Path(raw) if raw else None
+
+
 EXTRA_ROADMAP_PROMPT_MAX_CHARS = 4096
 
 
