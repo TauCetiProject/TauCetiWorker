@@ -446,8 +446,8 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             raise Die("TAUCETI_SECURITY_AUDIT_MIN_COMMITS must be a positive integer") from None
         try:
             return run(w.cfg, replace(opts, only=["security-audit"]), min_commits=minimum)
-        except (Die, NoProgress) as exc:
-            log(f"{exc}; continuing {', '.join(other_tasks)} work without advancing the audit cursor")
+        except Exception as exc:  # Any audit failure, even an unexpected one, must not starve maintenance.
+            log(f"{exc!r}; continuing {', '.join(other_tasks)} work without advancing the audit cursor")
         # The audit runner retains its evidence and blocks. Maintenance cannot
         # clear them or move the cursor; the separate release gate stays enforced.
         opts = replace(opts, only=other_tasks)

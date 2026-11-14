@@ -1214,7 +1214,7 @@ class MaintenanceScheduling(unittest.TestCase):
         maintenance.assert_not_called()
 
     def test_audit_blocks_and_service_failures_allow_maintenance(self):
-        for result in (sa.NoProgress("service unavailable"), sa.Die("finding")):
+        for result in (sa.NoProgress("service unavailable"), sa.Die("finding"), FileExistsError("audit state")):
             with (
                 self.subTest(error=str(result)),
                 patch.object(sa, "run", side_effect=result),
