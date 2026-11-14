@@ -20,14 +20,54 @@ HERE = _pkg if (_pkg / "prompts").is_dir() else _pkg.parent
 INSTALLED = HERE == _pkg  # a wheel (uv tool, pip, Fleet runtime), not a source checkout
 
 
+def login_home() -> Path:
+    """The account's home from the password database. Worker isolation changes $HOME."""
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        return Path(os.path.expanduser("~"))
+
+
 def user_data_root() -> Path:
-    """Per-user worker data for installed packages, outside the replaceable install."""
+    """Per-user worker data for installed packages, outside the replaceable install.
+
+    Anchored at the login home, never $HOME: an isolated worker runs with $HOME inside its own
+    state, and must keep selecting the root that holds that state."""
     xdg = os.environ.get("XDG_DATA_HOME")
-    if xdg:
+    if xdg and Path(xdg).expanduser().is_absolute():  # the spec ignores relative values
         return Path(xdg).expanduser() / "tauceti"
     if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "tauceti" / "data"
-    return Path.home() / ".local" / "share" / "tauceti"
+        return login_home() / "Library" / "Application Support" / "tauceti" / "data"
+    return login_home() / ".local" / "share" / "tauceti"
+
+
+def _older_generation_live(root: Path) -> bool:
+    """Whether a worker or round of an earlier installation still holds a lock under ``root``.
+
+    Such a loop keeps its package-relative root until it exits, and the rounds it starts run the
+    upgraded code; they must keep using its root rather than split from it."""
+    import fcntl
+
+    try:
+        locks = [*root.glob("state/*/instance.lock"), *root.glob("state/*/round.lock")]
+    except OSError:
+        return False
+    for lock in locks:
+        try:
+            fd = os.open(lock, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            continue
+        finally:
+            os.close(fd)  # releases the probe
+    return False
 
 
 def legacy_data_root(default: Path | None = None) -> Path:
@@ -37,13 +77,18 @@ def legacy_data_root(default: Path | None = None) -> Path:
     cleanup subprocesses, including isolated worker homes. A source checkout keeps them beside
     the code (gitignored). An installed package uses user_data_root(): data inside the package
     directory was silently kept across `uv tool upgrade` yet destroyed by `--force` or
-    `uninstall`, and the collector now deletes what earlier installations left there.
+    `uninstall`, and the collector deletes what earlier installations left there. The default
+    is resolved once per process and exported, so every descendant agrees on it.
     """
     raw = os.environ.get("TAUCETI_LEGACY_DATA_ROOT")
     if not raw:
         if default is not None and default != HERE:
             return default
-        return user_data_root() if INSTALLED else HERE
+        if not INSTALLED:
+            return HERE
+        root = HERE if _older_generation_live(HERE) else user_data_root()
+        os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(root)
+        return root
     root = Path(raw).expanduser()
     if not root.is_absolute():
         raise ValueError("TAUCETI_LEGACY_DATA_ROOT must be an absolute path")
