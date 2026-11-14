@@ -1433,7 +1433,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             opts.authoring_profile = checked
     from . import shared_mathlib
 
-    shared_mathlib.set_round_purpose(w.cfg.checkout)  # stages that need one set it themselves
+    shared_mathlib.set_round_purpose(None)  # stages that need one set it themselves
     fn = {
         "review": do_review,
         "fix": do_fix,
@@ -1995,7 +1995,7 @@ def _do_fixlike(
     from . import shared_mathlib
 
     shared_mathlib.set_round_purpose(
-        w.cfg.checkout, rebase=label == "rebase", bump=label == "bump" or getattr(p, "automatic_bump", False)
+        getattr(getattr(w, "cfg", None), "checkout", None), rebase=label == "rebase", bump=label == "bump" or getattr(p, "automatic_bump", False)
     )
     prompt = fill_prompt(
         HERE / "prompts" / prompt_file,
