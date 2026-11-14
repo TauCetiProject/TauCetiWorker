@@ -370,7 +370,9 @@ def replace(canonical, path):
         temporary.unlink(missing_ok=True)
 
 
-BATCH = 256
+# Files hashed and then converged together; small enough that one batch fits any budget.
+BATCH = 16
+GRACE = 30
 
 
 class Pass:
@@ -443,41 +445,48 @@ class Pass:
         except (OSError, subprocess.SubprocessError, ValueError) as error:
             log(f"canonical store: Lake hashing failed; deferring ({error})")
             return
-        for path, name, info in items:
+        for path, _, info in items:
             if str(path) in computed:
-                self.lakes[fingerprint(info)] = computed[str(path)] == name.split(".", 1)[0]
+                # The bytes' hash, not a verdict: two names may share one inode.
+                self.lakes[fingerprint(info)] = computed[str(path)]
 
     def lake(self, path, name, info):
-        """True if the bytes hash to their name, False if not, None if unknown."""
+        """True if the bytes hash to `name`, False if not, None if unknown."""
         if fingerprint(info) not in self.lakes:
             self.prefetch([(path, name, info)])
-        return self.lakes.get(fingerprint(info))
+        computed = self.lakes.get(fingerprint(info))
+        return None if computed is None else computed == name.split(".", 1)[0]
 
     def invalidate(self, path, name, info, private):
-        """Remove bytes that fail their own Lake hash (and the module trace) so Lake rebuilds."""
+        """Remove bytes that fail their own Lake hash so Lake rebuilds them.
+
+        The module trace stays: Lake's up-to-date check requires every recorded output to exist,
+        so one missing output already forces a rebuild, and the trace still lists the module's
+        unfinished siblings for the next relink pass.
+        """
         if not self.quiescent(path, info):
             return
-        trace = None if private else self.trace_of.get(path)
-        if trace is not None:
-            try:
-                trace_info = trace.lstat()
-            except FileNotFoundError:
-                trace = None
-            else:
-                if (trace_info.st_dev, trace_info.st_ino) in self.writable or trace_info.st_mtime > self.not_after:
-                    self.count("deferred_busy")
-                    return
         path.unlink(missing_ok=True)
         if private:
             self.count("stale_store_files")
             return
         path.with_name(path.name + ".hash").unlink(missing_ok=True)
-        if trace is not None:
-            trace.unlink(missing_ok=True)
-        self.count("invalidated_modules")
-        log(f"canonical store: {path} fails its Lake hash {name}; removed it and its trace so Lake rebuilds")
+        self.count("invalidated_outputs")
+        log(f"canonical store: {path} fails its Lake hash {name}; removed it so Lake rebuilds its module")
+
+    def idle(self, path, info):
+        """A pool file may be published, quarantined or evicted only while nothing can write it."""
+        if (info.st_dev, info.st_ino) in self.writable:
+            self.count("deferred_busy")
+            return False
+        try:
+            return fingerprint(path.lstat()) == fingerprint(info)
+        except FileNotFoundError:
+            return False
 
     def evict(self, name, info, reason):
+        if not self.idle(self.objects / name, info):
+            return False
         canonical = self.objects / name
         aliases = [canonical]
         old = legacy(self.pool, name)
@@ -489,6 +498,7 @@ class Pass:
         sidecar(self.directory, name).unlink(missing_ok=True)
         self.report.setdefault("integrity_failures", []).append(name)
         log(f"canonical store: INTEGRITY FAILURE: object {name} {reason}; evicted")
+        return True
 
     def link_in(self, canonical, path, info, private):
         if self.quiescent(path, info):
@@ -510,10 +520,14 @@ class Pass:
             except FileNotFoundError:
                 canonical_info = None
             if canonical_info is not None:
+                if (canonical_info.st_dev, canonical_info.st_ino) in self.writable:
+                    self.count("deferred_busy")  # Neither trusted nor re-recorded while writable.
+                    return
                 sha, size, intact = expected(self.directory, name, self.deadline)
                 if not intact:
-                    self.evict(name, canonical_info, "no longer matches its recorded sha256")
-                    continue
+                    if self.evict(name, canonical_info, "no longer matches its recorded sha256"):
+                        continue
+                    return
                 if canonical_info.st_ino == info.st_ino:
                     return
                 if info.st_size == size and self.sha(path, info) == (sha, size):
@@ -555,7 +569,11 @@ class Pass:
                 return None
             if pool_verdict:
                 try:
+                    if not self.idle(old, pool_info):
+                        return None
                     sha, size = self.sha(old, pool_info)
+                    if not self.idle(old, pool_info):
+                        return None  # Changed while hashing: not the bytes that were verified.
                     os.link(old, canonical)
                 except FileExistsError:
                     return "again"
@@ -573,6 +591,8 @@ class Pass:
                 log(f"canonical store: pool copy of {name} fails its Lake hash, and so does {path}; leaving it")
                 return None
             # The checkout's bytes are right and the pool's are not: quarantine the pool copy.
+            if not self.idle(old, pool_info):
+                return None
             old.unlink(missing_ok=True)
             self.count("pool_quarantined")
             log(f"canonical store: pool copy of {name} fails its Lake hash; removed it")
@@ -689,14 +709,21 @@ def _relink(work, build, sweep_private, delete_setup, limit):
             with contextlib.suppress(FileNotFoundError):
                 if (work.private / name).lstat().st_ino != (work.objects / name).stat().st_ino:
                     private_names.add(name)
-    names = sorted(set(by_name) | private_names)
+    # One work item per file, so a name with many copies is bounded like many names.
+    items = sorted(
+        [(name, str(path), False) for name, paths in by_name.items() for path in paths]
+        + [(name, str(work.private / name), True) for name in private_names]
+    )
     key = hashlib.sha256(str(work.checkout.resolve()).encode()).hexdigest()[:16]
     cursor_path = work.directory / "cursors" / (key + ".json")
-    after = read_json(cursor_path).get("after", "")
-    split = next((i for i, n in enumerate(names) if n > after), len(names))
-    order = names[split:] + names[:split]
+    after = tuple(read_json(cursor_path).get("after") or ("", ""))
+    split = next((i for i, item in enumerate(items) if item[:2] > after), len(items))
+    order = items[split:] + items[:split]
     done = 0
     last = None
+    deadline = work.deadline
+    # Every pass finishes at least one file, so even an exhausted budget makes progress.
+    work.deadline = max(deadline, time.monotonic() + GRACE)
     try:
         for offset in range(0, len(order), BATCH):
             batch = order[offset : offset + BATCH]
@@ -704,12 +731,13 @@ def _relink(work, build, sweep_private, delete_setup, limit):
                 batch = batch[: max(0, limit - done)]
             if not batch or time.monotonic() >= work.deadline:
                 raise TimeoutError("relink budget reached")
-            # Hash together what a batch will need to decide new names, then converge it.
-            fetch = []
-            for name in batch:
+            # Hash what this batch needs to decide new names, then converge this batch.
+            fetch, names = [], set()
+            for name, raw, _ in batch:
                 if (work.objects / name).exists():
                     continue
-                candidates = [*by_name.get(name, []), legacy(work.pool, name)]
+                candidates = [Path(raw)] + ([legacy(work.pool, name)] if name not in names else [])
+                names.add(name)
                 for candidate in candidates:
                     with contextlib.suppress(FileNotFoundError):
                         info = candidate.lstat()
@@ -717,16 +745,25 @@ def _relink(work, build, sweep_private, delete_setup, limit):
                             fetch.append((candidate, name, info))
             for start in range(0, len(fetch), HASH_BATCH):
                 work.prefetch(fetch[start : start + HASH_BATCH])
-            for name in batch:
+            index = 0
+            while index < len(batch):
+                name = batch[index][0]
+                end = index
+                while end < len(batch) and batch[end][0] == name:
+                    end += 1
+                group = batch[index:end]
                 with object_lock(work.directory, name, exclusive=True, deadline=work.deadline):
-                    for path in by_name.get(name, []):
-                        work.decide(path, name, False)
-                    if name in private_names:
-                        work.decide(work.private / name, name, True)
-                done += 1
-                last = name
+                    for _, raw, is_private in group:
+                        if time.monotonic() >= work.deadline:
+                            raise TimeoutError("relink budget reached")
+                        work.decide(Path(raw), name, is_private)
+                        done += 1
+                        last = (name, raw)
+                        work.deadline = deadline  # The first file's grace is over.
+                index += len(group)
     except TimeoutError:
         pass
+    work.deadline = deadline
     complete = done >= len(order)
     report["remaining"] = len(order) - done
     if complete:
@@ -734,7 +771,7 @@ def _relink(work, build, sweep_private, delete_setup, limit):
     else:
         report["incomplete"] = True
         if last is not None:
-            expanded_cache.atomic_json(cursor_path, dict(after=last))
+            expanded_cache.atomic_json(cursor_path, dict(after=list(last)))
     if delete_setup and complete:
         removed = 0
         for path in setups:
