@@ -49,6 +49,7 @@ from .processes import run as run_process
 from .quota import (
     Quota,
     _claude_keychain_creds_interactive,
+    _codex_store_setting,
     _read_json_file,
     _safe_exists,
     _write_json_atomic,
@@ -253,8 +254,13 @@ def _codex_model_probe(cfg: Config, model: str) -> subprocess.CompletedProcess[s
         "--ephemeral",
         "--ignore-user-config",
         "--ignore-rules",
-        _CODEX_MODEL_ACCESS_PROMPT,
     ]
+    # --ignore-user-config also drops the user's credential store, leaving the system or workspace
+    # default to choose it; repeat an explicit choice so the probe uses the credential authoring will.
+    store = _codex_store_setting(codex_dir(cfg.home) / "config.toml")
+    if store in ("file", "keyring", "auto", "ephemeral"):
+        command += ["-c", f'cli_auth_credentials_store="{store}"']
+    command.append(_CODEX_MODEL_ACCESS_PROMPT)
     try:
         return run_process(
             command,

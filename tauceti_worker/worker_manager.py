@@ -1583,9 +1583,12 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
         pacing += f" · curve {spec['pace']}"
     lines.extend(_status_field("pacing", [pacing], width))
 
-    # Worth stating rather than leaving implicit: this worker rotates the operator's Claude credential.
+    # Worth stating rather than leaving implicit: this worker rotates the operator's credentials.
     if spec.get("auto_refresh"):
-        lines.extend(_status_field("credential", ["renews its own Claude access token (--auto-refresh)"], width))
+        whose = {"claude": "Claude access token", "codex": "Codex access token"}.get(
+            agent, "Claude and Codex access tokens"
+        )
+        lines.extend(_status_field("credential", [f"renews its own {whose} (--auto-refresh)"], width))
 
     if "roadmap" in phases:
         focus = spec.get("roadmap_only")
@@ -2183,8 +2186,8 @@ def add_workers_parser(subparsers) -> None:
     add.add_argument(
         "--auto-refresh",
         action="store_true",
-        help="renew this worker's Claude access token when it expires, instead of parking until a "
-        "human runs `claude`. Only safe when nothing else uses the same credential file "
+        help="renew this worker's Claude and Codex access tokens when they expire, instead of parking "
+        "until a human runs `claude` or `codex`. Only safe when nothing else uses the same credential file "
         "(see `tauceti work --help`)",
     )
     add.add_argument("--self-tested", action="store_true", help="apply the self-tested label after local verification")

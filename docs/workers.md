@@ -226,7 +226,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `anthropic_api_key_file` | string | unset | Private key-file path for API mode; otherwise use `ANTHROPIC_API_KEY`; never store a raw key in config |
 | `sandbox` | string | `"host"` | `host` or `bubble`. Progress-report rounds always run on the host |
 | `ignore_quota` | bool | `false` | Skip soft pacing. Provider hard limits still apply; an `auto` worker cannot launch with this enabled |
-| `auto_refresh` | bool | `false` | Renew this worker's Claude access token when it expires, instead of parking until a human runs `claude`. Only safe when nothing else uses the same credential file — the refresh token is single-use. See [quota and pacing](quota.md) |
+| `auto_refresh` | bool | `false` | Renew this worker's Claude and Codex access tokens when they expire, instead of parking until a human runs `claude` or `codex`. Only safe when nothing else uses the same credential file — the refresh token is single-use. See [quota and pacing](quota.md) |
 | `roadmap_only` | string | unset | The single roadmap area for roadmap rounds. `""` means all areas; unset means a fresh random area each round |
 | `roadmap_skip` | string list | `[]` | Roadmap areas to exclude. `roadmap_only` wins on overlap |
 | `roadmap_extra_identities` | string list | `[]` | Extra GitHub logins whose claimed intentions count as this worker's own |

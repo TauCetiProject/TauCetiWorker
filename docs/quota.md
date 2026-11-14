@@ -131,16 +131,64 @@ someone intervenes.
 `tauceti work --loop --auto-refresh` (or `$TAUCETI_AUTO_REFRESH=1`) lets the
 worker renew the token itself once it is within 90 minutes of expiry.
 
+The same flag covers Codex. The Codex CLI renews its login only while it runs,
+and the pacer reads usage before launching it, so an expired access token parks
+the worker at `codex token expired; refresh left to the operator`. With the flag
+on, the worker renews the operator's `~/.codex/auth.json` once the access token,
+which lasts about ten days, is within two days of expiry, or when the usage
+endpoint answers 401. It leaves the file alone unless `cli_auth_credentials_store`
+resolves to `file` both for the worker's own Codex directory and for the one that
+holds that `auth.json`, counting `/etc/codex/config.toml`, the requirements files
+in `/etc/codex` and any managed `com.openai.codex` preference as Codex does. It
+also leaves it alone when a project `.codex/config.toml` sets another store (or
+cannot be read) in any directory the worker starts Codex from, or in any parent
+of one: the checkout, the state directory and the progress-writer, overlap-scan and
+recovery directories inside it, and the temporary directory. A stop signal that arrives during the exchange takes effect once the new token is
+saved.
+
+Two more sources can set the store's default: a workspace's cloud policy, which
+Codex fetches for business, education and enterprise plans, and a
+`config_server` enrolled in a requirements file in `/etc/codex`, which applies to
+any plan. Both sit below the user's `config.toml`, so how the worker treats them
+depends on that file:
+
+- **Set the store explicitly (preferred).** Put
+  `cli_auth_credentials_store = "file"` in the `config.toml` of both the worker's
+  Codex directory and the one that holds the renewed `auth.json` (the same
+  directory unless the worker is isolated). Codex then uses the file whatever
+  those defaults say, and the worker renews on any plan. Only the layers above
+  the user's file still stop it: requirements files and the legacy
+  `managed_config.toml` in `/etc/codex`, managed `com.openai.codex` preferences,
+  and the project `.codex/config.toml` files described above.
+- **Name the plan.** Without that setting the worker renews only plans that
+  Codex fetches no cloud policy for, plus any named in
+  `$TAUCETI_CODEX_REFRESH_PLANS`, and nothing at all while a `config_server` is
+  enrolled. The variable is a comma-separated list of plan names exactly as
+  Codex's tokens carry them, such as `edu_pro`. It is unset by default and
+  changes only the plan rule. A malformed value stops the worker at startup. Set
+  it per worker through the `env` table in `workers.toml`.
+
+Naming a plan asserts that your workspace's policy leaves Codex on the file store
+for this login, which `codex doctor` on the worker's host reports as the auth
+storage mode. If the policy defaults the store to the keyring, Codex keeps the
+login there, under a key derived from the Codex directory, and deletes
+`auth.json` whenever it saves to it. Renewing a leftover file is then usually just wasted: Codex never
+reads it, or the exchange fails because its refresh token was already spent. It
+logs you out only when the leftover file and the keyring hold the same refresh
+token, for example after a failed delete or a restored copy: the exchange retires
+the keyring's token, and that login needs `codex login` again.
+
 **Only turn it on when nothing else uses that credential file.** Claude and Codex
 issue single-use refresh tokens: exchanging one retires it and returns a
 replacement. TauCeti serializes its own processes on the host, but it cannot
-serialize an interactive `claude` sharing `~/.claude/.credentials.json`, a second
-refresher, or a copy of the credential on another machine — a rotation here logs
-any of those out. The shape this is meant for is a worker running as its own
-user, with its own Claude account nobody signs into interactively;
-`$CLAUDE_CONFIG_DIR` gives the same separation on a shared login. On macOS the
-flag does nothing: the Keychain is the store, and the section below applies
-instead.
+serialize an interactive `claude` sharing `~/.claude/.credentials.json` (or
+`codex` sharing `~/.codex/auth.json`), a second refresher, or a copy of the
+credential on another machine — a rotation here logs any of those out. The shape
+this is meant for is a worker running as its own user, with its own Claude and
+Codex accounts nobody signs into interactively; `$CLAUDE_CONFIG_DIR` and
+`$CODEX_HOME` give the same separation on a shared login. On macOS the Claude
+half of the flag does nothing: the Keychain is the store, and the section below
+applies instead. Codex keeps a file on macOS, so its half works there.
 
 When it is on: it renews the file the operator owns, never a worker's stripped
 mirror, and it never touches a credential carrying no refresh token, so the

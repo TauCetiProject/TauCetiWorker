@@ -47,7 +47,7 @@ TRANSIENT = SimpleNamespace(returncode=1, stdout=unavailable(500) + "\n", stderr
 RAW_FALSE_POSITIVE = SimpleNamespace(returncode=1, stdout="error: model not found\n", stderr="")
 
 
-def run(sequence, *, repeat=False, explicit=False):
+def run(sequence, *, repeat=False, explicit=False, user_config=None):
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         home = root / "home"
@@ -57,6 +57,9 @@ def run(sequence, *, repeat=False, explicit=False):
         (home / ".codex" / "auth.json").write_text(
             json.dumps({"tokens": {"account_id": "acct-test", "access_token": "secret"}})
         )
+        if user_config is not None:
+            (home / ".codex" / "config.toml").write_text(user_config)
+        saved_codex_home = os.environ.pop("CODEX_HOME", None)
         cfg = SimpleNamespace(home=home, quota_cache=cache, state=state)
         profile = tc.AuthoringProfile(
             provider="codex",
@@ -89,6 +92,8 @@ def run(sequence, *, repeat=False, explicit=False):
                 selected_again = None
         finally:
             tc.agents.run_process = saved_run
+            if saved_codex_home is not None:
+                os.environ["CODEX_HOME"] = saved_codex_home
             if saved_key is None:
                 os.environ.pop("OPENAI_API_KEY", None)
             else:
@@ -106,6 +111,22 @@ check("probe ignores user config and rules", all(x in argv for x in ("--ignore-u
 check("probe prompt is trivial, not an authoring prompt", argv[-1], "Reply with exactly OK. Do not use tools.")
 check("probe closes stdin", kwargs.get("stdin"), subprocess.DEVNULL)
 check("probe strips API-key billing", "OPENAI_API_KEY" in kwargs.get("env", {}), False)
+
+# --ignore-user-config drops the user's credential-store setting with the rest of that file, so a
+# system default would choose the probe's store. The probe carries the user's explicit setting.
+STORE = 'cli_auth_credentials_store="file"'
+check("no user store setting adds no override", STORE in argv, False)
+_, _, _, calls, _ = run([OK], user_config='cli_auth_credentials_store = "file"\n')
+argv = calls[0][0]
+check(
+    "an explicit user file store reaches the probe",
+    (STORE in argv, argv[argv.index(STORE) - 1] if STORE in argv else None),
+    (True, "-c"),
+)
+_, _, _, calls, _ = run([OK], user_config='cli_auth_credentials_store = "keyring"\n')
+check("an explicit keyring store reaches it too", 'cli_auth_credentials_store="keyring"' in calls[0][0], True)
+_, _, _, calls, _ = run([OK], user_config='cli_auth_credentials_store = "file; x"\n')
+check("an unknown value adds no override", any("cli_auth_credentials_store" in a for a in calls[0][0]), False)
 
 selected, again, error, calls, remaining = run([UNAVAILABLE, UNAVAILABLE], repeat=True)
 check("two confirmed entitlement misses select Luna", (selected.model, error), (LUNA, None))
