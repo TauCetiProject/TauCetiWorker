@@ -24,6 +24,9 @@ cd "$(dirname "$0")/.." || exit 1
 # Unit fixtures use their mocked transport, never the public production mirror.
 # Service tests explicitly override this; default-resolution tests remove it.
 export TAUCETI_GITHUB_STATE_URL=""
+# Rounds start a background cleanup collector on hosts without the systemd timer. Fixtures and
+# lifecycle scripts must never launch one against the checkout's or the host's real data.
+export TAUCETI_BACKGROUND_CLEANUP=off
 
 FAIL_FAST=0
 JOBS=1
@@ -70,11 +73,13 @@ RUN_STDLIB=(
   queue_repair_cache.py
   queue_claude_stdin.py
   expanded_cache.py
+  canonical_store.py
   cache_storage.py
   local_lint.py
   lean_pressure.py
   repair_pressure.py
   repair_parallel_fold.py
+  round_storage.py
   shared_mathlib.py
   agent_cmds.py
   agent_transcript.py
@@ -255,6 +260,7 @@ RUN_STDLIB=(
   workflow_backstop.py
   recovery_maintenance.py
   work_recovery.py
+  round_worktrees.py
   repair_recovery.py
 )
 # special-cased python tests (handled explicitly in run_one)

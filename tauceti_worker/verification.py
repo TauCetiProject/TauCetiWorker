@@ -421,6 +421,9 @@ class Verification:
             raise Incomplete("dependency, toolchain or verifier mutated during verification")
 
     def command(self, phase, argv, *, env=None, capture=False):
+        from .verification_resources import defaults
+
+        env = defaults(dict(os.environ if env is None else env))
         self.watch()
         report_runtime("verifying", verification_phase=phase, verification_receipt=str(self.path))
         log = self.directory / f"{len(self.receipt['commands']):03d}-{phase}.log"

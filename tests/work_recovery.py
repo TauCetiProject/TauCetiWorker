@@ -755,6 +755,60 @@ def test_activity(root):
     check("display shows moved-aside checkouts", "checkouts moved aside" in out.getvalue())
 
 
+def test_linked_worktrees(root):
+    """A round's linked worktree is saved like a clone, and never absorbs another round's work."""
+    origin, co, cfg = fixture(root / "worktrees")
+    mine, theirs = root / "worktrees" / "round-a", root / "worktrees" / "round-b"
+    git(co, "worktree", "add", "-q", "--detach", str(mine), "origin/main")
+    git(co, "worktree", "add", "-q", "--detach", str(theirs), "origin/main")
+    git(co, "fetch", "-q", "--tags", "origin")
+    git(co, "tag", "fetched-tag", "origin/main")
+    check("a linked worktree is recognised", wr.checkout_kind(mine) == "worktree")
+    check("the host clone is standalone", wr.checkout_kind(co) == "standalone")
+    (mine / ".git").unlink()
+    (mine / ".git").symlink_to(co / ".git")
+    check("a symlinked .git is never a checkout", wr.checkout_kind(mine) is None)
+    (mine / ".git").unlink()
+    (mine / ".git").write_text(f"gitdir: {co / '.git/worktrees/round-a'}\n")
+    check("git paths resolve through the worktree", wr.git_path(mine, "index") == co / ".git/worktrees/round-a/index")
+    (theirs / "B.lean").write_text("theorem other : True := trivial\n")
+    git(theirs, "commit", "-qam", "another round")
+    other = git(theirs, "rev-parse", "HEAD").strip()
+    before = wr.inspect(mine, history=True)
+    check("another worktree's commit is not this worktree's history", other not in before.tips.values())
+    (theirs / "A.lean").write_text("theorem later : True := trivial\n")
+    git(theirs, "commit", "-qam", "another round again")
+    check(
+        "another round's commits do not change this worktree's fingerprint",
+        wr.inspect(mine, history=True).fingerprint == before.fingerprint,
+    )
+    (mine / "A.lean").write_text("theorem mine : True := trivial\n")
+    git(mine, "commit", "-qam", "this round")
+    decision = wr.save_for_cleanup(cfg, mine)
+    check(f"a worktree with fetched tags is saved, not retained whole ({decision.reason})", decision.ok)
+    check("its record exists", decision.record is not None and wr._complete(decision.record) is not None)
+    git(theirs, "switch", "-q", "-c", "round-b-branch")
+    (theirs / "B.lean").write_text("theorem branch : True := trivial\n")
+    git(theirs, "commit", "-qam", "another round on a branch")
+    branch_tip = git(theirs, "rev-parse", "HEAD").strip()
+    check(
+        "another round's shared branch is not this worktree's history",
+        branch_tip not in wr.inspect(mine, history=True).tips.values(),
+    )
+    hosted = wr.save_for_cleanup(cfg, co)
+    check(f"a clone hosting worktrees is never approved for removal ({hosted.reason})", not hosted.ok)
+    moved = wr.retain(cfg, mine, "test retention")
+    dest = Path(moved.details["retained"]) if moved.ok else None
+    check(
+        "a retained worktree still resolves its own metadata", dest is not None and wr.checkout_kind(dest) == "worktree"
+    )
+    listing = git(co, "worktree", "list", "--porcelain") if dest else ""
+    check(
+        "a retained worktree is registered at its new path and locked",
+        f"worktree {dest}" in listing and "locked" in listing,
+    )
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -773,6 +827,7 @@ def main():
             test_prepare_checkout_restores_canonical_origin,
             test_work_paths,
             test_activity,
+            test_linked_worktrees,
         ):
             (root / test.__name__).mkdir()
             test(root / test.__name__)
