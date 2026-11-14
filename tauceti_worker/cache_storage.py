@@ -64,7 +64,11 @@ def roots(configs, pool):
 
 
 def inventory(paths, *, protected=(), owners=None, details=None):
-    """Allocated bytes, deduplicated by inode across both pool and private hard links."""
+    """Allocated bytes, deduplicated by inode across both pool and private hard links.
+
+    `named_bytes` counts every name, as `du --count-links` would: hard-linked files count once per
+    link there, so it overstates what the disk holds. `managed_bytes` counts each inode once, and
+    `unique_inodes` is how many inodes that is."""
     seen = {}
     owners = owners or {}
     for root in paths:
@@ -93,8 +97,13 @@ def inventory(paths, *, protected=(), owners=None, details=None):
         details.update(seen)
     result = {}
     for (device, _), (size, count, links, busy, _) in seen.items():
-        row = result.setdefault(device, dict(managed_bytes=0, externally_linked_bytes=0, protected_bytes=0))
+        row = result.setdefault(
+            device,
+            dict(managed_bytes=0, externally_linked_bytes=0, protected_bytes=0, named_bytes=0, unique_inodes=0),
+        )
         row["managed_bytes"] += size
+        row["named_bytes"] += size * count
+        row["unique_inodes"] += 1
         if busy:
             row["protected_bytes"] += size
         if links > count:
@@ -349,6 +358,8 @@ def collect(configs, *, dry=False, now=None, opened=...):
             )
         )
     report["managed_bytes"] = sum(row["managed_bytes"] for row in report["filesystems"])
+    report["named_bytes"] = sum(row.get("named_bytes", 0) for row in report["filesystems"])
+    report["unique_inodes"] = sum(row.get("unique_inodes", 0) for row in report["filesystems"])
     report["protected_bytes"] = sum(row.get("protected_bytes", 0) for row in report["filesystems"])
     report["reclaimed_bytes"] = sum(row["reclaimed_bytes"] for row in report["filesystems"])
     pressured = [
