@@ -306,3 +306,58 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert signals == [(12345, agents.signal.SIGTERM), (12345, agents.signal.SIGKILL)]
     assert waits[1]["timeout"] == 35  # Let the guardian reap detached descendants before the fallback.
     print("[OK] round interruption cleans up the complete downloader process group")
+
+# Without a TauCeti cache service the round must still enter the shared Mathlib view.
+with tempfile.TemporaryDirectory() as tmp:
+    co = Path(tmp)
+    (co / "lakefile.toml").write_text('name = "fixture"\n')
+    entered = []
+
+    @contextlib.contextmanager
+    def fake_view(cwd, env, logdir, fetch):
+        entered.append(cwd)
+        yield ["bwrap", "fixture"]
+
+    from tauceti_worker import shared_mathlib
+
+    with (
+        patch.object(agents, "TAUCETI_CACHE_SERVICE", ""),
+        patch.object(shared_mathlib, "view", fake_view),
+    ):
+        env = {}
+        with agents.host_build_cache_context(co, env, co / "logs") as prefix:
+            assert prefix == ["bwrap", "fixture"], prefix
+            assert json.loads(env["TAUCETI_SHARED_MATHLIB_VIEW"]) == prefix
+        assert "TAUCETI_SHARED_MATHLIB_VIEW" not in env
+
+        @contextlib.contextmanager
+        def refused(cwd, env, logdir, fetch):
+            raise shared_mathlib.Unavailable("fixture refusal")
+            yield
+
+        with patch.object(shared_mathlib, "view", refused):
+            try:
+                with agents.host_build_cache_context(co, {}, co / "logs"):
+                    raise AssertionError("round started without shared Mathlib")
+            except agents.BuildCacheUnavailable as error:
+                assert "fixture refusal" in str(error)
+    assert entered == [co]
+print("[OK] a round without the TauCeti cache service still requires the shared Mathlib view")
+
+# A workspace without Mathlib never runs Mathlib's cache executable.
+with tempfile.TemporaryDirectory() as tmp:
+    co = Path(tmp)
+    (co / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "batteries", "url": "x"}]}))
+    commands = []
+
+    def record(command, *args, **kwargs):
+        commands.append(list(command))
+        return 0
+
+    with patch.object(agents, "_cache_fetch", record):
+        try:
+            agents.warm_host_build_caches(co, {}, co / "logs")
+        except Exception:
+            pass  # later TauCeti steps need a real workspace; only the Mathlib step matters here
+    assert not any(c[-4:] == ["lake", "exe", "cache", "get"] for c in commands), commands
+print("[OK] a workspace without Mathlib skips Mathlib's cache fetch")

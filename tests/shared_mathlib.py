@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import shared_mathlib as s
-from tauceti_worker.runtime_status import atomic_json
+from tauceti_worker.runtime_status import atomic_json, read_json
 
 
 def git(repo, *args):
@@ -633,15 +633,34 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
 
     def test_missing_corrupt_policy_and_independent_safety_latch(self):
         self.env.pop("TAUCETI_SHARED_MATHLIB_BUILDS")
-        self.assertEqual(s.mode(self.env), "off")
+        default = "required"
+        self.assertEqual(s.mode(self.env), "off")  # a host with no policy never opted in
         self.pool.mkdir()
         (self.pool / "policy.json").write_text("{")
-        self.assertEqual(s.mode(self.env), "off")
+        with self.assertRaisesRegex(s.Unavailable, "invalid shared Mathlib policy"):
+            s.mode(self.env)  # an unreadable opt-in blocks instead of building privately
+        self.assertEqual(s.mode({**self.env, "TAUCETI_SHARED_MATHLIB_BUILDS": "off"}), "off")
         for build in ("auto", "required"):
             with self.assertRaisesRegex(s.Unavailable, "invalid shared Mathlib policy"):
                 s.mode({**self.env, "TAUCETI_SHARED_MATHLIB_BUILDS": build})
+        # An expired policy without an expiry mode falls back to the default, not to `off`.
+        atomic_json(self.pool / "policy.json", dict(mode="auto", expires_at=1))
+        self.assertEqual(s.mode(self.env), default)
         atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"]))
         self.assertEqual(s.mode(self.env), "required")
+        # A worker left off the allowlist is blocked, not given a private build.
+        with self.assertRaisesRegex(s.Unavailable, "not allowlisted"):
+            s.mode({**self.env, "TAUCETI_WORKER_ID": "not-allowlisted"})
+        s.stop_sharing(self.pool, "fixture integrity failure")
+        # The stop latches through the policy file alone (no environment override), and the
+        # policy's mode is left as it was rather than rewritten to `off`.
+        self.assertEqual(read_json(self.pool / "policy.json")["mode"], "auto")
+        with self.assertRaisesRegex(s.Unavailable, "safety stop"):
+            s.mode(self.env)
+        (self.pool / "safety-stop.json").unlink()
+        with self.assertRaisesRegex(s.Unavailable, "safety stop"):
+            s.mode(self.env)  # the policy's own record still latches it
+        atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"]))
         s.stop_sharing(self.pool, "fixture integrity failure")
         atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"]))
         with self.assertRaisesRegex(s.Unavailable, "safety stop"):
@@ -649,8 +668,8 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
         self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "required"
         with self.assertRaisesRegex(s.Unavailable, "safety stop"):
             s.mode(self.env)
-        self.env["TAUCETI_WORKER_ID"] = "not-allowlisted"
-        self.assertEqual(s.mode(self.env), "off")
+        self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
+        self.assertEqual(s.mode(self.env), "off")  # only an explicit operator `off` builds privately
 
     def test_reused_upper_whiteout_recovers_without_global_safety_stop(self):
         self.require_overlay()
@@ -729,8 +748,25 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
         with patch.object(s, "capability", side_effect=AssertionError("probed sharing without Mathlib")):
             with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
                 self.assertEqual(prefix, [])
-        self.assertEqual(s.summary(self.env)["blocked"], 0)
+        summary = s.summary(self.env)
+        self.assertEqual(summary["blocked"], 0)
         self.assertEqual(self.downloads, 0)
+        rows = [read_json(p) for p in (self.pool / "status").glob("*.json")]
+        self.assertEqual([r["mode"] for r in rows], ["not-applicable"])
+
+    def test_doubtful_manifests_count_as_mathlib(self):
+        for manifest in (
+            dict(name="mathlib", packages=[dict(name="batteries")]),  # Mathlib is the root package
+            dict(packages=[dict(name="mathlib-fork")]),
+            dict(packages=[dict(name="ml", url="https://github.com/someone/mathlib4")]),
+            dict(packages=[None, {}]),
+            dict(packages=[{}]),
+            dict(packages="nope"),
+        ):
+            (self.cwd / "lake-manifest.json").write_text(json.dumps(manifest))
+            self.assertTrue(s._names_mathlib(self.cwd), manifest)
+        (self.cwd / "lake-manifest.json").write_text(json.dumps(dict(packages=[dict(name="batteries", url="x")])))
+        self.assertFalse(s._names_mathlib(self.cwd))
 
     def test_required_missing_mathlib_reports_blocked_before_inference(self):
         shutil.rmtree(self.mathlib)
@@ -838,7 +874,8 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
 
     def test_canary_allowlist_and_private_rollback(self):
         self.env["TAUCETI_SHARED_MATHLIB_WORKERS"] = "one,two"
-        self.assertEqual(s.mode(self.env), "off")
+        with self.assertRaisesRegex(s.Unavailable, "not allowlisted"):
+            s.mode(self.env)  # required sharing: an unlisted worker is blocked, never private
         self.env["TAUCETI_WORKER_ID"] = "one"
         self.assertEqual(s.mode(self.env), "required")
         self.env["TAUCETI_SHARED_MATHLIB_BUILDS"] = "off"
@@ -990,7 +1027,10 @@ for name,expected in [('Mathlib.olean',b'private'),('Mathlib.ilean',b'verified a
         atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"], expires_at=time.time() + 60))
         self.assertEqual(s.mode(self.env), "required")
         atomic_json(self.pool / "policy.json", dict(mode="auto", workers=["fixture"], expires_at=time.time() - 1))
-        self.assertEqual(s.mode(self.env), "off")
+        self.assertEqual(s.mode(self.env), "required")
+        expiry = dict(mode="auto", workers=["fixture"], expires_at=time.time() - 1, expiry_mode="off")
+        atomic_json(self.pool / "policy.json", expiry)
+        self.assertEqual(s.mode(self.env), "off")  # an explicit operator expiry mode still applies
 
     def test_real_overlay_remounts_after_key_change(self):
         self.require_overlay()
