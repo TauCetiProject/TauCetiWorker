@@ -136,10 +136,11 @@ their build is shared with `main`.
 ### Checkouts and clones
 
 - One host clone of TauCeti under the build-cache root. Worker checkouts are
-  `git worktree add` from it (or `clone --shared`), so the object store exists once.
-- A checkout is disposable state: its `.lake` holds only links, and its source is
-  recoverable from git and the recovery record. Losing a checkout costs a worktree
-  add, not a 15 GiB rebuild.
+  worktrees of it (`git worktree add`), never `clone --shared` or separate clones,
+  so the object store exists once and `git gc` sees every reference.
+- A checkout lives for one round (see [TauCeti versions](#tauceti-versions)). Its
+  `.lake` holds only links, and its source is recoverable from git and the recovery
+  record, so creating one costs a worktree add, not a 15 GiB rebuild.
 
 ### Recovery and retention
 
@@ -199,8 +200,8 @@ checkouts, old branches and recovery records protect nothing.
   its budget.
 - **Shared git store.** `git worktree prune` and ordinary `git gc`. Checkouts are
   worktrees, not `clone --shared`, so `gc` sees every checkout's references.
-- **Checkouts.** Small (source plus nothing between rounds), deleted when a
-  worker is retired or idle for three days.
+- **Checkouts.** Removed at the end of every round, with their links; a crashed
+  round's worktree is removed by the next collector run once its lease is gone.
 - **Excess is an error.** More Mathlib versions than allowed, or a store over its
   budget, is reported as a regression in `workers status` and Fleet telemetry, not
   only as a warning. If live rounds alone exceed the budget, new rounds wait for
