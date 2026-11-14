@@ -93,6 +93,10 @@ def selection(env):
     ).lower()
     if value not in {"auto", "off", "required"}:
         raise Unavailable("TAUCETI_SHARED_MATHLIB_BUILDS must be auto, off or required")
+    if value == "auto":
+        # Sharing is no longer optional: a round that cannot share stops instead of building a
+        # private copy of Mathlib. Only an explicit operator `off` keeps private builds.
+        value = "required"
     allowed = env.get("TAUCETI_SHARED_MATHLIB_WORKERS", ",".join(policy["workers"]) if "workers" in policy else None)
     if allowed is not None and env.get("TAUCETI_WORKER_ID", "default") not in allowed.split(","):
         return "off", "worker is not allowlisted for shared Mathlib"
@@ -1173,6 +1177,16 @@ def summary(env=None, *, scope=None, worker=None):
 
 
 @contextlib.contextmanager
+def _names_mathlib(cwd):
+    try:
+        packages = json.loads((cwd / "lake-manifest.json").read_text()).get("packages")
+    except (OSError, ValueError, AttributeError):
+        return True  # unreadable: let the ordinary checks decide, never assume no Mathlib
+    if not isinstance(packages, list):
+        return True
+    return any(isinstance(p, dict) and p.get("name") == "mathlib" for p in packages)
+
+
 def view(cwd, env, logdir, fetch):
     """Yield an argv prefix and keep the lower leased until the whole agent exits."""
     pool = root(env)
@@ -1182,6 +1196,9 @@ def view(cwd, env, logdir, fetch):
         report(pool, env, mode="blocked", reason=str(error))
         raise
     started = time.monotonic()
+    if not _names_mathlib(cwd):
+        yield []  # nothing to share and nothing to copy: the project does not depend on Mathlib
+        return
     upper = cwd / ".lake/packages/mathlib/.lake/build"
     marker = upper.parent / "tauceti-shared-mathlib.json"
     owned = _build_parent_owned(upper)
