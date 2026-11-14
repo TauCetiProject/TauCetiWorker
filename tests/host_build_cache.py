@@ -82,6 +82,10 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         "CACHE_TEST_CALLS": str(calls),
         "TAUCETI_SHARED_ARTIFACTS": "0",
         "TAUCETI_SHARED_MATHLIB_ROOT": str(root / "shared-pool"),
+        # Pinned so no run can reach the host's real build pool, home or activity store.
+        "TAUCETI_BUILD_CACHE_ROOT": str(root / "base-pool"),
+        "TAUCETI_ACTIVITY_DIR": str(root / "activity"),
+        "HOME": str(root / "home"),
         "LAKE_CACHE_DIR": str(root / "private-lake-store"),
         "LAKE_ARTIFACT_CACHE": "1",
         "LAKE_RESTORE_ARTIFACTS": "1",
@@ -99,6 +103,10 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         return 0
 
     def run(mode="", cwd=co, **extra):
+        from tauceti_worker import expanded_cache
+
+        assert expanded_cache.root({**env, **extra}) != expanded_cache.root({"HOME": os.environ["HOME"]})
+        assert str(expanded_cache.root({**env, **extra})).startswith(str(root)), "unisolated test"
         calls.unlink(missing_ok=True)
         launched.clear()
         output = io.StringIO()
@@ -328,6 +336,26 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
             rc, records, text = run(**overrides)
         assert rc == 0 and len(launched) == 1, (failure, text)
         assert ("skipped" if failure == "busy" else "deferred") in text, text
+
+    # Exit 70 is the guardian's "cleanup incomplete": not a quiescent boundary, so no H2.
+    phases.clear()
+    launched.clear()
+    real_launch = launch
+
+    def incomplete(*args, **kwargs):
+        real_launch(*args, **kwargs)
+        return 70
+
+    with (
+        patch("tauceti_worker.expanded_cache.preparation", private_preparation),
+        patch.object(canonical_store, "boundary", observed),
+        patch.object(agents, "run_agent_proc", incomplete),
+    ):
+        overrides_env = {**env, "CACHE_TEST_MODE": "", **overrides}
+        with patch.dict(os.environ, overrides_env, clear=True), contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = agents.run_agent_host(co, "prompt", "claude", root / "logs")
+    assert rc == 70 and phases == [("prepare", 0)], (rc, phases)
+    assert "cleanup incomplete" in err.getvalue()
     shutil.rmtree(co / ".lake")
     print("[OK] busy or failing round-end relinking keeps the agent's successful result")
 

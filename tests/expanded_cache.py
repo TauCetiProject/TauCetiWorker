@@ -3,6 +3,7 @@
 import contextlib
 import json
 import os
+import pwd
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,21 @@ class Cache(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.pool = self.root / "pool"
+        # Never let a default root reach the host's real pool, Mathlib pool, home or activity store.
+        isolation = patch.dict(
+            os.environ,
+            {
+                "TAUCETI_BUILD_CACHE_ROOT": str(self.pool),
+                "TAUCETI_ACTIVITY_DIR": str(self.root / "activity"),
+                "TAUCETI_SHARED_MATHLIB_ROOT": str(self.root / "mathlib-builds"),
+                "HOME": str(self.root / "home"),
+                # Toolchains stay readable (elan resolves them from ELAN_HOME, not HOME).
+                "ELAN_HOME": os.environ.get("ELAN_HOME") or str(Path(pwd.getpwuid(os.getuid()).pw_dir) / ".elan"),
+            },
+        )
+        isolation.start()
+        self.addCleanup(isolation.stop)
+        assert cache.root() == self.pool, "unisolated test"
         cache_storage.initialize(self.pool)
 
     def test_shared_preparation_fetches_before_hydration_finishes(self):

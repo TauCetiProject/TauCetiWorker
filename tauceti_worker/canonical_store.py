@@ -85,12 +85,23 @@ def sidecar(directory, name):
 
 
 @contextlib.contextmanager
-def object_lock(directory, name, *, exclusive=False, blocking=True):
+def object_lock(directory, name, *, exclusive=False, blocking=True, deadline=None):
+    """The object's shard lock. With a monotonic `deadline`, poll until then, then raise TimeoutError."""
     locks = directory / "locks"
     locks.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (locks / f"obj-{name[:3]}.lock").open("a+") as stream:
         mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-        fcntl.flock(stream, mode | (0 if blocking else fcntl.LOCK_NB))
+        if deadline is None:
+            fcntl.flock(stream, mode | (0 if blocking else fcntl.LOCK_NB))
+        else:
+            while True:
+                try:
+                    fcntl.flock(stream, mode | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"object lock for {name} still held at the relink deadline") from None
+                    time.sleep(0.05)
         yield
 
 
@@ -119,10 +130,29 @@ def slot(directory, *, count, wait):
         time.sleep(0.5)
 
 
-def digest(path):
+def digest(path, deadline=None):
+    """`(sha256, size)`; with a monotonic `deadline`, stop between 1 MiB chunks (TimeoutError)."""
     with open(path, "rb") as stream:
         info = os.fstat(stream.fileno())
-        return hashlib.file_digest(stream, "sha256").hexdigest(), info.st_size
+        if deadline is None:
+            return hashlib.file_digest(stream, "sha256").hexdigest(), info.st_size
+        hasher = hashlib.sha256()
+        while chunk := stream.read(1 << 20):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"hashing {path} reached the relink deadline")
+            hasher.update(chunk)
+        return hasher.hexdigest(), info.st_size
+
+
+def fingerprint(info):
+    """What must not change between inspecting a file and acting on it."""
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+
+def recorded(directory, name, info):
+    """True if the sidecar still describes this inode: the cheap check before any shortcut."""
+    row = read_json(sidecar(directory, name))
+    return (row.get("size"), row.get("ino"), row.get("mtime_ns")) == (info.st_size, info.st_ino, info.st_mtime_ns)
 
 
 def record(directory, name, sha, size, provenance, *, exclusive=False):
@@ -150,7 +180,7 @@ def record(directory, name, sha, size, provenance, *, exclusive=False):
         os.unlink(out.name)
 
 
-def expected(directory, name):
+def expected(directory, name, deadline=None):
     """`(sha256, size, intact)` of the canonical object, from its sidecar.
 
     The sidecar is trusted while the object's inode, size and mtime are as recorded; otherwise
@@ -169,7 +199,7 @@ def expected(directory, name):
         info.st_mtime_ns,
     ):
         return row["sha256"], row["size"], True
-    sha, size = digest(canonical)
+    sha, size = digest(canonical, deadline)
     if recorded and (sha, size) != (row["sha256"], row["size"]) and row.get("ino") == info.st_ino:
         return row["sha256"], row["size"], False
     record(directory, name, sha, size, row.get("provenance", "unknown"), exclusive=not row)
@@ -236,9 +266,12 @@ def writers(checkout):
     return found
 
 
-def open_for_writing(inodes):
-    """The subset of `(dev, ino)` that some process of this user holds open for writing."""
-    if not inodes or not os.path.isdir("/proc/self/fd"):
+def open_for_writing():
+    """Every `(dev, ino)` some process of this user holds open for writing (Linux `/proc` only).
+
+    One scan per relink pass. An fd whose flags cannot be read counts as writable.
+    """
+    if not os.path.isdir("/proc/self/fd"):
         return set()
     found = set()
     uid = os.getuid()
@@ -256,14 +289,16 @@ def open_for_writing(inodes):
                 info = os.stat(descriptor.path)
             except OSError:
                 continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
             key = info.st_dev, info.st_ino
-            if key not in inodes or key in found:
+            if key in found:
                 continue
             try:
                 text = Path(entry.path, "fdinfo", descriptor.name).read_text()
                 flags = int(next(line.split()[1] for line in text.splitlines() if line.startswith("flags:")), 8)
             except (OSError, StopIteration, ValueError):
-                found.add(key)  # Unknown is not quiescent.
+                found.add(key)
                 continue
             if flags & (os.O_WRONLY | os.O_RDWR):
                 found.add(key)
@@ -335,48 +370,114 @@ def replace(canonical, path):
         temporary.unlink(missing_ok=True)
 
 
-class Relinker:
-    def __init__(self, pool, private_store, *, report, not_after, busy, checkout=None, env=None):
+BATCH = 256
+
+
+class Pass:
+    """One bounded relink pass over a checkout. Every destructive step re-checks quiescence.
+
+    Decisions follow the bytes: a file is trusted when its Lake hash matches its name (and, to
+    converge, when its sha256 matches the canonical object's). A file that fails its Lake hash is
+    removed with its module trace so Lake rebuilds it; a verified file is never deleted.
+    """
+
+    def __init__(self, checkout, pool, private_store, env, report, *, deadline, not_after):
         self.checkout = checkout
-        self.env = env
         self.pool = Path(pool)
+        self.env = env
         self.directory = store(self.pool)
         self.objects = self.directory / "objects"
         self.private = Path(private_store) / "artifacts" if private_store else None
         self.report = report
+        self.deadline = deadline
         self.not_after = not_after
-        self.busy = busy  # (dev, ino) some process may still be writing
-        self.digests = {}
-        self.module_of = {}
-        for name in ("objects", "meta", "locks", "uses"):
+        self.writable = open_for_writing()
+        self.shas = {}
+        self.lakes = {}
+        self.program = None
+        self.helper_failed = False
+        self.trace_of = {}
+        for name in ("objects", "meta", "locks", "uses", "cursors"):
             (self.directory / name).mkdir(parents=True, exist_ok=True, mode=0o700)
 
     def count(self, key, amount=1):
         self.report[key] = self.report.get(key, 0) + amount
 
-    def digest(self, path, info):
-        """sha256 once per inode: a build file and its private-store link are often one file."""
-        key = info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
-        if key not in self.digests:
-            self.digests[key] = digest(path)
-        return self.digests[key]
+    def quiescent(self, path, before):
+        """Unchanged since inspected, not open for writing, not modified since the boundary began."""
+        try:
+            now = path.lstat()
+        except FileNotFoundError:
+            return False
+        if fingerprint(now) != fingerprint(before):
+            self.count("deferred_changed")
+            return False
+        if (now.st_dev, now.st_ino) in self.writable or now.st_mtime > self.not_after:
+            self.count("deferred_busy")
+            return False
+        return True
 
-    def invalidate(self, path, private):
-        """Stale or partial bytes: delete them (and their module's trace) so Lake rebuilds."""
+    def sha(self, path, info):
+        key = fingerprint(info)
+        if key not in self.shas:
+            self.shas[key] = digest(path, self.deadline)
+        return self.shas[key]
+
+    def helper(self):
+        if self.program is None and not self.helper_failed:
+            try:
+                self.program = expanded_cache.native(self.checkout, dict(self.env), self.pool)
+            except (OSError, subprocess.SubprocessError, ValueError) as error:
+                self.helper_failed = True
+                log(f"canonical store: Lake hash helper unavailable; deferring decisions ({error})")
+        return self.program
+
+    def prefetch(self, items):
+        """Lake-hash `(path, name, info)` items in one helper call; unknown stays unknown."""
+        items = [(p, n, i) for p, n, i in items if fingerprint(i) not in self.lakes]
+        if not items or time.monotonic() >= self.deadline or self.helper() is None:
+            return
+        try:
+            with tempfile.TemporaryDirectory(dir=self.directory, prefix="hash-") as tmp:
+                computed = expanded_cache.hashes(self.program, [p for p, _, _ in items], Path(tmp))
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            log(f"canonical store: Lake hashing failed; deferring ({error})")
+            return
+        for path, name, info in items:
+            if str(path) in computed:
+                self.lakes[fingerprint(info)] = computed[str(path)] == name.split(".", 1)[0]
+
+    def lake(self, path, name, info):
+        """True if the bytes hash to their name, False if not, None if unknown."""
+        if fingerprint(info) not in self.lakes:
+            self.prefetch([(path, name, info)])
+        return self.lakes.get(fingerprint(info))
+
+    def invalidate(self, path, name, info, private):
+        """Remove bytes that fail their own Lake hash (and the module trace) so Lake rebuilds."""
+        if not self.quiescent(path, info):
+            return
+        trace = None if private else self.trace_of.get(path)
+        if trace is not None:
+            try:
+                trace_info = trace.lstat()
+            except FileNotFoundError:
+                trace = None
+            else:
+                if (trace_info.st_dev, trace_info.st_ino) in self.writable or trace_info.st_mtime > self.not_after:
+                    self.count("deferred_busy")
+                    return
+        path.unlink(missing_ok=True)
         if private:
-            path.unlink(missing_ok=True)
             self.count("stale_store_files")
             return
-        trace, paths = self.module_of.get(path, (None, [path]))
-        for output in paths:
-            output.unlink(missing_ok=True)
-            output.with_name(output.name + ".hash").unlink(missing_ok=True)
+        path.with_name(path.name + ".hash").unlink(missing_ok=True)
         if trace is not None:
             trace.unlink(missing_ok=True)
         self.count("invalidated_modules")
-        log(f"canonical store: {path} does not match its trace; removed its module outputs so Lake rebuilds it")
+        log(f"canonical store: {path} fails its Lake hash {name}; removed it and its trace so Lake rebuilds")
 
-    def evict_corrupt(self, name, info):
+    def evict(self, name, info, reason):
         canonical = self.objects / name
         aliases = [canonical]
         old = legacy(self.pool, name)
@@ -387,102 +488,110 @@ class Relinker:
             alias.unlink(missing_ok=True)
         sidecar(self.directory, name).unlink(missing_ok=True)
         self.report.setdefault("integrity_failures", []).append(name)
-        log(f"canonical store: INTEGRITY FAILURE: object {name} no longer matches its sha256; evicted")
+        log(f"canonical store: INTEGRITY FAILURE: object {name} {reason}; evicted")
 
-    def lake_verified(self, path, name):
-        """Lake-hash one file against its trace name; None if the helper is unavailable."""
+    def link_in(self, canonical, path, info, private):
+        if self.quiescent(path, info):
+            replace(canonical, path)
+            self.count("relinked_private" if private else "relinked")
+
+    def decide(self, path, name, private):
+        """Under the exclusive object lock: converge, publish, invalidate or defer `path`."""
         try:
-            program = expanded_cache.native(self.checkout, dict(self.env), self.pool)
-            with tempfile.TemporaryDirectory(dir=self.directory, prefix="hash-") as tmp:
-                computed = expanded_cache.hashes(program, [path], Path(tmp))
-        except (OSError, subprocess.SubprocessError, ValueError):
-            return None
-        return computed.get(str(path)) == name.split(".", 1)[0]
-
-    def publishable(self, path, info):
-        """Only a quiescent inode may become canonical: never one still open or changed since."""
-        if (info.st_dev, info.st_ino) in self.busy or info.st_mtime > self.not_after:
-            self.count("deferred_busy")
-            return False
-        return True
-
-    def converge(self, path, name, *, verified, private, exclusive):
-        """Leave `path` linked to the canonical object, invalidate it, or defer it.
-
-        Returns "exclusive" when the caller must retry holding the exclusive object lock.
-        """
+            info = path.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(info.st_mode):
+            return
         canonical = self.objects / name
         for _ in range(3):
             try:
-                info = path.lstat()
-            except FileNotFoundError:
-                return None
-            if not stat.S_ISREG(info.st_mode):
-                return None
-            try:
                 canonical_info = canonical.stat()
             except FileNotFoundError:
-                if not exclusive:
-                    return "exclusive"  # Publish under the exclusive lock: one hasher per object.
-                if self.publish(path, name, info, verified=verified, private=private) == "again":
+                canonical_info = None
+            if canonical_info is not None:
+                sha, size, intact = expected(self.directory, name, self.deadline)
+                if not intact:
+                    self.evict(name, canonical_info, "no longer matches its recorded sha256")
                     continue
-                return None
-            if canonical_info.st_ino == info.st_ino:
-                return None
-            sha, size, intact = expected(self.directory, name)
-            if not intact:
-                if not exclusive:
-                    return "exclusive"
-                self.evict_corrupt(name, canonical_info)
-                if verified is None and not private:
-                    verified = self.lake_verified(path, name)
-                continue
-            if info.st_size == size and self.digest(path, info) == (sha, size):
-                replace(canonical, path)
-                self.count("relinked_private" if private else "relinked")
-                return None
-            self.invalidate(path, private)
-            return None
-        raise Unavailable(f"canonical object {name} kept changing while relinking")
+                if canonical_info.st_ino == info.st_ino:
+                    return
+                if info.st_size == size and self.sha(path, info) == (sha, size):
+                    self.link_in(canonical, path, info, private)
+                    return
+                self.differs(path, name, info, private)
+                return
+            outcome = self.publish(path, name, info, private)
+            if outcome != "again":
+                return
+        self.count("deferred")
 
-    def publish(self, path, name, info, *, verified, private):
-        """Under the exclusive object lock: adopt the pool's CI copy, or publish a verified local file."""
+    def differs(self, path, name, info, private):
+        """`path` disagrees with a verified object: its own Lake hash decides."""
+        verdict = self.lake(path, name, info)
+        if verdict is False:
+            self.invalidate(path, name, info, private)
+        elif verdict is True:
+            self.count("conflicts")
+            log(f"canonical store: {path} and object {name} both verify but differ; leaving both")
+        else:
+            self.count("deferred")
+
+    def publish(self, path, name, info, private):
+        """No canonical object yet: adopt a verified pool copy or publish a verified local file."""
         canonical = self.objects / name
         old = legacy(self.pool, name)
         try:
             pool_info = old.lstat()
             if not stat.S_ISREG(pool_info.st_mode):
-                raise FileNotFoundError(old)
-            sha, size = self.digest(old, pool_info)
-            if pool_info.st_ino != info.st_ino and (info.st_size != size or self.digest(path, info) != (sha, size)):
-                self.invalidate(path, private)
-                return None
-            os.link(old, canonical)
+                pool_info = None
         except FileNotFoundError:
-            pass  # No pool copy, or legacy GC won the race: fall through to local publication.
-        except FileExistsError:
-            return "again"  # A concurrent publisher won; converge on its object.
-        except OSError as error:
-            raise Unavailable(f"cannot publish {name}: {error}") from None
-        else:
-            record(self.directory, name, sha, size, "ci")
-            self.count("published_ci")
-            if pool_info.st_ino != info.st_ino:
-                replace(canonical, path)
-                self.count("relinked_private" if private else "relinked")
+            pool_info = None
+        verdict = None
+        if pool_info is not None:
+            pool_verdict = self.lake(old, name, pool_info)
+            if pool_verdict is None:
+                self.count("deferred")
+                return None
+            if pool_verdict:
+                try:
+                    sha, size = self.sha(old, pool_info)
+                    os.link(old, canonical)
+                except FileExistsError:
+                    return "again"
+                except FileNotFoundError:
+                    return "again"  # Legacy GC won the race: decide again without it.
+                except OSError as error:
+                    raise Unavailable(f"cannot publish {name}: {error}") from None
+                record(self.directory, name, sha, size, "ci")
+                self.count("published_ci")
+                return "again"  # Converge `path` on the object just adopted.
+            verdict = False if pool_info.st_ino == info.st_ino else self.lake(path, name, info)
+            if verdict is not True:
+                # Neither copy verifies (or the checkout's is unknown): leave both.
+                self.count("unverifiable" if verdict is False else "deferred")
+                log(f"canonical store: pool copy of {name} fails its Lake hash, and so does {path}; leaving it")
+                return None
+            # The checkout's bytes are right and the pool's are not: quarantine the pool copy.
+            old.unlink(missing_ok=True)
+            self.count("pool_quarantined")
+            log(f"canonical store: pool copy of {name} fails its Lake hash; removed it")
+        elif private:
+            return None  # Private-store-only names are Lake's metadata; not hashed.
+        if verdict is None:
+            verdict = self.lake(path, name, info)
+        if verdict is False:
+            self.invalidate(path, name, info, private)
             return None
-        if private:
-            return None  # Private-store-only names are Lake's metadata to keep.
-        if verified is False:
-            self.invalidate(path, private)
-            return None
-        if verified is None or not self.publishable(path, info):
+        if verdict is None:
             self.count("deferred")
+            return None
+        if not self.quiescent(path, info):
             return None
         mode = 0o555 if info.st_mode & 0o111 else 0o444
         if stat.S_IMODE(info.st_mode) != mode:
             os.chmod(path, mode)
-        sha, size = digest(path)
+        sha, size = self.sha(path, info)
         try:
             os.link(path, canonical)
         except FileExistsError:
@@ -505,14 +614,15 @@ def relink(
     budget=None,
     slots=None,
     slot_wait=None,
+    limit=None,
     report=None,
 ):
     """Converge `checkout/.lake/build` (and the private Lake store) on canonical objects.
 
     Bounded and resumable: at most `slots` relinks run on the host at once, a relink that cannot
-    get a slot within `slot_wait` seconds is skipped, and one that exceeds `budget` seconds stops
-    and leaves the rest for the next boundary. Missing build directories are a no-op. Raises
-    `Unavailable` only for link failures.
+    get a slot within `slot_wait` seconds is skipped, and a pass stops at `budget` seconds (or
+    after `limit` names), keeping a per-checkout cursor so the next pass continues where this one
+    stopped. Missing build directories are a no-op. Raises `Unavailable` only for link failures.
     """
     checkout = Path(checkout)
     report = {} if report is None else report
@@ -531,128 +641,123 @@ def relink(
         expanded_cache.same_filesystem(build, *([private_store] if private_store else []), pool)
     except expanded_cache.SharedLinkUnavailable as error:
         raise Unavailable(str(error)) from None
-    directory = store(pool)
-    with slot(directory, count=slots, wait=slot_wait) as held:
+    with slot(store(pool), count=slots, wait=slot_wait) as held:
         if not held:
             report["skipped"] = f"{slots} relinks already running on this host"
             return report
-        return _relink(checkout, build, private_store, pool, env, sweep_private, delete_setup, budget, report)
+        started = time.monotonic()
+        work = Pass(
+            checkout, pool, private_store, env, report, deadline=started + budget, not_after=time.time()
+        )
+        _relink(work, build, sweep_private, delete_setup, limit)
+        report["seconds"] = round(time.monotonic() - started, 3)
+        return report
 
 
-def _relink(checkout, build, private_store, pool, env, sweep_private, delete_setup, budget, report):
-    started = time.monotonic()
-    deadline = started + budget
-    relinker = Relinker(
-        pool, private_store, report=report, not_after=time.time(), busy=set(), checkout=checkout, env=env
-    )
+def _relink(work, build, sweep_private, delete_setup, limit):
+    report = work.report
     modules, setups = outputs(build)
-    found = [(path, name) for pairs in modules.values() for path, name in pairs]
-    for trace, pairs in modules.items():
-        paths = [path for path, _ in pairs]
-        for path in paths:
-            relinker.module_of[path] = (trace, paths)
-    report["outputs"] = len(found)
-    # Fast path: no lock and no hashing for outputs that already share the canonical inode.
-    pending = []
-    for path, name in found:
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
-            continue
-        if not stat.S_ISREG(info.st_mode):
-            continue
-        try:
-            if (relinker.objects / name).stat().st_ino == info.st_ino:
-                relinker.count("in_place")
-                pending.append((None, name, info))
-                continue
-        except FileNotFoundError:
-            pass
-        pending.append((path, name, info))
-    names = {name for _, name, _ in pending}
-    if sweep_private and relinker.private is not None and relinker.private.is_dir():
-        names |= {
-            entry.name
-            for entry in os.scandir(relinker.private)
-            if expanded_cache.ARTIFACT.fullmatch(entry.name) and entry.is_file(follow_symlinks=False)
-        }
-    # Lake's name is verified only for bytes that could become a new local publication.
-    unpublished = {
-        path: (name, info)
-        for path, name, info in pending
-        if path is not None and not (relinker.objects / name).exists() and not legacy(pool, name).exists()
-    }
-    verified = {}
-    if unpublished:
-        relinker.busy = open_for_writing({(i.st_dev, i.st_ino) for _, i in unpublished.values()})
-        try:
-            program = expanded_cache.native(checkout, dict(env), pool)
-            with tempfile.TemporaryDirectory(dir=relinker.directory, prefix="hash-") as tmp:
-                paths = list(unpublished)
-                for offset in range(0, len(paths), HASH_BATCH):
-                    if time.monotonic() >= deadline:
-                        break
-                    batch = paths[offset : offset + HASH_BATCH]
-                    computed = expanded_cache.hashes(program, batch, Path(tmp))
-                    # A trace's name is the Lake hash of the file it recorded.
-                    for p in batch:
-                        if str(p) in computed:
-                            verified[p] = computed[str(p)] == unpublished[p][0].split(".", 1)[0]
-        except (OSError, subprocess.SubprocessError, ValueError) as error:
-            log(f"canonical store: Lake hashes unavailable, deferring new publications ({error})")
     by_name = {}
-    for path, name, _ in pending:
-        if path is not None:
-            by_name.setdefault(name, []).append(path)
-    for name in sorted(names):
-        if time.monotonic() >= deadline:
-            report["incomplete"] = True
-            break
-        paths = by_name.get(name, [])
-        private = relinker.private / name if relinker.private is not None else None
-        if private is not None:
+    found = 0
+    for trace, pairs in modules.items():
+        for path, name in pairs:
+            found += 1
+            work.trace_of[path] = trace
             try:
-                inode = private.lstat().st_ino
+                info = path.lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                # Shortcut only while the sidecar still describes this exact inode.
+                if (work.objects / name).stat().st_ino == info.st_ino and recorded(work.directory, name, info):
+                    work.count("in_place")
+                    continue
             except FileNotFoundError:
-                private = None
-            else:
-                with contextlib.suppress(FileNotFoundError):
-                    if (relinker.objects / name).stat().st_ino == inode:
-                        private = None
-        work = [(path, False) for path in paths] + ([(private, True)] if private is not None else [])
-        if not work:
-            continue
-        exclusive = not (relinker.objects / name).exists()
-        while work:
-            with object_lock(relinker.directory, name, exclusive=exclusive):
-                retry = []
-                for path, is_private in work:
-                    outcome = relinker.converge(
-                        path, name, verified=verified.get(path), private=is_private, exclusive=exclusive
-                    )
-                    if outcome == "exclusive":
-                        retry.append((path, is_private))
-            work, exclusive = retry, True
-    if delete_setup and not report.get("incomplete"):
+                pass
+            by_name.setdefault(name, []).append(path)
+    report["outputs"] = found
+    private_names = set()
+    if sweep_private and work.private is not None and work.private.is_dir():
+        for entry in os.scandir(work.private):
+            if not expanded_cache.ARTIFACT.fullmatch(entry.name) or not entry.is_file(follow_symlinks=False):
+                continue
+            with contextlib.suppress(FileNotFoundError):
+                if (work.objects / entry.name).stat().st_ino == entry.stat(follow_symlinks=False).st_ino:
+                    continue
+            private_names.add(entry.name)
+    elif work.private is not None:
+        for name in by_name:
+            with contextlib.suppress(FileNotFoundError):
+                if (work.private / name).lstat().st_ino != (work.objects / name).stat().st_ino:
+                    private_names.add(name)
+    names = sorted(set(by_name) | private_names)
+    key = hashlib.sha256(str(work.checkout.resolve()).encode()).hexdigest()[:16]
+    cursor_path = work.directory / "cursors" / (key + ".json")
+    after = read_json(cursor_path).get("after", "")
+    split = next((i for i, n in enumerate(names) if n > after), len(names))
+    order = names[split:] + names[:split]
+    done = 0
+    last = None
+    try:
+        for offset in range(0, len(order), BATCH):
+            batch = order[offset : offset + BATCH]
+            if limit is not None:
+                batch = batch[: max(0, limit - done)]
+            if not batch or time.monotonic() >= work.deadline:
+                raise TimeoutError("relink budget reached")
+            # Hash together what a batch will need to decide new names, then converge it.
+            fetch = []
+            for name in batch:
+                if (work.objects / name).exists():
+                    continue
+                candidates = [*by_name.get(name, []), legacy(work.pool, name)]
+                for candidate in candidates:
+                    with contextlib.suppress(FileNotFoundError):
+                        info = candidate.lstat()
+                        if stat.S_ISREG(info.st_mode):
+                            fetch.append((candidate, name, info))
+            for start in range(0, len(fetch), HASH_BATCH):
+                work.prefetch(fetch[start : start + HASH_BATCH])
+            for name in batch:
+                with object_lock(work.directory, name, exclusive=True, deadline=work.deadline):
+                    for path in by_name.get(name, []):
+                        work.decide(path, name, False)
+                    if name in private_names:
+                        work.decide(work.private / name, name, True)
+                done += 1
+                last = name
+    except TimeoutError:
+        pass
+    complete = done >= len(order)
+    report["remaining"] = len(order) - done
+    if complete:
+        cursor_path.unlink(missing_ok=True)
+    else:
+        report["incomplete"] = True
+        if last is not None:
+            expanded_cache.atomic_json(cursor_path, dict(after=last))
+    if delete_setup and complete:
+        removed = 0
         for path in setups:
             with contextlib.suppress(FileNotFoundError):
-                report["setup_bytes"] = report.get("setup_bytes", 0) + path.stat().st_blocks * 512
+                info = path.lstat()
+                if (info.st_dev, info.st_ino) in work.writable or info.st_mtime > work.not_after:
+                    continue
+                report["setup_bytes"] = report.get("setup_bytes", 0) + info.st_blocks * 512
                 path.unlink()
-        report["setup_removed"] = len(setups)
-    used = sorted({name for _, name in found})
-    lease = relinker.directory / "uses" / (hashlib.sha256(str(checkout.resolve()).encode()).hexdigest()[:16] + ".list")
+                removed += 1
+        report["setup_removed"] = removed
+    used = sorted({name for pairs in modules.values() for _, name in pairs})
+    lease = work.directory / "uses" / (key + ".list")
     with tempfile.NamedTemporaryFile("w", dir=lease.parent, delete=False) as out:
         out.write("\n".join(used) + ("\n" if used else ""))
     os.replace(out.name, lease)
-    report["seconds"] = round(time.monotonic() - started, 3)
-    return report
 
 
-def reconcile(pool, name, path):
+def reconcile(pool, name, path, *, blocking=True):
     """Make a pool alias of `name` (an entry file, `artifacts/`) the canonical inode, if identical.
 
     Expansion publishes CI outputs independently; this keeps one inode when a local publication
-    came first. Best effort: any doubt leaves the alias as it is.
+    came first. Best effort: any doubt, or (with `blocking` False) a busy shard, leaves the alias.
     """
     directory = store(pool)
     canonical = directory / "objects" / name
@@ -662,7 +767,7 @@ def reconcile(pool, name, path):
     except FileNotFoundError:
         return False
     try:
-        with object_lock(directory, name):
+        with object_lock(directory, name, blocking=blocking):
             sha, size, intact = expected(directory, name)
             if not intact:
                 return False  # The next relink evicts it; never spread a damaged object.
@@ -727,7 +832,7 @@ def boundary(checkout, env, *, phase, prefix=()):
     return report
 
 
-def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove):
+def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, reconcile_budget=60):
     """Evict canonical objects only their own pool names link to, under the exclusive object lock.
 
     Link counts are evidence, not a refcount: a checkout or private store that links an object
@@ -742,6 +847,7 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove):
         return 0
     leased = None
     freed = 0
+    reconciling_until = time.monotonic() + reconcile_budget
     for lease in (directory / "uses").glob("*.list"):
         with contextlib.suppress(FileNotFoundError):
             if now - lease.stat().st_mtime > lifetime:
@@ -755,7 +861,12 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove):
             aliases = [path]
             old = legacy(pool, name)
             with contextlib.suppress(FileNotFoundError):
-                if old.lstat().st_ino != info.st_ino and not dry and reconcile(pool, name, old):
+                if (
+                    old.lstat().st_ino != info.st_ino
+                    and not dry
+                    and time.monotonic() < reconciling_until
+                    and reconcile(pool, name, old, blocking=False)  # Busy shards wait for the next sweep.
+                ):
                     info = path.lstat()  # Expansion had published a second inode; now one.
                 if old.lstat().st_ino == info.st_ino:
                     aliases.append(old)

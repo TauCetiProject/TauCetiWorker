@@ -1056,7 +1056,11 @@ def run_agent_host(
 
             record_result(env, rc)
         # H2: the agent's process group has been reaped, so no Lake can be writing the checkout.
-        relink_build_outputs(cwd, env, phase="round-end")
+        # Exit 70 is the guardian's "child lifetime cleanup incomplete": no quiescent boundary.
+        if rc == 70:
+            log("canonical store (round-end): agent cleanup incomplete; relinking left for the next round")
+        else:
+            relink_build_outputs(cwd, env, phase="round-end")
     if rc == 75:
         from .claude_api import blocked_reason
 
