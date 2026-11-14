@@ -77,24 +77,35 @@ def selection(env):
     policy = read_json(path)
     if path.exists() and (
         not policy
-        or policy.get("mode") not in ("off", "auto", "required")
+        or policy.get("mode", "auto") not in ("off", "auto", "required")
         or not isinstance(policy.get("expires_at", 0), (int, float))
         or not math.isfinite(policy.get("expires_at", 0))
         or policy.get("expiry_mode", "off") not in ("off", "auto", "required")
         or not isinstance(policy.get("workers", []), list)
         or any(not isinstance(worker, str) for worker in policy.get("workers", []))
     ):
-        if env.get("TAUCETI_SHARED_MATHLIB_BUILDS") == "required":
+        # An unreadable opt-in is still an opt-in: block until an operator repairs it.
+        if env.get("TAUCETI_SHARED_MATHLIB_BUILDS", "auto").lower() in ("auto", "required"):
             raise Unavailable("invalid shared Mathlib policy; repair policy.json before requiring sharing")
         return "off", "invalid policy.json; repair before enabling sharing"
     expired = policy.get("expires_at", float("inf")) <= time.time()
+    # A host with no policy.json never opted in, so it keeps private builds. Once a host opted
+    # in, only an explicit operator `off` returns to them: an expired policy, or one whose
+    # mode a safety stop recorded over, still requires sharing.
     value = env.get(
-        "TAUCETI_SHARED_MATHLIB_BUILDS", policy.get("expiry_mode", "off") if expired else policy.get("mode", "off")
+        "TAUCETI_SHARED_MATHLIB_BUILDS",
+        policy.get("expiry_mode", "auto") if expired else policy.get("mode", "auto") if policy else "off",
     ).lower()
     if value not in {"auto", "off", "required"}:
         raise Unavailable("TAUCETI_SHARED_MATHLIB_BUILDS must be auto, off or required")
+    if value == "auto":
+        # Sharing is no longer optional: a round that cannot share stops instead of building a
+        # private copy of Mathlib. Only an explicit operator `off` keeps private builds.
+        value = "required"
     allowed = env.get("TAUCETI_SHARED_MATHLIB_WORKERS", ",".join(policy["workers"]) if "workers" in policy else None)
     if allowed is not None and env.get("TAUCETI_WORKER_ID", "default") not in allowed.split(","):
+        if value == "required":
+            raise Unavailable("worker is not allowlisted for shared Mathlib, which is required; fix the policy")
         return "off", "worker is not allowlisted for shared Mathlib"
     stop_path = pool / "safety-stop.json"
     stop = read_json(stop_path)
@@ -202,7 +213,10 @@ def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
 def capability(directory=None):
     """Exercise the actual filesystem, namespace, OverlayFS and bwrap flag support."""
     if platform.system() != "Linux":
-        return False, "Linux user namespaces and OverlayFS are required; use private builds on this system"
+        return (
+            False,
+            "Linux user namespaces and OverlayFS are required for shared Mathlib; an operator must set mode off on this system",
+        )
     if not shutil.which("bwrap"):
         return False, "install bubblewrap with --overlay support (0.12 or newer) to share extracted Mathlib"
     try:
@@ -307,11 +321,13 @@ def signature(cwd, env):
     for package in packages:
         name = package.get("name")
         if not isinstance(name, str) or not name or Path(name).name != name or package.get("type") != "git":
-            raise Unavailable("shared snapshots require pinned git dependencies; path dependencies use private builds")
+            raise Unavailable(
+                "shared snapshots require pinned git dependencies; path dependencies cannot share Mathlib"
+            )
         source = cwd / ".lake/packages" / name
         revision = git(source, "rev-parse", "HEAD")
         if revision != package.get("rev") or git(source, "status", "--porcelain", "--untracked-files=normal"):
-            raise Unavailable(f"dependency {name} differs from its pinned revision; using private builds")
+            raise Unavailable(f"dependency {name} differs from its pinned revision; restore the pin before building")
         dependencies[name] = revision
         cache_contexts[name] = cache_identity(cache_context(source))
     if "mathlib" not in dependencies:
@@ -400,9 +416,7 @@ def lease_lock(stream, flags, *, timeout=None):
             if deadline is None:
                 raise
             if time.monotonic() >= deadline:
-                raise Unavailable(
-                    "shared Mathlib lock wait timed out; use private mode and inspect publisher/reader leases"
-                ) from None
+                raise Unavailable("shared Mathlib lock wait timed out; inspect publisher/reader leases") from None
             time.sleep(min(0.1, max(0, deadline - time.monotonic())))
         except OSError as error:
             raise IntegrityFailure(f"shared Mathlib lease failure: {error}; stop sharing and investigate") from error
@@ -850,10 +864,10 @@ def ready_entry(entry, key, spec):
         )
     except (OSError, Unavailable) as error:
         raise IntegrityFailure(
-            f"snapshot integrity failure for {key}: {error}; retain lower and use private mode"
+            f"snapshot integrity failure for {key}: {error}; lower retained for inspection"
         ) from error
     if not valid:
-        raise IntegrityFailure(f"snapshot integrity failure for {key}; retain lower and use private mode")
+        raise IntegrityFailure(f"snapshot integrity failure for {key}; lower retained for inspection")
     return True
 
 
@@ -870,7 +884,9 @@ def stop_sharing(pool, reason):
     try:
         with key_lock(pool, "policy", timeout=1):
             policy = read_json(pool / "policy.json")
-            atomic_json(pool / "policy.json", {**policy, "mode": "off"})
+            # The stop blocks rounds through selection(); rewriting the mode to `off` would make the
+            # next round build Mathlib privately instead.
+            atomic_json(pool / "policy.json", {**policy, "safety_stop": reason})
             recorded = True
     except (OSError, Unavailable) as error:
         log(f"shared Mathlib SAFETY STOP policy could not be written: {error}")
@@ -986,7 +1002,7 @@ def clone(source, target, revision):
         git(target, "config", f"branch.{context['branch']}.remote", context["tracking"])
     if cache_identity(cache_context(target)) != cache_identity(context):
         raise Unavailable(
-            "Git cache selection context differs in the fresh clone; normalize repository-specific URL rules or use private builds"
+            "Git cache selection context differs in the fresh clone; normalize repository-specific URL rules"
         )
 
 
@@ -1076,7 +1092,7 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
         usage = shutil.disk_usage(pool)
         if usage.free < disk_reserve(usage):
             raise Unavailable(
-                "snapshot extraction would leave less than the free-space reserve (10%, capped at 20 GiB); using private builds"
+                "snapshot extraction would leave less than the free-space reserve (10%, capped at 20 GiB)"
             )
         entry.parent.mkdir(parents=True, exist_ok=True)
         os.replace(ready, entry)
@@ -1172,6 +1188,27 @@ def summary(env=None, *, scope=None, worker=None):
     )
 
 
+def _names_mathlib(cwd):
+    """False only when a well-formed manifest proves the workspace has no Mathlib anywhere.
+
+    Anything doubtful counts as Mathlib, so the ordinary checks decide (and block) instead of
+    the round getting an unrestricted view: an unreadable or malformed manifest, Mathlib as the
+    root package, or a dependency that looks like a renamed Mathlib (its URL or name)."""
+    try:
+        manifest = json.loads((cwd / "lake-manifest.json").read_text())
+        packages = manifest.get("packages")
+    except (OSError, ValueError, AttributeError):
+        return True
+    if not isinstance(packages, list) or str(manifest.get("name", "")).lower() == "mathlib":
+        return True
+    for package in packages:
+        if not isinstance(package, dict) or not isinstance(package.get("name"), str):
+            return True
+        if "mathlib" in package["name"].lower() or "mathlib" in str(package.get("url", "")).lower():
+            return True
+    return False
+
+
 @contextlib.contextmanager
 def view(cwd, env, logdir, fetch):
     """Yield an argv prefix and keep the lower leased until the whole agent exits."""
@@ -1182,6 +1219,11 @@ def view(cwd, env, logdir, fetch):
         report(pool, env, mode="blocked", reason=str(error))
         raise
     started = time.monotonic()
+    if not _names_mathlib(cwd):
+        # Nothing to share and nothing to copy: the project does not depend on Mathlib.
+        report(pool, env, mode="not-applicable", reason="project does not depend on Mathlib")
+        yield []
+        return
     upper = cwd / ".lake/packages/mathlib/.lake/build"
     marker = upper.parent / "tauceti-shared-mathlib.json"
     owned = _build_parent_owned(upper)
