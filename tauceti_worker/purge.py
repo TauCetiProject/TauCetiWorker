@@ -54,18 +54,26 @@ def _default_state_home() -> Path:
 
 def inventory(include_config=False):
     """(paths to delete, roots whose worker locks must be held, overridden locations to report)."""
+    from .paths import INSTALLED
     from .retention import RETIRED_PARTS, RETIRED_TRASH, retired_roots
     from .worker_manager import config_home, workers_runtime_dir
 
     home = login_home()
-    delete, roots = [], []
-    stable = user_data_root().resolve()
-    for root in {legacy_data_root().resolve(), stable, *retired_roots()}:
-        roots.append(root)
-        if root == stable:
-            delete.append(root)
+    delete, roots, overridden = [], [], []
+    stable = user_data_root()  # lexical: a symlink here is removed as a link, never followed
+    delete.append(stable)
+    roots.append(stable)
+    selected = legacy_data_root()
+    for root in [selected, *retired_roots()]:
+        if Path(os.path.abspath(root)) == Path(os.path.abspath(stable)) or _same(root, stable):
             continue
-        # A source checkout, a Fleet runtime or an operator-chosen root holds more than our data.
+        is_checkout = not INSTALLED and Path(root).resolve() == Path(HERE).resolve()
+        if root == selected and not is_checkout and os.environ.get("TAUCETI_LEGACY_DATA_ROOT"):
+            # An operator-chosen root: generic state/checkouts/logs names prove no ownership.
+            overridden.append(f"TAUCETI_LEGACY_DATA_ROOT={os.environ['TAUCETI_LEGACY_DATA_ROOT']}")
+            continue
+        roots.append(root)
+        # A source checkout or an earlier installation holds more than our data.
         delete += [root / part for part in RETIRED_PARTS]
         delete += list(root.glob(RETIRED_TRASH + "*"))
     delete += [_default_state_home(), home / ".cache" / "tauceti"]
@@ -77,7 +85,10 @@ def inventory(include_config=False):
     if not os.environ.get("TAUCETI_RUNTIME_DIR"):
         with contextlib.suppress(Exception):
             delete.append(workers_runtime_dir())
-    overridden = [f"{name}={os.environ[name]}" for name in OVERRIDES if os.environ.get(name)]
+    if not os.environ.get("TAUCETI_VERIFY_STORAGE_DIR"):
+        # verification_storage.root()'s default, which ignores XDG_STATE_HOME and macOS's location.
+        delete.append(home / ".local" / "state" / "tauceti" / "verification-storage")
+    overridden += [f"{name}={os.environ[name]}" for name in OVERRIDES if os.environ.get(name)]
     if include_config:
         if os.environ.get("TAUCETI_CONFIG_HOME"):
             overridden.append(f"TAUCETI_CONFIG_HOME={os.environ['TAUCETI_CONFIG_HOME']}")
@@ -86,6 +97,13 @@ def inventory(include_config=False):
         if os.environ.get("TAUCETI_WORKERS_CONFIG"):
             overridden.append(f"TAUCETI_WORKERS_CONFIG={os.environ['TAUCETI_WORKERS_CONFIG']}")
     return delete, sorted(roots), overridden
+
+
+def _same(first, second):
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
 
 
 def _refusal(path):
@@ -98,6 +116,8 @@ def _refusal(path):
         return "too broad"
     if os.path.realpath(path.parent) != str(path.parent):
         return "reached through a symbolic link"
+    if path.is_symlink():
+        return None  # removed as a link; its target is never touched
     if Path(HERE).resolve().is_relative_to(path.resolve()):
         return "contains the TauCetiWorker code"
     mounts = mount_points()
@@ -163,16 +183,21 @@ def stop_services():
     return failures
 
 
-def _busy(paths):
+def _busy(paths, roots):
     from .retention import _processes
-    from .worker_manager import _manager_lock_held
+    from .worker_manager import _live_manager_pointer, _manager_lock_held, default_workers_config
 
     if _manager_lock_held():
         return "the worker manager is running"
+    with contextlib.suppress(Exception):
+        if _live_manager_pointer(default_workers_config()):
+            return "the worker manager is running"
     processes = _processes()
     if processes is None:
         return "running processes cannot be inspected"
-    for found, _selects, _commands in processes:
+    for found, selects, _commands in processes:
+        if selects and any(_same(selects, root) or Path(selects) == Path(root) for root in roots):
+            return f"a running process selects {selects}"
         for path in paths:
             prefix = str(path)
             if any(item == prefix or item.startswith(prefix + os.sep) for item in found):
@@ -194,9 +219,9 @@ def cmd_purge(args):
         if paths:
             print("Re-run with --yes to delete. ~/.elan is kept; `elan toolchain gc` reclaims toolchains.")
         return 0
-    for failure in stop_services():
-        print(f"warning: {failure}", file=sys.stderr)
-    if reason := _busy(paths):
+    if failures := stop_services():
+        raise Die("could not stop TauCetiWorker services: " + "; ".join(failures))
+    if reason := _busy(paths, roots):
         raise Die(f"{reason}; stop it first (`tauceti workers manager-stop`), then re-run purge")
     from .retention import _drain, _idle_root
 

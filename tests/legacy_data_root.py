@@ -219,7 +219,7 @@ class LegacyDataRoot(unittest.TestCase):
         stack.enter_context(patch.object(retention, "HERE", old))
         stack.enter_context(patch.object(retention, "legacy_project", return_value=bool(extra)))
         stack.enter_context(patch.object(retention, "data_roots", return_value=[selected, *extra]))
-        stack.enter_context(patch.object(retention, "_unit_texts", return_value=list(units)))
+        stack.enter_context(patch.object(retention, "_configured_texts", return_value=list(units)))
         if mounts is not None:
             stack.enter_context(patch.object(retention, "mount_points", return_value=mounts))
         return stack
@@ -287,7 +287,7 @@ class LegacyDataRoot(unittest.TestCase):
                 for child in children:
                     child.kill()
                     child.wait()
-                with patch.object(retention, "_unit_texts", return_value=[]):
+                with patch.object(retention, "_configured_texts", return_value=[]):
                     retention.retire_roots(retention.fresh_report())
             for root in (used, chosen, unit, runtime):
                 self.assertEqual(sorted(p.name for p in root.iterdir()), ["prompts"], root)
@@ -323,7 +323,7 @@ class LegacyDataRoot(unittest.TestCase):
         stack.enter_context(patch.object(purge, "HERE", package))
         stack.enter_context(patch.object(retention, "HERE", package))
         stack.enter_context(patch.object(retention, "legacy_project", return_value=False))
-        stack.enter_context(patch.object(retention, "_unit_texts", return_value=[]))
+        stack.enter_context(patch.object(retention, "_configured_texts", return_value=[]))
         stack.enter_context(patch.object(purge, "VERIFY_TMP", base / "tmp"))
         stack.enter_context(patch.object(purge, "stop_services", return_value=[]))
         return stack
@@ -383,6 +383,11 @@ class LegacyDataRoot(unittest.TestCase):
             for kept in (shared, home / ".config/tauceti/workers.toml", home / ".elan/toolchains"):
                 self.assertTrue(kept.exists(), kept)
 
+    def stable_root(self, home):
+        return home / (
+            "Library/Application Support/tauceti/data" if sys.platform == "darwin" else ".local/share/tauceti"
+        )
+
     def test_purge_refuses_symlinked_ancestors_and_busy_workers(self):
         import fcntl
         from types import SimpleNamespace
@@ -396,17 +401,110 @@ class LegacyDataRoot(unittest.TestCase):
             (base / "elsewhere/tauceti").mkdir(parents=True)
             home.mkdir()
             (home / ".cache").symlink_to(base / "elsewhere")
-            data = base / "data"
+            data = self.stable_root(home)
             self.retired_fixture(data)
-            with self.purging(base, home, package, TAUCETI_LEGACY_DATA_ROOT=str(data)):
+            with self.purging(base, home, package):
                 _planned, _roots, _overridden, refused = purge.plan()
                 self.assertIn(f"{home / '.cache/tauceti'}: reached through a symbolic link", refused)
                 with open(data / "state/w/instance.lock") as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     with self.assertRaisesRegex(config.Die, "uses|holds a lock"):
                         purge.cmd_purge(SimpleNamespace(yes=True, config=False))
+                selector = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    env={**os.environ, "TAUCETI_LEGACY_DATA_ROOT": str(data)},
+                )
+                self.addCleanup(selector.wait)
+                self.addCleanup(selector.kill)
+                time.sleep(0.2)
+                with self.assertRaisesRegex(config.Die, "selects"):
+                    purge.cmd_purge(SimpleNamespace(yes=True, config=False))
+                selector.kill()
+                selector.wait()
+                purge.stop_services.return_value = ["tauceti-workers.service is still active"]
+                with self.assertRaisesRegex(config.Die, "could not stop"):
+                    purge.cmd_purge(SimpleNamespace(yes=True, config=False))
             self.assertTrue((data / "state/w/recovery/saved/patch.diff").exists())
             self.assertTrue((base / "elsewhere/tauceti").exists())
+
+    def test_purge_unlinks_a_symlinked_data_root_and_lists_custom_roots(self):
+        import io
+        from contextlib import redirect_stdout
+        from types import SimpleNamespace
+
+        from tauceti_worker import purge
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            home = base / "home"
+            package = base / "venv/site-packages/tauceti_worker"
+            archive = base / "archive"
+            (archive / "precious").mkdir(parents=True)
+            stable = self.stable_root(home)
+            stable.parent.mkdir(parents=True)
+            stable.symlink_to(archive)
+            custom = base / "srv/app"
+            (custom / "state").mkdir(parents=True)
+            with self.purging(base, home, package, TAUCETI_LEGACY_DATA_ROOT=str(custom)):
+                planned, _roots, overridden, _refused = purge.plan()
+                self.assertIn(stable, planned)
+                self.assertNotIn(custom / "state", planned)
+                self.assertIn(f"TAUCETI_LEGACY_DATA_ROOT={custom}", overridden)
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(purge.cmd_purge(SimpleNamespace(yes=True, config=False)), 0)
+            self.assertFalse(stable.is_symlink() or stable.exists())
+            self.assertTrue((archive / "precious").exists())
+            self.assertTrue((custom / "state").exists())
+
+    def test_configuration_evidence_includes_environment_files_and_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            home = base / "home"
+            units = home / ".config/systemd/user"
+            units.mkdir(parents=True)
+            environment = base / "worker.env"
+            environment.write_text("TAUCETI_LEGACY_DATA_ROOT=/srv/root-b\n")
+            (units / "tauceti-workers.service").write_text(f"[Service]\nEnvironmentFile=-{environment}\n")
+            workers = base / "workers.toml"
+            workers.write_text('[workers.w.env]\nTAUCETI_LEGACY_DATA_ROOT = "/srv/root-c"\n')
+            with (
+                patch.object(paths, "login_home", return_value=home),
+                patch.dict(os.environ, TAUCETI_WORKERS_CONFIG=str(workers)),
+            ):
+                os.environ.pop("XDG_CONFIG_HOME", None)
+                texts = retention._configured_texts()
+                self.assertTrue(any("/srv/root-b" in text for text in texts))
+                self.assertTrue(any("/srv/root-c" in text for text in texts))
+                environment.chmod(0)
+                if os.access(environment, os.R_OK):
+                    self.skipTest("running as a user that can read mode-0 files")
+                self.assertIsNone(retention._configured_texts())
+
+    def test_drain_honours_an_expired_deadline_for_directories_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            tree = Path(temporary) / "trash"
+            (tree / "a/b/c").mkdir(parents=True)
+            self.assertFalse(retention._drain(tree, deadline=time.monotonic() - 1))
+            self.assertTrue((tree / "a/b/c").exists())
+            self.assertTrue(retention._drain(tree))
+            self.assertFalse(tree.exists())
+
+    def test_liveness_probe_takes_no_lock(self):
+        import fcntl
+
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary) / "pkg"
+            (package / "state/w").mkdir(parents=True)
+            lock = package / "state/w/instance.lock"
+            lock.touch()
+            self.assertFalse(paths._older_generation_live(package))
+            with open(lock, "a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertTrue(paths._older_generation_live(package))
+            # A worker acquiring its slot right after a probe must succeed: the probe holds nothing.
+            self.assertFalse(paths._older_generation_live(package))
+            with open(lock, "a") as again:
+                fcntl.flock(again, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_purge_stops_services_before_removing_their_units(self):
         from tauceti_worker import purge

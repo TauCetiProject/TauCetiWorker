@@ -1050,23 +1050,10 @@ def data_roots():
 
 RETIRED_PARTS = ("state", "checkouts", "logs")
 RETIRED_TRASH = ".tauceti-retired-"
-# A process that refuses inspection blocks retirement unless it is plainly not one that could use
-# worker data: session helpers such as sd-pam, sshd-session or macOS agents. These may.
-_POSSIBLE_USERS = (
-    "python",
-    "tauceti",
-    "lake",
-    "lean",
-    "git",
-    "sh",
-    "bash",
-    "zsh",
-    "fish",
-    "node",
-    "codex",
-    "claude",
-    "uv",
-)
+# Processes that refuse inspection yet cannot use worker data. Anything else that refuses blocks
+# retirement and purge: unreadable never means unused.
+_SESSION_HELPERS = frozenset({"(sd-pam)", "sd-pam", "sshd-session", "systemd"})
+_SYSTEM_AGENTS = ("/usr/libexec/", "/System/", "/usr/bin/login")
 
 
 def _same_file(first, second):
@@ -1099,59 +1086,90 @@ def retired_roots():
     )
 
 
-def _could_use_data(command):
-    name = os.path.basename(command.strip().split(" ")[0]) if command.strip() else ""
-    return any(name == known or name.startswith(known) for known in _POSSIBLE_USERS)
+def _linux_process(process, uid):
+    """(paths, selected root, commands) of one /proc entry; None to skip it; raises if unknown."""
+    try:
+        if process.stat().st_uid != uid:
+            return None
+    except FileNotFoundError:
+        return None
+
+    def gone():
+        try:
+            state = (process / "stat").read_text().rsplit(")", 1)[1].split()[0]
+        except (OSError, IndexError):
+            return True
+        return state in ("Z", "X")  # a zombie has no files, working directory or future
+
+    paths, commands, selects, denied = [], [], None, False
+    readers = (
+        ("cwd", lambda: paths.append(os.readlink(process / "cwd"))),
+        ("exe", lambda: commands.append(os.readlink(process / "exe"))),
+        (
+            "cmdline",
+            lambda: commands.extend(
+                part.decode(errors="replace") for part in (process / "cmdline").read_bytes().split(b"\0")[:2] if part
+            ),
+        ),
+    )
+    for _name, read in readers:
+        try:
+            read()
+        except FileNotFoundError:
+            if gone():
+                return None
+            denied = True
+        except OSError:
+            denied = True
+    try:
+        for fd in (process / "fd").iterdir():
+            # A descriptor can close between listing and reading it, including the one this listing
+            # itself uses; that never means the whole process is gone.
+            with contextlib.suppress(FileNotFoundError):
+                paths.append(os.readlink(fd))
+    except FileNotFoundError:
+        if gone():
+            return None
+        denied = True
+    except OSError:
+        denied = True
+    try:
+        for value in (process / "environ").read_bytes().split(b"\0"):
+            if value.startswith(b"TAUCETI_LEGACY_DATA_ROOT="):
+                selects = value.split(b"=", 1)[1].decode(errors="replace")
+    except FileNotFoundError:
+        if gone():
+            return None
+        denied = True
+    except OSError:
+        denied = True
+    if denied:
+        try:
+            helper = (process / "comm").read_text().strip() in _SESSION_HELPERS
+        except OSError:
+            helper = False
+        if not (helper and not paths):
+            raise PermissionError(f"cannot inspect {process}")
+        return None
+    return paths, selects, commands
 
 
 def _processes():
-    """This user's processes as (paths, selected root, executable and argv), or None if unknown.
+    """This user's processes as (paths, selected root, commands), or None if any is unknown.
 
-    Paths are working directories and open files. A process that exits mid-scan is skipped; one
-    that refuses inspection makes the observation unavailable unless it could not use our data."""
+    Paths are working directories and open files; commands are the executable and first
+    arguments. A process that exits mid-scan, or a zombie, is skipped. One that refuses
+    inspection makes the observation unavailable, unless it is a known session helper or
+    operating-system agent that cannot use worker data."""
     uid = os.getuid()
     observed = []
     if Path("/proc/self/fd").is_dir():
-        for process in Path("/proc").glob("[0-9]*"):
-            try:
-                if process.stat().st_uid != uid:
-                    continue
-            except FileNotFoundError:
-                continue
-            try:
-                paths = [os.readlink(process / "cwd")]
-                for fd in (process / "fd").iterdir():
-                    # A descriptor can close between listing and reading it, including the one
-                    # this listing itself uses; that never means the whole process is gone.
-                    with contextlib.suppress(FileNotFoundError):
-                        paths.append(os.readlink(fd))
-                environ = (process / "environ").read_bytes().split(b"\0")
-                commands = [os.readlink(process / "exe")]
-                commands += [
-                    part.decode(errors="replace") for part in (process / "cmdline").read_bytes().split(b"\0")[:2]
-                ]
-            except (FileNotFoundError, ProcessLookupError):
-                try:
-                    state = (process / "stat").read_text().rsplit(")", 1)[1].split()[0]
-                except (OSError, IndexError):
-                    continue  # exited
-                if state in ("Z", "X"):
-                    continue  # a zombie has no files, working directory or future
-                return None  # present yet unreadable: unknown, never unused
-            except OSError:
-                with contextlib.suppress(OSError):
-                    if not _could_use_data((process / "comm").read_text()):
-                        continue
-                return None
-            selects = next(
-                (
-                    v.split(b"=", 1)[1].decode(errors="replace")
-                    for v in environ
-                    if v.startswith(b"TAUCETI_LEGACY_DATA_ROOT=")
-                ),
-                None,
-            )
-            observed.append((paths, selects, [c for c in commands if c]))
+        try:
+            for process in Path("/proc").glob("[0-9]*"):
+                if (entry := _linux_process(process, uid)) is not None:
+                    observed.append(entry)
+        except OSError:
+            return None
         return observed
     if sys.platform != "darwin":
         return None
@@ -1161,37 +1179,89 @@ def _processes():
         return None
     for process in psutil.process_iter():
         try:
-            if process.uids().real != uid:
-                continue
-            paths = [item.path for item in process.open_files()] + [process.cwd()]
-            selects = process.environ().get("TAUCETI_LEGACY_DATA_ROOT")
-            commands = [process.exe(), *process.cmdline()[:2]]
-        except psutil.NoSuchProcess:
-            continue
+            entry = _mac_process(psutil, process, uid)
         except (psutil.Error, OSError):
-            with contextlib.suppress(psutil.Error, OSError):
-                if process.exe().startswith(_PLATFORM_EXECUTABLES):
-                    continue
             return None
-        observed.append((paths, selects, [c for c in commands if c]))
+        if entry is not None:
+            observed.append(entry)
     return observed
 
 
-def _unit_texts():
-    """Installed systemd user units, drop-ins and LaunchAgents: roots they select stay in use."""
+def _mac_process(psutil, process, uid):
+    """(paths, selected root, commands) of one process; None to skip it; raises if unknown."""
+    try:
+        if process.uids().real != uid:
+            return None
+    except psutil.NoSuchProcess:
+        return None
+    paths, commands, selects, denied = [], [], None, False
+
+    def files():
+        paths.extend(item.path for item in process.open_files())
+
+    def directory():
+        paths.append(process.cwd())
+
+    def command():
+        commands.extend([process.exe(), *process.cmdline()[:2]])
+
+    def environment():
+        nonlocal selects
+        selects = process.environ().get("TAUCETI_LEGACY_DATA_ROOT")
+
+    for read in (files, directory, command, environment):
+        try:
+            read()
+        except psutil.NoSuchProcess:
+            return None
+        except psutil.AccessDenied:
+            denied = True
+    if denied:
+        try:
+            agent = process.exe().startswith(_SYSTEM_AGENTS)
+        except psutil.NoSuchProcess:
+            return None
+        except (psutil.Error, OSError):
+            agent = False
+        if agent and not paths:
+            return None
+        raise PermissionError(f"cannot inspect process {process.pid}")
+    return paths, selects, [c for c in commands if c]
+
+
+def _configured_texts():
+    """Text of everything that can select a data root without a process running right now:
+    systemd user units and drop-ins with their EnvironmentFile=s, LaunchAgents, and the worker
+    configuration files. None if any of it exists but cannot be read."""
     from .paths import login_home
+    from .worker_manager import default_workers_config
 
     home = login_home()
     directories = [home / ".config/systemd/user", home / "Library/LaunchAgents"]
     if xdg := os.environ.get("XDG_CONFIG_HOME"):
         directories.append(Path(xdg) / "systemd/user")
-    texts = []
+    files = []
     for directory in directories:
-        for base, _dirs, files in os.walk(directory):
-            for name in files:
-                if name.endswith((".service", ".timer", ".conf", ".plist")):
-                    with contextlib.suppress(OSError, UnicodeDecodeError):
-                        texts.append((Path(base) / name).read_text())
+        for base, _dirs, names in os.walk(directory):
+            files += [Path(base) / n for n in names if n.endswith((".service", ".timer", ".conf", ".plist"))]
+    with contextlib.suppress(Exception):
+        files.append(default_workers_config())
+    if configured := os.environ.get("TAUCETI_WORKERS_CONFIG"):
+        files.append(Path(configured).expanduser())
+    texts, seen = [], set()
+    while files:
+        path = files.pop()
+        if path in seen or not (path.exists() or path.is_symlink()):
+            continue
+        seen.add(path)
+        try:
+            text = path.read_text()
+        except (OSError, UnicodeDecodeError):
+            return None
+        texts.append(text)
+        for line in text.splitlines():
+            if line.strip().startswith("EnvironmentFile="):
+                files.append(Path(line.split("=", 1)[1].strip().lstrip("-")))
     return texts
 
 
@@ -1199,17 +1269,19 @@ def _venv(root):
     return next((parent for parent in root.parents if (parent / "pyvenv.cfg").is_file()), None)
 
 
-def _retirement_blocker(root, processes, mounts, units):
+def _retirement_blocker(root, processes, mounts, configured):
     """Why ``root`` must be kept for now, or None when it is provably retired."""
     if processes is None:
         return "process observation unavailable"
     if mounts is None:
         return "mount observation unavailable"
+    if configured is None:
+        return "service or worker configuration unreadable"
     target = canonical_candidate(root)
     if any(point == target or point.is_relative_to(target) for point in mounts):
         return "contains a mount"
-    if any(str(root) in text for text in units):
-        return "selected by an installed service"
+    if any(str(root) in text for text in configured):
+        return "selected by a service or worker configuration"
     parts = [os.path.join(str(root), part) for part in RETIRED_PARTS]
     runtime = _venv(root) if root != HERE.resolve() else None
     for paths, selects, commands in processes:
@@ -1260,7 +1332,14 @@ def _drain(path, deadline=None):
         if error.filename:
             writable(error.filename)
 
+    def expired():
+        return deadline is not None and time.monotonic() >= deadline
+
+    if expired():
+        return False
     for base, dirs, files in os.walk(path, topdown=False, onerror=unreadable):
+        if expired():
+            return False
         for name in [*files, *(d for d in dirs if os.path.islink(os.path.join(base, d)))]:
             if deadline is not None and time.monotonic() >= deadline:
                 return False
@@ -1299,11 +1378,11 @@ def retire_roots(report, *, dry=False, deadline=None):
     roots = retired_roots()
     if not roots:
         return
-    processes, mounts, units = _processes(), mount_points(), _unit_texts()
+    processes, mounts, configured = _processes(), mount_points(), _configured_texts()
     for root in roots:
         try:
             if any((root / part).is_dir() for part in RETIRED_PARTS):
-                if reason := _retirement_blocker(root, processes, mounts, units):
+                if reason := _retirement_blocker(root, processes, mounts, configured):
                     note(report, "protected", f"{root}: {reason}")
                     continue
                 if dry:

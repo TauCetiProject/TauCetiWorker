@@ -43,30 +43,73 @@ def user_data_root() -> Path:
     return login_home() / ".local" / "share" / "tauceti"
 
 
+def held_lock_files() -> set[tuple[int, int]] | None:
+    """(st_dev, st_ino) of files that are locked (Linux) or open (macOS) right now, or None.
+
+    Observed without taking any lock: probing with flock could make an older worker's own
+    exclusive acquisition fail, and an unmanaged loop then runs without its slot reservation."""
+    import re
+
+    try:
+        text = Path("/proc/locks").read_text()
+    except OSError:
+        text = None
+    if text is not None:
+        held = set()
+        for line in text.splitlines():
+            if "->" in line:
+                continue  # a waiter, not a holder
+            for token in line.split():
+                if match := re.fullmatch(r"([0-9a-f]+):([0-9a-f]+):(\d+)", token):
+                    held.add((os.makedev(int(match[1], 16), int(match[2], 16)), int(match[3])))
+        return held
+    if sys.platform != "darwin":
+        return None
+    try:
+        import psutil
+    except ImportError:
+        return None
+    held = set()
+    for process in psutil.process_iter():
+        try:
+            if process.uids().real != os.getuid():
+                continue
+            files = process.open_files()
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error:
+            continue  # system agents; worker processes are always inspectable
+        for item in files:
+            try:
+                info = os.stat(item.path)
+            except OSError:
+                continue
+            held.add((info.st_dev, info.st_ino))
+    return held
+
+
 def _older_generation_live(root: Path) -> bool:
     """Whether a worker or round of an earlier installation still holds a lock under ``root``.
 
     Such a loop keeps its package-relative root until it exits, and the rounds it starts run the
-    upgraded code; they must keep using its root rather than split from it."""
-    import fcntl
-
+    upgraded code; they must keep using its root rather than split from it. Unknown counts as
+    live: the package directory then simply stays selected, as before this change."""
     try:
         locks = [*root.glob("state/*/instance.lock"), *root.glob("state/*/round.lock")]
     except OSError:
         return False
+    if not locks:
+        return False
+    held = held_lock_files()
+    if held is None:
+        return True
     for lock in locks:
         try:
-            fd = os.open(lock, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            info = lock.stat()
         except OSError:
             continue
-        try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
+        if (info.st_dev, info.st_ino) in held:
             return True
-        except OSError:
-            continue
-        finally:
-            os.close(fd)  # releases the probe
     return False
 
 
