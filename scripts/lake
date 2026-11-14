@@ -1,0 +1,51 @@
+#!/bin/sh
+# TauCetiWorker's `lake` wrapper, first on the agent's PATH.
+#
+# Inside a shared Mathlib view, Mathlib's build comes from the host's shared entry. Running
+# `lake exe cache get` there re-extracts every archive into this checkout's private overlay
+# upper, a full private copy of Mathlib, so it is refused. If the checkout's Mathlib pin still
+# matches the shared entry there is nothing to fetch; if it has moved (for example after a
+# rebase), building would compile Mathlib privately, so the agent must stop and report instead.
+# Every other invocation runs the real `lake` unchanged.
+if [ -n "${TAUCETI_SHARED_MATHLIB_VIEW:-}" ] && [ "${TAUCETI_SHARED_MATHLIB_VIEW}" != "[]" ] \
+    && [ "${1:-}" = exe ] && [ "${2:-}" = cache ]; then
+  case "${3:-}" in
+    get | get! | unpack)
+      python=${TAUCETI_VERIFY_PYTHON:-python3}
+      if "$python" - <<'EOF'
+import json, sys
+from pathlib import Path
+
+def rev(manifest):
+    packages = json.loads(manifest.read_text()).get("packages", [])
+    return next(p.get("rev") for p in packages if p.get("name") == "mathlib")
+
+try:
+    marker = json.loads(Path(".lake/packages/mathlib/.lake/tauceti-shared-mathlib.json").read_text())
+    ready = json.loads((Path(marker["pool"]) / "entries" / marker["key"] / "ready.json").read_text())
+    sys.exit(0 if rev(Path("lake-manifest.json")) == ready["spec"]["mathlib"] else 1)
+except Exception:
+    sys.exit(1)
+EOF
+      then
+        echo "lake exe cache $3: Mathlib is provided by this host's shared build; nothing to fetch." >&2
+        exit 0
+      fi
+      echo "lake exe cache $3: this checkout's Mathlib pin no longer matches the host's shared build." >&2
+      echo "Do not build or fetch Mathlib here. Stop and report that the Mathlib pin changed." >&2
+      exit 1
+      ;;
+  esac
+fi
+self=$(cd "$(dirname "$0")" && pwd)
+old_ifs=$IFS
+IFS=:
+for dir in $PATH; do
+  [ "$dir" = "$self" ] && continue
+  if [ -x "$dir/lake" ]; then
+    IFS=$old_ifs
+    exec "$dir/lake" "$@"
+  fi
+done
+echo "lake: not found on PATH" >&2
+exit 127

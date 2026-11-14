@@ -380,3 +380,36 @@ for shared in (True, False):
         mathlib = [c for c in commands if c[-4:] == ["lake", "exe", "cache", "get"]]
         assert bool(mathlib) is not shared, (shared, commands)
 print("[OK] a shared Mathlib view never re-fetches Mathlib's cache into the checkout")
+
+# The agent-facing `lake` wrapper refuses Mathlib cache fetches inside a shared view.
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    real = root / "bin"
+    real.mkdir()
+    (real / "lake").write_text('#!/bin/sh\necho real-lake "$@"\n')
+    (real / "lake").chmod(0o755)
+    wrapper = Path(__file__).resolve().parents[1] / "scripts"
+    co = root / "co"
+    marker = co / ".lake/packages/mathlib/.lake/tauceti-shared-mathlib.json"
+    marker.parent.mkdir(parents=True)
+    pool = root / "pool"
+    (pool / "entries/k").mkdir(parents=True)
+    (pool / "entries/k/ready.json").write_text(json.dumps({"spec": {"mathlib": "abc"}}))
+    marker.write_text(json.dumps({"pool": str(pool), "key": "k"}))
+
+    def lake(*args, view=True, pin="abc"):
+        (co / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib", "rev": pin}]}))
+        env = {**os.environ, "PATH": f"{wrapper}:{real}:{os.environ['PATH']}", "TAUCETI_VERIFY_PYTHON": sys.executable}
+        env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)
+        if view:
+            env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(["bwrap"])
+        return agents.subprocess.run(["lake", *args], cwd=co, env=env, capture_output=True, text=True)
+
+    same = lake("exe", "cache", "get")
+    assert same.returncode == 0 and "real-lake" not in same.stdout, same
+    moved = lake("exe", "cache", "get", pin="def")
+    assert moved.returncode == 1 and "pin no longer matches" in moved.stderr, moved
+    assert lake("exe", "cache", "get", view=False).stdout.strip() == "real-lake exe cache get"
+    assert lake("build", "Foo").stdout.strip() == "real-lake build Foo"
+    assert lake("exe", "cache", "clean").stdout.strip() == "real-lake exe cache clean"
+print("[OK] the agent's lake wrapper refuses Mathlib cache fetches inside a shared view")
