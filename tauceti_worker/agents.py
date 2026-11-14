@@ -1068,6 +1068,12 @@ def run_agent_host(
             from .shared_mathlib import record_result
 
             record_result(env, rc)
+        # H2: the agent's process group has been reaped, so no Lake can be writing the checkout.
+        # Exit 70 is the guardian's "child lifetime cleanup incomplete": no quiescent boundary.
+        if rc == 70:
+            log("canonical store (round-end): agent cleanup incomplete; relinking left for the next round")
+        else:
+            relink_build_outputs(cwd, env, phase="round-end")
     if rc == 75:
         from .claude_api import blocked_reason
 
@@ -1599,6 +1605,12 @@ def _host_build_cache_context(cwd: Path, env: dict, logdir: Path, mathlib_view):
                 try:
                     try:
                         prepare_host_build_caches(cwd, env, logdir, report=report)
+                    except expanded_cache.Unavailable as error:
+                        if prefix:
+                            shared_mathlib.preparation_status(env, error=error)
+                        message = f"shared build outputs unavailable: {error}; agent not started"
+                        log(message)
+                        raise BuildCacheUnavailable(message) from error
                     except Exception as error:
                         if prefix:
                             shared_mathlib.preparation_status(env, error=error)
@@ -1606,6 +1618,7 @@ def _host_build_cache_context(cwd: Path, env: dict, logdir: Path, mathlib_view):
                     if prefix:
                         shared_mathlib.preparation_status(env)
                     restore()  # a rebase round's agent starts on its own branch's files
+                    relink_build_outputs(cwd, env, phase="prepare", prefix=prefix)  # H1
                     yield prefix
                 finally:
                     env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)
@@ -1613,6 +1626,25 @@ def _host_build_cache_context(cwd: Path, env: dict, logdir: Path, mathlib_view):
             raise BuildCacheUnavailable(
                 f"shared Mathlib preparation unavailable: {error}", log_file=logdir / "shared-mathlib-prepare.log"
             ) from error
+
+
+def relink_build_outputs(cwd: Path, env: dict, *, phase: str, prefix=()) -> dict | None:
+    """Converge the checkout's TauCeti outputs on the host's canonical objects (one inode each).
+
+    `prepare` runs before the agent starts and probes hard links in its namespace: a failed probe
+    stops the round, because Lake would silently copy. Relinking itself is maintenance: failures
+    are logged and retried at the next boundary, never allowed to discard or block a round.
+    """
+    from . import canonical_store
+
+    try:
+        return canonical_store.boundary(cwd, env, phase=phase, prefix=prefix or ())
+    except canonical_store.expanded_cache.Unavailable as error:
+        message = f"canonical build outputs ({phase}): {error}"
+        log(message)
+        if phase == "prepare":
+            raise BuildCacheUnavailable(message + "; agent not started") from error
+        return None
 
 
 def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -> None:

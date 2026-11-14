@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -82,6 +83,10 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         "CACHE_TEST_CALLS": str(calls),
         "TAUCETI_SHARED_ARTIFACTS": "0",
         "TAUCETI_SHARED_MATHLIB_ROOT": str(root / "shared-pool"),
+        # Pinned so no run can reach the host's real build pool, home or activity store.
+        "TAUCETI_BUILD_CACHE_ROOT": str(root / "base-pool"),
+        "TAUCETI_ACTIVITY_DIR": str(root / "activity"),
+        "HOME": str(root / "home"),
         "LAKE_CACHE_DIR": str(root / "private-lake-store"),
         "LAKE_ARTIFACT_CACHE": "1",
         "LAKE_RESTORE_ARTIFACTS": "1",
@@ -105,6 +110,10 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         yield ["env"]  # a transparent stand-in for the namespace prefix
 
     def run(mode="", cwd=co, **extra):
+        from tauceti_worker import expanded_cache
+
+        assert expanded_cache.root({**env, **extra}) != expanded_cache.root({"HOME": os.environ["HOME"]})
+        assert str(expanded_cache.root({**env, **extra})).startswith(str(root)), "unisolated test"
         calls.unlink(missing_ok=True)
         launched.clear()
         output = io.StringIO()
@@ -288,6 +297,87 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         assert rc == 0, text
         assert not any(r["args"] == ["exe", "cache", "clean"] for r in records)
     print("[OK] Mathlib prunes stale private archive links once daily and records current-tree pool reuse")
+
+    # H1 probes hard links in the agent's namespace and relinks before launch; H2 after it exits.
+    import errno
+    import shutil
+
+    from tauceti_worker import canonical_store
+
+    (co / ".lake/build/lib/lean").mkdir(parents=True)
+    phases = []
+    real_boundary = canonical_store.boundary
+
+    def observed(cwd, env, *, phase, prefix=()):
+        phases.append((phase, len(launched)))
+        return real_boundary(cwd, env, phase=phase, prefix=prefix)
+
+    with (
+        patch("tauceti_worker.expanded_cache.preparation", private_preparation),
+        patch.object(canonical_store, "boundary", observed),
+    ):
+        rc, records, text = run(**overrides)
+    assert rc == 0, text
+    assert phases == [("prepare", 0), ("round-end", 1)], phases
+    # EXDEV both in-process and inside the agent's namespace (the shared Mathlib view's prefix).
+    real_run = canonical_store.subprocess.run
+
+    def exdev_in_namespace(argv, *args, **kwargs):
+        if canonical_store.PROBE in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "Invalid cross-device link")
+        return real_run(argv, *args, **kwargs)
+
+    with (
+        patch("tauceti_worker.expanded_cache.preparation", private_preparation),
+        patch.object(canonical_store.os, "link", side_effect=OSError(errno.EXDEV, "Invalid cross-device link")),
+        patch.object(canonical_store.subprocess, "run", side_effect=exdev_in_namespace),
+    ):
+        rc, records, text = run(**overrides)
+    assert rc == 75 and not launched, text
+    assert "hard links unavailable" in text, text
+    print("[OK] relinking brackets the agent; a hard-link preflight failure stops it before launch")
+
+    # Round-end relinking is maintenance: a busy checkout or an I/O failure keeps the agent's result.
+    real_relink = canonical_store.relink
+    for failure in ("busy", "io"):
+
+        def round_end(checkout, *args, failure=failure, **kwargs):
+            if kwargs.get("sweep_private"):
+                return real_relink(checkout, *args, **kwargs)  # H1 is unaffected.
+            if failure == "busy":
+                return {"skipped": "Lake or Lean processes [1] name the checkout"}
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with (
+            patch("tauceti_worker.expanded_cache.preparation", private_preparation),
+            patch.object(canonical_store, "relink", round_end),
+        ):
+            rc, records, text = run(**overrides)
+        assert rc == 0 and len(launched) == 1, (failure, text)
+        assert ("skipped" if failure == "busy" else "deferred") in text, text
+
+    # Exit 70 is the guardian's "cleanup incomplete": not a quiescent boundary, so no H2.
+    phases.clear()
+    launched.clear()
+    real_launch = launch
+
+    def incomplete(*args, **kwargs):
+        real_launch(*args, **kwargs)
+        return 70
+
+    with (
+        patch("tauceti_worker.expanded_cache.preparation", private_preparation),
+        patch.object(canonical_store, "boundary", observed),
+        patch.object(agents, "run_agent_proc", incomplete),
+        patch.object(shared_mathlib, "view", shared_view),
+    ):
+        overrides_env = {**env, "CACHE_TEST_MODE": "", **overrides}
+        with patch.dict(os.environ, overrides_env, clear=True), contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = agents.run_agent_host(co, "prompt", "claude", root / "logs")
+    assert rc == 70 and phases == [("prepare", 0)], (rc, phases)
+    assert "cleanup incomplete" in err.getvalue()
+    shutil.rmtree(co / ".lake")
+    print("[OK] busy or failing round-end relinking keeps the agent's successful result")
 
     waits = []
     signals = []

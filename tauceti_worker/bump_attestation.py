@@ -60,7 +60,7 @@ def _bump_pull(live, head: str) -> str:
 
 def verify(w, checkout, base: str) -> dict:
     """Run the worker's verifier on `checkout` with the host build-cache view the agent used."""
-    from .agents import host_build_cache_context
+    from .agents import host_build_cache_context, relink_build_outputs
     from .processes import run as run_process
 
     env = dict(os.environ, TAUCETI_VERIFY_STATE=str(w.cfg.state), TAUCETI_VERIFY_POLICY="bump")
@@ -75,6 +75,8 @@ def verify(w, checkout, base: str) -> dict:
             )
         except subprocess.TimeoutExpired:
             return dict(status="incomplete", error=f"verification exceeded {VERIFY_TIMEOUT_S // 60} minutes")
+        # H3: a trusted build with no agent alongside; relinking is space, not a verdict.
+        relink_build_outputs(checkout, env, phase="verify")
     try:
         return json.loads(checked.stdout)
     except ValueError:
