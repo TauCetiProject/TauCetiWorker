@@ -230,8 +230,8 @@ def main():
         ]
         check(f"{name}: both variants say the same about the quality pass", lines[0] and lines[0] == lines[1])
 
-    # 8) Agents run Q1, Q2 and Q5 and decline the other checks unless the operator chose
-    # --full-quality (TAUCETI_FULL_QUALITY=1), in every quality-pass prompt of either variant.
+    # 8) Agents run the duplicate and proof-length checks and decline the others unless the operator
+    # chose --full-quality (TAUCETI_FULL_QUALITY=1), in every quality-pass prompt of either variant.
     for full in (None, "0", "1"):
         environment = {k: v for k, v in os.environ.items() if k != "TAUCETI_FULL_QUALITY"}
         if full is not None:
@@ -245,8 +245,39 @@ def main():
                     if full == "1":
                         ok = "Run every check." in text and "Run only" not in text
                     else:
-                        ok = "Run only Q1, Q2 and Q5" in text and "`declined — not run`" in text
+                        ok = "Run only the Mathlib duplicates" in text and "`declined — not run`" in text
                     check(f"{name}: quality scope (TAUCETI_FULL_QUALITY={full}, TAUCETI_VERIFY_HELPER={helper})", ok)
+
+    # 9) The default picks its checks by their titles, and the numbers it gives agree with both
+    # template shapes. A PR keeps the template its branch was cut with: five checks, with proof
+    # length Q5, or the three of TauCeti#40207, with proof length Q3.
+    shapes = {
+        "five": (
+            "Q1 Mathlib duplicates",
+            "Q2 Tau Ceti duplicates, on main and in open PRs",
+            "Q3 Hypotheses",
+            "Q4 Section variables",
+            "Q5 Proofs of at most 50 lines",
+        ),
+        "three": (
+            "Q1 Mathlib duplicates",
+            "Q2 Tau Ceti duplicates, on main and in open PRs",
+            "Q3 Proofs of at most 50 lines",
+        ),
+    }
+    expected = {
+        "five": (["Q1", "Q2", "Q5"], "Q1, Q2 and Q5 when the template has five checks"),
+        "three": (["Q1", "Q2", "Q3"], "Q1 to Q3 when it has three"),
+    }
+    with patch.dict(os.environ, {"TAUCETI_FULL_QUALITY": "0"}):
+        scope = tc.agents.quality_scope()
+    selected, _, rest = scope.partition(":")
+    for shape, rows in shapes.items():
+        run = [row.split(" ", 1)[0] for row in rows if row.split(" ", 1)[1].split(",")[0] in selected]
+        numbers, stated = expected[shape]
+        check(f"default scope runs {', '.join(numbers)} of the {shape}-check template", run == numbers)
+        check(f"default scope numbers the {shape}-check template's checks the same way", stated in rest)
+    check("default scope declines every other check", "Each other line" in rest and "`declined — not run`" in rest)
 
     print("FAIL" if fails else "PASS")
     return 1 if fails else 0
