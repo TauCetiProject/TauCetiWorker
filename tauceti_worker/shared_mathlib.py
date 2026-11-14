@@ -901,15 +901,15 @@ def discard_entry(pool, entry):
     remove_tree(retired)
 
 
-def collect(pool, *, protect=(), now=None, max_age=7 * 86400, dry_run=False):
+def collect(pool, *, protect=(), now=None, max_age=7 * 86400, dry_run=False, held=()):
     try:
         with key_lock(pool, "gc", nonblocking=True, readonly=dry_run):
-            return _collect(pool, protect=protect, now=now, max_age=max_age, dry_run=dry_run)
+            return _collect(pool, protect=protect, now=now, max_age=max_age, dry_run=dry_run, held=held)
     except BlockingIOError:
         return []
 
 
-def _collect(pool, *, protect=(), now=None, max_age=7 * 86400, dry_run=False):
+def _collect(pool, *, protect=(), now=None, max_age=7 * 86400, dry_run=False, held=()):
     """Bounded by snapshot count. Locked readers/builders are never reclaimed."""
     now = time.time() if now is None else now
     entries = pool / "entries"
@@ -919,9 +919,20 @@ def _collect(pool, *, protect=(), now=None, max_age=7 * 86400, dry_run=False):
     else:
         entries.mkdir(parents=True, exist_ok=True)
     for retired in (pool / "trash").glob("*"):
+        # Trash is named <key>-<32 hex>. Its lower may still be mounted by a round that outlived an
+        # eviction; delete it only while holding that key's exclusive lease, and skip it otherwise.
+        key = re.sub(r"-[0-9a-f]{32}$", "", retired.name)
         with contextlib.suppress(FileNotFoundError):
-            if not dry_run:
+            if dry_run:
+                continue
+            if key in held:  # the caller already holds this key's exclusive lease
                 remove_tree(retired)
+                continue
+            try:
+                with key_lock(pool, key, exclusive=True, nonblocking=True):
+                    remove_tree(retired)
+            except (BlockingIOError, Unavailable):
+                continue
     # A killed builder cannot run TemporaryDirectory cleanup. Reclaim its
     # staging tree before evicting useful published snapshots for disk pressure.
     for stage in (pool / "staging").glob("*"):
@@ -1000,7 +1011,7 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
     if ready_entry(entry, key, spec):
         os.utime(entry, None)
         return entry, True
-    collect(pool, protect=(key,))
+    collect(pool, protect=(key,), held=(key,))
     usage = shutil.disk_usage(pool)
     if usage.free < disk_reserve(usage):
         raise Unavailable(
@@ -1061,7 +1072,7 @@ def publish(pool, key, spec, cwd, env, logdir, fetch):
             ready / "ready.json",
             dict(key=key, spec=spec, files_verified=count, inventory=files, published_at=time.time()),
         )
-        collect(pool, protect=(key,))
+        collect(pool, protect=(key,), held=(key,))
         usage = shutil.disk_usage(pool)
         if usage.free < disk_reserve(usage):
             raise Unavailable(

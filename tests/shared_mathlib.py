@@ -1674,6 +1674,18 @@ class VersionCapTests(unittest.TestCase):
         self.assertIsInstance(s.CapContention("x"), s.NoFallback)
         self.assertIsNone(holder.poll())
 
+    def test_collect_keeps_trash_whose_key_is_still_leased(self):
+        pool = self.root / "pool"
+        trash = pool / "trash" / ("k-old-" + "a" * 32)
+        (trash / "build").mkdir(parents=True)
+        holder = self.holder(pool, "k-old")
+        s.collect(pool, max_age=10**9)
+        self.assertTrue(trash.exists())  # a round that outlived eviction still mounts this lower
+        holder.kill()
+        holder.wait()
+        s.collect(pool, max_age=10**9)
+        self.assertFalse(trash.exists())
+
     def test_cap_evicts_the_oldest_allowed_entry_when_all_are_allowed(self):
         pool = self.root / "pool"
         older = self.entry(pool, "k-a", "aaa", age=900)
