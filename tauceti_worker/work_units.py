@@ -436,18 +436,30 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         from .activity import select
         from .security_audit import run
 
-        select("security-audit")
         other_tasks = [task for task in opts.only if task != "security-audit"]
         if not other_tasks:
+            select("security-audit")
             return run(w.cfg, opts)  # No PR survey or general-purpose agent launcher.
         try:
             minimum = int(os.environ.get("TAUCETI_SECURITY_AUDIT_MIN_COMMITS", "20"))
         except ValueError:
             raise Die("TAUCETI_SECURITY_AUDIT_MIN_COMMITS must be a positive integer") from None
-        try:
-            return run(w.cfg, replace(opts, only=["security-audit"]), min_commits=minimum)
-        except Exception as exc:  # Any audit failure, even an unexpected one, must not starve maintenance.
-            log(f"{exc!r}; continuing {', '.join(other_tasks)} work without advancing the audit cursor")
+        # The audit and the maintenance tasks sharing this worker take turns: after a round that ran
+        # the audit, the next round goes to maintenance, so a long audit backlog cannot starve bumps.
+        # Any audit failure, even an unexpected one, also falls through to maintenance.
+        if w.counters.read("security-audit-yield"):
+            if not opts.dry_run:
+                w.counters.write("security-audit-yield", 0)
+        else:
+            select("security-audit")
+            try:
+                rc = run(w.cfg, replace(opts, only=["security-audit"]), min_commits=minimum)
+            except Exception as exc:
+                log(f"{exc!r}; continuing {', '.join(other_tasks)} work without advancing the audit cursor")
+            else:
+                if not opts.dry_run:
+                    w.counters.write("security-audit-yield", 1)
+                return rc
         # The audit runner retains its evidence and blocks. Maintenance cannot
         # clear them or move the cursor; the separate release gate stays enforced.
         opts = replace(opts, only=other_tasks)
