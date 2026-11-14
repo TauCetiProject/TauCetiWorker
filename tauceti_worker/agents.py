@@ -736,11 +736,11 @@ def prepare_checkout(
         log(f"cloning {TAUCETI} → {co} ({why})")
         return subprocess.run(["git", "clone", "-q", checkout_url(), str(co)]).returncode == 0
 
-    if co.exists() and not (co / ".git").is_dir():
+    if co.exists() and work_recovery.checkout_kind(co) is None:
         # An interrupted clone (or anything else without git metadata) would fail every round.
         if not work_recovery.retain(cfg, co, "the checkout has no git metadata").ok:
             return False
-    if not (co / ".git").is_dir() and not clone("first run"):
+    if not (co / ".git").exists() and not clone("first run"):
         return False
 
     def g(*a) -> int:

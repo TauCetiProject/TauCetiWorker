@@ -331,6 +331,42 @@ def _rev(repo: Path, name: str) -> str | None:
     return _git(repo, "rev-parse", "-q", "--verify", f"{name}^{{commit}}", check=False, text=True).strip() or None
 
 
+def git_path(repo: Path, name: str) -> Path:
+    """Git's own resolution of `name` inside `repo`'s metadata; works for linked worktrees.
+
+    A linked worktree's `.git` is a file, and its per-worktree files (`index`, `HEAD`, hooks
+    through `core.hooksPath`) live under the common repository, so never join `repo / ".git"`.
+    """
+    value = Path(_git(repo, "rev-parse", "--git-path", name, text=True).strip())
+    return value if value.is_absolute() else repo / value
+
+
+def checkout_kind(repo: Path) -> str | None:
+    """ "standalone" for an ordinary clone, "worktree" for a linked worktree, None otherwise.
+
+    A linked worktree must be the top level of its own work tree and its Git directory must be
+    a `worktrees/<name>` entry of its common repository; a symlinked `.git` is never accepted.
+    """
+    dotgit = repo / ".git"
+    if dotgit.is_symlink():
+        return None
+    if dotgit.is_dir():
+        return "standalone"
+    if not dotgit.is_file():
+        return None
+    try:
+        top, gitdir, common = _git(
+            repo, "rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir", text=True
+        ).splitlines()
+    except (RecordError, ValueError, OSError, subprocess.SubprocessError):
+        return None
+    common_path = Path(common) if Path(common).is_absolute() else repo / common
+    gitdir_path = Path(gitdir)
+    if Path(top).resolve() != repo.resolve() or gitdir_path.resolve().parent != (common_path / "worktrees").resolve():
+        return None
+    return "worktree"
+
+
 def _excluded(rel: str) -> str | None:
     parts = rel.rstrip("/").split("/")
     name = parts[-1]
@@ -393,7 +429,13 @@ def inspect(repo: Path, preserved: list[str] | None = None, *, history: bool = F
     tips: dict[str, str] = {}
     if head:
         tips["HEAD"] = head
-    for line in _git(repo, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", text=True).splitlines():
+    # Branches are shared by every worktree of one repository: a linked worktree owns only the
+    # branch its HEAD names, and other rounds' branches are theirs to save.
+    linked = checkout_kind(repo) == "worktree"
+    heads = [branch] if linked and branch else [] if linked else ["refs/heads"]
+    for line in (
+        _git(repo, "for-each-ref", "--format=%(objectname) %(refname)", *heads, text=True).splitlines() if heads else []
+    ):
         oid, _, ref = line.partition(" ")
         tips[ref] = oid
     gitdir = Path(_git(repo, "rev-parse", "--absolute-git-dir", text=True).strip())
@@ -411,6 +453,7 @@ def inspect(repo: Path, preserved: list[str] | None = None, *, history: bool = F
             _git(
                 repo,
                 "rev-list",
+                "--single-worktree",
                 "--all",
                 "--reflog",
                 "--not",
@@ -421,7 +464,9 @@ def inspect(repo: Path, preserved: list[str] | None = None, *, history: bool = F
             ).split()
         )
         if extra:
-            heads = set(_git(repo, "rev-list", "--no-walk", "--all", "--reflog", text=True).split())
+            heads = set(
+                _git(repo, "rev-list", "--single-worktree", "--no-walk", "--all", "--reflog", text=True).split()
+            )
             retained = extra & heads
             if len(retained) > MAX_HISTORY_TIPS:
                 raise HistoryLimit("retained history exceeds bounded descriptor tip count")
@@ -1318,8 +1363,9 @@ def save_for_cleanup(cfg, repo: Path, *, owner=None, dry_run=False) -> Decision:
     """Save source without moving/resetting a tree; a collector can still evict caches on failure."""
     record = None
     try:
-        if not (repo / ".git").is_dir() or (repo / ".git").is_symlink():
-            return Decision(False, "not a standalone Git checkout; retaining source", state="protected")
+        kind = checkout_kind(repo)
+        if kind is None:
+            return Decision(False, "not a Git checkout or linked worktree; retaining source", state="protected")
         snap = inspect(repo, history=True)
         if len(snap.untracked) > MAX_UNTRACKED_FILES or snap.archive_bytes > MAX_UNTRACKED_BYTES:
             return Decision(
@@ -1329,14 +1375,18 @@ def save_for_cleanup(cfg, repo: Path, *, owner=None, dry_run=False) -> Decision:
             record = _record(cfg, repo, snap, "TauCeti", TAUCETI, owner=owner)
         if any("credential" in reason for _, reason in snap.excluded):
             return Decision(False, "credential-like files require retaining the checkout", record, "protected")
-        if _git(
-            repo, "for-each-ref", "--format=%(refname)", "refs/stash", "refs/tags", "refs/notes", text=True
-        ).strip():
+        # A linked worktree shares fetched tags with every other worktree; only its own
+        # per-worktree refs and the shared stash and notes (conservatively) need retaining.
+        extra = ["refs/stash", "refs/notes"] + (
+            ["refs/worktree", "refs/bisect"] if kind == "worktree" else ["refs/tags"]
+        )
+        if _git(repo, "for-each-ref", "--format=%(refname)", *extra, text=True).strip():
             return Decision(False, "additional Git refs require retaining the checkout", record, "protected")
         preserved = [f"--glob={PRESERVED}/{record.name}"] if record else []
         if _git(
             repo,
             "rev-list",
+            "--single-worktree",
             "--reflog",
             "--all",
             "--not",

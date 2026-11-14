@@ -760,7 +760,7 @@ class WorkerBackend:
                 return self.restore(record, m, j)
             if saved.live_users(checkout):
                 raise Wait("continuation-cleanup", "Recovery checkout still has local users")
-            lock = checkout / ".git/index.lock"
+            lock = saved.git_path(checkout, "index.lock")
             if lock.exists() and (j.get("pending_merge_head") or j.get("content_started")):
                 lock.rename(record / f"retained-index-lock-{uuid.uuid4().hex}")
                 saved._fsync_dir(record)
@@ -815,6 +815,10 @@ class WorkerBackend:
         return checkout
 
     def configure_checkout(self, directory, final):
+        # Recovery checkouts are standalone `--local` clones: their hooks and config are their
+        # own. A linked worktree would share both with every other worktree, so never use one here.
+        if saved.checkout_kind(directory) != "standalone":
+            raise RuntimeError("recovery checkouts must be standalone clones with private hooks")
         hook = directory / ".git/hooks/pre-push"
         saved._write(
             hook,
@@ -838,8 +842,8 @@ class WorkerBackend:
         checkout = record / "checkout"
         built = Path(transaction["built"])
         archived = Path(transaction["archived"])
-        marker = checkout / ".git/tauceti-recovery-delta"
-        if not marker.is_file() or marker.read_text() != transaction["id"]:
+        marker = saved.git_path(checkout, "tauceti-recovery-delta") if (checkout / ".git").exists() else None
+        if marker is None or not marker.is_file() or marker.read_text() != transaction["id"]:
             if checkout.exists():
                 if archived.exists():
                     raise RuntimeError("Ambiguous delta checkout handoff; all source directories retained")
@@ -976,7 +980,7 @@ class WorkerBackend:
         saved._git(built, "remote", "set-url", "origin", repository_url(m["repository"]))
         saved._git(built, "config", "remote.origin.pushurl", "no_push")
         self.configure_checkout(built, checkout)
-        saved._write(built / ".git/tauceti-recovery-delta", transaction["id"].encode())
+        saved._write(saved.git_path(built, "tauceti-recovery-delta"), transaction["id"].encode())
         applied = (
             subprocess.run(
                 ["git", "-C", str(built), "apply", "--3way", "--index", str(transaction["patch"])], capture_output=True
