@@ -1933,6 +1933,11 @@ def _service_environment() -> dict[str, str]:
         # The unit may outlive a Nix store path. Preserve it as a candidate, not as the final
         # SSL_CERT_FILE, so cli_main revalidates it and can fall back or warn after collection.
         service_env["NIX_SSL_CERT_FILE"] = advertised_path
+    from .paths import INSTALLED, legacy_data_root
+
+    if INSTALLED or os.environ.get("TAUCETI_LEGACY_DATA_ROOT"):
+        # The unit must keep this installation's data root, including an XDG_DATA_HOME choice.
+        service_env["TAUCETI_LEGACY_DATA_ROOT"] = str(legacy_data_root().resolve())
     return service_env
 
 

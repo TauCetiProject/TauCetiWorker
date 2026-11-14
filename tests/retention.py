@@ -65,6 +65,10 @@ class Retention(unittest.TestCase):
             item.start()
             self.addCleanup(item.stop)
         # Rounds start the fallback collector; fixtures must never launch a real one.
+        # run() retires other data roots; on a Fleet host that would find the host's real runtimes.
+        retire = patch.object(retention, "retired_roots", return_value=[])
+        retire.start()
+        self.addCleanup(retire.stop)
         self.spawn = patch.object(retention, "_fallback_collector")
         self.fallback = self.spawn.start()
         self.addCleanup(self.spawn.stop)
