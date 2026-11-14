@@ -98,6 +98,7 @@ RUN_STDLIB=(
   contest_claim.py
   compact_surveys.py
   cost_model.py
+  declined_incidents.py
   dispatch_revalidation.py
   fix_diagnostic.py
   fork_authoring.py
