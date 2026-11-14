@@ -1290,6 +1290,37 @@ def ready_entry(entry, key, spec):
     return True
 
 
+def writable_directories(lower, upper):
+    """Give the round's private source upper a writable copy of every lower directory.
+
+    The shared source tree is read-only (directories 0555). OverlayFS takes a merged directory's
+    mode from the lower layer until the upper has its own copy, so creating any new file (Lake
+    writes `.hash` files beside inputs such as ProofWidgets' widget/package-lock.json) failed
+    with EACCES. Mirrored 0755 directories make the merged view writable for this round only;
+    the shared tree itself stays read-only. The build directory is a separate layer."""
+    lower = Path(lower)
+    for directory, children, _ in os.walk(lower):
+        relative = Path(directory).relative_to(lower)
+        if relative.parts[:2] == (".lake", "build") or relative.parts[:1] == (".git",):
+            children[:] = []
+            continue
+        children[:] = [c for c in children if not os.path.islink(os.path.join(directory, c))]
+        (Path(upper) / relative).mkdir(mode=0o755, parents=True, exist_ok=True)
+
+
+def raise_open_file_limit(wanted=65536):
+    """Raise this process's soft RLIMIT_NOFILE (inherited by children) towards its hard limit.
+
+    Mathlib's cache extraction decompresses thousands of archives in parallel and fails with
+    EMFILE under the common default soft limit of 1024."""
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = wanted if hard == resource.RLIM_INFINITY else min(wanted, hard)
+    if soft != resource.RLIM_INFINITY and soft < target:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+
+
 def stop_sharing(pool, reason):
     """Stop future rounds; never disturb existing leases or immutable readers."""
     from .config import log
@@ -1534,6 +1565,7 @@ def publish(P, key, spec, graph, closure, env, logdir, fetch):
                 *binds,
                 "--",
             ]
+            raise_open_file_limit()  # leantar opens thousands of archives at once (EMFILE at 1024)
             rc = fetch([*prefix, "lake", "exe", "cache", "get"], project, env, output, 1200)
         if rc:
             raise Unavailable(f"fresh Mathlib extraction failed (exit {rc}); see {log}")
@@ -1768,6 +1800,7 @@ def view(cwd, env, logdir, fetch):
             for name in closure:
                 for part in ("source-upper", "source-work", "upper", "work"):
                     (generation / name / part).mkdir(parents=True)
+                writable_directories(source / name, generation / name / "source-upper")
                 # The package's source first: Lake writes `.hash` files beside input files (such as
                 # ProofWidgets' widget/package-lock.json), so the round gets a private upper over
                 # the immutable tree. Then its build, mounted inside that view.

@@ -83,7 +83,9 @@ class Fixture(unittest.TestCase):
         upstream = self.root / "upstream"
         self.batteries_repo = upstream / "batteries"
         self.batteries_rev = repository(
-            self.batteries_repo, {"Batteries.lean": "def b := 1\n", ".gitignore": ".lake/\n"}
+            # widget/: a nested input directory, like ProofWidgets' widget/package-lock.json.
+            self.batteries_repo,
+            {"Batteries.lean": "def b := 1\n", ".gitignore": ".lake/\n", "widget/package-lock.json": "{}\n"},
         )
         self.mathlib_repo = upstream / "mathlib"
         self.rev = repository(
@@ -383,6 +385,19 @@ class AttachTests(Fixture):
         self.env["LAKE_PKG_URL_MAP"] = "{"
         with self.assertRaisesRegex(s.Unavailable, "LAKE_PKG_URL_MAP"):
             s.expected_url("mathlib", "x", self.env)
+
+
+class OpenFileLimitTests(unittest.TestCase):
+    def test_raises_the_soft_limit_towards_the_hard_limit(self):
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        low = 256 if hard == resource.RLIM_INFINITY else min(256, hard)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (low, hard))
+        s.raise_open_file_limit(wanted=4096)
+        expected = 4096 if hard == resource.RLIM_INFINITY else min(4096, hard)
+        self.assertEqual(resource.getrlimit(resource.RLIMIT_NOFILE), (expected, hard))
 
 
 class SignatureTests(Fixture):
@@ -748,6 +763,23 @@ class ViewTests(Fixture):
             generation = self.cwd / ".lake" / s.META / s.view_marker(self.cwd)["generation"]
             self.assertEqual((generation / "mathlib/upper/lib/lean/Mathlib.olean").read_bytes(), b"copyup")
         self.assertEqual(list(self.build.iterdir()), [])  # outside the view: the empty mount point
+        self.assertEqual(writable_bits(self.source), [])
+
+    def test_new_files_in_nested_shared_source_directories_stay_in_the_round(self):
+        # ProofWidgets' widget/package-lock.json.hash: Lake creates new files in nested source
+        # directories, which are 0555 in the shared tree; the round's view must still allow it.
+        with s.view(self.cwd, self.env, self.root / "logs", self.extract) as prefix:
+            nested = sorted(
+                Path(d)
+                for d, _, _ in os.walk(self.source)
+                if len(Path(d).relative_to(self.source).parts) >= 2 and not {".lake", ".git"} & set(Path(d).parts)
+            )
+            self.assertIn(self.source / "batteries/widget", nested)
+            for directory in nested:
+                made = directory / "created-by-lake.hash"
+                p = self.run_in(prefix, "sh", "-c", 'printf h > "$1" && cat "$1"', "sh", str(made))
+                self.assertEqual((p.returncode, p.stdout), (0, b"h"), (directory, p.stderr))
+                self.assertFalse(made.exists())
         self.assertEqual(writable_bits(self.source), [])
 
     def test_two_build_keys_against_one_source_revision_in_concurrent_namespaces(self):
