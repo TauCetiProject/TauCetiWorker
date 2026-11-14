@@ -397,13 +397,16 @@ with tempfile.TemporaryDirectory() as tmp:
     (pool / "entries/k/ready.json").write_text(json.dumps({"spec": {"mathlib": "abc"}}))
     marker.write_text(json.dumps({"pool": str(pool), "key": "k"}))
 
-    def lake(*args, view=True, pin="abc"):
+    def lake(*args, view=True, pin="abc", path=None, cwd=None):
         (co / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib", "rev": pin}]}))
-        env = {**os.environ, "PATH": f"{wrapper}:{real}:{os.environ['PATH']}", "TAUCETI_VERIFY_PYTHON": sys.executable}
+        path = path or f"{wrapper}:{real}"
+        env = {**os.environ, "PATH": f"{path}:{os.environ['PATH']}", "TAUCETI_VERIFY_PYTHON": sys.executable}
         env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)
         if view:
             env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(["bwrap"])
-        return agents.subprocess.run(["lake", *args], cwd=co, env=env, capture_output=True, text=True)
+        return agents.subprocess.run(
+            [str(wrapper / "lake"), *args], cwd=cwd or co, env=env, capture_output=True, text=True, timeout=30
+        )
 
     same = lake("exe", "cache", "get")
     assert same.returncode == 0 and "real-lake" not in same.stdout, same
@@ -412,4 +415,33 @@ with tempfile.TemporaryDirectory() as tmp:
     assert lake("exe", "cache", "get", view=False).stdout.strip() == "real-lake exe cache get"
     assert lake("build", "Foo").stdout.strip() == "real-lake build Foo"
     assert lake("exe", "cache", "clean").stdout.strip() == "real-lake exe cache clean"
+    # Every spelling of the extraction is refused: options, aliases, qualified names, forced unpack.
+    for args in (
+        ("-q", "exe", "cache", "get"),
+        ("exe", "-q", "cache", "get"),
+        ("exec", "cache", "get"),
+        ("exe", "mathlib/cache", "get"),
+        ("+leanprover/lean4:v4.36.0", "exe", "cache", "get!"),
+        ("exe", "cache", "unpack!"),
+        ("exe", "cache", "--repo=x/y", "get"),
+        ("--log-level", "info", "exe", "cache", "unpack"),
+    ):
+        refused = lake(*args)
+        assert refused.returncode == 0 and "real-lake" not in refused.stdout, (args, refused)
+    # `-d DIR` selects the workspace whose pin is checked, wherever lake is run from.
+    remote = lake("-d", str(co), "exe", "cache", "get", cwd=root)
+    assert remote.returncode == 0 and "real-lake" not in remote.stdout, remote
+    elsewhere = lake("exe", "cache", "get", cwd=root)
+    assert elsewhere.returncode == 1, elsewhere
+    # `lake env CMD` puts the wrapper back in front of the toolchain's own lake.
+    (real / "lake").write_text(
+        '#!/bin/sh\nif [ "$1" = env ]; then shift; PATH="' + str(real) + ':$PATH" exec "$@"; fi\necho real-lake "$@"\n'
+    )
+    nested = lake("env", "lake", "exe", "cache", "get")
+    assert nested.returncode == 0 and "real-lake" not in nested.stdout, nested
+    assert lake("env", "lake", "build").stdout.strip() == "real-lake build"
+    # Aliases of the wrapper's own directory never make it exec itself.
+    for alias in (f"{wrapper}/", f"{wrapper}/.", "scripts"):
+        looped = lake("build", path=f"{alias}:{real}", view=False, cwd=wrapper.parent if alias == "scripts" else None)
+        assert looped.stdout.strip() == "real-lake build", (alias, looped)
 print("[OK] the agent's lake wrapper refuses Mathlib cache fetches inside a shared view")
