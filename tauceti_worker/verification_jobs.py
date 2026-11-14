@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,43 +24,51 @@ from .runtime_status import read_json, report_runtime
 from .verification_scope import git
 from .verification_storage import Pressure
 
-
-def copy_file(source, target):
-    """Use independent CoW extents when available, with a portable byte-copy fallback."""
-    try:
-        with open(source, "rb") as incoming, open(target, "wb") as outgoing:
-            fcntl.ioctl(outgoing.fileno(), 0x40049409, incoming.fileno())  # Linux FICLONE
-        shutil.copystat(source, target)
-        return target
-    except OSError:
-        return shutil.copy2(source, target)
-
-
-def backing_source(source, build, lower):
-    """Merged enumeration owns whiteouts; open real backing files for reflink."""
-    source = Path(source)
-    if not source.is_relative_to(build):
-        return source
-    relative = source.relative_to(build)
-    private = build.parent / "tauceti-overlay-upper" / relative
-    return private if private.is_file() else lower / relative
-
-
-def snapshot_command():
-    """Private subprocess entry; preserve retryable storage failures across IPC."""
-    payload = json.load(sys.stdin)
-    for name in ("root", "target", "immutable_packages"):
-        if payload.get(name) is not None:
-            payload[name] = Path(payload[name])
-    try:
-        snapshot(**payload)
-    except Pressure as error:
-        print(json.dumps(dict(pressure=error.reason, error=str(error))))
-        raise SystemExit(75) from error
+# Build payloads and sources are hard-linked from the source workspace, never copied: Lake
+# replaces these files (it clears outputs before writing them) and Git checks files out by
+# rename, so a link never sees a write in place. Small metadata (traces, hashes, manifests,
+# logs, Git metadata outside the object store, and other small files a build may append to)
+# is copied. Any other large file is linked too, so nothing large is ever copied.
+LINKED = (
+    ".olean",
+    ".olean.server",
+    ".olean.private",
+    ".ilean",
+    ".ir",
+    ".ir.sig",
+    ".c",
+    ".bc",
+    ".ltar",
+    ".o",
+    ".a",
+    ".so",
+    ".dylib",
+    ".lean",
+)
+COPY_LIMIT = 64 * 1024
+COPIED = (".trace", ".hash", ".json", ".toml", ".log", ".lock")
+LINKS = "tauceti-links.json"
+SCRATCH = {
+    LINKS,
+    "__pycache__",
+    "tauceti-scope",
+    "tauceti-overlay-work",
+    "tauceti-overlay-upper",
+    "tauceti-shared-mathlib.json",
+    "build-before-sharing",
+    "build-shared-delta",
+}
 
 
 def snapshot(root, target, names, *, immutable_packages=None, include_builds=True):
-    """A failed copy is disposable until the caller durably publishes isolated ownership."""
+    """A failed snapshot is disposable until the caller durably publishes isolated ownership.
+
+    Shared Mathlib is never copied: its package links into the host's read-only sources are kept
+    as links, the private view state is left behind, and the candidate's own verification enters a
+    fresh shared view. TauCeti's build outputs and other payloads are hard links, never copies. A
+    checkout still carrying an older layout's sparse Mathlib upper keeps its sources without build
+    outputs; its next view retires that private package.
+    """
     from .shared_mathlib import remove_tree
     from .verification import atomic, digest
     from .verification_storage import candidate, release
@@ -70,73 +79,25 @@ def snapshot(root, target, names, *, immutable_packages=None, include_builds=Tru
         raise ValueError("snapshot needs a new owned candidate path")
     marker = state / "verification-copy-incomplete" / f"{target.name}.json"
     atomic(marker, dict(version=1, source=str(root), source_digest=digest(names)))
+    skip_packages = False
     try:
-        # After the agent namespace exits, this host path is only the sparse
-        # upper (possibly with whiteouts), not a usable Mathlib build. Materialize
-        # its merged cache while holding the existing lower's ordinary reader lease.
-        from . import shared_mathlib
-        from .verification import Incomplete
+        legacy = root / ".lake/packages/mathlib/.lake/tauceti-shared-mathlib.json"
+        if include_builds and legacy.is_file() and not (root / ".lake/packages/mathlib").is_symlink():
+            from .config import log
 
-        upper = root / ".lake/packages/mathlib/.lake/build"
-        shared = read_json(upper.parent / "tauceti-shared-mathlib.json")
-        if include_builds and shared and not upper.is_mount():
-            if not shared_mathlib._build_parent_owned(upper):
-                # A stale overlay under caller-owned dependency links must not
-                # be detached or repeatedly rehydrated. Preserve independent
-                # exact sources; normal verification warms the private cache.
-                from .config import log
-
-                log("verification: stale shared Mathlib build under linked packages; preserving private sources")
-                return _snapshot(root, target, names, immutable_packages=None, include_builds=False)
-            key = shared.get("key", "")
-            if not re.fullmatch("[0-9a-f]{64}", key):
-                raise Incomplete("invalid shared Mathlib snapshot identity", reason="preservation")
-            pool = Path(shared.get("pool") or shared_mathlib.root())
-            with shared_mathlib.key_lock(pool, key, exclusive=False) as lease:
-                lower = pool / "entries" / key / "build"
-                if lower.is_dir() and shared.get("boot_id") == shared_mathlib.boot_id():
-                    work = upper.with_name("tauceti-overlay-work")
-                    work.mkdir(exist_ok=True)
-                    payload = dict(
-                        root=str(root),
-                        target=str(target),
-                        names=names,
-                        immutable_packages=str(immutable_packages) if immutable_packages else None,
-                        include_builds=include_builds,
-                    )
-                    env = dict(os.environ)
-                    package = str(Path(__file__).resolve().parent.parent)
-                    env["PYTHONPATH"] = package + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-                    result = subprocess.run(
-                        shared_mathlib.overlay_command(lower, upper, work, upper, pool, lease_fd=lease.fileno())
-                        + [sys.executable, "-m", "tauceti_worker.verification_jobs"],
-                        input=json.dumps(payload),
-                        env=env,
-                        text=True,
-                        capture_output=True,
-                        pass_fds=(lease.fileno(),),
-                    )
-                    if result.returncode == 75:
-                        failure = json.loads(result.stdout)
-                        raise Pressure(failure["error"], reason=failure["pressure"])
-                    if result.returncode:
-                        raise Incomplete(
-                            "merged Mathlib snapshot failed: " + result.stderr[-1000:], reason="preservation"
-                        )
-                    return
-            # A collected lower or pre-reboot disposable upper is a cache
-            # miss. Rehydrate normally, with the normal service config.
-            from .agents import host_build_cache_context
-
-            try:
-                shared_mathlib.detach_upper(upper, upper.parent / "tauceti-shared-mathlib.json")
-                with host_build_cache_context(root, dict(os.environ), state / "verification-cache-prepare"):
-                    return snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=True)
-            except Pressure:
-                raise
-            except Exception as error:
-                raise Pressure(f"Mathlib cache preparation pending: {error}", reason="cache") from error
-        return _snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=include_builds)
+            # Its private Mathlib and closure stay behind: the candidate's own view attaches
+            # the shared sources from the manifest, so nothing of Mathlib enters the candidate.
+            log("verification: older shared Mathlib layout under this checkout; leaving its packages behind")
+            include_builds = False
+            skip_packages = True
+        return _snapshot(
+            root,
+            target,
+            names,
+            immutable_packages=immutable_packages,
+            include_builds=include_builds,
+            skip_packages=skip_packages,
+        )
     except BaseException:
         # Nothing in this directory has become an authoritative workspace. Owner death leaves
         # the same durable construction marker for bounded ordinary collection.
@@ -153,28 +114,123 @@ def commit_copy(state, identifier):
     (state / "verification-copy-incomplete" / f"{identifier}.json").unlink(missing_ok=True)
 
 
-def _snapshot(root, target, names, *, immutable_packages=None, include_builds=True):
-    """Copy exact sources/index and warm build caches without editing the agent's index."""
+def link(source, dest):
+    """Hard-link one file; a failure stops the snapshot instead of falling back to a copy."""
+    from .verification import Incomplete
+
+    try:
+        os.link(source, dest, follow_symlinks=True)
+    except OSError as error:
+        raise Incomplete(
+            f"candidate preservation needs hard links ({error}); nothing was copied", reason="preservation"
+        ) from error
+
+
+def _shared_links(lake):
+    """`{package: target}` for packages that are links into the host's read-only shared sources."""
+    from .shared_mathlib import root as shared_root
+
+    pool = str(shared_root()) + os.sep
+    packages = lake / "packages"
+    links = {}
+    if packages.is_dir() and not packages.is_symlink():
+        for entry in packages.iterdir():
+            if entry.is_symlink() and os.readlink(entry).startswith(pool):
+                links[entry.name] = os.readlink(entry)
+    return links
+
+
+def _linked(relative, info):
+    parts = relative.parts
+    if ".git" in parts:
+        return "objects" in parts[parts.index(".git") :]
+    if relative.name.endswith(LINKED) or info.st_mode & 0o111:
+        return True
+    return info.st_size > COPY_LIMIT and not relative.name.endswith(COPIED)
+
+
+def _link_tree(lake, dest, budget, *, include_builds, immutable_packages, target, skip_packages=False):
+    """Rebuild `.lake` under `dest`: payloads and sources by hard link, small metadata by copy.
+
+    Returns `{relative path: [inode, size, mtime_ns]}` of the links, so a continuation can
+    prove that nothing wrote through a shared inode in the meantime.
+    """
+    from .shared_mathlib import META
+
+    shared = _shared_links(lake)
+    linked = {}
+    for directory, dirs, files in os.walk(lake, followlinks=True):
+        here = Path(directory)
+        out = dest / here.relative_to(lake)
+        out.mkdir(parents=True, exist_ok=True)
+        out.chmod(out.stat().st_mode | 0o700)
+        kept = []
+        for name in dirs:
+            path = here / name
+            if (
+                name in SCRATCH
+                or name in ("build-shared-deltas", META)
+                and here.name == ".lake"
+                or here == lake / "packages"
+                and name in shared
+                or target.is_relative_to(path)
+                or not include_builds
+                and name in {"build", "build-before-sharing"}
+                and here.name == ".lake"
+                or (immutable_packages is not None or skip_packages)
+                and here == lake
+                and name == "packages"
+            ):
+                continue
+            kept.append(name)
+        dirs[:] = kept
+        for name in files:
+            if name in SCRATCH or name.endswith(".setup.json"):
+                continue  # Lake rewrites setup files before each compile; nothing reads them back.
+            source = here / name
+            info = source.stat()
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            relative = source.relative_to(lake)
+            if _linked(relative, info):
+                link(source, out / name)
+                linked[str(relative)] = [info.st_ino, info.st_size, info.st_mtime_ns]
+                budget.linked += info.st_size
+            else:
+                budget.charge(source)
+                shutil.copy2(source, out / name)
+    return linked
+
+
+def links_intact(root):
+    """Whether every hard link a snapshot made still has the inode, size and mtime it had.
+
+    Lake replaces outputs instead of writing them in place, and Git checks files out by
+    rename, but an editor or tool can write a linked source in place. Such a candidate is
+    abandoned rather than verified against changed dependencies.
+    """
+    recorded = read_json(root / ".lake" / LINKS).get("links") or {}
+    for relative, (inode, size, mtime_ns) in recorded.items():
+        try:
+            info = (root / ".lake" / relative).lstat()
+        except FileNotFoundError:
+            continue  # removed by the candidate's own build: no longer shared
+        except OSError:
+            return False
+        # A different inode is Lake's own replacement; only the shared inode changing is a write.
+        if info.st_ino == inode and (info.st_size, info.st_mtime_ns) != (size, mtime_ns):
+            return False
+    return True
+
+
+def _snapshot(root, target, names, *, immutable_packages=None, include_builds=True, skip_packages=False):
+    """Exact sources and index; Git objects and build payloads are hard links, never copies."""
     from .verification import Incomplete
     from .verification_storage import CopyBudget, reserve, settle
 
     try:
         amount = reserve(target.parent.parent, target.name)
         budget = CopyBudget(amount, target)
-
-        build = root / ".lake/packages/mathlib/.lake/build"
-        shared = read_json(build.parent / "tauceti-shared-mathlib.json")
-        lower = None
-        if shared and build.is_mount():
-            from .shared_mathlib import root as shared_root
-
-            lower = Path(shared.get("pool") or shared_root()) / "entries" / shared["key"] / "build"
-
-        def copy(source, dest):
-            budget.charge(Path(source))
-            actual = backing_source(source, build, lower) if lower is not None else source
-            return copy_file(actual, dest)
-
         index = git(root, "rev-parse", "--git-path", "index").decode().strip()
         index = Path(index) if Path(index).is_absolute() else root / index
         with tempfile.TemporaryDirectory(prefix="verification-index-") as temporary:
@@ -190,16 +246,10 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
                 .stdout.decode()
                 .strip()
             )
-        # Git's clone writes outside copytree's callback; charge the source object inventory
-        # before launching it. Never rely on reflink/hardlink savings for admission.
-        gitdir = Path(git(root, "rev-parse", "--git-common-dir").decode().strip())
-        gitdir = gitdir if gitdir.is_absolute() else root / gitdir
-        for directory, dirs, files in os.walk(gitdir, followlinks=False):
-            dirs[:] = [name for name in dirs if not (Path(directory) / name).is_symlink()]
-            for name in files:
-                budget.charge(Path(directory) / name)
+        # An explicit --local clone hard-links the object store and dies if a link fails, so the
+        # candidate's refs and index are its own while its objects share the source's inodes.
         subprocess.run(
-            ["git", "clone", "--local", "--no-hardlinks", "--dissociate", "--no-checkout", str(root), str(target)],
+            ["git", "clone", "--local", "--no-checkout", "--quiet", str(root), str(target)],
             check=True,
             capture_output=True,
         )
@@ -218,49 +268,52 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
             budget.charge(source)
             shutil.copy2(source, dest, follow_symlinks=False)
         lake = root / ".lake"
+        budget.linked = 0
         if lake.exists():
-            # Existing oleans/build traces avoid a cold Mathlib rebuild. These caches have the
-            # same trust level as ordinary local verification; audits still own proof correctness.
-            def ignore(directory, entries):
-                return [
-                    name
-                    for name in entries
-                    if name
-                    in {
-                        "__pycache__",
-                        "tauceti-scope",
-                        "tauceti-overlay-work",
-                        "tauceti-overlay-upper",
-                        "tauceti-shared-mathlib.json",
-                        "build-before-sharing",
-                        "build-shared-delta",
-                    }
-                    or name == "build-shared-deltas"
-                    and Path(directory).name == ".lake"
-                    or not include_builds
-                    and name in {"build", "build-before-sharing"}
-                    and Path(directory).name == ".lake"
-                    or immutable_packages is not None
-                    and Path(directory) == lake
-                    and name == "packages"
-                    or target.is_relative_to(Path(directory) / name)
-                ]
-
-            shutil.copytree(lake, target / ".lake", symlinks=False, copy_function=copy, ignore=ignore)
-            if not include_builds:
-                # Read-only installations can supply source inputs. Their new
-                # private directories must allow new cache files and Git lockfile
-                # operations; existing file bytes and modes remain unchanged.
-                for directory, _, _ in os.walk(target / ".lake", followlinks=False):
-                    path = Path(directory)
-                    path.chmod(path.stat().st_mode | 0o700)
+            linked = _link_tree(
+                lake,
+                target / ".lake",
+                budget,
+                include_builds=include_builds,
+                immutable_packages=immutable_packages,
+                target=target,
+                skip_packages=skip_packages,
+            )
+            (target / ".lake" / LINKS).write_text(json.dumps(dict(version=1, links=linked)))
         if immutable_packages is not None:
             (target / ".lake").mkdir(exist_ok=True)
             (target / ".lake/packages").symlink_to(immutable_packages, target_is_directory=True)
+        elif lake.exists() and (shared := _shared_links(lake)):
+            # The candidate attaches to the same read-only shared sources, never a copy of them.
+            (target / ".lake/packages").mkdir(parents=True, exist_ok=True)
+            for name, link_target in shared.items():
+                (target / ".lake/packages" / name).symlink_to(link_target, target_is_directory=True)
         with contextlib.suppress(OSError, Pressure):
-            settle(target.parent.parent, target.name, budget.bytes + 65536, compact=not include_builds)
-    except (OSError, subprocess.CalledProcessError) as error:
+            # Count linked bytes too: once the source workspace drops its links, the
+            # candidate is their only holder.
+            settle(target.parent.parent, target.name, budget.bytes + budget.linked + 65536, compact=not include_builds)
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or b"").decode(errors="replace").strip()[-300:]
+        raise Incomplete(f"candidate preservation incomplete: {error} {detail}", reason="preservation") from error
+    except OSError as error:
         raise Incomplete(f"candidate preservation incomplete: {error}", reason="preservation") from error
+
+
+def _rebaseline(verification):
+    """Accept our own links: a hard link changes only the source inode's ctime and link count.
+
+    Any change to content, size, mtime, inode or mode still fails the final watch.
+    """
+    from .verification import stamps
+
+    before = getattr(verification, "static_stamps", None)
+    if not before:
+        return
+    now = stamps(before)
+    for path, old in before.items():
+        new = now.get(path)
+        if old and new and [*old[:4], *old[5:7]] == [*new[:4], *new[5:7]]:
+            before[path] = new
 
 
 def prepare_job(verification, inputs):
@@ -351,6 +404,7 @@ def preserve_candidate(verification, *, disposable_only=False):
         inventory(verification.root, verification.base),
         immutable_packages=immutable_packages,
     )
+    _rebaseline(verification)
     if digest(inventory(verification.root, verification.base)) != job["source_digest"]:
         raise ValueError("candidate changed while preserving verification job")
     if digest(inventory(target, verification.base)) != job["source_digest"]:
@@ -487,6 +541,26 @@ def _settle_child(state, path, job, process, result_path):
         path.unlink(missing_ok=True)
 
 
+def _mathlib_view(stack, root, env, state):
+    """The shared Mathlib view prefix for a continuation in ``root`` (``[]`` without Mathlib)."""
+    from . import shared_mathlib
+
+    lake_project = any((root / name).is_file() for name in ("lakefile.toml", "lakefile.lean"))
+    if not lake_project or not shared_mathlib._names_mathlib(root):
+        return []  # as host_build_cache_context: only Lake projects that need Mathlib get a view
+    from .agents import _cache_fetch
+
+    try:
+        prefix = stack.enter_context(shared_mathlib.view(root, env, state / "verification-cache-prepare", _cache_fetch))
+    except (shared_mathlib.PinRefused, shared_mathlib.LayoutRefused):
+        raise  # permanent for this candidate: retrying cannot change the answer
+    except shared_mathlib.Unavailable as error:
+        raise Pressure(f"shared Mathlib view pending: {error}", reason="cache") from error
+    if prefix:
+        env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
+    return prefix
+
+
 def reap_continuations(cfg):
     key = str(getattr(cfg, "state", ""))
     active = []
@@ -610,6 +684,8 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             raise ValueError("isolated candidate path does not match its job")
                         if digest(inventory(root, job["base"])) != job["source_digest"]:
                             raise ValueError("candidate source changed; preserved job requires reconciliation")
+                        if job.get("isolated") and not links_intact(root):
+                            raise ValueError("a file linked into the candidate was written in place; abandoned")
                         if not job.get("isolated"):
                             if target == root or target in root.parents or root in target.parents:
                                 raise ValueError("continuation snapshot path overlaps its source")
@@ -643,7 +719,14 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             TAUCETI_VERIFY_JOB_FD=str(owner.fileno()),
                             TAUCETI_VERIFY_PYTHON=sys.executable,
                         )
+                        # Mathlib comes only from a shared view; its leases outlive this supervisor
+                        # in the helper's namespace, exactly as an agent's do.
+                        prefix = _mathlib_view(stack, root, env, state)
+                        from .shared_mathlib import lease_fds
+
+                        fds = (owner.fileno(), *lease_fds(env))
                         argv = [
+                            *prefix,
                             sys.executable,
                             str(HERE / "scripts/tauceti-verify"),
                             "--base",
@@ -672,7 +755,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                                     stdout=output,
                                     stderr=log,
                                     start_new_session=True,
-                                    pass_fds=(owner.fileno(),),
+                                    pass_fds=fds,
                                 )
                             _CHILDREN.setdefault(str(cfg.state), []).append((state, path, job, process, result_path))
                             return True
@@ -683,7 +766,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             stdout=subprocess.PIPE,
                             text=True,
                             start_new_session=True,
-                            pass_fds=(owner.fileno(),),
+                            pass_fds=fds,
                         )
                         try:
                             output, _ = process.communicate()
@@ -729,7 +812,3 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                         report_runtime("verification-incomplete", detail=str(error), verification_job=job["id"])
                     return True
     return False
-
-
-if __name__ == "__main__":
-    snapshot_command()

@@ -138,6 +138,14 @@ def display(value, default_kinds=()):
                 f"{cleanup.get('protected_bytes', 0) / 2**30:.1f} GiB held by live workers; "
                 f"{cleanup.get('reclaimed_bytes', 0) / 2**30:.1f} GiB space recovered; checked {age}s ago"
             )
+            if "named_bytes" in cleanup:
+                # du counts each hard link, so named bytes alone prove nothing about disk use.
+                print(
+                    f"  Cache storage: {cleanup['named_bytes'] / 2**30:.1f} GiB named (du, every link); "
+                    f"{cleanup['managed_bytes'] / 2**30:.1f} GiB allocated in "
+                    f"{cleanup.get('unique_inodes', 0):,} unique inodes; "
+                    f"{cleanup.get('free_bytes', 0) / 2**30:.1f} GiB filesystem free"
+                )
             if cleanup.get("pressure"):
                 print("  Disk cleanup requested; live work and saved source remain protected")
     if expanded := s.get("expanded_cache"):
@@ -564,6 +572,8 @@ def combine(values):
                 key: sum(row.get(key, 0) for row in cleanup)
                 for key in (
                     "managed_bytes",
+                    "named_bytes",
+                    "unique_inodes",
                     "protected_bytes",
                     "reclaimed_bytes",
                     "free_bytes",
@@ -574,6 +584,10 @@ def combine(values):
             },
             pressure=any(row.get("pressure", False) for row in cleanup),
         )
+        if not all("named_bytes" in row for row in cleanup):
+            # A host on an older collector reports no link-aware totals; a partial sum would mislead.
+            s["storage_cleanup"].pop("named_bytes")
+            s["storage_cleanup"].pop("unique_inodes")
     expanded = [v["expanded_cache"] for v in known if v.get("expanded_cache")]
     if expanded:
         s["expanded_cache"] = {

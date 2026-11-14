@@ -90,6 +90,8 @@ class Scaffold(unittest.TestCase):
             workflow = (Path(tmp) / ".github/workflows/pr-build.yml").read_text()
             # What the service relies on: the dispatch event, the run title, the job names, the bound status.
             self.assertIn("types: [tauceti-bors-staging]", workflow)
+            self.assertNotIn("nscloud-", workflow)
+            self.assertNotIn("namespace-features:", workflow)
             self.assertIn("format('bors branch={0} batch={1} head={2} base={3}'", workflow)
             self.assertIn("  sandboxed-build:", workflow)
             self.assertIn("  finalize-merge-group-build:", workflow)

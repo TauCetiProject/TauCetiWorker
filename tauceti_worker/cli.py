@@ -660,6 +660,12 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_mode = cleanup.add_mutually_exclusive_group()
     cleanup_mode.add_argument("--dry-run", action="store_true", help="report eligible paths without changing files")
     cleanup_mode.add_argument("--install-timer", action="store_true", help="install hourly systemd user cleanup")
+    cleanup.add_argument("--max-seconds", type=float, help="stop draining deletion work after this long")
+    cleanup.add_argument("--fallback-marker", type=Path, help=argparse.SUPPRESS)
+
+    purge = sub.add_parser("purge", help="remove all TauCetiWorker data for this user (run before uninstalling)")
+    purge.add_argument("--yes", action="store_true", help="delete; without it, only print what would be removed")
+    purge.add_argument("--config", action="store_true", help="also remove configuration (workers.toml, settings)")
 
     w = sub.add_parser(
         "work",
@@ -966,6 +972,10 @@ def main(argv: list[str] | None = None) -> int:
         from .retention import cmd_cleanup
 
         return cmd_cleanup(args)
+    if cmd == "purge":
+        from .purge import cmd_purge
+
+        return cmd_purge(args)
 
     from .config import max_open_prs
     from .overlaps import batch_size
@@ -1707,7 +1717,13 @@ def cmd_host_doctor(args) -> int:
     from . import shared_mathlib
 
     shared_ok, shared_note = shared_mathlib.capability()
-    rows.append(("shared Mathlib", shared_ok, shared_note + "; TAUCETI_SHARED_MATHLIB_BUILDS=auto|off|required"))
+    rows.append(
+        (
+            "shared Mathlib",
+            shared_ok,
+            shared_note + "; required for rounds that need Mathlib (TAUCETI_SHARED_MATHLIB_BUILDS=off blocks them)",
+        )
+    )
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
     rows.append(("kiro-cli", _have("kiro-cli"), "for --agent kiro"))
     rows.append(("tmux", _have("tmux"), "optional `tauceti workers tmux` log workspace"))
@@ -1776,7 +1792,7 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     if needs_host_build and not _have("lake") and not opts.dry_run:
         raise Die(
             "preflight: host authoring (the default) needs an elan/lake toolchain on PATH "
-            "(or pass --bubble to build inside the sandbox instead)"
+            "(bubble work rounds are refused: they would build a private Mathlib in the container)"
         )
     # bubble (the --bubble sandbox) runs each model on untrusted PR content inside an Incus container.
     # Without Incus, bubble fails deep in the round with a terse "Incus is required but not installed";

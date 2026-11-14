@@ -51,7 +51,7 @@ SCHEMA = "tauceti-queue.rehearsal/v1"
 LEAN_TOOLCHAIN = "leanprover/lean4:v4.36.0-rc2"  # TauCeti's pin
 SCAFFOLD_VERSION = "5"
 # Where CI reads the rehearsal service: the Bors observation feed TauCeti's staging path resolves a dispatch
-# through. Namespace runners cannot reach the service's local listener and TauCetiTools accepts HTTPS only,
+# through. Cloud runners cannot reach the service's local listener and TauCetiTools accepts HTTPS only,
 # so the hostname is a Cloudflare tunnel forwarded to that listener on the operator's host.
 DEFAULT_PUBLIC_URL = "https://queue-rehearsal.taucetiproject.org"
 SCRATCH_REPOSITORY = "TauCetiProject/TauCetiQueueScratch"
@@ -177,7 +177,7 @@ jobs:
   # Deliberately named as in TauCeti: the service reads this job's log for diagnostics and its
   # runner for status, and never names a job `build` (that name is the required commit status).
   sandboxed-build:
-    runs-on: nscloud-ubuntu-24.04-amd64-2x4  # the organisation's Namespace pool, as TauCeti's jobs; GitHub-hosted labels queue indefinitely here
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     outputs:
       status-sha: ${{ steps.pr.outputs.status_sha }}
@@ -366,7 +366,7 @@ jobs:
   finalize-merge-group-build:
     needs: sandboxed-build
     if: ${{ always() && github.event_name == 'repository_dispatch' && github.event.action == 'tauceti-bors-staging' }}
-    runs-on: nscloud-ubuntu-24.04-amd64-2x4  # the organisation's Namespace pool, as TauCeti's jobs; GitHub-hosted labels queue indefinitely here
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read  # sparse immutable finalization tools only
@@ -480,7 +480,7 @@ roots = ["TauCeti"]
 backend = "bors"
 checks = ["build"]
 
-# The queue service under rehearsal, as CI must reach it: the Namespace runners that serve this
+# The queue service under rehearsal, as CI must reach it: the cloud runners that serve this
 # repository cannot reach the rehearsal's local listener (http://127.0.0.1:8781), and the schema
 # accepts HTTPS only. Expose the rehearsal service at this address (a Cloudflare tunnel hostname,
 # as queue.taucetiproject.org is served) and give the service the same public_url; the runner
