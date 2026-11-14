@@ -414,6 +414,12 @@ with tempfile.TemporaryDirectory() as tmp:
     assert moved.returncode == 1 and "pin no longer matches" in moved.stderr, moved
     assert lake("exe", "cache", "get", view=False).stdout.strip() == "real-lake exe cache get"
     assert lake("build", "Foo").stdout.strip() == "real-lake build Foo"
+    # On a pin the shared build does not carry (a rebase round before it integrates main),
+    # every lake command is refused rather than compiling that Mathlib privately.
+    behind = lake("build", "Foo", pin="def")
+    assert behind.returncode == 1 and "Integrate origin/main" in behind.stderr and not behind.stdout, behind
+    assert lake("--version", pin="def").stdout.strip() == "real-lake --version"
+    assert lake("build", "Foo", pin="def", view=False).stdout.strip() == "real-lake build Foo"
     assert lake("exe", "cache", "clean").stdout.strip() == "real-lake exe cache clean"
     # Every spelling of the extraction is refused: options, aliases, qualified names, forced unpack.
     for args in (

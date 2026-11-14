@@ -65,16 +65,22 @@ def extraction(command):
     return None
 
 
-def pin_matches(workspace):
+def pins(workspace):
+    """(checkout's Mathlib pin, shared build's pin), or None when either cannot be read."""
     try:
         marker = workspace / ".lake/packages/mathlib/.lake/tauceti-shared-mathlib.json"
         marker = json.loads(marker.read_text())
         ready = json.loads((Path(marker["pool"]) / "entries" / marker["key"] / "ready.json").read_text())
         packages = json.loads((workspace / "lake-manifest.json").read_text()).get("packages", [])
         rev = next(p.get("rev") for p in packages if p.get("name") == "mathlib")
-        return rev == ready["spec"]["mathlib"]
+        return rev, ready["spec"]["mathlib"]
     except Exception:
-        return False
+        return None
+
+
+def pin_matches(workspace):
+    found = pins(workspace)
+    return found is not None and found[0] == found[1]
 
 
 def main(real, wrapper, args):
@@ -92,6 +98,17 @@ def main(real, wrapper, args):
             file=sys.stderr,
         )
         print("Do not build or fetch Mathlib here. Stop and report that the Mathlib pin changed.", file=sys.stderr)
+        return 1
+    found = pins(workspace)
+    if found and found[0] != found[1] and not ({"--version", "-h", "--help"} & set(args) or command[:1] == ["help"]):
+        # Typically a rebase round before it has integrated main: the shared build is main's
+        # Mathlib, and running Lake on the old pin would compile that old Mathlib privately.
+        print(
+            f"lake: this checkout pins Mathlib {str(found[0])[:12]}, but the host's shared Mathlib build is"
+            f" {str(found[1])[:12]}. Integrate origin/main (whose lake-manifest.json pins it) before running"
+            " lake; if this branch must keep its own pin, stop and report.",
+            file=sys.stderr,
+        )
         return 1
     if command and command[0] == "env" and len(words) > 1:
         cut = words[1]
