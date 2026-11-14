@@ -98,6 +98,7 @@ RUN_STDLIB=(
   contest_claim.py
   compact_surveys.py
   cost_model.py
+  declined_incidents.py
   dispatch_revalidation.py
   fix_diagnostic.py
   fork_authoring.py
@@ -125,6 +126,7 @@ RUN_STDLIB=(
   ignore_quota_hardblock.py
   quota_outage_autonomy.py
   infra_failure_budget.py
+  sandbox_failure_refund.py
   isolate_home_macos.py
   isolate_home_paths.py
   legacy_data_root.py

@@ -36,6 +36,9 @@ MAX_INFRA_REFUNDS = 20  # per-head: how many times a provider outage may hand an
 # the budget starts charging anyway. Not a cost control — the escalating loop back-off already caps
 # retries at ~4/hour — but a stop on MISCLASSIFICATION: if some persistent, PR-specific failure ever
 # matched the transient patterns, an uncapped refund would retry it until a human noticed.
+MAX_SANDBOX_REFUNDS = 3  # per-head: rounds that ended in the sandbox before the agent started and gave
+# their attempt back. A pull request's own checkout can be what breaks the setup, so the allowance is
+# as short as an attempt budget; a new head is a new checkout.
 MAX_REVIEW_ERRORS = 3  # per PR: after this many review rounds that ERROR without completing a review
 
 # The tauceti-review engine's exit status for "I stopped because the provider is unusable, and I
