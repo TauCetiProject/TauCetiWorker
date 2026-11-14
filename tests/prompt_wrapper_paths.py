@@ -54,6 +54,7 @@ CALL_SITES = {
         CLOSE_AUTHORITY="Closure authority is pinned by the worker.",
     ),
     "overlap-scan.md": dict(BATCH="/tmp/batch.json", RESULT="/tmp/result.json"),
+    "curate.md": dict(CANDIDATES="/tmp/candidates.json", CHECKOUT="/tmp/main", VERDICTS="/tmp/verdicts.json"),
     "overlap-fix.md": dict(ISSUE=123, BODY="Evidence", FORK="alice/TauCeti", FORK_OWNER="alice", BIN="/bin", **VERIFY),
     "fix.md": FIXLIKE,
     "fix-ci.md": FIXLIKE,
@@ -73,11 +74,12 @@ CALL_SITES = {
         RUBRICS="/opt/rubrics/rubrics.md",
         SOURCE_GUIDANCE="",
         EXTRA_ROADMAP_PROMPT="",
+        TARGET_LIST="",
         BIN="/bin",
         **VERIFY,
     ),
 }
-NO_WRAPPER = {"overlap-scan.md", "pr-outcome.md", "local-verification.md"}
+NO_WRAPPER = {"overlap-scan.md", "curate.md", "pr-outcome.md", "local-verification.md"}
 # What each prompt must say about the quality pass, in either variant (see 7 below).
 QUALITY_PASS = {
     "roadmap.md": (

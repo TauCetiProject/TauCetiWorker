@@ -9,7 +9,7 @@ list is in `tauceti work -h`. For persistent workers, see
 | Flag | What it does |
 | --- | --- |
 | `--loop` | Run the driver: keep doing rounds, pacing against quota between them, instead of one. |
-| `--only TASKS` | Restrict the round to a comma list of `rebase,bump,progress,fix-ci,fix,review,roadmap,lint-repair` (default: the whole cascade). |
+| `--only TASKS` | Restrict the round to a comma list of `rebase,bump,progress,fix-ci,fix,review,roadmap,lint-repair` (default: the whole cascade). `curate`, which keeps a [target list](target-lists.md#curation) true, is never part of the whole cascade and runs only when named here. |
 | `--skip TASKS` | Drop a comma list of tasks from the cascade. Combines with `--only` by subtraction. |
 | `--pr N[,N...]` | Work only on these pull requests (comma list or repeated flag; a leading `#` is accepted). A filter over what the round would already have done: it can never make a PR actionable that the survey passed over, and never bypasses branch claims, attempt budgets or a peer's in-progress review. Intersects with `--only`; `progress` and `roadmap` name no existing PR, so a targeted round drops them rather than falling through to unrelated work, and it makes no GitHub writes about PRs you did not name. When none of the named PRs are actionable the round reports why for each one and exits without progress. An empty or unreadable value (`--pr ""`, `--pr ,,`) is an error rather than silently no targeting. |
 | `--agent AGENT` | `auto` (default), `codex`, `claude`, `kiro`, `deepseek`, or `minimax`. Kiro and OpenRouter providers are explicit-only and unpaced. |
@@ -22,6 +22,7 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
 | `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
 | `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
+| `--roadmap-targets FILE` | Author only from an operator [target list](target-lists.md): each roadmap round takes one open item whose prerequisites have landed, claims it, and assigns it to the agent; with nothing eligible the round authors nothing. `--roadmap-only` and `--roadmap-skip` narrow the areas it draws from. Re-read every round; an empty value means no list. |
 | `--extra-roadmap-prompt TEXT` | Operator guidance rendered into the roadmap prompt as its own section, steering the choice of target within the designated roadmap (and of area under `--roadmap-only ""`; an unpinned worker still draws its area at random first). It cannot override `--roadmap-skip`, others' claims, or the repository's rules; other phases ignore it. At most 4096 characters, not blank. |
 | `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. A shallow snapshot is stored in worker state, refreshed on later rounds, and mounted read-only in Bubble mode. Requires the roadmap phase to be enabled and one specific `--roadmap-only AREA`; other enabled phases ignore it, and the roadmap and review quality remain authoritative. |
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
@@ -365,6 +366,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_FORK` | auto-created | Point at an existing fork instead of the one the worker creates. |
 | `TAUCETI_ROADMAP_ONLY` | _(unset)_ | The single roadmap area for `--roadmap-only`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
 | `TAUCETI_ROADMAP_SKIP` | _(unset)_ | Comma-separated roadmap areas to exclude, for `--roadmap-skip`. |
+| `TAUCETI_ROADMAP_TARGETS` | _(unset)_ | Path of the operator target list, for `--roadmap-targets`; blank means no list. |
 | `TAUCETI_EXTRA_ROADMAP_PROMPT` | _(unset)_ | Operator guidance for roadmap rounds, for `--extra-roadmap-prompt`. |
 | `TAUCETI_ROADMAP_EXTRA_IDENTITIES` | _(unset)_ | Comma-separated extra GitHub logins whose claimed intentions count as the worker's own. |
 | `TAUCETI_RESPECT_CLAIMS` | `true` | Whether roadmap workers avoid others' claimed intentions; `false` is the same as `--ignore-claims`. |
@@ -417,6 +419,10 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_GITHUB_SHARED_DIR` | `state/github-shared` | Stable cross-worker cache, quota state, host gh wrapper and HTTP accounting directory. |
 | `TAUCETI_GITHUB_CACHE_BYPASS` | _(unset)_ | Set to `1` to bypass shared cached reads for diagnosis. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
+| `TAUCETI_CURATE_GAP` | `21600` | Seconds between looks at the target list by the [`curate` phase](target-lists.md#curation), shared by the workers that curate one file on a host. |
+| `TAUCETI_CURATE_MAX_CANDIDATES` | `12` | Eligible items one `curate` look puts to the model. |
+| `TAUCETI_INCIDENTS_DIR` | _(unset)_ | Directory, shared by a fleet's workers, for [incident records](incidents.md): a `rebase`, `fix`, or `fix-ci` round that left nothing on GitHub writes the agent's final message there, and a spent attempt budget is noted once per head. Unset writes nothing. |
+| `TAUCETI_HOLD_DECLINED` | _(unset)_ | `1` keeps a stage off a pull request head that such a `declined` record names, until the head moves or the record is deleted. Needs `TAUCETI_INCIDENTS_DIR`. |
 | `CLAIM_REPO` | automatic | The repository holding this worker's cooperative claim leases. Without an override it is the shared namespace `TauCetiProject/tauceti-claims` once your account can push there, and your own fork until then. See [the claim namespace](#the-claim-namespace). |
 | `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `1500` / `300` | Branch-claim lease TTL and heartbeat interval (seconds). |
 
