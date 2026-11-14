@@ -349,3 +349,34 @@ with tempfile.TemporaryDirectory() as tmp:
     ):
         agents.materialize_dependencies(failing, {}, root / "logs")  # logged, never raised
 print("[OK] fresh checkouts materialize Mathlib's source before shared Mathlib is chosen")
+
+# Inside a shared Mathlib view the published entry is already a complete `lake exe cache get` result.
+# Fetching again re-extracted every archive into the checkout's private overlay upper.
+for shared in (True, False):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        commands = []
+
+        def recording(command, cwd, env, output, timeout, commands=commands):
+            commands.append(command)
+            return 0
+
+        env = {
+            "HOME": str(root / "home"),
+            "MATHLIB_CACHE_DIR": str(root / "mathlib"),
+            "TAUCETI_BUILD_CACHE_ROOT": str(root / "builds"),
+        }
+        if shared:
+            env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(["bwrap-prefix"])
+        with (
+            patch.object(agents, "_cache_fetch", side_effect=recording),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            try:
+                agents.warm_host_build_caches(root, env, root / "logs")
+            except Exception:
+                pass  # later TauCeti steps need a real workspace; only the Mathlib decision matters here
+        mathlib = [c for c in commands if c[-4:] == ["lake", "exe", "cache", "get"]]
+        assert bool(mathlib) is not shared, (shared, commands)
+print("[OK] a shared Mathlib view never re-fetches Mathlib's cache into the checkout")

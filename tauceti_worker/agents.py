@@ -1760,7 +1760,13 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
             unavailable(f"{label} build cache download failed")
         raise AssertionError("unreachable")
 
-    if fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
+    shared_view = bool(json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]")))
+    if shared_view:
+        # The shared entry is a complete `lake exe cache get` result. Running it again inside the
+        # view re-extracts every archive, and each new file lands in this checkout's private
+        # overlay upper: a full private copy of Mathlib's outputs under a "shared" round.
+        log("host build caches: Mathlib comes from the shared build; not fetching it again")
+    elif fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
         return
     # Mathlib itself knows which compressed archives the selected dependency tree
     # needs. Prune stale private links daily so pool GC can actually release them;
