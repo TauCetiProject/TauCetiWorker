@@ -121,15 +121,25 @@ def atomic_json(path, value):
         temporary.unlink(missing_ok=True)
 
 
-def link(source, target):
+class LinkDeferred(Unavailable):
+    """A payload's source may still be written: spreading it now could spread later writes."""
+
+
+def link(source, target, guard=None):
     """Hard-link, never copy: a copy would be a second private instance of shared bytes.
 
     A vanished source stays `FileNotFoundError` (a GC race the caller may treat as a miss).
-    Only creates a new name (an existing target is kept), so it never replaces shared bytes and
-    needs no `canonical_store.Guard`.
+    It only creates a new name (an existing target is kept). Build-output payloads pass a
+    `canonical_store.Guard`, so a source open for writing, or changed since inspected, is never
+    spread (`LinkDeferred`); seeded downloads and revision maps (metadata) pass none.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
+        if guard is not None:
+            before = source.lstat()
+            if not guard.link(source, before, target, recent_ok=True):
+                raise LinkDeferred(f"{source} is in use or changed; not linking it into {target}")
+            return
         os.link(source, target)
     except (FileExistsError, FileNotFoundError) as error:
         if isinstance(error, FileNotFoundError):
@@ -292,16 +302,21 @@ def hydrate(entry, private, input_hash, *, private_mappings=None, report=None, g
     keys = input_hash if isinstance(input_hash, list) else [input_hash]
     known = {} if private_mappings is None else private_mappings
     changed = [key for key in keys if private_mapping(private, key, known) != desired]
-    from .canonical_store import Guard, reconcile
+    from .canonical_store import Guard, fingerprint, reconcile, rejected
 
     guard = Guard() if guard is None else guard
+    refused = rejected(entry.parent.parent)
+    if refused and any(fingerprint((entry / name).lstat()) in refused for name in names):
+        # Relinking proved these bytes wrong: re-expand the entry from its verified archive.
+        raise ValueError("entry holds bytes relinking rejected")
     for name in names:
         # A local publication may have made this name canonical first: keep one inode.
         reconcile(entry.parent.parent, name, entry / name, guard=guard)
     missing = [name for name in names if not (private / "artifacts" / name).is_file()]
     started = clock()
     for name in missing:
-        link(entry / name, private / "artifacts" / name)
+        # Deferred links stop here, before any mapping names these artifacts.
+        link(entry / name, private / "artifacts" / name, guard)
     for key in changed:
         atomic_json(private / "outputs/TauCeti" / (key + ".json"), desired)
         known[key] = desired
@@ -421,13 +436,13 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
                         reconcile(pool, name, artifacts[name], guard=guard)
                         # Create a publication link FIRST, so a newly published canonical
                         # artifact never appears to GC as an unreferenced single link.
-                        link(artifacts[name], publication / name)
-                        link(publication / name, shared)
+                        link(artifacts[name], publication / name, guard)
+                        link(publication / name, shared, guard)
                         shared.chmod(0o444)  # Only ever removes write permission.
                         reconcile(pool, name, shared, guard=guard)
                         if shared.stat().st_ino != (publication / name).stat().st_ino:
                             (publication / name).unlink()  # Our staging name.
-                            link(shared, publication / name)
+                            link(shared, publication / name, guard)
                     atomic_json(publication / "entry.json", dict(data=data))
                     entry.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(publication, entry)  # A new entry name from our staging directory.
@@ -438,10 +453,13 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
         raise Unavailable(f"expanded {completed} of {len(pending)} selected archives")
 
 
-def transfer(download, private, seeded=(), *, manifest=None, private_mappings=None):
+def transfer(download, private, seeded=(), *, manifest=None, private_mappings=None, guard=None):
     """Preserve downloads on unsupported toolchains, without linking mutable metadata."""
     manifest = mappings(download) if manifest is None else manifest
     known = {} if private_mappings is None else private_mappings
+    from .canonical_store import Guard
+
+    guard = Guard() if guard is None else guard
     wanted = {name for _, name in entries(download, manifest)}
     for row in manifest.values():
         if isinstance(row.get("data"), dict):
@@ -455,7 +473,7 @@ def transfer(download, private, seeded=(), *, manifest=None, private_mappings=No
                 continue
             target = private / directory / source.relative_to(download / directory)
             if directory == "artifacts":
-                link(source, target)
+                link(source, target, guard)
                 continue
             if source.suffix != ".json":
                 target.parent.mkdir(parents=True, exist_ok=True)

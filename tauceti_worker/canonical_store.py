@@ -144,6 +144,27 @@ def digest(path, deadline=None):
         return hasher.hexdigest(), info.st_size
 
 
+def rejected(pool):
+    """Fingerprints of bytes relinking proved wrong; hydration must not reinstall them."""
+    try:
+        lines = (store(pool) / "rejected.list").read_text().split()
+    except FileNotFoundError:
+        return set()
+    found = set()
+    for line in lines:
+        with contextlib.suppress(ValueError):
+            found.add(tuple(int(part) for part in line.split(":")))
+    return found
+
+
+def reject(pool, info):
+    """Remember a rejected inode snapshot (one short O_APPEND line: atomic across workers)."""
+    path = store(pool) / "rejected.list"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as out:
+        out.write(":".join(map(str, fingerprint(info))) + "\n")
+
+
 def fingerprint(info):
     """What must not change between inspecting a file and acting on it."""
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
@@ -480,6 +501,7 @@ class Pass:
         self.helper_failed = False
         self.trace_of = {}
         self.suspect = set()  # Names whose bytes failed here: their private aliases get checked.
+        self.rejected = rejected(self.pool)  # Snapshots earlier passes proved wrong.
         for name in ("objects", "meta", "locks", "uses", "cursors", "hashes"):
             (self.directory / name).mkdir(parents=True, exist_ok=True, mode=0o700)
 
@@ -538,6 +560,7 @@ class Pass:
         unfinished siblings for the next relink pass.
         """
         self.suspect.add(name)
+        self.remember(info)
         if not private:
             self.drop_private_alias(name, info)
         if not self.guard.unlink(path, info):
@@ -554,15 +577,23 @@ class Pass:
         """A pool file may be published, quarantined or evicted only while nothing can write it."""
         return self.guard.idle((path, info), recent_ok=True)
 
-    def drop_private_alias(self, name, info):
-        """The private store's link to bad bytes would let Lake restore them: remove it too."""
+    def remember(self, info):
+        if fingerprint(info) not in self.rejected:
+            self.rejected.add(fingerprint(info))
+            with contextlib.suppress(OSError):
+                reject(self.pool, info)
+
+    def drop_private_alias(self, name, rejected_info):
+        """The private store's link to bad bytes would let Lake restore them: remove it too.
+
+        Only while the alias is still exactly the rejected snapshot: repaired bytes are kept.
+        """
         if self.private is None:
             return
         alias = self.private / name
         with contextlib.suppress(FileNotFoundError):
-            alias_info = alias.lstat()
-            if (alias_info.st_dev, alias_info.st_ino) == (info.st_dev, info.st_ino):
-                if self.guard.unlink(alias, alias_info, recent_ok=True):
+            if fingerprint(alias.lstat()) == fingerprint(rejected_info):
+                if self.guard.unlink(alias, rejected_info, recent_ok=True):
                     self.count("stale_store_files")
 
     def evict(self, name, info, reason):
@@ -578,6 +609,7 @@ class Pass:
             self.guard.unlink(alias, info, recent_ok=True)
         sidecar(self.directory, name).unlink(missing_ok=True)  # Our metadata for the evicted name.
         self.suspect.add(name)
+        self.remember(info)
         self.drop_private_alias(name, info)
         self.report.setdefault("integrity_failures", []).append(name)
         log(f"canonical store: INTEGRITY FAILURE: object {name} {reason}; evicted")
@@ -677,7 +709,7 @@ class Pass:
                 return None
             self.count("pool_quarantined")
             log(f"canonical store: pool copy of {name} fails its Lake hash; removed it")
-        elif private and name not in self.suspect:
+        elif private and name not in self.suspect and fingerprint(info) not in self.rejected:
             return None  # Private-store-only names are Lake's metadata; not hashed.
         elif private:
             if self.lake(path, name, info) is False:
@@ -800,11 +832,18 @@ def _relink(work, build, sweep_private, delete_setup, limit):
     )
     key = hashlib.sha256(str(work.checkout.resolve()).encode()).hexdigest()[:16]
     cursor_path = work.directory / "cursors" / (key + ".json")
-    after = tuple(read_json(cursor_path).get("after") or ("", ""))
+    cursor = read_json(cursor_path)
+    after = tuple(cursor.get("after") or ("", ""))
     split = next((i for i, item in enumerate(items) if item[:2] > after), len(items))
     order = items[split:] + items[:split]
+    # Files whose sha256 outlasted an earlier pass: skipped then, retried one per pass, first.
+    slow = set(cursor.get("slow") or ()) & {raw for _, raw, _ in items}
+    retry = next((item for item in order if item[1] in slow), None)
+    if retry is not None:
+        order = [retry] + [item for item in order if item is not retry]
     done = 0
     last = None
+    regranted = False
     deadline = work.deadline
     # Lake hashes computed by earlier passes, keyed by fingerprint: a pass that ran out of time
     # while hashing leaves that work for the next one instead of discarding it.
@@ -815,7 +854,7 @@ def _relink(work, build, sweep_private, delete_setup, limit):
     reserve = min(30.0, max(0.5, 0.2 * (deadline - time.monotonic())))  # Kept for converging.
     per_file = None
     # Every pass finishes at least one file, so even an exhausted budget makes progress.
-    work.deadline = max(deadline, time.monotonic() + GRACE)
+    work.deadline = max(deadline, time.monotonic() + (3 * GRACE if retry is not None else GRACE))
     try:
         offset = 0
         while offset < len(order):
@@ -868,10 +907,27 @@ def _relink(work, build, sweep_private, delete_setup, limit):
                     for _, raw, is_private in group:
                         if time.monotonic() >= work.deadline:
                             raise TimeoutError("relink budget reached")
-                        work.decide(Path(raw), name, is_private)
+                        skipped = False
+                        try:
+                            work.decide(Path(raw), name, is_private)
+                            slow.discard(raw)
+                        except TimeoutError:
+                            # Its sha256 did not fit: skip it, retry it first next pass.
+                            slow.add(raw)
+                            work.count("deferred_slow")
+                            skipped = True
                         done += 1
-                        last = (name, raw)
-                        work.deadline = deadline  # The first file's grace is over.
+                        if retry is None or (name, raw) != retry[:2]:
+                            last = (name, raw)
+                            work.deadline = deadline  # The first file's grace is over.
+                            if skipped and not regranted:
+                                # Once per pass, a skipped file hands its grace to the next one.
+                                regranted = True
+                                work.deadline = max(deadline, time.monotonic() + GRACE)
+                        else:
+                            # The retried file is out of order (no cursor move), and it never
+                            # uses up the next file's grace: a slow file cannot pin later work.
+                            work.deadline = max(deadline, time.monotonic() + GRACE)
                 index += len(group)
             offset += len(batch)
     except TimeoutError:
@@ -885,12 +941,16 @@ def _relink(work, build, sweep_private, delete_setup, limit):
     work.deadline = deadline
     complete = done >= len(order)
     report["remaining"] = len(order) - done
-    if complete:
-        cursor_path.unlink(missing_ok=True)
-    else:
+    state = {}
+    if not complete:
         report["incomplete"] = True
-        if last is not None:
-            expanded_cache.atomic_json(cursor_path, dict(after=list(last)))
+        state["after"] = list(last) if last is not None else list(after)
+    if slow:
+        state["slow"] = sorted(slow)
+    if state:
+        expanded_cache.atomic_json(cursor_path, state)
+    else:
+        cursor_path.unlink(missing_ok=True)
     if delete_setup and complete:
         removed = 0
         for path in setups:
@@ -949,6 +1009,9 @@ def boundary(checkout, env, *, phase, prefix=()):
     if not (checkout / ".lake/build/lib/lean").is_dir():
         return None
     pool = expanded_cache.root(env)
+    # Operator switches, read at every boundary: no restart needed for the file.
+    if env.get("TAUCETI_CANONICAL_RELINK", "1") == "0" or (store(pool) / "disabled").exists():
+        return None
     private_store = Path(env["LAKE_CACHE_DIR"])
     if phase == "prepare":
         try:

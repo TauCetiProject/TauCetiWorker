@@ -489,6 +489,122 @@ class Canonical(unittest.TestCase):
         self.assertEqual(remaining[-1], 0)
         self.assertTrue(all(a > b for a, b in zip(remaining, remaining[1:], strict=False)), remaining)
 
+    def entry_for(self, checkout, key="e" * 16):
+        """A pool entry whose payload names link the checkout's files, as expansion leaves them."""
+        entry = self.pool / "entries" / key
+        entry.mkdir(parents=True)
+        trace = next((checkout / ".lake/build/lib/lean").rglob("*.trace"))
+        for path, name in paths(checkout):
+            if path.exists():
+                os.link(path, entry / name)
+        cache.atomic_json(entry / "entry.json", dict(data=json.loads(trace.read_text())["outputs"]))
+        return entry
+
+    def test_hydration_never_links_a_writable_payload(self):
+        checkout = self.checkout("w", "TauCeti.A")
+        entry = self.entry_for(checkout)
+        name = paths(checkout)[0][1]
+        os.chmod(entry / name, 0o644)
+        held = open(entry / name, "r+b")
+        self.addCleanup(held.close)
+        private = self.root / "other-store"
+        with self.assertRaises(cache.LinkDeferred):
+            cache.hydrate(entry, private, "d" * 16)
+        self.assertFalse((private / "outputs").exists())  # No mapping names unlinked artifacts.
+        self.assertFalse((private / "artifacts" / name).exists())
+        held.close()
+        cache.hydrate(entry, private, "d" * 16)
+        self.assertTrue((private / "outputs/TauCeti" / ("d" * 16 + ".json")).exists())
+
+    def test_rejected_bytes_are_never_rehydrated_or_kept_privately(self):
+        checkout = self.checkout("w", "TauCeti.A")
+        self.relink(checkout)
+        entry = self.entry_for(checkout)
+        olean, name = next((p, n) for p, n in paths(checkout) if p.name == "A.olean")
+        os.chmod(olean, 0o644)
+        olean.write_bytes(b"x" * olean.stat().st_size)  # Corrupts the object and the entry alias.
+        os.utime(olean, (time.time() - 60,) * 2)
+        bad = (entry / name).lstat()
+        report = self.relink(checkout)
+        self.assertEqual(report["integrity_failures"], [name])
+        self.assertIn(canonical.fingerprint(bad), canonical.rejected(self.pool))
+        private = self.root / "w-store"
+        with self.assertRaisesRegex(ValueError, "rejected"):  # Expansion then re-expands the entry.
+            cache.hydrate(entry, private, "d" * 16)
+        self.assertFalse((private / "artifacts" / name).exists())
+        # A later pass (fresh `suspect` set) still removes a private alias of the rejected bytes.
+        (private / "artifacts").mkdir(parents=True, exist_ok=True)
+        os.link(entry / name, private / "artifacts" / name)
+        report = canonical.relink(checkout, private, self.pool, sweep_private=True)
+        self.assertEqual(report["stale_store_files"], 1)
+        self.assertFalse((private / "artifacts" / name).exists())
+
+    def test_private_alias_is_dropped_only_while_it_is_the_rejected_snapshot(self):
+        checkout = self.checkout("w", "TauCeti.A")
+        olean, name = next((p, n) for p, n in paths(checkout) if p.name == "A.olean")
+        private = self.root / "w-store/artifacts"
+        private.mkdir(parents=True)
+        os.link(olean, private / name)
+        snapshot = olean.lstat()
+        # Repaired in place after verification: same inode, new bytes and mtime.
+        os.chmod(olean, 0o644)
+        olean.write_bytes(olean.read_bytes())
+        os.utime(olean, ns=(snapshot.st_mtime_ns + 10**9,) * 2)
+        work = canonical.Pass(
+            checkout,
+            self.pool,
+            private.parent,
+            dict(os.environ),
+            {},
+            deadline=time.monotonic() + 30,
+            not_after=time.time() + 60,
+        )
+        work.drop_private_alias(name, snapshot)
+        self.assertTrue((private / name).exists())
+        # Still exactly the rejected snapshot: dropped.
+        work.drop_private_alias(name, (private / name).lstat())
+        self.assertFalse((private / name).exists())
+
+    def test_a_file_whose_sha256_never_fits_does_not_pin_later_work(self):
+        good = self.checkout("good", *[f"TauCeti.M{i}" for i in range(6)])
+        self.relink(good)  # Canonical objects exist, so convergence needs sha256.
+        checkout = self.checkout("w", *[f"TauCeti.M{i}" for i in range(6)])
+        objects = canonical.store(self.pool) / "objects"
+        stuck = sorted(paths(checkout), key=lambda pair: pair[1])[0][0]
+        real_digest = canonical.digest
+
+        def slow(path, deadline=None):
+            if Path(path) == stuck and deadline is not None:
+                raise TimeoutError("hashing reached the relink deadline")  # Always too slow.
+            return real_digest(path, deadline)
+
+        def unshared():
+            return sum(1 for p, n in paths(checkout) if p.stat().st_ino != (objects / n).stat().st_ino)
+
+        remaining = [unshared()]
+        with patch.object(canonical, "digest", slow):
+            for _ in range(40):
+                report = self.relink(checkout, budget=0)
+                remaining.append(unshared())
+                if remaining[-1] == 1:
+                    break
+        self.assertEqual(remaining[-1], 1)  # Everything but the stuck file converged.
+        self.assertTrue(all(a > b for a, b in zip(remaining, remaining[1:], strict=False)), remaining)
+        self.assertGreaterEqual(report.get("deferred_slow", 0), 1)
+        cursor = next((canonical.store(self.pool) / "cursors").glob("*.json"))
+        self.assertIn(str(stuck), json.loads(cursor.read_text())["slow"])
+
+    def test_operator_switches_disable_relinking_immediately(self):
+        checkout = self.checkout("w", "TauCeti.A")
+        env = dict(os.environ, LAKE_CACHE_DIR=str(self.root / "w-store"))
+        (canonical.store(self.pool)).mkdir(parents=True, exist_ok=True)
+        (canonical.store(self.pool) / "disabled").touch()
+        self.assertIsNone(canonical.boundary(checkout, env, phase="prepare"))
+        (canonical.store(self.pool) / "disabled").unlink()
+        self.assertIsNone(canonical.boundary(checkout, dict(env, TAUCETI_CANONICAL_RELINK="0"), phase="round-end"))
+        self.assertFalse((canonical.store(self.pool) / "objects").exists())
+        self.assertIsNotNone(canonical.boundary(checkout, env, phase="round-end"))
+
     def test_sweep_skips_busy_shards_instead_of_waiting(self):
         from tauceti_worker import retention
 
