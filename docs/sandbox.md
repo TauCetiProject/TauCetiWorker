@@ -76,6 +76,22 @@ revision and content-addressed GET routes are shared across rounds; containers
 cannot select another origin or upload, and their writable Lake views are
 discarded when the container is popped.
 
+## Lean toolchains from the host
+
+Bubble's image holds the Lean toolchain the round's target pins, and the
+container cannot download another. A round that merges a `main` with a newer
+`lean-toolchain` then has nothing to build with. `TAUCETI_BUBBLE_TOOLCHAINS=1`
+mounts each complete toolchain in the host's elan pool (`$ELAN_HOME/toolchains`)
+read-only at the same name under `/home/user/.elan/toolchains` in code-writing
+rounds, so a toolchain the host has installed is available without a download.
+A toolchain present in both places is served from the host's copy. A toolchain
+registered with `elan toolchain link` is not mounted, since elan inside the
+container would read its name as a release to download. A toolchain still
+being installed by elan or pooled by `scripts/share-build-caches --link` sits
+under a temporary name until it is complete and is not mounted. The setting
+applies on Linux hosts only and adds one disk device per toolchain; review
+rounds are unaffected.
+
 ## Requirements
 
 Bubble needs a working [Incus](https://linuxcontainers.org/incus/) runtime.
@@ -86,6 +102,28 @@ capability checks only, `tauceti` can fetch it with `uvx`. `tauceti doctor`
 reports whether the Bubble and Incus executables are present; the round preflight
 checks the Bubble version and capabilities. `TAUCETI_BUBBLE` overrides the
 executable, and `TAUCETI_BUBBLE_HOME` overrides the private Bubble home.
+
+### Restricted Incus projects
+
+A user in the `incus` group is served by `incus-user` and gets a restricted
+project of their own, without the root-equivalent access `incus-admin` grants.
+Such a project accepts a disk device only when its source lies under the
+project's allowed paths (the user's home directory, for a project `incus-user`
+creates) and is reached without crossing an absolute symlink. The worker hands
+Bubble every mount by its resolved path, so the roadmap and review-engine
+checkouts, which are links into the shared repository store, arrive as the
+snapshots they point to.
+
+What the worker mounts must itself sit under an allowed path: its state and
+data directories, the Python environment it is installed in,
+`TAUCETI_GITHUB_SHARED_DIR`, a `TAUCETI_REVIEW_ENGINE_DIR` checkout, and
+`ELAN_HOME` when host toolchains are mounted. With `TAUCETI_VERIFY_HELPER=1`,
+set `TAUCETI_VERIFY_CACHE_DIR` as well, because its default is under `/tmp`.
+
+The worker changes no ownership or permissions for the container. Connecting
+the container to the project's bridge and mapping the host user onto the
+container's `user`, so that private files mounted from the host stay readable
+inside, are Bubble's part.
 
 ## OpenRouter agents
 
