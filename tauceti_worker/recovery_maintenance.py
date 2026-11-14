@@ -1051,7 +1051,16 @@ class Sweep:
                 row["cleanup_oldest_at"] = min(row["cleanup_oldest_at"] or oldest, oldest)
             return
         if kind == "discarded":
-            return  # drained by prepare() after the housekeeping lock is released
+            # Drained by prepare() after the housekeeping lock is released; still backlog until gone.
+            if path.is_dir() and not path.is_symlink():
+                self.cleanup_pending = True
+                row["cleanup_backlog"] += 1
+                job = read_json(path.with_name(path.name + ".json"))
+                action = job.get("next_action", "queued-for-collector")
+                row["cleanup_actions"][action] = row["cleanup_actions"].get(action, 0) + 1
+                oldest = job.get("created_at", path.stat().st_mtime)
+                row["cleanup_oldest_at"] = min(row["cleanup_oldest_at"] or oldest, oldest)
+            return
         if kind == "registration":
             self.current_registration = {}
             registry = _metadata(path)
@@ -1287,22 +1296,46 @@ def _drain_discarded(base, errors):
     work = wr._WORK.get()
     for state in base.iterdir():
         work.charge(entries=1)
-        if state.is_symlink() or not state.is_dir():
-            continue
-        parent = state / "recovery-cleanup"
-        directory = parent / "discarded"
-        if parent.is_symlink() or directory.is_symlink() or not directory.is_dir():
-            continue
-        for path in directory.iterdir():
-            work.charge(entries=1)
-            if path.is_symlink() or not path.is_dir():
+        try:
+            if state.is_symlink() or not state.is_dir():
                 continue
+            parent = state / "recovery-cleanup"
+            directory = parent / "discarded"
+            if parent.is_symlink() or directory.is_symlink() or not directory.is_dir():
+                continue
+            entries = list(directory.iterdir())
+        except OSError as error:
+            errors.append(f"{state.name}: {error}"[:200])
+            continue  # one unreadable queue must not stop the others
+        for path in entries:
+            work.charge(entries=1)
             try:
-                _drain_entry(path, work)
+                if path.is_symlink():
+                    continue
+                if path.is_dir():
+                    _drain_entry(path, work)
+                elif path.suffix in (".json", ".lock"):
+                    _drop_orphan_sidecars(path.with_suffix(""))
             except wr.BudgetExhausted:
                 raise
             except (OSError, ValueError, TypeError, KeyError) as error:
                 errors.append(str(error)[:200])
+
+
+def _drop_orphan_sidecars(path):
+    """A cursor and lock whose tree is gone (a crash or failed unlink after removal)."""
+    if path.exists() or path.is_symlink():
+        return
+    lock_path = path.with_name(path.name + ".lock")
+    with lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        if path.exists() or path.is_symlink():
+            return
+        path.with_name(path.name + ".json").unlink(missing_ok=True)
+        lock_path.unlink(missing_ok=True)
 
 
 def collect_discarded(base, *, seconds=30, entries=262144, removal_bytes=32 * 1024**3):
@@ -1450,6 +1483,7 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup
         drained = trash.report()
         for key in ("removed_bytes", "removed_entries"):
             report[key] = report.get(key, 0) + drained.get(key, 0)
+        report["trash"] = drained  # its own elapsed time and metadata counts
         if trash_errors:
             report["trash_errors"] = trash_errors[:10]
     report.update(

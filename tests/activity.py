@@ -422,6 +422,35 @@ class ActivityTests(unittest.TestCase):
         self.assertTrue(stuck.exists())
         self.assertFalse(other.exists())
 
+    def test_locked_discarded_entries_stay_reported_as_backlog(self):
+        import fcntl
+
+        from tauceti_worker import work_recovery
+
+        stuck = self.discarded_tree(3)
+        with open(stuck.with_name(stuck.name + ".lock"), "a+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            report = work_recovery.housekeep(cleanup=True, seconds=5, entries=100000)
+        self.assertTrue(report["cleanup_pending"])
+
+    def test_orphan_sidecars_are_dropped_and_a_bad_queue_blocks_no_other(self):
+        from tauceti_worker import work_recovery
+
+        tree = self.discarded_tree(3)
+        queue = tree.parent
+        (queue / "gone-entry.json").write_text("{}")  # its tree was removed, the cursor survived
+        (queue / "gone-entry.lock").write_text("")
+        broken = work_recovery._state_root() / "worker0" / "recovery-cleanup" / "discarded"
+        broken.mkdir(parents=True)
+        broken.chmod(0)  # an unreadable queue, sorted before worker1
+        try:
+            work_recovery.housekeep(cleanup=True, seconds=5, entries=100000)
+        finally:
+            broken.chmod(0o700)
+        self.assertFalse(tree.exists())
+        self.assertFalse((queue / "gone-entry.json").exists())
+        self.assertFalse((queue / "gone-entry.lock").exists())
+
     def test_current_work_counts_distinct_workers_not_unfinished_receipts(self):
         a.prepare(now=self.now)
         with contextlib.closing(a._connect()) as db, db:
