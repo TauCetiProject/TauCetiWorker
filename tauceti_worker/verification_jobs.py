@@ -12,7 +12,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import stat
 import subprocess
 import sys
@@ -49,16 +48,7 @@ LINKED = (
 COPY_LIMIT = 64 * 1024
 COPIED = (".trace", ".hash", ".json", ".toml", ".log", ".lock")
 LINKS = "tauceti-links.json"
-FORWARDED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
-CONTINUATION = "tauceti-continuation.json"
-# Imports this package by path, so the verifier's environment (PYTHONPATH included) is unchanged.
-CONTINUE = (
-    "import sys; sys.path.insert(0, sys.argv[1]); "
-    "from tauceti_worker.verification_jobs import continue_command; "
-    "raise SystemExit(continue_command(sys.argv[2:]))"
-)
 SCRATCH = {
-    CONTINUATION,
     LINKS,
     "__pycache__",
     "tauceti-scope",
@@ -73,8 +63,11 @@ SCRATCH = {
 def snapshot(root, target, names, *, immutable_packages=None, include_builds=True):
     """A failed snapshot is disposable until the caller durably publishes isolated ownership.
 
-    The candidate never holds a copy of Mathlib's build: a shared Mathlib build stays in the
-    host's shared view, which the continuation attaches again (`continue_command`).
+    Shared Mathlib is never copied: its package links into the host's read-only sources are kept
+    as links, the private view state is left behind, and the candidate's own verification enters a
+    fresh shared view. TauCeti's build outputs and other payloads are hard links, never copies. A
+    checkout still carrying an older layout's sparse Mathlib upper keeps its sources without build
+    outputs; its next view retires that private package.
     """
     from .shared_mathlib import remove_tree
     from .verification import atomic, digest
@@ -87,6 +80,12 @@ def snapshot(root, target, names, *, immutable_packages=None, include_builds=Tru
     marker = state / "verification-copy-incomplete" / f"{target.name}.json"
     atomic(marker, dict(version=1, source=str(root), source_digest=digest(names)))
     try:
+        legacy = root / ".lake/packages/mathlib/.lake/tauceti-shared-mathlib.json"
+        if include_builds and legacy.is_file() and not (root / ".lake/packages/mathlib").is_symlink():
+            from .config import log
+
+            log("verification: older shared Mathlib layout under this checkout; linking sources only")
+            include_builds = False
         return _snapshot(root, target, names, immutable_packages=immutable_packages, include_builds=include_builds)
     except BaseException:
         # Nothing in this directory has become an authoritative workspace. Owner death leaves
@@ -116,16 +115,18 @@ def link(source, dest):
         ) from error
 
 
-def _shared_builds(lake):
-    """Package build directories that are views of the host's shared Mathlib."""
+def _shared_links(lake):
+    """`{package: target}` for packages that are links into the host's read-only shared sources."""
+    from .shared_mathlib import root as shared_root
+
+    pool = str(shared_root()) + os.sep
     packages = lake / "packages"
-    if not packages.is_dir():  # a symlinked packages tree is followed, as `_link_tree` does
-        return set()
-    return {
-        package / ".lake/build"
-        for package in packages.iterdir()
-        if (package / ".lake/tauceti-shared-mathlib.json").exists() or (package / ".lake/build").is_mount()
-    }
+    links = {}
+    if packages.is_dir() and not packages.is_symlink():
+        for entry in packages.iterdir():
+            if entry.is_symlink() and os.readlink(entry).startswith(pool):
+                links[entry.name] = os.readlink(entry)
+    return links
 
 
 def _linked(relative, info):
@@ -143,7 +144,9 @@ def _link_tree(lake, dest, budget, *, include_builds, immutable_packages, target
     Returns `{relative path: [inode, size, mtime_ns]}` of the links, so a continuation can
     prove that nothing wrote through a shared inode in the meantime.
     """
-    shared = _shared_builds(lake)
+    from .shared_mathlib import META
+
+    shared = _shared_links(lake)
     linked = {}
     for directory, dirs, files in os.walk(lake, followlinks=True):
         here = Path(directory)
@@ -155,9 +158,10 @@ def _link_tree(lake, dest, budget, *, include_builds, immutable_packages, target
             path = here / name
             if (
                 name in SCRATCH
-                or name == "build-shared-deltas"
-                and here.name == ".lake"
-                or path in shared
+                or name in ("build-shared-deltas", META)
+                and here == lake
+                or here == lake / "packages"
+                and name in shared
                 or target.is_relative_to(path)
                 or not include_builds
                 and name in {"build", "build-before-sharing"}
@@ -261,13 +265,14 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
                 target=target,
             )
             (target / ".lake" / LINKS).write_text(json.dumps(dict(version=1, links=linked)))
-        if lake.exists() and _shared_builds(lake) and include_builds:
-            # The continuation must attach the host's shared Mathlib view to build here.
-            (target / ".lake").mkdir(exist_ok=True)
-            (target / ".lake" / CONTINUATION).write_text(json.dumps(dict(shared_view=True)))
         if immutable_packages is not None:
             (target / ".lake").mkdir(exist_ok=True)
             (target / ".lake/packages").symlink_to(immutable_packages, target_is_directory=True)
+        elif lake.exists() and (shared := _shared_links(lake)):
+            # The candidate attaches to the same read-only shared sources, never a copy of them.
+            (target / ".lake/packages").mkdir(parents=True, exist_ok=True)
+            for name, link_target in shared.items():
+                (target / ".lake/packages" / name).symlink_to(link_target, target_is_directory=True)
         with contextlib.suppress(OSError, Pressure):
             # Count linked bytes too: once the source workspace drops its links, the
             # candidate is their only holder.
@@ -277,10 +282,6 @@ def _snapshot(root, target, names, *, immutable_packages=None, include_builds=Tr
         raise Incomplete(f"candidate preservation incomplete: {error} {detail}", reason="preservation") from error
     except OSError as error:
         raise Incomplete(f"candidate preservation incomplete: {error}", reason="preservation") from error
-
-
-def _job_fds(env):
-    return (int(env["TAUCETI_VERIFY_JOB_FD"]),) if env.get("TAUCETI_VERIFY_JOB_FD") else ()
 
 
 def _rebaseline(verification):
@@ -298,67 +299,6 @@ def _rebaseline(verification):
         new = now.get(path)
         if old and new and [*old[:4], *old[5:7]] == [*new[:4], *new[5:7]]:
             before[path] = new
-
-
-def continue_command(argv):
-    """Run the verifier inside the host's shared build view, as the agent's round did.
-
-    The candidate holds no Mathlib build of its own, so the continuation attaches the shared
-    Mathlib view and the TauCeti cache before verifying, and relinks its outputs afterwards.
-    Exit 75 means the view or cache is unavailable now: the job stays pending.
-    """
-    from .agents import BuildCacheUnavailable, host_build_cache_context, relink_build_outputs
-    from .shared_mathlib import lease_fds
-
-    root = Path.cwd()
-    env = dict(os.environ)
-    if not read_json(root / ".lake" / CONTINUATION).get("shared_view"):
-        # The candidate holds everything it builds against: become the verifier, unchanged.
-        os.execve(argv[0], argv, env)
-    logdir = Path(env["TAUCETI_VERIFY_STATE"]) / "verification-cache-prepare"
-    logdir.mkdir(parents=True, exist_ok=True)
-    keep = _job_fds(env)
-    # Only the verifier's JSON receipt may reach stdout; preparation chatter goes to stderr.
-    receipt = os.dup(1)
-    os.dup2(2, 1)
-    try:
-        with host_build_cache_context(root, env, logdir) as prefix:
-            if not prefix:
-                # Without the shared view, Lake would rebuild Mathlib privately here.
-                print("verification continuation: no shared Mathlib view; not building privately", file=sys.stderr)
-                return 75
-            # The supervisor stops a continuation by signalling this wrapper: pass it on, so
-            # the verifier and its tools stop with it instead of outliving their owner.
-            pending, children = [], []
-
-            def relay(number, _frame):
-                pending.append(number)
-                for child in children:
-                    child.send_signal(number)
-
-            forward = {sig: signal.signal(sig, relay) for sig in FORWARDED}
-            try:
-                children.append(
-                    subprocess.Popen(
-                        [*(prefix or []), *argv], env=env, stdout=receipt, pass_fds=(*keep, *lease_fds(env))
-                    )
-                )
-                for number in pending:
-                    children[0].send_signal(number)
-                returncode = children[0].wait()
-            finally:
-                for sig, previous in forward.items():
-                    signal.signal(sig, previous)
-            if returncode < 0 or pending:
-                # Die the way the verifier did, so the supervisor sees a stopped continuation.
-                number = -returncode if returncode < 0 else pending[0]
-                signal.signal(number, signal.SIG_DFL)
-                os.kill(os.getpid(), number)
-            relink_build_outputs(root, env, phase="verify")
-    except BuildCacheUnavailable as error:
-        print(f"verification continuation: shared build view unavailable: {error}", file=sys.stderr)
-        return 75
-    return returncode
 
 
 def prepare_job(verification, inputs):
@@ -572,9 +512,9 @@ def _settle_child(state, path, job, process, result_path):
 
     process.wait()
     result = read_json(result_path)
-    if (process.returncode < 0 or process.returncode == 75) and path.exists():
+    if process.returncode < 0 and path.exists():
         current = read_json(path) or job
-        current.update(status="pending", next_at=time.time() + (60 if process.returncode == 75 else 5))
+        current.update(status="pending", next_at=time.time() + 5)
         atomic(path, current)
         return
     if path.exists() and (not result.get("receipt") or not result.get("continuation_job")):
@@ -584,6 +524,26 @@ def _settle_child(state, path, job, process, result_path):
         )
         atomic(state / "verification-jobs" / path.name, current)
         path.unlink(missing_ok=True)
+
+
+def _mathlib_view(stack, root, env, state):
+    """The shared Mathlib view prefix for a continuation in ``root`` (``[]`` without Mathlib)."""
+    from . import shared_mathlib
+
+    lake_project = any((root / name).is_file() for name in ("lakefile.toml", "lakefile.lean"))
+    if not lake_project or not shared_mathlib._names_mathlib(root):
+        return []  # as host_build_cache_context: only Lake projects that need Mathlib get a view
+    from .agents import _cache_fetch
+
+    try:
+        prefix = stack.enter_context(shared_mathlib.view(root, env, state / "verification-cache-prepare", _cache_fetch))
+    except (shared_mathlib.PinRefused, shared_mathlib.LayoutRefused):
+        raise  # permanent for this candidate: retrying cannot change the answer
+    except shared_mathlib.Unavailable as error:
+        raise Pressure(f"shared Mathlib view pending: {error}", reason="cache") from error
+    if prefix:
+        env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
+    return prefix
 
 
 def reap_continuations(cfg):
@@ -744,14 +704,14 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             TAUCETI_VERIFY_JOB_FD=str(owner.fileno()),
                             TAUCETI_VERIFY_PYTHON=sys.executable,
                         )
-                        # The candidate has no Mathlib build of its own: the wrapper attaches
-                        # the host's shared view, then runs the installed helper inside it.
-                        package = str(Path(__file__).resolve().parent.parent)
+                        # Mathlib comes only from a shared view; its leases outlive this supervisor
+                        # in the helper's namespace, exactly as an agent's do.
+                        prefix = _mathlib_view(stack, root, env, state)
+                        from .shared_mathlib import lease_fds
+
+                        fds = (owner.fileno(), *lease_fds(env))
                         argv = [
-                            sys.executable,
-                            "-c",
-                            CONTINUE,
-                            package,
+                            *prefix,
                             sys.executable,
                             str(HERE / "scripts/tauceti-verify"),
                             "--base",
@@ -780,7 +740,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                                     stdout=output,
                                     stderr=log,
                                     start_new_session=True,
-                                    pass_fds=(owner.fileno(),),
+                                    pass_fds=fds,
                                 )
                             _CHILDREN.setdefault(str(cfg.state), []).append((state, path, job, process, result_path))
                             return True
@@ -791,7 +751,7 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                             stdout=subprocess.PIPE,
                             text=True,
                             start_new_session=True,
-                            pass_fds=(owner.fileno(),),
+                            pass_fds=fds,
                         )
                         try:
                             output, _ = process.communicate()
@@ -803,8 +763,8 @@ def resume_pending(cfg, *, seconds=7200, background=False):
                                 process.kill()
                                 process.communicate()
                             raise
-                        if process.returncode == 75:
-                            raise Pressure("shared build view unavailable for the continuation", reason="cache")
+                        import json
+
                         result = json.loads(output)
                         if result.get("status") not in {"success", "failed", "incomplete"}:
                             raise ValueError("mechanical helper did not return a typed verification result")

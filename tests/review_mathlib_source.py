@@ -55,6 +55,25 @@ def test_sources_match_the_reviewed_head_and_cached_snapshots_are_reused():
         assert len(calls) == 3
 
 
+def test_a_published_shared_source_tree_is_reused_without_staging():
+    from tauceti_worker import shared_mathlib
+
+    manifest = SimpleNamespace(returncode=0, stdout=json.dumps({"packages": [{"name": "mathlib", "rev": REV}]}))
+    with (
+        tempfile.TemporaryDirectory() as tmp,
+        patch.dict(os.environ, TAUCETI_SHARED_MATHLIB_ROOT=str(Path(tmp) / "pool")),
+        patch.object(github, "gh_run", return_value=manifest),
+        patch.object(agents.subprocess, "run", side_effect=AssertionError("staged a private snapshot")),
+    ):
+        P = shared_mathlib.layout(shared_mathlib.root())
+        tree = shared_mathlib.source_dir(P, REV)
+        (tree / "mathlib").mkdir(parents=True)
+        (tree / "mathlib/Mathlib.lean").write_text("-- shared source\n")
+        (tree / "source.json").write_text(json.dumps(dict(rev=REV, packages={"mathlib": {"rev": REV}})))
+        with agents._review_mathlib_source(SimpleNamespace(state=Path(tmp) / "worker"), HEAD) as source:
+            assert source == tree / "mathlib"
+
+
 def test_pruning_keeps_a_snapshot_another_reviewer_holds():
     def git(command, **kwargs):
         if "checkout" in command:

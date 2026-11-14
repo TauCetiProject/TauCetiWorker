@@ -1274,9 +1274,13 @@ class WorkerBackend:
                     # The supervisor is outside the agent's mount namespace. Run
                     # the existing verifier inside the same merged Mathlib view,
                     # rather than rehydrating another full private dependency build.
-                    env = dict(cache_env, TAUCETI_VERIFY_STATE=str(self.w.cfg.state), TAUCETI_VERIFY_POLICY=policy)
-                    if os.environ.get("LAKE_CONFIG"):
-                        env["LAKE_CONFIG"] = os.environ["LAKE_CONFIG"]
+                    # The same environment as the in-process verifier below, plus only the view's
+                    # own keys: cache preparation's defaults (LEAN_NUM_THREADS, cache settings) are
+                    # verification inputs, and prepare() fingerprints without them.
+                    view = {k: v for k, v in cache_env.items() if k.startswith("TAUCETI_SHARED_MATHLIB_")}
+                    env = dict(
+                        os.environ, **view, TAUCETI_VERIFY_STATE=str(self.w.cfg.state), TAUCETI_VERIFY_POLICY=policy
+                    )
                     if self.w.rc.deadline is not None:
                         env["TAUCETI_ROUND_DEADLINE"] = str(self.w.rc.deadline)
                     logpath = self.w.cfg.logdir / "recovery-verification.log"
