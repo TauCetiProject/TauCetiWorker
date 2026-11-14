@@ -3064,8 +3064,9 @@ _WORKER_SKILL = "pi"
 # from host_agent_argv, so they are deliberately absent rather than a second source of truth.
 _WORKER_CLAUDE_SETTINGS = {
     # The isolated .claude/projects/*.jsonl is the only per-turn record of what a claude round did;
-    # the worker's own logs/agent-*.log is a rendered summary. Keep both.
-    "cleanupPeriodDays": 36500,
+    # the worker's own logs/agent-*.log is a rendered summary. Keep a month of transcripts
+    # (retention.TRANSCRIPT_LIFETIME, which also bounds Codex sessions): unbounded, they filled disks.
+    "cleanupPeriodDays": 30,
     "permissions": {"defaultMode": "bypassPermissions"},
     # An unattended round has no one to show an artifact to, and publishing one is outward-facing.
     "enableArtifact": False,
@@ -3077,6 +3078,9 @@ _WORKER_CLAUDE_SETTINGS = {
     # production.
     "skipDangerousModePermissionPrompt": True,
 }
+# Earlier generated versions. A settings.json still exactly equal to one of them was never edited
+# by the operator, so it is upgraded in place (and discarded like the current one).
+_PREVIOUS_WORKER_CLAUDE_SETTINGS = ({**_WORKER_CLAUDE_SETTINGS, "cleanupPeriodDays": 36500},)
 
 
 def _config_sources(real_claude: Path | None, iso_claude: Path) -> tuple[Path, ...]:
@@ -3181,9 +3185,15 @@ def seed_worker_claude_config(real_claude: Path | None, iso_claude: Path) -> Non
         except OSError:
             pass
 
-    # Written once, so an operator can tune a worker by editing it in place.
+    # Written once, so an operator can tune a worker by editing it in place; a file still exactly
+    # as an earlier version generated it is brought up to date.
     settings = iso_claude / "settings.json"
-    if not settings.exists() and not settings.is_symlink():
+    try:
+        stale = settings.is_file() and not settings.is_symlink()
+        stale = stale and json.loads(settings.read_text()) in _PREVIOUS_WORKER_CLAUDE_SETTINGS
+    except (OSError, ValueError):
+        stale = False
+    if stale or (not settings.exists() and not settings.is_symlink()):
         try:
             _write_json_atomic(settings, _WORKER_CLAUDE_SETTINGS)
         except OSError:
@@ -3199,7 +3209,7 @@ def _discard_generated(iso_claude: Path) -> None:
     settings = iso_claude / "settings.json"
     try:
         if settings.is_file() and not settings.is_symlink():
-            if json.loads(settings.read_text()) == _WORKER_CLAUDE_SETTINGS:
+            if json.loads(settings.read_text()) in (_WORKER_CLAUDE_SETTINGS, *_PREVIOUS_WORKER_CLAUDE_SETTINGS):
                 settings.unlink()
     except (OSError, ValueError):
         pass

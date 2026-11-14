@@ -21,6 +21,9 @@ from .paths import HERE, canonical_candidate, legacy_data_root, self_env
 from .runtime_status import atomic_json, read_json
 
 LIFETIME = 3 * 86400
+# Agent transcripts are the per-turn record of a round; keep a month of them. Claude prunes its own
+# (cleanupPeriodDays in the isolated settings); Codex keeps every session forever.
+TRANSCRIPT_LIFETIME = 30 * 86400
 
 
 def safe(path, root):
@@ -215,17 +218,58 @@ def fresh_report(now=None):
     return dict(at=now if now is not None else time.time(), removed=[], protected=[], errors=[])
 
 
-def cache_roots(cfg):
-    # Never traverse arbitrary caches in the login home or operator-supplied cache overrides.
+def worker_home(cfg):
+    """(isolated home, anchor) of a worker, or None. Never the login home itself."""
     home, anchor = cfg.state / "home", cfg.state
     if sys.platform == "darwin" and legacy_project():
         from .agents import _worker_iso_home
 
         home = _worker_iso_home(cfg.wid, _base=cfg.home)
         if not safe(home, cfg.home):
-            return []
+            return None
         anchor = home
+    return home, anchor
+
+
+def cache_roots(cfg):
+    # Never traverse arbitrary caches in the login home or operator-supplied cache overrides.
+    located = worker_home(cfg)
+    if located is None:
+        return []
+    home, anchor = located
     return [(home / ".cache" / name, anchor) for name in ("lake", "mathlib")]
+
+
+def expire_transcripts(cfg, report, *, now, dry=False, opened=None, mounts=...):
+    """Codex sessions in a worker's isolated home older than TRANSCRIPT_LIFETIME."""
+    located = worker_home(cfg)
+    if located is None:
+        return
+    home, anchor = located
+    sessions = home / ".codex" / "sessions"
+    try:
+        if sessions.is_symlink() or not sessions.is_dir() or not safe(sessions, anchor):
+            return
+    except OSError as error:
+        note(report, "errors", f"{sessions}: {error}")
+        return
+    for base, _dirs, files in os.walk(
+        sessions, topdown=False, onerror=lambda error: note(report, "errors", str(error))
+    ):
+        directory = Path(base)
+        for name in files:
+            path = directory / name
+            try:
+                if path.is_symlink() or now - path.lstat().st_mtime < TRANSCRIPT_LIFETIME:
+                    continue
+                remove(path, sessions, report, dry=dry, opened=opened, mounts=mounts)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                note(report, "errors", f"{path}: {error}")
+        if directory != sessions and not dry:
+            with contextlib.suppress(OSError):
+                directory.rmdir()  # only once empty: the date directories Codex leaves behind
 
 
 def merge_report(report, result):
@@ -617,6 +661,7 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
                 note(report, "protected", str(cfg.state))
         except (OSError, ValueError, TypeError) as error:
             note(report, "errors", f"{cfg.wid}: {error}")
+        expire_transcripts(cfg, report, now=now, dry=dry, opened=opened, mounts=mounts)
         # Diagnostic paths have their own independent references and leases. One disappearing
         # telemetry file or inaccessible directory must not skip other roots or workers.
         for root in (cfg.logdir, cfg.state / "verification", cfg.state / "verification-state" / "verification"):

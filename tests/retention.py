@@ -1196,6 +1196,59 @@ print('{"result":"kept on protocol stdout"}', flush=True)
         retention.sweep(now=self.clock)
         self.assertFalse(entry.exists())
 
+    def test_codex_sessions_expire_after_a_month_and_claude_prunes_its_own(self):
+        from tauceti_worker import agents
+
+        self.assertEqual(agents._WORKER_CLAUDE_SETTINGS["cleanupPeriodDays"] * 86400, retention.TRANSCRIPT_LIFETIME)
+        home, _anchor = retention.worker_home(self.cfg)
+        sessions = home / ".codex/sessions"
+        old = sessions / "2026/01/02/rollout-old.jsonl"
+        recent = sessions / "2026/03/01/rollout-recent.jsonl"
+        for path in (old, recent):
+            path.parent.mkdir(parents=True)
+            path.write_text("{}")
+        stale = self.clock - retention.TRANSCRIPT_LIFETIME - 1
+        os.utime(old, (stale, stale))
+        os.utime(recent, (self.clock, self.clock))
+        report = retention.fresh_report(self.clock)
+        retention.expire_transcripts(self.cfg, report, now=self.clock, dry=True)
+        self.assertTrue(old.exists())
+        retention.expire_transcripts(self.cfg, report, now=self.clock)
+        self.assertFalse(old.exists())
+        self.assertFalse((sessions / "2026/01").exists())
+        self.assertTrue(recent.exists())
+
+    def test_manager_log_rotates_only_the_log_the_manager_writes(self):
+        log = self.root / "manager.log"
+        log.write_bytes(b"x" * 11)
+        script = (
+            "import sys; from pathlib import Path; from tauceti_worker import worker_manager as m\n"
+            "m.rotate_log(Path(sys.argv[1]), limit=10); print('after', flush=True)\n"
+            "m.rotate_log(Path(sys.argv[1]), limit=10); print('again', flush=True)\n"
+        )
+        with log.open("ab") as output:
+            subprocess.run([sys.executable, "-c", script, str(log)], stdout=output, stderr=output, check=True)
+        self.assertEqual((self.root / "manager.log.1").read_bytes(), b"x" * 11)
+        self.assertEqual(log.read_text(), "after\nagain\n")
+        # stderr going elsewhere (a journal, another file) stays there.
+        log.write_bytes(b"z" * 11)
+        errors = self.root / "errors.log"
+        script_err = (
+            "import sys; from pathlib import Path; from tauceti_worker import worker_manager as m\n"
+            "m.rotate_log(Path(sys.argv[1]), limit=10); print('out', flush=True); print('err', file=sys.stderr)\n"
+        )
+        with log.open("ab") as output, errors.open("ab") as error_output:
+            subprocess.run([sys.executable, "-c", script_err, str(log)], stdout=output, stderr=error_output, check=True)
+        self.assertEqual(log.read_text(), "out\n")
+        self.assertEqual(errors.read_text(), "err\n")
+        other = self.root / "other.log"
+        other.write_bytes(b"y" * 11)
+        from tauceti_worker import worker_manager
+
+        worker_manager.rotate_log(other, limit=10)  # this process does not write it
+        self.assertEqual(other.read_bytes(), b"y" * 11)
+        worker_manager.rotate_log(self.root / "missing.log")
+
     def test_round_start_requests_the_fallback_collector(self):
         with round_.RoundContext(self.cfg):
             pass
