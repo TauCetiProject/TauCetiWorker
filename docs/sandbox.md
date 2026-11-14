@@ -42,11 +42,12 @@ refreshes a selected container through another account's active login.
 
 ## Lake caches
 
-Before the work agent starts, the worker fetches Mathlib's prebuilt outputs with
-`lake exe cache get`, fetches TauCeti's own main-built outputs with
-`lake cache get`. Host coding rounds do this after selecting the target branch,
-using the anonymous public service at `cache.taucetiproject.org` and a private
-per-worker artifact store. Lake searches up to 100 revisions for a published
+Before the work agent starts, a host coding round attaches the host's shared Mathlib
+(sources and the builds of Mathlib and its dependencies; see
+[shared-mathlib.md](shared-mathlib.md)) and fetches TauCeti's own main-built outputs with
+`lake cache get`. It does this after selecting the target branch, using the anonymous public
+service at `cache.taucetiproject.org` and a private per-worker artifact store. Bubble rounds
+still fetch Mathlib's prebuilt outputs with `lake exe cache get` inside the container. Lake searches up to 100 revisions for a published
 build; `LAKE_CACHE_MAX_REVS` overrides that limit (`0` searches the complete history).
 The build restores matching artifacts and compiles changed modules and their
 affected dependents. Progress-writing and review jobs do not need this bootstrap.
