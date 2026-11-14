@@ -1213,17 +1213,24 @@ print('{"result":"kept on protocol stdout"}', flush=True)
         self.assertFalse((sessions / "2026/01").exists())
         self.assertTrue(recent.exists())
 
-    def test_manager_log_keeps_one_previous_generation(self):
-        from tauceti_worker import worker_manager
-
+    def test_manager_log_rotates_only_the_log_the_manager_writes(self):
         log = self.root / "manager.log"
         log.write_bytes(b"x" * 11)
-        worker_manager.rotate_log(log, limit=10)
-        self.assertFalse(log.exists())
+        script = (
+            "import sys; from pathlib import Path; from tauceti_worker import worker_manager as m\n"
+            "m.rotate_log(Path(sys.argv[1]), limit=10); print('after', flush=True)\n"
+            "m.rotate_log(Path(sys.argv[1]), limit=10); print('again', flush=True)\n"
+        )
+        with log.open("ab") as output:
+            subprocess.run([sys.executable, "-c", script, str(log)], stdout=output, stderr=output, check=True)
         self.assertEqual((self.root / "manager.log.1").read_bytes(), b"x" * 11)
-        log.write_bytes(b"y")
-        worker_manager.rotate_log(log, limit=10)
-        self.assertEqual(log.read_bytes(), b"y")
+        self.assertEqual(log.read_text(), "after\nagain\n")
+        other = self.root / "other.log"
+        other.write_bytes(b"y" * 11)
+        from tauceti_worker import worker_manager
+
+        worker_manager.rotate_log(other, limit=10)  # this process does not write it
+        self.assertEqual(other.read_bytes(), b"y" * 11)
         worker_manager.rotate_log(self.root / "missing.log")
 
 

@@ -137,12 +137,23 @@ MANAGER_LOG_BYTES = 16 * 1024**2
 
 
 def rotate_log(path: Path, limit: int = MANAGER_LOG_BYTES) -> None:
-    """Keep one previous generation of an append-only log once it passes ``limit``."""
+    """Keep one previous generation of the log this process writes to, once it passes ``limit``.
+
+    Called by the manager while it holds manager.lock, so concurrent starters cannot rotate the
+    winner's log. Only when stdout is that very file are stdout and stderr moved to a fresh one."""
     try:
-        if path.stat().st_size > limit:
-            path.replace(path.with_name(path.name + ".1"))
+        info, out = path.stat(), os.fstat(1)
+        if (info.st_dev, info.st_ino) != (out.st_dev, out.st_ino) or info.st_size <= limit:
+            return
+        path.replace(path.with_name(path.name + ".1"))
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.dup2(fd, 1)
+            os.dup2(fd, 2)
+        finally:
+            os.close(fd)
     except OSError:
-        pass  # a missing or unmovable log never prevents starting the manager
+        pass  # a missing or unmovable log never prevents running the manager
 
 
 def workers_state_dir() -> Path:
@@ -1037,6 +1048,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             workers_die("another worker manager is already running")
+        rotate_log(workers_state_dir() / "manager.log")
         pointer = manager_pointer(config)
         try:
             atomic_json(
@@ -1384,7 +1396,6 @@ def ensure_manager(config: Path) -> bool:
             if spawned is None:
                 state = workers_state_dir()
                 state.mkdir(parents=True, exist_ok=True)
-                rotate_log(state / "manager.log")
                 log = (state / "manager.log").open("ab", buffering=0)
                 try:
                     spawned = subprocess.Popen(

@@ -104,8 +104,10 @@ def collect_sources(parent: Path, keep: Path, now: float | None = None) -> list[
     """Remove extracted Mathlib trees for pins nothing has used recently.
 
     Each pin is a full Mathlib source tree and every Mathlib bump adds one, so without this they
-    accumulate forever. A tree is taken only under its own extraction lock, never the one in use."""
-    now = time.time() if now is None else now
+    accumulate forever. A tree is taken only under its own extraction lock, and its age is checked
+    again there, so a pin acquired meanwhile survives. Readers hold no lock once they have the
+    path, but every reader runs inside a round, and rounds end within ROUND_TIMEOUT (90 minutes
+    by default), far inside SOURCES_IDLE."""
     removed = []
     try:
         entries = list(parent.iterdir())
@@ -119,9 +121,10 @@ def collect_sources(parent: Path, keep: Path, now: float | None = None) -> list[
         if not re.fullmatch(r"[0-9a-f]{40}", pin):
             continue  # not ours
         try:
-            if now - entry.stat().st_mtime < SOURCES_IDLE:
-                continue
             with locked(parent / (pin + ".lock"), timeout=0):
+                current = time.time() if now is None else now
+                if current - entry.stat().st_mtime < SOURCES_IDLE:
+                    continue
                 shutil.rmtree(entry)
             removed.append(entry)
         except OSError:
@@ -131,6 +134,7 @@ def collect_sources(parent: Path, keep: Path, now: float | None = None) -> list[
 
 def pinned_sources(repo: Path, pin: str) -> Path:
     target = root() / "overlap" / "sources" / pin
+    extracted_now = False
     with locked(target.with_suffix(".lock"), timeout=240):
         if not target.exists():
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -146,10 +150,12 @@ def pinned_sources(repo: Path, pin: str) -> Path:
                 if archive.wait() or extracted.returncode:
                     raise Die("overlap: could not extract pinned Mathlib sources")
                 temporary.rename(target)
+                extracted_now = True
             finally:
                 shutil.rmtree(temporary, ignore_errors=True)
         os.utime(target)  # last use, which collect_sources() measures
-    collect_sources(target.parent, target)
+    if extracted_now:  # a new pin is the only time another can have become unused
+        collect_sources(target.parent, target)
     return target
 
 
