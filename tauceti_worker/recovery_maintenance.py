@@ -1467,9 +1467,16 @@ def prepare(base, *, seconds=0.25, entries=4096, bytes=16 * 1024 * 1024, cleanup
     if busy:
         report["busy"] = True
     if cleanup and base.is_dir():
-        # Outside the housekeeping lock, with the same allowance again: detached trash never
-        # waits behind inventory, and a stuck deletion cannot hold up the next sweep.
-        trash = wr.Work(seconds=seconds, entries=entries, bytes=bytes, removal_bytes=work.removal_bytes)
+        # Outside the housekeeping lock, with what is left of this call's allowance: one call never
+        # removes more than its budget, and when another process holds the lock the locked part
+        # spent nothing, so detached trash still gets the whole allowance.
+        elapsed = time.monotonic() - work.started
+        trash = wr.Work(
+            seconds=max(0.0, seconds - elapsed),
+            entries=max(0, entries - work.metadata_entries),
+            bytes=bytes,
+            removal_bytes=max(0, work.removal_remaining),
+        )
         trash_token = wr._WORK.set(trash)
         trash_errors = []
         try:
