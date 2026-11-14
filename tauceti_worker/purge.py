@@ -184,16 +184,22 @@ def stop_services():
 
 
 def _runs_worker(argv):
-    """Whether a command line invokes TauCetiWorker: `tauceti …`, `python -m tauceti_worker …`
-    or `python …/tauceti …`. Other arguments that merely mention it (an editor, a search) don't."""
-    if not argv:
+    """Whether a command line invokes TauCetiWorker: `tauceti …`, `python [options] -m
+    tauceti_worker …` or `python [options] …/tauceti …`. Arguments that merely mention it (an
+    editor, a search, `vim -m tauceti_worker`) do not."""
+    from .retention import invocation
+
+    program, code = invocation(argv)
+    if program is None:
         return False
-    if os.path.basename(argv[0]) == "tauceti":
+    if os.path.basename(program) == "tauceti":
         return True
-    if len(argv) >= 3 and argv[1] == "-m" and argv[2].split(".")[0] == "tauceti_worker":
-        return True
-    python = os.path.basename(argv[0]).startswith("python")
-    return python and len(argv) >= 2 and os.path.basename(argv[1]) == "tauceti"
+    if code is None:
+        return False
+    kind, target = code
+    if kind == "-m":
+        return target.split(".")[0] == "tauceti_worker"
+    return os.path.basename(target) == "tauceti"
 
 
 def _lineage():

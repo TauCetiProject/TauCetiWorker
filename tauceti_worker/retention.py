@@ -8,6 +8,7 @@ import fcntl
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1056,6 +1057,38 @@ _SESSION_HELPERS = frozenset({"(sd-pam)", "sd-pam", "sshd-session", "systemd"})
 _SYSTEM_AGENTS = ("/usr/libexec/", "/System/", "/usr/bin/login")
 
 
+_PYTHON_VALUE_OPTIONS = frozenset({"-W", "-X", "-Q", "--check-hash-based-pycs"})
+
+
+def invocation(argv):
+    """What a command line runs: (argv[0], the Python module or script it runs, or None).
+
+    Interpreter options are skipped, so `python3 -u -m tauceti_worker` and `python3 -I script`
+    identify the module or script; arguments after it are data, not the code being executed."""
+    if not argv:
+        return None, None
+    program = argv[0]
+    if not os.path.basename(program).startswith("python"):
+        return program, None
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "-m":
+            return program, ("-m", argv[index + 1]) if index + 1 < len(argv) else None
+        if argument.startswith("-m") and len(argument) > 2:
+            return program, ("-m", argument[2:])
+        if argument in ("-c", "-"):
+            return program, None
+        if argument in _PYTHON_VALUE_OPTIONS:
+            index += 2
+            continue
+        if argument.startswith("-"):
+            index += 1
+            continue
+        return program, ("script", argument)
+    return program, None
+
+
 def _same_file(first, second):
     try:
         return os.path.samefile(first, second)
@@ -1252,6 +1285,27 @@ def _configured_texts():
     if configured := os.environ.get("TAUCETI_WORKERS_CONFIG"):
         files.append(Path(configured).expanduser())
 
+    def unescape(token):
+        """systemd C-style escapes, as _systemd_unit's json.dumps() writes non-ASCII paths."""
+
+        def decode(match):
+            code = match[1]
+            if code[0] in "uUx":
+                return chr(int(code[1:], 16))
+            return {"n": "\n", "t": "\t", "\\": "\\", '"': '"', "'": "'"}[code]
+
+        decoded = re.sub(r"\\(u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|x[0-9a-fA-F]{2}|[nt\\\"'])", decode, token)
+        if "\\" in decoded:
+            raise ValueError(token)  # an escape we cannot interpret: unknown, never absent
+        return decoded
+
+    def split(value):
+        # Keep backslashes for unescape(): posix shlex would drop them outside quotes.
+        lexer = shlex.shlex(value.replace("\\", "\0"), posix=True)
+        lexer.whitespace_split = True
+        lexer.escape = ""
+        return [unescape(token.replace("\0", "\\")) for token in lexer]
+
     def referenced(value):
         value = value.replace("%h", str(home)).replace("%%", "\0")
         if "%" in value:
@@ -1290,9 +1344,9 @@ def _configured_texts():
             for line in text.splitlines():
                 key, _, value = line.strip().partition("=")
                 if key == "EnvironmentFile":
-                    files += [referenced(token.removeprefix("-")) for token in shlex.split(value)]
+                    files += [referenced(token.removeprefix("-")) for token in split(value)]
                 elif key in ("ExecStart", "ExecStartPre", "ExecStartPost"):
-                    files += [referenced(token) for token in configs(shlex.split(value.lstrip("@-:+!")))]
+                    files += [referenced(token) for token in configs(split(value.lstrip("@-:+!")))]
         except (ValueError, TypeError, AttributeError):
             return None
     return texts
@@ -1322,9 +1376,13 @@ def _retirement_blocker(root, processes, mounts, configured):
             return "selected by a running process"
         if any(path == part or path.startswith(part + os.sep) for path in paths for part in parts):
             return "in use by a running process"
-        # The executable and argv[0] identify what runs; later arguments are only data (a file
-        # an editor has open there is covered by the open-file check above).
-        if runtime and any(command.startswith(str(runtime) + os.sep) for command in commands[:2]):
+        # The executable, argv[0] and a Python script identify what runs; other arguments are
+        # data (a file an editor has open there is covered by the open-file check above).
+        program, code = invocation(commands[1:])
+        running = [commands[0] if commands else "", program or ""]
+        if code and code[0] == "script":
+            running.append(code[1])
+        if runtime and any(command.startswith(str(runtime) + os.sep) for command in running):
             return "its runtime is running"
     return None
 

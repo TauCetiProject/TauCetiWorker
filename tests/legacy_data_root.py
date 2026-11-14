@@ -571,6 +571,46 @@ class LegacyDataRoot(unittest.TestCase):
                 time.sleep(0.2)
                 self.assertIn("TauCetiWorker process", purge._busy([data], [data]))
 
+    def test_worker_and_runtime_identity_come_from_the_invocation(self):
+        from tauceti_worker import purge
+
+        for argv, expected in (
+            (["/opt/bin/tauceti", "workers", "manager"], True),
+            (["python3", "-u", "-m", "tauceti_worker", "workers", "manager"], True),
+            (["python3", "-X", "dev", "-mtauceti_worker.cli"], True),
+            (["python3", "-I", "/old/runtime/bin/tauceti", "work"], True),
+            (["vim", "-m", "tauceti_worker"], False),
+            (["vim", "/repo/tauceti_worker/paths.py"], False),
+            (["rg", "tauceti_worker", "/repo"], False),
+            (["tail", "-f", "/logs/tauceti"], False),
+            (["python3", "-c", "print('tauceti_worker')"], False),
+        ):
+            self.assertEqual(purge._runs_worker(argv), expected, argv)
+        self.assertEqual(
+            retention.invocation(["/usr/bin/python3", "-u", "/old/runtime/bin/tauceti", "work"]),
+            ("/usr/bin/python3", ("script", "/old/runtime/bin/tauceti")),
+        )
+
+    def test_configuration_decodes_systemd_escapes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            home = base / "home"
+            units = home / ".config/systemd/user"
+            units.mkdir(parents=True)
+            accented = base / "café" / "workers.toml"
+            accented.parent.mkdir()
+            accented.write_text('[workers.w.env]\nTAUCETI_LEGACY_DATA_ROOT = "/srv/root-g"\n')
+            escaped = json.dumps(str(accented))  # how _systemd_unit writes a non-ASCII path
+            (units / "tauceti-workers.service").write_text(
+                f'[Service]\nExecStart="/opt/tauceti" "--config" {escaped}\n'
+            )
+            with patch.object(paths, "login_home", return_value=home), patch.dict(os.environ):
+                for name in ("XDG_CONFIG_HOME", "TAUCETI_WORKERS_CONFIG"):
+                    os.environ.pop(name, None)
+                self.assertTrue(any("/srv/root-g" in text for text in retention._configured_texts()))
+                (units / "tauceti-workers.service").write_text('[Service]\nExecStart=/opt/tauceti --config "\\q"\n')
+                self.assertIsNone(retention._configured_texts())  # an escape we cannot interpret
+
     def test_drain_honours_an_expired_deadline_for_directories_only(self):
         with tempfile.TemporaryDirectory() as temporary:
             tree = Path(temporary) / "trash"
