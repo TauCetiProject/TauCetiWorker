@@ -1145,6 +1145,16 @@ def test_close(tmp):
         decide.added_declarations(closed_only),
         {"real"},
     )
+    strings = (
+        '+++ b/B.lean\n@@ -0,0 +1,6 @@\n+theorem before : True := trivial\n+def closer : String := "-/"\n'
+        '+def opener : String := "a \\" /-"\n+theorem after : True := trivial\n+def quote : Char := \'"\'\n'
+        "+theorem last : True := trivial\n"
+    )
+    check(
+        "…and a comment delimiter inside a string or character literal is not one",
+        decide.added_declarations(strings),
+        {"before", "closer", "opener", "after", "quote", "last"},
+    )
 
     root = tmp / "close"
     comment = "Everything here landed through #41, in the same file and under the same names."

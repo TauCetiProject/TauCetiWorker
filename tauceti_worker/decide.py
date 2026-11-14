@@ -828,14 +828,46 @@ def max_closes() -> int:
     return _setting(CLOSES_ENV, 3)
 
 
+_CHAR = re.compile(r"'(?:\\.|[^\\'])'")
+
+
+def _code(lines: list[str], *, depth: int = 0) -> tuple[list[str], bool]:
+    """`lines` with comments and string and character literals blanked, starting `depth` block
+    comments deep; and whether a block comment closed that had not opened in them. Block comments
+    nest; `--`, `/-` and `-/` inside a literal are text."""
+    out: list[str] = []
+    unopened = in_string = False
+    for line in lines:
+        kept, i = [], 0
+        while i < len(line):
+            pair = line[i : i + 2]
+            if depth:
+                depth += (pair == "/-") - (pair == "-/")
+                i += 2 if pair in ("/-", "-/") else 1
+            elif in_string:
+                in_string = line[i] != '"'
+                i += 2 if line[i] == "\\" else 1
+            elif line[i] == '"':
+                in_string, i = True, i + 1
+            elif (char := _CHAR.match(line, i)) and not (i and (line[i - 1].isalnum() or line[i - 1] in "_.")):
+                i = char.end()
+            elif pair == "--":
+                break
+            elif pair in ("/-", "-/"):
+                depth, unopened, i = (1, unopened, i + 2) if pair == "/-" else (0, True, i + 2)
+            else:
+                kept.append(line[i])
+                i += 1
+        out.append("".join(kept))
+    return out, unopened
+
+
 def added_declarations(diff: str, *, private: bool = False) -> set[str]:
     """The names, as written, of the declarations a unified diff adds to `.lean` files, outside
-    comments. Each hunk's added and unchanged lines are read together, so a comment opened on an
-    unchanged line covers the added lines inside it, and a hunk that closes a comment it did not
-    open is read as starting inside one. A hunk lying wholly inside a comment opened above it cannot
-    be told from code by the diff alone. `private` ones are left out unless asked for."""
-    from tauceti_queue.repair_context import _strip_comments
-
+    comments and literals. Each hunk's added and unchanged lines are read together, so a comment
+    opened on an unchanged line covers the added lines inside it, and a hunk that closes a comment
+    it did not open is read as starting inside one. A hunk lying wholly inside a comment opened
+    above it cannot be told from code by the diff alone. `private` ones are left out unless asked for."""
     names: set[str] = set()
     hunks: list[list[tuple[bool, str]]] = []
     lean = False
@@ -849,11 +881,10 @@ def added_declarations(diff: str, *, private: bool = False) -> set[str]:
             hunks[-1].append((line[0] == "+", line[1:]))
     for hunk in hunks:
         text = [line for _, line in hunk]
-        stripped = _strip_comments(text)
-        if any("-/" in line for line in stripped):
-            # A close with no opener in the hunk: the hunk starts inside a comment opened above it.
-            stripped = _strip_comments(["/-", *text])[1:]
-        for (added, _), line in zip(hunk, stripped, strict=True):
+        code, unopened = _code(text)
+        if unopened:
+            code, _ = _code(text, depth=1)
+        for (added, _), line in zip(hunk, code, strict=True):
             found = _DECLARATION.match(line) if added else None
             if found and (private or "private" not in found.group("modifiers").split()):
                 names.add(found.group("name"))
