@@ -446,7 +446,7 @@ def set_round_purpose(checkout, *, rebase=False, bump=False):
     """Record what the current round in ``checkout`` is for. Keyed by the checkout, so cache
     preparation for any other directory (verification jobs, recovery) is unaffected."""
     _PURPOSE.clear()
-    if rebase or bump:
+    if checkout is not None and (rebase or bump):
         _PURPOSE[Path(checkout).resolve()] = dict(rebase=rebase, bump=bump)
 
 
