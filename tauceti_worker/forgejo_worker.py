@@ -109,15 +109,15 @@ class ForgejoWorkerSource(ForgejoReadSource):
 
     def merged_prs(self, search, *, limit=200):
         """`GitHub.merged_prs` on this source: number, title, body, URL and base branch of the `limit` most recently
-        created merged pull requests whose body matches the GitHub-style `search` (`body_matches`;
-        its qualifiers are not native and are ignored), among the closed pull requests the client's
+        created pull requests merged into `content_base()` whose body matches the GitHub-style `search`
+        (`body_matches`; its qualifiers are not native and are ignored), among the closed pull requests the client's
         page bound reaches. One item's search (`landed_pr`) goes to the native keyword search for
         its slug, which reaches a pull request of any age. Raises SourceUnavailable when it fails."""
         import urllib.parse
 
         from .config import SourceUnavailable
         from .github import BORS_MERGED_PREFIX
-        from .targets import MARKER_TAG, body_matches, search_id, search_phrases
+        from .targets import MARKER_TAG, body_matches, content_base, search_id, search_phrases
 
         phrases = search_phrases(search)
         keyword = search_id(phrases) or next((p for p in phrases if p != MARKER_TAG), None)
@@ -139,11 +139,16 @@ class ForgejoWorkerSource(ForgejoReadSource):
                 row = self.api.pull(self.repository, row["number"])
             return (row.get("base") or {}).get("ref") or ""
 
+        def on_base(row):
+            row["baseRefName"] = base(row)
+            return row["baseRefName"] == content_base()
+
         def fetch():
             rows = []
             # Stop at the client's page bound, where `pages` would raise, rather than fail the read.
             for n, batch in enumerate(self.api.pages(path), 1):
-                rows += [r for r in batch if merged(r) and body_matches(r.get("body") or "", phrases)]
+                # The base is checked before counting, so landings on other branches never fill `limit`.
+                rows += [r for r in batch if merged(r) and body_matches(r.get("body") or "", phrases) and on_base(r)]
                 if len(rows) >= limit or n >= self.api.max_pages:
                     break
             return [
@@ -152,7 +157,7 @@ class ForgejoWorkerSource(ForgejoReadSource):
                     "title": r.get("title") or "",
                     "body": r.get("body") or "",
                     "url": self.repository.pull_url(r["number"]),
-                    "baseRefName": base(r),
+                    "baseRefName": r["baseRefName"],
                 }
                 for r in rows[:limit]
             ]
