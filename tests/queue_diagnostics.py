@@ -51,6 +51,12 @@ class ParseLog(unittest.TestCase):
         self.assertTrue(all(f["module"] == "TauCeti" for f in findings[1:]))
         self.assertEqual(d.parse_log(["../TauCeti/A.lean: missing project import TauCeti.B"]), [])
 
+    def test_linter_timeout_preserves_the_actual_failure_message(self):
+        line = "LINT-ENV: FAIL — driver/linter failure: no lint report header found (lean exit 124)"
+        findings = d.parse_log([line])
+        self.assertEqual(kinds(findings), [("lint", "")])
+        self.assertEqual(findings[0]["message"], line)
+
     def test_compiler_errors(self):
         lines = [
             "2026-11-04T04:20:00.1234567Z \x1b[31merror: TauCeti/Algebra/Group/Basic.lean:12:3: error: unknown identifier\x1b[0m",

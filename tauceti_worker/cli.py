@@ -79,7 +79,6 @@ from .constants import (
     EX_GITHUB_WAIT,
     EX_HALTED,
     EX_NOPROGRESS,
-    EX_RECOVERY_IDLE,
     EXPLICIT_TASKS,
     OPENROUTER_MODELS,
     PR_TASKS,
@@ -217,6 +216,7 @@ def add_source_flags(parser):
 
 def add_work_flags(p: argparse.ArgumentParser) -> None:
     add_source_flags(p)
+    # Accepted and ignored: a loop driver from an older release may still pass them to a new child.
     p.add_argument("--recovery-only", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--recovery-agent", default=None, help=argparse.SUPPRESS)
     p.add_argument("--recovery-unpinned-profile", action="store_true", help=argparse.SUPPRESS)
@@ -361,6 +361,12 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--roadmap-skip OneParameterSemigroups. Excludes them from the auto-random pick and the "
         "all-areas case; --roadmap-only takes precedence if it names a skipped area. Overrides "
         "$TAUCETI_ROADMAP_SKIP for this run",
+    )
+    p.add_argument(
+        "--self-tested",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="instruct source-changing agents to apply the self-tested label to eligible PRs after successful local verification",
     )
     p.add_argument(
         "--extra-roadmap-prompt",
@@ -656,15 +662,17 @@ def build_parser() -> argparse.ArgumentParser:
     activity.add_argument("--json", action="store_true")
     activity.add_argument("--inventory", action="store_true", help="read prepared PR identity inventory as JSON")
 
-    recovery = sub.add_parser("recovery", help="list saved unfinished source and moved-aside checkouts; local only")
-    recovery.add_argument("--worker-id", dest="worker_id", default=None)
-    recovery.add_argument("--json", action="store_true")
-
     cleanup = sub.add_parser("cleanup", help="reclaim disposable caches and expired diagnostics; local only")
     cleanup.add_argument("--all-data-roots", action="store_true", help="include retired Fleet data roots")
     cleanup_mode = cleanup.add_mutually_exclusive_group()
     cleanup_mode.add_argument("--dry-run", action="store_true", help="report eligible paths without changing files")
     cleanup_mode.add_argument("--install-timer", action="store_true", help="install hourly systemd user cleanup")
+    cleanup.add_argument("--max-seconds", type=float, help="stop draining deletion work after this long")
+    cleanup.add_argument("--fallback-marker", type=Path, help=argparse.SUPPRESS)
+
+    purge = sub.add_parser("purge", help="remove all TauCetiWorker data for this user (run before uninstalling)")
+    purge.add_argument("--yes", action="store_true", help="delete; without it, only print what would be removed")
+    purge.add_argument("--config", action="store_true", help="also remove configuration (workers.toml, settings)")
 
     w = sub.add_parser(
         "work",
@@ -966,12 +974,14 @@ def main(argv: list[str] | None = None) -> int:
         from .activity import command
 
         return command(args)
-    if cmd == "recovery":
-        return cmd_recovery(args)
     if cmd == "cleanup":
         from .retention import cmd_cleanup
 
         return cmd_cleanup(args)
+    if cmd == "purge":
+        from .purge import cmd_purge
+
+        return cmd_purge(args)
 
     from .config import max_open_prs
     from .overlaps import batch_size
@@ -1006,7 +1016,19 @@ def main(argv: list[str] | None = None) -> int:
         raise Die(f"TAUCETI_MAX_OPEN_PRS {error}") from None
 
     if cmd == "_fleet-protocol":
-        print(json.dumps({"version": 1, "admission": True, "events": True, "activity": 1, "roadmap_focus": 1}))
+        print(
+            json.dumps(
+                {
+                    "version": 1,
+                    "admission": True,
+                    "events": True,
+                    "activity": 1,
+                    "roadmap_focus": 1,
+                    "self_tested": 1,
+                    "graceful_restart": 1,
+                }
+            )
+        )
         return 0
     if cmd == "budget":
         try:
@@ -1266,38 +1288,6 @@ def cmd_usage(args) -> int:
     return 0 if all(v.get("ok") for v in snap.values()) else 1
 
 
-def cmd_recovery(args) -> int:
-    """Local recovery records: never GitHub, never a reset, never a required step."""
-    from . import work_recovery
-
-    rows = []
-    for worker, record, manifest, status in work_recovery.records():
-        if args.worker_id and worker != args.worker_id:
-            continue
-        rows.append(
-            dict(
-                worker=worker,
-                record=str(record) if record else None,
-                state=status.get("state") or ("corrupt" if record and manifest is None else "unknown"),
-                reason=status.get("reason"),
-                work=(manifest or {}).get("work"),
-                pr=(manifest or {}).get("pr"),
-                local_head=(manifest or {}).get("local_head"),
-            )
-        )
-    if args.json:
-        print(json.dumps(rows, indent=2))
-        return 0
-    if not rows:
-        print("No local recovery records.")
-    for row in rows:
-        target = f" #{row['pr']}" if row["pr"] else ""
-        print(f"{row['worker']}: {row['state']} {row['record'] or '(incomplete save)'} {row['work'] or ''}{target}")
-        if row["reason"]:
-            print("  " + work_recovery.describe_reason(row["reason"]))
-    return 0
-
-
 def cmd_status(args) -> int:
     cfg = Config.resolve(getattr(args, "worker_id", None))
     gh = GitHub()
@@ -1390,6 +1380,9 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     # roadmap_skip()).
     if getattr(args, "roadmap_skip", None) is not None:
         os.environ["TAUCETI_ROADMAP_SKIP"] = args.roadmap_skip
+    # Persist the operator's choice into loop children and recovery rounds.
+    if getattr(args, "self_tested", None) is not None:
+        os.environ["TAUCETI_SELF_TESTED"] = "1" if args.self_tested else "0"
     # --extra-roadmap-prompt likewise: validated here, at the boundary, then read live by do_roadmap via
     # extra_roadmap_prompt() so loop children see it without a flag of their own.
     if getattr(args, "extra_roadmap_prompt", None) is not None:
@@ -1527,71 +1520,32 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             time.sleep(int(slp))
             return 0
 
-        # Source recovery precedes provider selection/admission and unrelated work. A
-        # mechanically valid repair can publish even when all model budgets are closed.
-        # Audit-only workers author nothing; mixed workers recover their other phases' repairs.
+        # Rendered review output awaiting publication is posted before provider admission: it only
+        # retries GitHub (or native forge) API writes of a review that already finished.
         if not dry and set(only) != {"security-audit"}:
-            from .quota import mirror_creds
-            from .repair_recovery import recover
-            from .work_recovery import guard
-
             try:
-                mirror_creds(cfg)
-                recovery_opts = RoundOpts(
-                    only=only,
-                    agent=getattr(args, "recovery_agent", None) or agent,
-                    work_model="auto",
-                    sandbox_host=not getattr(args, "bubble", False),
-                    dry_run=False,
-                    prs=prs,
-                    account=getattr(args, "account", None),
-                    ignore_quota=ignore_quota,
-                    authoring_profile=(
-                        resolve_authoring_profile(agent, cli_model=author_model, cli_effort=author_effort)
-                        if agent != "auto"
-                        and (author_model or author_effort)
-                        and not getattr(args, "recovery_unpinned_profile", False)
-                        else None
-                    ),
-                )
                 if os.environ.get("TAUCETI_WORKER_FORGES") != "forgejo":
                     try:
-                        recovery_gh = GitHub()
-                        if (cfg.checkout / ".git").exists():
-                            guard(cfg, cfg.checkout, repository=recovery_gh.repo)  # Preserve before selecting recovery.
-                        recovery_worker = Worker(
-                            cfg, recovery_gh, ReviewState(cfg, recovery_gh), Counters(cfg), ctx, Claims(cfg, ctx)
-                        )
+                        review_gh = GitHub()
+                        from types import SimpleNamespace
+
                         from .review_runtime import recover as recover_review
 
-                        if recover_review(recovery_worker, numbers=getattr(recovery_opts, "prs", ())) or recover(
-                            recovery_worker, recovery_opts
-                        ):
+                        if recover_review(SimpleNamespace(cfg=cfg, gh=review_gh), numbers=prs):
                             return 0
                     except Exception as error:
-                        log(f"GitHub recovery deferred ({type(error).__name__}); checking other selected sources")
+                        log(f"review publication retry deferred ({type(error).__name__}); checking other sources")
                 from .worker_sources import enabled
 
                 if enabled():
-                    from .multi_source import recover_native
+                    from .multi_source import publish_native_reviews
 
-                    if recover_native(cfg, ctx, recovery_opts):
+                    if publish_native_reviews(cfg, prs):
                         return 0
             except Halted:
                 raise
             except Exception as error:
-                log(f"recovery phase deferred; existing source is preserved: {type(error).__name__}: {error}")
-                report_runtime(
-                    recovery_reason=dict(
-                        code="recovery-phase-unavailable",
-                        detail=str(error),
-                        next_action="Repair recovery state storage or its local prerequisites",
-                    )
-                )
-            if getattr(args, "recovery_only", False):
-                if ctx.activity:
-                    ctx.activity.rc = EX_RECOVERY_IDLE
-                return EX_RECOVERY_IDLE
+                log(f"review publication retry deferred: {type(error).__name__}: {error}")
 
         # A `_round` child is spawned by a loop driver that forced a usage read moments ago, so it may
         # use that. A one-shot `tauceti work` has nothing recent behind it and must look for itself,
@@ -1631,6 +1585,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             review_min_age=review_min_age,
             prs=prs,
             ignore_quota=ignore_quota,
+            quota_cmd=quota_cmd,
             loop_paced=one_round and getattr(args, "loop_paced", False),
         )
         # Before preflight, and NOT gated on --dry-run: --dry-run is how an operator checks their setup,
@@ -1731,7 +1686,13 @@ def cmd_host_doctor(args) -> int:
     from . import shared_mathlib
 
     shared_ok, shared_note = shared_mathlib.capability()
-    rows.append(("shared Mathlib", shared_ok, shared_note + "; TAUCETI_SHARED_MATHLIB_BUILDS=auto|off|required"))
+    rows.append(
+        (
+            "shared Mathlib",
+            shared_ok,
+            shared_note + "; required for rounds that need Mathlib (TAUCETI_SHARED_MATHLIB_BUILDS=off blocks them)",
+        )
+    )
     rows.append(("pi", _have("pi"), "for --agent deepseek/minimax"))
     rows.append(("kiro-cli", _have("kiro-cli"), "for --agent kiro"))
     rows.append(("tmux", _have("tmux"), "optional `tauceti workers tmux` log workspace"))
@@ -1800,7 +1761,7 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     if needs_host_build and not _have("lake") and not opts.dry_run:
         raise Die(
             "preflight: host authoring (the default) needs an elan/lake toolchain on PATH "
-            "(or pass --bubble to build inside the sandbox instead)"
+            "(bubble work rounds are refused: they would build a private Mathlib in the container)"
         )
     # bubble (the --bubble sandbox) runs each model on untrusted PR content inside an Incus container.
     # Without Incus, bubble fails deep in the round with a terse "Incus is required but not installed";

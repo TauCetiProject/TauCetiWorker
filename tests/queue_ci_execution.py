@@ -8,6 +8,7 @@ import socket
 import sys
 import unittest
 import urllib.error
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -267,6 +268,26 @@ class Execution(unittest.TestCase):
         self.reader.pages = [{"total_count": 2, "workflow_runs": []}]
         with self.assertRaises(EvidenceUnavailable):
             self.adapter.discover(self.frozen, since=100)
+
+    def test_verified_failure_keeps_diagnostics_without_giving_logs_verdict_authority(self):
+        self.reader.add(status="completed")
+        self.reader.results["101"] = {"classification": "source_failure"}
+        failure = self.adapter._run(self.reader.runs["101"])
+        finding = {"kind": "lint", "module": "", "message": "lint driver timed out"}
+        detail = replace(failure, diagnostics=(finding,), runner_name="reserved-staging")
+        with patch("tauceti_queue.ci_execution.GitHubAdapter.read_run", return_value=detail):
+            observation = self.adapter.observe(self.frozen, "101", owned=True)
+        self.assertEqual(observation.run.diagnostics, (finding,))
+        self.assertEqual(observation.run.runner_name, "reserved-staging")
+        self.assertEqual(observation.result, {"classification": "source_failure"})
+        for result in [replace(detail, attempt=2), None]:
+            with patch("tauceti_queue.ci_execution.GitHubAdapter.read_run", return_value=result):
+                observation = self.adapter.observe(self.frozen, "101", owned=True)
+            self.assertEqual(observation.run.diagnostics, ())
+            self.assertEqual(observation.result["classification"], "source_failure")
+        with patch("tauceti_queue.ci_execution.GitHubAdapter.read_run", side_effect=OSError("logs unavailable")):
+            observation = self.adapter.observe(self.frozen, "101", owned=True)
+        self.assertEqual(observation.result["classification"], "source_failure")
 
     def test_owned_rerun_needs_current_result_and_cancel_rechecks_live_metadata(self):
         proof = self.reader.add(attempt=2, status="completed")
