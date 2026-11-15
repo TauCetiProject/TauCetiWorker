@@ -60,6 +60,33 @@ class ControllerCase(unittest.TestCase):
         return self.controller.store.row("batches", {"state": "head"})
 
 
+class RepairCheckOwnership(ControllerCase):
+    def claimed_repair(self, diagnostic):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller._head()
+        self.controller._create_task(head, "repair", head["base"], [diagnostic], self.clock())
+        return self.controller.claim_task("worker", "admin-worker")
+
+    def test_a_diagnosed_audit_repair_runs_checks_before_resubmission(self):
+        task = self.claimed_repair({"kind": "audit", "module": "TauCeti.A", "message": "import collision"})
+        self.assertEqual(task.extra["checks_owner"], "worker")
+        self.controller.renew_task(task.task_id, task.claim_token)
+        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "worker")
+
+    def test_a_diagnosed_lint_repair_runs_checks_before_resubmission(self):
+        task = self.claimed_repair({"kind": "lint", "module": "TauCeti.A", "message": "unused hypothesis"})
+        self.assertEqual(task.extra["checks_owner"], "worker")
+
+    def test_compiler_only_repairs_still_defer_full_checks_to_staging(self):
+        task = self.claimed_repair({"kind": "compiler", "module": "TauCeti.A", "message": "type mismatch"})
+        self.assertEqual(task.extra["checks_owner"], "staging")
+
+    def test_admission_predictions_do_not_require_a_second_full_check(self):
+        task = self.claimed_repair({"kind": "admission_predictions", "proactive": True, "records": []})
+        self.assertEqual(task.extra["checks_owner"], "staging")
+
+
 class DeclarationNames(ControllerCase):
     def test_declaration_fetch_is_background_head_bound_retry_bounded_and_in_task(self):
         from tauceti_queue import declaration_names as dn

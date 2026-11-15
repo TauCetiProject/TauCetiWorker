@@ -1009,6 +1009,11 @@ MEMBER_STATES = ("replayed", "conflicting", "pending")
 
 HARD_RULES = (
     "The aim is that every constituent PR's mathematics lands as its author intended, compiled and checked. "
+    "A duplicate name or similar API does not make a contribution redundant when its universes, hypotheses, "
+    "or conclusions are more general. Preserve that generality by reusing or extending the existing API; "
+    "editing the existing mathematics is within repair scope, even when another PR owns its file. "
+    "Do not discard a different-universe construction merely because main has a same-universe version. "
+    "Only describe a contribution as redundant when all of its mathematical content is already covered. "
     "Hard rules: no `sorry`, no `native_decide`, no new axioms, no `set_option` (banned throughout Tau Ceti), "
     "no silenced linters."
 )
