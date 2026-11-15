@@ -147,7 +147,7 @@ was:
 | What it finds | The item becomes |
 | --- | --- |
 | A merged pull request completes the item by its marker, under the rules of [Live statuses](#live-statuses) | `[x]`, with `landed: #N` (on Forgejo, its URL; likewise below) |
-| The pull request a `[~]` item names in `in flight: #N` merged | `[x]`, with `landed: #N` |
+| The pull request a `[~]` item names in `in flight: #N` merged into the content base (`TAUCETI_BASE_BRANCH`, `main` by default); one merged elsewhere settles nothing | `[x]`, with `landed: #N` |
 | That pull request merged, but its marker for the item says `"partial":true` | `[ ]`, with `#N` added to `partial:` |
 | That pull request closed unmerged, and a `declined` [incident record](incidents.md) about it at its last head names the pull requests that replaced it, all of them merged | `[x]`, with `subsumed by: #M; closed: #N` |
 | The same, but that pull request was partial (by its marker or the item's `partial:` clause) | `[ ]`, with the replacements added to `partial:` and `closed: #N` |

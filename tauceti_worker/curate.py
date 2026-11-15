@@ -45,6 +45,7 @@ from .targets import (
     TargetItem,
     Targets,
     _is_partial,
+    content_base,
     eligible_items,
     github_history_enabled,
     inflight_ref,
@@ -121,7 +122,7 @@ class Source:
         return self._read("merged_prs", f"{MERGED_SEARCH} sort:updated-desc", limit=MERGED_LIMIT)
 
     def view(self, number: int) -> dict:
-        row = self._read("pr_view", number, ["state", "title", "body", "headRefOid"]) or {}
+        row = self._read("pr_view", number, ["state", "title", "body", "headRefOid", "baseRefName"]) or {}
         return normalize_merged(row)
 
 
@@ -196,6 +197,11 @@ def _partial_refs(item: TargetItem) -> set[str]:
     return {f"#{n}" for n in partial_prs(item)} | set(re.findall(r"https?://[^\s,;]+", clauses, re.I))
 
 
+def _merged_into_base(pull: dict) -> bool:
+    """A merge settles an item only into the content base, as `targets.landed` counts one."""
+    return pull.get("state") == "MERGED" and pull.get("baseRefName") == content_base()
+
+
 def settle(targets: Targets, seen: Seen) -> tuple[list[Change], list[tuple[TargetItem, str]]]:
     """The edits that `seen` implies for the items not yet done, and the in-flight items it leaves
     to the operator, each with the closed pull request it names.
@@ -220,14 +226,15 @@ def settle(targets: Targets, seen: Seen) -> tuple[list[Change], list[tuple[Targe
         named = inflight_ref(it) if it.status == "inflight" else None
         pull = seen.pulls.get(named) or {}
         partial = key in marker_keys(pull.get("body"))[1] or (named is not None and ref_key(named) in excused[key])
+        merged = _merged_into_base(pull)
         if key in by_marker:
             ref = by_marker[key]
             changes.append(Change(it, "done", f"{ref} merged", ("in flight",), (f"landed: {ref}",)))
-        elif pull.get("state") == "MERGED" and partial:
+        elif merged and partial:
             clause = "partial: " + _refs([*_partial_refs(it), named])
             note = f"{named} merged without completing it; open again"
             changes.append(Change(it, "open", note, ("in flight", "partial"), (clause,)))
-        elif pull.get("state") == "MERGED":
+        elif merged:
             changes.append(Change(it, "done", f"{named} merged", ("in flight",), (f"landed: {named}",)))
         elif pull.get("state") == "CLOSED" and named in seen.subsumed and partial:
             replaced = seen.subsumed[named]
@@ -272,7 +279,7 @@ def observe(targets: Targets, read: list[Source]) -> Seen:
         pulls[ref], where[ref] = source.view(number), (source.repository, number)
         head = pulls[ref].get("headRefOid") or ""
         by = incidents.subsumed_by(number, head, source.repository) if pulls[ref].get("state") == "CLOSED" else []
-        if by and all(source.view(m).get("state") == "MERGED" for m in by):
+        if by and all(_merged_into_base(source.view(m)) for m in by):
             subsumed[ref] = [source.ref(m) for m in by]
     return Seen(merged, pulls, subsumed, open_keys, where)
 

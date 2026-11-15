@@ -48,12 +48,18 @@ def ref(n):
 
 
 def seen(merged=(), pulls=None, subsumed=None, open_keys=()):
-    """A GitHub pull request is given by number, any other by URL; a merged one by URL has a `url`."""
+    """A GitHub pull request is given by number, any other by URL; a merged one by URL has a `url`.
+    Every pull request is into `main` unless it says otherwise."""
     rows = [
-        {"number": int(str(n).rsplit("/", 1)[-1]), "body": body, **({"url": n} if isinstance(n, str) else {})}
+        {
+            "number": int(str(n).rsplit("/", 1)[-1]),
+            "body": body,
+            "baseRefName": "main",
+            **({"url": n} if isinstance(n, str) else {}),
+        }
         for n, body in merged
     ]
-    pulls = {ref(n): d for n, d in (pulls or {}).items()}
+    pulls = {ref(n): {"baseRefName": "main", **d} for n, d in (pulls or {}).items()}
     subsumed = {ref(n): [ref(m) for m in by] for n, by in (subsumed or {}).items()}
     return curate.Seen(rows, pulls, subsumed, set(open_keys))
 
@@ -218,7 +224,7 @@ class Records(Tmp):
 
         def pr_view(number, fields):
             views.append(number)
-            return dict(states[number]) if number in states else None
+            return {"baseRefName": "main", **states[number]} if number in states else None
 
         gh = SimpleNamespace(
             merged_prs=lambda search, limit: [{"number": 7, "body": "", "limit": limit, "search": search}],
@@ -571,9 +577,12 @@ class Round(Tmp):
 
     def github(self, merged=(), states=None):
         return SimpleNamespace(
-            merged_prs=lambda search, limit: [{"number": n, "body": body} for n, body in merged],
+            merged_prs=lambda search, limit: [{"number": n, "body": body, "baseRefName": "main"} for n, body in merged],
             open_prs=lambda: [],
-            pr_view=lambda number, fields: dict((states or {}).get(number) or {"state": "OPEN", "title": ""}),
+            pr_view=lambda number, fields: {
+                "baseRefName": "main",
+                **((states or {}).get(number) or {"state": "OPEN", "title": ""}),
+            },
         )
 
     def agent(self, cwd, prompt, profile, logdir, **kwargs):
@@ -745,14 +754,17 @@ class ForgejoLists(Tmp):
         self.merged_rows = [
             {"number": 3, "body": marker("MeasureTheory", "kolmogorov-zero-one"), "state": "closed", "merged": True}
         ]
-        api.pages.side_effect = lambda path: iter([self.merged_rows])
+        api.pages.side_effect = lambda path: iter([[{"base": {"ref": "main"}, **r} for r in self.merged_rows]])
+        api.pull.side_effect = lambda repository, number: {"number": number, "base": {"ref": "main"}}
         self.forgejo.open_prs = Mock(return_value=[])
         self.states = {}
-        self.forgejo.pr_view = Mock(side_effect=lambda number, fields: dict(self.states.get(number, {"state": "OPEN"})))
+        self.forgejo.pr_view = Mock(
+            side_effect=lambda number, fields: {"baseRefName": "main", **self.states.get(number, {"state": "OPEN"})}
+        )
         self.path = self.tmp / "targets.md"
         env = {"TAUCETI_ROADMAP_TARGETS": str(self.path), "TAUCETI_INCIDENTS_DIR": str(self.tmp / "incidents")}
         self.github_rows = []
-        self.github_reads = Mock(side_effect=lambda limit: self.github_rows)
+        self.github_reads = Mock(side_effect=lambda limit: [{"baseRefName": "main", **r} for r in self.github_rows])
         for item in (
             patch.dict(os.environ, env),
             patch.object(curate, "_main_checkout", return_value=None),
@@ -779,7 +791,7 @@ class ForgejoLists(Tmp):
             repo="TauCetiProject/TauCeti",
             merged_prs=lambda search, limit: [],
             open_prs=lambda: [],
-            pr_view=lambda number, fields: dict(states.get(number) or {"state": "OPEN"}),
+            pr_view=lambda number, fields: {"baseRefName": "main", **(states.get(number) or {"state": "OPEN"})},
         )
 
     def test_a_look_on_a_forgejo_source_is_not_declined_for_want_of_a_pull_request(self):
@@ -794,7 +806,7 @@ class ForgejoLists(Tmp):
         text = self.path.read_text()
         self.assertIn(f"(needs: none; landed: {url})", text)
         self.assertIn(f"needs: `borel-cantelli`; landed: {self.repo.pull_url(3)})", text)
-        self.forgejo.pr_view.assert_called_once_with(12, ["state", "title", "body", "headRefOid"])
+        self.forgejo.pr_view.assert_called_once_with(12, ["state", "title", "body", "headRefOid", "baseRefName"])
 
     def test_a_forgejo_only_worker_settles_github_items_from_one_github_read(self):
         self.merged_rows = []
@@ -900,6 +912,20 @@ class ForgejoLists(Tmp):
         self.states = {7: {"state": "MERGED", "body": marker("Probability", "truncation-bounds", partial=True)}}
         self.assertEqual(self.curate(self.forgejo)[0], 0)
         self.assertIn(f"(needs: none; partial: {older}, {url})", self.path.read_text())
+
+    def test_a_named_pull_request_merged_into_another_branch_settles_nothing(self):
+        self.merged_rows = []
+        url = self.repo.pull_url(12)
+        listed = EXAMPLE.replace("in flight: #1234", f"in flight: {url}")
+        self.path.write_text(listed)
+        self.states = {12: {"state": "MERGED", "body": "", "baseRefName": "staging", "headRefOid": "a" * 40}}
+        self.assertEqual(self.curate(self.forgejo)[0], None)
+        self.assertEqual(self.path.read_text(), listed)
+        github = self.github({1234: {"state": "MERGED", "body": "", "baseRefName": "staging"}})
+        self.path.write_text(EXAMPLE)
+        self.assertEqual(self.curate(github)[0], None)
+        self.assertEqual(self.path.read_text(), EXAMPLE)
+        self.assertEqual(incidents.records(incidents.TARGET_CLOSED), [])
 
     def test_a_mixed_worker_settles_items_from_both_forges(self):
         self.path.write_text(EXAMPLE)
