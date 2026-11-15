@@ -136,6 +136,7 @@ RUN_STDLIB=(
   verification.py
   verification_audit.py
   verification_storage.py
+  verification_snapshot_slots.py
   ledger_blocking.py
   loop_sigterm.py
   mirror_creds.py

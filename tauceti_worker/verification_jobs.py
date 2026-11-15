@@ -60,6 +60,24 @@ SCRATCH = {
 }
 
 
+SNAPSHOT_SLOTS = 3
+SNAPSHOT_SLOT_WAIT = 1800
+
+
+@contextlib.contextmanager
+def candidate_slot():
+    """Hold one of SNAPSHOT_SLOTS host-wide candidate-snapshot slots, waiting at most SNAPSHOT_SLOT_WAIT s."""
+    from . import canonical_store, expanded_cache
+
+    directory = expanded_cache.root(os.environ) / "candidate-snapshots"
+    with canonical_store.slot(directory, count=SNAPSHOT_SLOTS, wait=SNAPSHOT_SLOT_WAIT) as held:
+        if not held:
+            from .config import log
+
+            log(f"verification: no candidate-snapshot slot after {SNAPSHOT_SLOT_WAIT}s; snapshotting anyway")
+        yield
+
+
 def snapshot(root, target, names, *, immutable_packages=None, include_builds=True):
     """A failed snapshot is disposable until the caller durably publishes isolated ownership.
 
@@ -90,14 +108,18 @@ def snapshot(root, target, names, *, immutable_packages=None, include_builds=Tru
             log("verification: older shared Mathlib layout under this checkout; leaving its packages behind")
             include_builds = False
             skip_packages = True
-        return _snapshot(
-            root,
-            target,
-            names,
-            immutable_packages=immutable_packages,
-            include_builds=include_builds,
-            skip_packages=skip_packages,
-        )
+        # Each snapshot links hundreds of thousands of files: a metadata storm that, run by every
+        # round at once, saturates the filesystem journal for the whole host. Bound it host-wide;
+        # past the wait the snapshot proceeds anyway, so it can never block a round indefinitely.
+        with candidate_slot():
+            return _snapshot(
+                root,
+                target,
+                names,
+                immutable_packages=immutable_packages,
+                include_builds=include_builds,
+                skip_packages=skip_packages,
+            )
     except BaseException:
         # Nothing in this directory has become an authoritative workspace. Owner death leaves
         # the same durable construction marker for bounded ordinary collection.
