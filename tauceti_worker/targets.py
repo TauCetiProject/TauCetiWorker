@@ -216,8 +216,14 @@ def overlay_live(targets: Targets, inflight: set[Key], done: set[Key]) -> Target
     )
 
 
+def content_base() -> str:
+    """The branch the worker authors against (TAUCETI_BASE_BRANCH); a target lands only there."""
+    return os.environ.get("TAUCETI_BASE_BRANCH", "main")
+
+
 def landed(items: Iterable[TargetItem], merged: Iterable[dict]) -> dict[Key, int]:
-    """The items a merged pull request among `merged` completes, each with that pull request: its
+    """The items a merged pull request among `merged` completes, each with that pull request: it
+    merged into `content_base()` (its `baseRefName`; a row without one completes nothing), its
     marker names the item and is not partial, and the item's `partial:` clause does not name it.
     A row with a `url` (a Forgejo pull request) is named by that URL, any other by `#N`."""
     items = list(items)
@@ -229,7 +235,10 @@ def landed(items: Iterable[TargetItem], merged: Iterable[dict]) -> dict[Key, int
         for it in items
     }
     done: dict[Key, int] = {}
+    base = content_base()
     for d in merged:
+        if d.get("baseRefName") != base:
+            continue
         keys, partial = marker_keys(d.get("body"))
         for key in keys - partial:
             if d.get("url"):
