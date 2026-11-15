@@ -719,6 +719,10 @@ class Handler(BaseHTTPRequestHandler):
     def _feed(self, which: str, repo: str, query: dict, *, source=None) -> dict:
         if source is None:
             source = feeds.feed_source(self.server.controller)
+        with feeds.read_snapshot(source) as snapshot:
+            return self._feed_document(which, repo, query, source=snapshot)
+
+    def _feed_document(self, which: str, repo: str, query: dict, *, source) -> dict:
         base = (query.get("base") or [None])[0]
         if not base:
             canonical = getattr(source, "canonical_branch", None)

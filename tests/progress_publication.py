@@ -5,6 +5,7 @@ import errno
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -185,10 +186,10 @@ with (
             assert args[:1] == ["git"] and operation in args
             return subprocess.CompletedProcess(args, 1, "", "network unavailable")
 
-        original_git = roadmap / ".git"
-        backup_git = roadmap / ".saved-git"
+        saved_tree = roadmap.parent / "roadmap-saved"
         if operation == "clone":
-            original_git.rename(backup_git)
+            shutil.copytree(roadmap, saved_tree, symlinks=True)
+            shutil.rmtree(roadmap / ".git")
         try:
             with (
                 patch.object(wu, "me", return_value="author"),
@@ -197,11 +198,9 @@ with (
                 assert wu._do_progress_inner(worker, None) is None
         finally:
             if operation == "clone":
-                # Without .git the directory is moved aside whole before the clone attempt.
-                moved = sorted(d for d in (roadmap.parent / "retained-checkouts").glob("roadmap-*") if d.is_dir())
-                if not roadmap.exists() and moved:
-                    moved[-1].rename(roadmap)
-                backup_git.rename(original_git)
+                # Without .git the directory is deleted before the clone attempt.
+                assert not roadmap.exists()
+                saved_tree.rename(roadmap)
         assert publication.retained(cfg)["attempts"] == 0
         assert publication.fingerprints(work) == original
     assert (

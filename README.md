@@ -599,6 +599,10 @@ they always run on the host. Bubble needs an
 [Incus](https://linuxcontainers.org/incus/) runtime. See
 [the sandbox notes](docs/sandbox.md) for the exact boundary and requirements.
 
+Code-writing rounds in Bubble are currently refused: the container would unpack
+its own Mathlib build and build TauCeti privately, and a host keeps one shared copy
+of each. Review rounds still run in Bubble, against a shared read-only Mathlib source.
+
 The agent's conversation transcript is normalized into readable narration,
 reasoning summaries, tool activity, and results. File edits are listed by path
 instead of repeating full diffs; tool inputs are bounded, and tool results over
@@ -625,7 +629,8 @@ tauceti workers logs --follow reviewer     # its durable console log
 there, `enable`, `disable`, `restart`, and `remove` adjust one worker each. The
 manager validates the whole file before applying it, starts missing enabled
 workers, gracefully stops disabled or removed ones, restarts only definitions
-that changed, and backs off repeated failures.
+that changed, and backs off repeated failures. Restarts wait for the worker's
+current round to finish; see [rolling deploys](docs/workers.md#restarts-and-rolling-deploys).
 
 For fields that `add` does not expose, run `tauceti workers edit`, validate with
 `tauceti workers apply --check`, then apply. Editing while the manager runs is
@@ -776,10 +781,8 @@ in `workers.toml`. Keep the raw API key out of that file.
 - [Inside the sandbox](docs/sandbox.md): what `--bubble` enforces, Lake caches,
   and macOS credential handling.
 - [Docker deployment](docs/docker.md): the unattended Compose deployment.
-- [Unfinished source recovery](docs/work-recovery.md): records saved before
-  checkout preparation resets, and checkouts moved aside while still in use.
 - [Incident records](docs/incidents.md): the opt-in local record of a repair
-  round that left nothing on GitHub, and of a spent attempt budget.
+  round that left nothing on its forge, and of a spent attempt budget.
 - [The decide phase](docs/decide.md): `--only decide` rules on those records
   and writes each ruling back as a record.
 

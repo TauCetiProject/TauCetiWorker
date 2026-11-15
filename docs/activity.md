@@ -207,11 +207,6 @@ review runner's existing cache; previously recorded worker cache paths are also 
 (separated by the platform path separator). No new process, clone, archive sync, GitHub
 request or shared-server request is introduced.
 
-Local [work recovery](work-recovery.md) counts come from each worker's
-`state/<worker>/recovery` directory: saved, checkouts moved aside, incomplete and
-corrupt records, with reasons. The background collector prepares them.
-Fleet summaries add host counts.
-
 Completed review counts include reviews of other authors' PRs. `PRs assisted`
 counts distinct PRs in the reported scope with completed review/fix/rebase work
 or a branch push, excluding that scope's initiated PRs. Multi-host summaries add
