@@ -317,11 +317,9 @@ def round_tests():
     assert report["killed"] and report["exceeded"] and report["new_private_bytes"] > 16 * MIB, report
     assert report["baseline_private_bytes"] >= 8 * MIB, report
     assert not checkout.exists(), "the checkout must not be retained"
-    discarded = list((state / "recovery-cleanup" / "discarded").iterdir())
-    assert len(discarded) == 1 and discarded[0].name.startswith("abandoned-"), discarded
-    assert (discarded[0] / "Main.lean").is_file()  # moved whole, for the collector, never saved
-    assert not (state / "recovery").exists() and not (checkout.parent / "retained-checkouts").exists()
-    print("[OK] a round writing one-link files past its cap is killed and abandoned without recovery")
+    assert not [path for path in checkout.parent.iterdir() if ".abandoned-" in path.name]  # deleted, not moved
+    assert not (state / "recovery-cleanup").exists() and not (state / "recovery").exists()
+    print("[OK] a round writing one-link files past its cap is killed and its checkout deleted")
 
     checkout, rc, error, report, elapsed, text = run("link", "enforce")
     assert error is None and rc == 0, text
@@ -363,7 +361,6 @@ def round_tests():
     from tauceti_worker import retention
 
     name = f"checkout-copy-enforce-{len(runs) + 1}"
-    queued = len(list((state / "recovery-cleanup" / "discarded").iterdir()))
     checkout, rc, error, report, elapsed, text = run(
         "copy",
         "enforce",
@@ -372,8 +369,7 @@ def round_tests():
     assert error is not None and not checkout.exists(), text
     hidden = [path for path in base.iterdir() if path.name.startswith(f".{name}.abandoned-")]
     assert len(hidden) == 1 and "operator removal" in str(error), (hidden, error)
-    assert len(list((state / "recovery-cleanup" / "discarded").iterdir())) == queued  # never queued with a mount
-    print("[OK] a checkout with a mount inside is moved aside, never queued for deletion")
+    print("[OK] a checkout with a mount inside is moved aside, never deleted")
 
     # The shared view check runs before the baseline; a mismatch never launches the agent.
     pool, entry = publish_entry("k2")

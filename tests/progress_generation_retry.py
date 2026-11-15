@@ -15,10 +15,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tauceti_worker import cli, loop, work_recovery
+from tauceti_worker import cli, loop
 from tauceti_worker import progress_publication as publication
 from tauceti_worker import work_units as wu
-from tauceti_worker.config import Die, DocumentationUnavailable, ProgressPreparationUnavailable
+from tauceti_worker.config import Die, DocumentationUnavailable
 from tauceti_worker.constants import EX_DOCUMENTATION_WAIT, EX_NOPROGRESS, PROGRESS_ERROR_KEY
 from tauceti_worker.survey import progress_due
 
@@ -510,8 +510,8 @@ class GenerationRetryTests(unittest.TestCase):
             if args[0] == "git":
                 return subprocess.CompletedProcess(args, 0, "", "")
             stage = args[1]
-            self.assertLessEqual(kwargs["timeout"], 1800)
-            self.timeouts.append(kwargs["timeout"])
+            # No timeout of their own: only the round's hard cap bounds the tools.
+            self.assertNotIn("timeout", kwargs)
             if stage == timeout_stage:
                 raise subprocess.TimeoutExpired(args, 1800, output=b"partial stdout", stderr=b"partial stderr")
             if stage in ("plan", "facts"):
@@ -549,8 +549,6 @@ class GenerationRetryTests(unittest.TestCase):
                 (publication, "parked_window", None),
                 (publication, "save", {}),
                 (publication, "defer", {}),
-                (work_recovery, "guard", SimpleNamespace(ok=True)),
-                (work_recovery, "note_owner", None),
                 (wu, "prepare_checkout", checkout_ok),
                 (wu, "_apply_prepared_progress", 0),
             ):
@@ -708,16 +706,11 @@ class GenerationRetryTests(unittest.TestCase):
             self.assertIn("round_waited", [c.args[0] for c in emit.call_args_list])
             self.assertNotIn("round_finished", [c.args[0] for c in emit.call_args_list])
 
-    def test_stage_timeout_fits_the_remaining_round_budget(self):
+    def test_round_deadline_never_defers_preparation(self):
+        # A deadline already in the past is not a reason to wait: only the hard cap ends a round.
         with patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": str(time.time() - 1)}):
-            with self.assertRaises(ProgressPreparationUnavailable):
-                self.drive_inner()
-        self.assertNotIn("plan", self.calls)
-        self.assert_uncharged()
-        with patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": str(time.time() + 600)}):
             self.assertEqual(self.drive_inner(), 0)
-        self.assertTrue(self.timeouts)
-        self.assertTrue(all(timeout <= 585 for timeout in self.timeouts))
+        self.assertIn("writer", self.calls)
 
     def test_checkout_failure_preserves_cadence_and_defers_mechanical_work(self):
         with self.assertRaisesRegex(Die, "checkout failed"):
@@ -728,25 +721,6 @@ class GenerationRetryTests(unittest.TestCase):
         with patch("tauceti_worker.survey.subprocess.run") as tool:
             self.assertFalse(progress_due(self.cfg, self.worker.counters)[0])
             tool.assert_not_called()
-
-    def test_deadline_cut_timeout_is_an_uncharged_non_churn_wait(self):
-        with patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": str(time.time() + 600)}):
-            with self.assertRaises(ProgressPreparationUnavailable) as raised:
-                self.drive_inner(timeout_stage="facts")
-        self.assertEqual(raised.exception.state, "waiting-progress-preparation")
-        self.assertEqual(self.values[PROGRESS_ERROR_KEY], 1)
-        self.assertEqual(self.values.get("progress-docs-waits", 0), 0)
-        self.assertNotIn("writer", self.calls)
-        self.assert_uncharged()
-        self.assertIn("partial stdout", next(self.cfg.logdir.glob("progress-facts-*.log")).read_text())
-
-    def test_insufficient_writer_budget_waits_before_spending_cadence(self):
-        with patch.dict(os.environ, {"TAUCETI_ROUND_DEADLINE": str(time.time() + 120)}):
-            with self.assertRaises(ProgressPreparationUnavailable):
-                self.drive_inner()
-        self.assertIn("prompt", self.calls)
-        self.assertNotIn("writer", self.calls)
-        self.assert_uncharged()
 
     def test_mechanical_traces_are_bounded_and_prepared_archives_survive(self):
         archive = self.root / "progress/mechanical/attempt-prepared/previous"

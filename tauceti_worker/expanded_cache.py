@@ -12,6 +12,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import pwd
 import re
@@ -59,7 +60,7 @@ def lock_path(pool, key):
 
 
 @contextlib.contextmanager
-def locked_all(pool, keys, *, deadline):
+def locked_all(pool, keys, *, deadline, shared=False):
     """Hold the exclusive locks of many keys: each shard once, in one global order.
 
     Keys share 4096 shards, so one batch often maps two keys to one shard; taking that shard
@@ -67,17 +68,17 @@ def locked_all(pool, keys, *, deadline):
     """
     with contextlib.ExitStack() as stack:
         for path in sorted({lock_path(pool, key) for key in keys}):
-            stack.enter_context(_flock(path, deadline=deadline))
+            stack.enter_context(_flock(path, deadline=deadline, shared=shared))
         yield
 
 
 @contextlib.contextmanager
-def _flock(path, *, deadline):
+def _flock(path, *, deadline, shared=False):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with path.open("a+") as stream:
         while True:
             try:
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(stream, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
                 if deadline is None or time.monotonic() >= deadline:
@@ -290,7 +291,7 @@ def private_mapping(private, key, known):
     return known[key]
 
 
-def hydrate(entry, private, input_hash, *, private_mappings=None, report=None, guard=None):
+def hydrate(entry, private, input_hash, *, private_mappings=None, report=None, guard=None, refused=None):
     row = read_json(entry / "entry.json")
     names = list(dict.fromkeys(descriptions(row["data"])))
     try:
@@ -302,16 +303,15 @@ def hydrate(entry, private, input_hash, *, private_mappings=None, report=None, g
     keys = input_hash if isinstance(input_hash, list) else [input_hash]
     known = {} if private_mappings is None else private_mappings
     changed = [key for key in keys if private_mapping(private, key, known) != desired]
-    from .canonical_store import Guard, fingerprint, reconcile, rejected
+    from .canonical_store import Guard, fingerprint, rejected
 
     guard = Guard() if guard is None else guard
-    refused = rejected(entry.parent.parent)
+    refused = rejected(entry.parent.parent) if refused is None else refused
     if refused and any(fingerprint((entry / name).lstat()) in refused for name in names):
         # Relinking proved these bytes wrong: re-expand the entry from its verified archive.
         raise ValueError("entry holds bytes relinking rejected")
-    for name in names:
-        # A local publication may have made this name canonical first: keep one inode.
-        reconcile(entry.parent.parent, name, entry / name, guard=guard)
+    # No reconcile here: hydration runs under exclusive batch locks for every round on the host,
+    # and reconciling hashes whole files. The pool collector's sweep merges duplicate inodes.
     missing = [name for name in names if not (private / "artifacts" / name).is_file()]
     started = clock()
     for name in missing:
@@ -329,52 +329,95 @@ def hydrate(entry, private, input_hash, *, private_mappings=None, report=None, g
         os.utime(entry / "entry.json", None)
 
 
-# Bounded by the host's single preparation deadline (agents.HOST_CACHE_TIMEOUT).
-EXPANSION_TIMEOUT = 1200
-
-
 def expand(download, private, cwd, env, pool, report, *, manifest=None, private_mappings=None, deadline=None):
-    """Expand and hydrate every selected archive, or raise: partial hydration is not a fallback."""
+    """Expand and hydrate every selected archive, or raise: partial hydration is not a fallback.
+
+    Entry locks held by another round are waited for: their holder is publishing or reading an
+    entry this round needs, and a dead holder releases its lock. Only an explicit ``deadline``
+    (tests) bounds the wait; the round's hard cap bounds it otherwise."""
     grouped = {}
     for input_hash, archive in entries(download, manifest):
         grouped.setdefault(archive, []).append(input_hash)
     pending = [(inputs, archive) for archive, inputs in grouped.items()]
     if not pending:
         return
-    deadline = time.monotonic() + EXPANSION_TIMEOUT if deadline is None else deadline
+    deadline = math.inf if deadline is None else deadline
     program = None
     completed = 0
     from .canonical_store import Guard, reconcile
 
     guard = Guard()  # One lazy /proc scan for every alias this expansion may replace.
+    from .canonical_store import rejected
+
+    refused = rejected(pool)  # read once per expansion, not once per entry
     for offset in range(0, len(pending), 128):
         with contextlib.ExitStack() as stack:
             missing = []
             batch = pending[offset : offset + 128]
+
+            def hydrated(input_hash, entry):
+                hydrate(
+                    entry,
+                    private,
+                    input_hash,
+                    private_mappings=private_mappings,
+                    report=report,
+                    guard=guard,
+                    refused=refused,
+                )
+                report["hits"] += 1
+
+            # Hydrating a published entry only reads it, so it takes SHARED locks: rounds that
+            # hydrate the same entries never wait on each other. Exclusive locks are taken only
+            # below, for the entries this batch must publish or replace.
+            unusable = []
             try:
-                # Another publisher is useful work: wait for it, then hydrate its entry.
-                stack.enter_context(locked_all(pool, [archive[:-5] for _, archive in batch], deadline=deadline))
+                with locked_all(pool, [archive[:-5] for _, archive in batch], deadline=deadline, shared=True):
+                    for input_hash, archive in batch:
+                        entry = pool / "entries" / archive[:-5]
+                        try:
+                            if (entry / "entry.json").is_file():
+                                hydrated(input_hash, entry)
+                                completed += 1
+                            else:
+                                missing.append((input_hash, archive, entry))
+                        except (ValueError, KeyError) as error:
+                            unusable.append((input_hash, archive, entry, error))
             except BlockingIOError:
                 raise Unavailable("expansion entries still locked at the preparation deadline") from None
-            for input_hash, archive in batch:
-                key = archive[:-5]
-                entry = pool / "entries" / key
+            if not missing and not unusable:
+                continue
+            try:
+                # Another publisher is useful work: wait for it, then hydrate its entry.
+                keys = [archive[:-5] for _, archive, *_ in missing + unusable]
+                stack.enter_context(locked_all(pool, keys, deadline=deadline))
+            except BlockingIOError:
+                raise Unavailable("expansion entries still locked at the preparation deadline") from None
+            pending_here, missing = missing, []
+            for input_hash, archive, entry, error in unusable:
+                try:
+                    hydrated(input_hash, entry)  # replaced by another publisher meanwhile
+                    completed += 1
+                    continue
+                except (ValueError, KeyError, FileNotFoundError):
+                    pass
+                log(f"expanded cache: replacing unusable entry {archive[:-5]}: {error}")
+                if entry.is_dir() and not entry.is_symlink():
+                    # Only this invalid entry's alias names go, under its exclusive entry
+                    # lock; every linked inode survives in its other names.
+                    shutil.rmtree(entry)
+                missing.append((input_hash, archive, entry))
+            for input_hash, archive, entry in pending_here:
                 try:
                     if (entry / "entry.json").is_file():
-                        hydrate(
-                            entry, private, input_hash, private_mappings=private_mappings, report=report, guard=guard
-                        )
-                        report["hits"] += 1
+                        hydrated(input_hash, entry)  # another round published it meanwhile
                         completed += 1
-                    else:
-                        missing.append((input_hash, archive, entry))
+                        continue
                 except (ValueError, KeyError) as error:
-                    log(f"expanded cache: replacing unusable entry {key}: {error}")
+                    log(f"expanded cache: replacing unusable entry {archive[:-5]}: {error}")
                     if entry.is_dir() and not entry.is_symlink():
-                        # Only this invalid entry's alias names go, under its exclusive entry
-                        # lock; every linked inode survives in its other names.
                         shutil.rmtree(entry)
-                    missing.append((input_hash, archive, entry))
+                missing.append((input_hash, archive, entry))
             if not missing:
                 continue
             if program is None:
@@ -446,7 +489,15 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
                     atomic_json(publication / "entry.json", dict(data=data))
                     entry.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(publication, entry)  # A new entry name from our staging directory.
-                    hydrate(entry, private, input_hash, private_mappings=private_mappings, report=report, guard=guard)
+                    hydrate(
+                        entry,
+                        private,
+                        input_hash,
+                        private_mappings=private_mappings,
+                        report=report,
+                        guard=guard,
+                        refused=refused,
+                    )
                     report["expanded"] += 1
                     completed += 1
     if completed != len(pending):
@@ -522,12 +573,14 @@ def preparation(cwd, env, *, refetch=None, report=None):
     except (OSError, ValueError) as error:
         raise Unavailable(f"expanded cache unavailable: {error}") from error
     started = time.monotonic()
-    deadline = started + EXPANSION_TIMEOUT
+    deadline = None  # wait for entry locks: see expand()
     report = {} if report is None else report
     report.update(hits=0, expanded=0)
     with temporary as tmp, contextlib.ExitStack() as leases:
         try:
-            leases.enter_context(locked(pool, "download-" + Path(tmp).name))
+            # A shared lease: rounds whose download names share a lock shard never exclude each
+            # other, while collection (an exclusive, non-blocking attempt) still skips the tree.
+            leases.enter_context(_flock(lock_path(pool, "download-" + Path(tmp).name), deadline=math.inf, shared=True))
         except OSError as error:
             raise Unavailable(f"expanded cache download lock unavailable: {error}") from error
         download = Path(tmp)

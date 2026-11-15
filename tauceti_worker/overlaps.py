@@ -106,7 +106,7 @@ def collect_sources(parent: Path, keep: Path, now: float | None = None) -> list[
     Each pin is a full Mathlib source tree and every Mathlib bump adds one, so without this they
     accumulate forever. A tree is taken only under its own extraction lock, and its age is checked
     again there, so a pin acquired meanwhile survives. Readers hold no lock once they have the
-    path, but every reader runs inside a round, and rounds end within ROUND_TIMEOUT (90 minutes
+    path, but every reader runs inside a round, and rounds end within ROUND_TIMEOUT (6 hours
     by default), far inside SOURCES_IDLE."""
     removed = []
     try:
@@ -608,9 +608,7 @@ def do_fix(w, sv, c, opts, bubble):
                 rc = run_in_bubble(w, TAUCETI, prompt, opts, allow_push=fork, cancel_event=lease.lost)
             else:
                 if not prepare_checkout(w.cfg, work="overlap-fix"):
-                    from .work_recovery import LAST_REFUSAL
-
-                    raise Die(f"overlap-fix: checkout preparation failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}")
+                    raise Die("overlap-fix: checkout preparation failed")
                 lease.require()
                 rc = run_agent_host(
                     w.cfg.checkout,

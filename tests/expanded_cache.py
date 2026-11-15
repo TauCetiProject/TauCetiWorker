@@ -193,10 +193,16 @@ class Cache(unittest.TestCase):
             yield
 
         env = dict(LAKE_CACHE_DIR=str(self.root / "private"), TAUCETI_BUILD_CACHE_ROOT=str(self.pool))
-        with patch.object(cache, "locked", busy):
+        # An unusable lease (a lock-table error, not ordinary contention) still refuses the round.
+        with patch.object(cache, "_flock", busy):
             with self.assertRaises(cache.Unavailable):
                 with cache.preparation(self.root, env):
                     self.fail("must not run the round on a private cache")
+
+    def test_download_leases_sharing_a_lock_shard_do_not_exclude_each_other(self):
+        lease = cache.lock_path(self.pool, "download-prepare-a")
+        with cache._flock(lease, deadline=0, shared=True), cache._flock(lease, deadline=0, shared=True):
+            pass
 
     def test_entry_lock_contention_waits_then_fails_at_the_deadline(self):
         import fcntl
@@ -291,6 +297,33 @@ class Cache(unittest.TestCase):
             thread.join()
         self.assertEqual(errors, [])
         self.assertEqual({r["hits"] for r in reports.values()}, {5 * len(keys)})
+
+    def test_hydrating_a_published_entry_never_waits_for_another_hydration(self):
+        import fcntl
+        import time
+
+        keys = [f"{n:016x}" for n in range(0, 2000, 13)][:64]
+        download = self.root / "download"
+        self.warm_entries(keys, download)
+        # Another round is hydrating the same entries: it holds their shard locks SHARED.
+        paths = sorted({cache.lock_path(self.pool, key) for key in keys})
+        paths[0].parent.mkdir(parents=True, exist_ok=True)
+        held = [path.open("a+") for path in paths]
+        for stream in held:
+            fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        try:
+            report = dict(hits=0, expanded=0)
+            started = time.monotonic()
+            cache.expand(download, self.root / "reader", self.root, {}, self.pool, report, deadline=started + 3)
+            self.assertEqual(report["hits"], len(keys))
+            self.assertLess(time.monotonic() - started, 2)
+            # A publisher or collector still needs the exclusive lock, which readers exclude.
+            with self.assertRaises(BlockingIOError):
+                with cache.locked_all(self.pool, keys[:1], deadline=time.monotonic()):
+                    pass
+        finally:
+            for stream in held:
+                stream.close()
 
     def test_refetch_failure_after_corrupt_archive_fails_preparation(self):
         from tauceti_worker.config import NoProgress
