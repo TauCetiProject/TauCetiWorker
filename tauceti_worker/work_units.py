@@ -1878,6 +1878,51 @@ def _refund_infra_failure(w, c, label: str, charged: tuple[str, ...]) -> None:
     raise NoProgress(f"{label} #{c.pr}: {reason} — not charged to the PR, will retry after back-off")
 
 
+def _branch_tip(remote: str, ref: str) -> str | None:
+    """The head repository's real branch tip, "" when the branch is absent, None when unknown.
+
+    Read with `git ls-remote`, so it works for every forge the push arbiter can push to."""
+    dest = ref if ref.startswith("refs/") else f"refs/heads/{ref}"
+    try:
+        proc = subprocess.run(
+            ["git", "ls-remote", "--refs", remote, dest],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except OSError:
+        return None
+    if proc.returncode:
+        return None
+    rows = [row.split() for row in proc.stdout.splitlines() if row.strip()]
+    tips = {row[0] for row in rows if len(row) == 2 and row[1] == dest and re.fullmatch(r"[0-9a-f]{40}", row[0])}
+    if len(rows) != len(tips) or len(tips) > 1:
+        return None
+    return next(iter(tips), "")
+
+
+def _stale_pr_head(w, c: Candidate, label: str) -> bool:
+    """Whether the PR's recorded head is known to differ from its branch tip.
+
+    git-safe-push expects the recorded head, so a push from a stale record is rejected every time.
+    Never overwrite the unknown tip: release the PR to the existing per-head source-refresh retry,
+    which also keeps selection from picking the same stale head again immediately."""
+    remote, ref = os.environ.get("TAUCETI_PUSH_REMOTE"), os.environ.get("TAUCETI_PUSH_REF")
+    if not remote or not ref:
+        return False
+    tip = _branch_tip(remote, ref)
+    if tip is None or tip == c.head:
+        return False
+    log(
+        f"  {label} #{c.pr}: PR head is stale: the forge has {c.head[:12]}, branch tip is "
+        f"{tip[:12] if tip else '<missing>'}; selecting other work"
+    )
+    from .state_repair import repair_selected
+
+    repair_selected(w, c, tip)
+    return True
+
+
 def _do_fixlike(
     w: Worker,
     sv: Survey,
@@ -1953,6 +1998,9 @@ def _do_fixlike(
         for key in charged:
             w.counters.write(key, max(0, w.counters.read(key) - 1))
         return None
+
+    if _stale_pr_head(w, c, label):
+        return decline_repair()
 
     if label == "fix" or bubble:
         c.progress = _progress_snapshot(w, c)
@@ -2143,6 +2191,8 @@ def _do_fixlike(
         push_scope = current_round_id() or os.urandom(16).hex()
         scoped_push_marker = f"refs/tauceti/published/scope/{push_scope}/{p.head_ref.removeprefix('refs/heads/')}"
         scoped_published_before = _rev(co, scoped_push_marker)
+        scoped_rejected = f"refs/tauceti/push-rejected-scope/{push_scope}/{p.head_ref.removeprefix('refs/heads/')}"
+        scoped_rejected_before = _rev(co, scoped_rejected)
         try:
             with (
                 environment(TAUCETI_PUSH_SCOPE=push_scope),
@@ -2171,6 +2221,10 @@ def _do_fixlike(
                     if c.progress is None:
                         c.progress = {}
                     c.progress["published"] = published_after
+                elif _rev(co, scoped_rejected) != scoped_rejected_before:
+                    # A stale-head rejection: back off this head instead of selecting it again.
+                    with contextlib.suppress(Exception):
+                        _stale_pr_head(w, c, label)
     if rc == 0:
         w.rs.bust(pr)
     elif not foreign:
