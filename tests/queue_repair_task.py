@@ -12,11 +12,11 @@ stopping the agent without a submission; a chain the service rejects, retried on
 a locally invalid chain retried with the local report; a content change without an explanation,
 completed by a follow-up turn in the same session; artifacts unavailable (released, or left to expire
 when the service has no release endpoint); inference unavailable after bounded retries; an ordinary
-agent failure released as such; a second claimant refused; and a checkpointed task resumed in its
-recorded session. The long-running worker (``serve``): the claim/run/submit cycle with the provider
+agent failure released as such; a second claimant refused; and a task left mid-attempt abandoned and
+its claim released. The long-running worker (``serve``): the claim/run/submit cycle with the provider
 outcome reported to ``/tasks/inference`` and idle polling until stopped; a failing service and a
-failing task that do not end the loop; SIGTERM stopping the agent while keeping the claim and
-checkpoint, which the next start resumes; and the host preflight checks. The streaming repair: the
+failing task that do not end the loop; SIGTERM stopping the agent and releasing the claim; and the host
+preflight checks. The streaming repair: the
 worker's background ``lake build --iofail`` (a scripted stub emitting two errors with a pause between
 them) launches the agent after the first error with the "Build in progress" section, the error list and
 the lock behave as the prompt says, and ``--no-stream-repair`` restores the sequential flow.
@@ -2120,28 +2120,6 @@ class Providers(Fixture):
         self.assertTrue(call["codex_credentials"])
         self.assertEqual(call["env"]["CODEX_HOME"], str(self.root / "state" / "codex-home"))
 
-    def test_a_resumed_session_keeps_its_provider_even_over_pace(self):
-        # An interrupted task resumes the recorded codex thread, ahead of a now-eligible claude and
-        # without re-checking codex's pace: the work was admitted when it started.
-        os.environ["STUB_AGENT_MODE"] = "resume-only"
-        cfg = self.config(providers=("claude", "codex"))
-        claim = self.service.preclaim(1, "old-token", cfg.worker)
-        task = repair_task.Task.from_json(self.service.task_record(1, claim))
-        repair_task.fetch_retained(cfg.clone, task)
-        worktree = cfg.root / "worktrees" / "task-1"
-        repair.checkout_worktree(cfg.clone, task.tip, worktree)
-        state = repair_task.TaskState(cfg.tasks_dir / "1", task)
-        state.write("agent_running", agent_attempt=1, provider="codex")
-        from tauceti_worker.runtime_status import atomic_json
-
-        atomic_json(state.session_path, {"session": "thread-old", "cwd": str(worktree)})
-        self.statuses["codex"] = (False, "weekly ahead of pace")
-        outcomes = repair_task.resume_pending(cfg, self.client(cfg))
-        self.assertEqual([o["status"] for o in outcomes], ["adopted"], outcomes)
-        calls = self.agent_calls()
-        self.assertEqual([(c["agent"], c["resume"]) for c in calls], [("codex", "thread-old")])
-        self.assertEqual(self.provider_attempts(outcomes[0]), [("codex", "ran")])
-
     def test_the_heartbeat_counts_the_providers(self):
         self.statuses["claude"] = (False, "weekly exhausted")
         self.break_launch("codex")
@@ -2300,9 +2278,8 @@ class AgentTimeout(Fixture):
         self.assertEqual([r["reason"] for r in self.service.releases], ["agent_failed"])
 
 
-class Resume(Fixture):
-    def test_checkpointed_task_resumes_its_session(self):
-        os.environ["STUB_AGENT_MODE"] = "resume-only"
+class Abandon(Fixture):
+    def test_a_task_left_mid_agent_is_abandoned_and_its_claim_released(self):
         cfg = self.config()
         client = self.client(cfg)
         # A previous runner claimed the task, prepared the worktree and was running the agent in sess-old.
@@ -2318,25 +2295,24 @@ class Resume(Fixture):
         from tauceti_worker.runtime_status import atomic_json
 
         atomic_json(state.session_path, {"session": "sess-old", "cwd": str(worktree)})
-        outcomes = repair_task.resume_pending(cfg, client)
-        self.assertEqual([o["status"] for o in outcomes], ["adopted"], outcomes)
-        calls = self.agent_calls()
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["resume"], "sess-old")
-        self.assertIn("has resumed your session", calls[0]["prompt"])
-        self.assertEqual(
-            self.lake_calls(), ["build --iofail"], "artifacts are not prepared again on resume; the worker verifies"
-        )
-        self.assertTrue(self.state()["resumed"])
+        outcomes = repair_task.retry_deliveries(cfg, client)
+        self.assertEqual([(o["status"], o["reason"]) for o in outcomes], [("released", "worker-stopped")])
+        self.assertEqual(self.agent_calls(), [], "nothing of the attempt is continued")
+        self.assertEqual([r["reason"] for r in self.service.releases], ["worker-stopped"])
+        self.assertIsNone(self.service.live_claim(1))
+        self.assertFalse(worktree.exists())
+        outcome = repair_task.claim_and_run(cfg, client)
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.agent_calls()[0]["resume"], None, "a fresh run, not a resume")
 
-    def test_a_checkpoint_whose_claim_is_gone_is_not_resumed(self):
+    def test_a_record_whose_claim_is_gone_is_not_continued(self):
         cfg = self.config()
         task = repair_task.Task.from_json(
             {**self.content.task(), "claim_token": "gone", "expires_at": time.time() + 5, "renew_after": 0.2}
         )
         state = repair_task.TaskState(cfg.tasks_dir / "1", task)
         state.write("agent_running")
-        self.assertEqual(repair_task.resume_pending(cfg, self.client(cfg)), [])
+        self.assertEqual(repair_task.retry_deliveries(cfg, self.client(cfg)), [])
         self.assertEqual(self.state()["state"], "claim_lost")
         self.assertEqual(self.agent_calls(), [])
 
@@ -2474,7 +2450,7 @@ class Serve(Fixture):
         self.assertNotIn("artifacts_backoff", result["summary"])
         self.assertEqual(self.agent_calls(), [])
 
-    def test_sigterm_interrupts_the_agent_keeps_the_claim_and_the_next_start_resumes(self):
+    def test_sigterm_abandons_the_attempt_and_releases_the_claim(self):
         os.environ["STUB_AGENT_MODE"] = "sleep"
         os.environ["STUB_SLEEP"] = "30"
         cfg = self.config(poll_seconds=0.2)
@@ -2497,27 +2473,19 @@ class Serve(Fixture):
         summary = repair_task.serve(cfg, self.client(cfg), stop)  # the main thread: where the handler runs
         self.assertLess(time.monotonic() - started, 25, "the sleeping agent was stopped promptly")
         self.assertEqual(stop.reason, "SIGTERM")
-        self.assertEqual(summary["outcomes"], {"interrupted": 1}, summary)
+        self.assertEqual(summary["outcomes"], {"released": 1}, summary)
         state = self.state()
-        self.assertEqual(state["state"], "interrupted")
-        self.assertEqual(state["phase"], "agent_running")
-        # Nothing was submitted or released, the claim is still ours and the worktree is kept.
+        self.assertEqual(state["state"], "released")
+        self.assertEqual(state["reason"], "worker-stopped")
+        # Nothing was submitted, the claim was released at once and the worktree removed.
         self.assertEqual(self.service.results, [])
-        self.assertEqual(self.service.releases, [])
-        self.assertEqual(self.service.inference_reports, [])
-        self.assertIsNotNone(self.service.live_claim(1), "the claim is kept for the next start")
-        self.assertTrue((self.root / "state" / "worktrees" / "task-1").is_dir())
+        self.assertEqual([r["reason"] for r in self.service.releases], ["worker-stopped"])
+        self.assertIsNone(self.service.live_claim(1), "the task is claimable again at once")
+        self.assertFalse((self.root / "state" / "worktrees" / "task-1").exists())
         self.assertEqual(self.heartbeat(cfg)["state"], "stopped")
-        # The next start renews the claim and resumes the recorded session in the kept worktree.
-        os.environ["STUB_AGENT_MODE"] = "resume-only"
-        outcomes = repair_task.resume_pending(cfg, self.client(cfg))
-        self.assertEqual([o["status"] for o in outcomes], ["adopted"], outcomes)
-        calls = self.agent_calls()
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[1]["resume"], "sess-1")
-        self.assertIn("has resumed your session", calls[1]["prompt"])
-        self.assertEqual(len(self.service.results), 1)
-        self.assertEqual(self.state()["state"], "adopted")
+        # The next start has nothing to continue.
+        self.assertEqual(repair_task.retry_deliveries(cfg, self.client(cfg)), [])
+        self.assertEqual(len(self.agent_calls()), 1)
 
     def test_stop_before_a_claim_does_not_claim(self):
         cfg = self.config(poll_seconds=0.1)
@@ -2772,10 +2740,9 @@ class ReleaseRetry(Fixture):
         self.assertEqual(len(self.service.releases), 1)
 
 
-class StopAndResume(Fixture):
-    """A claim never outlives the worker that holds it: a stop before the agent runs releases it, a
-    restart releases or resumes whatever a stopped run left, and a claim refused for our own stale
-    claim is given back and retried at once."""
+class StopAndRelease(Fixture):
+    """A claim never outlives the worker that holds it: a stop releases it, a restart releases whatever
+    a stopped run left, and a claim refused for our own stale claim is given back and retried at once."""
 
     RETAINED_TIP = "refs/heads/queue/batch-1/tip"
 
@@ -2827,20 +2794,16 @@ class StopAndResume(Fixture):
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
 
-    def test_sigterm_with_the_agent_running_renews_the_claim_before_checkpointing(self):
+    def test_sigterm_with_the_agent_running_releases_the_claim(self):
         os.environ["STUB_AGENT_MODE"] = "sleep"
         os.environ["STUB_SLEEP"] = "30"
         cfg = self.config(poll_seconds=0.2)
         stop = self.install_handlers()
         self.terminate_when(lambda: self.checkpoint_state() == "agent_running", delay=1.0)
-        renewals_before = self.service.renewals
         summary = repair_task.serve(cfg, self.client(cfg), stop)
-        self.assertEqual(summary["outcomes"], {"interrupted": 1}, summary)
-        claim = self.service.live_claim(1)
-        self.assertIsNotNone(claim, "the claim is kept for the resume")
-        self.assertGreater(self.service.renewals, renewals_before)
-        self.assertAlmostEqual(claim["expires_at"], self.state()["task"]["expires_at"], delta=1.0)
-        self.assertEqual(self.service.releases, [])
+        self.assertEqual(summary["outcomes"], {"released": 1}, summary)
+        self.assertIsNone(self.service.live_claim(1))
+        self.assertEqual([r["reason"] for r in self.service.releases], ["worker-stopped"])
 
     def test_on_start_a_checkpoint_stopped_before_the_agent_is_released_and_claimed_fresh(self):
         cfg = self.config()
@@ -2851,7 +2814,7 @@ class StopAndResume(Fixture):
         state = repair_task.TaskState(cfg.tasks_dir / "1", task)
         state.write("claimed", worker=cfg.worker)
         self.assertIsNone(client.claim(), "the stale claim blocks a fresh one (concurrency)")
-        outcomes = repair_task.resume_pending(cfg, client)
+        outcomes = repair_task.retry_deliveries(cfg, client)
         self.assertEqual([(o["status"], o["reason"]) for o in outcomes], [("released", "worker-stopped")])
         self.assertEqual([r["reason"] for r in self.service.releases], ["worker-stopped"])
         self.assertEqual(self.state()["state"], "released")
@@ -4884,7 +4847,7 @@ class WorkerAudits(Fixture):
         self.assertEqual(self.service.done, set())
         self.assertEqual(len(self.service.results), 1)
         before = (len(self.agent_calls()), len(self.lake_calls()))
-        [saved] = repair_task.resume_pending(cfg, client)
+        [saved] = repair_task.retry_deliveries(cfg, client)
         self.assertEqual(saved["reason"], "repair-checkpoint", saved)
         self.assertEqual((len(self.agent_calls()), len(self.lake_calls())), before)
         self.assertFalse((cfg.root / "worktrees/task-1").exists())
@@ -4926,7 +4889,7 @@ class WorkerAudits(Fixture):
             pending = repair_task.claim_and_run(cfg, client)
         self.assertEqual(pending["status"], "delivery_pending", pending)
         before = (len(self.agent_calls()), len(self.lake_calls()))
-        [recovered] = repair_task.resume_pending(cfg, client)
+        [recovered] = repair_task.retry_deliveries(cfg, client)
         self.assertEqual(recovered["status"], "adopted", recovered)
         self.assertEqual(recovered["response"]["reason"], "already-adopted")
         self.assertEqual((len(self.agent_calls()), len(self.lake_calls())), before)
@@ -5014,7 +4977,7 @@ class WorkerAudits(Fixture):
             pending = repair_task.claim_and_run(cfg, client)
         self.assertEqual(pending["status"], "delivery_pending", pending)
         before = (len(self.agent_calls()), len(self.lake_calls()))
-        [recovered] = repair_task.resume_pending(cfg, client)
+        [recovered] = repair_task.retry_deliveries(cfg, client)
         self.assertEqual(recovered["status"], "adopted", recovered)
         self.assertEqual((len(self.agent_calls()), len(self.lake_calls())), before)
 
@@ -5027,7 +4990,7 @@ class WorkerAudits(Fixture):
         before = (len(self.agent_calls()), len(self.lake_calls()))
         self.assertEqual(self.service.releases, [])
         self.assertTrue((cfg.root / "worktrees/task-1").exists())
-        [outcome] = repair_task.resume_pending(cfg, client)
+        [outcome] = repair_task.retry_deliveries(cfg, client)
         self.assertEqual(outcome["status"], "adopted", outcome)
         self.assertEqual((len(self.agent_calls()), len(self.lake_calls())), before)
         self.assertFalse((cfg.root / "worktrees/task-1").exists())
@@ -5039,7 +5002,7 @@ class WorkerAudits(Fixture):
             self.assertEqual(repair_task.claim_and_run(cfg, client)["status"], "delivery_pending")
         before = (len(self.agent_calls()), len(self.lake_calls()))
         cfg.worker_audits = True
-        [outcome] = repair_task.resume_pending(cfg, client)
+        [outcome] = repair_task.retry_deliveries(cfg, client)
         self.assertEqual(outcome["status"], "adopted", outcome)
         self.assertEqual(len(self.agent_calls()), before[0])
         self.assertGreater(len(self.lake_calls()), before[1])
@@ -5979,7 +5942,7 @@ class EarlyPublication(Fixture):
             pending = repair_task.claim_and_run(cfg, client)
         self.assertEqual(pending["status"], "delivery_pending", pending)
         before = (len(self.agent_calls()), len(self.lake_builds()))
-        [recovered] = repair_task.resume_pending(cfg, client)
+        [recovered] = repair_task.retry_deliveries(cfg, client)
         self.assertEqual(recovered["status"], "adopted", recovered)
         self.assertEqual((len(self.agent_calls()), len(self.lake_builds())), before)
         records = repair_publish.BACKGROUND.wait(60)

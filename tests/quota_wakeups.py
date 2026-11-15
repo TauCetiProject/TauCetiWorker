@@ -263,7 +263,7 @@ def test_keychain_and_custom_command():
 
 
 def test_outer_loop_reaches_launch(*, ignore=False, stop_wait=False):
-    from tauceti_worker import config, repair_recovery
+    from tauceti_worker import config
 
     with fixture(agent="claude" if ignore else "auto") as f, ExitStack() as stack:
         if ignore:
@@ -275,7 +275,6 @@ def test_outer_loop_reaches_launch(*, ignore=False, stop_wait=False):
         f.clock.events.append((100, lambda: publish(f, used=99 if ignore else 1)))
         for module, name, result in (
             (config, "rotate_console_log", None),
-            (repair_recovery, "due", False),
             (loop, "fleet_admission_reason", None),
             (loop, "github_budget", {}),
         ):
