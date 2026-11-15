@@ -333,6 +333,6 @@ def publish_native_reviews(cfg, prs=()):
         if os.environ.get("TAUCETI_NATIVE_REVIEW_PUBLISHER"):
             from .native_review_publisher import QueueReviewPublisher
 
-            if QueueReviewPublisher(SimpleNamespace(source=source)).reconcile():
+            if QueueReviewPublisher(SimpleNamespace(source=source)).reconcile(numbers=prs):
                 return True
         return pending(source, cfg, numbers=prs)

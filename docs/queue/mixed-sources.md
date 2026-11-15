@@ -106,6 +106,7 @@ the common Review publisher with
     "generation": "<effective publisher generation from the queue profile>",
     "reviews": [7], "statuses": [8], "recoveries": [8]
   },
+  "publisher_host_id": "<publishing host /etc/machine-id>",
   "ledger": "/home/operator/.local/state/tauceti/native-review-publications/outbox.sqlite3"
 }
 ```
@@ -113,11 +114,14 @@ the common Review publisher with
 Project only `MixedProfile.publishers().record()` from the queue's current policy;
 this file needs no queue execution, mirror or main-writer credentials. The worker
 uses its existing source token and automatically selects the backend inside native
-rounds. Canonical Tau Ceti native reviews require this policy; a missing file
-cannot silently fall back to mutable comments. Its directory must be owned by
-the operator with mode `0700`, the file must have mode `0600`, and its path must
-contain no symlinks. An explicit `TAUCETI_NATIVE_REVIEW_POLICY` overrides the path.
-The Review engine must support `TAUCETI_NATIVE_REVIEW_PUBLISHER`; Worker checks this
+rounds when this profile exists. Managed fleet services should explicitly set
+`TAUCETI_NATIVE_REVIEW_POLICY` to keep publication configured if the file becomes
+unavailable; publication then fails closed. Its directory must be owned by the
+operator with mode `0700`, the file must have mode `0600`, and its path must contain
+no symlinks. Other repositories must select their policy explicitly; the default
+is only for canonical Tau Ceti. Optional `publisher_host_id` prevents accidentally
+copying the authority to a different host with an independent allocator.
+The Review engine must report native publication protocol 2; Worker probes this
 before review inference. Ordinary standalone Review comments remain discussion
 unless a trusted backend is configured.
 
@@ -129,15 +133,21 @@ queue's authoritative profile during deployment and trust changes.
 All reviewers of this source must share the single durable outbox and its sequence
 allocator on the publishing host. Keep this host as the publication authority until
 an equally durable shared allocator is deployed for multiple publishing hosts.
-In-progress, red and green boards all use the existing
-`ForgejoSourceAdapter.prepare_publication` / `publish` protocol. Intents persist
-before remote writes; common Review recovery retries the same paid output and
-intent. Immutable comment history is retained, and superseded intents cannot
-revive an older verdict. Before paid inference the backend validates the source,
-actor and local policy, and the shared renderer publishes its in-progress plan.
-Periodic integrity checks can repair moderated receipts from retained paid bodies,
-including after the Review scratch directory has been cleaned up. Sequence
-conflicts and unsupported outbox protocol versions require operator repair.
+Verdicts use the existing `ForgejoSourceAdapter.prepare_publication` / `publish`
+protocol. Before inference the backend validates the source, actor and local
+policy and reserves an ordered run with a nonce. Common Review retains this opaque
+reservation with the paid body. A delayed older output cannot obtain a newer
+sequence merely by retrying after another worker publishes. No extra early
+scoreboard is posted, so unchanged-review behavior stays shared with GitHub.
+
+Intents freeze before remote writes; common Review recovery retries the same paid
+output and intent. Both Worker survey and Review handoff read receipt-selected
+boards. Immutable history is retained, and superseded output cannot revive an
+older verdict. Periodic integrity checks use per-PR locks, bounded sweeps and
+bounded repair attempts, including after scratch cleanup. Repairs remain within
+the original run's sequence interval, before later runs. Retained negative facts
+are delivered even if the PR closes or moves to another head. Repeated damage,
+sequence conflicts and unsupported outbox versions require operator repair.
 Never bypass this gate to make a canary enter the queue.
 
 The explicit `authority_generation` is a fresh nonzero 128-bit value; rotate it

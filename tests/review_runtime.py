@@ -83,7 +83,7 @@ class ReviewRuntime(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(NoProgress, "publication backend"):
                     review_runtime.resolve(SimpleNamespace(state=Path(directory)))
-                (root / "runner/publication_transport.py").write_text("TAUCETI_NATIVE_REVIEW_PUBLISHER")
+                (root / "runner/cli.py").write_text("print('{\"native_publisher\": 2}')")
                 with patch("tauceti_worker.native_review_publisher.QueueReviewPublisher") as publisher:
                     runtime = review_runtime.resolve(SimpleNamespace(state=Path(directory)))
                     publisher.return_value.preflight.assert_called_once()

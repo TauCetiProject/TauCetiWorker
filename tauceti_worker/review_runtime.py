@@ -7,6 +7,7 @@ neither needs another distribution/pin in the launcher's inline dependencies.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -82,8 +83,17 @@ def resolve(cfg):
     if not (directory / "runner/cli.py").is_file() or not (directory / "rubrics").is_dir():
         raise NoProgress("review engine checkout is incomplete")
     if os.environ.get("TAUCETI_NATIVE_REVIEW_PUBLISHER"):
-        transport = directory / "runner/publication_transport.py"
-        if not transport.is_file() or "TAUCETI_NATIVE_REVIEW_PUBLISHER" not in transport.read_text():
+        try:
+            probe = subprocess.run(
+                [sys.executable, str(directory / "runner/cli.py"), "--publication-protocol"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            supported = probe.returncode == 0 and json.loads(probe.stdout).get("native_publisher") == 2
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            supported = False
+        if not supported:
             raise NoProgress("review engine does not support the configured native publication backend")
         from types import SimpleNamespace
 
