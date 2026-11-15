@@ -105,21 +105,38 @@ def attest(w, pr: int, *, bubble: bool, sleep=time.sleep, clock=time.monotonic) 
         return f"not attested: local verification {result.get('status', 'incomplete')} ({result.get('error', '')})"
     if why := _bump_pull(w.gh.live_pull(pr), head):
         return f"not attested after verification: {why}"
+    outcome = confirm_label(w, pr, head, lambda live: _bump_pull(live, head), sleep=sleep, clock=clock)
+    if outcome == "accepted":
+        return f"attested {head[:12]}: picker accepted self-tested"
+    if outcome == "refused":
+        return f"picker refused self-tested on {head[:12]}"
+    if outcome == "label failed":
+        return "not attested: adding the label failed"
+    if outcome.startswith("stopped: "):
+        return f"stopped waiting: {outcome.removeprefix('stopped: ')}"
+    return "assertion not observed; ordinary CI continues"
+
+
+def confirm_label(w, pr: int, head: str, recheck, *, sleep=time.sleep, clock=time.monotonic) -> str:
+    """Apply `self-tested` to `pr` at `head` and wait for the picker's PR-bound assertion.
+
+    `recheck(live)` names why the live PR no longer qualifies ("" while it does). Returns
+    "accepted", "refused", "label failed", "stopped: <why>" or "unobserved"."""
     context = f"self-tested/{pr}"
     for _ in range(LABEL_ATTEMPTS):
         if not w.gh.add_label(pr, LABEL):
-            return "not attested: adding the label failed"
+            return "label failed"
         deadline = clock() + ASSERTION_WAIT_S
         while clock() < deadline:
             sleep(ASSERTION_POLL_S)
             state = w.gh.commit_status(head, context)
             if state == "success":
-                return f"attested {head[:12]}: picker accepted self-tested"
+                return "accepted"
             if state in ("failure", "error"):
-                return f"picker refused self-tested on {head[:12]}"
+                return "refused"
             live = w.gh.live_pull(pr)
-            if why := _bump_pull(live, head):
-                return f"stopped waiting: {why}"
+            if why := recheck(live):
+                return f"stopped: {why}"
             if LABEL not in {str(label.get("name", "")).lower() for label in live.get("labels", [])}:
                 break  # removed by a concurrent picker run; label again once
-    return "assertion not observed; ordinary CI continues"
+    return "unobserved"

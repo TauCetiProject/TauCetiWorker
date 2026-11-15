@@ -735,6 +735,8 @@ PROGRESS_GUARDED = {"rebase", "fix", "fix-ci", "bump", "lint-repair", "roadmap"}
 # Stages whose agent edits the checkout. `review` and `progress` do not, and a bubble round works
 # inside the container, so the host checkout would say nothing about it either way.
 FILE_CHANGE_STAGES = {"rebase", "fix", "fix-ci", "bump", "lint-repair", "roadmap"}
+# Stages whose pushes the worker labels `self-tested` itself; automatic bumps use bump_attestation.
+SELF_TESTED_STAGES = {"rebase", "fix", "fix-ci", "lint-repair", "roadmap"}
 _MAX_CHANGED_FILES = 25
 
 
@@ -1484,6 +1486,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             p.number == c.pr and getattr(p, "automatic_bump", False) for p in sv.open_prs
         )
     pre_head = _checkout_head(w.cfg) if (stage in FILE_CHANGE_STAGES and not bubble) else None
+    # Receipts this round's agent left are at least this new (see self_tested_label).
+    round_started = time.time()
     # Fresh candidate/claim reads can exhaust a bucket after the initial dispatch preflight.
     _check_stage_read_quota(stage)
     from .budget import BudgetError
@@ -1540,6 +1544,17 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
                 progress = True
         except Exception as error:  # noqa: BLE001 - an attestation problem must not fail the round
             log(f"  {stage} #{c.pr}: self-tested attestation failed ({one_line(str(error))}); ordinary CI continues")
+    if stage in SELF_TESTED_STAGES and not bubble and not opts.dry_run:
+        # The review bot clears `self-tested` on every push, so the worker labels each head the
+        # round published once it has checked the live head, this round's verification receipt
+        # for exactly that commit, and the change's eligibility (self_tested_label).
+        try:
+            from .self_tested_label import label_round_pushes
+
+            for number, outcome in label_round_pushes(w, c, stage, round_started):
+                log(f"  {stage}{f' #{number}' if number else ''}: self-tested: {outcome}")
+        except Exception as error:  # noqa: BLE001 - a labelling problem must not fail the round
+            log(f"  {stage}: self-tested labelling failed ({one_line(str(error))}); ordinary CI continues")
     if rc == 0 and stage in PROGRESS_GUARDED and progress is None:
         from .activity import observation
 
@@ -3118,4 +3133,19 @@ other contributors' claims, or the hard rules of the repo.
         LOCAL_VERIFICATION=local_verification("ordinary", bubble),
         BIN=wrapper_bin(),
     )
-    return run_agent_host(w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir, quota_cfg=w.cfg)
+    from .activity import current_round_id
+
+    # Scope git-safe-push's publication records to this round so its pushes can be labelled.
+    push_scope = current_round_id() or os.urandom(16).hex()
+    try:
+        with environment(TAUCETI_PUSH_SCOPE=push_scope):
+            return run_agent_host(
+                w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir, quota_cfg=w.cfg
+            )
+    finally:
+        from .self_tested_label import scoped_publications
+
+        if (w.cfg.checkout / ".git").exists() and (published := scoped_publications(w.cfg.checkout, push_scope)):
+            if c.progress is None:
+                c.progress = {}
+            c.progress.update(published_branches=published, published_owner=fork_owner)

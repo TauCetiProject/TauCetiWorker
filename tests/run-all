@@ -86,6 +86,7 @@ RUN_STDLIB=(
   auto_stage_priority.py
   automatic_bump.py
   bump_attestation.py
+  self_tested_label.py
   authoring_profiles.py
   bubble_cache.py
   bubble_version.py
