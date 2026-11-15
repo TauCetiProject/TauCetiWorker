@@ -463,9 +463,7 @@ class Verification:
 
         if entry["exit"] and RESOURCE_ERROR.search(text):
             record_wait("build tool could not create threads; host resource exhaustion")
-            raise Incomplete(
-                "build tool resource exhaustion; retry after backoff", reason="resource-pressure"
-            )
+            raise Incomplete("build tool resource exhaustion; retry after backoff", reason="resource-pressure")
 
         if capture:
             entry["stdout_log"] = str(stdout_path)

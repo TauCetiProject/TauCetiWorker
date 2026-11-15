@@ -132,6 +132,18 @@ class Storage(Receipts):
         self.assertTrue(legacy.exists())
         self.assertTrue(checkpoint.is_file())
 
+    def test_settled_checkpoints_do_not_starve_later_legacy_rows(self):
+        for index in range(3):
+            self.checkpoint(f"settled source {index}\n")
+        self.collect()
+        with storage.ledger() as data:
+            identity = storage.key(self.state, "e" * 32)
+            data["candidates"][identity] = dict(
+                state=str(self.state.resolve()), id="e" * 32, kind="candidate", reserved=16384, last_used=1.0
+            )
+        report = storage.housekeep((self.state,), seconds=10, entries=2, now=time.time() + 90000)
+        self.assertEqual(report["candidates"].get(identity), "legacy-candidate-dropped", report)
+
     def test_verification_runs_in_the_round_checkout_and_leaves_no_continuation_state(self):
         with patch.dict(os.environ, TAUCETI_ROUND_DEADLINE=str(time.time() - 60), TAUCETI_VERIFY_BUBBLE="1"):
             result = self.verify(stage="all")

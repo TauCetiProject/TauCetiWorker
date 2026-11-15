@@ -674,6 +674,10 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
         try:
             if not safe(cfg.state, cfg.state.parent):
                 continue
+            if not diagnostics_only:
+                # Live workers too: nothing uses this state any more, and remove() still spares
+                # symlinks, mount points and any tree an older helper process still has open.
+                purge_legacy_verification(cfg.state, report, dry=dry)
             if diagnostics_only or not workspace_idle(cfg, opened):
                 raise BlockingIOError  # Live loops recycle their own caches at ordinary boundaries.
             generation = read_json(cfg.state / "cache-generation.json").get("started_at")
@@ -686,7 +690,6 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
                 discard = isinstance(idle_since, (int, float)) and now - idle_since >= LIFETIME
                 result = recycle(cfg, now=now, dry=dry)
                 merge_report(report, result)
-                purge_legacy_verification(cfg.state, report, dry=dry)
                 collect_retired(cfg, report, now=now, dry=dry, discard_checkout=discard)
         except BlockingIOError:
             if not diagnostics_only:

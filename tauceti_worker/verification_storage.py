@@ -473,8 +473,11 @@ def _housekeep(states=(), *, seconds=0.25, entries=2048, removal_bytes=256 * 102
         _prune_scans(data["candidates"])
         allowed = {str(canonical_state(state)) for state in states}
         for identity, row in rows:
-            work.charge(entries=1)
             state, identifier = Path(row["state"]), row["id"]
+            if row.get("kind") == "checkpoint" and row["state"] in allowed and not row.get("legacy"):
+                if row.get("settled") and (state / "verification-checkpoints" / identifier).exists():
+                    continue  # Measured and present: no work, so it never consumes the slice.
+            work.charge(entries=1)
             if row.get("kind") != "checkpoint":
                 # An older release's verification candidate. Its tree is deleted by retention;
                 # its accounting row is never migrated.

@@ -1277,6 +1277,12 @@ print('{"result":"kept on protocol stdout"}', flush=True)
         retention.sweep(now=self.clock)
         self.assert_legacy_verification_deleted(self.state, shared)
 
+    def test_cleanup_collector_deletes_legacy_verification_state_of_live_workers(self):
+        shared = self.legacy_verification_state(self.state)
+        with patch.object(retention, "workspace_idle", return_value=False):
+            retention.sweep(now=self.clock)
+        self.assert_legacy_verification_deleted(self.state, shared)
+
     def test_round_start_requests_the_fallback_collector(self):
         with round_.RoundContext(self.cfg):
             pass
