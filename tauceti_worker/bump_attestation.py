@@ -35,9 +35,6 @@ HOLD_LABELS = {"keep", "hold", "wip", "human", "on-hold", "do-not-close", "full-
 VERIFY_TIMEOUT_S = 45 * 60
 # The push's own picker run removes a label it finds on a head without an assertion, so a label
 # applied while that run is still in flight can vanish. Wait for the assertion and relabel once.
-ASSERTION_WAIT_S = 150
-ASSERTION_POLL_S = 15
-LABEL_ATTEMPTS = 2
 
 
 def _bump_pull(live, head: str) -> str:

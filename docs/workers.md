@@ -88,14 +88,14 @@ for bumps: one branch claim serializes edits anyway, and every worker whose
 After a host round pushes a new bump head, the worker runs the full local
 verifier (`tauceti verify`, bump policy) on that exact commit with the same
 build-cache view the agent used. If it succeeds and GitHub still reports that
-commit as the PR head, the worker applies `self-tested`. The TauCeti picker
-then checks eligibility itself (the labeler's team membership, bump-only paths
-and the real `bump-guard` validation) and posts the PR-bound assertion, so
-review and queue admission need not wait for the ordinary PR build. The agent's
+commit as the PR head, the worker applies `self-tested`. Review and queue admission
+validate eligibility directly (the labeler's team membership, bump-only paths
+and the real `bump-guard` validation), without waiting for an Actions receipt or
+the ordinary PR build. The agent's
 own claims are never consulted. Bubble rounds, a dirty checkout, a moved head,
 or a failed or incomplete verification (capped at 45 minutes) leave the PR on
-ordinary CI, which the push has already started. If the push's own picker run
-removes the label, the worker applies it once more. Set
+ordinary CI, which the push has already started. The label persists through pushes and fix rounds; withdraw it if local
+verification fails or is incomplete. Set
 `TAUCETI_BUMP_SELF_TESTED=0` in a worker's `env` to turn this off.
 
 ## Rebase retry budget
