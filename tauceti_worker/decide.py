@@ -923,14 +923,17 @@ class _Lexer:
                 return self.blank(start, i + 1)
             elif c == "{" and interpolated:
                 self.blank(start, i + 1)
-                i = self.code(i + 1, closing=True)
+                i = self.code(i + 1, closing="}")
                 start = i - 1
             else:
                 braces += (c == "{") - (c == "}")
                 i += 1
 
-    def code(self, i: int = 0, *, closing: bool = False) -> int:
+    def code(self, i: int = 0, *, closing: str = "") -> int:
+        """Read code from `i`; with `closing`, up to and past the bracket that closes the group
+        open at `i`, nested ones of its kind included."""
         text, depth = self.text, 0
+        opening = {"}": "{", ")": "("}.get(closing, "")
         while i < len(text):
             c, pair = text[i], text[i : i + 2]
             before = text[i - 1] if i else ""
@@ -941,6 +944,9 @@ class _Lexer:
                 i = self.comment(i, i + 2)
             elif pair == "-/":
                 self.unopened, i = True, i + 2
+            elif pair == "`(":
+                # A syntax quotation is data: a command written inside it declares nothing.
+                i = self.blank(i, self.code(i + 2, closing=")"))
             elif c == "«":
                 end = text.find("»", i)
                 if end < 0 or "\n" in text[i:end]:
@@ -956,9 +962,9 @@ class _Lexer:
                 i = self.blank(i, end + len(close))
             elif c == "'" and not _ident(before) and (char := _CHAR.match(text, i)):
                 i = self.blank(i, char.end())
-            elif closing and c == "{":
+            elif closing and c == opening:
                 depth, i = depth + 1, i + 1
-            elif closing and c == "}":
+            elif closing and c == closing:
                 if not depth:
                     return i + 1
                 depth, i = depth - 1, i + 1

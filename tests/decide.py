@@ -1317,6 +1317,29 @@ def test_close(tmp):
             attempt(Hub(p1={"diff": base + candidate}, p41={"state": "MERGED", "diff": base + replacement}))[:2],
             want,
         )
+    real = "+theorem missingFact : True := trivial\n"
+    for layout, quotation in (
+        (
+            "on one line",
+            "+def template : Lean.MacroM (Lean.TSyntax `command) := `(command| theorem missingFact : True := trivial)\n",
+        ),
+        (
+            "across lines",
+            "+def template : Lean.MacroM (Lean.TSyntax `command) :=\n+  `(command|\n+    theorem missingFact : True := trivial)\n",
+        ),
+    ):
+        check(
+            f"a command inside a syntax quotation {layout} supplies no declaration",
+            attempt(Hub(p1={"diff": base + real}, p41={"state": "MERGED", "diff": base + quotation}))[:2],
+            (False, "#41 do not add `missingFact`"),
+        )
+    check(
+        "a quotation with an antiquotation and nested parentheses is read past",
+        decide.added_declarations(
+            "+++ b/A.lean\n@@ -0,0 +1,2 @@\n+def t := `(term| f ($(x) (g y)))\n+theorem after : True := trivial\n"
+        ),
+        {"t", "after"},
+    )
     check(
         "a name ending in ?'x' is read whole",
         lexed('"x"', name="already_covered?'x'")[:2],
