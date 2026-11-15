@@ -37,10 +37,7 @@ Bubble's mounted Tools package and standalone checkers' sibling imports. Its ins
 implementation and configuration are verification inputs. Local helpers use the Worker's installed Tools pin; checkout launchers and CI use the aligned content pin.
 Historical checkouts may retain older pins. A missing required Tools import yields
 `incomplete_reason: tool-missing`, rather than a source failure. Other checker exits retain their
-existing failure meaning. Recovery probes this prerequisite before claiming work or warming caches,
-so an unavailable Python dependency does not launch source repair. A changed verification-tool
-identity permits a fresh mechanical check of prior source failures, including records blocked only
-on continuation admission; publication scope, source ownership and model authorization still apply.
+existing failure meaning.
 
 Local environment lint uses Tools' shared `LocalLint.lean` checker, compiled once and
 shared across workers with the same toolchain and dependency content. It imports only the
@@ -140,37 +137,23 @@ Verification runs to completion inside the round's own checkout and writes its r
 publication guards read that receipt. There is no checkpoint margin, no durable verification job
 and no copy of the workspace: verification never continues past the round. If the round is killed
 (the loop's `TAUCETI_ROUND_TIMEOUT` hard safety cap, a signal or owner death), the receipt stays
-`status: incomplete` and the work is abandoned. Bubble candidate edits are saved as a base-bound
-binary patch and an untracked-file archive in `verification-checkpoints/` before checks begin.
+`status: incomplete` and the work is abandoned: rounds are all-or-nothing, so whatever the agent
+pushed survives and nothing else does.
 
 Older releases kept continuation state under worker state (`verification-candidates/`,
 `verification-pending/`, `verification-jobs/`, `verification-job-index/`,
-`verification-copy-incomplete/`, `verification-storage/` and `verification-storage-generations/`,
-including under Bubble's `verification-state/`). Each round start and the cleanup collector delete
-it through the ordinary retention removal, which never deletes through a symlink, never removes a
-mount point and leaves a tree in use by a live process for a later pass. It is never migrated.
+`verification-copy-incomplete/`, `verification-storage/`, `verification-storage-generations/`,
+`verification-checkpoints/` and `verification-checkpoint-locks/`, including under Bubble's
+`verification-state/`), and a host-local ledger of Bubble source checkpoints
+(`~/.local/state/tauceti/verification-storage/`, or `TAUCETI_VERIFY_STORAGE_DIR`). Each round start
+and the cleanup collector delete it through the ordinary retention removal, which never deletes
+through a symlink, never removes a mount point and leaves a tree in use by a live process for a
+later pass. It is never migrated.
 
 Incomplete CLI results exit nonzero with a typed incomplete reason and `result_type: incomplete`.
 Toolchain probes retain separate stdout/stderr logs. Their final version/prefix lines bind the
 inputs; changing Lake package diagnostics are retained in logs and do not invalidate successful
 checks. A prefix must name an absolute installed directory containing `bin/lean`.
-
-### Checkpoint storage
-
-The host-local ledger records Bubble source checkpoints across worker HOME overrides and runtime
-versions; bounded housekeeping measures them. Rows an older release recorded for verification
-candidates are dropped. Only actual filesystem headroom can defer or interrupt verification.
-
-| Environment variable | Default | Meaning |
-| --- | --- | --- |
-| `TAUCETI_VERIFY_MIN_FREE_BYTES` | 20 GiB | Actual minimum filesystem headroom |
-| `TAUCETI_VERIFY_MIN_FREE_PERCENT` | 10 | Percentage headroom capped at the worker critical reserve (at most 20 GiB); explicit `MIN_FREE_BYTES` remains a minimum |
-| `TAUCETI_VERIFY_STORAGE_DIR` | Host-local state directory | Shared observation root; use private state for tests |
-
-Running tools return `incomplete_reason: disk-pressure` only for actual low filesystem headroom.
-Ownership/cleanup lease contention is separately typed `verification-busy`. If ENOSPC prevents
-housekeeping, the collector may discard optional V2 stat-hash metadata under its writer lock and
-retry once.
 
 Tools run in owned process groups. Interruption terminates the group, and normal completion sweeps
 leftover background tools. Cleanup is best effort: deliberately detached descendants can escape.

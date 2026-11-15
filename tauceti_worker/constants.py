@@ -155,7 +155,6 @@ EX_DOCUMENTATION_WAIT = 79  # Progress plan/facts deployment churn, without fail
 EX_NOPROGRESS = 75  # round did NO productive work (distinct from error=1 / success=0)
 EX_ADMISSION_WAIT = 76  # Fleet capacity/API funding/queue/throughput wait, outside the round timeout
 EX_GITHUB_WAIT = 77  # GitHub quota/publication recovery pause, without failed-round backoff
-EX_RECOVERY_IDLE = 80  # Mechanical recovery found no available work; select normal work immediately
 EX_CLAIM_COLLISION = 81  # Peer owns the candidate; skip or briefly reselect, never failure backoff
 REVIEW_HEAD_CHANGED_EXIT = 82  # Review command refused a superseded selection before inference
 REVIEW_PREPARATION_WAIT_EXIT = 83  # Transport/host preparation failed before any paid review
@@ -170,13 +169,11 @@ BACKOFF_MAX = int(os.environ.get("TAUCETI_BACKOFF_MAX", "900"))  # cap on the es
 # GitHub REST rate-limit handling. We pace LLM quota carefully; GitHub's REST budget needs the same
 # care, or a 403 mid-round throws away the agent's (expensive) work. Two layers:
 #  - gh_run() waits IN PLACE for a rate limit to clear and retries (so a transient limit costs a pause,
-#    not a lost round), bounded by GH_INROUND_WAIT so it can't blow ROUND_TIMEOUT.
+#    not a lost round); only the round's hard cap bounds the wait.
 #  - cmd_loop preflights core budget BEFORE launching a round (no hard cap there) — the right place to
 #    wait out an hourly primary reset, and what keeps us from launching the review engine (whose own
 #    diff fetch would 403) without enough budget to finish.
 GH_MIN_BUDGET = int(os.environ.get("TAUCETI_GH_MIN_BUDGET", "200"))  # core requests a round needs to finish
-
-GH_INROUND_WAIT = int(os.environ.get("TAUCETI_GH_INROUND_WAIT", "900"))  # cap on gh_run's in-place wait (15 min)
 
 GH_SECONDARY_BASE = 60  # first secondary-limit sleep when no Retry-After is given (then exponential)
 

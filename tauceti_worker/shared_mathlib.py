@@ -1112,7 +1112,7 @@ def lease_lock(stream, flags, *, timeout=None):
 
 def _scratch_unused(parent):
     """Check old namespace mounts as well as ordinary process references."""
-    from .work_recovery import live_users
+    from .live_use import live_users
 
     parent = parent.resolve()
     if live_users(parent):

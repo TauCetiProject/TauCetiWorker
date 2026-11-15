@@ -4,17 +4,15 @@ With `TAUCETI_ROUND_WORKTREES=1`, a host keeps one bare clone of TauCeti (one ob
 set of refs) and every round works in a linked worktree of it at the worker's ordinary checkout
 path, `cfg.checkout`:
 
-- `prepare()` saves any leftover worktree through the recovery guard (history-aware for worktrees,
-  so a commit an agent made and then reset away is saved), fetches the host clone under the host
-  lock, and adds a fresh worktree with a detached HEAD at `origin/main`. Nothing resets a shared
-  `main`.
-- `release()` runs when the round's context exits: it saves the worktree through the cleanup save
-  path and removes it only when that save succeeded. A tree it cannot save is left for the next
-  `prepare()`, which retains it whole if the guard cannot save it either.
+- `prepare()` removes any leftover worktree, fetches the host clone under the host lock, and adds a
+  fresh worktree with a detached HEAD at `origin/main`. Nothing resets a shared `main`.
+- `release()` runs when the round's context exits and removes the worktree.
 - A crashed round's worktree is removed by the next `prepare()` on the host once no process holds
-  that worker's round lock or uses the tree, again only after a successful save.
-- An old permanent checkout is deleted on its worker's first round, after the same save; one that
-  cannot be saved is moved aside whole by the existing retention path.
+  that worker's round lock or uses the tree.
+- An old permanent checkout is deleted on its worker's first round.
+
+Rounds are all-or-nothing: whatever an agent pushed (through git-safe-push) is on the remote, and
+anything unpushed is discarded with the worktree.
 
 `.lake` (the worker's warm build state and Lake's dependency checkouts) is moved beside the worktree
 between rounds instead of being deleted with it, so rounds keep today's warm builds.
@@ -82,14 +80,6 @@ def is_clone(path: Path) -> bool:
     return (path / ".git").exists() or (path / "HEAD").is_file() and (path / "objects").is_dir()
 
 
-def recovery_source(cfg) -> Path:
-    """What recovery hard-links its private clones from: the host clone once rounds use worktrees,
-    since a worker's worktree exists only during its round."""
-    if enabled() and is_clone(host_clone()) and not (cfg.checkout / ".git").exists():
-        return host_clone()
-    return cfg.checkout
-
-
 def parked_lake(cfg) -> Path:
     """Where a worker's `.lake` waits between rounds (same filesystem, so a rename)."""
     return cfg.checkout.with_name(cfg.checkout.name + ".lake-between-rounds")
@@ -115,12 +105,12 @@ def _git(*args, check=True, timeout=600):
 
 def owns(path: Path) -> bool:
     """Whether `path` is a linked worktree of this host's clone."""
-    from .work_recovery import _common_dir, checkout_kind
+    from .live_use import checkout_kind, common_dir
 
     if checkout_kind(path) != "worktree":
         return False
     try:
-        return _common_dir(path).resolve() == host_clone().resolve()
+        return common_dir(path).resolve() == host_clone().resolve()
     except Exception:  # noqa: BLE001 - an unreadable worktree is not ours to manage
         return False
 
@@ -210,31 +200,16 @@ def _unpark(cfg, tree: Path):
         os.rename(parked, tree / ".lake")
 
 
-def _discard(path: Path):
-    from . import retention
+def _discard(path: Path, why: str = "a leftover tree") -> bool:
+    from .agents import discard_checkout
 
-    report = retention.fresh_report()
-    retention.remove(path, path.parent, report, check_users=True)
-    for error in report["errors"]:
-        log(f"worktrees: deletion deferred: {error}")
+    return discard_checkout(path, why)
 
 
 def _remove(tree: Path, common: Path | None = None):
-    """Remove a saved worktree. Branches stay: another round may already own one."""
+    """Remove a worktree and anything unpushed in it. Branches stay: another round may own one."""
     git = ["git", f"--git-dir={common or host_clone()}"]
     subprocess.run([*git, "worktree", "remove", "--force", str(tree)], check=True, capture_output=True, text=True)
-
-
-def _save(cfg, tree: Path):
-    """The cleanup save path: a durable record of anything unpublished, never a move or reset."""
-    from .work_recovery import save_for_cleanup
-
-    decision = save_for_cleanup(cfg, tree)
-    if not decision.ok:
-        log(f"worktrees: kept {tree}: {decision.reason}")
-    elif decision.record is not None:
-        log(f"worktrees: saved {tree} in {decision.record} before removing it")
-    return decision.ok
 
 
 def _round_lock(tree: Path) -> Path | None:
@@ -247,10 +222,10 @@ def _round_lock(tree: Path) -> Path | None:
 
 
 def sweep(current: Path):
-    """Remove worktrees of crashed rounds: holding their worker's round lock, after a save."""
+    """Remove worktrees of crashed rounds, holding their worker's round lock."""
     from types import SimpleNamespace
 
-    from .work_recovery import live_users
+    from .live_use import live_users
 
     _git("worktree", "prune", check=False)
     for tree in _worktrees():
@@ -258,10 +233,10 @@ def sweep(current: Path):
             continue
         lock = _round_lock(tree)
         if lock is None:
-            continue  # a retained tree or unknown layout: the retention collector's to judge
+            continue  # an unknown layout: not ours to remove
         with lock.open("a+") as stream:
             try:
-                # Held through the save and removal, so no new round can take this checkout now.
+                # Held through the removal, so no new round can take this checkout now.
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 continue  # a live round
@@ -269,37 +244,26 @@ def sweep(current: Path):
                 continue
             state = lock.parent
             owner = SimpleNamespace(wid=state.name, state=state, checkout=tree, data_home=state / "home")
-            if _save(owner, tree):
-                with contextlib.suppress(OSError):
-                    _park(owner, tree)
-                _remove(tree)
-                log(f"worktrees: removed the crashed round's worktree {tree}")
+            with contextlib.suppress(OSError):
+                _park(owner, tree)
+            _remove(tree)
+            log(f"worktrees: removed the crashed round's worktree {tree}")
 
 
 def prepare(cfg, url) -> bool:
     """Leave `cfg.checkout` a fresh worktree of the host clone, detached at `origin/main`."""
-    from . import work_recovery
+    from .live_use import checkout_kind
 
     co = cfg.checkout
-    kind = work_recovery.checkout_kind(co) if co.exists() else None
+    kind = checkout_kind(co) if co.exists() or co.is_symlink() else None
     if kind == "standalone" or (kind == "worktree" and not owns(co)):
-        # An old permanent checkout: save it, then delete it (legacy data is not migrated).
-        if work_recovery.save_for_cleanup(cfg, co).ok:
-            with contextlib.suppress(OSError):
-                _park(cfg, co)
-            _discard(co)
-            if co.exists():
-                log(f"worktrees: could not delete the old checkout {co}; retrying next round")
-                return False
-            log(f"worktrees: deleted the old permanent checkout {co} after saving it")
-        elif not work_recovery.retain(cfg, co, "an old checkout could not be saved before deletion").ok:
+        # An old permanent checkout, or a worktree of another clone: delete it (never migrated).
+        with contextlib.suppress(OSError):
+            _park(cfg, co)
+        if not _discard(co, "an old checkout replaced by per-round worktrees"):
             return False
-    elif kind == "worktree" and not _save(cfg, co):
-        # A worktree that outlived its round and cannot be archived: keep it whole, aside.
-        if not work_recovery.retain(cfg, co, "a leftover worktree could not be saved before removal").ok:
-            return False
-    elif co.exists():
-        if not work_recovery.retain(cfg, co, "the checkout has no git metadata").ok:
+    elif kind is None and (co.exists() or co.is_symlink()):
+        if not _discard(co, "the checkout has no git metadata"):
             return False
     try:
         with host_lock():
@@ -324,7 +288,7 @@ def prepare(cfg, url) -> bool:
 
 
 def release(cfg) -> None:
-    """At round end: save each worktree this round prepared, then remove it. Never raises."""
+    """At round end: remove each worktree this round prepared. Never raises."""
     state = Path(getattr(cfg, "state", "/nonexistent")).resolve()
 
     def own(other):
@@ -342,30 +306,26 @@ def release(cfg) -> None:
         try:
             if not enabled() or not co.exists() or not owns(co):
                 continue
-            if not _save(current, co):
-                continue
             _park(current, co)
             with host_lock():
                 _remove(co)
         except Exception as error:  # noqa: BLE001 - round cleanup must not fail the round
-            log(f"worktrees: release deferred ({type(error).__name__}: {error}); the next round saves it")
+            log(f"worktrees: release deferred ({type(error).__name__}: {error}); the next round removes it")
 
 
 def retire(cfg) -> bool:
-    """With the flag turned off again: save and remove this worker's worktree, keeping `.lake`.
+    """With the flag turned off again: remove this worker's worktree, keeping `.lake`.
 
     Any linked worktree counts, whatever host root it came from: its own common directory is the
-    evidence. One that cannot be saved is moved aside whole, and the transition continues.
+    evidence.
     """
-    from .work_recovery import _common_dir, checkout_kind, retain
+    from .live_use import checkout_kind, common_dir
 
     co = cfg.checkout
     try:
         if not co.exists() or checkout_kind(co) != "worktree":
             return True
-        common = _common_dir(co)
-        if not _save(cfg, co):
-            return retain(cfg, co, "a worktree could not be saved when worktree rounds were turned off").ok
+        common = common_dir(co)
         _park(cfg, co)
         with host_lock():
             _remove(co, common)

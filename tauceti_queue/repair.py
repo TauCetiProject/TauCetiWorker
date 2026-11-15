@@ -2169,7 +2169,7 @@ def agent_environment(
     None because the prompt is in argv."""
     os.environ["TAUCETI_ROUND_DEADLINE"] = str(time.time() + deadline_seconds)
     from tauceti_worker.agents import host_agent_launch
-    from tauceti_worker.repair_recovery import environment
+    from tauceti_worker.config import environment
 
     with environment(**isolation_env(root, env_lake)):
         argv, env, stdin_text = host_agent_launch(prompt, claude_profile())

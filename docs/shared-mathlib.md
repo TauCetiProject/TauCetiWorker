@@ -92,7 +92,7 @@ Agents never fetch or resolve Mathlib: the agent-facing `lake` wrapper refuses
 the checkout's Mathlib pin differs from the view's. Rebase and repair rounds whose pin is
 refused prepare main's Mathlib before the agent starts, so integrating main brings the pins
 back into agreement. Verification snapshots keep the package links and copy no Mathlib
-bytes; verification continuations enter their own view.
+bytes.
 
 ## Reclaiming
 
