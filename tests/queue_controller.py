@@ -60,6 +60,33 @@ class ControllerCase(unittest.TestCase):
         return self.controller.store.row("batches", {"state": "head"})
 
 
+class RepairCheckOwnership(ControllerCase):
+    def claimed_repair(self, diagnostic):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller._head()
+        self.controller._create_task(head, "repair", head["base"], [diagnostic], self.clock())
+        return self.controller.claim_task("worker", "admin-worker")
+
+    def test_a_diagnosed_audit_repair_runs_checks_before_resubmission(self):
+        task = self.claimed_repair({"kind": "audit", "module": "TauCeti.A", "message": "import collision"})
+        self.assertEqual(task.extra["checks_owner"], "worker")
+        self.controller.renew_task(task.task_id, task.claim_token)
+        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "worker")
+
+    def test_a_diagnosed_lint_repair_runs_checks_before_resubmission(self):
+        task = self.claimed_repair({"kind": "lint", "module": "TauCeti.A", "message": "unused hypothesis"})
+        self.assertEqual(task.extra["checks_owner"], "worker")
+
+    def test_compiler_only_repairs_still_defer_full_checks_to_staging(self):
+        task = self.claimed_repair({"kind": "compiler", "module": "TauCeti.A", "message": "type mismatch"})
+        self.assertEqual(task.extra["checks_owner"], "staging")
+
+    def test_admission_predictions_do_not_require_a_second_full_check(self):
+        task = self.claimed_repair({"kind": "admission_predictions", "proactive": True, "records": []})
+        self.assertEqual(task.extra["checks_owner"], "staging")
+
+
 class DeclarationNames(ControllerCase):
     def test_declaration_fetch_is_background_head_bound_retry_bounded_and_in_task(self):
         from tauceti_queue import declaration_names as dn
@@ -1133,6 +1160,34 @@ class SupersededRuns(ControllerCase):
         self.assertEqual(self.controller.store.journal_entries("ci-cancelled"), [])
         self.assertIsNone(self.attempts()[0]["cancelled_at"])
         self.assertEqual(self.controller.status()["head"]["cancelled_runs"], [])
+
+    def test_rebase_conflict_cancels_obsolete_ci_before_a_replacement_can_dispatch(self):
+        self.github.start_runs()
+        self.observe()
+        self.repo.advance_main({"A.lean": "conflicting main version\n"})
+        self.observe()
+        task = self.controller.store.row("tasks", {"batch_id": self.head["id"], "state": "open"})
+        self.assertEqual(task["kind"], "rebase_conflict")
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(self.github.runs[0].conclusion, "cancelled")
+        self.assertEqual(self.attempts()[0]["outcome"], "superseded")
+        self.assertEqual(self.attempts()[0]["cancel_reason"], "canonical advanced; rebase incomplete")
+        self.observe()
+        self.assertEqual(len(self.cancel_calls()), 1)
+
+    def test_canonical_advance_cancels_ci_but_preserves_the_active_repair_claim(self):
+        self.github.start_runs()
+        self.observe()
+        self.controller._create_task(self.head, "repair", self.head["base"], [], self.clock())
+        task = self.controller.claim_task("worker", "admin-worker")
+        self.assertIsNotNone(task)
+        self.repo.advance_main({"Z.lean": "z\n"})
+        self.observe()
+        self.assertEqual(self.github.runs[0].conclusion, "cancelled")
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["state"], "open")
+        self.assertEqual(self.controller._active_claims(self.head["id"])[0]["task_id"], task.task_id)
+        self.assertEqual(self.attempts()[0]["cancel_reason"], "canonical advanced; rebase waits for worker")
 
     def test_a_failed_cancel_never_blocks_the_dispatch_and_is_retried_once(self):
         self.github.fail_next["cancel_run"] = 5
@@ -2786,6 +2841,26 @@ class TickBudget(ControllerCase):
 
 
 class OutboxBatching(ControllerCase):
+    def test_control_operations_run_ahead_of_landing_notifications_within_the_drain_budget(self):
+        self.controller.set_setting("outbox_drain_budget_seconds", 0, "t")
+        self.controller._enqueue("comment", "old-comment", {})
+        self.controller._enqueue("labels", "old-labels", {})
+        control = ["mixed-sync", "cancel_run", "retry_status_delivery", "promote"]
+        for kind in control:
+            self.controller._enqueue(kind, kind, {})
+        performed = []
+
+        def perform(kind, payload, now):
+            performed.append(kind)
+            return "done"
+
+        self.controller._perform = perform
+        for length in range(1, 7):
+            self.controller._drain_outbox(self.clock())
+            self.assertEqual(len(performed), length, "the one-operation drain budget is preserved")
+        self.assertEqual(performed, [*control, "comment", "labels"])
+        self.assertEqual(self.controller.store.count("outbox", {"state": "pending"}), 0)
+
     def retains(self, state):
         return self.controller.store.rows("outbox", {"kind": "retain_ref", "state": state}, order="id")
 

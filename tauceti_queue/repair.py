@@ -1009,6 +1009,11 @@ MEMBER_STATES = ("replayed", "conflicting", "pending")
 
 HARD_RULES = (
     "The aim is that every constituent PR's mathematics lands as its author intended, compiled and checked. "
+    "A duplicate name or similar API does not make a contribution redundant when its universes, hypotheses, "
+    "or conclusions are more general. Preserve that generality by reusing or extending the existing API; "
+    "editing the existing mathematics is within repair scope, even when another PR owns its file. "
+    "Do not discard a different-universe construction merely because main has a same-universe version. "
+    "Only describe a contribution as redundant when all of its mathematical content is already covered. "
     "Hard rules: no `sorry`, no `native_decide`, no new axioms, no `set_option` (banned throughout Tau Ceti), "
     "no silenced linters."
 )
@@ -2021,8 +2026,8 @@ def prepare_errors_lines(record: dict | None) -> list[str]:
     return lines
 
 
-def explanation_prompt(unexplained: list[str], chain: list[ChainCommit]) -> str:
-    """The short follow-up turn when content changed without an appended explanation."""
+def explanation_prompt(unexplained: list[str], chain: list[ChainCommit], *, base: str | None = None) -> str:
+    """Ask for missing explanations using the current result's commits and target base."""
     by_pr = {c.pr: c for c in chain if c.pr is not None}
     lines = [
         "The chain at HEAD changes the content of these constituent commits without appending an explanation to "
@@ -2038,7 +2043,8 @@ def explanation_prompt(unexplained: list[str], chain: list[ChainCommit]) -> str:
         "Append a very concise explanation of what changed and why to each of these messages, preserving the existing "
         "message text as a prefix and keeping the `Source-PR:` and `Accepted-Head:` trailers. Change nothing else: no "
         "content edits, no reordering, no new commits. Leave HEAD (detached) at the reworded chain tip, still a linear "
-        f"chain on `{(chain[0].parent[:12] if chain else '?')}`, with a clean working tree, then stop.",
+        f"chain on `{(base[:12] if base else chain[0].parent[:12] if chain else '?')}`, "
+        "with a clean working tree, then stop.",
     ]
     return "\n".join(lines)
 
@@ -2169,7 +2175,7 @@ def agent_environment(
     None because the prompt is in argv."""
     os.environ["TAUCETI_ROUND_DEADLINE"] = str(time.time() + deadline_seconds)
     from tauceti_worker.agents import host_agent_launch
-    from tauceti_worker.repair_recovery import environment
+    from tauceti_worker.config import environment
 
     with environment(**isolation_env(root, env_lake)):
         argv, env, stdin_text = host_agent_launch(prompt, claude_profile())
