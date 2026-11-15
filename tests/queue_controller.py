@@ -1134,6 +1134,34 @@ class SupersededRuns(ControllerCase):
         self.assertIsNone(self.attempts()[0]["cancelled_at"])
         self.assertEqual(self.controller.status()["head"]["cancelled_runs"], [])
 
+    def test_rebase_conflict_cancels_obsolete_ci_before_a_replacement_can_dispatch(self):
+        self.github.start_runs()
+        self.observe()
+        self.repo.advance_main({"A.lean": "conflicting main version\n"})
+        self.observe()
+        task = self.controller.store.row("tasks", {"batch_id": self.head["id"], "state": "open"})
+        self.assertEqual(task["kind"], "rebase_conflict")
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(self.github.runs[0].conclusion, "cancelled")
+        self.assertEqual(self.attempts()[0]["outcome"], "superseded")
+        self.assertEqual(self.attempts()[0]["cancel_reason"], "canonical advanced; rebase incomplete")
+        self.observe()
+        self.assertEqual(len(self.cancel_calls()), 1)
+
+    def test_canonical_advance_cancels_ci_but_preserves_the_active_repair_claim(self):
+        self.github.start_runs()
+        self.observe()
+        self.controller._create_task(self.head, "repair", self.head["base"], [], self.clock())
+        task = self.controller.claim_task("worker", "admin-worker")
+        self.assertIsNotNone(task)
+        self.repo.advance_main({"Z.lean": "z\n"})
+        self.observe()
+        self.assertEqual(self.github.runs[0].conclusion, "cancelled")
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["state"], "open")
+        self.assertEqual(self.controller._active_claims(self.head["id"])[0]["task_id"], task.task_id)
+        self.assertEqual(self.attempts()[0]["cancel_reason"], "canonical advanced; rebase waits for worker")
+
     def test_a_failed_cancel_never_blocks_the_dispatch_and_is_retried_once(self):
         self.github.fail_next["cancel_run"] = 5
         first, second = self.replay()
