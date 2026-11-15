@@ -718,7 +718,8 @@ def discard_checkout(path: Path, why: str) -> bool:
 
     report = retention.fresh_report()
     try:
-        retention.remove(path, path.parent, report, check_users=True)
+        # Anchored one level up, so a symlinked parent directory is refused like any other link.
+        retention.remove(path, path.parent.parent, report, check_users=True)
     except OSError as error:
         retention.note(report, "errors", f"{path}: {error}")
     for error in report["errors"]:
@@ -2329,9 +2330,7 @@ def bubble_work_cmd(inner: str, *, verify_helper=False) -> str:
     library from source, every round, for as long as the endpoint stayed down.
     """
     preliminary = (
-        '"$TAUCETI_VERIFY_PYTHON" "/opt/round/tauceti-verify" --stage build'
-        if verify_helper
-        else "lake build"
+        '"$TAUCETI_VERIFY_PYTHON" "/opt/round/tauceti-verify" --stage build' if verify_helper else "lake build"
     )
     if not TAUCETI_CACHE_SERVICE:
         return f"set -e; lake exe cache get || lake exe cache get; {preliminary} || true; exec {inner}"

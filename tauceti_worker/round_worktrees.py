@@ -206,8 +206,28 @@ def _discard(path: Path, why: str = "a leftover tree") -> bool:
     return discard_checkout(path, why)
 
 
+class InUse(OSError):
+    """A process still uses the worktree, or a mount lies inside it: it is not removed."""
+
+
+def _check_unused(tree: Path) -> None:
+    """Raise ``InUse`` while a live process uses ``tree`` or a mount lies inside it."""
+    from .live_use import live_users
+    from .paths import canonical_candidate
+    from .retention import mount_points
+
+    users = live_users(tree)
+    mounts = mount_points()
+    target = canonical_candidate(tree)
+    if users or mounts is None or any(point == target or point.is_relative_to(target) for point in mounts):
+        raise InUse(f"{tree} is in use ({', '.join(users) or 'a mount inside it, or mounts unobservable'})")
+
+
 def _remove(tree: Path, common: Path | None = None):
-    """Remove a worktree and anything unpushed in it. Branches stay: another round may own one."""
+    """Remove a worktree and anything unpushed in it. Branches stay: another round may own one.
+
+    Never while a live process uses the tree or a mount lies inside it (``InUse``)."""
+    _check_unused(tree)
     git = ["git", f"--git-dir={common or host_clone()}"]
     subprocess.run([*git, "worktree", "remove", "--force", str(tree)], check=True, capture_output=True, text=True)
 
@@ -244,9 +264,14 @@ def sweep(current: Path):
                 continue
             state = lock.parent
             owner = SimpleNamespace(wid=state.name, state=state, checkout=tree, data_home=state / "home")
-            with contextlib.suppress(OSError):
-                _park(owner, tree)
-            _remove(tree)
+            try:
+                _check_unused(tree)
+                with contextlib.suppress(OSError):
+                    _park(owner, tree)
+                _remove(tree)
+            except InUse as error:
+                log(f"worktrees: kept the crashed round's worktree for now: {error}")
+                continue
             log(f"worktrees: removed the crashed round's worktree {tree}")
 
 
@@ -257,7 +282,14 @@ def prepare(cfg, url) -> bool:
     co = cfg.checkout
     kind = checkout_kind(co) if co.exists() or co.is_symlink() else None
     if kind == "standalone" or (kind == "worktree" and not owns(co)):
-        # An old permanent checkout, or a worktree of another clone: delete it (never migrated).
+        # An old permanent checkout, or a worktree of another clone: delete it (never migrated),
+        # unless other linked worktrees still use its Git store.
+        from .live_use import dependent_worktrees
+
+        dependents = dependent_worktrees(co)
+        if dependents:
+            log(f"worktrees: kept the old checkout {co}: linked worktrees use it ({', '.join(dependents)})")
+            return False
         with contextlib.suppress(OSError):
             _park(cfg, co)
         if not _discard(co, "an old checkout replaced by per-round worktrees"):
@@ -271,6 +303,7 @@ def prepare(cfg, url) -> bool:
             harden(url)
             _fetch()
             if co.exists() and owns(co):
+                _check_unused(co)
                 with contextlib.suppress(OSError):
                     _park(cfg, co)
                 _remove(co)
@@ -306,6 +339,7 @@ def release(cfg) -> None:
         try:
             if not enabled() or not co.exists() or not owns(co):
                 continue
+            _check_unused(co)
             _park(current, co)
             with host_lock():
                 _remove(co)
@@ -326,6 +360,7 @@ def retire(cfg) -> bool:
         if not co.exists() or checkout_kind(co) != "worktree":
             return True
         common = common_dir(co)
+        _check_unused(co)
         _park(cfg, co)
         with host_lock():
             _remove(co, common)

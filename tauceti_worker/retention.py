@@ -296,9 +296,15 @@ def _evict_tree(cfg, tree, anchor, report, *, dry=False, discard=False):
         note(report, "protected", str(tree))
         return
     if discard:
-        # Rounds are all-or-nothing: an idle checkout holds nothing that was not pushed.
-        remove(tree, anchor, report, dry=dry)
-        return
+        # Rounds are all-or-nothing: an idle checkout holds nothing that was not pushed. A clone
+        # that other linked worktrees still use keeps its Git store; its caches are still evicted.
+        from .live_use import dependent_worktrees
+
+        dependents = dependent_worktrees(tree)
+        if not dependents:
+            remove(tree, anchor, report, dry=dry)
+            return
+        note(report, "protected", f"{tree}: used by linked worktrees {', '.join(dependents)}")
     for base, dirs, _ in os.walk(tree, followlinks=False, onerror=lambda error: note(report, "errors", str(error))):
         dirs[:] = [name for name in dirs if name != ".git" and not (Path(base) / name).is_symlink()]
         caches = [name for name in dirs if name in CACHE_DIRS or (Path(base) == tree and name in CACHE_TOP)]
@@ -551,7 +557,8 @@ def _purge(parent, root, names, report, *, dry=False):
 def purge_legacy(state, report, *, dry=False, checkout=None):
     """Delete legacy continuation and recovery state of the worker whose state is ``state``.
 
-    That is everything in ``LEGACY`` under ``state`` and its Bubble ``verification-state``, the
+    That is everything in ``LEGACY`` under ``state``, its Bubble ``verification-state`` and its
+    native forge sources (``sources/<id>/``), the
     retained checkouts beside the progress roadmap clone, and, given the worker's ``checkout``, the
     retained checkouts beside it. Every path goes through ``remove``: no deletion through a symlink,
     of a mount point or of a tree a live process still uses (such a tree is reported protected and
@@ -560,7 +567,13 @@ def purge_legacy(state, report, *, dry=False, checkout=None):
     shared Mathlib and immutable installations by symlink, which deletion never follows; hard links
     into a workspace lose only the candidate's own name.
     """
-    for member in (state, state / "verification-state"):
+    members = [state, state / "verification-state"]
+    # A native forge source keeps the same layout under state/sources/<id>/.
+    sources = state / "sources"
+    with contextlib.suppress(OSError):
+        if safe(sources, state) and sources.is_dir():
+            members += [path for path in sorted(sources.iterdir()) if path.is_dir() and not path.is_symlink()]
+    for member in members:
         if member != state and not safe(member, state):
             continue
         if not member.is_dir() or member.is_symlink():
@@ -572,8 +585,8 @@ def purge_legacy(state, report, *, dry=False, checkout=None):
     if checkout is not None:
         parent = Path(checkout).parent
         with contextlib.suppress(OSError):
-            if parent != state and parent.is_dir() and not parent.is_symlink():
-                _purge(parent, parent, ("retained-checkouts",), report, dry=dry)
+            if parent != state and parent.is_dir() and safe(parent, parent.parent):
+                _purge(parent, parent.parent, ("retained-checkouts",), report, dry=dry)
     return report
 
 

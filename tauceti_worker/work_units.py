@@ -2671,7 +2671,8 @@ def _do_progress_inner(w, opts) -> int | None:
         from .agents import discard_checkout
 
         if roadmap_dir.exists() and not (roadmap_dir / ".git").is_dir():
-            discard_checkout(roadmap_dir, "the roadmap clone has no git metadata")
+            if not discard_checkout(roadmap_dir, "the roadmap clone has no git metadata"):
+                raise Die(f"refreshing {roadmap_dir} failed: it could not be replaced")
         if (roadmap_dir / ".git").is_dir():
             # An interrupted `apply` left only unpushed leftovers: rounds are all-or-nothing.
             if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
@@ -2680,7 +2681,8 @@ def _do_progress_inner(w, opts) -> int | None:
                 ["git", "-C", str(roadmap_dir), "checkout", "-q", "-f", "-B", "main", "origin/main"]
             ).returncode:
                 # A local failure (a stale lock): delete the clone and clone afresh below.
-                discard_checkout(roadmap_dir, "forced checkout of the roadmap clone failed")
+                if not discard_checkout(roadmap_dir, "forced checkout of the roadmap clone failed"):
+                    raise Die(f"refreshing {roadmap_dir} failed: it could not be replaced")
             else:
                 subprocess.run(["git", "-C", str(roadmap_dir), "clean", "-fdxq"])
         if not (roadmap_dir / ".git").is_dir():

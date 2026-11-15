@@ -1062,6 +1062,8 @@ print('{"result":"kept on protocol stdout"}', flush=True)
             self.state / "recovery-cleanup" / "discarded" / "abandoned-x" / "Main.lean",
             self.state / "checkout-owners" / "TauCeti.json",
             self.state / "provider-conversations" / "round-1.json",
+            self.state / "sources" / "abc" / "recovery" / "round-2" / "manifest.json",
+            self.state / "sources" / "abc" / "retained-checkouts" / "TauCeti-2" / "Main.lean",
             self.state / "progress" / "retained-checkouts" / "roadmap-1" / "README.md",
             self.checkout.parent / "retained-checkouts" / "TauCeti-1" / "Main.lean",
         ):
@@ -1075,6 +1077,8 @@ print('{"result":"kept on protocol stdout"}', flush=True)
             self.assertFalse((self.state / name).exists(), name)
         self.assertFalse((self.state / "progress" / "retained-checkouts").exists())
         self.assertFalse((self.checkout.parent / "retained-checkouts").exists())
+        self.assertFalse((self.state / "sources" / "abc" / "recovery").exists())
+        self.assertFalse((self.state / "sources" / "abc" / "retained-checkouts").exists())
         self.assertEqual((self.checkout / "Source.lean").read_text(), "original\n")
 
     def test_round_start_deletes_legacy_recovery_state(self):

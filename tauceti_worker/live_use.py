@@ -48,6 +48,25 @@ def common_dir(repo: Path) -> Path:
     return path if path.is_absolute() else (repo / path).resolve()
 
 
+def dependent_worktrees(repo: Path) -> list[str]:
+    """Existing linked worktrees, other than ``repo`` itself, that use ``repo``'s Git store.
+
+    Deleting a standalone clone would break them even when no process uses them now."""
+    if checkout_kind(repo) != "standalone":
+        return []
+    listing = _git(repo, "worktree", "list", "--porcelain")
+    if listing is None:
+        return ["worktree list unavailable"]
+    here = repo.resolve()
+    found = []
+    for line in listing.splitlines():
+        if line.startswith("worktree "):
+            path = Path(line[len("worktree ") :])
+            if path.resolve() != here and path.exists():
+                found.append(str(path))
+    return found
+
+
 def checkout_kind(repo: Path) -> str | None:
     """ "standalone" for an ordinary clone, "worktree" for a linked worktree, None otherwise.
 

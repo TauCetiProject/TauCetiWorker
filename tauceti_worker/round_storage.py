@@ -539,7 +539,7 @@ class RoundStorage:
             return "no worker checkout to delete; the caller's worktree is left to its owner"
         report = retention.fresh_report()
         try:
-            retention.remove(cwd, cwd.parent, report)
+            retention.remove(cwd, cwd.parent.parent, report)
         except OSError as error:
             retention.note(report, "errors", f"{cwd}: {error}")
         if not cwd.exists():
