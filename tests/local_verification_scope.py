@@ -319,6 +319,13 @@ def main():
                 and "--add-label self-tested" in text
                 and "failed, incomplete, or outdated" in text,
             )
+            check(
+                f"self-tested helper={helper}: author-only comment fallback for missing label permissions",
+                "lack of label permissions" in text
+                and "you are the PR author" in text
+                and "gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested" in text
+                and "do not post duplicate requests" in text,
+            )
             for policy in ("bump", "full-lint", "lint-repair"):
                 check(
                     f"self-tested helper={helper}: excludes {policy}",
