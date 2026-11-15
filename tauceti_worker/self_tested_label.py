@@ -27,7 +27,7 @@ from pathlib import Path
 
 from .bump_attestation import LABEL, confirm_label
 from .verification import SCHEMA, STAGES, digest
-from .verification_scope import git
+from .verification_scope import git, local_main
 
 STAGES_PUSHING = {"fix", "fix-ci", "rebase", "roadmap", "lint-repair"}
 CANONICAL_URL = "https://github.com/taucetiproject/tauceti"
@@ -50,6 +50,8 @@ def _labels(live) -> set[str]:
 
 def _live_reason(live, head: str) -> str:
     """Why the live PR is not an ordinary open PR at `head`, or "" when it is."""
+    from tauceti_tools.self_tested import EXCLUDED_LABELS
+
     from .agents import scope_policy
 
     if not live:
@@ -61,7 +63,10 @@ def _live_reason(live, head: str) -> str:
         (live.get("base", {}).get("ref") == "main", "base is not main"),
         (live.get("head", {}).get("sha") == head, "PR head moved since the push"),
         (not ref.startswith("bump-mathlib/"), "automatic bump branch"),
-        (scope_policy(sorted(_labels(live)), ref) == "ordinary", "full-lint or lint-repair request"),
+        (
+            scope_policy(sorted(_labels(live)), ref) == "ordinary" and not _labels(live) & EXCLUDED_LABELS,
+            "full-lint or lint-repair request",
+        ),
     )
     return next((why for ok, why in checks if not ok), "")
 
@@ -104,7 +109,8 @@ def commit_sources(checkout: Path, commit: str, base: str) -> dict:
 
     Mirrors `verification.inventory`: every path of the commit and of the base, with each
     file's bytes; a base path the commit removes is missing. File modes are compared only by
-    their executable bit, which is all git records."""
+    their executable bit, which is all git records. The verifier records a symlink with the
+    bytes it followed, which a tree cannot reproduce, so a symlink never matches."""
     tree, base_names = _tree(checkout, commit), set(_tree(checkout, base))
     contents = _blobs(checkout, (oid for _, oid in tree.values() if oid))
     out = {}
@@ -113,9 +119,7 @@ def commit_sources(checkout: Path, commit: str, base: str) -> dict:
             out[name] = {"kind": "missing"}
             continue
         mode, oid = tree[name]
-        if mode == "120000":
-            out[name] = {"kind": "symlink", "target": contents[oid].decode(errors="surrogateescape")}
-        elif mode in ("100644", "100755"):
+        if mode in ("100644", "100755"):
             sha = hashlib.sha256(contents[oid]).hexdigest()
             out[name] = {"kind": "file", "sha256": sha, "executable": mode == "100755"}
         else:
@@ -130,8 +134,6 @@ def _comparable(record) -> dict:
     if kind == "file":
         mode = record.get("mode")
         return {"kind": "file", "sha256": record.get("sha256"), "executable": bool(int(mode or 0) & 0o100)}
-    if kind == "symlink":
-        return {"kind": "symlink", "target": record.get("target")}
     if kind == "missing":
         return {"kind": "missing"}
     return {"kind": f"unsupported {kind}"}
@@ -215,12 +217,16 @@ def label_push(w, stage: str, pr: int, commit: str, since: float, *, sleep=time.
     if receipt is None:
         return f"no matching receipt ({base})"
     try:
-        changed = _changed_paths(checkout, base, commit)
-    except (OSError, subprocess.CalledProcessError) as error:
+        # Judge the change against canonical main, never the base the receipt chose to verify.
+        changed = _changed_paths(checkout, local_main(checkout), commit)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
         return f"not eligible (changed paths unreadable: {error})"
     if not allowed_paths(changed):
         outside = next((p for p in changed if not p.startswith("TauCeti/")), "no changed paths")
         return f"not eligible (changes outside TauCeti/: {outside})"
+    # Receipt discovery takes a while; never label a head that moved meanwhile.
+    if why := _live_reason(w.gh.live_pull(pr), commit):
+        return f"not eligible ({why})"
     outcome = confirm_label(w, pr, commit, lambda now: _live_reason(now, commit), sleep=sleep, clock=clock)
     if outcome == "accepted":
         return f"labelled {commit[:12]}: picker accepted self-tested"

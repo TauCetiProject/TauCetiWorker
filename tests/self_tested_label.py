@@ -29,8 +29,10 @@ def git(root, *args):
     return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
-def checkout(tmp, *, infra=False):
-    """origin/main is the base; HEAD edits one module, deletes another and adds an executable."""
+def checkout(tmp, *, infra=False, middle=False, symlink=False):
+    """origin/main is the base; HEAD edits one module, deletes another and adds an executable.
+
+    `middle` puts an infrastructure commit between main and the change; `symlink` adds one."""
     root = Path(tmp) / "code"
     (root / "TauCeti").mkdir(parents=True)
     git(root, "init", "-q", "-b", "work")
@@ -42,13 +44,19 @@ def checkout(tmp, *, infra=False):
     git(root, "add", ".")
     git(root, "commit", "-q", "-m", "base")
     base = git(root, "rev-parse", "HEAD")
+    git(root, "remote", "add", "origin", "https://github.com/TauCetiProject/TauCeti.git")
     git(root, "update-ref", "refs/remotes/origin/main", base)
+    if middle:
+        (root / "lakefile.toml").write_text("name = 'm'\n")
+        git(root, "commit", "-q", "-am", "infrastructure")
     (root / "TauCeti/A.lean").write_text("a2\n")
     git(root, "rm", "-q", "TauCeti/B.lean")
     (root / "TauCeti/run.sh").write_text("#!/bin/sh\n")
     (root / "TauCeti/run.sh").chmod(0o755)
     if infra:
         (root / "lakefile.toml").write_text("name = 'u'\n")
+    if symlink:
+        (root / "TauCeti/Link.lean").symlink_to("A.lean")
     git(root, "add", ".")
     git(root, "commit", "-q", "-m", "change")
     return root, base, git(root, "rev-parse", "HEAD")
@@ -118,9 +126,9 @@ class FakeGitHub:
         return self.heads.get(f"{owner}:{branch}")
 
 
-def run(tmp, pulls, statuses, *, stage="fix", receipt=None, infra=False, since=None, env="1"):
+def run(tmp, pulls, statuses, *, stage="fix", receipt=None, since=None, env="1", **shape):
     """One fix round on PR 9 that pushed HEAD; `receipt(state, root, base, head)` writes the evidence."""
-    root, base, head = checkout(tmp, infra=infra)
+    root, base, head = checkout(tmp, **shape)
     state = Path(tmp) / "state"
     state.mkdir()
     started = time.time() - 5 if since is None else since
@@ -238,10 +246,35 @@ CASES = [
     (
         "head moving while waiting stops",
         {"receipt": verified},
-        lambda h: [pull(h), pull("d" * 40)],
+        lambda h: [pull(h), pull(h), pull("d" * 40)],
         [],
         "labelled",
         1,
+    ),
+    (
+        "head moving during receipt discovery adds no label",
+        {"receipt": verified},
+        lambda h: [pull(h), pull("d" * 40)],
+        [],
+        "not eligible (PR head moved",
+        0,
+    ),
+    (
+        "receipt verified against a base past an infrastructure commit",
+        {"receipt": lambda s, r, b, h: write_receipt(s, r, git(r, "rev-parse", "HEAD~1")), "middle": True},
+        lambda h: [pull(h)],
+        [],
+        "not eligible (changes outside TauCeti/: lakefile.toml)",
+        0,
+    ),
+    ("symlink in the sources", {"receipt": verified, "symlink": True}, lambda h: [pull(h)], [], "no matching", 0),
+    (
+        "lint-repair label",
+        {"receipt": verified},
+        lambda h: [pull(h, labels=("lint-repair",))],
+        [],
+        "not eligible (full-lint or lint-repair",
+        0,
     ),
     (
         "full-lint label",
@@ -264,7 +297,7 @@ CASES = [
     (
         "removed label is applied again",
         {"receipt": verified},
-        lambda h: [pull(h), pull(h), pull(h, labels=LABELLED)],
+        lambda h: [pull(h), pull(h), pull(h), pull(h, labels=LABELLED)],
         ["", "", "success"],
         "labelled",
         2,
