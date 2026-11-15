@@ -555,6 +555,30 @@ class Publish(Tmp):
         )
         self.assertEqual(git(first.parent, "status", "--porcelain"), "")
 
+    def test_a_verdict_a_larger_upstream_commit_contains_leaves_a_surviving_local_commit_alone(self):
+        first, second = self.clone("first"), self.clone("second")
+        listed = t.parse_targets(EXAMPLE)
+        item = listed.find("kolmogorov-zero-one")
+        ticked = t.rewrite_item(EXAMPLE, item, "done", add=("landed elsewhere: A.lean a_b",))
+        milestone = "- [ ] `second-moment-route` — nothing under this heading is a target\n"
+        first.write_text(EXAMPLE.replace(milestone, milestone + "- [ ] `later` — an operator's note\n"))
+        git(first.parent, "commit", "-q", "-m", "Operator adds milestone", "targets.md")
+        base = first.read_text()
+        ours = t.rewrite_item(base, item, "done", add=("landed elsewhere: A.lean a_b",))
+        second.write_text(ticked.replace("i.i.d. integrable", "i.i.d. measurable"))
+        git(second.parent, "commit", "-q", "-m", "verdict and goal", "targets.md")
+        hook = first.parent / ".git" / "hooks" / "post-commit"
+        hook.write_text(f"#!/bin/sh\ngit -C {second.parent} push -q origin HEAD:main\n")
+        hook.chmod(0o755)
+        self.assertIsNone(curate.publish(first, base, ours, ["n"], still=curate._unchanged(first, listed, [item])))
+        hook.unlink()
+        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
+        self.assertEqual(git(first.parent, "log", "-1", "--format=%s"), "Operator adds milestone")
+        self.assertEqual(git(first.parent, "rev-parse", "HEAD~1"), git(self.tmp / "remote.git", "rev-parse", "main"))
+        text = first.read_text()
+        self.assertEqual(t.parse_targets(text).find("kolmogorov-zero-one").status, "done")
+        self.assertIn("`later`", text)
+
     def test_a_verdict_another_host_already_published_leaves_the_rebased_clone_alone(self):
         first, second = self.clone("first"), self.clone("second")
         listed = t.parse_targets(EXAMPLE)

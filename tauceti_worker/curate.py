@@ -422,10 +422,11 @@ def _upstream(path: Path) -> tuple[str, str] | None:
     return (found[0], found[1]) if len(found) == 2 and found[0] != "." else None
 
 
-def _sync(path: Path) -> None:
+def _sync(path: Path, *, keep: bool = False) -> None:
     """Fetch the branch the list's branch tracks and rebase local commits onto it. A clone with
     uncommitted changes to tracked files is left where it is; so is one whose rebase stops on a
-    conflict, after aborting it."""
+    conflict, after aborting it. With `keep`, every local commit is replayed, an emptied one
+    included, so the tip commit stays the tip."""
     upstream = _upstream(path)
     if upstream is None:
         return
@@ -434,16 +435,24 @@ def _sync(path: Path) -> None:
         log(f"curate: fetch from {upstream[0]} failed ({one_line(fetched.stderr)}); working from the local list")
     elif _git(path, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         log(f"curate: {path.parent} has uncommitted changes; not rebasing it onto {upstream[0]}")
-    elif _git(path, "rebase", "-q", "@{upstream}").returncode != 0:
+    elif (
+        _git(
+            path, "rebase", "-q", *(("--reapply-cherry-picks", "--empty=keep") if keep else ()), "@{upstream}"
+        ).returncode
+        != 0
+    ):
         _git(path, "rebase", "--abort")
         log(f"curate: local commits in {path.parent} conflict with {upstream[0]}; rebase there by hand")
 
 
-def _push(path: Path, still=None) -> bool:
+def _push(path: Path, still=None) -> bool | None:
     """Push the list's branch to the branch it tracks when it is ahead, once more after a sync if
     the remote has moved; whether nothing is left unpushed. A commit that cannot be pushed stays
-    local and goes with a later call. With `still`, a sync after which `still(the file)` fails
-    stops the push."""
+    local and goes with a later call.
+
+    With `still`, HEAD is this look's own commit: the sync keeps it at the tip, a copy the rebase
+    emptied (the remote already has its edit) is dropped and None returned, and one after which
+    `still(the file)` fails is not pushed."""
     upstream = _upstream(path)
     if upstream is None:
         return True
@@ -457,25 +466,16 @@ def _push(path: Path, still=None) -> bool:
             log(f"curate: pushed the target list to {upstream[0]}")
             return True
         if attempt == 1:
-            _sync(path)
+            _sync(path, keep=still is not None)
+            if still is not None and _git(path, "diff", "--quiet", "HEAD~1", "HEAD").returncode == 0:
+                _git(path, "reset", "-q", "--soft", "HEAD~1")
+                log(f"curate: {upstream[0]} already has this curation's edits; the rebased list is kept")
+                return None
             if still is not None and not still(path.read_text()):
                 log(f"curate: {upstream[0]} changed what this curation's verdicts were given; not pushed")
                 return False
     log(f"curate: push to {upstream[0]} failed ({one_line(pushed.stderr)}); the commit stays local")
     return False
-
-
-def _holds(path: Path, made: str) -> bool:
-    """Whether HEAD is still this look's unpushed commit `made`, or its rebased copy: a rebase drops
-    it when the branch it tracks already has the same change (`git cherry` marks it `-`)."""
-    head = _git(path, "rev-parse", "HEAD").stdout.strip()
-    if head == made:
-        return True
-    ahead = _git(path, "rev-list", "--count", "@{upstream}..HEAD")
-    if ahead.returncode == 0 and ahead.stdout.strip() in ("", "0"):
-        return False
-    cherry = _git(path, "cherry", "@{upstream}", made, f"{made}~1")
-    return not cherry.stdout.startswith("-")
 
 
 def merge3(base: str, ours: str, theirs: str) -> str | None:
@@ -541,15 +541,15 @@ def publish(path: Path, base: str, ours: str, notes: list[str], *, still=None) -
             else:
                 _write(path, undone)
             return None
-        made = _git(path, "rev-parse", "HEAD").stdout.strip()
-    if tracked and not _push(path, still) and still is not None and merged != theirs:
+    own = still if tracked and merged != theirs else None
+    pushed = _push(path, own) if tracked else True
+    if pushed is None:
+        return None
+    if not pushed and own is not None:
         # A verdict is published in the look that made it or not at all: a later push could carry
-        # it onto a goal or item line it was never given.
-        # The commit can also hold the operator's uncommitted edits, so only this look's edit is
-        # taken out of the file, which stays uncommitted.
-        if not _holds(path, made):
-            log(f"curate: {path.name} already has these edits upstream; the rebased list is kept")
-            return None
+        # it onto a goal or item line it was never given. HEAD is this look's commit (see `_push`),
+        # and it can also hold the operator's uncommitted edits, so only this look's edit is taken
+        # out of the file, which stays uncommitted.
         undone = merge3(ours, path.read_text(), base)
         if undone is None or _git(path, "reset", "-q", "--soft", "HEAD~1").returncode != 0:
             log(f"curate: the unpushed verdict commit in {path.parent} could not be taken back; remove it by hand")
