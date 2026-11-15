@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Cross-forge routing, independent outages, identities and budgets."""
 
+import contextlib
 import io
 import json
 import os
@@ -59,6 +60,20 @@ class Sources(unittest.TestCase):
             os.environ["TAUCETI_FORGEJO_TOKEN_FILE"] = str(link)
             with self.assertRaises(OSError):
                 load_source()
+
+    def test_native_author_claim_uses_shared_github_namespace_resolution(self):
+        from tauceti_worker.source_claims import main
+
+        with (
+            patch.object(sys, "argv", ["claim-source", "acquire", "author/Algebra/test"]),
+            patch.dict(os.environ, {"TAUCETI_WORKER_ID": "native-worker"}),
+            patch("tauceti_worker.worker_sources.shared_github_environment", return_value=contextlib.nullcontext()),
+            patch("tauceti_worker.github.claims_repo", return_value="team/shared-claims"),
+            patch("tauceti_tools.claims.GitClaim") as claim,
+        ):
+            claim.return_value.command.return_value = 0
+            self.assertEqual(main(), 0)
+            self.assertEqual(claim.call_args.args[:3], ("team/shared-claims", "author/Algebra/test", "native-worker"))
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
