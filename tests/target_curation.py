@@ -500,6 +500,30 @@ class Publish(Tmp):
         self.assertEqual(curate.publish(path, EXAMPLE, a, ["n"], still=lambda text: True), a)
         self.assertEqual(git(remote, "show", "main:targets.md") + "\n", a)
 
+    def test_a_verdict_another_host_already_published_leaves_the_rebased_clone_alone(self):
+        first, second = self.clone("first"), self.clone("second")
+        listed = t.parse_targets(EXAMPLE)
+        item = listed.find("kolmogorov-zero-one")
+        ticked = t.rewrite_item(EXAMPLE, item, "done", add=("landed elsewhere: A.lean a_b",))
+        second.write_text(ticked)
+        git(second.parent, "commit", "-q", "-m", "same verdict", "targets.md")
+        second.write_text(ticked.replace("i.i.d. integrable", "i.i.d. measurable"))
+        git(second.parent, "commit", "-q", "-m", "goal", "targets.md")
+        hook = first.parent / ".git" / "hooks" / "post-commit"
+        hook.write_text(f"#!/bin/sh\ngit -C {second.parent} push -q origin HEAD:main\n")
+        hook.chmod(0o755)
+        self.assertIsNone(curate.publish(first, EXAMPLE, ticked, ["n"], still=curate._unchanged(first, listed, [item])))
+        hook.unlink()
+        remote = self.tmp / "remote.git"
+        self.assertEqual(git(first.parent, "rev-parse", "HEAD"), git(remote, "rev-parse", "main"))
+        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
+        self.assertEqual(t.parse_targets(first.read_text()).find("kolmogorov-zero-one").status, "done")
+        second.write_text(second.read_text() + "- [ ] `applications` — x (needs: `strong-law`)\n")
+        git(second.parent, "commit", "-q", "-m", "milestone", "targets.md")
+        git(second.parent, "push", "-q", "origin", "HEAD:main")
+        curate._sync(first)
+        self.assertIn("`applications`", first.read_text())
+
     def test_a_push_that_loses_the_race_is_retried_after_a_rebase(self):
         first, second = self.clone("first"), self.clone("second")
         a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")

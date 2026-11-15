@@ -458,6 +458,15 @@ def _push(path: Path, still=None) -> bool:
     return False
 
 
+def _holds(path: Path, message: str) -> bool:
+    """Whether HEAD is still this look's unpushed commit with `message`: a rebase drops it when the
+    branch it tracks already has the same change."""
+    if _git(path, "log", "-1", "--format=%B", "HEAD").stdout.strip() != message.strip():
+        return False
+    ahead = _git(path, "rev-list", "--count", "@{upstream}..HEAD")
+    return ahead.returncode != 0 or ahead.stdout.strip() not in ("", "0")
+
+
 def merge3(base: str, ours: str, theirs: str) -> str | None:
     """Two edits of `base` merged (`git merge-file`), or None when they touch the same lines."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -526,6 +535,9 @@ def publish(path: Path, base: str, ours: str, notes: list[str], *, still=None) -
         # it onto a goal or item line it was never given.
         # The commit can also hold the operator's uncommitted edits, so only this look's edit is
         # taken out of the file, which stays uncommitted.
+        if not _holds(path, message):
+            log(f"curate: {path.name} already has these edits upstream; the rebased list is kept")
+            return None
         undone = merge3(ours, path.read_text(), base)
         if undone is None or _git(path, "reset", "-q", "--soft", "HEAD~1").returncode != 0:
             log(f"curate: the unpushed verdict commit in {path.parent} could not be taken back; remove it by hand")
