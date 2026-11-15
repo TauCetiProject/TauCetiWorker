@@ -153,6 +153,7 @@ environment (flags win; full reference linked below):
   TAUCETI_AUTHORING_CLAUDE_MODEL / _EFFORT exact Claude authoring profile
   TAUCETI_STREAM=1       same as --stream
   TAUCETI_AUTO_REFRESH=1 same as --auto-refresh (renew an expired Claude token; see --auto-refresh)
+  TAUCETI_FULL_QUALITY=1 same as --full-quality
   TAUCETI_ACCOUNT        default for --account (require a specific Codex account)
   TAUCETI_GITHUB_ACCOUNT default for --github-account (select the GitHub login)
   TAUCETI_OVERLAP_BATCH_COMMITS  commits per scan session (default 160)
@@ -364,6 +365,12 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="instruct source-changing agents to apply the self-tested label to eligible PRs after successful local verification",
+    )
+    p.add_argument(
+        "--full-quality",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="have agents run all five quality-pass checks; by default they run Q1, Q2 and Q5 and decline the others",
     )
     p.add_argument(
         "--extra-roadmap-prompt",
@@ -1350,6 +1357,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     # Persist the operator's choice into loop children and recovery rounds.
     if getattr(args, "self_tested", None) is not None:
         os.environ["TAUCETI_SELF_TESTED"] = "1" if args.self_tested else "0"
+    if getattr(args, "full_quality", None) is not None:
+        os.environ["TAUCETI_FULL_QUALITY"] = "1" if args.full_quality else "0"
     # --extra-roadmap-prompt likewise: validated here, at the boundary, then read live by do_roadmap via
     # extra_roadmap_prompt() so loop children see it without a flag of their own.
     if getattr(args, "extra_roadmap_prompt", None) is not None:

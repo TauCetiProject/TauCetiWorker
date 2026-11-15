@@ -533,6 +533,19 @@ def self_tested_guidance(policy: str) -> str:
     )
 
 
+def quality_scope() -> str:
+    """Which quality-pass checks agents run: all of them under `--full-quality`, else the duplicate and
+    proof-length checks, named as the template titles them. A PR keeps the template its branch was cut
+    with, which numbers proof length Q5 of five checks or Q3 of three (TauCeti#40207)."""
+    if os.environ.get("TAUCETI_FULL_QUALITY", "0") == "1":
+        return "Run every check."
+    return (
+        "Run only the Mathlib duplicates, Tau Ceti duplicates and Proofs of at most 50 lines checks: Q1, Q2 "
+        "and Q5 when the template has five checks, Q1 to Q3 when it has three. Each other line, such as "
+        "Hypotheses or Section variables, reads `declined — not run`."
+    )
+
+
 def local_verification(policy: str, bubble: bool = False) -> str:
     """The shared verification rules and scope recipe every authoring/repair prompt embeds."""
     if policy not in {"ordinary", "full-lint", "lint-repair", "bump"}:
