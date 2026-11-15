@@ -9,6 +9,7 @@ import importlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -578,6 +579,33 @@ class Publish(Tmp):
         text = first.read_text()
         self.assertEqual(t.parse_targets(text).find("kolmogorov-zero-one").status, "done")
         self.assertIn("`later`", text)
+
+    def test_taking_back_a_partly_replayed_verdict_keeps_what_the_remote_already_has(self):
+        for goal in ("i.i.d. measurable", "i.i.d. integrable"):
+            with self.subTest(goal=goal):
+                for name in ("remote.git", "first", "second", "seed"):
+                    shutil.rmtree(self.tmp / name, ignore_errors=True)
+                first, second = self.clone("first"), self.clone("second")
+                listed = t.parse_targets(EXAMPLE)
+                items = [listed.find("kolmogorov-zero-one"), listed.find("strong-law")]
+                ours = EXAMPLE
+                for item in items:
+                    ours = t.rewrite_item(ours, item, "done", add=("landed elsewhere: A.lean a_b",))
+                peer = t.rewrite_item(EXAMPLE, items[0], "done", add=("landed elsewhere: A.lean a_b",))
+                second.write_text(peer.replace("i.i.d. integrable", goal))
+                git(second.parent, "commit", "-q", "-m", "peer", "targets.md")
+                hook = first.parent / ".git" / "hooks" / "post-commit"
+                hook.write_text(f"#!/bin/sh\ngit -C {second.parent} push -q origin HEAD:main\n")
+                hook.chmod(0o755)
+                published = curate.publish(first, EXAMPLE, ours, ["n"], still=curate._unchanged(first, listed, items))
+                hook.unlink()
+                remote = git(self.tmp / "remote.git", "show", "main:targets.md") + "\n"
+                text = first.read_text()
+                self.assertEqual(git(first.parent, "status", "--porcelain"), "")
+                self.assertEqual(text, remote)
+                self.assertEqual(t.parse_targets(text).find("kolmogorov-zero-one").status, "done")
+                done = t.parse_targets(text).find("strong-law").status == "done"
+                self.assertEqual((published is None, done), (goal != "i.i.d. integrable", goal == "i.i.d. integrable"))
 
     def test_a_verdict_another_host_already_published_leaves_the_rebased_clone_alone(self):
         first, second = self.clone("first"), self.clone("second")

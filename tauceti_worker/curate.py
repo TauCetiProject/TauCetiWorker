@@ -18,6 +18,7 @@ Only `ask` starts a model. Its answer reaches the list as a file path and a decl
 from __future__ import annotations
 
 import contextlib
+import difflib
 import fcntl
 import hashlib
 import json
@@ -478,6 +479,20 @@ def _push(path: Path, still=None) -> bool | None:
     return False
 
 
+def _taken_back(base: str, ours: str, parent: str, current: str) -> str | None:
+    """`current` with each line `ours` rewrote from `base` put back as `base` had it, unless
+    `parent` already holds the rewritten line. None when `ours` is not line-for-line rewrites."""
+    before, after = base.splitlines(keepends=True), ours.splitlines(keepends=True)
+    back: dict[str, str] = {}
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=before, b=after, autojunk=False).get_opcodes():
+        if tag == "replace" and i2 - i1 == j2 - j1:
+            back.update(zip(after[j1:j2], before[i1:i2], strict=True))
+        elif tag != "equal":
+            return None
+    kept = set(parent.splitlines(keepends=True))
+    return "".join(line if line in kept else back.get(line, line) for line in current.splitlines(keepends=True))
+
+
 def merge3(base: str, ours: str, theirs: str) -> str | None:
     """Two edits of `base` merged (`git merge-file`), or None when they touch the same lines."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -549,8 +564,9 @@ def publish(path: Path, base: str, ours: str, notes: list[str], *, still=None) -
         # A verdict is published in the look that made it or not at all: a later push could carry
         # it onto a goal or item line it was never given. HEAD is this look's commit (see `_push`),
         # and it can also hold the operator's uncommitted edits, so only this look's edit is taken
-        # out of the file, which stays uncommitted.
-        undone = merge3(ours, path.read_text(), base)
+        # out of the file, which stays uncommitted; a line the rebased parent already has stays.
+        parent = _git(path, "show", f"HEAD~1:./{path.name}")
+        undone = _taken_back(base, ours, parent.stdout if parent.returncode == 0 else "", path.read_text())
         if undone is None or _git(path, "reset", "-q", "--soft", "HEAD~1").returncode != 0:
             log(f"curate: the unpushed verdict commit in {path.parent} could not be taken back; remove it by hand")
         else:
