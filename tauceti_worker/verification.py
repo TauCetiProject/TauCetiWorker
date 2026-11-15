@@ -6,13 +6,11 @@ A receipt is durable and incomplete before any child starts; SIGKILL cannot turn
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import contextvars
 import fcntl
 import hashlib
 import json
-import math
 import os
 import platform
 import shlex
@@ -34,7 +32,7 @@ from .processes import owned_process
 from .runtime_status import read_json, report_runtime
 from .verification_installations import Installations
 from .verification_scope import git, local_main, scope, untracked
-from .verification_storage import Pressure, cache_generation
+from .verification_storage import Pressure
 
 SCHEMA = "tauceti-verification/v1"
 POLICY_VERSION = 7
@@ -54,7 +52,7 @@ class Incomplete(Exception):
 class _HashCache:
     """Directory-grouped mutable hashes, with per-workspace lazy V1 migration."""
 
-    def __init__(self, state, root=None, *, fresh_candidate=False):
+    def __init__(self, state, root=None):
         self.path = state / "verification-hashes-v2.json"
         payload = read_json(self.path)
         self.entries = self.directories(payload)
@@ -63,7 +61,7 @@ class _HashCache:
         self.imported = bool(self.marker and read_json(self.marker).get("schema") == "tauceti-hash-root/v2")
         self.finished = False
         self.legacy_path = state / "verification-hashes.json"
-        self.legacy = {} if self.imported or fresh_candidate or root is None else None
+        self.legacy = {} if self.imported or root is None else None
         self.retained = set()
         self.inventory_depth = 0
 
@@ -338,15 +336,13 @@ class Verification:
         stage="all",
         reuse=True,
         policy="ordinary",
-        deadline=None,
         lint_modules=None,
-        job=None,
     ):
         self.root, self.state = root.resolve(), state.resolve()
         self.base_arg, self.policy = base, policy
         self.lint_modules = lint_modules
         self.requested = list(STAGES) if stage == "all" else [stage]
-        self.reuse, self.deadline = reuse, deadline
+        self.reuse = reuse
         self.id = uuid.uuid4().hex
         self.directory = self.state / "verification" / self.id
         self.path = self.directory / "receipt.json"
@@ -366,15 +362,11 @@ class Verification:
         self.watched = {}
         self.static_stamps = {}
         self.static_names = {}
-        self.at_boundary = False
         self.watch_names = set()
         self.dependency_names = None
         self.mutated = False
         self.last_watch = 0.0
         self.live_lease = None
-        self.job = job
-        self.storage_monitor = None
-        self.storage_lease = None
         self.installations = Installations(
             self.state,
             digest=digest,
@@ -392,19 +384,7 @@ class Verification:
     def progress(self, message):
         print(message, file=sys.stderr, flush=True)
 
-    def check_deadline(self):
-        if self.at_boundary:
-            return  # Finish validation/index publication for an already completed phase.
-        margin = float(os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600"))
-        if not math.isfinite(margin) or margin < 0:
-            raise ValueError("TAUCETI_VERIFY_CHECKPOINT_MARGIN must be a nonnegative number of seconds")
-        if self.deadline is not None and time.time() >= self.deadline - margin:
-            raise Incomplete("round deadline checkpoint margin reached; checkpoint now", reason="deadline")
-
     def watch(self):
-        self.check_deadline()
-        if self.storage_monitor is not None:
-            self.storage_monitor.check(resources=not self.at_boundary)
         if self.watched and time.monotonic() - self.last_watch >= 2:
             self.last_watch = time.monotonic()
             if stamps(self.watched) != self.watched or source_names(self.root, self.base) != self.watch_names:
@@ -460,7 +440,7 @@ class Verification:
                                 if RESOURCE_ERROR.search(decoded):
                                     record_wait("build tool could not create threads; host resource exhaustion")
                                     raise Incomplete(
-                                        "build tool resource exhaustion; preserve candidate and retry after backoff",
+                                        "build tool resource exhaustion; retry after backoff",
                                         reason="resource-pressure",
                                     )
                     self.watch()
@@ -483,9 +463,7 @@ class Verification:
 
         if entry["exit"] and RESOURCE_ERROR.search(text):
             record_wait("build tool could not create threads; host resource exhaustion")
-            raise Incomplete(
-                "build tool resource exhaustion; preserve candidate and retry after backoff", reason="resource-pressure"
-            )
+            raise Incomplete("build tool resource exhaustion; retry after backoff", reason="resource-pressure")
 
         if capture:
             entry["stdout_log"] = str(stdout_path)
@@ -543,32 +521,27 @@ class Verification:
             raise Incomplete(str(error), reason=error.reason) from error
 
     def validate_inputs(self, inputs, *, full=False):
-        self.at_boundary = True
-        try:
-            self.final_watch()
-            if full:
-                unchanged = digest(self.inputs()) == digest(inputs)
-            else:
-                config = os.environ.get("LAKE_CONFIG")
-                unchanged = (
-                    inventory(self.root, self.base) == inputs["sources"]
-                    and scope(self.root, self.base, self.policy) == inputs["scope"]
-                    and self.environment() == inputs["environment"]
-                    and self.tools_inputs() == inputs["tools"]
-                    and (file_record(Path(config)) if config else None) == inputs["configuration"]
-                    and (file_record(Path(self.lint_modules)) if self.lint_modules else None) == inputs["lint_modules"]
-                    and POLICY_VERSION == inputs["policy_version"]
-                    and {p.name for p in Path(__file__).parent.glob("*.py")}
-                    == set(inputs["verifier"]) - {"wrapper", *LOCAL_CHECKERS}
-                )
-            if self.mutated or not unchanged:
-                raise Incomplete("verification inputs changed during execution")
-            self.final_watch()
-        finally:
-            self.at_boundary = False
+        self.final_watch()
+        if full:
+            unchanged = digest(self.inputs()) == digest(inputs)
+        else:
+            config = os.environ.get("LAKE_CONFIG")
+            unchanged = (
+                inventory(self.root, self.base) == inputs["sources"]
+                and scope(self.root, self.base, self.policy) == inputs["scope"]
+                and self.environment() == inputs["environment"]
+                and self.tools_inputs() == inputs["tools"]
+                and (file_record(Path(config)) if config else None) == inputs["configuration"]
+                and (file_record(Path(self.lint_modules)) if self.lint_modules else None) == inputs["lint_modules"]
+                and POLICY_VERSION == inputs["policy_version"]
+                and {p.name for p in Path(__file__).parent.glob("*.py")}
+                == set(inputs["verifier"]) - {"wrapper", *LOCAL_CHECKERS}
+            )
+        if self.mutated or not unchanged:
+            raise Incomplete("verification inputs changed during execution")
+        self.final_watch()
 
     def inputs(self):
-        self.check_deadline()
         toolchain = {}
         for name in ("lake", "lean", "bash", "python3", "git", "tar"):
             executable = shutil.which(name)
@@ -591,8 +564,6 @@ class Verification:
             toolchain[" ".join(command)] = lines[-1] if lines else ""
         prefix = Path(toolchain["lake env lean --print-prefix"])
         if not prefix.is_absolute() or not prefix.is_dir() or not (prefix / "bin" / "lean").is_file():
-            if prefix.is_absolute() and self.job:
-                self.job["toolchain_wait_path"] = str(prefix)
             raise Incomplete("Lean did not report an absolute installed toolchain prefix", reason="tool-missing")
         toolchain["distribution"] = self.installations.inventory(prefix)
         deps = self.root / ".lake" / "packages"
@@ -616,7 +587,7 @@ class Verification:
             toolchain=toolchain,
             verifier=verifier,
             policy_version=POLICY_VERSION,
-            cache_generation=cache_generation(self.state, self.root),
+            cache_generation=None,  # Retained so earlier receipts keep their fingerprints.
             python=dict(version=sys.version, executable=file_record(Path(sys.executable))),
             tools=self.tools_inputs(),
             lint_modules=file_record(Path(self.lint_modules)) if self.lint_modules else None,
@@ -728,11 +699,7 @@ class Verification:
         previous = {}
         self.live_lease = (self.directory / "live.lock").open("a+")
         fcntl.flock(self.live_lease, fcntl.LOCK_EX)
-        cache = _HashCache(
-            self.state,
-            self.root,
-            fresh_candidate=bool(self.job and self.job.get("isolated") and self.job.get("attempts") == 1),
-        )
+        cache = _HashCache(self.state, self.root)
         cache_token = _HASH_CACHE.set(cache)
         try:
             if any(phase in self.requested for phase in ("shim-expiry", "axioms", "module-system", "lint")):
@@ -743,23 +710,6 @@ class Verification:
 
             for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
                 previous[sig] = signal.signal(sig, interrupted)
-            if self.root.parent == self.state / "verification-candidates":
-                from .retention import locked
-                from .verification_storage import Monitor, reserve
-
-                # A direct CLI invocation in an older candidate can create a new job ID.
-                # Protect the actual workspace independently of whichever job refers to it.
-                self.storage_lease = locked(self.state / "verification-storage" / f"{self.root.name}.lock")
-                try:
-                    self.storage_lease.__enter__()
-                except BlockingIOError:
-                    self.storage_lease = None
-                    raise Pressure("candidate storage is being reclaimed; retry verification", reason="busy") from None
-                reserve(self.state, self.root.name)
-                self.storage_monitor = Monitor(self.state, self.root.name)
-                # A direct invocation claims this as an editable workspace, not a disposable
-                # failed copy left by a different invocation.
-                (self.state / "verification-copy-incomplete" / f"{self.root.name}.json").unlink(missing_ok=True)
             raw = self.base_arg or os.environ.get("TAUCETI_VERIFY_BASE") or local_main(self.root)
             self.base = git(self.root, "rev-parse", "--verify", f"{raw}^{{commit}}").decode().strip()
             self.receipt["scope"] = scope(self.root, self.base, self.policy)
@@ -767,21 +717,6 @@ class Verification:
             candidate_sources = inventory(self.root, self.base)
             if os.environ.get("TAUCETI_VERIFY_BUBBLE") == "1":
                 self.checkpoint_sources(dict(sources=candidate_sources))
-            from .verification_jobs import prepare_job
-
-            self.job = prepare_job(self, dict(sources=candidate_sources))
-            self.receipt["job"] = self.job["id"]
-            if self.job.get("isolated") and self.storage_monitor is None:
-                from .verification_storage import Monitor
-
-                self.storage_monitor = Monitor(self.state, self.job["id"])
-            if self.deadline is not None and time.time() >= self.deadline - float(
-                os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600")
-            ):
-                from .verification_jobs import preserve_candidate
-
-                preserve_candidate(self)
-            self.check_deadline()
             self.watch_names = source_names(self.root, self.base)
             self.watched = stamps([self.root / p for p in self.watch_names])
             inputs = self.inputs()
@@ -815,7 +750,7 @@ class Verification:
             if os.environ.get("TAUCETI_VERIFY_BUBBLE") == "1":
                 self.checkpoint_sources(inputs)
 
-            if digest(inputs["sources"]) != self.job["source_digest"]:
+            if digest(inputs["sources"]) != digest(candidate_sources):
                 raise Incomplete("candidate changed while preparing verification")
             modules = self.directory / "modules.txt"
             modules.write_text("".join(f"{m}\n" for m in self.receipt["scope"]["modules"]))
@@ -827,9 +762,6 @@ class Verification:
                 and not (self.reuse and self.find_reuse(fingerprint, "lint"))
             )
             if early_sources:
-                from .verification_jobs import preserve_candidate
-
-                preserve_candidate(self, disposable_only=True)
                 self.receipt["phases"]["lint"] = dict(status="incomplete", started_at=time.time(), ended_at=None)
                 try:
                     self.command(
@@ -862,9 +794,6 @@ class Verification:
                     self.progress(f"{phase}: reused exact-input success ({reused})")
                     self.save()
                     continue
-                from .verification_jobs import preserve_candidate
-
-                preserve_candidate(self, disposable_only=True)
                 record = self.receipt["phases"].get(phase) or dict(
                     status="incomplete", started_at=time.time(), ended_at=None
                 )
@@ -890,8 +819,6 @@ class Verification:
                 self.index_success()
             # Recompute bytes, pins, dependencies, toolchain, environment and verifier after all tools exit.
             self.validate_inputs(inputs, full=True)
-            if self.storage_monitor is not None:
-                self.storage_monitor.finish()
             self.receipt.update(status="success", ended_at=time.time())
             self.index_success()
         except subprocess.CalledProcessError as error:
@@ -925,28 +852,20 @@ class Verification:
             self.receipt.update(status="incomplete", error=str(error), incomplete_reason="preparation")
         finally:
             self.receipt["ended_at"] = time.time()
-            if self.storage_monitor is not None:
-                try:
-                    self.storage_monitor.settle_idle()
-                except (OSError, Pressure) as error:
-                    self.progress(f"verification storage accounting deferred: {error}")
             # Retain the legacy field for readers; local checks no longer import an environment.
             self.receipt["audit_phase_timings"] = []
             for phase in self.receipt["phases"].values():
                 if phase.get("ended_at") is None:
                     phase.update(ended_at=self.receipt["ended_at"], status=self.receipt["status"])
-            if self.job:
-                from .verification_jobs import finish_job
-
-                finish_job(self)
+            if self.receipt["status"] == "incomplete":
+                self.receipt.update(
+                    result_type="incomplete",
+                    next_action=self.receipt.get("next_action") or "repair verification inputs and invoke verify again",
+                )
             self.save()
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
             self.live_lease.close()
-            if self.storage_monitor is not None:
-                self.storage_monitor.close()
-            if self.storage_lease is not None:
-                self.storage_lease.__exit__(None, None, None)
             _HASH_CACHE.reset(cache_token)
             # Bound the metadata cache; immutable input blobs and receipts retain durable evidence.
             try:
@@ -955,14 +874,7 @@ class Verification:
                 self.progress(f"verification hash cache unavailable: {error}")
             shutil.rmtree(self.directory / "base", ignore_errors=True)
             (self.directory / "base.tar").unlink(missing_ok=True)
-            if self.receipt.get("result_type") == "pending":
-                report_runtime(
-                    "verification-pending",
-                    verification_phase=None,
-                    verification_job=self.job["id"] if self.job else Path(self.receipt["continuation_job"]).stem,
-                    detail="durable verification job retained for mechanical continuation",
-                )
-            elif self.receipt["status"] == "incomplete":
+            if self.receipt["status"] == "incomplete":
                 report_runtime("verification-incomplete", verification_phase=None, detail=self.receipt.get("error"))
             else:
                 report_runtime("working", verification_phase=None)
@@ -1084,7 +996,6 @@ def add_parser(sub):
         "--json", action="store_true", help="emit exactly one JSON result on stdout; progress on stderr"
     )
     parser.add_argument("--no-reuse", action="store_true", help="run requested phases even when exact evidence exists")
-    parser.add_argument("--resume-job", type=Path, help=argparse.SUPPRESS)
 
 
 def command(args):
@@ -1094,30 +1005,6 @@ def command(args):
     )
     try:
         root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").decode().strip()).resolve()
-        deadline = float(os.environ["TAUCETI_ROUND_DEADLINE"]) if os.environ.get("TAUCETI_ROUND_DEADLINE") else None
-        if deadline is not None and not math.isfinite(deadline):
-            raise ValueError("round deadline must be finite")
-        job = None
-        if getattr(args, "resume_job", None):
-            job_path = args.resume_job.resolve()
-            job = read_json(job_path)
-            if (
-                job.get("schema") != "tauceti-verification-job/v1"
-                or job_path != state.resolve() / "verification-pending" / f"{job.get('id')}.json"
-                or not isinstance(job.get("root"), str)
-                or not Path(job["root"]).is_absolute()
-                or Path(job["root"]).resolve() != root
-            ):
-                raise ValueError("invalid mechanical verification job")
-            descriptor = int(os.environ.get("TAUCETI_VERIFY_JOB_FD", "-1"))
-            owned = os.fstat(descriptor)
-            lease = (state / "verification-jobs" / f"{job['id']}.lock").stat()
-            if (owned.st_dev, owned.st_ino) != (lease.st_dev, lease.st_ino):
-                raise ValueError("mechanical helper requires its supervisor's job lease")
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            # A runtime's state symlink and Git's physical cwd name the same candidate.
-            # Persist the actual execution path; different workspaces remain distinct inputs.
-            job["root"] = str(root)
         verification = Verification(
             root,
             state,
@@ -1125,9 +1012,7 @@ def command(args):
             stage=args.stage,
             reuse=not args.no_reuse,
             policy=os.environ.get("TAUCETI_VERIFY_POLICY", "ordinary"),
-            deadline=deadline,
             lint_modules=getattr(args, "lint_modules", None),
-            job=job,
         )
         result = verification.run()
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:

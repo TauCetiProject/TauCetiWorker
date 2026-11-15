@@ -2669,15 +2669,11 @@ def run_in_bubble(
             if host_cache is not None
             else "/tmp/verification-cache",
             "TAUCETI_VERIFY_POLICY": os.environ.get("TAUCETI_VERIFY_POLICY", "ordinary"),
-            "TAUCETI_ROUND_DEADLINE": str(getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)),
-            "TAUCETI_VERIFY_CHECKPOINT_MARGIN": os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600"),
             "TAUCETI_VERIFY_BUBBLE": "1",
         }.items():
             tcenv += f" {key}={shlex.quote(value)}"
         for name in (
             "STORAGE_BYTES",
-            "CANDIDATE_BYTES",
-            "SOURCE_CANDIDATE_BYTES",
             "CHECKPOINT_BYTES",
             "CHECKPOINT_POOL_BYTES",
             "MIN_FREE_BYTES",

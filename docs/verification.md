@@ -13,8 +13,7 @@ Wheel entry points restore its execute permission, so login-shell PATH changes c
 points keep working.
 
 The worker pins `TAUCETI_VERIFY_BASE` from the existing canonical-main checkout preparation,
-`TAUCETI_VERIFY_POLICY` from surveyed labels/branch, `TAUCETI_VERIFY_STATE` to worker state, and
-`TAUCETI_ROUND_DEADLINE` to the round's deadline. Standalone invocations resolve canonical main
+`TAUCETI_VERIFY_POLICY` from surveyed labels/branch and `TAUCETI_VERIFY_STATE` to worker state. Standalone invocations resolve canonical main
 from local Git refs only. No scope or verification step requests GitHub data or fetches refs.
 The shared offline Python scope calculation is re-exported by `verification_scope.py`: merge-base
 diff, both rename ends, staged/dirty/deleted/untracked sources, ignored sources under TauCeti,
@@ -102,11 +101,9 @@ inside that installation. Directory paths are stored once; mutable input records
 Cache saves merge only touched keys under a bounded one-second per-state lock; an unavailable cache
 cannot change the verification result or skip runtime cleanup.
 Migration imports matching V1 stat-keyed hashes without rereading their payloads until each workspace
-completes preparation. Early deadlines and isolated continuations retain migration eligibility for
-the original workspace. Completion markers live separately in `verification-hash-roots/`, with one exact lookup per
+completes preparation. Completion markers live separately in `verification-hash-roots/`, with one exact lookup per
 workspace and no history scan. Warm preparation in migrated workspaces reads only V2, including
-after source changes. Fresh isolated candidates skip opaque V1 history with nonmatching paths/inodes.
-Repeated continuations reuse their V2 hashes. A toolchain switch may require one new payload hash
+after source changes. A toolchain switch may require one new payload hash
 if its stat key is absent from V2, even when an old V1 file has that key. The V1 file remains intact for
 rollback and may be removed once rollback support is no longer needed. Immutable identity files and
 receipt indexes keep their existing formats.
@@ -139,159 +136,46 @@ retain complete inventory validation without requiring a shared cache. If the sh
 unavailable or unsafe, host verification falls back to complete validation and Bubble uses a
 private cache directory. Cache availability never grants success or prevents the checks from running.
 
-`TAUCETI_VERIFY_CHECKPOINT_MARGIN` reserves 600 seconds before the round deadline by default (a
-nonnegative number of seconds; fixtures explicitly use zero). At that boundary the helper returns
-incomplete with “checkpoint now”. Bubble candidate edits are saved as a base-bound binary patch and
-an untracked-file archive in `verification-checkpoints/` before checks begin, including when there is
-insufficient time to start verification. These artifacts are retained alongside a durable verification job in `verification-pending/`.
-Interrupted candidates are copied to independent `verification-candidates/` workspaces; disposable Bubble candidates are
-preserved before a non-reused phase starts. A fully reused invocation copies no dependencies or
-Git history. Copies preserve actual sources/index, local Git history and warm Lake/Mathlib build
-caches. The original Git index is read through a private copy. Linux uses independent CoW extents
-when supported, with portable copying otherwise; trusted external immutable host dependencies can
-retain their validated read-only identity. Absolute/escaping source symlinks fail incomplete because
-they need specific recovery ownership. Copying still has production storage/I/O cost to measure
-before broad dispatch. No clone contacts a remote. Candidate source/checkpoint data is retained for
-publication/reconciliation; disk retention and package history cost remain canary measurements.
+Verification runs to completion inside the round's own checkout and writes its receipt there;
+publication guards read that receipt. There is no checkpoint margin, no durable verification job
+and no copy of the workspace: verification never continues past the round. If the round is killed
+(the loop's `TAUCETI_ROUND_TIMEOUT` hard safety cap, a signal or owner death), the receipt stays
+`status: incomplete` and the work is abandoned. Bubble candidate edits are saved as a base-bound
+binary patch and an untracked-file archive in `verification-checkpoints/` before checks begin.
 
-Interrupted CLI results remain `status: incomplete`, exit nonzero, and include a typed incomplete
-reason, `result_type: pending`, the continuation job and its next automatic action. SIGKILL leaves
-the published job eligible once its live flocks release. The ordinary supervisor checks fleet/CI
-admission, then launches an owned fresh installed helper before model selection or GitHub reads.
-The helper inherits the job lease, works only in the isolated candidate, and does not hold the
-worker's round lock while building. Independent verification leaves inference scheduling available.
-One continuation per worker bounds preparation concurrency. Ordinary child polling reaps results;
-supervisor shutdown terminates its owned helper, preserving a durable interrupted job.
+Older releases kept continuation state under worker state (`verification-candidates/`,
+`verification-pending/`, `verification-jobs/`, `verification-job-index/`,
+`verification-copy-incomplete/`, `verification-storage/` and `verification-storage-generations/`,
+including under Bubble's `verification-state/`). Each round start and the cleanup collector delete
+it through the ordinary retention removal, which never deletes through a symlink, never removes a
+mount point and leaves a tree in use by a live process for a later pass. It is never migrated.
 
-Continuation runtime status is separate from model-round status, so concurrent replay cannot
-overwrite authoring progress. Repeated deadlines retain the candidate and validated phase evidence.
-Phase boundaries finish metadata/source validation and index publication even if the checkpoint
-margin arrives at command completion. Complete input/tool-version preparation runs at invocation
-boundaries; phase checkpoints use existing input metadata and exact source/configuration checks.
-Job/index leases suppress duplicate exact-candidate jobs. Permanent scope/configuration/ownership
-errors become terminal incomplete results with retained artifacts, so they cannot starve inference.
-Missing tools remain dormant without repeated verifier launches until local toolchain availability,
-provenance or any installed verifier component changes. Toolchain probes retain separate stdout/stderr
-logs. Their final version/prefix lines bind the inputs; changing Lake package diagnostics are retained
-in logs and do not invalidate successful checks. A prefix must name an absolute installed directory
-containing `bin/lean`. Invalid final output still leaves verification incomplete. Deadline/signal jobs remain eligible without an expiry that discards their
-candidate. Terminal jobs move from `verification-pending/` into `verification-jobs/`.
+Incomplete CLI results exit nonzero with a typed incomplete reason and `result_type: incomplete`.
+Toolchain probes retain separate stdout/stderr logs. Their final version/prefix lines bind the
+inputs; changing Lake package diagnostics are retained in logs and do not invalidate successful
+checks. A prefix must name an absolute installed directory containing `bin/lean`.
 
-### Candidate storage and automatic reclamation
+### Checkpoint storage
 
-Verification records host-local storage observations across worker HOME overrides and runtime
-versions. Bubble helpers mount the same ledger and record canonical host state paths. Logical-byte
-settings are cleanup targets: they do not reserve growth, gate admission, interrupt tools, refuse
-source preservation or park a verification job. Active work may exceed these targets while physical
-space is available. There is no fixed heavy-work queue or storage-based inference admission limit.
-
-Default settings (positive integers except the percentage, which permits zero):
+The host-local ledger records Bubble source checkpoints across worker HOME overrides and runtime
+versions; bounded housekeeping measures them. Rows an older release recorded for verification
+candidates are dropped. Only actual filesystem headroom can defer or interrupt verification.
 
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
-| `TAUCETI_VERIFY_STORAGE_BYTES` | 128 GiB | Host/user target for eligible idle candidate data; triggers completed-cache reclamation |
-| `TAUCETI_VERIFY_CANDIDATE_BYTES` | 32 GiB | Candidate-size target that triggers early completed-cache reclamation |
-| `TAUCETI_VERIFY_OWNERSHIP_SECONDS` | 2 | Separate bound for one process-reference observation per cleanup slice |
 | `TAUCETI_VERIFY_MIN_FREE_BYTES` | 20 GiB | Actual minimum filesystem headroom |
 | `TAUCETI_VERIFY_MIN_FREE_PERCENT` | 10 | Percentage headroom capped at the worker critical reserve (at most 20 GiB); explicit `MIN_FREE_BYTES` remains a minimum |
-| `TAUCETI_VERIFY_COMPLETED_CACHE_SECONDS` | 900 | Completed-job cache grace period (15 minutes) |
-| `TAUCETI_VERIFY_IDLE_CACHE_SECONDS` | 21600 | Idle pending-job cache lifetime (6 hours) |
 | `TAUCETI_VERIFY_STORAGE_DIR` | Host-local state directory | Shared observation root; use private state for tests |
 
-The former `TAUCETI_VERIFY_SOURCE_CANDIDATE_BYTES`, `TAUCETI_VERIFY_CHECKPOINT_BYTES` and
-`TAUCETI_VERIFY_CHECKPOINT_POOL_BYTES` caps no longer restrict preservation. They are accepted for
-configuration compatibility. Existing `reserve` helper calls register activity without preallocating
-32 GiB. Twenty active candidates therefore do not book 640 GiB of imaginary future writes.
-Copies retain warm build outputs even when larger than the candidate target; source checkpoints
-can exceed the old archive/pool caps. Pending jobs blocked by an earlier storage limit resume
-mechanically without requiring a configuration change or a new model invocation.
+Running tools return `incomplete_reason: disk-pressure` only for actual low filesystem headroom.
+Ownership/cleanup lease contention is separately typed `verification-busy`. If ENOSPC prevents
+housekeeping, the collector may discard optional V2 stat-hash metadata under its writer lock and
+retry once.
 
-Observations count logical bytes, including reflinked payloads, with a 16 KiB accounting floor.
-The persisted `reserved`/`reserved_bytes` fields retain their names for older readers; new activity
-records contain measured bytes or small metadata floors rather than speculative growth. Prepared
-status includes `target_bytes` and `admission_limited: false`. Newly discovered unmeasured trees start at a small metadata floor; bounded read-only inventories
-replace this with measured sizes before their caches are considered for expiry. Historical
-speculative growth estimates are excluded from cleanup pressure, so imaginary reservations cannot
-force needless cache eviction or block verification. A corrupt disposable ledger
-is quarantined and reconstructed locally without deleting source or evidence. Optional observation
-errors cannot invalidate verification or prevent receipt publication. Successful and interrupted
-invocations mark their actual idle time without a full tree walk on exit; bounded housekeeping
-owns complete size accounting. Invalid cleanup targets/TTLs use defaults and prepared warnings;
-invalid physical-headroom settings still require correction.
-
-The ordinary supervisor, activity preparer and explicit `tauceti cleanup` invoke bounded reclamation.
-At most one collector runs per host, with a ten-second minimum interval; actual cadence depends on
-ordinary activity/round boundaries. The default deletion slice is 0.25 seconds, 2048 metadata entries
-and 256 MiB of removal. One process-reference observation has its separate two-second bound, so
-it cannot repeatedly consume the deletion allowance. Prepared metrics report that overhead and total
-wall time separately. Recursive removal has a durable journal; partial removal stays with the oldest progressing cache
-until complete, while blocked owners are skipped fairly. Its continuation is recovered even if a
-collector dies before saving the scheduling cursor. Stale inventory generations release their
-bounded scan slots when a candidate restarts or disappears. Eligible terminal or urgent outputs
-can be reclaimed before a complete source-tree size measurement. Inventories resume within a long-lived
-collector and restart safely after process death. They retain no directory descriptors between ticks
-that could masquerade as live workspace users. Cursor rotation prevents a live or large candidate
-starving others. Collection skips compacted rows, never follows symlinks and never crosses observed
-mounts. Job/receipt/workspace flocks and live process references protect active work; missing ownership
-or mount observations withhold that tree.
-
-Completed candidates can shed their own and dependency build outputs after 15 minutes. Idle pending
-candidates normally shed only their own build outputs after 6 hours, measured from when an attempt
-stops. Logical targets cannot evict recent pending progress seconds before mechanical continuation.
-Completed caches can expire earlier above a size target. Each cleanup sweep starts with completed,
-oldest-idle candidates, rotates past blocked owners, and stops size-triggered eviction once enough
-has been reclaimed. Active candidates, checkpoints, recent pending progress and already compacted
-source-only trees do not consume the reclaimable-data target or force other caches to be flushed.
-Only actual low disk space overrides pending idle protection. As a last resort under that physical
-pressure, other idle jobs can shed dependency builds while the oldest runnable candidate's
-dependencies stay warm, avoiding repeated self-eviction/rebuild loops. Before removing a build directory the collector checks for tracked and
-untracked non-ignored files. Source under `build/`, staged state, dependency edits, Git history,
-checkpoints, receipts and publication/accounting journals remain protected. No unpublished source
-expires merely because it is old. If only active work or protected source remains above a target,
-status reports that fact and verification continues; a target is not a hard disk cap.
-
-Failed copies carry a durable construction marker until isolated ownership is published. Exceptions
-remove partial copies and process death leaves bounded mechanical cleanup. A direct invocation claims
-its workspace before such disposal is permitted. Removed artifacts release their accounting. A cache
-generation token invalidates build receipt reuse after eviction without historical receipt scans.
-Cleanup errors cannot terminate the supervisor. If ENOSPC prevents writing cleanup intent, the
-collector may discard optional V2 stat-hash metadata under its writer lock and retry once. This can
-require cold hashing next time; ordinary warm operation retains the hash cache and receipt index.
-
-Running tools sample actual free space once per second and inspect at most 4096 metadata entries
-per sample for cleanup observations. Only actual low filesystem headroom can interrupt their owned
-process group and return `incomplete_reason: disk-pressure`. An independent candidate remains pending
-for mechanical continuation once space returns, without a model or an attempt charge for admission
-refusal. If preservation itself encounters low disk space, the original workspace remains intact;
-without an independent candidate the CLI reports incomplete with accurate workspace retry guidance.
-Ownership/cleanup lease contention is separately typed `verification-busy`, never reported as
-logical capacity or actual disk pressure. A workspace with partially removed outputs stays owned
-by mechanical cleanup until that journal is complete; ordinary supervisor ticks finish it without
-a model or an admission-attempt charge. Other candidates remain eligible. Pending checkpoint
-mtime supplements the idle clock after abnormal exit or unavailable optional accounting. Source checkpoint writes also check actual headroom. Samples cannot prevent a fast writer exhausting
-space between observations; the targets are not filesystem quotas. This change does not raise
-capacity, restart active rounds or change V0 helper dispatch.
-
-Recovery builds only in an independent candidate, never resets the original source and never pushes,
-creates a PR or bypasses accounting/publication guards.
-Jobs store canonical candidate paths. The helper resolves runtime state/workspace symlinks before
-checking that its working directory matches the job and validating the inherited job lease. Receipts
-remain bound to that physical workspace, including when a runtime alias changes after deployment.
-Receipts bind the actual replay environment; a different toolchain/configuration invalidates prior
-evidence. Bubble recovery needs the host's normal verification tools for the pinned project; unavailable
-tools leave typed incomplete evidence
-and a dormant job that wakes on local tool availability changes. Publication/reconciliation of a recovered candidate remains #310's separate concern. This
-verification continuation does not require #310. Claude Bash timeout variables cover the remaining
-round; Codex prompts instruct the agent to wait on its returned execution session. SIGINT, SIGTERM
-and SIGHUP cause owned cleanup and incomplete receipts.
-
-Tools run in owned process groups. Interruption and deadlines terminate the group, and normal
-completion sweeps leftover background tools. Cleanup is best effort: deliberately detached
-descendants can escape. Host verification needs no rootless PID namespace or historical cleanup
-proof. Explicit Bubble execution retains its existing outer sandbox. Normal exits check each command
-directly; shell lint drivers use Bash pipefail. No process-name polling is used. Job/invocation lease
-descriptors are never inherited by tools, so owner death releases ownership for recovery. Recovery
-verifies in an independent workspace; publication retains its separate source, claim and CAS checks.
+Tools run in owned process groups. Interruption terminates the group, and normal completion sweeps
+leftover background tools. Cleanup is best effort: deliberately detached descendants can escape.
+Normal exits check each command directly; shell lint drivers use Bash pipefail. SIGINT, SIGTERM and
+SIGHUP cause owned cleanup and incomplete receipts.
 
 `TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS=/absolute/installations.json` can register trusted
 installations with a mapping such as `{"/nix/store/example-lean": "publisher-revision-1"}`. Paths
@@ -311,19 +195,16 @@ base, executable/version and verifier checks remain exact. The trust contract an
 accidental-mutation guards, not protection from an adversary changing read-only aliases or receipts.
 
 Set `TAUCETI_VERIFY_HELPER=0` to retain/restore bundled V0 prompts at the next round. This changes
-dispatch only: it does not delete receipts/checkpoints/jobs or terminate active verification.
-`TAUCETI_VERIFY_CONTINUATION=0` separately pauses launching new mechanical continuations while
-retaining eligible jobs and allowing active helpers to finish. Green fixture tests do not authorize
+dispatch only: it does not delete receipts/checkpoints or terminate active verification. Green fixture tests do not authorize
 blanket fleet dispatch.
 
 ## Implementation evidence
 
 `tests/verification.py` covers real exits, pipefail, exact and phase reuse, source mutations,
 pin/base/toolchain/executable changes, deletions, renames, untracked/ignored sources, owner death,
-deadlines and owned-group cleanup. Twenty independent fake verifiers must enter their builds together,
+and owned-group cleanup. Twenty independent fake verifiers must enter their builds together,
 even with an old one-slot lock held and stale wait records present. `tests/verification_audit.py` adds
-repeated deadlines followed by an actual successful build in the isolated candidate, Bubble namespace recovery after original deletion,
-phase evidence after interruption, dispatch gating and immutable preparation costs. Its 30,000-file,
+dispatch gating and immutable preparation costs. Its 30,000-file,
 122,880,000-byte installation uses fixture read-only `statvfs` flags with the real mountinfo
 reader/parser; real writable installations are also tested to fall back. Twenty contenders use
 separate worker states and the host-shared validated identity cache. It prints cold and twenty-contender warm bytes, file records, stat/lstat

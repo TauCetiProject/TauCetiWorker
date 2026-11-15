@@ -764,8 +764,6 @@ ci="one/project"
                     patch("tauceti_worker.loop.run_round_subprocess", side_effect=KeyboardInterrupt) as launch,
                     patch("tauceti_worker.loop.github_budget", return_value={}),
                     patch("tauceti_worker.loop.fleet_admission_reason", return_value=None),
-                    patch("tauceti_worker.verification_jobs.resume_pending"),
-                    patch("tauceti_worker.verification_jobs.reap_continuations"),
                     patch("tauceti_worker.repair_recovery.due", return_value=False),
                 ):
                     cmd_loop(args, self.cfg, only=["review"], agent="deepseek")

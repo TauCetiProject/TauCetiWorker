@@ -485,17 +485,6 @@ class Retention(unittest.TestCase):
         self.assertTrue(archive.exists())
         self.assertEqual(reader.read_text(), "immutable")
 
-    def test_active_verification_job_protects_private_caches(self):
-        self.old()
-        cache = self.cache()
-        lease = self.state / "verification-jobs" / "job.lock"
-        with retention.locked(lease):
-            report = retention.sweep(now=self.clock)
-        self.assertTrue(cache.exists())
-        self.assertIn(str(lease), report["protected"])
-        retention.sweep(now=self.clock)
-        self.assertFalse(cache.exists())
-
     def test_symlinked_worker_home_cannot_delete_external_cache(self):
         self.old()
         outside = self.root / "outside"
@@ -722,74 +711,6 @@ class Retention(unittest.TestCase):
         with retention.locked(path, dry=True):
             with retention.locked(path):
                 pass
-
-    def test_pending_job_keeps_its_attempt_even_without_live_process(self):
-        attempt = self.state / "verification" / "old"
-        attempt.mkdir(parents=True)
-        (attempt / "receipt.json").write_text("evidence")
-        os.utime(attempt, (0, 0))
-        atomic_json(self.state / "verification-pending/job.json", dict(receipt=str(attempt / "receipt.json")))
-        result = retention.sweep(now=self.clock)
-        self.assertTrue(attempt.exists())
-        self.assertIn(str(attempt), result["protected"])
-
-    def test_pending_reference_through_a_root_alias_keeps_its_attempt(self):
-        alias = self.root / "state-alias"
-        alias.symlink_to(self.state, target_is_directory=True)
-        attempt = self.state / "verification/old"
-        attempt.mkdir(parents=True)
-        os.utime(attempt, (0, 0))
-        atomic_json(self.state / "verification-pending/job.json", dict(receipt=str(alias / "verification/old/receipt")))
-        retention.sweep(now=self.clock)
-        self.assertTrue(attempt.exists())
-
-    def test_pending_bubble_paths_keep_the_host_attempt(self):
-        state = self.state / "verification-state"
-        attempt = state / "verification/old"
-        attempt.mkdir(parents=True)
-        (attempt / "receipt.json").write_text("needed bubble receipt")
-        atomic_json(
-            state / "verification-pending/job.json",
-            dict(
-                lease="/opt/verification-state/verification/old/live.lock",
-                receipt="/opt/verification-state/verification/old/receipt.json",
-            ),
-        )
-        os.utime(attempt, (0, 0))
-        retention.sweep(now=self.clock)
-        self.assertTrue((attempt / "receipt.json").exists())
-
-    def test_pending_verification_keeps_its_source_checkout_until_completed(self):
-        self.old()
-        self.cache()
-        source = self.checkout / "Source.lean"
-        source.write_text("pending exact candidate")
-        pending = self.state / "verification-pending/job.json"
-        atomic_json(pending, dict(root=str(self.checkout)))
-        report = retention.sweep(now=self.clock)
-        self.assertEqual(source.read_text(), "pending exact candidate")
-        self.assertIn(str(self.checkout), report["protected"])
-        pending.unlink()
-        report = retention.fresh_report()
-        retention.collect_retired(self.cfg, report, now=self.clock, discard_checkout=True)
-        self.assertFalse(self.checkout.exists())
-        self.assertEqual(len(list(work_recovery.records(self.state.parent))), 1)
-
-    def test_interrupted_deletion_obeys_live_job_lock_and_pending_reference(self):
-        trash = self.checkout / ".lake.retention-deleting"
-        trash.mkdir()
-        artifact = trash / "artifact"
-        artifact.write_text("still needed")
-        with retention.locked(self.state / "verification-jobs/job.lock"):
-            retention.recycle(self.cfg, now=self.clock)
-        self.assertTrue(artifact.exists())
-        pending = self.state / "verification-pending/job.json"
-        atomic_json(pending, dict(root=str(trash)))
-        retention.recycle(self.cfg, now=self.clock)
-        self.assertTrue(artifact.exists())
-        pending.unlink()
-        retention.recycle(self.cfg, now=self.clock)
-        self.assertFalse(artifact.exists())
 
     def test_partial_cache_failure_does_not_recycle_new_caches_next_round(self):
         self.old()
@@ -1282,6 +1203,85 @@ print('{"result":"kept on protocol stdout"}', flush=True)
         worker_manager.rotate_log(other, limit=10)  # this process does not write it
         self.assertEqual(other.read_bytes(), b"y" * 11)
         worker_manager.rotate_log(self.root / "missing.log")
+
+    def legacy_verification_state(self, state):
+        """An older release's continuation state, with links into shared Mathlib and a workspace."""
+        shared = self.root / "pool" / "mathlib-source"
+        (shared / "Mathlib").mkdir(parents=True, exist_ok=True)
+        (shared / "Mathlib" / "Basic.lean").write_text("shared")
+        candidate = state / "verification-candidates" / ("c" * 32)
+        (candidate / ".lake/packages").mkdir(parents=True)
+        (candidate / ".lake/packages/mathlib").symlink_to(shared, target_is_directory=True)
+        os.link(self.checkout / "Source.lean", candidate / "Source.lean")
+        (candidate / ".lake/build").mkdir()
+        (candidate / ".lake/build/out.olean").write_text("x" * 4096)
+        atomic_json(state / "verification-pending" / ("c" * 32 + ".json"), dict(root=str(candidate)))
+        (state / "verification-jobs").mkdir(parents=True)
+        (state / "verification-jobs" / ("c" * 32 + ".lock")).touch()
+        atomic_json(state / "verification-copy-incomplete" / ("c" * 32 + ".json"), dict(version=1))
+        atomic_json(state / "verification-job-index" / ("d" * 64 + ".json"), dict(id="c" * 32))
+        return shared
+
+    def assert_legacy_verification_deleted(self, state, shared):
+        for name in retention.LEGACY_VERIFICATION:
+            self.assertFalse((state / name).exists(), name)
+            self.assertFalse((state / (name + ".retention-deleting")).exists(), name)
+        self.assertEqual((shared / "Mathlib" / "Basic.lean").read_text(), "shared")
+        self.assertEqual((self.checkout / "Source.lean").read_text(), "original\n")
+
+    def test_round_start_deletes_legacy_verification_continuation_state(self):
+        receipt = self.state / "verification" / "kept" / "receipt.json"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text("{}")
+        checkpoint = self.state / "verification-checkpoints" / ("b" * 64) / "checkpoint.json"
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.write_text("{}")
+        shared = self.legacy_verification_state(self.state)
+        bubble = self.legacy_verification_state(self.state / "verification-state")
+        with round_.RoundContext(self.cfg):
+            pass
+        self.assert_legacy_verification_deleted(self.state, shared)
+        self.assert_legacy_verification_deleted(self.state / "verification-state", bubble)
+        self.assertTrue(receipt.is_file())
+        self.assertTrue(checkpoint.is_file())
+
+    def test_legacy_verification_cleanup_never_follows_symlinks(self):
+        outside = self.root / "outside-candidates"
+        (outside / ("c" * 32)).mkdir(parents=True)
+        (outside / ("c" * 32) / "keep").write_text("not ours")
+        (self.state / "verification-candidates").symlink_to(outside, target_is_directory=True)
+        elsewhere = self.root / "outside-bubble-state"
+        (elsewhere / "verification-pending").mkdir(parents=True)
+        (elsewhere / "verification-pending" / "job.json").write_text("{}")
+        (self.state / "verification-state").symlink_to(elsewhere, target_is_directory=True)
+        report = retention.purge_legacy_verification(self.state, retention.fresh_report())
+        self.assertEqual((outside / ("c" * 32) / "keep").read_text(), "not ours")
+        self.assertTrue((elsewhere / "verification-pending" / "job.json").exists())
+        self.assertIn(str(self.state / "verification-candidates"), report["protected"])
+
+    def test_legacy_verification_cleanup_spares_a_tree_in_use_until_released(self):
+        shared = self.legacy_verification_state(self.state)
+        candidate = self.state / "verification-candidates"
+        with patch.object(
+            work_recovery, "live_users", side_effect=lambda path, **_: ["1 (lake)"] if path == candidate else []
+        ):
+            report = retention.purge_legacy_verification(self.state, retention.fresh_report())
+        self.assertTrue(candidate.exists())
+        self.assertIn(str(candidate), report["protected"])
+        self.assertFalse((self.state / "verification-pending").exists())
+        retention.purge_legacy_verification(self.state, retention.fresh_report())
+        self.assert_legacy_verification_deleted(self.state, shared)
+
+    def test_cleanup_collector_deletes_legacy_verification_state_of_idle_workers(self):
+        shared = self.legacy_verification_state(self.state)
+        retention.sweep(now=self.clock)
+        self.assert_legacy_verification_deleted(self.state, shared)
+
+    def test_cleanup_collector_deletes_legacy_verification_state_of_live_workers(self):
+        shared = self.legacy_verification_state(self.state)
+        with patch.object(retention, "workspace_idle", return_value=False):
+            retention.sweep(now=self.clock)
+        self.assert_legacy_verification_deleted(self.state, shared)
 
     def test_round_start_requests_the_fallback_collector(self):
         with round_.RoundContext(self.cfg):
