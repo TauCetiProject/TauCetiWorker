@@ -118,8 +118,9 @@ def relevant_comment(comment):
 
 
 class AdmissionPolicy:
-    def __init__(self, *, rubrics, prefix: str, allow_files):
+    def __init__(self, *, rubrics, prefix: str, allow_files, repository: str = ""):
         self.rubrics = tuple(rubrics)
+        self.repository = repository
         self.prefix = prefix
         self.allow_files = tuple(allow_files)
         if not self.rubrics or not prefix or not all(self.rubrics):
@@ -144,17 +145,34 @@ class AdmissionPolicy:
             }
         )
 
+    def rubrics_for(self, number):
+        """The rubrics PR `number` must have green: the configured ones, then any the pinned review
+        policy is phasing in for this repository's PRs above its cutoff.
+
+        The review engine runs a rubric being phased in only on those PRs, so requiring it of an
+        earlier one would hold that PR for a row no review adds. The table is the pinned policy's:
+        it reaches this service when the pin moves, and a pin that predates it requires the
+        configured rubrics of every PR. Each forge numbers its own PRs, so the table has a cutoff
+        for each repository: the GitHub service names its repository `owner/name`, and a native
+        source names its own by its qualified key. A policy that names none takes no phased rubric.
+        """
+        phased = getattr(policy, "with_phased_rubrics", None)
+        if phased is None or not self.repository:
+            return self.rubrics
+        return tuple(phased(self.rubrics, self.repository, number))
+
     def evaluate(self, snapshot):
+        rubrics = self.rubrics_for(snapshot.pull.number)
         result = policy.decide_from_comments(
             snapshot.comments,
             snapshot.pull.head_sha,
-            set(self.rubrics),
+            set(rubrics),
             snapshot.paths,
             snapshot.statuses.get("build", ""),
             snapshot.statuses.get("bump-guard", ""),
             merge_path_prefix=self.prefix,
             merge_allow_file=self.allow_files,
-            table_rubrics=self.rubrics,
+            table_rubrics=rubrics,
             scope=snapshot.statuses.get("scope", ""),
             merge_base_sha=snapshot.merge_base_sha,
             self_tested=accepted(
@@ -168,7 +186,7 @@ class AdmissionPolicy:
         comment, meta = board if board else ({}, {})
         states = meta.get("states")
         if not isinstance(states, dict) or not states:
-            states = policy.states_from_table(comment.get("body"), self.rubrics)
+            states = policy.states_from_table(comment.get("body"), rubrics)
         # CI/configuration, formatting, timestamps, costs and token accounting are not approval intent.
         authorization = (
             dumps(
