@@ -96,8 +96,7 @@ allowance.
 Publication retains the rendered plan before writing. Findings are published
 and read back before the scoreboard. Retrying adopts the same remote markers.
 A changed head supersedes an older publication. Pending publication is reconciled
-before provider selection or another paid review on that head. Repair recovery checks the original
-source repository and native actor IDs. Failed reviews release generated source
+before provider selection or another paid review on that head. Failed reviews release generated source
 inputs after retaining any paid plan; crash cleanup requires a stopped owner
 and no surviving users. Reviews reuse the existing shared Mathlib source cache.
 Small publication receipts remain alongside the existing ledger and archive

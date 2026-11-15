@@ -405,6 +405,30 @@ class OverTheController(unittest.TestCase):
     """The feeds generated from the real controller's records (tauceti_queue.controller over the
     end-to-end fakes): an approved PR inserted into the open batch, sealed into a head and built."""
 
+    def test_feed_snapshot_keeps_one_committed_generation_and_refreshes_for_the_next_request(self):
+        import tempfile
+
+        from tauceti_queue import fakes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            controller, github, _repo, _clock = fakes.make_controller(tmp)
+            self.addCleanup(controller.store.close)
+            head = github.create_pr(101, {"A.lean": "a\n"})
+            controller.approve(TAUCETI, 101, head, "reviewer")
+            controller.tick()
+            source = feeds.ControllerFeedSource(controller)
+            controller.batches = lambda *_: self.fail("feed escaped its own store snapshot")
+            with feeds.read_snapshot(source) as snapshot:
+                before = feeds.observation_feed(snapshot, TAUCETI, "main", now=1000)
+                batch = before["batch_ids"][0]
+                controller.store.update("batches", {"id": batch}, state="landed")
+                self.assertEqual(feeds.observation_feed(snapshot, TAUCETI, "main", now=1000), before)
+            with feeds.read_snapshot(source) as snapshot:
+                self.assertEqual(
+                    feeds.observation_feed(snapshot, TAUCETI, "main")["batch_ids"],
+                    [number for number in before["batch_ids"] if number != batch],
+                )
+
     def test_feeds_from_a_live_controller(self):
         import tempfile
 

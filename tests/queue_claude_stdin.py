@@ -21,7 +21,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tauceti_queue import repair, repair_task
 from tauceti_worker import agents
-from tauceti_worker.repair_recovery import environment
+from tauceti_worker.config import environment
 
 
 class API(http.server.ThreadingHTTPServer):

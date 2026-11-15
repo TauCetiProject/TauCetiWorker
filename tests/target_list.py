@@ -1056,6 +1056,37 @@ class LandingBase(unittest.TestCase):
             self.assertIn(f"Your target is assigned: `{assigned}` in `Algebra`", prompt, (base, marked))
             self.claims.begin_target_work.assert_called_once_with("Algebra", assigned)
 
+    def test_the_per_item_search_counts_only_landings_on_the_base(self):
+        """30 newer landings of the same item on another branch must not hide the one on the base."""
+        item = t.TargetItem("Algebra", "prerequisite", "open", "p")
+        body = marker("Algebra", "prerequisite")
+        fixture = Forgejo()
+        fixture.setUp()
+        fixture.found = [
+            [{"number": n, "body": body, "pull_request": {"merged": True}} for n in range(100, 130)]
+            + [{"number": 31, "body": body, "pull_request": {"merged": True}}]
+        ]
+        fixture.api.pull.side_effect = lambda _r, n: {
+            "number": n,
+            "base": {"ref": "main" if n == 31 else "integration"},
+        }
+        self.assertEqual(t.landed_pr(item, fixture.source), 31)
+        fixture.closed = [
+            [Forgejo.pull(n, body, base="integration") for n in range(100, 130)] + [Forgejo.pull(31, body)]
+        ]
+        self.assertEqual([d["number"] for d in fixture.source.merged_prs(t.MERGED_SEARCH, limit=1)], [31])
+        searches = []
+        gh = SimpleNamespace(open_prs=lambda: [], merged_prs=lambda search, limit: searches.append(search) or [])
+        t.landed_pr(item, gh)
+        t.live_targets(t.parse_targets(self.LIST), gh)
+        self.assertTrue(searches and all("base:main" in search.split() for search in searches), searches)
+        reads = SimpleNamespace(
+            target_marker_prs=Mock(side_effect=lambda limit, search="": [] if search else GitHubHistoryLookup.NEWER)
+        )
+        with patch("tauceti_worker.worker_sources.shared_github_environment", contextlib.nullcontext):
+            t.landed_pr(item, t.GitHubMarkerReads(reads))
+        self.assertIn("base:main", reads.target_marker_prs.call_args.kwargs["search"].split())
+
     def test_the_base_branch_setting_names_the_content_base(self):
         row = {"number": 41, "body": marker("Algebra", "prerequisite"), "baseRefName": "integration"}
         item = t.TargetItem("Algebra", "prerequisite", "open", "p")

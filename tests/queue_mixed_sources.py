@@ -947,17 +947,27 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         intent = loads(self.controller.store.row("outbox", {"id": entry["id"]})["payload"])
         self.assertEqual(intent["promotion_send"]["state"], "settled")
 
-    def test_changed_original_native_head_cannot_land_cached_pass(self):
-        original = self.repo.main_sha()
+    def test_mutable_original_prs_do_not_withdraw_frozen_staged_contributions(self):
         frozen = self.start_mixed()
-        self.native.create_pr(17, {"Native.lean": "changed\n"})
+        for port, filename in ((self.native, "Native.lean"), (self.github, "Github.lean")):
+            port.push_pr(17, {filename: "changed after staging\n"})
+            port.prs[17].update(state="closed", draft=True, base_ref="other")
+            port.labels[17] = {"awaiting-author", "hold"}
         self.execution.add(frozen, classification="passed")
         self.clock.advance(60)
         self.controller.tick()
-        self.assertEqual(self.repo.main_sha(), original)
-        attempt = self.controller.store.row("ci_attempts", {"id": frozen.attempt_id})
-        self.assertEqual(attempt["outcome"], "pending")
-        self.assertIn("reconciliation-required", attempt["outcome_detail"])
+        self.assertEqual(self.repo.main_sha(), frozen.request.head, self.controller._reasons)
+        self.assertEqual(len(self.execution.dispatches), 1)
+
+    def test_changed_frozen_membership_still_refuses_promotion(self):
+        from tauceti_queue.ports import PromotionRefused
+
+        frozen = self.start_mixed()
+        self.execution.add(frozen, classification="passed")
+        members = self.controller._members(1)
+        members[0] = {**members[0], "accepted_head": "a" * 40}
+        with self.assertRaisesRegex(PromotionRefused, "membership changed"):
+            self.ci.verify_promotion(frozen.attempt_id, members, self.controller.source)
 
     def test_primary_changes_reuse_running_exact_ci_and_keep_source_attribution(self):
         frozen = self.start_mixed()

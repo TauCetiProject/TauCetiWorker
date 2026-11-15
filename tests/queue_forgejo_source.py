@@ -1181,6 +1181,58 @@ class NativeSource(unittest.TestCase):
         self.assertEqual(result["recovery_heads"], ["c" * 40])
         self.assertTrue(result["merge"], result)
 
+    def test_a_phased_rubric_is_required_by_this_sources_own_cutoff(self):
+        from tauceti_queue.admission import policy as review_policy
+        from tauceti_queue.mixed_identity import SourceNumber
+        from tauceti_queue.mixed_native import MixedNativePolicy
+
+        def with_phased_rubrics(rubrics, repo, pr):
+            # GitHub's repository of the same name has its own, far higher, cutoff.
+            cutoff = {self.repository.key: 3, self.repository.name: 100}.get(repo)
+            return [*rubrics, "quality-pass"] if cutoff is not None and int(pr) > cutoff else list(rubrics)
+
+        def merges(policy, number, states):
+            meta = {"head_sha": "a" * 40, "merge_base_sha": "b" * 40, "states": states}
+            body = "<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 " + json.dumps(meta) + "-->"
+            snapshot = ports.AdmissionSnapshot(
+                ports.PullRequest(number, "a" * 40, "main", "Proof", "", "author", "open"),
+                "b" * 40,
+                ("Math/A.lean",),
+                (self.comment(body=body),),
+                {"build": "success", "scope": "success"},
+            )
+            return policy.evaluate(snapshot)[0]["merge"]
+
+        mixed = MixedNativePolicy(self.publishers, rubrics=("proof",), prefix="Math/", allow_files=())
+        unnamed = NativeAdmissionPolicy(
+            self.publishers, rubrics=("proof",), prefix="Math/", allow_files=(), repository=""
+        )
+        with patch.object(review_policy, "with_phased_rubrics", with_phased_rubrics, create=True):
+            for policy in (self.policy, mixed):
+                self.assertEqual(policy.rubrics_for(3), ("proof",))
+                self.assertEqual(policy.rubrics_for(SourceNumber(4, self.identity)), ("proof", "quality-pass"))
+                self.assertTrue(merges(policy, 3, {"proof": "green"}))
+                self.assertFalse(merges(policy, 4, {"proof": "green"}))
+                self.assertFalse(merges(policy, 4, {"proof": "green", "quality-pass": "blocking_request"}))
+                self.assertTrue(merges(policy, 4, {"proof": "green", "quality-pass": "green"}))
+            self.assertEqual(unnamed.rubrics_for(4), ("proof",))
+        with patch.object(review_policy, "with_phased_rubrics", None, create=True):
+            self.assertEqual(self.policy.rubrics_for(4), ("proof",), "a pin that predates the table")
+        # Naming the repository must not re-evaluate every open PR when this is deployed.
+        self.assertEqual(unnamed.revision, self.policy.revision)
+
+    def test_the_pinned_table_names_a_native_repository_by_its_qualified_key(self):
+        from tauceti_queue.admission import policy as review_policy
+
+        table = getattr(review_policy, "PHASED_RUBRICS", None)
+        if table is None or not hasattr(review_policy, "repository_key"):
+            self.skipTest("the pinned review policy predates per-forge cutoffs")
+        with patch.dict(table, {"quality-pass": {self.repository.key: 3, self.repository.name: 100}}):
+            self.assertEqual(self.policy.rubrics_for(3), ("proof",))
+            self.assertEqual(self.policy.rubrics_for(4), ("proof", "quality-pass"))
+        with patch.dict(table, {"quality-pass": {self.repository.name: 3}}):
+            self.assertEqual(self.policy.rubrics_for(4), ("proof",), "a GitHub cutoff is not this source's")
+
     def test_only_an_explicit_recovery_publisher_can_clear_an_attested_hold(self):
         hold = self.comment(
             actor=self.queue,

@@ -1,8 +1,8 @@
 """Attest a locally verified automatic Mathlib bump head with the `self-tested` label.
 
-A bump repair round pushes a new head and then waits 2.5 to 4.5 hours for the ordinary PR build
-before it can be reviewed, while main keeps moving under it. After a host round pushes a bump head,
-the worker itself runs the full local verifier (`tauceti verify`, bump policy: whole-library
+A bump head otherwise waits 2.5 to 4.5 hours for the ordinary PR build before it can be reviewed,
+while main keeps moving under it. After a host bump round, whether it pushed a repair or found the
+head needed none, the worker itself runs the full local verifier (`tauceti verify`, bump policy: whole-library
 `lake build --iofail` against the new Mathlib, local axiom, module-system, lint and shim checks) on
 that exact commit. Only when the verifier succeeds and GitHub still reports that commit as the
 PR head does the worker apply `self-tested`. The TauCeti picker then decides eligibility itself
@@ -12,7 +12,7 @@ PR head does the worker apply `self-tested`. The TauCeti picker then decides eli
 The agent's own checks are never taken on trust: no receipt or model statement is consulted, only
 the verifier's result for the checkout whose HEAD equals the live PR head. Anything unexpected
 (bubble rounds, a dirty checkout, a moved head, an unreadable PR, a failed or incomplete
-verification) leaves the PR on ordinary CI, which the push has already started.
+verification) leaves the PR on ordinary CI.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def _bump_pull(live, head: str) -> str:
 
 def verify(w, checkout, base: str) -> dict:
     """Run the worker's verifier on `checkout` with the host build-cache view the agent used."""
-    from .agents import host_build_cache_context
+    from .agents import host_build_cache_context, relink_build_outputs
     from .processes import run as run_process
 
     env = dict(os.environ, TAUCETI_VERIFY_STATE=str(w.cfg.state), TAUCETI_VERIFY_POLICY="bump")
@@ -75,14 +75,16 @@ def verify(w, checkout, base: str) -> dict:
             )
         except subprocess.TimeoutExpired:
             return dict(status="incomplete", error=f"verification exceeded {VERIFY_TIMEOUT_S // 60} minutes")
+        # H3: a trusted build with no agent alongside; relinking is space, not a verdict.
+        relink_build_outputs(checkout, env, phase="verify")
     try:
         return json.loads(checked.stdout)
     except ValueError:
         return dict(status="incomplete", error=f"verifier produced no result; see {logpath}")
 
 
-def attest(w, pr: int, before: str, *, bubble: bool, sleep=time.sleep, clock=time.monotonic) -> str:
-    """Label a verified, newly pushed bump head `self-tested`; return a one-line outcome."""
+def attest(w, pr: int, *, bubble: bool, sleep=time.sleep, clock=time.monotonic) -> str:
+    """Label the verified bump head left by a round `self-tested`; return a one-line outcome."""
     if bubble:
         return "skipped: bubble rounds keep ordinary CI"
     if os.environ.get("TAUCETI_BUMP_SELF_TESTED", "1") == "0":
@@ -94,8 +96,6 @@ def attest(w, pr: int, before: str, *, bubble: bool, sleep=time.sleep, clock=tim
         base = git(checkout, "rev-parse", "--verify", "origin/main").decode().strip()
     except (OSError, subprocess.CalledProcessError) as error:
         return f"skipped: checkout unreadable ({error})"
-    if head == before:
-        return "skipped: the round pushed no new head"
     if dirty:
         return "skipped: checkout has uncommitted changes"
     if why := _bump_pull(w.gh.live_pull(pr), head):

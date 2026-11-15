@@ -249,7 +249,13 @@ class ServerTest(unittest.TestCase):
         status, header, ordinary = fetch(path)
         self.assertEqual(status, 200)
         self.assertIsNone(header)  # compatibility FeedSource makes no frozen claim
-        native = feeds.ControllerFeedSource(object())
+        from types import SimpleNamespace
+
+        from tauceti_queue.store import Store
+
+        store = Store()
+        self.addCleanup(store.close)
+        native = feeds.ControllerFeedSource(SimpleNamespace(store=store))
         with (
             patch.object(feeds, "feed_source", return_value=native),
             patch.object(feeds, "observation_feed", return_value=ordinary),
