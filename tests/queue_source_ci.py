@@ -586,6 +586,20 @@ class SourceController(unittest.TestCase):
             ["source-ci:binding", "source-ci:epoch"],
         )
 
+    def test_verified_source_failure_supplies_actual_findings_to_repair(self):
+        attempt = self.start()
+        frozen = self.ledger.load(attempt["id"])
+        self.execution.add(frozen, classification="source_failure")
+        digest, original = self.execution.runs["101"]
+        finding = {"kind": "lint", "module": "", "message": "lint driver timed out (exit 124)"}
+        self.execution.runs["101"] = (digest, replace(original, run=replace(original.run, diagnostics=(finding,))))
+        self.clock.advance(60)
+        self.controller.tick()
+        import json
+        task = self.store.rows("tasks", {"kind": "repair"})[-1]
+        self.assertIn(finding, json.loads(task["diagnostics"]))
+        self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "source-failure")
+
     def test_transient_result_outage_after_completion_grace_preserves_source_failure(self):
         attempt = self.start()
         frozen = self.ledger.load(attempt["id"])

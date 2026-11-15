@@ -6087,7 +6087,7 @@ class Controller:
                 )
                 if outcome == OUTCOME_SOURCE_FAILURE:
                     values["diagnostics"] = dumps(
-                        [
+                        list(run.diagnostics) or [
                             {
                                 "kind": "status",
                                 "module": "",
