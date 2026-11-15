@@ -2841,6 +2841,26 @@ class TickBudget(ControllerCase):
 
 
 class OutboxBatching(ControllerCase):
+    def test_control_operations_run_ahead_of_landing_notifications_within_the_drain_budget(self):
+        self.controller.set_setting("outbox_drain_budget_seconds", 0, "t")
+        self.controller._enqueue("comment", "old-comment", {})
+        self.controller._enqueue("labels", "old-labels", {})
+        control = ["mixed-sync", "cancel_run", "retry_status_delivery", "promote"]
+        for kind in control:
+            self.controller._enqueue(kind, kind, {})
+        performed = []
+
+        def perform(kind, payload, now):
+            performed.append(kind)
+            return "done"
+
+        self.controller._perform = perform
+        for length in range(1, 7):
+            self.controller._drain_outbox(self.clock())
+            self.assertEqual(len(performed), length, "the one-operation drain budget is preserved")
+        self.assertEqual(performed, [*control, "comment", "labels"])
+        self.assertEqual(self.controller.store.count("outbox", {"state": "pending"}), 0)
+
     def retains(self, state):
         return self.controller.store.rows("outbox", {"kind": "retain_ref", "state": state}, order="id")
 
