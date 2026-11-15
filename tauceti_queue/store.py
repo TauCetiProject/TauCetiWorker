@@ -384,6 +384,28 @@ class Store:
         self._add_missing_columns()
         self._connection.executescript(SCHEMA)
 
+    @contextmanager
+    def read_snapshot(self):
+        """A fresh committed WAL snapshot without holding the controller's connection lock."""
+        if str(self.path) == ":memory:":
+            with self._lock:
+                yield self
+            return
+        snapshot = Store.__new__(Store)
+        snapshot.path = self.path
+        snapshot._connection = sqlite3.connect(
+            "file:" + urllib.parse.quote(str(self.path)) + "?mode=ro", uri=True, isolation_level=None
+        )
+        snapshot._connection.row_factory = sqlite3.Row
+        snapshot._lock = threading.RLock()
+        snapshot._depth = 0
+        try:
+            snapshot._connection.execute("PRAGMA query_only=ON")
+            snapshot._connection.execute("BEGIN")
+            yield snapshot
+        finally:
+            snapshot._connection.close()
+
     def _add_missing_columns(self) -> None:
         """Add to each table every column `SCHEMA` declares that the database's table lacks.
 
