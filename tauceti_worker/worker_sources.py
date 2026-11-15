@@ -46,6 +46,19 @@ def pull_url(number):
     return (source.repository if source else RepositoryRef(GITHUB, TAUCETI)).pull_url(number)
 
 
+def resolve_selection(github, forgejo, new_pr_forge=None):
+    """Validate the source switches shared by direct and managed workers."""
+    if not github and not forgejo:
+        raise Die("enable at least one source with --github or --forgejo")
+    requested = "both" if github and forgejo else "github" if github else "forgejo"
+    destination = new_pr_forge or "github"
+    if destination not in ("github", "forgejo"):
+        raise Die("new PR forge must be github or forgejo")
+    if requested != "both" and destination != requested and new_pr_forge is not None:
+        raise Die("the new PR forge must be among the selected forges")
+    return requested, destination
+
+
 def configure(args):
     github = getattr(args, "github", None)
     forgejo = getattr(args, "forgejo", None)
@@ -61,14 +74,7 @@ def configure(args):
         # project configuration must never turn an ordinary worker into a trial.
         github = True if github is None else github
         forgejo = False if forgejo is None else forgejo
-    if not github and not forgejo:
-        raise Die("enable at least one source with --github or --forgejo")
-    requested = "both" if github and forgejo else "github" if github else "forgejo"
-    destination = getattr(args, "new_pr_forge", None) or "github"
-    if destination not in ("github", "forgejo"):
-        raise Die("new PR forge must be github or forgejo")
-    if requested != "both" and destination != requested and getattr(args, "new_pr_forge", None) is not None:
-        raise Die("the new PR forge must be among the selected forges")
+    requested, destination = resolve_selection(github, forgejo, getattr(args, "new_pr_forge", None))
     if (getattr(args, "pr", None) or os.environ.get("TAUCETI_PR", "").strip()) and requested == "both":
         raise Die("numeric --pr targets need one source: use --no-github --forgejo or --no-forgejo")
     if (
