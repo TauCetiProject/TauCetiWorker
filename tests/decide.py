@@ -1239,6 +1239,20 @@ def test_close(tmp):
         ("an ordinary string holding a closer", '"-/"'),
     ):
         check(f"a declaration after {kind} is still read", lexed(marker), (False, "#41 do not add `missingFact`", []))
+    quoted = "+++ b/A.lean\n@@ -0,0 +1,2 @@\n+theorem «shared fact» : True := trivial\n"
+    check(
+        "a quoted name is read whole, also inside a qualified name",
+        (
+            attempt(
+                Hub(
+                    p1={"diff": quoted + "+theorem «shared missing» : True := trivial\n"},
+                    p41={"state": "MERGED", "diff": quoted},
+                )
+            )[:2],
+            decide.added_declarations("+++ b/A.lean\n@@ -0,0 +1 @@\n+def Foo.«bar baz».qux : Nat := 1\n"),
+        ),
+        ((False, "#41 do not add `«shared missing»`"), {"Foo.«bar baz».qux"}),
+    )
     check(
         "a name ending in ?'x' is read whole",
         lexed('"x"', name="already_covered?'x'")[:2],

@@ -818,7 +818,7 @@ CLOSURES = "closures.log"
 _DECLARATION = re.compile(
     r"^\s*(?:@\[[^\]]*\]\s*)*(?P<modifiers>(?:(?:private|protected|noncomputable|unsafe|partial|nonrec|scoped|local)\s+)*)"
     r"(?:theorem|lemma|def|abbrev|instance|structure|class(?:\s+inductive)?|inductive|opaque|axiom)\s+"
-    r"(?:\(\s*priority\s*:=[^)]*\)\s*)?(?P<name>[^\s:(\[{⦃⟨⟪|,]+)"
+    r"(?:\(\s*priority\s*:=[^)]*\)\s*)?(?P<name>(?:«[^»]*»|[^\s:(\[{⦃⟨⟪|,«])+)"
 )
 
 
