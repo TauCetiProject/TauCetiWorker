@@ -512,13 +512,14 @@ def self_tested_guidance(policy: str) -> str:
     if policy != "ordinary" or enabled():
         return ""
     return (
-        "### Apply the self-tested label after verification\n"
-        "For an ordinary mathematics PR entirely under `TauCeti/`, after the final source changes "
+        "### Verification for self-tested publication\n"
+        "For an ordinary mathematics PR entirely under `TauCeti/`, after the final source changes, "
         "successfully complete the local verification below (equivalent to "
         "`lake build --iofail && lake test && lake lint`). Wait for its successful exit; "
         "failed, incomplete, or outdated checks do not qualify. Reuse successful checks whose inputs "
         "have not changed; this adds no verification pass.\n"
         "Create new PRs through the existing "
+        "worker flow; leave the self-tested label and assertion to the worker. Use the "
         "`gh-safe-pr-create` wrapper; do not bypass it. After creation or pushing an update, "
         "confirm the live PR commit matches your verified commit. After the round, the worker applies "
         "`self-tested` and confirms a PR/head-bound assertion through the selected forge, only for "

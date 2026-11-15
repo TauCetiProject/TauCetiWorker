@@ -28,10 +28,6 @@ from .bump_attestation import LABEL, confirm_label
 from .verification import SCHEMA, STAGES, digest
 from .verification_scope import git, local_main
 
-STAGES_PUSHING = {"fix", "fix-ci", "rebase", "roadmap", "lint-repair"}
-CANONICAL_URL = "https://github.com/taucetiproject/tauceti"
-
-
 def enabled() -> str:
     """Why the worker must not label anything, or "" when the self-tested route is on."""
     from .worker_sources import canonical_mathematics_source
@@ -207,14 +203,14 @@ def label_push(w, stage: str, pr: int, commit: str, since: float, *, sleep=time.
     live = w.gh.live_pull(pr)
     if not live:
         return "not eligible (PR unreadable)"
+    if why := _live_reason(live, commit):
+        return f"not eligible ({why})"
     if (
         live.get("head", {}).get("sha") == commit
         and LABEL in _labels(live)
         and w.gh.commit_status(commit, f"self-tested/{pr}") == "success"
     ):
         return "already labelled"
-    if why := _live_reason(live, commit):
-        return f"not eligible ({why})"
     checkout = w.cfg.checkout
     receipt, base = matching_receipt(Path(w.cfg.state), checkout, commit, since)
     if receipt is None:
@@ -239,7 +235,7 @@ def label_push(w, stage: str, pr: int, commit: str, since: float, *, sleep=time.
         return "not labelled: adding the label failed"
     if outcome.startswith("stopped: "):
         return f"self-tested stopped for {commit[:12]}: {outcome.removeprefix('stopped: ')}"
-    return f"labelled {commit[:12]}; assertion not observed, ordinary CI continues"
+    return f"self-tested unconfirmed for {commit[:12]}; reviews and staging CI still apply"
 
 
 def round_pushes(c) -> list[tuple[int | None, str, str]]:

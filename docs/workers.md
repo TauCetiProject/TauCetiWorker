@@ -99,7 +99,8 @@ GitHub confirms through its existing picker. Forgejo confirms through the
 existing private native publisher policy, using the enrolled status publisher's
 native identity and repository permission. The native worker attests only its
 own PRs and respects existing refusals. Provision the `self-tested` repository
-label before enabling this route; no additional publisher grants are needed.
+label before enabling this route. This rollout reuses the enrolled worker
+identity and does not change publisher grants.
 
 The accepted observation requires both the label and a trusted
 `self-tested/<PR number>` success on the current head. A label left on a Forgejo

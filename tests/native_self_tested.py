@@ -115,13 +115,20 @@ class NativeSelfTested(unittest.TestCase):
         self.assertEqual(self.confirm(), "accepted")
         self.record["publishers"]["generation"] = "2" * 32
         self.save_policy()
-        self.assertEqual(self.source.commit_status("a" * 40, "self-tested/1"), "error")
+        self.assertEqual(self.source.commit_status("a" * 40, "self-tested/1"), "")
+        newest = copy.deepcopy(self.fixture.status_rows[-1])
+        newest.update(id=101, creator=dict(id=999, login="outsider"))
+        self.fixture.status_rows.append(newest)
+        self.assertEqual(self.source.commit_status("a" * 40, "self-tested/1"), "")
+        # Freshly verified publication can replace expired or untrusted rows,
+        # but cannot revive a policy generation already retired by this host.
+        self.assertEqual(self.confirm(), "accepted")
+        self.assertEqual(self.fixture.status_rows[-1]["description"], "tauceti-ci-status/v1:" + "2" * 32)
+        before = len(self.fixture.status_rows)
         self.record["publishers"]["generation"] = self.fixture.publishers.generation
         self.save_policy()
-        newest = copy.deepcopy(self.fixture.status_rows[-1])
-        newest.update(id=999, creator=dict(id=999, login="outsider"))
-        self.fixture.status_rows.append(newest)
-        self.assertEqual(self.source.commit_status("a" * 40, "self-tested/1"), "error")
+        self.assertEqual(self.confirm(), "unobserved")
+        self.assertEqual(len(self.fixture.status_rows), before)
 
     def test_moved_closed_draft_held_scope_never_publishes(self):
         for key, value in (

@@ -34,12 +34,12 @@ REVIEW_CONTEXT = "tauceti-review/"
 RECOVERY_CONTEXT = "tauceti-recovery/"
 
 
-def ci_status_state(row, publishers, permission):
+def ci_status_state(row, publishers, permission, *, invalid="error"):
     """One native status authority check shared by queue and worker observations."""
     try:
         actor = SourceActor.from_native(publishers.source.repository.forge, row.get("creator"))
     except Incomplete:
-        return "error"
+        return invalid
     try:
         writable = actor.principal in publishers.statuses and permission(actor) in {"write", "admin", "owner"}
     except ForgeError as error:
@@ -52,7 +52,7 @@ def ci_status_state(row, publishers, permission):
         and row.get("description") == "tauceti-ci-status/v1:" + publishers.generation
         and state in {"pending", "success", "error", "failure", "warning"}
     )
-    return state if valid else "error"
+    return state if valid else invalid
 
 
 class PublicationSuperseded(RuntimeError):

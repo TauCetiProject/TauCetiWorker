@@ -322,12 +322,12 @@ def main():
             for policy in ("bump", "full-lint", "lint-repair"):
                 check(
                     f"self-tested helper={helper}: excludes {policy}",
-                    "Apply the self-tested label after verification" not in tc.agents.local_verification(policy),
+                    "Verification for self-tested publication" not in tc.agents.local_verification(policy),
                 )
         with patch.dict(os.environ, TAUCETI_SELF_TESTED="0"):
             check(
                 f"self-tested helper={helper}: off by default",
-                "Apply the self-tested label after verification" not in tc.agents.local_verification("ordinary"),
+                "Verification for self-tested publication" not in tc.agents.local_verification("ordinary"),
             )
 
     with (

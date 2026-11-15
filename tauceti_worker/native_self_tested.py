@@ -41,7 +41,14 @@ def status(source, head, context, *, publication=None, permission=None):
     if any(type(row.get("id")) is not int or row["id"] < 1 for row in rows):
         raise Incomplete("native self-tested status identity is unavailable")
     row = max(rows, key=lambda row: row["id"])
-    return ci_status_state(row, publication.publishers, permission or publication.adapter()._permission)
+    if permission is None:
+        # Reuse the review publisher's durable generation fence. A rolled-back
+        # private policy must not revive authority the queue has retired.
+        with publication.outbox() as (_store, adapter):
+            permission = adapter._permission
+    # No current assertion differs from a current publisher's explicit refusal:
+    # fresh verification can replace an expired or untrusted observation.
+    return ci_status_state(row, publication.publishers, permission, invalid="")
 
 
 def confirm(source, number, head, recheck):
@@ -49,7 +56,8 @@ def confirm(source, number, head, recheck):
     from .self_tested_label import _labels, _live_reason
 
     publication = publisher(source, number, head)
-    adapter = publication.adapter()
+    with publication.outbox() as (_store, adapter):
+        pass
 
     @cache
     def permission(actor):
