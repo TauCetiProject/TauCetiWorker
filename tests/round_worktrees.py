@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Rounds in per-round worktrees of one host clone save their source before anything is removed.
+"""Rounds in per-round worktrees of one host clone: all-or-nothing, nothing unpushed is kept.
 
 Local git fixtures only (no GitHub, no agents). Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
 import fcntl
-import json
 import os
 import subprocess
 import sys
@@ -16,8 +15,8 @@ from types import SimpleNamespace
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 import tauceti_worker as tc  # noqa: E402
+from tauceti_worker import live_use  # noqa: E402
 from tauceti_worker import round_worktrees as rw  # noqa: E402
-from tauceti_worker import work_recovery as wr  # noqa: E402
 
 fails = 0
 
@@ -47,18 +46,17 @@ def worker(root, wid):
     return SimpleNamespace(wid=wid, state=state, checkout=state / "checkout", data_home=root / "home" / wid)
 
 
-def records(cfg):
-    base = cfg.state / "recovery"
-    return [p for p in base.iterdir() if p.is_dir()] if base.is_dir() else []
-
-
-def saved_commits(cfg):
-    found = set()
-    for record in records(cfg):
-        manifest = json.loads((record / "manifest.json").read_text())
-        found.update(manifest.get("unpublished") or [])
-        found.update((manifest.get("tips") or {}).values())
-    return found
+def legacy_absent(cfg):
+    """No recovery records, retained checkouts or cleanup queues are written."""
+    return not any(
+        (path).exists()
+        for path in (
+            cfg.state / "recovery",
+            cfg.state / "recovery-cleanup",
+            cfg.state / "retained-checkouts",
+            cfg.checkout.parent / "retained-checkouts",
+        )
+    )
 
 
 def main():
@@ -81,13 +79,12 @@ def main():
         agents.CHECKOUT_URL = str(origin)
         main_oid = git(origin, "rev-parse", "main").strip()
 
-        # 1. An old permanent checkout is saved, then deleted; its .lake survives.
+        # 1. An old permanent checkout is deleted with its unpushed work; its .lake survives.
         one = worker(root, "w1")
         subprocess.run(["git", "clone", "-q", str(origin), str(one.checkout)], check=True)
         identity(one.checkout)
         (one.checkout / "A.lean").write_text("theorem legacy : True := trivial\n")
         git(one.checkout, "commit", "-qam", "unpublished legacy work")
-        legacy = git(one.checkout, "rev-parse", "HEAD").strip()
         (one.checkout / ".lake/build").mkdir(parents=True)
         (one.checkout / ".lake/build/A.olean").write_text("warm build")
         os.environ["TAUCETI_ROUND_WORKTREES"] = "1"
@@ -98,18 +95,17 @@ def main():
         check("the checkout is now a worktree of the host clone", rw.owns(one.checkout))
         check("detached at origin/main", git(one.checkout, "rev-parse", "HEAD").strip() == main_oid)
         check("no branch is checked out", not git(one.checkout, "symbolic-ref", "-q", "HEAD", check_rc=False).strip())
-        check("the old checkout's commit was saved first", legacy in saved_commits(one))
+        check("nothing of the old checkout was saved", legacy_absent(one))
         check("warm .lake came along", (one.checkout / ".lake/build/A.olean").read_text() == "warm build")
 
-        # 2. A commit made and then reset away is saved at round end; the worktree is removed.
+        # 2. Unpushed work is discarded at round end with the worktree.
         identity(one.checkout)
         (one.checkout / "A.lean").write_text("theorem lost : True := trivial\n")
         git(one.checkout, "commit", "-qam", "commit then reset away")
-        lost = git(one.checkout, "rev-parse", "HEAD").strip()
-        git(one.checkout, "reset", "-q", "--hard", main_oid)
+        (one.checkout / "Draft.lean").write_text("unpushed draft\n")
         rw.release(one)
         check("round end removed the worktree", not one.checkout.exists())
-        check("the reset-away commit was saved", lost in saved_commits(one))
+        check("nothing unpushed was saved", legacy_absent(one))
         check(".lake waits between rounds", (rw.parked_lake(one) / "build/A.olean").is_file())
         check("the next round prepares again", agents.prepare_checkout(one, work="fix", pr=1))
         check(".lake is back in the new worktree", (one.checkout / ".lake/build/A.olean").is_file())
@@ -141,7 +137,7 @@ def main():
         ]
         check("one host clone, two worktrees", len(trees) == 3)
 
-        # 4. A crashed round's worktree is saved and removed once its round lock is free.
+        # 4. A crashed round's worktree is removed once its round lock is free.
         identity(two.checkout)
         (two.checkout / "Crash.lean").write_text("unsaved work of a crashed round\n")
         if Path("/proc/locks").exists():
@@ -152,20 +148,21 @@ def main():
             rw.release(one)
             check("the next round prepares", agents.prepare_checkout(one, work="fix", pr=1))
             check("a crashed round's worktree is removed", not two.checkout.exists())
-            check(
-                "its unsaved file was saved first",
-                any("Crash.lean" in json.loads((r / "manifest.json").read_text())["untracked"] for r in records(two)),
-            )
+            check("nothing of the crashed round was saved", legacy_absent(two))
 
-        # 5. Recovery links from the host clone between rounds.
+        # 5. A leftover tree without git metadata is deleted, never moved aside.
         rw.release(one)
-        check("recovery links from the host clone between rounds", rw.recovery_source(one) == clone)
+        one.checkout.mkdir()
+        (one.checkout / "stray").write_text("no git metadata\n")
+        check("prepare replaces a tree without git metadata", agents.prepare_checkout(one, work="fix", pr=1))
+        check("the stray tree is gone", not (one.checkout / "stray").exists() and legacy_absent(one))
+        rw.release(one)
 
         # 6. Turning the flag off again returns to an ordinary checkout, keeping .lake.
         check("prepare again", agents.prepare_checkout(one, work="fix", pr=1))
         os.environ["TAUCETI_ROUND_WORKTREES"] = "0"
         check("flag off prepares", agents.prepare_checkout(one, work="fix", pr=1))
-        check("an ordinary clone again", wr.checkout_kind(one.checkout) == "standalone")
+        check("an ordinary clone again", live_use.checkout_kind(one.checkout) == "standalone")
         check(".lake kept across the switch", (one.checkout / ".lake/build/A.olean").is_file())
         live.close()
     print("PASS" if not fails else f"FAIL ({fails})")

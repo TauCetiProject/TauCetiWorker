@@ -45,8 +45,7 @@ do differently. A finding that only the PR description can answer is repaired by
 description and replying on its thread. Preserve the branch. Re-read the live author, starting head and hold labels before
 commenting and closing, using the same checks above, then confirm closure succeeded.
 The closure authority above applies here too; never close somebody else's PR or a specially
-scoped automatic bump. For those repairs, preserve the existing retry/checkpoint policy.
+scoped automatic bump.
 
-Transient provider/GitHub failures, lost claims and deadlines use existing retry and checkpoint
-handling. A withdrawn request, changed head or lost claim needs no repetitive comment: stop
+Transient provider/GitHub failures and lost claims use the existing retry handling. A withdrawn request, changed head or lost claim needs no repetitive comment: stop
 safely; the changed shared state already routes future work.

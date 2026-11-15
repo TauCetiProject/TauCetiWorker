@@ -174,7 +174,7 @@ def _remove(path, root, report, *, dry=False, check_users=True, opened=None, mou
     """Rename first: a crash leaves an explicitly owned, resumable deletion."""
     if not safe(path, root) or not path.exists():
         return
-    from .work_recovery import live_users
+    from .live_use import live_users
 
     info = path.stat()
     in_use = ((info.st_dev, info.st_ino) in opened) if opened is not None else check_users and live_users(path)
@@ -287,34 +287,30 @@ def evict_tree(cfg, tree, anchor, report, **kwargs):
         note(report, "errors", f"{tree}: {error}")
 
 
-def _evict_tree(cfg, tree, anchor, report, *, dry=False, discard=False, owner=None):
-    from . import work_recovery as recovery
+def _evict_tree(cfg, tree, anchor, report, *, dry=False, discard=False):
+    from .live_use import CACHE_DIRS, CACHE_TOP, live_users
 
     if not safe(tree, anchor) or not tree.is_dir() or tree.name.endswith(".retention-deleting"):
         return
-    if recovery.live_users(tree):
+    if live_users(tree):
         note(report, "protected", str(tree))
         return
-    decision = None
     if discard:
-        try:
-            decision = recovery.save_for_cleanup(cfg, tree, owner=owner, dry_run=dry)
-            if not decision.ok:
-                note(report, "protected" if decision.state == "protected" else "errors", f"{tree}: {decision.reason}")
-        except Exception as error:
-            note(report, "errors", f"{tree}: source preservation failed: {error}")
+        # Rounds are all-or-nothing: an idle checkout holds nothing that was not pushed. A clone
+        # that other linked worktrees still use keeps its Git store; its caches are still evicted.
+        from .live_use import dependent_worktrees
+
+        dependents = dependent_worktrees(tree)
+        if not dependents:
+            remove(tree, anchor, report, dry=dry)
+            return
+        note(report, "protected", f"{tree}: used by linked worktrees {', '.join(dependents)}")
     for base, dirs, _ in os.walk(tree, followlinks=False, onerror=lambda error: note(report, "errors", str(error))):
         dirs[:] = [name for name in dirs if name != ".git" and not (Path(base) / name).is_symlink()]
-        caches = [
-            name for name in dirs if name in recovery.CACHE_DIRS or (Path(base) == tree and name in recovery.CACHE_TOP)
-        ]
+        caches = [name for name in dirs if name in CACHE_DIRS or (Path(base) == tree and name in CACHE_TOP)]
         for name in caches:
             remove(Path(base) / name, anchor, report, dry=dry)
         dirs[:] = [name for name in dirs if name not in caches]
-    if discard and decision is not None and decision.ok:
-        remove(tree, anchor, report, dry=dry)
-        if not dry and not tree.exists() and decision.record is not None:
-            recovery._set_status(decision.record, "checkout-reset", "saved before retention removed the checkout")
 
 
 def evict_workspace(cfg, report, *, dry=False):
@@ -331,32 +327,17 @@ def evict_workspace(cfg, report, *, dry=False):
 
 
 def collect_retired(cfg, report, *, now, dry=False, discard_checkout=False):
-    from . import work_recovery as recovery
-
     anchor = cfg.checkout.parent.parent if legacy_project() else cfg.state
     if discard_checkout:
         from .round_worktrees import parked_lake
 
         evict_tree(cfg, cfg.checkout, anchor, report, dry=dry, discard=True)
         remove(parked_lake(cfg), anchor, report, dry=dry)
-    # Retained roots have exactly one recursive collector: bounded recovery housekeeping.
-    # Registration is constant metadata work and never inspects history on this timer path.
-    parent = cfg.checkout.parent / recovery.RETAINED_DIR
-    if not parent.is_dir():
-        return
-    if dry:
-        note(report, "protected", f"{parent}: bounded recovery housekeeping owns retained trees")
-        return
-    from .constants import TAUCETI
-    from .recovery_maintenance import register
-
-    register(cfg.state, parent, "TauCeti", TAUCETI)
-    note(report, "protected", f"{parent}: queued for bounded recovery housekeeping")
 
 
 def collect_review_scratch(cfg, report, *, dry=False):
     """Only worker-owned review inputs; review results and outboxes live elsewhere."""
-    from . import work_recovery as recovery
+    from . import live_use
 
     parent = cfg.state / "review-work"
     for path in children(parent, report):
@@ -365,7 +346,7 @@ def collect_review_scratch(cfg, report, *, dry=False):
         try:
             with locked(path / "live.lock", dry=dry):
                 owner = read_json(path / "owner.json")
-                if not (owner.get("finished") or recovery.owner_stopped(owner.get("process"))) or recovery.live_users(
+                if not (owner.get("finished") or live_use.owner_stopped(owner.get("process"))) or live_use.live_users(
                     path
                 ):
                     note(report, "protected", str(path))
@@ -386,14 +367,7 @@ def collect_review_scratch(cfg, report, *, dry=False):
                 if mounts is None or any(p == path.resolve() or p.is_relative_to(path.resolve()) for p in mounts):
                     note(report, "protected", str(path))
                     continue
-                if not dry:
-                    discarded = cfg.state / "recovery-cleanup/discarded"
-                    discarded.mkdir(parents=True, exist_ok=True)
-                    path.rename(discarded / path.name)
-                    recovery._fsync_dir(discarded)
-                    recovery._fsync_dir(parent)
-                    request_cleanup()
-                note(report, "removed", str(path))
+                remove(path, parent, report, dry=dry, check_users=False, mounts=mounts)
         except (BlockingIOError, FileNotFoundError):
             continue
         except OSError as error:
@@ -402,7 +376,7 @@ def collect_review_scratch(cfg, report, *, dry=False):
 
 @contextlib.contextmanager
 def review_workspace(cfg):
-    from .work_recovery import process_owner
+    from .live_use import process_owner
 
     parent = cfg.state / "review-work"
     parent.mkdir(parents=True, exist_ok=True)
@@ -427,15 +401,13 @@ def recycle(cfg, *, now=None, dry=False):
     row = read_json(marker)
     born = row.get("started_at")
     report = fresh_report(now)
-    from . import work_recovery as recovery
+    from .live_use import CACHE_DIRS, CACHE_TOP
 
     anchor = cfg.checkout.parent.parent if legacy_project() else cfg.state
     pending = [(cfg.checkout.with_name(cfg.checkout.name + ".retention-deleting"), anchor)]
     pending += [(path.with_name(path.name + ".retention-deleting"), root) for path, root in cache_roots(cfg)]
     pending += [
-        (cfg.checkout / name, anchor)
-        for name in recovery.CACHE_DIRS | recovery.CACHE_TOP
-        if name.endswith(".retention-deleting")
+        (cfg.checkout / name, anchor) for name in CACHE_DIRS | CACHE_TOP if name.endswith(".retention-deleting")
     ]
     pending = [(path, root) for path, root in pending if path.exists() and safe(path, root)]
     valid = isinstance(born, (float, int)) and math.isfinite(born)
@@ -540,9 +512,12 @@ def worker_configs():
         )
 
 
-# Verification continuation state from older releases: durable jobs, their locks and indexes,
-# preserved candidate workspaces and incomplete-copy markers. Verification now runs to
-# completion inside the round's own checkout, so this is only ever deleted, never migrated.
+# Continuation and recovery state from older releases. Rounds are all-or-nothing now: work an agent
+# pushed is on the remote, and anything else is abandoned with the round. Older releases kept:
+# verification continuations (durable jobs, their locks and indexes, preserved candidate workspaces,
+# incomplete-copy markers, Bubble source checkpoints), unfinished-source recovery records with their
+# index, cleanup queues and checkout attribution, retained ("moved aside") checkouts, and provider
+# conversation identities for resuming repairs. All of it is only ever deleted, never migrated.
 LEGACY_VERIFICATION = (
     "verification-pending",
     "verification-copy-incomplete",
@@ -551,29 +526,87 @@ LEGACY_VERIFICATION = (
     "verification-storage",
     "verification-candidates",
     "verification-jobs",
+    "verification-checkpoints",
+    "verification-checkpoint-locks",
 )
+LEGACY_RECOVERY = (
+    "recovery",
+    "recovery-index",
+    "recovery-index.lock",
+    "recovery-cleanup",
+    "recovery-save.lock",
+    "recovery-prepared.json",
+    "recovery-preparation.json",
+    "checkout-owners",
+    "provider-conversations",
+    "retained-checkouts",
+)
+LEGACY = LEGACY_VERIFICATION + LEGACY_RECOVERY
 
 
-def purge_legacy_verification(state, report, *, dry=False):
-    """Delete legacy continuation state under ``state`` and its Bubble ``verification-state``.
+def _purge(parent, root, names, report, *, dry=False):
+    for name in names:
+        path = parent / name
+        if path.is_symlink():
+            note(report, "protected", str(path))
+        elif path.exists() or path.with_name(name + ".retention-deleting").exists():
+            remove(path.with_name(name + ".retention-deleting"), root, report, dry=dry)
+            remove(path, root, report, dry=dry)
 
-    Every path goes through ``remove``: no deletion through a symlink, of a mount point or of a
-    tree a live process still uses (such a tree is reported protected and retried next time).
-    Candidate trees only link into shared Mathlib and immutable installations by symlink, which
-    deletion never follows; hard links into a workspace lose only the candidate's own name.
+
+def purge_legacy(state, report, *, dry=False, checkout=None):
+    """Delete legacy continuation and recovery state of the worker whose state is ``state``.
+
+    That is everything in ``LEGACY`` under ``state``, its Bubble ``verification-state`` and its
+    native forge sources (``sources/<id>/``), the
+    retained checkouts beside the progress roadmap clone, and, given the worker's ``checkout``, the
+    retained checkouts beside it. Every path goes through ``remove``: no deletion through a symlink,
+    of a mount point or of a tree a live process still uses (such a tree is reported protected and
+    retried next time). Removal restores owner write and search permission first, so read-only
+    trees and OverlayFS work directories (mode 000) are deleted too. Candidate trees only link into
+    shared Mathlib and immutable installations by symlink, which deletion never follows; hard links
+    into a workspace lose only the candidate's own name.
     """
-    for member in (state, state / "verification-state"):
+    members = [state, state / "verification-state"]
+    # A native forge source keeps the same layout under state/sources/<id>/.
+    sources = state / "sources"
+    with contextlib.suppress(OSError):
+        if safe(sources, state) and sources.is_dir():
+            members += [path for path in sorted(sources.iterdir()) if path.is_dir() and not path.is_symlink()]
+    for member in members:
         if member != state and not safe(member, state):
             continue
         if not member.is_dir() or member.is_symlink():
             continue
-        for name in LEGACY_VERIFICATION:
-            path = member / name
-            if path.is_symlink():
-                note(report, "protected", str(path))
-            elif path.exists() or path.with_name(name + ".retention-deleting").exists():
-                remove(path.with_name(name + ".retention-deleting"), state, report, dry=dry)
-                remove(path, state, report, dry=dry)
+        _purge(member, state, LEGACY, report, dry=dry)
+    progress = state / "progress"
+    if safe(progress, state) and progress.is_dir():
+        _purge(progress, state, ("retained-checkouts",), report, dry=dry)
+    if checkout is not None:
+        parent = Path(checkout).parent
+        with contextlib.suppress(OSError):
+            if parent != state and parent.is_dir() and safe(parent, parent.parent):
+                _purge(parent, parent.parent, ("retained-checkouts",), report, dry=dry)
+    return report
+
+
+def purge_legacy_host(report, *, dry=False):
+    """Delete the host-local ledger older releases kept for verification checkpoints."""
+    import pwd
+
+    # TAUCETI_VERIFY_STORAGE_DIR moved the ledger (tests point it at scratch); only that is deleted.
+    configured = os.environ.get("TAUCETI_VERIFY_STORAGE_DIR")
+    if configured:
+        path = Path(configured)
+        parent = path.parent
+        if path.name != "verification-storage":
+            return report
+    else:
+        parent = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/state/tauceti"
+        path = parent / "verification-storage"
+    with contextlib.suppress(OSError):
+        if parent.is_dir() and not parent.is_symlink() and (path.exists() or path.is_symlink()):
+            _purge(parent, parent, (path.name,), report, dry=dry)
     return report
 
 
@@ -604,33 +637,8 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
     mounts = mount_points()
     configs = list(worker_configs())
     if not diagnostics_only:
-        from . import recovery_maintenance
-
-        # Already-retired data needs no source archival. Use the existing collector
-        # and deletion cursors instead of the activity preparer's tiny foreground slice.
-        if not dry and not defer("retained-cleanup"):
-            try:
-                # Retained trees need the existing background collector too;
-                # activity preparation only inventories and requests this work.
-                report["retained_cleanup"] = recovery_maintenance.prepare(
-                    worker_state_root().resolve(),
-                    seconds=remaining(deadline, 30),
-                    entries=262144,
-                    bytes=1024**3,
-                    removal_bytes=32 * 1024**3,
-                )
-            except Exception as error:
-                note(report, "errors", f"retained cache cleanup: {error}")
-        if not dry and not defer("recovery-trash"):
-            try:
-                trash = recovery_maintenance.collect_discarded(
-                    worker_state_root().resolve(), seconds=remaining(deadline, 30)
-                )
-                report["recovery_trash"] = trash
-                for error in trash.get("errors", []):
-                    note(report, "errors", "recovery trash: " + error)
-            except Exception as error:
-                note(report, "errors", f"recovery trash cleanup: {error}")
+        if not defer("legacy-host-ledger"):
+            purge_legacy_host(report, dry=dry)
         if shared and not defer("shared-caches"):
             from .cache_storage import collect
 
@@ -657,15 +665,6 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
                 )
             except (OSError, ValueError) as error:
                 note(report, "errors", f"shared cache cleanup: {error}")
-        from . import verification_storage
-
-        states = [state for cfg in configs for state in (cfg.state, cfg.state / "verification-state")]
-        if not defer("verification-storage"):
-            report["verification_storage"] = (
-                read_json(verification_storage.root() / "status.json")
-                if dry
-                else verification_storage.housekeep(states)
-            )
 
     for cfg in configs:
         if defer(f"worker {cfg.wid}"):
@@ -677,7 +676,7 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
             if not diagnostics_only:
                 # Live workers too: nothing uses this state any more, and remove() still spares
                 # symlinks, mount points and any tree an older helper process still has open.
-                purge_legacy_verification(cfg.state, report, dry=dry)
+                purge_legacy(cfg.state, report, dry=dry, checkout=cfg.checkout)
             if diagnostics_only or not workspace_idle(cfg, opened):
                 raise BlockingIOError  # Live loops recycle their own caches at ordinary boundaries.
             generation = read_json(cfg.state / "cache-generation.json").get("started_at")
@@ -947,90 +946,6 @@ def free_bytes(path):
     return shutil.disk_usage(path).free
 
 
-def pending_work(base):
-    """Prepared counts and immediate queue entries, never materialized-tree walks."""
-    from .recovery_maintenance import cached_summary
-
-    result = dict(recovery_backlog=cached_summary(base)["cleanup_backlog"], discarded_trees=0)
-    for state in base.iterdir() if base.is_dir() else ():
-        if state.is_symlink() or not state.is_dir():
-            continue
-        for member in (state, state / "verification-state"):
-            result["discarded_trees"] += sum(
-                path.is_dir() and not path.is_symlink() for path in (member / "recovery-cleanup/discarded").glob("*")
-            )
-    return result
-
-
-# One collector slice of recovery housekeeping. Activity refresh reuses it on hosts
-# without an installed collector, where it is the only path that deletes anything.
-COLLECTOR_SLICE = dict(seconds=30, entries=262144, bytes=1024**3, removal_bytes=32 * 1024**3)
-
-
-def drain_pending(reports, *, once=False, deadline=None):
-    """Round-robin existing deletion slices without repeating expensive inventories.
-
-    ``deadline`` (time.monotonic()) ends the run after the current slice; cursors resume later."""
-    from . import recovery_maintenance, verification_storage
-    from .activity import root
-
-    previous = os.environ.get("TAUCETI_LEGACY_DATA_ROOT")
-    requested_at = time.time()
-    pending = list(reports)
-    extra_requested = False
-    try:
-        while pending:
-            again = []
-            for path, report in pending:
-                if deadline is not None and time.monotonic() >= deadline:
-                    again = []
-                    break
-                os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
-                totals = report.setdefault("drain", dict(slices=0, removed_bytes=0, removed_entries=0))
-                try:
-                    states = [
-                        member for cfg in worker_configs() for member in (cfg.state, cfg.state / "verification-state")
-                    ]
-                    recovery = recovery_maintenance.prepare(worker_state_root().resolve(), **COLLECTOR_SLICE)
-                    trash = recovery_maintenance.collect_discarded(worker_state_root().resolve())
-                    verification = verification_storage.housekeep(
-                        states,
-                        seconds=1,
-                        entries=8192,
-                        removal_bytes=1024**3,
-                        now=time.time(),
-                    )
-                    totals["slices"] += 1
-                    progress = 0
-                    for result in (recovery, trash, verification.get("work", {})):
-                        for key in ("removed_bytes", "removed_entries"):
-                            amount = result.get(key, 0)
-                            totals[key] += amount
-                            progress += amount
-                    for error in trash.get("errors", []) + verification.get("errors", []):
-                        note(report, "errors", str(error))
-                    scanning = not recovery.get("sweep_complete", True) and recovery.get("metadata_entries", 0) > 0
-                    if progress or scanning:
-                        again.append((path, report))
-                    report["free_bytes"] = shutil.disk_usage(worker_state_root()).free
-                except Exception as error:
-                    note(report, "errors", f"{path}: {error}")
-            if once or (deadline is not None and time.monotonic() >= deadline):
-                break
-            requested = read_json(root() / "cleanup-request.json").get("at", 0)
-            if requested > requested_at and (again or not extra_requested):
-                requested_at = requested
-                extra_requested = not bool(again)
-                pending = list(reports)
-            else:
-                pending = again
-    finally:
-        if previous is None:
-            os.environ.pop("TAUCETI_LEGACY_DATA_ROOT", None)
-        else:
-            os.environ["TAUCETI_LEGACY_DATA_ROOT"] = previous
-
-
 def root_lock(state_root, *, dry=False):
     """cleanup.lock is per activity directory. Installations sharing a data root through different
     activity directories must still never collect it concurrently, so each collected worker-state
@@ -1049,8 +964,6 @@ def run(*, dry=False, diagnostics_only=False, deadline=None):
             retire_roots(report, dry=dry, deadline=deadline)
         report["free_before_bytes"] = before
         if not dry and not diagnostics_only:
-            drain_pending([(legacy_data_root(HERE), report)], deadline=deadline)
-            report["pending_work"] = pending_work(worker_state_root())
             report["free_bytes"] = free_bytes(worker_state_root())
             atomic_json(root() / "cleanup.json", report)
         return report
@@ -1619,9 +1532,6 @@ def run_all(*, dry=False, deadline=None):
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
                 configs.extend(worker_configs())
             initial = {path: dict(free_before_bytes=free_bytes(path)) for path in paths}
-            if not dry:
-                # Exact queued disposal must not wait behind shared-cache inventory.
-                drain_pending(list(initial.items()), once=True, deadline=deadline)
             for index, path in enumerate(paths):
                 os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(path)
                 try:
@@ -1630,18 +1540,13 @@ def run_all(*, dry=False, deadline=None):
                     result = fresh_report()
                     note(result, "errors", str(error))
                 result["free_before_bytes"] = initial[path]["free_before_bytes"]
-                if "drain" in initial[path]:
-                    result["drain"] = initial[path]["drain"]
                 report["roots"].append(dict(path=str(path), **result))
-            if not dry:
-                drain_pending([(Path(result["path"]), result) for result in report["roots"]], deadline=deadline)
             for result in report["roots"]:
                 base = Path(result["path"]) / "state"
                 try:
-                    result["pending_work"] = pending_work(base)
                     result["free_bytes"] = free_bytes(base)
                 except (OSError, ValueError, TypeError) as error:
-                    note(result, "errors", f"pending-work report: {error}")
+                    note(result, "errors", f"free-space report: {error}")
                 merge_report(report, result)
         finally:
             if previous is None:

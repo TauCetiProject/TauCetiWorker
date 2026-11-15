@@ -12,6 +12,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import pwd
 import re
@@ -328,19 +329,19 @@ def hydrate(entry, private, input_hash, *, private_mappings=None, report=None, g
         os.utime(entry / "entry.json", None)
 
 
-# Bounded by the host's single preparation deadline (agents.HOST_CACHE_TIMEOUT).
-EXPANSION_TIMEOUT = 1200
-
-
 def expand(download, private, cwd, env, pool, report, *, manifest=None, private_mappings=None, deadline=None):
-    """Expand and hydrate every selected archive, or raise: partial hydration is not a fallback."""
+    """Expand and hydrate every selected archive, or raise: partial hydration is not a fallback.
+
+    Entry locks held by another round are waited for: their holder is publishing or reading an
+    entry this round needs, and a dead holder releases its lock. Only an explicit ``deadline``
+    (tests) bounds the wait; the round's hard cap bounds it otherwise."""
     grouped = {}
     for input_hash, archive in entries(download, manifest):
         grouped.setdefault(archive, []).append(input_hash)
     pending = [(inputs, archive) for archive, inputs in grouped.items()]
     if not pending:
         return
-    deadline = time.monotonic() + EXPANSION_TIMEOUT if deadline is None else deadline
+    deadline = math.inf if deadline is None else deadline
     program = None
     completed = 0
     from .canonical_store import Guard, reconcile
@@ -572,12 +573,14 @@ def preparation(cwd, env, *, refetch=None, report=None):
     except (OSError, ValueError) as error:
         raise Unavailable(f"expanded cache unavailable: {error}") from error
     started = time.monotonic()
-    deadline = started + EXPANSION_TIMEOUT
+    deadline = None  # wait for entry locks: see expand()
     report = {} if report is None else report
     report.update(hits=0, expanded=0)
     with temporary as tmp, contextlib.ExitStack() as leases:
         try:
-            leases.enter_context(locked(pool, "download-" + Path(tmp).name))
+            # A shared lease: rounds whose download names share a lock shard never exclude each
+            # other, while collection (an exclusive, non-blocking attempt) still skips the tree.
+            leases.enter_context(_flock(lock_path(pool, "download-" + Path(tmp).name), deadline=math.inf, shared=True))
         except OSError as error:
             raise Unavailable(f"expanded cache download lock unavailable: {error}") from error
         download = Path(tmp)

@@ -189,10 +189,6 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
             TAUCETI_PROCESS_CONTAINMENT="invalid-old-policy",
             TAUCETI_VERIFY_STATE=str(self.state),
             TAUCETI_LOCAL_LINT_CACHE=str(self.home / "local-lint-cache"),
-            TAUCETI_VERIFY_MIN_FREE_PERCENT="0",
-            TAUCETI_VERIFY_STORAGE_DIR=str(self.home / "verification-storage"),
-            TAUCETI_VERIFY_STORAGE_BYTES=str(512 * 1024**2),
-            TAUCETI_VERIFY_MIN_FREE_BYTES="1",
             TAUCETI_VERIFY_CACHE_DIR=str(self.home / "cache"),
             TAUCETI_VERIFY_BASE=self.base,
             TAUCETI_LOCAL_AXIOMS_CACHE=str(self.home / "local-axioms-cache"),
@@ -705,19 +701,13 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         result = self.verify(stage="lint", lint_modules=modules)
         self.assertNotIn("reused_from", result["phases"]["lint"])
 
-    def test_bubble_checkpoint_survives_incomplete_verification(self):
+    def test_bubble_verification_keeps_no_source_checkpoint(self):
         write(self.root, "TauCeti/A.lean", "candidate edit\n")
-        write(self.root, "TauCeti/Untracked.lean", "untracked edit\n")
         with patch.dict(os.environ, TAUCETI_VERIFY_BUBBLE="1", FIXTURE_MODE="fail"):
             result = self.verify(stage="build")
         self.assertNotEqual(result["status"], "success")
-        checkpoint = Path(result["source_checkpoint"])
-        self.assertTrue(checkpoint.is_file())
-        self.assertIn("candidate edit", checkpoint.with_name("source.patch").read_text())
-        import tarfile
-
-        with tarfile.open(checkpoint.with_name("untracked.tar")) as archive:
-            self.assertEqual(archive.extractfile("TauCeti/Untracked.lean").read(), b"untracked edit\n")
+        self.assertNotIn("source_checkpoint", result)
+        self.assertFalse((self.state / "verification-checkpoints").exists())
 
     def test_content_cache_rechecks_changed_ctime(self):
         self.verify(stage="build")

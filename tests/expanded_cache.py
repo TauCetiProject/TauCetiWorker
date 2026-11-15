@@ -193,10 +193,16 @@ class Cache(unittest.TestCase):
             yield
 
         env = dict(LAKE_CACHE_DIR=str(self.root / "private"), TAUCETI_BUILD_CACHE_ROOT=str(self.pool))
-        with patch.object(cache, "locked", busy):
+        # An unusable lease (a lock-table error, not ordinary contention) still refuses the round.
+        with patch.object(cache, "_flock", busy):
             with self.assertRaises(cache.Unavailable):
                 with cache.preparation(self.root, env):
                     self.fail("must not run the round on a private cache")
+
+    def test_download_leases_sharing_a_lock_shard_do_not_exclude_each_other(self):
+        lease = cache.lock_path(self.pool, "download-prepare-a")
+        with cache._flock(lease, deadline=0, shared=True), cache._flock(lease, deadline=0, shared=True):
+            pass
 
     def test_entry_lock_contention_waits_then_fails_at_the_deadline(self):
         import fcntl

@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tauceti_worker import agents, config, paths, retention, work_recovery
+from tauceti_worker import agents, config, paths, retention
 
 
 def _parent(pid):
@@ -35,9 +35,6 @@ class LegacyDataRoot(unittest.TestCase):
             worker = data / "state" / "existing"
             worker.mkdir(parents=True)
             (worker / "instance.lock").touch()
-            recovery = worker / "recovery" / "saved"
-            recovery.mkdir(parents=True)
-            (recovery / "status.json").write_text(json.dumps({"state": "eligible"}))
             checkout = data / "checkouts" / "existing" / "TauCeti"
             checkout.mkdir(parents=True)
             with patch.dict(os.environ, {"TAUCETI_LEGACY_DATA_ROOT": str(data)}):
@@ -47,7 +44,6 @@ class LegacyDataRoot(unittest.TestCase):
                         patch.object(config, "HERE", assets),
                         patch.object(agents, "HERE", assets),
                         patch.object(retention, "HERE", assets),
-                        patch.object(work_recovery, "HERE", assets),
                         patch("tauceti_tools.project.active", return_value=None),
                     ):
                         cfg = config.Config.resolve("existing", home=root / "login")
@@ -57,7 +53,6 @@ class LegacyDataRoot(unittest.TestCase):
                         self.assertEqual(agents._worker_iso_home("existing"), worker / "home")
                         self.assertEqual(config.HERE, assets)
                         self.assertEqual([(c.wid, c.state) for c in retention.worker_configs()], [("existing", worker)])
-                        self.assertEqual(next(work_recovery.records())[1], recovery)
                 child = subprocess.check_output(
                     [
                         sys.executable,
@@ -81,9 +76,6 @@ class LegacyDataRoot(unittest.TestCase):
             for path in (old, current):
                 (path / "state/w").mkdir(parents=True)
             (fleet / "worker-data/roots.json").write_text(json.dumps(dict(roots={"old": str(old)})))
-            state = old / "state/w"
-            (state / "recovery-prepared.json").write_text(json.dumps(dict(cleanup_backlog=4)))
-            (state / "recovery-cleanup/discarded/old-copy").mkdir(parents=True)
             with (
                 patch.dict(os.environ, TAUCETI_LEGACY_DATA_ROOT=str(current)),
                 patch.object(retention.Config, "resolve", return_value=SimpleNamespace(home=home)),
@@ -107,12 +99,6 @@ class LegacyDataRoot(unittest.TestCase):
                 self.assertEqual(shared, [True, False, False])
                 self.assertIsInstance(report["free_before_bytes"], int)
                 self.assertIsInstance(report["free_bytes"], int)
-                by_root = {item["path"]: item for item in report["roots"]}
-                self.assertEqual(by_root[str(old)]["pending_work"], dict(recovery_backlog=4, discarded_trees=1))
-                self.assertEqual(
-                    by_root[str(current)]["pending_work"],
-                    dict(recovery_backlog=0, discarded_trees=0),
-                )
                 for item in report["roots"]:
                     self.assertIsInstance(item["free_before_bytes"], int)
                     self.assertIsInstance(item["free_bytes"], int)
@@ -135,7 +121,6 @@ class LegacyDataRoot(unittest.TestCase):
                 patch.object(retention.Config, "resolve", return_value=SimpleNamespace(home=home)),
                 patch.object(retention, "legacy_project", return_value=True),
                 patch.object(retention, "sweep", return_value=retention.fresh_report()),
-                patch.object(retention, "drain_pending"),
                 open(old / "state/.cleanup.lock", "a") as held,
             ):
                 # Another collector, selecting the old root, is collecting it right now.

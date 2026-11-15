@@ -19,7 +19,6 @@ import signal
 import stat
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 import uuid
@@ -32,7 +31,6 @@ from .processes import owned_process
 from .runtime_status import read_json, report_runtime
 from .verification_installations import Installations
 from .verification_scope import git, local_main, scope, untracked
-from .verification_storage import Pressure
 
 SCHEMA = "tauceti-verification/v1"
 POLICY_VERSION = 7
@@ -112,6 +110,8 @@ class _HashCache:
     def save(self, immutable_roots):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.with_suffix(".lock").open("a+") as lock:
+            # Bounded on purpose: the caller may already hold this lock through another
+            # descriptor, and the cache is optional (a failed save is only reported).
             deadline = time.monotonic() + 1
             while True:
                 try:
@@ -715,8 +715,6 @@ class Verification:
             self.receipt["scope"] = scope(self.root, self.base, self.policy)
             self.progress(f"scope: {self.receipt['scope']['mode']}: {self.receipt['scope']['reason']}")
             candidate_sources = inventory(self.root, self.base)
-            if os.environ.get("TAUCETI_VERIFY_BUBBLE") == "1":
-                self.checkpoint_sources(dict(sources=candidate_sources))
             self.watch_names = source_names(self.root, self.base)
             self.watched = stamps([self.root / p for p in self.watch_names])
             inputs = self.inputs()
@@ -747,9 +745,6 @@ class Verification:
             if not input_file.exists():
                 atomic(input_file, inputs)
             self.receipt.update(inputs=dict(path=str(input_file), sha256=fingerprint), fingerprint=fingerprint)
-            if os.environ.get("TAUCETI_VERIFY_BUBBLE") == "1":
-                self.checkpoint_sources(inputs)
-
             if digest(inputs["sources"]) != digest(candidate_sources):
                 raise Incomplete("candidate changed while preparing verification")
             modules = self.directory / "modules.txt"
@@ -828,24 +823,6 @@ class Verification:
                 incomplete_reason="toolchain" if probing else None,
                 error=f"command exited {error.returncode}: {error.cmd}",
             )
-        except Pressure as error:
-            self.receipt.update(
-                status="incomplete",
-                error=str(error),
-                incomplete_reason="storage-limit"
-                if error.reason == "limit"
-                else "storage-configuration"
-                if error.reason == "configuration"
-                else "verification-busy"
-                if error.reason == "busy"
-                else "disk-pressure",
-                result_type="incomplete",
-                next_action="correct filesystem-headroom settings and invoke verify again"
-                if error.reason == "configuration"
-                else "retry after the current verification/cleanup owner finishes"
-                if error.reason == "busy"
-                else "reclaim verification storage and retry verify in this workspace",
-            )
         except Incomplete as error:
             self.receipt.update(status="incomplete", error=str(error), incomplete_reason=error.reason)
         except (Die, OSError, ValueError, RuntimeError) as error:
@@ -919,70 +896,6 @@ class Verification:
         ):
             return path
         return None
-
-    def checkpoint_sources(self, inputs):
-        """Preserve pre-verification Bubble edits before its disposable container can disappear."""
-        from .retention import locked
-        from .verification_storage import SpaceWriter, release, reserve_checkpoint, settle
-
-        key = digest(dict(base=self.base, sources=inputs["sources"]))
-        target = self.state / "verification-checkpoints" / key
-        try:
-            with locked(self.state / "verification-checkpoint-locks" / f"{key}.lock"):
-                if not (target / "checkpoint.json").exists():
-                    patch = git(self.root, "diff", "--binary", "--no-ext-diff", self.base, "--")
-                    names = sorted(untracked(self.root))
-                    size = len(patch) + sum((self.root / name).lstat().st_size for name in names)
-                    # Observe the archive estimate without gating preservation on an arbitrary
-                    # logical-byte target. Only actual filesystem headroom may interrupt writes.
-                    estimate = size + 16384 + sum(len(name.encode()) * 2 + 8192 for name in names)
-                    reserve_checkpoint(self.state, key, amount=estimate)
-                    target.mkdir(mode=0o700, parents=True, exist_ok=True)
-                    try:
-                        with (target / "source.patch").open("wb") as out:
-                            SpaceWriter(out, target).write(patch)
-                            out.flush()
-                            os.fsync(out.fileno())
-                        with (target / "untracked.tar").open("wb") as out:
-                            with tarfile.open(fileobj=SpaceWriter(out, target), mode="w") as archive:
-                                for name in names:
-                                    archive.add(self.root / name, arcname=name, recursive=False)
-                            out.flush()
-                            os.fsync(out.fileno())
-                        atomic(
-                            target / "checkpoint.json",
-                            dict(
-                                base=self.base,
-                                root=str(self.root),
-                                source_digest=digest(inputs["sources"]),
-                                patch="source.patch",
-                                untracked="untracked.tar",
-                                created_at=time.time(),
-                                payloads={
-                                    name: file_record(target / name) for name in ("source.patch", "untracked.tar")
-                                },
-                            ),
-                        )
-                    finally:
-                        # A failed write retains any partial source payload, but never books a
-                        # permanent 256 MiB for an empty directory or a tiny completed checkpoint.
-                        size = sum(path.stat().st_size for path in target.iterdir() if path.is_file())
-                        if not size:
-                            for name in ("source.patch", "untracked.tar"):
-                                path = target / name
-                                if path.is_file() and path.stat().st_size == 0:
-                                    path.unlink()
-                            if not any(target.iterdir()):
-                                target.rmdir()
-                                with contextlib.suppress(OSError, Pressure):
-                                    release(self.state, key)
-                        else:
-                            with contextlib.suppress(OSError, Pressure):
-                                settle(self.state, key, size, compact=True)
-        except BlockingIOError:
-            raise Pressure("exact source checkpoint is being preserved; retry verification", reason="busy") from None
-        self.receipt["source_checkpoint"] = str(target / "checkpoint.json")
-        self.save()
 
 
 def add_parser(sub):

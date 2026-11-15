@@ -629,7 +629,8 @@ tauceti workers logs --follow reviewer     # its durable console log
 there, `enable`, `disable`, `restart`, and `remove` adjust one worker each. The
 manager validates the whole file before applying it, starts missing enabled
 workers, gracefully stops disabled or removed ones, restarts only definitions
-that changed, and backs off repeated failures.
+that changed, and backs off repeated failures. Restarts wait for the worker's
+current round to finish; see [rolling deploys](docs/workers.md#restarts-and-rolling-deploys).
 
 For fields that `add` does not expose, run `tauceti workers edit`, validate with
 `tauceti workers apply --check`, then apply. Editing while the manager runs is
@@ -780,8 +781,6 @@ in `workers.toml`. Keep the raw API key out of that file.
 - [Inside the sandbox](docs/sandbox.md): what `--bubble` enforces, Lake caches,
   and macOS credential handling.
 - [Docker deployment](docs/docker.md): the unattended Compose deployment.
-- [Unfinished source recovery](docs/work-recovery.md): records saved before
-  checkout preparation resets, and checkouts moved aside while still in use.
 
 The `overlap-scan` and `overlap-fix` phases maintain a shared Mathlib cursor and
 adopt overlapping upstream APIs. See [Mathlib overlap maintenance](docs/mathlib-overlaps.md)
