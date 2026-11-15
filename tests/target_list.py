@@ -562,6 +562,24 @@ class ForgejoIdentity(unittest.TestCase):
         self.assertIsNone(claims.lease)
 
 
+class OpenBeyondListing(unittest.TestCase):
+    def test_an_older_open_pull_request_on_another_base_stays_in_flight(self):
+        """Completion searches are restricted to the base branch; the open search is not."""
+        item = t.TargetItem("Algebra", "old", "open", "x")
+        open_elsewhere = {"number": 41, "body": marker("Algebra", "old"), "state": "OPEN", "baseRefName": "integration"}
+
+        def answer(limit, search=""):
+            if not search:
+                return GitHubHistoryLookup.NEWER
+            return [] if "base:main" in search.split() else [open_elsewhere]
+
+        gh = SimpleNamespace(target_marker_prs=Mock(side_effect=answer))
+        reads = t.GitHubMarkerReads(gh)
+        with patch("tauceti_worker.worker_sources.shared_github_environment", contextlib.nullcontext):
+            self.assertIsNone(t.landed_pr(item, reads))
+            self.assertEqual(t.open_pr(item, reads), 41)
+
+
 class ClaimsBeforeAuthoring(unittest.TestCase):
     """A round whose repair claimed a branch and then fell through to list authoring."""
 
