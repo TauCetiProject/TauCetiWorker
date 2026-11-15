@@ -41,6 +41,17 @@ def repository_url(name=TAUCETI):
     ).url
 
 
+def canonical_mathematics_source():
+    """The enrolled TauCeti content repositories, with native identity checked too."""
+    source = current()
+    if source is None:
+        return repository_url().lower() == "https://github.com/taucetiproject/tauceti"
+    return (
+        source.repository.key == "forgejo:https://git.taucetiproject.org/taucetiproject/tauceti"
+        and source.identity.native_id == 1
+    )
+
+
 def pull_url(number):
     source = current()
     return (source.repository if source else RepositoryRef(GITHUB, TAUCETI)).pull_url(number)

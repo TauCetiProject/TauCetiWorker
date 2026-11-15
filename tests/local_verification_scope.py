@@ -314,9 +314,9 @@ def main():
             text = tc.agents.local_verification("ordinary")
             check(
                 f"self-tested helper={helper}: label the PR after verification",
-                "Apply the `self-tested` label to the PR" in text
+                "worker applies `self-tested`" in text
                 and "gh-safe-pr-create" in text
-                and "--add-label self-tested" in text
+                and "PR/head-bound assertion through the selected forge" in text
                 and "failed, incomplete, or outdated" in text,
             )
             for policy in ("bump", "full-lint", "lint-repair"):

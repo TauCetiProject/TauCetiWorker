@@ -507,13 +507,9 @@ def scope_policy(labels=(), head_ref: str = "", *, bump: bool = False) -> str:
 
 
 def self_tested_guidance(policy: str) -> str:
-    from .worker_sources import repository_url
+    from .self_tested_label import enabled
 
-    if (
-        policy != "ordinary"
-        or os.environ.get("TAUCETI_SELF_TESTED", "0") != "1"
-        or repository_url().lower() != "https://github.com/taucetiproject/tauceti"
-    ):
+    if policy != "ordinary" or enabled():
         return ""
     return (
         "### Apply the self-tested label after verification\n"
@@ -522,16 +518,14 @@ def self_tested_guidance(policy: str) -> str:
         "`lake build --iofail && lake test && lake lint`). Wait for its successful exit; "
         "failed, incomplete, or outdated checks do not qualify. Reuse successful checks whose inputs "
         "have not changed; this adds no verification pass.\n"
-        "Apply the `self-tested` label to the PR. Create new PRs through the existing "
+        "Create new PRs through the existing "
         "`gh-safe-pr-create` wrapper; do not bypass it. After creation or pushing an update, "
-        "confirm the live PR commit matches your verified commit, then use "
-        "`gh pr edit <number> --repo TauCetiProject/TauCeti "
-        "--add-label self-tested`. A push clears the label, so reapply it after testing subsequent changes; "
-        "after the round the worker also reapplies it to each pushed head that matches a successful "
-        "complete verification receipt and qualifies. "
-        "If a concurrent push workflow removes the label again, confirm the commit still matches "
-        "and reapply it once. Do not apply it for infrastructure or pin changes, or full-lint/lint-repair requests. "
-        "The trusted picker checks eligibility; reviews and all staging tests still run.\n\n"
+        "confirm the live PR commit matches your verified commit. After the round, the worker applies "
+        "`self-tested` and confirms a PR/head-bound assertion through the selected forge, only for "
+        "heads that match a successful complete verification receipt and qualify. "
+        "Verify again after source changes; a label on an earlier head does not qualify a new head. "
+        "Infrastructure or pin changes and full-lint/lint-repair requests do not qualify. "
+        "Reviews and all staging tests still run.\n\n"
     )
 
 

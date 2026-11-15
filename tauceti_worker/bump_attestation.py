@@ -122,6 +122,8 @@ def confirm_label(w, pr: int, head: str, recheck, *, sleep=time.sleep, clock=tim
 
     `recheck(live)` names why the live PR no longer qualifies ("" while it does). Returns
     "accepted", "refused", "label failed", "stopped: <why>" or "unobserved"."""
+    if confirm := getattr(w.gh, "confirm_self_tested", None):
+        return confirm(pr, head, recheck)
     context = f"self-tested/{pr}"
     for _ in range(LABEL_ATTEMPTS):
         if not w.gh.add_label(pr, LABEL):

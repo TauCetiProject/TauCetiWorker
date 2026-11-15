@@ -148,8 +148,20 @@ class ForgejoWorkerSource(ForgejoReadSource):
         return True
 
     def commit_status(self, sha, context):
-        # Source statuses remain observations. Stage 1C supplies execution authority.
-        return ""
+        from .native_self_tested import status
+
+        try:
+            return status(self, sha, context)
+        except (ForgeError, OSError, ValueError, PermissionError):
+            return ""
+
+    def confirm_self_tested(self, pr, head, recheck):
+        from .native_self_tested import confirm
+
+        try:
+            return confirm(self, pr, head, recheck)
+        except (ForgeError, OSError, ValueError, PermissionError):
+            return "unobserved"
 
     def rebase_requested(self, pr, head):
         return False

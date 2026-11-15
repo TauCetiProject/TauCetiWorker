@@ -5,15 +5,15 @@ earlier label rarely remembers to apply it again. So once a host round's agent h
 worker labels each head the round published through git-safe-push itself, but only when:
 
 - the self-tested route is enabled (`TAUCETI_SELF_TESTED=1`) for TauCetiProject/TauCeti;
-- GitHub still reports the pushed commit as the PR head;
+- the selected forge still reports the pushed commit as the PR head;
 - the change is ordinary mathematics entirely under `TauCeti/` (no pin, lakefile or other
   infrastructure change; no full-lint or lint-repair request, label or branch); and
 - this round left a successful, complete `tauceti-verify` receipt (every stage, policy
   `ordinary`) whose recorded sources are exactly the pushed commit's tree.
 
-A label the agent already applied is left alone. The trusted picker still decides eligibility
-(team membership, paths) and posts the PR-bound `self-tested/<pr>` assertion; staging still builds
-and audits everything. Any doubt leaves the PR on ordinary CI.
+Confirmation uses the selected source: GitHub's picker or the enrolled native status publisher.
+A label alone never proves that the current head was verified. Staging still builds and audits
+everything. Any doubt leaves the PR without an accepted self-tested assertion.
 """
 
 from __future__ import annotations
@@ -35,11 +35,11 @@ CANONICAL_URL = "https://github.com/taucetiproject/tauceti"
 
 def enabled() -> str:
     """Why the worker must not label anything, or "" when the self-tested route is on."""
-    from .worker_sources import repository_url
+    from .worker_sources import canonical_mathematics_source
 
     if os.environ.get("TAUCETI_SELF_TESTED", "0") != "1":
         return "TAUCETI_SELF_TESTED is not 1"
-    if repository_url().lower() != CANONICAL_URL:
+    if not canonical_mathematics_source():
         return "repository is not TauCetiProject/TauCeti"
     return ""
 
@@ -208,7 +208,11 @@ def label_push(w, stage: str, pr: int, commit: str, since: float, *, sleep=time.
     live = w.gh.live_pull(pr)
     if not live:
         return "not eligible (PR unreadable)"
-    if live.get("head", {}).get("sha") == commit and LABEL in _labels(live):
+    if (
+        live.get("head", {}).get("sha") == commit
+        and LABEL in _labels(live)
+        and w.gh.commit_status(commit, f"self-tested/{pr}") == "success"
+    ):
         return "already labelled"
     if why := _live_reason(live, commit):
         return f"not eligible ({why})"
@@ -229,9 +233,9 @@ def label_push(w, stage: str, pr: int, commit: str, since: float, *, sleep=time.
         return f"not eligible ({why})"
     outcome = confirm_label(w, pr, commit, lambda now: _live_reason(now, commit), sleep=sleep, clock=clock)
     if outcome == "accepted":
-        return f"labelled {commit[:12]}: picker accepted self-tested"
+        return f"labelled {commit[:12]}: self-tested confirmed"
     if outcome == "refused":
-        return f"labelled {commit[:12]}: picker refused self-tested"
+        return f"labelled {commit[:12]}: self-tested refused"
     if outcome == "label failed":
         return "not labelled: adding the label failed"
     if outcome.startswith("stopped: "):
