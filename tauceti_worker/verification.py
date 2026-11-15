@@ -110,7 +110,17 @@ class _HashCache:
     def save(self, immutable_roots):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.with_suffix(".lock").open("a+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)  # held only for a read-merge-write of this cache
+            # Bounded on purpose: the caller may already hold this lock through another
+            # descriptor, and the cache is optional (a failed save is only reported).
+            deadline = time.monotonic() + 1
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)
             disk = read_json(self.path)
             merged = self.directories(disk)
             direct = disk.get("direct", {})
