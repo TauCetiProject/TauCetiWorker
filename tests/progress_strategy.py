@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tauceti_worker import cli, config, work_recovery
+from tauceti_worker import cli, config
 from tauceti_worker import progress_publication as publication
 from tauceti_worker import work_units as wu
 from tauceti_worker.config import Die
@@ -140,8 +140,6 @@ class ProgressStrategyTests(unittest.TestCase):
                 (publication, "parked_window", None),
                 (publication, "save", {}),
                 (publication, "defer", retained or {}),
-                (work_recovery, "guard", SimpleNamespace(ok=True)),
-                (work_recovery, "note_owner", None),
                 (wu, "prepare_checkout", True),
                 (wu, "fill_prompt", "prompt"),
                 (wu, "me", "fixture"),

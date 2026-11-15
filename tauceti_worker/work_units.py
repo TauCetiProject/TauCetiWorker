@@ -46,6 +46,7 @@ from .config import (
     GitHubUnavailable,
     NoProgress,
     SharedStateUnavailable,
+    environment,
     extra_roadmap_prompt,
     is_git_url,
     log,
@@ -84,7 +85,6 @@ from .constants import (
     REVIEW_PREPARATION_WAIT_EXIT,
     REVIEW_PROVIDER_DOWN_EXIT,
     ROADMAP,
-    ROUND_TIMEOUT,
     SANDBOX_DEFAULT,
     TAUCETI,
 )
@@ -113,11 +113,11 @@ from .review_diagnostics import (
 from .review_state import ReviewState
 from .round import Claims, RoundContext
 from .runtime_status import report_failure, report_runtime, runtime_snapshot
-from .source_execution import authorization as source_authorization
 from .survey import (
     TARGET_MARKER_RE,
     Candidate,
     Counters,
+    PRInfo,
     Survey,
     bump_prs,
     bust_progress_cache,
@@ -452,18 +452,30 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         from .activity import select
         from .security_audit import run
 
-        select("security-audit")
         other_tasks = [task for task in opts.only if task != "security-audit"]
         if not other_tasks:
+            select("security-audit")
             return run(w.cfg, opts)  # No PR survey or general-purpose agent launcher.
         try:
             minimum = int(os.environ.get("TAUCETI_SECURITY_AUDIT_MIN_COMMITS", "20"))
         except ValueError:
             raise Die("TAUCETI_SECURITY_AUDIT_MIN_COMMITS must be a positive integer") from None
-        try:
-            return run(w.cfg, replace(opts, only=["security-audit"]), min_commits=minimum)
-        except (Die, NoProgress) as exc:
-            log(f"{exc}; continuing {', '.join(other_tasks)} work without advancing the audit cursor")
+        # The audit and the maintenance tasks sharing this worker take turns: after a round that ran
+        # the audit, the next round goes to maintenance, so a long audit backlog cannot starve bumps.
+        # Any audit failure, even an unexpected one, also falls through to maintenance.
+        if w.counters.read("security-audit-yield"):
+            if not opts.dry_run:
+                w.counters.write("security-audit-yield", 0)
+        else:
+            select("security-audit")
+            try:
+                rc = run(w.cfg, replace(opts, only=["security-audit"]), min_commits=minimum)
+            except Exception as exc:
+                log(f"{exc!r}; continuing {', '.join(other_tasks)} work without advancing the audit cursor")
+            else:
+                if not opts.dry_run:
+                    w.counters.write("security-audit-yield", 1)
+                return rc
         # The audit runner retains its evidence and blocks. Maintenance cannot
         # clear them or move the cursor; the separate release gate stays enforced.
         opts = replace(opts, only=other_tasks)
@@ -861,6 +873,8 @@ def _mutation_cursor():
 
 
 def _round_mutated(c: Candidate, pre: dict) -> str | None:
+    """What this round published on its PR, from the mutation journal: "closure", "reply",
+    "description-reply" (it replaced the PR description and replied on a thread), or None."""
     cursor, round_id = pre.get("mutation_cursor"), pre.get("round_id")
     if not cursor or not round_id:
         return None
@@ -874,7 +888,7 @@ def _round_mutated(c: Candidate, pre: dict) -> str | None:
             data = stream.read(4 * 1024 * 1024 + 1)
         if len(data) > 4 * 1024 * 1024 or data and not data.endswith(b"\n"):
             return None
-        publication = None
+        publications = set()
         for line in data.splitlines():
             event = json.loads(line)
             if not isinstance(event, dict):
@@ -885,14 +899,29 @@ def _round_mutated(c: Candidate, pre: dict) -> str | None:
                 and event.get("repository") == TAUCETI
                 and event.get("pr") == c.pr
                 and event.get("activity") == "github_mutation"
-                and event.get("publication") in ("reply", "closure")
+                and event.get("publication") in ("reply", "closure", "description")
             ):
                 if event["publication"] == "closure":
                     return "closure"
-                publication = "reply"
-        return publication
+                publications.add(event["publication"])
+        if publications >= {"reply", "description"}:
+            return "description-reply"
+        return "reply" if "reply" in publications else None
     except (OSError, ValueError, TypeError):
         return None
+
+
+def _description_repaired(w: Worker, c: Candidate, pre: dict, st: dict) -> bool | None:
+    """Whether a round that pushed nothing replaced the PR description and replied, read from the PR.
+
+    The journal that records the same is optional and best effort, so it cannot be what completes a
+    final attempt. The PR shows the repair as an edit time that moved and a comment that was added;
+    the source then says whether both are this account's. A reply alone, an edit alone and a peer's
+    writes are still no progress, and so is a source that reports no edit time."""
+    if "edited" not in pre or st.get("edited") in (None, pre["edited"]) or st["ncomments"] <= pre["ncomments"]:
+        return False
+    repair = getattr(w.gh, "pr_description_repair", None)
+    return repair(c.pr, pre["edited"], pre["ncomments"]) if repair else False
 
 
 def _progressed(w: Worker, c: Candidate, pre: dict | None) -> bool | None:
@@ -916,14 +945,17 @@ def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool | None
         if pre.get("published"):
             return True
         mutated = _round_mutated(c, pre)
-        if mutated == "closure" or mutated == "reply" and not pre.get("require_push"):
+        # A finding that only the PR description can answer (a quality-pass report) leaves no source
+        # change to push. Replacing the description and replying on its thread is that repair, so it
+        # completes even a final attempt; a reply alone still does not.
+        if mutated in ("closure", "description-reply") or mutated == "reply" and not pre.get("require_push"):
             return True
         st = w.gh.pr_progress_state(c.pr)
         if st is None:
             return None
         closed = st.get("state") in {"CLOSED", "MERGED"} and pre.get("state") not in {"CLOSED", "MERGED"}
         if pre.get("require_push") and (st["head"] or "") == pre["head"] and not closed:
-            return False
+            return _description_repaired(w, c, pre, st)
         if (st["head"] or "") != pre["head"] or closed or st["ncomments"] > pre["ncomments"]:
             # Bubble has no host-visible push markers. Its current baseline is
             # taken after the branch claim; unclaimed work stays unattributed.
@@ -996,6 +1028,8 @@ def _selected_pr_matches(stage: str, c: Candidate, live) -> bool | None:
 def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool | None:
     from tauceti_tools.forge import GITHUB, RepositoryRef
 
+    if not c.pr and stage in ("roadmap",):
+        return True  # no pull request to re-read or to authorize on any source
     source_repository = getattr(c, "source_repository", None)
     if source_repository is not None:
         selected = getattr(w.gh, "repository", None)
@@ -1074,11 +1108,27 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) ->
             labels = {str(label.get("name", "")).lower() for label in live.get("labels", [])}
             if labels & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}:
                 return False
+            # Some source APIs cannot distinguish conflicts from an unfinished
+            # check. Let their adapter prove the exact commit pair only after
+            # the shared ownership, head, base and pause checks have passed.
+            resolver = getattr(type(w.gh), "resolve_mergeability", None)
+            if live.get("mergeable") == "UNKNOWN" and resolver is not None:
+                live["mergeable"] = resolver(w.gh, w.cfg.state, c.pr, c.head)
             return live.get("mergeable") == "CONFLICTING" or (
                 "needs-rebase" in labels and w.gh.rebase_requested(c.pr, c.head)
             )
     if stage == "bump" and getattr(c, "bump_integration_failure", False):
         return bool(w.gh.bump_repair_requested(c.pr, c.head))
+    if stage == "bump" and getattr(c, "bump_pending", False):
+        # Another worker may have verified this head, or CI finished, since the survey read it.
+        from .github_transport import read_context
+
+        with read_context(fresh=True, direct=True):
+            live = w.gh.pr_view(c.pr, ["number", "headRefOid", "headRefName", "labels", "statusCheckRollup"])
+        if not live:
+            return False
+        p = PRInfo.from_json(live)
+        return p.head_oid == c.head and not (p.build_success or p.build_failed or p.self_tested)
     if stage not in ("review", "fix"):
         return True
     # Refresh cheap shared review evidence before a direct PR-header read. Many
@@ -1238,14 +1288,25 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
     try:
         rc = fn(w, sv, c, opts, bubble)
         check_result(rc)
-    except AdmissionUnavailable:
-        refund_admission()
+    except AdmissionUnavailable as error:
+        from .build_resources import ResourceUnavailable
+
+        if isinstance(error, ResourceUnavailable):
+            for key, value in before.items():
+                w.counters.write(key, min(value, w.counters.read(key)))
+        else:
+            refund_admission()
         raise
     except GitHubUnavailable as error:
         for key, value in before.items():
             w.counters.write(key, min(value, w.counters.read(key)))
         raise error
     except NoProgress as error:
+        from .build_resources import QueueOwned
+
+        if isinstance(error, QueueOwned):
+            for key, value in before.items():
+                w.counters.write(key, min(value, w.counters.read(key)))
         # Preserve verification, lease/cache, and other independently typed pauses.
         if type(error) is NoProgress and blocked_since(started):
             pause()
@@ -1285,6 +1346,13 @@ def _check_stage_read_quota(stage):
         raise GitHubUnavailable("GitHub read quota exhausted — waiting for reset", retry_at=max(exhausted.values()))
 
 
+BUBBLE_WORK_REFUSED = (
+    "bubble work rounds are refused: their container would unpack a private Mathlib build and "
+    "build TauCeti privately. Run this worker on the host (drop --bubble, or set sandbox = 'host'), "
+    "where rounds share the host's Mathlib and TauCeti outputs; review rounds may stay in bubble"
+)
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
     """Perform one stage. Return its rc, or None to decline this candidate and try another.
 
@@ -1299,6 +1367,11 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             f"sandbox={'bubble' if bubble else 'host'}"
         )
         return 0
+    if bubble and stage != "review":
+        # Bubble's bootstrap unpacks Mathlib's cache and builds TauCeti inside the container, a
+        # private copy per round. Until Bubble rounds see the host's read-only shared views,
+        # they do not run. Review only greps a shared, read-only Mathlib source.
+        raise NoProgress(BUBBLE_WORK_REFUSED)
     from .github_outbox import pending_for
 
     if (
@@ -1309,12 +1382,16 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     ):
         log(f"  #{c.pr}: retained publication pending; selecting unrelated work")
         return None
-    if c.pr and stage in FILE_CHANGE_STAGES and w is not None:
-        from .repair_recovery import pending_for as retained_repair
+    from .build_resources import queue_owned
 
-        if retained_repair(getattr(w, "cfg", None), getattr(getattr(w, "gh", None), "repo", TAUCETI), c.pr):
-            log(f"  #{c.pr}: retained source recovery has priority; selecting unrelated work")
-            return None
+    selected = next((p for p in getattr(sv, "open_prs", ()) if p.number == c.pr), None) if c.pr else None
+    if (
+        selected is not None
+        and queue_owned(getattr(selected, "labels", ()))
+        and c.pr not in (getattr(opts, "prs", ()) or ())
+    ):
+        log(f"{stage} #{c.pr}: merge queue owns this PR; skipping ordinary maintenance")
+        return None
     os.environ["TAUCETI_GITHUB_PR"] = str(c.pr or "")
     _check_stage_read_quota(stage)
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
@@ -1376,6 +1453,9 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         checked = validate_kiro_model_access(w.cfg, kiro_probe_profile)
         if stage != "review":
             opts.authoring_profile = checked
+    from . import shared_mathlib
+
+    shared_mathlib.set_round_purpose(None)  # stages that need one set it themselves
     fn = {
         "review": do_review,
         "fix": do_fix,
@@ -1456,6 +1536,27 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # worker pushed the branch first and safe-push declined rather than clobber, or the agent chose not
     # to act. Surface it as no-progress (so the loop backs off) but say so plainly and point at the log.
     progress = _progressed(w, c, pre) if rc == 0 and stage in PROGRESS_GUARDED else None
+    if (
+        rc == 0
+        and (progress is True or (progress is False and stage == "bump"))
+        and stage in FILE_CHANGE_STAGES
+        and c.pr
+        and not opts.dry_run
+        and any(p.number == c.pr and getattr(p, "automatic_bump", False) for p in sv.open_prs)
+    ):
+        # A bump head left by the round, pushed or unchanged, is verified locally and labelled
+        # `self-tested`, so its review and admission need not wait for the ordinary PR build
+        # (bump_attestation). Verifying an unchanged head is what ends work on a bump that needed
+        # no repair. Any attestation failure leaves the PR on ordinary CI.
+        try:
+            from .bump_attestation import attest
+
+            outcome = attest(w, c.pr, bubble=bubble)
+            log(f"  {stage} #{c.pr}: self-tested: {outcome}")
+            if outcome.startswith("attested"):
+                progress = True
+        except Exception as error:  # noqa: BLE001 - an attestation problem must not fail the round
+            log(f"  {stage} #{c.pr}: self-tested attestation failed ({one_line(str(error))}); ordinary CI continues")
     if rc == 0 and stage in PROGRESS_GUARDED and progress is None:
         from .activity import observation
 
@@ -1477,23 +1578,6 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             )
             return None
         raise NoProgress(reason)
-    if (
-        rc == 0
-        and progress is True
-        and stage in FILE_CHANGE_STAGES
-        and c.pr
-        and not opts.dry_run
-        and any(p.number == c.pr and getattr(p, "automatic_bump", False) for p in sv.open_prs)
-    ):
-        # A pushed bump head is verified locally and labelled `self-tested`, so its review and
-        # admission need not wait for the ordinary PR build (bump_attestation). The round's
-        # result never depends on it: any failure leaves the PR on ordinary CI.
-        try:
-            from .bump_attestation import attest
-
-            log(f"  {stage} #{c.pr}: self-tested: {attest(w, c.pr, c.head, bubble=bubble)}")
-        except Exception as error:  # noqa: BLE001 - an attestation problem must not fail the pushed round
-            log(f"  {stage} #{c.pr}: self-tested attestation failed ({one_line(str(error))}); ordinary CI continues")
     if rc == 0 and stage in PR_TASKS and c.pr and (stage not in PROGRESS_GUARDED or progress is True):
         with contextlib.suppress(Exception):
             from .fleet_events import emit
@@ -1826,6 +1910,8 @@ def _do_fixlike(
 
     `charged` names the per-PR counters the caller already spent, so a provider outage can hand them
     back (see _refund_infra_failure)."""
+    from .build_resources import MaintenanceStop, queue_owned
+
     pr, head = c.pr, c.head
     p = next((x for x in sv.open_prs if x.number == pr), None)
     if p is None:
@@ -1835,6 +1921,12 @@ def _do_fixlike(
     # remote or an `allow_push="/"` (a fork head deletes to empty fields in PRInfo.from_json).
     if not (p.head_owner and p.head_repo and p.head_ref):
         log(f"  {label} #{pr}: head repo deleted/unavailable — skipping")
+        return None
+    explicit = pr in (getattr(opts, "prs", ()) or ())
+    if not explicit and queue_owned(getattr(p, "labels", ())):
+        for key in charged:
+            w.counters.write(key, max(0, w.counters.read(key) - 1))
+        log(f"{label} #{pr}: merge queue owns this PR; skipping ordinary maintenance")
         return None
     foreign = getattr(c, "foreign_repair_base", "")
     if foreign:
@@ -1920,6 +2012,18 @@ def _do_fixlike(
         getattr(p, "labels", ()), p.head_ref, bump=label == "bump" or getattr(p, "automatic_bump", False)
     )
     os.environ["TAUCETI_VERIFY_POLICY"] = policy
+    # Shared Mathlib follows the round's purpose: a rebase prepares main's Mathlib, which the
+    # branch is about to move to, and a bump may use the next Mathlib it pins.
+    from . import shared_mathlib
+
+    bump = label == "bump" or getattr(p, "automatic_bump", False)
+    shared_mathlib.set_round_purpose(
+        getattr(getattr(w, "cfg", None), "checkout", None),
+        rebase=label == "rebase",
+        bump=bump,
+        repair=not bump and label in ("fix", "fix-ci", "lint-repair"),
+    )
+
     prompt = fill_prompt(
         HERE / "prompts" / prompt_file,
         PR=pr,
@@ -1973,24 +2077,15 @@ def _do_fixlike(
         ),
     )
     if getattr(c, "final_resolution", False) and may_close:
-        prompt += (
-            "\nThis is the last permitted per-head repair attempt. "
-            "Check the current rubric and actual source, then repair and push or close this PR "
-            "with the unresolved finding and a useful explanation for a fresh attempt. "
-            "A comment alone does not complete this attempt; confirm a push or closure.\n"
-        )
+        prompt += FINAL_ATTEMPT_INSTRUCTION
     if getattr(p, "automatic_bump", False):
-        deadline = getattr(getattr(w, "rc", None), "deadline", time.time() + ROUND_TIMEOUT)
         prompt += (
             "\nThis is an automatic Mathlib bump. Preserve its dependency target. "
-            "Prepare one coherent source repair checkpoint and push it once through git-safe-push, "
-            "then end this session. A pending Mathlib migration may leave full-library CI red; "
+            "Push coherent source repairs through git-safe-push; anything unpushed is discarded when "
+            "the round ends. A pending Mathlib migration may leave full-library CI red; "
             "build each repaired module group where possible and report the remaining "
             "failures honestly. Never add sorry, admit, native_decide, axioms, or option overrides. "
-            "Full CI and review decide when the whole PR can merge. "
-            f"The round ends at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(deadline))}; "
-            "stop starting new groups ten minutes before then and push completed repairs before "
-            "the timeout. Run builds in the foreground. A correct conflict resolution may be pushed "
+            "Full CI and review decide when the whole PR can merge. Run builds in the foreground. A correct conflict resolution may be pushed "
             "while unrelated migration failures remain. These instructions override any earlier "
             "requirement to never push red or to finish the entire library before pushing.\n"
         )
@@ -2018,27 +2113,28 @@ def _do_fixlike(
     if bubble:
         # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
         # auto-derives this from a PR target, so it's explicit/testable belt-and-suspenders (kim-em/bubble#320).
-        rc = run_in_bubble(
-            w, f"{TAUCETI}/pull/{pr}", prompt, opts, allow_push=f"{p.head_owner}/{p.head_repo}"
-        )  # bubble checks out the PR inside
+        with MaintenanceStop(w, c, explicit=explicit) as stop:
+            rc = run_in_bubble(
+                w, f"{TAUCETI}/pull/{pr}", prompt, opts, allow_push=f"{p.head_owner}/{p.head_repo}", cancel_event=stop
+            )
     else:
         if not prepare_checkout(w.cfg, work=label, pr=pr):
-            from .work_recovery import LAST_REFUSAL
-
             log(f"checkout failed for #{pr} — skipping this attempt")
-            report_failure(
-                f"{label} #{pr}: checkout preparation failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}", code=1
-            )
+            report_failure(f"{label} #{pr}: checkout preparation failed", code=1)
             return 1
         co = w.cfg.checkout
         from .activity import current_round_id
 
-        conversation_round = current_round_id()
-        conversation_path = w.cfg.state / "provider-conversations" / f"{conversation_round or time.time_ns()}.json"
-        conversation_scope = dict(repository=TAUCETI, pr=pr, source_round=conversation_round)
         # Capture the checkout's git chatter ("Switched to a new branch …", "set up to track …") instead
         # of letting it spill into the main log; surface a one-line summary, and the stderr only on failure.
-        chk = subprocess.run(["gh", "pr", "checkout", str(pr), "--force"], cwd=str(co), capture_output=True, text=True)
+        from .round_worktrees import enabled as worktree_rounds
+        from .round_worktrees import local_branch
+
+        # Worktrees share branches: a PR's branch name (often `patch-1`) must be this worker's own.
+        unique = ["--branch", local_branch(w.cfg, pr)] if worktree_rounds() else []
+        chk = subprocess.run(
+            ["gh", "pr", "checkout", str(pr), "--force", *unique], cwd=str(co), capture_output=True, text=True
+        )
         if chk.returncode:
             detail = ((chk.stderr or "") + (chk.stdout or "")).strip()[-200:]
             log(f"  {label} #{pr}: gh pr checkout failed — skipping this attempt ({detail})")
@@ -2056,140 +2152,40 @@ def _do_fixlike(
         if foreign:
             os.environ["TAUCETI_VERIFY_BASE"] = foreign
         os.environ["TAUCETI_PUSH_EXPECT"] = checked  # CAS against what we actually checked out
-        if rev.returncode == 0:
-            from .work_recovery import mark_published, note_owner
-
-            # The remote head is published by definition; a later recovery record names it as the
-            # expected head and bundles only commits made on top of it.
-            mark_published(co, f"pr/{pr}", checked)
-            from dataclasses import asdict
-
-            note_owner(
-                w.cfg,
-                expected_head=checked,
-                authorization=dict(
-                    **source_authorization(w, p),
-                    actor=getattr(sv, "me_login", ""),
-                    git_author=dict(
-                        name=subprocess.run(
-                            ["git", "config", "user.name"], cwd=co, capture_output=True, text=True
-                        ).stdout.strip(),
-                        email=subprocess.run(
-                            ["git", "config", "user.email"], cwd=co, capture_output=True, text=True
-                        ).stdout.strip(),
-                    ),
-                    author=getattr(p, "author", ""),
-                    repository=f"{p.head_owner}/{p.head_repo}",
-                    ref=p.head_ref,
-                    foreign=bool(foreign),
-                    automatic_bump=getattr(p, "automatic_bump", False),
-                    profile=asdict(_effective_authoring_profile(opts)),
-                    billing="api" if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else "subscription",
-                    account=getattr(opts, "account", None),
-                    sandbox_host=getattr(opts, "sandbox_host", True),
-                    charged=list(charged),
-                    budget=getattr(c, "budget", 0) or 3,
-                    roadmap=getattr(sv, "roadmap_only", None),
-                ),
-                conversation_path=str(conversation_path),
-            )
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
-        from .work_recovery import _rev
+        from .live_use import rev as _rev
 
-        push_marker = f"refs/tauceti/published/push/{p.head_ref.removeprefix('refs/heads/')}"
-        published_before = _rev(co, push_marker)
-        push_scope = conversation_round or os.urandom(16).hex()
+        push_scope = current_round_id() or os.urandom(16).hex()
         scoped_push_marker = f"refs/tauceti/published/scope/{push_scope}/{p.head_ref.removeprefix('refs/heads/')}"
         scoped_published_before = _rev(co, scoped_push_marker)
-        note_owner(w.cfg, publication_marker=dict(ref=push_marker, before=published_before, scope=push_scope))
-        handoffs = []
-        if (
-            not foreign
-            and label != "bump"
-            and not getattr(p, "automatic_bump", False)
-            and owns_pr(sv, p, casefold_legacy=True)
-        ):
-            from .repair_recovery import Wait as RecoveryWait
-            from .repair_recovery import handoff_context
-            from .work_recovery import RecordError as RecoveryRecordError
-
-            try:
-                retained, handoffs = handoff_context(
-                    w.cfg,
-                    getattr(getattr(w, "gh", None), "repo", TAUCETI),
-                    pr,
-                    head=checked,
-                    actor=getattr(sv, "me_login", ""),
-                    checkout=co,
-                    push_marker=push_marker,
-                    published_before=published_before,
-                    push_scope=push_scope,
-                )
-                prompt += retained
-            except (OSError, RuntimeError, RecoveryWait, RecoveryRecordError) as error:
-                log(f"  #{pr}: source handoff deferred without model launch: {error}")
-                return decline_repair()
-        agent_rc = None
-        from .config import AdmissionUnavailable
-
         try:
-            from .repair_recovery import environment
-
-            with environment(TAUCETI_PUSH_SCOPE=push_scope):
+            with (
+                environment(TAUCETI_PUSH_SCOPE=push_scope),
+                MaintenanceStop(w, c, explicit=explicit) as stop,
+            ):
                 rc = run_agent_host(
                     co,
                     prompt,
                     _effective_authoring_profile(opts),
                     w.cfg.logdir,
-                    cancel_event=getattr(w.claims, "lost", None) if getattr(w.claims, "held", None) else None,
-                    session_path=conversation_path,
-                    session_actor=getattr(sv, "me_login", ""),
-                    session_scope=conversation_scope,
+                    cancel_event=stop,
                     quota_cfg=w.cfg,
                 )
-            agent_rc = rc
         except BuildCacheUnavailable:
             # Unlike a transcript-derived provider failure, we know the agent never started.
             # A persistent cache outage must not exhaust the bounded provider-refund allowance.
             for key in charged:
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
-            from .repair_recovery import return_handoffs
-
-            return_handoffs(handoffs)
-            raise
-        except AdmissionUnavailable:
-            from .repair_recovery import return_handoffs
-
-            return_handoffs(handoffs)
             raise
         finally:
-            # The owned agent process group has been swept before this returns or raises.
-            # Capture the final source now, so a quota-blocked loop can recover it
-            # without needing another paid round to reach checkout preparation.
-            from .work_recovery import guard, note_owner
-
+            # git-safe-push records each push of this session under its scope; whatever it pushed
+            # is the round's published work. Anything unpushed is discarded with the checkout.
             if (co / ".git").exists():
                 published_after = _rev(co, scoped_push_marker)
                 if published_after and published_after != scoped_published_before:
                     if c.progress is None:
                         c.progress = {}
                     c.progress["published"] = published_after
-                note_owner(
-                    w.cfg,
-                    recovery_handoffs=handoffs,
-                    round_outcome=dict(
-                        exit_code=agent_rc,
-                        published_head=published_after if published_after != scoped_published_before else None,
-                    ),
-                )
-                if handoffs and published_after and published_after != scoped_published_before:
-                    from .repair_recovery import complete_handoffs
-
-                    try:
-                        complete_handoffs(w.cfg, handoffs, published_after)
-                    except OSError as error:
-                        log(f"recovery handoff acknowledgement deferred; durable push marker retained: {error}")
-                guard(w.cfg, co)
     if rc == 0:
         w.rs.bust(pr)
     elif not foreign:
@@ -2197,6 +2193,18 @@ def _do_fixlike(
         # provider later fails. Do not turn its scope into repeated paid tasks.
         _refund_infra_failure(w, c, label, charged)  # raises NoProgress when the provider was at fault
     return rc
+
+
+# Appended to the last per-head repair prompt of an owned PR (see _progressed_direct for the rule).
+FINAL_ATTEMPT_INSTRUCTION = (
+    "\nThis is the last permitted per-head repair attempt. "
+    "Check the current rubric and actual source, then repair and push or close this PR "
+    "with the unresolved finding and a useful explanation for a fresh attempt. "
+    "A comment alone does not complete this attempt; confirm a push or closure. "
+    "The one exception is a finding that only the PR description can answer, such as a "
+    "`quality-pass` report: there, update the description and reply on the finding's thread, "
+    "and that completes the attempt.\n"
+)
 
 
 def _close_spent_pr(w, sv, c) -> int | None:
@@ -2491,16 +2499,6 @@ def _progress_documentation_wait(w, reason, *, recovery=False):
     raise DocumentationUnavailable(f"waiting-documentation: {reason}", retry_at=retry_at)
 
 
-def _progress_deadline_wait(w):
-    from .config import ProgressPreparationUnavailable
-
-    _progress_mechanical_delay(w, 60)
-    raise ProgressPreparationUnavailable(
-        "waiting-progress-preparation: insufficient round time; artifacts retained for the next ordinary round",
-        retry_at=w.counters.read("progress-mechanical-retry-at"),
-    )
-
-
 # Open roadmap PRs of the account listed to find its reports: `gh` pages 100 at a time and stops early.
 PROGRESS_REPORT_SCAN = 1000
 
@@ -2763,7 +2761,6 @@ def _do_progress_inner(w, opts) -> int | None:
     # A writable clone with a real `origin/main`, not the depth-1 throwaway mirror `fetch_ref` makes:
     # `apply` branches from origin/main and pushes. The roadmap repo is small, so a full clone is cheap.
     roadmap_dir = w.cfg.state / "progress" / "roadmap"
-    from .work_recovery import guard, note_owner, retain
 
     if retained and (roadmap_dir / ".git").is_dir():
         # A prepared local branch is an immutable publication artifact. Fetch
@@ -2771,21 +2768,21 @@ def _do_progress_inner(w, opts) -> int | None:
         if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
             return _defer_progress_publication(w, retained, f"temporary fetch failure in {roadmap_dir}")
     else:
+        from .agents import discard_checkout
+
         if roadmap_dir.exists() and not (roadmap_dir / ".git").is_dir():
-            retain(w.cfg, roadmap_dir, "the roadmap clone has no git metadata", label="progress-roadmap")
+            if not discard_checkout(roadmap_dir, "the roadmap clone has no git metadata"):
+                raise Die(f"refreshing {roadmap_dir} failed: it could not be replaced")
         if (roadmap_dir / ".git").is_dir():
-            # `apply` commits and pushes here; an interrupted apply's leftovers are saved, not discarded.
-            decision = guard(w.cfg, roadmap_dir, label="progress-roadmap", repository=ROADMAP)
-            if not decision.ok:
-                raise Die(f"refreshing {roadmap_dir} refused: {decision.reason}")
-        if (roadmap_dir / ".git").is_dir():  # still in place unless the guard moved it aside
+            # An interrupted `apply` left only unpushed leftovers: rounds are all-or-nothing.
             if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
                 raise Die(f"refreshing {roadmap_dir} failed")  # usually the network; retried next round
             if subprocess.run(
                 ["git", "-C", str(roadmap_dir), "checkout", "-q", "-f", "-B", "main", "origin/main"]
             ).returncode:
-                # A local failure (a stale lock): move the clone aside and clone afresh below.
-                retain(w.cfg, roadmap_dir, "forced checkout of the roadmap clone failed", label="progress-roadmap")
+                # A local failure (a stale lock): delete the clone and clone afresh below.
+                if not discard_checkout(roadmap_dir, "forced checkout of the roadmap clone failed"):
+                    raise Die(f"refreshing {roadmap_dir} failed: it could not be replaced")
             else:
                 subprocess.run(["git", "-C", str(roadmap_dir), "clean", "-fdxq"])
         if not (roadmap_dir / ".git").is_dir():
@@ -2794,13 +2791,10 @@ def _do_progress_inner(w, opts) -> int | None:
                 if retained:
                     return _defer_progress_publication(w, retained, f"temporary clone failure for {ROADMAP}")
                 raise Die(f"cloning {ROADMAP} failed")
-    note_owner(w.cfg, "progress-roadmap", work="progress")  # attribution only; never stops the round
 
     # `plan` and `facts` read TauCeti history, so they need the full-history checkout, not a shallow one.
     if not retained and not prepare_checkout(w.cfg, work="progress"):
-        from .work_recovery import LAST_REFUSAL
-
-        raise Die(f"checkout failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}")
+        raise Die("checkout failed")
 
     work = w.cfg.state / "progress" / "work"
     work.mkdir(parents=True, exist_ok=True)
@@ -2810,16 +2804,12 @@ def _do_progress_inner(w, opts) -> int | None:
     status_body = work / "status-body.md"
     section_body = work / "section-body.md"
 
-    deadline = float(os.environ.get("TAUCETI_ROUND_DEADLINE") or time.time() + ROUND_TIMEOUT)
-
     def run_tool(*args: str, capture: bool = False, docs_cache=None):
         # `errors="replace"`: text mode decodes strictly by default, so a tool that emits one invalid
         # byte raises UnicodeDecodeError inside subprocess.run — before there is a CompletedProcess to
         # inspect. The failure would then skip the counter, the saved output and the Die path entirely,
         # and surface as a bare decode error naming nothing. Mojibake beats losing the diagnostic.
-        remaining = deadline - time.time() - 15
-        if remaining < 30 and args[0] in ("plan", "facts", "prompt"):
-            _progress_deadline_wait(w)
+        # No timeout of its own: the round's hard cap (TAUCETI_ROUND_TIMEOUT) bounds a hung tool.
         log(f"  $ tauceti-progress {args[0]} …")
         try:
             proc = subprocess.run(
@@ -2827,7 +2817,6 @@ def _do_progress_inner(w, opts) -> int | None:
                 capture_output=capture,
                 text=True,
                 errors="replace",
-                timeout=max(1, min(1800, remaining)),
                 env={
                     **os.environ,
                     "TAUCETI_FACTS_CACHE": os.environ.get("TAUCETI_FACTS_CACHE")
@@ -2848,9 +2837,7 @@ def _do_progress_inner(w, opts) -> int | None:
             )
             _progress_tool_output(w, args[0], proc)
             if args[0] == "apply":
-                raise  # publication transport waits keep their existing recovery path
-            if isinstance(exc, subprocess.TimeoutExpired) and remaining < 1800:
-                _progress_deadline_wait(w)
+                raise  # publication transport waits keep their existing retry path
         _progress_tool_output(w, args[0], proc)
         return proc
 
@@ -2937,8 +2924,6 @@ def _do_progress_inner(w, opts) -> int | None:
         SECTION_OUT=str(section_out),
         AGENT=opts.agent_name,
     )
-    if deadline - time.time() < 300:
-        _progress_deadline_wait(w)
     w.counters.write("progress-mechanical-retry-at", 0)
     w.counters.write("progress-attempt-ts", int(time.time()))
     rc = run_agent_host(writing, prompt, opts.work_model, w.cfg.logdir, quota_cfg=w.cfg)
@@ -3220,9 +3205,7 @@ other contributors' claims, or the hard rules of the repo.
             allow_push=fork,  # bubble grants git fetch/push to the fork (kim-em/bubble#320)
         )
     if not prepare_checkout(w.cfg, work="roadmap", roadmap=only or None):
-        from .work_recovery import LAST_REFUSAL
-
-        raise Die(f"checkout failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}")
+        raise Die("checkout failed")
     prompt = fill_prompt(
         HERE / "prompts" / "roadmap.md",
         ONLY=only,

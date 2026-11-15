@@ -320,7 +320,7 @@ class Identity(unittest.TestCase):
         before = state.path.read_bytes()
         client = Mock()
         for configured in (cfg, replace(cfg, binding=self.binding)):
-            self.assertEqual(repair_task.resume_pending(configured, client), [])
+            self.assertEqual(repair_task.retry_deliveries(configured, client), [])
             self.assertEqual(repair_task.release_stale_claims(configured, client), 0)
             self.assertEqual(repair_task.retry_releases(configured, client), [])
         self.assertFalse(client.mock_calls)

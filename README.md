@@ -599,6 +599,10 @@ they always run on the host. Bubble needs an
 [Incus](https://linuxcontainers.org/incus/) runtime. See
 [the sandbox notes](docs/sandbox.md) for the exact boundary and requirements.
 
+Code-writing rounds in Bubble are currently refused: the container would unpack
+its own Mathlib build and build TauCeti privately, and a host keeps one shared copy
+of each. Review rounds still run in Bubble, against a shared read-only Mathlib source.
+
 The agent's conversation transcript is normalized into readable narration,
 reasoning summaries, tool activity, and results. File edits are listed by path
 instead of repeating full diffs; tool inputs are bounded, and tool results over
@@ -625,7 +629,8 @@ tauceti workers logs --follow reviewer     # its durable console log
 there, `enable`, `disable`, `restart`, and `remove` adjust one worker each. The
 manager validates the whole file before applying it, starts missing enabled
 workers, gracefully stops disabled or removed ones, restarts only definitions
-that changed, and backs off repeated failures.
+that changed, and backs off repeated failures. Restarts wait for the worker's
+current round to finish; see [rolling deploys](docs/workers.md#restarts-and-rolling-deploys).
 
 For fields that `add` does not expose, run `tauceti workers edit`, validate with
 `tauceti workers apply --check`, then apply. Editing while the manager runs is
@@ -645,6 +650,11 @@ tauceti workers service status
 
 This installs a systemd user service on Linux or a LaunchAgent on macOS. Omit
 the first command when no detached manager is running.
+
+Rounds clean up after themselves in every mode, starting a low-priority
+collector at most hourly. To remove all TauCetiWorker data before uninstalling,
+run `tauceti workers manager-stop`, then `tauceti purge --yes`, then
+`uv tool uninstall tauceti`; see [cleanup and uninstalling](docs/workers.md#cleanup-and-uninstalling).
 
 Every worker needs a unique id, which `add` assigns for you. The id namespaces
 that worker's state, checkout, review store, and logs, and isolates its mutable
@@ -771,8 +781,6 @@ in `workers.toml`. Keep the raw API key out of that file.
 - [Inside the sandbox](docs/sandbox.md): what `--bubble` enforces, Lake caches,
   and macOS credential handling.
 - [Docker deployment](docs/docker.md): the unattended Compose deployment.
-- [Unfinished source recovery](docs/work-recovery.md): records saved before
-  checkout preparation resets, and checkouts moved aside while still in use.
 
 The `overlap-scan` and `overlap-fix` phases maintain a shared Mathlib cursor and
 adopt overlapping upstream APIs. See [Mathlib overlap maintenance](docs/mathlib-overlaps.md)

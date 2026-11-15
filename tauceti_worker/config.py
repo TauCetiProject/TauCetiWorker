@@ -47,6 +47,25 @@ def security_audit_problem(only, *, agent="auto", prs=(), author_override=False,
     return None
 
 
+@contextlib.contextmanager
+def environment(**changes):
+    """Set (or, for None, unset) environment variables for the duration of a block."""
+    previous = {key: os.environ.get(key) for key in changes}
+    try:
+        for key, value in changes.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def max_open_prs() -> int:
     return positive_integer(os.environ.get("TAUCETI_MAX_OPEN_PRS", MAX_OPEN_PRS))
 
