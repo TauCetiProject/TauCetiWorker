@@ -58,6 +58,7 @@ def settings(root=None, **env):
         "TAUCETI_WORKER_FORGES",
         "TAUCETI_NEW_PR_FORGE",
         "TAUCETI_ROADMAP_TARGETS_GITHUB",
+        "TAUCETI_BASE_BRANCH",
     )
     base = {k: v for k, v in os.environ.items() if k not in drop and not k.startswith("TAUCETI_DECIDE_")}
     if root is not None:
@@ -1027,8 +1028,10 @@ def test_prerequisite(tmp):
     landed = targets_module.target_markers(parse_targets(LIST).find("strong-law"))[0]
 
     class Landed(Hub):
+        base = "main"
+
         def merged_prs(self, search, limit=200):
-            return [{"number": 99, "title": "", "body": landed}]
+            return [{"number": 99, "title": "", "body": landed, "baseRefName": self.base}]
 
     with settings(root, TAUCETI_ROADMAP_TARGETS=str(path)):
         declined(4)
@@ -1038,6 +1041,11 @@ def test_prerequisite(tmp):
         (statuses, "[ ] `strong-law`" in path.read_text()),
         ({"borel-cantelli": "done", "strong-law": "done"}, True),
     )
+    Landed.base = "integration"
+    with settings(root, TAUCETI_ROADMAP_TARGETS=str(path)):
+        declined(4)
+        statuses = rounds(tmp, Landed(p4={}), {"rulings": []})["packet"]["target_statuses"]
+    check("…which a landing on another branch than the content base does not complete", statuses["strong-law"], "open")
 
     root = tmp / "prerequisite-relative"
     path.write_text(LIST)
@@ -1069,7 +1077,7 @@ def test_prerequisite(tmp):
             return []
 
         def merged_prs(self, search, *, limit=200):
-            return [{"number": 99, "title": "", "body": marker}] if landed else []
+            return [{"number": 99, "title": "", "body": marker, "baseRefName": "main"}] if landed else []
 
     for history, want in (("1", "retry"), ("0", "prerequisite")):
         with (
