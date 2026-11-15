@@ -29,7 +29,7 @@ Land Tools support before its TauCeti and Worker consumers. Use the existing tes
 
 ## Stage 2 — Let trusted authors skip expensive PR CI
 
-An author runs the Stage 1 commands and applies `self-tested`. The label asserts that the current PR head passed. This rollout is manual opt-in only: do not add automatic worker labelling, contributor recommendations or announcements.
+An author runs the Stage 1 commands and applies `self-tested`. The persistent label declares that the author runs local verification, including fix rounds. This rollout is manual opt-in only: do not add automatic worker labelling, contributor recommendations or announcements.
 
 One exception (operator decision, 2026-11-10): workers label automatic Mathlib bump PRs themselves after mechanically verifying the pushed head, because the bump otherwise waits a full PR build per repair round while main moves under it. The picker checks the labeler's team membership instead of the bot author's, allows exactly `lake-manifest.json` and `lean-toolchain` beside `TauCeti/`, and runs the real `bump-guard` validation. See [dependency bumps](../workers.md#dependency-bumps).
 
@@ -46,7 +46,7 @@ Change the existing path as follows:
 | Reporting | Say “PR CI skipped: self-tested.” |
 | Staging | Admit the reviewed PR through the existing staging path, with all current candidate tests and repair behaviour. |
 
-A push clears the label; the author reapplies it after testing. Main advancing does not clear it. Removing the label or leaving the allowed scope returns an unadmitted PR to ordinary CI. Use the existing event/reconciliation machinery to handle missed events and membership changes; unavailable membership information falls back to ordinary CI. Accepted staging members retain their existing membership rules.
+Pushes and fix/rebase rounds preserve the label. Authors and agents remove it when verification fails or is incomplete. Admission reads the label and checks membership/scope inline, without a separate Actions status or workflow receipt. Removing the label or leaving the allowed scope returns an unadmitted PR to ordinary CI. Use the existing event/reconciliation machinery to handle missed events and membership changes; unavailable membership information falls back to ordinary CI. Accepted staging members retain their existing membership rules.
 
 Update the workflow and all callers that currently require green PR `build` together, so skipped CI does not strand PRs. Exercise the changed routes in their existing test suites, then enable the initial team and deploy live.
 
