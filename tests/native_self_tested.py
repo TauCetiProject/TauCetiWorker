@@ -280,10 +280,12 @@ class NativeSelfTested(unittest.TestCase):
             pr=None, progress=dict(published_branches={"roadmap/x": head}, published_owner="team")
         )
         with (
-            patch.dict(os.environ, TAUCETI_SELF_TESTED="1", TAUCETI_CONF=str(project)),
+            patch.dict(os.environ, TAUCETI_SELF_TESTED="1", TAUCETI_SOURCE_GH_CONF=str(project)),
             patch("tauceti_worker.worker_sources.canonical_mathematics_source", return_value=True),
         ):
+            os.environ.pop("TAUCETI_CONF", None)
             result = self_tested_label.label_round_pushes(worker, candidate, "roadmap", time.time() - 5)
+            self.assertNotIn("TAUCETI_CONF", os.environ)
         self.assertEqual(result, [(1, f"labelled {head[:12]}: self-tested confirmed")])
         posts = [call for call in self.fixture.api.request.call_args_list if call.args[0] == "POST"]
         self.assertEqual(len(posts), 1)
