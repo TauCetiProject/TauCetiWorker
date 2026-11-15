@@ -1212,6 +1212,35 @@ def test_close(tmp):
         ),
         (False, "#41 do not add `missingFact`", []),
     )
+
+    def lexed(marker, *, name="missingFact"):
+        """Close #1, which adds `already_covered`, `marker` and `name`, as subsumed by #41, which
+        adds only the first two."""
+        head = "+++ b/A.lean\n@@ -0,0 +1,3 @@\n+theorem already_covered : True := trivial\n"
+        merged = head + f"+def marker : String := {marker}\n"
+        return attempt(
+            Hub(p1={"diff": merged + f"+theorem {name} : True := trivial\n"}, p41={"state": "MERGED", "diff": merged})
+        )
+
+    for kind, marker in (
+        ("a raw string ending in a backslash", 'r"\\"'),
+        ("a raw string with hashes holding a quote", 'r#""/-"#'),
+        ("an interpolated string with a string inside", 's!"{"/-"}"'),
+        ("an ordinary string", '"\\\\"'),
+        ("an ordinary string holding an opener", '"/-"'),
+        ("an ordinary string holding a closer", '"-/"'),
+    ):
+        check(f"a declaration after {kind} is still read", lexed(marker), (False, "#41 do not add `missingFact`", []))
+    check(
+        "a name ending in ?'x' is read whole",
+        lexed('"x"', name="already_covered?'x'")[:2],
+        (False, "#41 do not add `already_covered?'x'`"),
+    )
+    check(
+        "a hunk the reader cannot finish refuses the closure",
+        lexed('"open')[:2],
+        (False, "its diff cannot be read for declarations with certainty"),
+    )
     check(
         "…or merged into another branch than this one targets",
         attempt(Hub(p1={}, p41={"state": "MERGED", "base": "integration"})),

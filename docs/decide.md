@@ -248,14 +248,16 @@ all of these hold at the moment of closing:
 - Every non-private declaration the pull request's diff adds to a `.lean` file
   (`theorem`, `lemma`, `def`, `abbrev`, `instance`, `structure`, `class`,
   `inductive`, `opaque`, `axiom`, an instance's name after any priority clause,
-  outside comments and string and character literals, compared by name as
-  written) is also added by
-  the diff of one of those merged pull requests. A pull request that adds no
-  named declaration cannot be closed this way. Each diff is read with `gh pr
-  diff`, on Forgejo through the source's command layer, which returns the pull
-  request's own diff from its recorded merge base, merged or not. Comments are
-  read per diff hunk, so an added line in a hunk that lies wholly inside a
-  comment opened outside it, closer included, still counts as a declaration.
+  outside comments and string, raw-string, interpolated-string and character
+  literals, compared by name as written) is also added by the diff of one of
+  those merged pull requests. A pull request that adds no named declaration
+  cannot be closed this way. Each diff is read with `gh pr diff`, on Forgejo
+  through the source's command layer, which returns the pull request's own diff
+  from its recorded merge base, merged or not. Comments are read per diff hunk,
+  so an added line in a hunk that lies wholly inside a comment opened outside
+  it, closer included, still counts as a declaration. A hunk in which a
+  comment, literal, `«…»` name or interpolation does not end, or a plain string
+  holds an unmatched `{`, cannot be read with certainty and refuses the closure.
 
 A closure that does not complete when it is sent is not kept in the publication
 outbox for a later replay, which would skip these checks and the claim; the

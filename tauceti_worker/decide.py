@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import time
+import unicodedata
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -829,46 +830,114 @@ def max_closes() -> int:
     return _setting(CLOSES_ENV, 3)
 
 
-_CHAR = re.compile(r"'(?:\\.|[^\\'])'")
+_CHAR = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|.)|[^\\'\n])'")
+_RAW = re.compile(r'r(#*)"')
+
+
+class _Unsure(Exception):
+    """The text cannot be split into Lean tokens with certainty."""
+
+
+def _ident(c: str) -> bool:
+    return c.isalnum() or c in "_'!?" or (ord(c) > 127 and unicodedata.category(c)[0] in "LN")
+
+
+class _Lexer:
+    """Blanks comments and literals in Lean source text, keeping its layout: block comments nest,
+    `--` runs to the line's end, ordinary strings take backslash escapes, raw strings `r#…"…"#…` none,
+    interpolated strings (`s!"…{…}…"`) hold code in braces, and `«…»` is a name. Raises `_Unsure`
+    where a token does not end within the text."""
+
+    def __init__(self, text: str):
+        self.text, self.out, self.unopened = text, list(text), False
+
+    def blank(self, start: int, end: int) -> int:
+        for k in range(start, end):
+            if self.out[k] != "\n":
+                self.out[k] = " "
+        return end
+
+    def comment(self, start: int, i: int, depth: int = 1) -> int:
+        """Blank from `start` to the end of a block comment `depth` deep at `i`."""
+        text = self.text
+        while depth:
+            if i >= len(text):
+                raise _Unsure
+            pair = text[i : i + 2]
+            depth += (pair == "/-") - (pair == "-/")
+            i += 2 if pair in ("/-", "-/") else 1
+        return self.blank(start, i)
+
+    def string(self, i: int, *, interpolated: bool) -> int:
+        start, text, braces = i, self.text, 0
+        i += 1
+        while True:
+            if i >= len(text):
+                raise _Unsure
+            c = text[i]
+            if c == "\\":
+                i += 2
+            elif c == '"':
+                if braces > 0:
+                    raise _Unsure  # `{` with no `}`: possibly an interpolation this reader cannot see
+                return self.blank(start, i + 1)
+            elif c == "{" and interpolated:
+                self.blank(start, i + 1)
+                i = self.code(i + 1, closing=True)
+                start = i - 1
+            else:
+                braces += (c == "{") - (c == "}")
+                i += 1
+
+    def code(self, i: int = 0, *, closing: bool = False) -> int:
+        text, depth = self.text, 0
+        while i < len(text):
+            c, pair = text[i], text[i : i + 2]
+            before = text[i - 1] if i else ""
+            if pair == "--":
+                end = text.find("\n", i)
+                i = self.blank(i, len(text) if end < 0 else end)
+            elif pair == "/-":
+                i = self.comment(i, i + 2)
+            elif pair == "-/":
+                self.unopened, i = True, i + 2
+            elif c == "«":
+                end = text.find("»", i)
+                if end < 0:
+                    raise _Unsure
+                i = end + 1
+            elif c == '"':
+                i = self.string(i, interpolated=before == "!")
+            elif c == "r" and not _ident(before) and (raw := _RAW.match(text, i)):
+                close = '"' + raw.group(1)
+                end = text.find(close, raw.end())
+                if end < 0:
+                    raise _Unsure
+                i = self.blank(i, end + len(close))
+            elif c == "'" and not _ident(before) and (char := _CHAR.match(text, i)):
+                i = self.blank(i, char.end())
+            elif closing and c == "{":
+                depth, i = depth + 1, i + 1
+            elif closing and c == "}":
+                if not depth:
+                    return i + 1
+                depth, i = depth - 1, i + 1
+            else:
+                i += 1
+        if closing:
+            raise _Unsure
+        return i
 
 
 def _code(lines: list[str], *, depth: int = 0) -> tuple[list[str], bool]:
-    """`lines` with comments and string and character literals blanked, starting `depth` block
-    comments deep; and whether a block comment closed that had not opened in them. Block comments
-    nest; `--`, `/-` and `-/` inside a literal are text."""
-    out: list[str] = []
-    unopened = in_string = False
-    for line in lines:
-        kept, i = [], 0
-        while i < len(line):
-            pair = line[i : i + 2]
-            if depth:
-                depth += (pair == "/-") - (pair == "-/")
-                i += 2 if pair in ("/-", "-/") else 1
-            elif in_string:
-                in_string = line[i] != '"'
-                i += 2 if line[i] == "\\" else 1
-            elif line[i] == '"':
-                in_string, i = True, i + 1
-            elif (char := _CHAR.match(line, i)) and not (i and (line[i - 1].isalnum() or line[i - 1] in "_.")):
-                i = char.end()
-            elif pair == "--":
-                break
-            elif pair in ("/-", "-/"):
-                depth, unopened, i = (1, unopened, i + 2) if pair == "/-" else (0, True, i + 2)
-            else:
-                kept.append(line[i])
-                i += 1
-        out.append("".join(kept))
-    return out, unopened
+    """`lines` with comments and literals blanked by `_Lexer`, starting `depth` block comments deep;
+    and whether a block comment closed that had not opened in them. Raises `_Unsure`."""
+    lexer = _Lexer("\n".join(lines))
+    lexer.code(lexer.comment(0, 0, depth) if depth else 0)
+    return "".join(lexer.out).split("\n"), lexer.unopened
 
 
-def added_declarations(diff: str, *, private: bool = False) -> set[str]:
-    """The names, as written, of the declarations a unified diff adds to `.lean` files, outside
-    comments and literals. Each hunk's added and unchanged lines are read together, so a comment
-    opened on an unchanged line covers the added lines inside it, and a hunk that closes a comment
-    it did not open is read as starting inside one. A hunk lying wholly inside a comment opened
-    above it cannot be told from code by the diff alone. `private` ones are left out unless asked for."""
+def _added(diff: str, private: bool) -> set[str]:
     names: set[str] = set()
     hunks: list[list[tuple[bool, str]]] = []
     lean = False
@@ -880,16 +949,32 @@ def added_declarations(diff: str, *, private: bool = False) -> set[str]:
             hunks.append([])
         elif lean and hunks and line[:1] in ("+", " "):
             hunks[-1].append((line[0] == "+", line[1:]))
-    for hunk in hunks:
+    for hunk in filter(None, hunks):
         text = [line for _, line in hunk]
         code, unopened = _code(text)
         if unopened:
-            code, _ = _code(text, depth=1)
+            code, unopened = _code(text, depth=1)
+            if unopened:
+                raise _Unsure
         for (added, _), line in zip(hunk, code, strict=True):
             found = _DECLARATION.match(line) if added else None
             if found and (private or "private" not in found.group("modifiers").split()):
                 names.add(found.group("name"))
     return names
+
+
+def added_declarations(diff: str, *, private: bool = False) -> set[str] | None:
+    """The names, as written, of the declarations a unified diff adds to `.lean` files, outside
+    comments and literals; None where a hunk cannot be read with certainty (a literal, comment or
+    interpolation that does not end within it). Each hunk's added and unchanged lines are read
+    together, so a comment opened on an unchanged line covers the added lines inside it, and a hunk
+    that closes a comment it did not open is read as starting inside one. A hunk lying wholly inside
+    a comment opened above it cannot be told from code by the diff alone. `private` ones are left
+    out unless asked for."""
+    try:
+        return _added(diff, private)
+    except _Unsure:
+        return None
 
 
 def closes_today() -> int:
@@ -977,9 +1062,12 @@ def close_subsumed(
     if None in diffs:
         return False, "a diff could not be read"
     own = added_declarations(diffs[0])
+    found = [added_declarations(diff, private=True) for diff in diffs[1:]]
+    if own is None or None in found:
+        return False, "its diff cannot be read for declarations with certainty"
     if not own:
         return False, "its diff adds no named declaration to compare"
-    theirs = set().union(*(added_declarations(diff, private=True) for diff in diffs[1:]))
+    theirs = set().union(*found)
     if missing := sorted(own - theirs):
         return False, f"{named} do not add {', '.join(f'`{name}`' for name in missing[:5])}"
     with read_context(fresh=True, direct=True):
