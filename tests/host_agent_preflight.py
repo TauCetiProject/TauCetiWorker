@@ -141,6 +141,18 @@ try:
     check("bubble -> host preflight skipped, stage runs", runs["n"], 1)
     check("bubble -> no red warning", len(warns), 0)
 
+    # 3b) a bubble code-writing round would build a private Mathlib in the container: refused
+    #     before any stage work, with a reason that names the copy.
+    reset()
+    raised, msg = False, ""
+    try:
+        wu.dispatch("fix", WORKER, None, CAND, opts(sandbox_host=False))
+    except tc.NoProgress as e:
+        raised, msg = True, str(e)
+    check("bubble fix -> NoProgress", raised, True)
+    check("bubble fix -> stage NOT run", runs["n"], 0)
+    check("bubble fix -> reason names the private Mathlib build", "private Mathlib" in msg, True)
+
     # 4) a non-review OpenRouter stage: the gate is `pi` (host_agent_argv), missing -> pause, no stage run.
     wu._bubble = lambda stage, o: False
     wu.shutil.which = lambda name: None

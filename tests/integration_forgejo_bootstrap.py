@@ -29,7 +29,7 @@ from tauceti_queue.forgejo_source import NativePublishers
 from tauceti_queue.github_app import AppCredentials, InstallationTokenSource
 from tauceti_queue.native_bootstrap import NativeBootstrap
 from tauceti_queue.runtime import Revision, ServiceRuntime
-from tauceti_queue.source_authority import QueueControlPolicy, SourceAuthorityUnavailable, control_token_fingerprint
+from tauceti_queue.source_authority import QueueControlPolicy, SourceAccessDenied, control_token_fingerprint
 from tauceti_queue.task_identity import TASK_SCHEMA, TaskBinding
 from tauceti_worker.source_identity import SourceActor
 
@@ -106,7 +106,7 @@ class Integration(unittest.TestCase):
                 service.open_store()
                 service.open_github()
                 if not os.environ.get("FORGEJO_EFFECTIVE_ACCESS"):
-                    with self.assertRaises(SourceAuthorityUnavailable):
+                    with self.assertRaises(SourceAccessDenied):
                         service.build_controller()
                     self.assertIsNone(service.store.get_setting("source-ci:binding"))
                     return

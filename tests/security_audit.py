@@ -1194,7 +1194,11 @@ class MaintenanceScheduling(unittest.TestCase):
             sandbox_host=True,
             dry_run=False,
         )
-        self.worker = SimpleNamespace(cfg=SimpleNamespace())
+        values = {}
+        self.worker = SimpleNamespace(
+            cfg=SimpleNamespace(),
+            counters=SimpleNamespace(read=lambda name: values.get(name, 0), write=values.__setitem__),
+        )
 
     def test_below_threshold_reaches_maintenance_without_changing_options(self):
         with (
@@ -1213,8 +1217,29 @@ class MaintenanceScheduling(unittest.TestCase):
             self.assertEqual(wu.run_round(self.worker, self.opts), 0)
         maintenance.assert_not_called()
 
+    def test_audit_and_maintenance_take_turns(self):
+        with (
+            patch.object(sa, "run", return_value=0) as audit,
+            patch.object(wu, "mirror_creds", side_effect=RuntimeError("maintenance reached")),
+        ):
+            self.assertEqual(wu.run_round(self.worker, self.opts), 0)
+            with self.assertRaisesRegex(RuntimeError, "maintenance reached"):
+                wu.run_round(self.worker, self.opts)
+            self.assertEqual(wu.run_round(self.worker, self.opts), 0)
+        self.assertEqual(audit.call_count, 2)
+
+    def test_failed_audit_keeps_its_next_turn(self):
+        with (
+            patch.object(sa, "run", side_effect=FileExistsError("audit state")) as audit,
+            patch.object(wu, "mirror_creds", side_effect=RuntimeError("maintenance reached")),
+        ):
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, "maintenance reached"):
+                    wu.run_round(self.worker, self.opts)
+        self.assertEqual(audit.call_count, 2)
+
     def test_audit_blocks_and_service_failures_allow_maintenance(self):
-        for result in (sa.NoProgress("service unavailable"), sa.Die("finding")):
+        for result in (sa.NoProgress("service unavailable"), sa.Die("finding"), FileExistsError("audit state")):
             with (
                 self.subTest(error=str(result)),
                 patch.object(sa, "run", side_effect=result),

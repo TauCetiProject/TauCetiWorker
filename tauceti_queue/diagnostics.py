@@ -126,6 +126,9 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
                 ),
             )
             continue
+        if line.startswith("LINT-ENV: FAIL"):
+            fallback.setdefault(("lint", line[:MAX_MESSAGE]), _finding("lint", "", line))
+            continue
         if line == FAILED_TARGETS_HEADER:
             in_targets = True
             continue
