@@ -596,6 +596,7 @@ class SourceController(unittest.TestCase):
         self.clock.advance(60)
         self.controller.tick()
         import json
+
         task = self.store.rows("tasks", {"kind": "repair"})[-1]
         self.assertIn(finding, json.loads(task["diagnostics"]))
         self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "source-failure")
