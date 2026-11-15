@@ -1013,6 +1013,7 @@ def main(argv: list[str] | None = None) -> int:
                     "activity": 1,
                     "roadmap_focus": 1,
                     "self_tested": 1,
+                    "source_selection": 1,
                     "graceful_restart": 1,
                 }
             )

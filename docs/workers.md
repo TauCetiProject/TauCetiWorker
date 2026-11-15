@@ -68,6 +68,24 @@ Persistent workers are declarative. You describe the workers you want in
 starting missing workers, stopping removed ones, restarting changed ones, and
 backing off repeated failures. They do not belong to a terminal session.
 
+## Source selection
+
+Worker definitions select the same sources as `tauceti work`. Existing definitions
+keep their GitHub-only defaults. For a Forgejo worker, set:
+
+```toml
+github = false
+forgejo = true
+new_pr_forge = "forgejo"
+```
+
+Set both source booleans to `true` to maintain PRs from both sources. New PRs use
+`new_pr_forge`, independently of maintenance selection. Configure all three fields
+for native authoring; without an explicit destination, new PRs still default to GitHub.
+These fields are available in `workers.toml`. Credentials use the existing
+private Forgejo token-file configuration. Source changes wait for the worker's
+current round to finish; other workers retain their running processes and settings.
+
 ## Dependency bumps
 
 Bot-authored `bump-mathlib/` PRs hosted on TauCeti are repaired until they land.
