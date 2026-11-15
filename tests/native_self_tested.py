@@ -289,6 +289,25 @@ class NativeSelfTested(unittest.TestCase):
         self.assertEqual(len(posts), 1)
         self.assertTrue(posts[0].args[1].endswith("/statuses/" + head))
 
+    def test_native_checkout_separates_local_branch_from_remote_pr_branch(self):
+        from tauceti_worker.source_cli import checkout
+
+        row = dict(head=dict(sha="a" * 40, ref="remote/pr-branch", repo=dict(full_name="team/Math")))
+        self.fixture.api.pull = Mock(return_value=row)
+        with (
+            patch("tauceti_worker.source_cli.subprocess.run") as run,
+            patch("tauceti_worker.source_cli.subprocess.check_output", return_value="a" * 40 + "\n"),
+        ):
+            self.assertEqual(checkout(["1", "--force", "--branch", "tauceti/worker/pr-1"], self.source), 0)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["git", "checkout", "--force", "-B", "tauceti/worker/pr-1", "a" * 40], commands)
+        self.assertIn(["git", "config", "branch.tauceti/worker/pr-1.merge", "refs/heads/remote/pr-branch"], commands)
+        self.assertTrue(
+            any(
+                command[:2] == ["git", "fetch"] and command[-1] == "refs/heads/remote/pr-branch" for command in commands
+            )
+        )
+
 
 class CanonicalSource(unittest.TestCase):
     def test_only_enrolled_native_content_repository_qualifies(self):

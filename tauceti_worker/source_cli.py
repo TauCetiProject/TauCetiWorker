@@ -56,6 +56,7 @@ def checkout(args, source):
     parser = argparse.ArgumentParser(prog="gh pr checkout")
     parser.add_argument("number", type=int)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--branch", "-b")
     parser.add_argument("--repo", "-R")
     opts = parser.parse_args(args)
     if opts.repo and opts.repo not in (
@@ -69,12 +70,14 @@ def checkout(args, source):
     from tauceti_tools.forge import RepositoryRef
 
     repository = RepositoryRef(source.repository.forge, head["repo"]["full_name"])
-    sha, branch = head["sha"], head["ref"]
+    sha, remote_branch = head["sha"], head["ref"]
+    branch = opts.branch if opts.branch is not None else remote_branch
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise ValueError("PR checkout requires an exact commit")
-    subprocess.run(["git", "check-ref-format", "--branch", branch], check=True, capture_output=True)
+    for name in {remote_branch, branch}:
+        subprocess.run(["git", "check-ref-format", "--branch", name], check=True, capture_output=True)
     subprocess.run(
-        ["git", "fetch", "--no-tags", repository.clone_url, "refs/heads/" + branch],
+        ["git", "fetch", "--no-tags", repository.clone_url, "refs/heads/" + remote_branch],
         check=True,
         capture_output=True,
         timeout=60,
@@ -88,7 +91,7 @@ def checkout(args, source):
     subprocess.run(command, check=True, capture_output=True)
     # gh checkout normally establishes the PR branch's tracking destination.
     subprocess.run(["git", "config", "branch." + branch + ".remote", repository.clone_url], check=True)
-    subprocess.run(["git", "config", "branch." + branch + ".merge", "refs/heads/" + branch], check=True)
+    subprocess.run(["git", "config", "branch." + branch + ".merge", "refs/heads/" + remote_branch], check=True)
     return 0
 
 
