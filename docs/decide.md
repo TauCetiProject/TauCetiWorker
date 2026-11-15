@@ -257,9 +257,10 @@ all of these hold at the moment of closing:
   so an added line in a hunk that lies wholly inside a comment opened outside
   it, closer included, still counts as a declaration. A hunk in which a
   comment, literal, `«…»` name or interpolation does not end, a plain string
-  holds an unmatched `{`, a `«…»` name spans lines, or a declaration keyword has
-  its name on a later line cannot be read with certainty and refuses the
-  closure.
+  holds an unmatched `{`, a `«…»` name spans lines, or a declaration's header
+  (its attribute list, an instance's priority clause and its name, with nested
+  brackets) does not end on its keyword's line cannot be read with certainty and
+  refuses the closure.
 
 A closure that does not complete when it is sent is not kept in the publication
 outbox for a later replay, which would skip these checks and the claim; the

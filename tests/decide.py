@@ -1266,6 +1266,57 @@ def test_close(tmp):
             attempt(Hub(p1={"diff": quoted + f"+{head}\n"}, p41={"state": "MERGED", "diff": quoted}))[:2],
             (False, "its diff cannot be read for declarations with certainty"),
         )
+    unsure = (False, "its diff cannot be read for declarations with certainty")
+    base = "+++ b/A.lean\n@@ -0,0 +1,3 @@\n+theorem already_covered : True := trivial\n"
+    for kind, candidate, replacement, want in (
+        (
+            "a parenthesised priority",
+            "+instance (priority := (100)) missingInst : Inhabited Nat := ⟨0⟩\n",
+            "",
+            (False, "#41 do not add `missingInst`"),
+        ),
+        (
+            "a priority with a space before its close",
+            "+instance (priority := (100) ) missingInst : Inhabited Nat := ⟨0⟩\n",
+            "+instance (priority := (100) ) coveredInst : Inhabited Nat := ⟨0⟩\n",
+            (False, "#41 do not add `missingInst`"),
+        ),
+        (
+            "a priority value on the next line",
+            "+instance (priority :=\n+  100) missingInst : Inhabited Nat := ⟨0⟩\n",
+            "",
+            unsure,
+        ),
+        (
+            "a priority's close on the next line",
+            "+instance (priority := 100\n+  ) missingInst : Inhabited Nat := ⟨0⟩\n",
+            "",
+            unsure,
+        ),
+        (
+            "an attribute list closed on the next line",
+            "+@[simp,\n+  norm_cast] theorem missingFact : True := trivial\n",
+            "",
+            unsure,
+        ),
+        (
+            "attributes on the line before",
+            "+@[simp, to_additive (attr := simp)]\n+theorem missingFact : True := trivial\n",
+            "",
+            (False, "#41 do not add `missingFact`"),
+        ),
+        (
+            "a one-line priority",
+            "+instance (priority := 100) missingInst : Inhabited Nat := ⟨0⟩\n",
+            "",
+            (False, "#41 do not add `missingInst`"),
+        ),
+    ):
+        check(
+            f"{kind}: the instance is read or the closure refused",
+            attempt(Hub(p1={"diff": base + candidate}, p41={"state": "MERGED", "diff": base + replacement}))[:2],
+            want,
+        )
     check(
         "a name ending in ?'x' is read whole",
         lexed('"x"', name="already_covered?'x'")[:2],

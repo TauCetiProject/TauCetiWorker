@@ -815,14 +815,51 @@ CLOSE = "close"
 CLOSE_ENV = "TAUCETI_DECIDE_CLOSE"
 CLOSES_ENV = "TAUCETI_DECIDE_MAX_CLOSES_PER_DAY"
 CLOSURES = "closures.log"
-_HEAD = (
-    r"^\s*(?:@\[[^\]]*\]\s*)*(?P<modifiers>(?:(?:private|protected|noncomputable|unsafe|partial|nonrec|scoped|local)\s+)*)"
-    r"(?:theorem|lemma|def|abbrev|instance|structure|class(?:\s+inductive)?|inductive|opaque|axiom)"
-    r"(?:\s+\(\s*priority\s*:=[^)]*\))?"
+_KEYWORD = re.compile(
+    r"\s*(?P<modifiers>(?:(?:private|protected|noncomputable|unsafe|partial|nonrec|scoped|local)\s+)*)"
+    r"(?P<kind>theorem|lemma|def|abbrev|instance|structure|class(?:\s+inductive)?|inductive|opaque|axiom)(?![^\s(])"
 )
-_DECLARATION = re.compile(_HEAD + r"\s+(?P<name>(?:«[^»]*»|[^\s:(\[{⦃⟨⟪|,«])+)")
-# A keyword whose name, if any, is on a later line: the line alone cannot say what it declares.
-_HEAD_ONLY = re.compile(_HEAD + r"\s*$")
+_NAME = re.compile(r"(?:«[^»]*»|[^\s:(\[{⦃⟨⟪|,«])+")
+_PRIORITY = re.compile(r"\(\s*priority\s*:=")
+
+
+def _group(line: str, i: int) -> int:
+    """The end of the bracketed group opening at `line[i]`, nested brackets included. Raises
+    `_Unsure` when it does not close on this line."""
+    pairs, stack = {"(": ")", "[": "]", "{": "}"}, []
+    for j in range(i, len(line)):
+        if line[j] in pairs:
+            stack.append(pairs[line[j]])
+        elif stack and line[j] == stack[-1]:
+            stack.pop()
+            if not stack:
+                return j + 1
+        elif line[j] in ")]}":
+            raise _Unsure
+    raise _Unsure
+
+
+def _declared(line: str) -> tuple[str, str] | None:
+    """(modifiers, name) of the declaration a lexed line opens, or None when it opens none or an
+    anonymous instance. Raises `_Unsure` when the header (attributes, priority clause, name) does
+    not end on the line, since the line alone cannot then say what is declared."""
+    i = len(line) - len(line.lstrip())
+    while line.startswith("@[", i):
+        i = _group(line, i + 1)
+        i += len(line[i:]) - len(line[i:].lstrip())
+    head = _KEYWORD.match(line, i)
+    if not head:
+        return None
+    rest = line[head.end() :].lstrip()
+    if rest.startswith("("):
+        end = _group(rest, 0)
+        if not _PRIORITY.match(rest):
+            return None  # an anonymous instance's binder
+        rest = rest[end:].lstrip()
+    if not rest:
+        raise _Unsure
+    name = _NAME.match(rest)
+    return (head.group("modifiers"), name.group()) if name else None
 
 
 def close_enabled() -> bool:
@@ -960,11 +997,9 @@ def _added(diff: str, private: bool) -> set[str]:
             if unopened:
                 raise _Unsure
         for (added, _), line in zip(hunk, code, strict=True):
-            found = _DECLARATION.match(line) if added else None
-            if added and not found and _HEAD_ONLY.match(line):
-                raise _Unsure
-            if found and (private or "private" not in found.group("modifiers").split()):
-                names.add(found.group("name"))
+            found = _declared(line) if added else None
+            if found and (private or "private" not in found[0].split()):
+                names.add(found[1])
     return names
 
 
