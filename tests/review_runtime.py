@@ -84,7 +84,9 @@ class ReviewRuntime(unittest.TestCase):
                 with self.assertRaisesRegex(NoProgress, "publication backend"):
                     review_runtime.resolve(SimpleNamespace(state=Path(directory)))
                 (root / "runner/publication_transport.py").write_text("TAUCETI_NATIVE_REVIEW_PUBLISHER")
-                runtime = review_runtime.resolve(SimpleNamespace(state=Path(directory)))
+                with patch("tauceti_worker.native_review_publisher.QueueReviewPublisher") as publisher:
+                    runtime = review_runtime.resolve(SimpleNamespace(state=Path(directory)))
+                    publisher.return_value.preflight.assert_called_once()
                 self.assertEqual(runtime.directory, root)
 
     def test_archive_uses_the_same_resolved_runtime_and_preserves_failed_outbox(self):

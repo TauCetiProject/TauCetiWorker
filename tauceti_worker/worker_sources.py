@@ -218,9 +218,10 @@ def activate(source, cfg):
 
         os.environ.update(self_env())
         publication_policy = original.get("TAUCETI_NATIVE_REVIEW_POLICY")
-        if publication_policy is None:
+        canonical = source.repository.key == "forgejo:https://git.taucetiproject.org/taucetiproject/tauceti"
+        if not publication_policy:
             candidate = cfg.home / ".config/tauceti-forgejo/review-publication.json"
-            if candidate.is_file():
+            if canonical or candidate.is_file():
                 publication_policy = str(candidate)
         if publication_policy:
             os.environ.update(

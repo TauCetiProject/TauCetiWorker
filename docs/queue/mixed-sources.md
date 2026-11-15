@@ -93,7 +93,8 @@ similarly named account on the other host.
 Native review admission uses the existing revision-bound native publication
 protocol, including immutable status receipts, current publisher ACLs, body
 hashes and recovery holds. Ordinary scoreboards alone do not authorize admission:
-Forgejo writers can edit another author's comment. Managed native reviewers can use the common Review publisher with
+Forgejo writers can edit another author's comment. Managed native reviewers use
+the common Review publisher with
 `tauceti_worker.native_review_publisher:QueueReviewPublisher`. Provision a private
 `~/.config/tauceti-forgejo/review-publication.json` on the publishing host:
 
@@ -112,10 +113,18 @@ Forgejo writers can edit another author's comment. Managed native reviewers can 
 Project only `MixedProfile.publishers().record()` from the queue's current policy;
 this file needs no queue execution, mirror or main-writer credentials. The worker
 uses its existing source token and automatically selects the backend inside native
-rounds. An explicit `TAUCETI_NATIVE_REVIEW_POLICY` overrides the policy-file path.
+rounds. Canonical Tau Ceti native reviews require this policy; a missing file
+cannot silently fall back to mutable comments. Its directory must be owned by
+the operator with mode `0700`, the file must have mode `0600`, and its path must
+contain no symlinks. An explicit `TAUCETI_NATIVE_REVIEW_POLICY` overrides the path.
 The Review engine must support `TAUCETI_NATIVE_REVIEW_PUBLISHER`; Worker checks this
 before review inference. Ordinary standalone Review comments remain discussion
 unless a trusted backend is configured.
+
+Distribute an updated projection whenever queue publisher authority changes.
+Authority generations are random, not ordered; differing historical CI receipts
+cannot identify which policy is current. Verify the host projection against the
+queue's authoritative profile during deployment and trust changes.
 
 All reviewers of this source must share the single durable outbox and its sequence
 allocator on the publishing host. Keep this host as the publication authority until
@@ -124,7 +133,14 @@ In-progress, red and green boards all use the existing
 `ForgejoSourceAdapter.prepare_publication` / `publish` protocol. Intents persist
 before remote writes; common Review recovery retries the same paid output and
 intent. Immutable comment history is retained, and superseded intents cannot
-revive an older verdict. Never bypass this gate to make a canary enter the queue. The explicit `authority_generation` is a fresh nonzero 128-bit value; rotate it
+revive an older verdict. Before paid inference the backend validates the source,
+actor and local policy, and the shared renderer publishes its in-progress plan.
+Periodic integrity checks can repair moderated receipts from retained paid bodies,
+including after the Review scratch directory has been cleaned up. Sequence
+conflicts and unsupported outbox protocol versions require operator repair.
+Never bypass this gate to make a canary enter the queue.
+
+The explicit `authority_generation` is a fresh nonzero 128-bit value; rotate it
 when changing native review authority and never reuse a retired generation.
 Credential-path, caller, mirror and review-authority changes preserve paid repair
 claims, which bind to the enrolled repositories, queue epoch and CI scope.

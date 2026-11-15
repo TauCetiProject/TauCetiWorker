@@ -79,6 +79,7 @@ from .constants import (
     REVIEW_HEAD_CHANGED_EXIT,
     REVIEW_PREPARATION_WAIT_EXIT,
     REVIEW_PROVIDER_DOWN_EXIT,
+    REVIEW_PUBLICATION_SUPERSEDED_EXIT,
     ROADMAP,
     SANDBOX_DEFAULT,
     TAUCETI,
@@ -1656,6 +1657,10 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
         from .claude_api import check_result
 
         check_result(rc)
+        if rc == REVIEW_PUBLICATION_SUPERSEDED_EXIT:
+            log(f"  review #{pr}: newer publication superseded this saved output")
+            w.rs.bust(pr)
+            return None
         if rc == REVIEW_HEAD_CHANGED_EXIT:  # Review command: head changed before any review/inference.
             from .state_repair import repair_selected
 

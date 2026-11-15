@@ -233,5 +233,9 @@ class ForgejoWorkerSource(ForgejoReadSource):
             ]
         )
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # activate() creates bin/ first; mkdir(parents=True) may have created
+        # this intermediate directory with ordinary permissions. The trusted
+        # CLI loader requires the configuration's immediate parent to be private.
+        path.parent.chmod(0o700)
         path.write_text("\n".join(lines) + "\n")
         path.chmod(0o600)

@@ -28,6 +28,22 @@ from tauceti_worker.worker_sources import configure, source_config
 
 
 class Sources(unittest.TestCase):
+    def test_cli_configuration_repairs_an_existing_nonprivate_parent(self):
+        from tauceti_queue.control_policy_file import read_control_policy
+        from tauceti_worker.forgejo_worker import ForgejoWorkerSource
+
+        parent = self.root / "source-state"
+        parent.mkdir(mode=0o755)
+        parent.chmod(0o755)
+        path = parent / "gh-project.toml"
+        source = ForgejoWorkerSource(
+            self.identity, SimpleNamespace(forge=self.repo.forge, _token="token"), token_file=self.root / "token"
+        )
+        source.write_cli_configuration(path)
+        self.assertEqual(parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertIn(b'kind = "forgejo"', read_control_policy(path))
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

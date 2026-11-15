@@ -85,6 +85,17 @@ def resolve(cfg):
         transport = directory / "runner/publication_transport.py"
         if not transport.is_file() or "TAUCETI_NATIVE_REVIEW_PUBLISHER" not in transport.read_text():
             raise NoProgress("review engine does not support the configured native publication backend")
+        from types import SimpleNamespace
+
+        from .native_review_publisher import QueueReviewPublisher
+        from .worker_sources import current as selected_source
+
+        try:
+            QueueReviewPublisher(SimpleNamespace(source=selected_source())).preflight()
+        except (OSError, RuntimeError, ValueError) as error:
+            raise NoProgress(
+                f"native review publisher unavailable before inference ({type(error).__name__})"
+            ) from error
     current = subprocess.run(["git", "-C", str(directory), "rev-parse", "HEAD"], capture_output=True, text=True)
     return ReviewRuntime(directory, current.stdout.strip() if current.returncode == 0 else "")
 
@@ -190,6 +201,6 @@ def recover(worker, *, numbers=()):
         from .config import log
 
         log("review recovery: paid output awaits its original publisher or record repair; affected heads withheld")
-    if result.returncode not in (82, 84, 86):
+    if result.returncode not in (82, 84, 86, 87):
         raise NoProgress("rendered review output remains retained for publication retry")
     return False
