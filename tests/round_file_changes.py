@@ -219,6 +219,24 @@ def main():
                     tc.work_units._progressed_direct(types.SimpleNamespace(gh=gh), candidate, pre) == expected,
                 )
 
+        # A finding that only the PR description can answer (a quality-pass report) leaves no source
+        # change to push. Replacing the description and replying on its thread completes even the
+        # final attempt; a reply alone, or nothing, still does not.
+        gh = types.SimpleNamespace(pr_progress_state=lambda _: {"head": head, "ncomments": 1, "state": "OPEN"})
+        pre = {"head": head, "ncomments": 0, "state": "OPEN", "require_push": True}
+        for mutated, expected in (("description-reply", True), ("reply", False), (None, False)):
+            with patch.object(tc.work_units, "_round_mutated", return_value=mutated):
+                check(
+                    "final resolution accepts a description repair with its reply: " + str(mutated),
+                    tc.work_units._progressed_direct(types.SimpleNamespace(gh=gh), candidate, pre) == expected,
+                )
+        final = tc.work_units.FINAL_ATTEMPT_INSTRUCTION
+        check(
+            "the final-attempt instruction keeps its rule and names the exception",
+            "A comment alone does not complete this attempt" in final
+            and "update the description and reply on the finding's thread" in final,
+        )
+
         from tauceti_worker import github_transport as transport
 
         gh = types.SimpleNamespace(
@@ -302,6 +320,58 @@ def main():
                         types.SimpleNamespace(stdout=""),
                     )
                 check(method + " is not a new reply", tc.work_units._round_mutated(candidate, baseline) is None)
+
+            def record(created, argv, round_id="this-round"):
+                # The journal takes an action's round from the command's own context.
+                context = {"activity": {"round_id": round_id}}
+                with patch.dict(os.environ, TAUCETI_ACTIVITY_ROUND_ID=round_id):
+                    fleet_events.mutation(
+                        command | {"created": created, "argv": argv, "context": context},
+                        types.SimpleNamespace(stdout=""),
+                    )
+
+            edit = ["pr", "edit", "1", "--repo", "TauCetiProject/TauCeti", "--body-file", "/tmp/body.md"]
+            reply = ["api", "-X", "POST", "repos/TauCetiProject/TauCeti/pulls/1/comments/42/replies"]
+            final = baseline | {"require_push": True}
+            baseline["mutation_cursor"] = final["mutation_cursor"] = tc.work_units._mutation_cursor()
+            record("label", ["pr", "edit", "1", "--repo", "TauCetiProject/TauCeti", "--add-label", "x"])
+            record("peer-edit", edit, round_id="other-round")
+            record("reply-1", reply)
+            check(
+                "a reply without this round's description edit stays a reply",
+                tc.work_units._round_mutated(candidate, final) == "reply",
+            )
+            check(
+                "a reply alone does not complete a final attempt",
+                tc.work_units._progressed(types.SimpleNamespace(gh=gh), candidate, final) is False,
+            )
+            baseline["mutation_cursor"] = final["mutation_cursor"] = tc.work_units._mutation_cursor()
+            record("edit", edit)
+            check(
+                "a description edit alone is not a publication",
+                tc.work_units._round_mutated(candidate, final) is None,
+            )
+            record("reply-2", reply)
+            check(
+                "a description edit with its reply is attributed",
+                tc.work_units._round_mutated(candidate, final) == "description-reply",
+            )
+            check(
+                "a description repair with its reply completes a final attempt",
+                tc.work_units._progressed(types.SimpleNamespace(gh=gh), candidate, final) is True,
+            )
+            check(
+                "and an ordinary one",
+                tc.work_units._progressed(types.SimpleNamespace(gh=gh), candidate, baseline) is True,
+            )
+            baseline["mutation_cursor"] = final["mutation_cursor"] = tc.work_units._mutation_cursor()
+            record("rest-edit", ["api", "-X", "PATCH", "repos/TauCetiProject/TauCeti/pulls/1", "-f", "body=new text"])
+            record("reply-3", reply)
+            check(
+                "the REST form of a description edit counts the same",
+                tc.work_units._round_mutated(candidate, final) == "description-reply",
+            )
+            baseline["mutation_cursor"] = tc.work_units._mutation_cursor()
             journal.unlink()
             check(
                 "missing journal leaves observation unknown", tc.work_units._round_mutated(candidate, baseline) is None
@@ -318,6 +388,169 @@ def main():
             )
             is True,
         )
+
+        # The journal is optional and best effort, so it cannot be what completes a final attempt.
+        # Without its answer the same repair is read from the PR: the description's edit time moved,
+        # a comment was added, and the source says both are this account's.
+        class Source:
+            def __init__(self, reports_edits=True):
+                self.edited, self.ncomments, self.repair, self.asked = None, 0, True, []
+                self.reports_edits = reports_edits
+
+            def pr_progress_state(self, _pr):
+                state = {"head": head, "ncomments": self.ncomments, "state": "OPEN"}
+                return state | {"edited": self.edited} if self.reports_edits else state
+
+            def pr_description_repair(self, pr, edited, ncomments):
+                self.asked.append((pr, edited, ncomments))
+                return self.repair
+
+        def final_attempt(edit=True, reply=True, repair=True, final=True, source=None):
+            source = source or Source()
+            w = types.SimpleNamespace(gh=source)
+            pre = tc.work_units._progress_snapshot(w, candidate)
+            pre["require_push"] = final
+            if edit:
+                source.edited = "2026-11-13T12:00:00Z"
+            source.ncomments += reply
+            source.repair = repair
+            return tc.work_units._progressed(w, candidate, pre), pre["mutation_cursor"], source.asked
+
+        with patch.dict(os.environ):
+            os.environ.pop("TAUCETI_FLEET_EVENTS", None)
+            check("with the journal unset, a description repair completes a final attempt", final_attempt()[0] is True)
+            check("...read from the PR, from where the round began", final_attempt()[1:] == (None, [(1, None, 0)]))
+            check("a reply alone still does not", final_attempt(edit=False) == (False, None, []))
+            check("nor a description edit alone", final_attempt(reply=False) == (False, None, []))
+            check("a peer's edit or reply is not this round's", final_attempt(repair=False)[0] is False)
+            check("a repair that cannot be read stays unknown", final_attempt(repair=None)[0] is None)
+            check(
+                "a source that reports no edit time answers as before",
+                final_attempt(source=Source(reports_edits=False)) == (False, None, []),
+            )
+            check("an ordinary round is judged as before", final_attempt(final=False) == (None, None, []))
+        with patch.dict(os.environ, TAUCETI_FLEET_EVENTS=str(root / "absent.jsonl"), TAUCETI_FLEET_MACHINE_ID="test"):
+            check("with the journal missing when the round began, likewise", final_attempt()[:2] == (True, None))
+            check("...and a reply alone still does not", final_attempt(edit=False)[0] is False)
+        journal.write_text("")
+        with patch.dict(os.environ, TAUCETI_FLEET_EVENTS=str(journal), TAUCETI_FLEET_MACHINE_ID="test"):
+            # The journal recorded this round's reply and lost its description edit.
+            source = Source()
+            lost = {"head": head, "ncomments": 0, "state": "OPEN", "edited": None, "require_push": True}
+            lost |= {"round_id": "this-round", "mutation_cursor": tc.work_units._mutation_cursor()}
+            record("reply-4", reply)
+            source.edited, source.ncomments = "2026-11-13T12:00:00Z", 1
+            check("the journal has the reply alone", tc.work_units._round_mutated(candidate, lost) == "reply")
+            check(
+                "a journal that lost the edit does not hide the repair",
+                tc.work_units._progressed(types.SimpleNamespace(gh=source), candidate, lost) is True,
+            )
+
+        # The source's own answer, from one request for the PR's edit time, editor and newest comments.
+        from tauceti_worker import github
+
+        def written(*comments, total=None):
+            nodes = [{"createdAt": at, "author": {"login": who} if who else None} for who, at in comments]
+            return {"totalCount": len(nodes) if total is None else total, "nodes": nodes}
+
+        def pull(edited, editor, issue=(), threads=(), nthreads=None):
+            return {
+                "lastEditedAt": edited,
+                "editor": {"login": editor} if editor else None,
+                "comments": written(*issue),
+                "reviewThreads": {
+                    "totalCount": len(threads) if nthreads is None else nthreads,
+                    "nodes": [{"comments": written(*thread)} for thread in threads],
+                },
+            }
+
+        def repaired(pull_request, edited=None, ncomments=1, **answer):
+            payload = {"data": {"viewer": {"login": "worker"}, "repository": {"pullRequest": pull_request}}} | answer
+            client = types.SimpleNamespace(
+                repo="TauCetiProject/TauCeti",
+                _gh=lambda _args: types.SimpleNamespace(returncode=0, stdout=json.dumps(payload)),
+            )
+            return github.GitHub.pr_description_repair(client, 1, edited, ncomments)
+
+        finding, later = ("reviewer", "2026-11-13T10:00:00Z"), "2026-11-13T12:05:00Z"
+        check(
+            "this account's edit and its reply on the thread are a repair",
+            repaired(pull("2026-11-13T12:00:00Z", "Worker", threads=[[finding, ("worker", later)]])) is True,
+        )
+        check(
+            "an earlier edit is not this round's",
+            repaired(
+                pull("2026-11-13T09:00:00Z", "worker", threads=[[finding, ("worker", later)]]), "2026-11-13T09:00:00Z"
+            )
+            is False,
+        )
+        check(
+            "nor a description never edited",
+            repaired(pull(None, None, threads=[[finding, ("worker", later)]])) is False,
+        )
+        check(
+            "a peer's edit is not attributed",
+            repaired(pull("2026-11-13T12:00:00Z", "peer", threads=[[finding, ("worker", later)]])) is False,
+        )
+        check(
+            "a peer's reply is not attributed",
+            repaired(pull("2026-11-13T12:00:00Z", "worker", threads=[[finding, ("peer", later)]])) is False,
+        )
+        check(
+            "nor a deleted account's",
+            repaired(pull("2026-11-13T12:00:00Z", "worker", threads=[[finding, (None, later)]])) is False,
+        )
+        check(
+            "this account's comment from before the round is not its reply",
+            repaired(pull("2026-11-13T12:00:00Z", "worker", [("worker", "2026-11-13T09:00:00Z")], [[("peer", later)]]))
+            is False,
+        )
+        check(
+            "its reply counts among several new comments",
+            repaired(
+                pull(
+                    "2026-11-13T12:00:00Z", "worker", [finding, ("worker", "2026-11-13T12:01:00Z")], [[("peer", later)]]
+                )
+            )
+            is True,
+        )
+        crowded = pull("2026-11-13T12:00:00Z", "worker", threads=[[("worker", later)] * 10])
+        crowded["reviewThreads"]["nodes"][0]["comments"]["totalCount"] = 12
+        check("more new comments than the request shows stay unknown", repaired(crowded) is None)
+        check(
+            "and so do more threads than it shows",
+            repaired(pull("2026-11-13T12:00:00Z", "worker", threads=[[finding, ("worker", later)]], nthreads=101))
+            is None,
+        )
+        check(
+            "a rejected query is unknown",
+            repaired(pull("2026-11-13T12:00:00Z", "worker", threads=[[finding, ("worker", later)]]), errors=[{}])
+            is None,
+        )
+        check("a missing PR is unknown", repaired(None) is None)
+        failed = types.SimpleNamespace(repo="o/r", _gh=lambda _args: types.SimpleNamespace(returncode=1, stdout=""))
+        check("a failed read is unknown", github.GitHub.pr_description_repair(failed, 1, None, 0) is None)
+
+        def progress_state(pull_request):
+            payload = {"data": {"repository": {"pullRequest": pull_request}}}
+            client = types.SimpleNamespace(
+                repo="TauCetiProject/TauCeti",
+                _gh=lambda _args: types.SimpleNamespace(returncode=0, stdout=json.dumps(payload)),
+            )
+            with transport.read_context(direct=True):
+                return github.GitHub.pr_progress_state(client, 1)
+
+        counted = {"headRefOid": head, "state": "OPEN", "comments": {"totalCount": 2}}
+        counted["reviewThreads"] = {"totalCount": 1, "nodes": [{"comments": {"totalCount": 3}}]}
+        check(
+            "the progress read carries the description's edit time",
+            progress_state(counted | {"lastEditedAt": "2026-11-13T12:00:00Z"})
+            == {"head": head, "ncomments": 5, "state": "OPEN", "edited": "2026-11-13T12:00:00Z"},
+        )
+        check(
+            "...None for a description never edited", progress_state(counted | {"lastEditedAt": None})["edited"] is None
+        )
+        check("...and nothing when the answer has none", "edited" not in progress_state(counted))
 
         # 4) a round that changed nothing is silent.
         check("a clean round logs nothing", run(repo, head) == "")

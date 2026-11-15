@@ -14,30 +14,6 @@ COST_WINDOWS = ("24h", "7d", "total")
 # Shared PR inventories reconcile hourly. Allow a missed cycle before warning;
 # the preparer's five-minute reads do not make the underlying evidence younger.
 PR_STALE_SECONDS = 2 * 3600
-RECOVERY_COUNTS = (
-    "records",
-    "retained",
-    "blocked",
-    "preserved",
-    "reset",
-    "superseded",
-    "incomplete",
-    "corrupt",
-    "errors",
-    "cleanup_backlog",
-) + tuple(
-    "recovery_" + state
-    for state in (
-        "retained",
-        "eligible",
-        "resuming",
-        "verified",
-        "publication_pending",
-        "published",
-        "obsolete",
-        "blocked",
-    )
-)
 
 
 def amount(value, *, rate=False):
@@ -138,6 +114,14 @@ def display(value, default_kinds=()):
                 f"{cleanup.get('protected_bytes', 0) / 2**30:.1f} GiB held by live workers; "
                 f"{cleanup.get('reclaimed_bytes', 0) / 2**30:.1f} GiB space recovered; checked {age}s ago"
             )
+            if "named_bytes" in cleanup:
+                # du counts each hard link, so named bytes alone prove nothing about disk use.
+                print(
+                    f"  Cache storage: {cleanup['named_bytes'] / 2**30:.1f} GiB named (du, every link); "
+                    f"{cleanup['managed_bytes'] / 2**30:.1f} GiB allocated in "
+                    f"{cleanup.get('unique_inodes', 0):,} unique inodes; "
+                    f"{cleanup.get('free_bytes', 0) / 2**30:.1f} GiB filesystem free"
+                )
             if cleanup.get("pressure"):
                 print("  Disk cleanup requested; live work and saved source remain protected")
     if expanded := s.get("expanded_cache"):
@@ -402,39 +386,6 @@ def display(value, default_kinds=()):
                 messages.add(reason)
             for message in sorted(messages):
                 print(f"  {label}: {message}")
-    recovery = s.get("work_recovery")
-    if recovery and (any(recovery.get(key) for key in RECOVERY_COUNTS) or recovery.get("preparation_metadata_entries")):
-        print()
-        print(
-            f"Local work recovery: {recovery.get('records', 0)} saved, "
-            f"{recovery.get('retained', 0)} checkouts moved aside, "
-            f"{recovery.get('incomplete', 0)} incomplete, {recovery.get('corrupt', 0)} corrupt, {recovery.get('errors', 0)} errors"
-        )
-        if any(recovery.get(key, 0) for key in RECOVERY_COUNTS if key.startswith("recovery_")):
-            print(
-                "Repair recovery: "
-                + ", ".join(
-                    f"{recovery.get('recovery_' + state, 0)} {state.replace('_', '-')}"
-                    for state in (
-                        "eligible",
-                        "resuming",
-                        "verified",
-                        "publication_pending",
-                        "published",
-                        "obsolete",
-                        "blocked",
-                    )
-                )
-            )
-        print(
-            f"  Cleanup: {recovery.get('cleanup_backlog', 0)} queued, "
-            f"oldest {int(recovery.get('cleanup_oldest_age_seconds', 0))}s; "
-            f"preparation {recovery.get('preparation_seconds', 0):.3f}s, "
-            f"read {recovery.get('preparation_read_bytes', 0)}B, "
-            f"hashed {recovery.get('preparation_hash_bytes', 0)}B"
-        )
-        for reason in recovery.get("reasons", []):
-            print("  " + reason)
     if ci_rows:
         table("CI history", headers, ci_rows, widths)
     print()
@@ -564,6 +515,8 @@ def combine(values):
                 key: sum(row.get(key, 0) for row in cleanup)
                 for key in (
                     "managed_bytes",
+                    "named_bytes",
+                    "unique_inodes",
                     "protected_bytes",
                     "reclaimed_bytes",
                     "free_bytes",
@@ -574,6 +527,10 @@ def combine(values):
             },
             pressure=any(row.get("pressure", False) for row in cleanup),
         )
+        if not all("named_bytes" in row for row in cleanup):
+            # A host on an older collector reports no link-aware totals; a partial sum would mislead.
+            s["storage_cleanup"].pop("named_bytes")
+            s["storage_cleanup"].pop("unique_inodes")
     expanded = [v["expanded_cache"] for v in known if v.get("expanded_cache")]
     if expanded:
         s["expanded_cache"] = {
@@ -706,20 +663,6 @@ def combine(values):
         s["shared_mathlib"]["reasons_by_mode"] = {
             mode: sorted(reasons) for mode, reasons in sorted(reasons_by_mode.items())
         }
-    recovery = [v.get("work_recovery", {}) for v in known]
-    if any(recovery):
-        s["work_recovery"] = {key: sum(row.get(key, 0) for row in recovery) for key in RECOVERY_COUNTS}
-        for key in (
-            "preparation_seconds",
-            "preparation_read_bytes",
-            "preparation_hash_bytes",
-            "preparation_metadata_entries",
-        ):
-            s["work_recovery"][key] = sum(row.get(key, 0) for row in recovery)
-        s["work_recovery"]["cleanup_oldest_age_seconds"] = max(
-            (row.get("cleanup_oldest_age_seconds", 0) for row in recovery), default=0
-        )
-        s["work_recovery"]["reasons"] = sorted({reason for row in recovery for reason in row.get("reasons", [])})
     funds = [v.get("costs", {}).get("funding") for v in known]
     if all(funds) and len(known) == len(values):
         s["costs"]["funding"] = {

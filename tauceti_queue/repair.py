@@ -468,7 +468,7 @@ def compare_chains(clone: Path, before: list[ChainCommit], after: list[ChainComm
 
 def owners_of(clone: Path, chain: list[ChainCommit], path: str) -> list[int]:
     """Constituent PRs whose commit touches ``path`` (file-level ownership, as Bors attributes it)."""
-    if not chain:
+    if not chain or not path:
         return []
     shas = set(git(clone, "rev-list", f"{chain[0].parent}..{chain[-1].sha}", "--", path).split())
     return [c.pr for c in chain if c.sha in shas and c.pr is not None]
@@ -1009,6 +1009,11 @@ MEMBER_STATES = ("replayed", "conflicting", "pending")
 
 HARD_RULES = (
     "The aim is that every constituent PR's mathematics lands as its author intended, compiled and checked. "
+    "A duplicate name or similar API does not make a contribution redundant when its universes, hypotheses, "
+    "or conclusions are more general. Preserve that generality by reusing or extending the existing API; "
+    "editing the existing mathematics is within repair scope, even when another PR owns its file. "
+    "Do not discard a different-universe construction merely because main has a same-universe version. "
+    "Only describe a contribution as redundant when all of its mathematical content is already covered. "
     "Hard rules: no `sorry`, no `native_decide`, no new axioms, no `set_option` (banned throughout Tau Ceti), "
     "no silenced linters."
 )
@@ -1886,10 +1891,14 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
         lines.append("Compiler errors:")
         lines.append("")
         for error in findings["compiler_errors"]:
-            owners = owners_of(clone, chain, error["path"])
-            lines.append(
-                f"- `{error['path']}:{error.get('line', 0)}:{error.get('column', 0)}` ({_owner_text(owners, chain)})"
-            )
+            path = error.get("path") or ""
+            if path:
+                owners = owners_of(clone, chain, path)
+                lines.append(
+                    f"- `{path}:{error.get('line', 0)}:{error.get('column', 0)}` ({_owner_text(owners, chain)})"
+                )
+            else:
+                lines.append("- Build/verification diagnostic (no file path):")
             for text in str(error.get("message", "")).splitlines():
                 lines.append(f"      {text}")
         lines.append("")
@@ -2017,8 +2026,8 @@ def prepare_errors_lines(record: dict | None) -> list[str]:
     return lines
 
 
-def explanation_prompt(unexplained: list[str], chain: list[ChainCommit]) -> str:
-    """The short follow-up turn when content changed without an appended explanation."""
+def explanation_prompt(unexplained: list[str], chain: list[ChainCommit], *, base: str | None = None) -> str:
+    """Ask for missing explanations using the current result's commits and target base."""
     by_pr = {c.pr: c for c in chain if c.pr is not None}
     lines = [
         "The chain at HEAD changes the content of these constituent commits without appending an explanation to "
@@ -2034,7 +2043,8 @@ def explanation_prompt(unexplained: list[str], chain: list[ChainCommit]) -> str:
         "Append a very concise explanation of what changed and why to each of these messages, preserving the existing "
         "message text as a prefix and keeping the `Source-PR:` and `Accepted-Head:` trailers. Change nothing else: no "
         "content edits, no reordering, no new commits. Leave HEAD (detached) at the reworded chain tip, still a linear "
-        f"chain on `{(chain[0].parent[:12] if chain else '?')}`, with a clean working tree, then stop.",
+        f"chain on `{(base[:12] if base else chain[0].parent[:12] if chain else '?')}`, "
+        "with a clean working tree, then stop.",
     ]
     return "\n".join(lines)
 
@@ -2165,7 +2175,7 @@ def agent_environment(
     None because the prompt is in argv."""
     os.environ["TAUCETI_ROUND_DEADLINE"] = str(time.time() + deadline_seconds)
     from tauceti_worker.agents import host_agent_launch
-    from tauceti_worker.repair_recovery import environment
+    from tauceti_worker.config import environment
 
     with environment(**isolation_env(root, env_lake)):
         argv, env, stdin_text = host_agent_launch(prompt, claude_profile())

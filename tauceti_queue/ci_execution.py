@@ -12,7 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
 from tauceti_tools import ci_candidate as cc
@@ -20,7 +20,7 @@ from tauceti_tools.ci_candidate_evidence import EvidenceUnavailable, GitHubEvide
 from tauceti_tools.forge import GITHUB
 
 from . import github_app
-from .github_adapter import UrllibTransport
+from .github_adapter import GitHubAdapter, GitHubClient, UrllibTransport
 from .ports import CandidateRun, DispatchNotAccepted
 from .workflow_token import WorkflowTokenSource
 
@@ -311,6 +311,29 @@ class GitHubSourceExecution:
             and run.conclusion in {"cancelled", "timed_out", "startup_failure", "failure"}
         ):
             absent = self._result_absent(reader, frozen, run)
+        if result is not None and result.get("classification") in {"source_failure", "policy_failure"}:
+            # Logs are repair context only. The verified result above remains the
+            # sole verdict/ownership authority, even if diagnostics are unavailable.
+            try:
+                adapter = GitHubAdapter(
+                    GitHubClient(self.tokens, self.transport), frozen.policy.execution.repository.name
+                )
+                details = adapter.read_run(frozen.policy.execution.repository.name, run_id, with_jobs=True)
+                if details is not None and (details.run_id, details.attempt, details.status) == (
+                    run.run_id,
+                    run.attempt,
+                    run.status,
+                ):
+                    run = replace(
+                        run,
+                        diagnostics=details.diagnostics,
+                        phases=details.phases,
+                        runner_name=details.runner_name,
+                        runner_labels=details.runner_labels,
+                        host=details.host,
+                    )
+            except Exception:
+                pass  # Optional context cannot erase a verified failure or create a pass.
         return CandidateObservation(run, ownership, result, absent)
 
     def _result_absent(self, reader, frozen, run):

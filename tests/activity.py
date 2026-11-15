@@ -41,11 +41,6 @@ class ActivityTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.addCleanup(setattr, a, "_round", None)
-        from tauceti_worker import work_recovery
-
-        recovery_home = patch.object(work_recovery, "HERE", Path(self.tmp.name) / "worker")
-        recovery_home.start()
-        self.addCleanup(recovery_home.stop)
         self.now = time.time()
 
     def test_collector_keeps_minute_cadence_without_overlapping_or_replaying_missed_ticks(self):
@@ -329,27 +324,6 @@ class ActivityTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             a.display(older)
         self.assertIn(f"  Worker message (state unavailable): {private_reason}\n", output.getvalue())
-
-    def test_housekeeping_failure_does_not_abort_activity_refresh(self):
-        from tauceti_worker import work_recovery
-
-        with patch.object(work_recovery, "housekeep", side_effect=OSError("fixture housekeeping failure")):
-            value = a.prepare(now=self.now)
-        self.assertTrue(a.cached()["available"])
-        self.assertTrue(any("Recovery housekeeping deferred" in error for error in value["errors"]))
-
-    def test_installed_collector_keeps_destructive_cleanup_out_of_reporting(self):
-        from tauceti_worker import retention, work_recovery
-
-        a.atomic_json(a.root() / "cleanup-service.json", dict(installed=True))
-        with (
-            patch.object(work_recovery, "housekeep", return_value=dict(cleanup_pending=True)) as inventory,
-            patch.object(retention, "request_cleanup") as request,
-        ):
-            a.prepare(now=self.now)
-        inventory.assert_called_once_with(cleanup=False)
-        request.assert_called_once()
-        self.assertTrue(a.cached()["available"])
 
     def test_current_work_counts_distinct_workers_not_unfinished_receipts(self):
         a.prepare(now=self.now)

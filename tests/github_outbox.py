@@ -372,3 +372,269 @@ with (
     value = json.loads(path.read_text())
     assert value["status"] == "rejected" and value["retry_at"] >= time.time() + 295
     assert not getattr(rejected, "github_permanent_failure", False)
+
+# A description edit whose acknowledgement was lost is settled from the live description, so its PR
+# does not wait for manual recovery. A fix round that answers a quality-pass finding makes this edit.
+with (
+    tempfile.TemporaryDirectory() as tmp,
+    patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": tmp, "GH_TOKEN": "description-fixture"}),
+):
+    env = dict(os.environ)
+    text = "This PR proves foo.\n\nQuality pass:\n- Q1 Mathlib duplicates: checked — none\n"
+    report = Path(tmp) / "body.md"
+    lost = subprocess.CompletedProcess([], 1, "", "connection reset")
+
+    def description(body, edited, editor=None):
+        pull = {"body": body, "lastEditedAt": edited, "editor": {"login": editor} if editor else None}
+        return subprocess.CompletedProcess([], 0, json.dumps({"data": {"repository": {"pullRequest": pull}}}), "")
+
+    def stamp(offset):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + offset))
+
+    def retained(*form):
+        """An edit of PR 7's description that was sent and never acknowledged."""
+        report.write_text(text)
+        edit = ["gh", "pr", "edit", "7", "--repo", "org/repo", *form]
+        path = outbox.prepare(edit, env, tmp)
+        report.unlink()  # the round removes its files
+        outbox.finish(path, lost, [])
+        assert json.loads(path.read_text())["status"] == "ambiguous"
+        assert json.loads(path.read_text())["context"]["body"] == text, form
+        assert outbox.pending_for("org/repo", 7, env)
+        return path
+
+    # GitHub applied it: one read, nothing sent again, and later work on the PR may proceed.
+    for form in (
+        ["--body-file", str(report)],
+        ["-F", str(report)],
+        ["--body-file=" + str(report)],
+        ["--body", text],
+        ["-b", text],
+        ["--body=" + text],
+    ):
+        path = retained(*form)
+        applied = description(text.replace("\n", "\r\n"), stamp(0))
+        with patch.object(tr, "execute", return_value=applied) as read:
+            assert outbox.drain(env) == [] and not path.exists(), form
+            assert read.call_count == 1 and read.call_args.args[0][1:3] == ["api", "graphql"]
+        assert not outbox.pending_for("org/repo", 7, env)
+
+    # GitHub never applied it: the edit is sent again, from the copy kept of the file.
+    for form, edited in (
+        (["--body-file", str(report)], None),
+        (["-F", str(report)], "2020-01-01T00:00:00Z"),
+        (["--body-file=" + str(report)], stamp(-3600)),
+    ):
+        path = retained(*form)
+        sent = []
+
+        def unapplied(args, edited=edited, sent=sent, **_kwargs):
+            if args[1:3] == ["api", "graphql"]:
+                return description("This PR proves foo.", edited)
+            name = next(a for a in reversed(args) if "body" in a or a.endswith(".body"))
+            sent.append(Path(name.removeprefix("--body-file=")).read_text())
+            return subprocess.CompletedProcess(args, 0, "{}", "")
+
+        with patch.object(tr, "execute", side_effect=unapplied):
+            assert outbox.drain(env) == [] and not path.exists(), form
+        assert sent == [text] and not outbox.pending_for("org/repo", 7, env), form
+        assert not list(outbox.directory(env).glob("*.body"))
+
+    # A later edit left other text there: this one is set aside, never replayed over it.
+    path = retained("--body-file", str(report))
+    with patch.object(tr, "execute", return_value=description("A newer description.", stamp(30))) as read:
+        assert outbox.drain(env) == [] and not path.exists() and path.with_suffix(".failed").exists()
+        assert read.call_count == 1
+    assert not outbox.pending_for("org/repo", 7, env)
+
+    # An unreadable description settles nothing; the intent is kept and its PR still waits.
+    path = retained("--body-file", str(report))
+    value = json.loads(path.read_text())
+    for unread in (
+        subprocess.CompletedProcess([], 1, "", "timeout"),
+        subprocess.CompletedProcess([], 0, "not json", ""),
+        subprocess.CompletedProcess([], 0, json.dumps({"data": {"repository": {"pullRequest": None}}}), ""),
+    ):
+        with patch.object(tr, "execute", return_value=unread):
+            assert outbox.reconcile(value, env) is None
+    with patch.object(tr, "execute", return_value=unread):
+        assert outbox.drain(env) == [path.stem] and path.exists()
+    assert outbox.pending_for("org/repo", 7, env)
+    for live, expected in (
+        (description(text, None), True),
+        (description(None, None), False),
+        (description("other", stamp(-3600)), False),
+        (description("other", stamp(-120)), "superseded"),  # within the allowance for clock skew
+        (description("other", stamp(120)), "superseded"),
+    ):
+        with patch.object(tr, "execute", return_value=live):
+            assert outbox.reconcile(value, env) == expected, (live.stdout, expected)
+    # In the minutes before the intent was written, this clock and GitHub's cannot order two edits,
+    # so an edit there counts as later whoever made it: workers share their operator's account.
+    author = {**env, "TAUCETI_GITHUB_ACCOUNT": "Author"}
+    for editor in ("author", "maintainer", None):
+        with patch.object(tr, "execute", return_value=description("other", stamp(-120), editor)):
+            assert outbox.reconcile(value, author) == "superseded", editor
+    path.unlink()
+
+    # The same check is made before every later attempt, whatever became of the last one.
+    edit = ["gh", "pr", "edit", "7", "--repo", "org/repo", "--body-file", str(report)]
+
+    def unsent():
+        """An edit of PR 7's description that was written down and never sent."""
+        report.write_text(text)
+        path = outbox.prepare(edit, env, tmp)
+        report.unlink()
+        assert json.loads(path.read_text())["status"] == "prepared"
+        path.with_suffix(".failed").unlink(missing_ok=True)
+        return path
+
+    def rejected():
+        """An edit of PR 7's description that was refused before it was sent."""
+        path = unsent()
+        outbox.finish(path, subprocess.CompletedProcess([], 1, "", "API rate limit exceeded"), before_request=True)
+        assert json.loads(path.read_text())["status"] == "rejected"
+        return path
+
+    def github(live, sent, answer=None):
+        """A GitHub whose description is `live`. The text of every edit sent to it goes in `sent`."""
+
+        def execute(args, **_kwargs):
+            if args[1:3] == ["api", "graphql"]:
+                return live
+            sent.append(Path(args[-1]).read_text())
+            return answer or subprocess.CompletedProcess(args, 0, "{}", "")
+
+        return execute
+
+    # A replay that is itself refused before sending leaves the intent `rejected`. A maintainer
+    # edits the description meanwhile: the next drain sets the old text aside and sends nothing.
+    path = retained(*edit[6:])
+    path.with_suffix(".failed").unlink(missing_ok=True)
+    sent = []
+    refusal = subprocess.CompletedProcess([], 1, "", "gh: secondary rate limit; Retry-After: 30\n")
+    refusal.github_before_request = True
+    with patch.object(tr, "execute", side_effect=github(description("This PR proves foo.", None), sent, refusal)):
+        assert outbox.drain(env) == [path.stem]
+    assert sent == [text] and json.loads(path.read_text())["status"] == "rejected"
+    newer = description("A maintainer's description.", stamp(30), "maintainer")
+    with patch.object(tr, "execute", side_effect=github(newer, sent)):
+        assert outbox.drain(env) == [] and not path.exists() and path.with_suffix(".failed").exists()
+    assert sent == [text], "an older text went back over the maintainer's description"
+    assert not outbox.pending_for("org/repo", 7, env)
+
+    # So it is for an edit refused at its first attempt, and for one never sent.
+    for make in (rejected, unsent):
+        path, sent = make(), []
+        with patch.object(tr, "execute", side_effect=github(newer, sent)):
+            assert outbox.drain(env) == [] and not path.exists() and path.with_suffix(".failed").exists()
+        assert sent == [], make.__name__
+
+    # While the description is still the one it was written to replace, a refused edit is sent
+    # again as before: never edited, or last edited long before.
+    for live in (
+        description("This PR proves foo.", None),
+        description("This PR proves foo.", stamp(-3600), "maintainer"),
+    ):
+        path, sent = rejected(), []
+        with patch.object(tr, "execute", side_effect=github(live, sent)):
+            assert outbox.drain(env) == [] and not path.exists(), live.stdout
+        assert sent == [text] and not path.with_suffix(".failed").exists(), live.stdout
+
+    # This host's clock runs a minute ahead of GitHub's. The operator, on the account the worker
+    # shares, edits the description half a minute after the refused edit was written, so GitHub
+    # stamps that later edit half a minute before the intent. The older text is not sent over it.
+    ahead = 60
+    path, sent = rejected(), []
+    operator = description("The operator's later description.", stamp(30 - ahead), "author")
+    with patch.object(tr, "execute", side_effect=github(operator, sent)):
+        assert outbox.drain(author) == [] and not path.exists() and path.with_suffix(".failed").exists()
+    assert sent == [], "an older text went back over a later edit from the same account"
+
+    # The description cannot be read: nothing is sent over a text that was not seen, and the
+    # intent waits as it was.
+    path, sent = rejected(), []
+    unread = subprocess.CompletedProcess([], 1, "", "timeout")
+    with patch.object(tr, "execute", side_effect=github(unread, sent)):
+        assert outbox.drain(env) == [path.stem] and sent == []
+    held = json.loads(path.read_text())
+    assert held["status"] == "rejected" and held["retry_at"] > time.time() + 50
+    assert outbox.pending_for("org/repo", 7, env)
+    path.unlink()
+
+    # The description already carries this text, from another command: the intent is finished.
+    path, sent = rejected(), []
+    with patch.object(tr, "execute", side_effect=github(description(text, stamp(0), "author"), sent)):
+        assert outbox.drain(env) == [] and not path.exists() and sent == []
+    assert not path.with_suffix(".failed").exists()
+
+    # The same command issued again finds its retained intent, which is checked in the same way
+    # before it is sent. An intent this command wrote itself is sent without a read.
+    path = rejected()
+    written = json.loads(path.read_text())["created"]
+    with patch.object(tr, "execute") as read:
+        assert outbox.may_send(path, env, written) and outbox.may_send(path)
+        read.assert_not_called()
+    for live in (description("This PR proves foo.", None), description(text, stamp(0), "author")):
+        with patch.object(tr, "execute", return_value=live) as read:
+            assert outbox.may_send(path, env, written + 1) and read.call_count == 1
+    with patch.object(tr, "execute", return_value=unread):
+        assert not outbox.may_send(path, env, written + 1)
+    assert json.loads(path.read_text())["status"] == "rejected" and outbox.retry_at(path) > time.time() + 50
+    with patch.object(tr, "execute", return_value=newer):
+        try:
+            outbox.may_send(path, env, written + 1)
+            raise AssertionError("an older text was allowed over a later description")
+        except GitHubUnavailable as refused:
+            assert "later edit" in str(refused) and refused.retry_at < time.time() + 5
+    assert not path.exists() and path.with_suffix(".failed").exists()
+    assert not outbox.pending_for("org/repo", 7, env)
+
+    # Through the transport, which tells a retained intent from the command's own by when the
+    # command began. Refused once, the same command is a new one, written now, and is sent.
+    path, sent = rejected(), []
+
+    def transport(argv, **_kwargs):
+        if argv[1:3] == ["api", "graphql"]:
+            return newer
+        sent.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+    report.write_text(text)
+    with patch.object(tr, "_execute", side_effect=transport):
+        try:
+            tr.execute(edit, env=env, cwd=tmp)
+            raise AssertionError("an older text was sent over a later description")
+        except GitHubUnavailable:
+            assert sent == [] and not path.exists() and path.with_suffix(".failed").exists()
+        assert tr.execute(edit, env=env, cwd=tmp).returncode == 0 and sent == [edit]
+    report.unlink()
+    assert not outbox.pending_for("org/repo", 7, env)
+    # Other intents are sent as before, with no read.
+    comment = ["gh", "pr", "comment", "7", "--repo", "org/repo", "--body", "Updated the description."]
+    path = outbox.prepare(comment, env, tmp)
+    outbox.finish(path, subprocess.CompletedProcess([], 1, "", "API rate limit exceeded"), before_request=True)
+    with patch.object(tr, "execute") as read:
+        assert outbox.may_send(path, env, time.time() + 1)
+        read.assert_not_called()
+    path.unlink()
+
+    # Labels and titles are separate writes: an edit that carries one is not settled by its text,
+    # and an edit with no description is as it was.
+    for extra in (["--add-label", "self-tested"], ["--title", "A title"], ["-t", "A title"], ["--base", "main"]):
+        compound = {
+            "argv": ["pr", "edit", "7", "--repo", "org/repo", "--body", text, *extra],
+            "context": {"body": text},
+        }
+        with patch.object(tr, "execute") as read:
+            assert outbox.reconcile(compound, env) is None, extra
+            read.assert_not_called()
+    label = {"argv": ["pr", "edit", "7", "--repo", "org/repo", "--add-label", "self-tested"], "context": {}}
+    with patch.object(tr, "execute") as read:
+        assert outbox.reconcile(label, env) is None
+        read.assert_not_called()
+    assert outbox.description_edit(["pr", "edit", "7", "-R", "org/repo", "--body", "- starts with a dash"])
+    assert outbox.description_edit(["pr", "edit", "https://github.com/org/repo/pull/7", "--repo=org/repo", "-b", "x"])
+    assert not outbox.description_edit(["pr", "edit", "7", "--repo", "org/repo"])
+    assert not outbox.description_edit(["pr", "comment", "7", "--body", "x"])
+print("PASS: description edits are reconciled against the live description")

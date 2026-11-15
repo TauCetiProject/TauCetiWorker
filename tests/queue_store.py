@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -21,6 +22,41 @@ class StoreTests(unittest.TestCase):
         self.path = str(Path(self.tmp.name) / "queue.sqlite")
         self.store = Store(self.path)
         self.addCleanup(self.store.close)
+
+    def test_snapshot_reads_committed_data_while_a_writer_holds_the_shared_connection(self):
+        self.store.set_setting("snapshot-test", "committed")
+        writing, release = threading.Event(), threading.Event()
+
+        def writer():
+            with self.store.transaction():
+                self.store.set_setting("snapshot-test", "pending")
+                writing.set()
+                release.wait(3)
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        try:
+            self.assertTrue(writing.wait(2))
+            started = time.monotonic()
+            with self.store.read_snapshot() as snapshot:
+                self.assertEqual(snapshot.get_setting("snapshot-test"), "committed")
+            self.assertLess(time.monotonic() - started, 1)
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.store.get_setting("snapshot-test"), "pending")
+
+    def test_snapshot_is_consistent_read_only_and_fresh_on_the_next_request(self):
+        self.store.set_setting("snapshot-test", "before")
+        with self.store.read_snapshot() as snapshot:
+            self.assertEqual(snapshot.get_setting("snapshot-test"), "before")
+            self.store.set_setting("snapshot-test", "after")
+            self.assertEqual(snapshot.get_setting("snapshot-test"), "before")
+            with self.assertRaises(sqlite3.OperationalError):
+                snapshot.execute("DELETE FROM settings")
+        with self.store.read_snapshot() as snapshot:
+            self.assertEqual(snapshot.get_setting("snapshot-test"), "after")
 
     def test_schema_creates_every_table_in_wal_mode(self):
         names = {row["name"] for row in self.store.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
