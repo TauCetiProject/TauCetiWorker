@@ -70,7 +70,8 @@ The marks in the file go stale between edits, so each round overlays them:
 - An open pull request, on any forge the worker discovers, whose body carries
   `<!--tauceti-target:v1 {"focus":"<Area>","id":"<slug>"}-->` puts that item in
   flight.
-- A merged one marks it done, unless its marker also says `"partial":true` or
+- A merged one, into the branch the worker authors against
+  (`TAUCETI_BASE_BRANCH`, default `main`), marks it done, unless its marker also says `"partial":true` or
   the item's `partial:` clause names the pull request. A pull request Bors
   landed, closed under a `[Merged by Bors] - ` title, counts as merged.
 

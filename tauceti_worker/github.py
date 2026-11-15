@@ -871,12 +871,12 @@ class GitHub:
         return json.loads(p.stdout or "[]")
 
     def merged_prs(self, search: str, *, limit: int = 200) -> list[dict]:
-        """Number, title and body of the merged pull requests among the first `limit` closed ones a
-        search returns, Bors landings included (see `normalize_merged`)."""
+        """Number, title, body and base branch (`baseRefName`) of the merged pull requests among the
+        first `limit` closed ones a search returns, Bors landings included (see `normalize_merged`)."""
         args = ["pr", "list", "--repo", self.repo, "--state", "closed", "--search", search, "--limit", str(limit)]
 
         def fetch():
-            p = self._gh([*args, "--json", "number,title,body,state"])
+            p = self._gh([*args, "--json", "number,title,body,state,baseRefName"])
             if p.returncode != 0:
                 raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
             return [d for d in map(normalize_merged, json.loads(p.stdout or "[]")) if d.get("state") == "MERGED"]
@@ -884,14 +884,15 @@ class GitHub:
         return transport.shared_read(["merged_prs", self.repo, search, limit], fetch, ttl=120)
 
     def target_marker_prs(self, *, limit: int = 200, search: str = "") -> list[dict]:
-        """Number, title, body, head (`headRefOid`) and state (OPEN, CLOSED or MERGED, Bors landings included) of the
+        """Number, title, body, head (`headRefOid`), base branch (`baseRefName`) and state (OPEN, CLOSED or
+        MERGED, Bors landings included) of the
         `limit` most recently updated pull requests in any state whose body carries a target
         marker and matches the extra `search` terms: one search request, shared for two minutes."""
         query = f'{search} "tauceti-target:v1" in:body sort:updated-desc'.strip()
         args = ["pr", "list", "--repo", self.repo, "--state", "all", "--search", query, "--limit", str(limit)]
 
         def fetch():
-            p = self._gh([*args, "--json", "number,title,body,state,headRefOid"])
+            p = self._gh([*args, "--json", "number,title,body,state,headRefOid,baseRefName"])
             if p.returncode != 0:
                 raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
             return [normalize_merged(d) for d in json.loads(p.stdout or "[]")]
