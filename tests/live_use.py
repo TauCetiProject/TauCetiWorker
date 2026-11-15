@@ -102,8 +102,9 @@ class LiveUse(unittest.TestCase):
         alias = self.root / "retained-alias"
         alias.symlink_to(tree, target_is_directory=True)
         own = process(os.getpid(), str(tree))
-        own.parents.return_value = [SimpleNamespace(pid=101)]
+        own.ppid.return_value = 101
         parent = process(101, str(tree))
+        parent.ppid.return_value = 1
         cwd = process(102, str(tree / "nested"))
         opened = process(103, "/", [str(tree / "Draft.lean")])
         member = process(104)

@@ -148,7 +148,16 @@ def _darwin_process_references():
 
     result = []
     try:
-        skip = {os.getpid()} | {process.pid for process in psutil.Process().parents()}
+        # Walk the parent chain by hand: psutil's parents() ends the walk at the lowest PID it
+        # takes from pids(), so on macOS (PID 0 is its own parent) any doubt there loops forever.
+        skip = {os.getpid()}
+        process = psutil.Process()
+        while True:
+            ppid = process.ppid()
+            if ppid <= 1 or ppid in skip:
+                break
+            skip.add(ppid)
+            process = psutil.Process(ppid)
         for pid in psutil.pids():
             if pid <= 0:
                 continue
