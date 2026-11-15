@@ -2499,6 +2499,10 @@ def run_in_bubble(
     (rounddir / "lean").chmod(0o755)
     (rounddir / "tauceti-tools").write_text('#!/bin/sh\nexec python3 -m tauceti_tools "$@"\n')
     (rounddir / "tauceti-tools").chmod(0o755)
+    (rounddir / "review-bin").mkdir()
+    for tool in ("git", "gh"):
+        shutil.copy(HERE / "scripts" / f"review-{tool}", rounddir / "review-bin" / tool)
+        (rounddir / "review-bin" / tool).chmod(0o755)
     shutil.copy(
         HERE / "verification_resources.py"
         if (HERE / "verification_resources.py").exists()
@@ -2629,11 +2633,18 @@ def run_in_bubble(
     # agent's git-safe-push / gh-safe-pr-create need. \$PATH stays literal so it expands to the
     # CONTAINER PATH inside bubble's bash -lc. We do NOT forward TAUCETI_CLAIM_* (the claim+heartbeat
     # are host-side; the branch CAS is the [HARD] guarantee and needs no in-container claim).
-    tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/round:$PATH TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"
+    path = "/opt/round:$PATH"
     if api_bridge and _uses_claude_credentials(cred_model):
-        tcenv = "env PYTHONPATH=/opt/tools PATH=/opt/api-bin:/opt/round:$PATH TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"
-        if inner_cmd is not None:  # Only the external review engine needs its free --auth api check.
-            tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
+        path = "/opt/api-bin:" + path
+    if inner_cmd is not None:
+        # What the review engine assumes of GitHub access that Bubble's proxy does not give; see scripts/review-*.
+        path = "/opt/round/review-bin:" + path
+    tcenv = f"env PYTHONPATH=/opt/tools PATH={path} TAUCETI_LOCAL_AXIOMS_CACHE=/opt/local-axioms-cache"
+    if inner_cmd is not None:
+        tcenv += f" TAUCETI_BUBBLE_LOGIN={shlex.quote(me())}"
+    if inner_cmd is not None and api_bridge and _uses_claude_credentials(cred_model):
+        # Only the external review engine needs its free --auth api check.
+        tcenv += ' ANTHROPIC_API_KEY="$(cat /opt/round/anthropic.key)"'
     tcenv += " TAUCETI_LOCAL_LINT_CACHE=/opt/local-lint-cache TAUCETI_VERIFY_PYTHON=/usr/bin/python3"
     if resource_wait := os.environ.get("TAUCETI_BUILD_RESOURCE_WAIT"):
         wait_path = Path(resource_wait)

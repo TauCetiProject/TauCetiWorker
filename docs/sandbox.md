@@ -27,7 +27,12 @@ also run their cache downloads and advisory `lake build` there.
 - Review runs the `tauceti-review` engine inside the container too, offline. The
   engine, the roadmap, and the review store are mounted in, and it runs on the
   image's `python3` with no PyPI or cross-repo fetch. The only traffic crossing
-  the proxy is the TauCeti clone, the PR API, and the scoreboard post.
+  the proxy is the TauCeti clone, the PR API, and the scoreboard post. Two
+  wrappers come first on `PATH` for review commands. The engine runs git with
+  the user config blanked, which is where Bubble's routing to the proxy lives;
+  `scripts/review-git` puts back that routing and nothing else. The proxy
+  refuses `/user`, whose login the engine needs before publishing;
+  `scripts/review-gh` answers that one query with the worker's account.
 
 That isolation matters most for review, where the agent reads untrusted PRs.
 
