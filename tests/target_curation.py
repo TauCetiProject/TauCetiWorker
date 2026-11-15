@@ -347,6 +347,35 @@ class Evidence(Tmp):
             self.assertIsNone(curate.confirmed(checkout, bad), bad)
 
 
+class ContentBase(Tmp):
+    def test_landed_elsewhere_is_looked_for_on_the_content_base(self):
+        from tauceti_worker import agents
+
+        remote = self.tmp / "content.git"
+        git(self.tmp, "init", "-q", "--bare", "-b", "main", str(remote))
+        seed = self.tmp / "seed"
+        git(self.tmp, "clone", "-q", str(remote), str(seed))
+        (seed / "A.lean").write_text("theorem only_on_main : True := trivial\n")
+        git(seed, "add", "A.lean")
+        git(seed, "commit", "-q", "-m", "main")
+        git(seed, "push", "-q", "origin", "HEAD:main")
+        (seed / "A.lean").write_text("theorem on_integration : True := trivial\n")
+        git(seed, "commit", "-q", "-am", "integration")
+        git(seed, "push", "-q", "origin", "HEAD:integration")
+        w = SimpleNamespace(cfg=SimpleNamespace(state=self.tmp / "state"))
+        real = agents._fetch_shallow
+        with (
+            patch.dict(os.environ, {"TAUCETI_BASE_BRANCH": "integration"}),
+            patch.object(agents, "_fetch_shallow", side_effect=lambda url, dir, **kw: real(str(remote), dir, **kw)),
+        ):
+            checkout = curate._main_checkout(w)
+            self.assertIn("on_integration", (checkout / "A.lean").read_text())
+            git(seed, "commit", "-q", "--allow-empty", "-m", "later")
+            git(seed, "push", "-q", "origin", "HEAD:integration")
+            checkout = curate._main_checkout(w)
+            self.assertEqual(git(checkout, "rev-parse", "HEAD"), git(remote, "rev-parse", "integration"))
+
+
 class Publish(Tmp):
     def test_an_untracked_list_is_edited_in_place_and_keeps_a_hand_edit(self):
         path = self.tmp / "targets.md"

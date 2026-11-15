@@ -152,7 +152,7 @@ was:
 | That pull request closed unmerged, and a `declined` [incident record](incidents.md) about it at its last head names the pull requests that replaced it, all of them merged | `[x]`, with `subsumed by: #M; closed: #N` |
 | The same, but that pull request was partial (by its marker or the item's `partial:` clause) | `[ ]`, with the replacements added to `partial:` and `closed: #N` |
 | That pull request closed unmerged, with no such record | unchanged; a `target-closed` incident record asks the operator to mark it `[ ]` or `[x]` |
-| A model confirms that main already has an eligible item (below) | `[x]`, with `landed elsewhere: <file> <declaration>` |
+| A model confirms that the content base already has an eligible item (below) | `[x]`, with `landed elsewhere: <file> <declaration>` |
 
 An `in flight:` clause is removed when its item is settled. A record about a
 closed pull request is looked up for that pull request's own repository, and
@@ -162,7 +162,8 @@ marker (on GitHub the most recently updated, on Forgejo the most recently
 created).
 
 **Landed elsewhere.** A milestone can land without any pull request naming it.
-For each eligible item, the worker searches a fresh shallow checkout of main,
+For each eligible item, the worker searches a fresh shallow checkout of the
+content base (`TAUCETI_BASE_BRANCH`, `main` by default) on GitHub,
 which every forge's landings reach,
 for declarations of the Lean names the description quotes in backticks (dotted,
 capitalised or with an underscore), and of the slug's words in any case with or
@@ -174,7 +175,7 @@ the goal they serve; it reads the checkout and answers per item with `landed` an
 and a declaration. The worker ticks the item only if that file of the checkout
 declares that name, and writes the file and name it checked, so the list gains
 nothing else of the model's answer. An item found not landed is not asked about again
-until its line, the preamble, or a file of main that declares what it names
+until its line, the preamble, or a file of the content base that declares what it names
 changes;
 every such file counts, though the agent is shown at most five hits per name. This is the phase's only model
 call, with the worker's authoring model; a look with no qualifying item starts
@@ -212,7 +213,7 @@ branch that tracks nothing is committed and not pushed. Add the lock file to
 A look costs, on each forge it reads, one search for merged markers and one
 listing of open pull requests, plus one read per `in flight:` clause and per
 replacement a record names, and, when
-an item is eligible, a shallow fetch of main and one `git grep` per quoted name
+an item is eligible, a shallow fetch of the content base and one `git grep` per quoted name
 and per slug.
 
 ## What the agent sees

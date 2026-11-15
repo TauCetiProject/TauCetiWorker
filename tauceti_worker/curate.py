@@ -1,4 +1,4 @@
-"""The `curate` phase: keep an operator's target list true to GitHub and to main.
+"""The `curate` phase: keep an operator's target list true to its forges and to the content base.
 
 Runs only for a worker whose `only` names `curate` and that has a target list, at most once per
 TAUCETI_CURATE_GAP. What it changes in the file, and why, is documented in docs/target-lists.md
@@ -6,7 +6,7 @@ TAUCETI_CURATE_GAP. What it changes in the file, and why, is documented in docs/
 
     due(counters)                  whether a look is due, and the reason either way
     settle(targets, ...)           pure: the edits that pull request states and records imply
-    evidence(checkout, item)       where a checkout of main declares what an item names
+    evidence(checkout, item)       where a checkout of the content base declares what an item names
     confirmed(checkout, verdict)   a model verdict reduced to a declaration the checkout has
     publish(path, base, ours, ..)  merge an edit into the file; commit and push a tracked one
     run(w, c, profile)             one curation, under the list's lock
@@ -565,11 +565,11 @@ def _main_checkout(w) -> Path | None:
     from .agents import fetch_ref
 
     checkout = w.cfg.state / "curate" / "main"
-    return checkout if fetch_ref(TAUCETI, checkout) else None
+    return checkout if fetch_ref(TAUCETI, checkout, ref=content_base()) else None
 
 
 def _landed_elsewhere(w, profile, live: Targets) -> list[Change]:
-    """The eligible items of `live` that a model verdict, checked against a fresh checkout of main,
+    """The eligible items of `live` that a model verdict, checked against a fresh checkout of the content base,
     shows landed. At most MAX_CANDIDATES items with evidence are put to the model, in file order;
     one it found not landed is not asked about again until its description or a file declaring
     what it names changes."""
@@ -577,7 +577,7 @@ def _landed_elsewhere(w, profile, live: Targets) -> list[Change]:
     checkout = _main_checkout(w) if eligible else None
     if checkout is None:
         if eligible:
-            log("curate: no checkout of main; eligible items are not looked for there")
+            log(f"curate: no checkout of {content_base()}; eligible items are not looked for there")
         return []
     memo_file = w.cfg.state / "curate" / "not-landed.json"
     try:
@@ -594,7 +594,7 @@ def _landed_elsewhere(w, profile, live: Targets) -> list[Change]:
             break
     changes = []
     if candidates:
-        log(f"curate: asking about {len(candidates)} eligible item(s) that main declares by name")
+        log(f"curate: asking about {len(candidates)} eligible item(s) that {content_base()} declares by name")
         verdicts = ask(w, profile, checkout, live, candidates)
         for it, hits in candidates:
             verdict = verdicts.get(it.slug)
