@@ -3954,6 +3954,8 @@ class Controller:
         assert canonical is not None
         task_claims = [c for c in self._active_claims(head["id"]) if c["task_id"] is not None]
         if task_claims:
+            if head["base"] != canonical:
+                self._cancel_superseded_runs(head["id"], now, reason="canonical advanced; rebase waits for worker")
             # A speculative repair runs alongside its own candidate CI, whose observation
             # continues without permitting promotion or replacing the claimed task.
             active = self._open_task(head)
@@ -3971,6 +3973,7 @@ class Controller:
             return
         if head["base"] != canonical:
             if not self._rebase_head(head, canonical, now):
+                self._cancel_superseded_runs(head["id"], now, reason="canonical advanced; rebase incomplete")
                 return
             head = self._head()
             assert head is not None
