@@ -74,7 +74,10 @@ class IntegrityFailure(Unavailable):
     pass
 
 
-LOCK_WAIT_SECONDS = 1500  # fresh extraction can take up to 1200 seconds
+# Publisher and reader leases are waited for without a deadline: a holder is doing useful work
+# (extracting or reading an entry) and a dead holder releases its lock. The round's hard cap
+# (TAUCETI_ROUND_TIMEOUT) bounds the wait; tests may set a bound.
+LOCK_WAIT_SECONDS = None
 SOURCE_FETCH_SECONDS = 900
 LAYOUT = "v4"  # pool subdirectory of the current layout; anything else in the pool is legacy
 META = "tauceti-mathlib"  # private per-checkout view metadata under .lake/
@@ -1566,7 +1569,7 @@ def publish(P, key, spec, graph, closure, env, logdir, fetch):
                 "--",
             ]
             raise_open_file_limit()  # leantar opens thousands of archives at once (EMFILE at 1024)
-            rc = fetch([*prefix, "lake", "exe", "cache", "get"], project, env, output, 1200)
+            rc = fetch([*prefix, "lake", "exe", "cache", "get"], project, env, output, None)
         if rc:
             raise Unavailable(f"fresh Mathlib extraction failed (exit {rc}); see {log}")
         count = verify(builds / "mathlib", source / "mathlib", spec["artifacts"])

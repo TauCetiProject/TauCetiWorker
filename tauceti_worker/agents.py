@@ -1510,7 +1510,6 @@ class AgentLaunchUnavailable(BuildCacheUnavailable):
     """A process creation failure before the agent existed."""
 
 
-HOST_CACHE_TIMEOUT = 1200
 _LAKE_FALSE = {"0", "false", "no", "off", "n", "f"}
 
 
@@ -1670,7 +1669,7 @@ def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None
         warm_host_build_caches(cwd, warm_env, logdir, report=report)
 
 
-def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float) -> int:
+def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float | None) -> int:
     """Bind the downloader process group to the worker, including after parent SIGKILL.
 
     The pipe guardian retains the snapshot lease and kills its process group if
@@ -1724,7 +1723,8 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
 
     Genuine workspace errors must reach repair agents. Transport, publication and partial-download
     failures stop before an agent starts. Lake verifies and atomically installs artifacts, so retries
-    retain successful downloads. All fetches together have one twenty-minute deadline.
+    retain successful downloads. Fetches have no wall-clock deadline of their own: Lake's HTTP
+    timeouts cover a hung connection, and the round's hard cap (TAUCETI_ROUND_TIMEOUT) the rest.
     """
     from . import shared_mathlib
 
@@ -1733,7 +1733,6 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
     has_mathlib = shared_mathlib._names_mathlib(cwd)
     logdir.mkdir(parents=True, exist_ok=True)
     logf = logdir / f"build-cache-{time.strftime('%Y%m%d-%H%M%S')}.log"
-    deadline = time.monotonic() + HOST_CACHE_TIMEOUT
     log(f"host build caches: warming Mathlib and TauCeti; output → {logf}")
 
     def unavailable(reason: str):
@@ -1744,9 +1743,6 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
 
     def fetch(label: str, command: list[str]) -> str:
         for attempt in range(1, 3):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                unavailable("build cache preparation deadline exceeded")
             with logf.open("ab") as output:
                 offset = output.tell()
                 output.write(f"{label} cache, attempt {attempt}: {' '.join(command)}\n".encode())
@@ -1755,7 +1751,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
                     from .expanded_cache import measured
 
                     with measured(report, label.lower().replace(" ", "_") + "_fetch"):
-                        rc = _cache_fetch([*prefix, *command], cwd, env, output, remaining)
+                        rc = _cache_fetch([*prefix, *command], cwd, env, output, None)
                 except (OSError, subprocess.TimeoutExpired) as e:
                     output.write(f"cache command failed: {e}\n".encode())
                     rc = 1
@@ -1839,7 +1835,6 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
         and mathlib_private != home
         and (mathlib_pool.parent / "owner.json").is_file()
         and time.time() - read_json(marker).get("at", 0) > 86400
-        and deadline - time.monotonic() > 60
     ):
         try:
             # Failed housekeeping retries in an hour, never on every paid round.
@@ -1850,7 +1845,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
                     cwd,
                     env,
                     output,
-                    max(1, min(30, deadline - time.monotonic())),
+                    30,  # housekeeping only; a slow clean is retried in an hour
                 )
             if rc == 0:
                 build_caches.link_into(mathlib_private, mathlib_pool)
@@ -2336,7 +2331,7 @@ def bubble_work_cmd(inner: str, *, verify_helper=False) -> str:
     preliminary = (
         '"$TAUCETI_VERIFY_PYTHON" "/opt/round/tauceti-verify" --stage build'
         if verify_helper
-        else "timeout 1800 lake build"
+        else "lake build"
     )
     if not TAUCETI_CACHE_SERVICE:
         return f"set -e; lake exe cache get || lake exe cache get; {preliminary} || true; exec {inner}"

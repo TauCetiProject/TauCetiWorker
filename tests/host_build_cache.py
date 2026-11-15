@@ -45,8 +45,8 @@ if mode == label + '-fail':
  print('error: artifact transfer failed'); sys.exit(1)
 if mode == 'miss' and label == 'TauCeti':
  print('error: TauCetiProject/TauCeti: no outputs found in 100 revisions from HEAD'); sys.exit(1)
-if mode == 'timeout':
- import time; time.sleep(20)
+if mode == 'slow':
+ import time; time.sleep(3)
 if mode == 'dependency-error' or mode.startswith('dependency-network'):
  if mode == 'dependency-error': print('info: fatal: not our ref abc')
  errors={'dependency-network':'HTTP response status code 503',
@@ -205,11 +205,10 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert rc == 0 and not launched and not records
     print("[OK] prose jobs and echo-only probes perform no cache work")
 
-    with patch.object(agents, "HOST_CACHE_TIMEOUT", 0.1):
-        rc, records, text = run("timeout")
-    assert rc == 75 and not launched
-    assert "deadline exceeded" in text or "timed out" in text
-    print("[OK] a single bootstrap deadline blocks launch and terminates the downloader")
+    rc, records, text = run("slow")
+    assert rc == 0 and len(launched) == 1, text
+    assert "deadline exceeded" not in text
+    print("[OK] a slow cache fetch has no wall-clock deadline: the agent starts once it finishes")
 
     worker = SimpleNamespace(
         cfg=SimpleNamespace(checkout=co, logdir=root / "logs", state=root / "state"),
