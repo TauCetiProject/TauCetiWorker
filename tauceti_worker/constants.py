@@ -144,7 +144,10 @@ STATUS_LABELS = (
 # Loop timing. Env-overridable for tuning and tests.
 POLL = int(os.environ.get("TAUCETI_POLL", "300"))  # seconds between quota checks while waiting
 
-ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "5400"))  # 90 min hard cap per round
+# Hard safety cap per round, against a hung agent or tool: the loop kills the round's whole process
+# group and abandons it (nothing is checkpointed or continued). Work, including verification, is
+# expected to finish inside the round, so this is set far above any healthy round, not as a budget.
+ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "21600"))  # 6 h
 
 INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
 

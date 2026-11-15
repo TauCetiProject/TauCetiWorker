@@ -229,14 +229,11 @@ class Storage(unittest.TestCase):
         ):
             with (
                 retention.locked(configs[0].state / "round.lock"),
-                retention.locked(configs[1].state / "verification-jobs/held.lock"),
+                retention.locked(configs[1].state / "round.lock"),
             ):
                 self.assertEqual(storage.collect(configs)["private_reclamation_worker"], "3")
                 self.assertEqual(storage.collect(configs, opened=None)["private_reclamation_worker"], "1")
-                with (
-                    retention.locked(configs[1].state / "round.lock"),
-                    retention.locked(configs[2].state / "round.lock"),
-                ):
+                with retention.locked(configs[2].state / "round.lock"):
                     self.assertEqual(storage.collect(configs)["private_reclamation_worker"], "1")
             first = storage.collect(configs)
             self.assertEqual(first["private_reclamation_worker"], "1")

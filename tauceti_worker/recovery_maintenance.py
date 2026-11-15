@@ -252,38 +252,6 @@ def _cleanup_cache_tree(state, tree, registry, work, observation):
             atomic_json(job_path, job)
 
 
-def _referenced(state, tree):
-    """Honor pending verification references with the same ordinary housekeeping budget."""
-    from .work_recovery import _charge
-
-    targets = {tree.resolve()}
-    if tree.name.endswith(".deleting"):
-        targets.add(tree.with_name(tree.name.removesuffix(".deleting")).resolve())
-    for source in (state, state / "verification-state"):
-        directory = source / "verification-pending"
-        if not directory.is_dir():
-            continue
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                _charge(entries=1)
-                if entry.name.startswith(".") or not entry.name.endswith(".json"):
-                    continue  # interrupted atomic writes never became pending jobs
-                job = _metadata(Path(entry.path))
-                if not job:
-                    return True  # malformed reference withholds only this destructive candidate
-                for key in ("lease", "receipt", "lint_modules", "root"):
-                    value = job.get(key)
-                    if isinstance(value, str):
-                        reference = Path(value)
-                        if reference.is_relative_to("/opt/verification-state"):
-                            reference = source / reference.relative_to("/opt/verification-state")
-                        if not reference.is_absolute():
-                            reference = source / reference
-                        if any(reference.resolve().is_relative_to(target) for target in targets):
-                            return True
-    return False
-
-
 def _safe(state, tree, owner, *, locked=False):
     with completed_check():
         return _safe_once(state, tree, owner, locked=locked)
@@ -296,8 +264,6 @@ def _safe_once(state, tree, owner, *, locked=False):
     birth = owner.get("process") if isinstance(owner, dict) else None
     if not wr.owner_stopped(birth):
         return "await-owner"
-    if _referenced(state, tree):
-        return "await-verification-reference"
     try:
         session = wr.owner_session(birth)
     except (OSError, ValueError, KeyError, IndexError):
@@ -891,7 +857,7 @@ def abandon_incomplete(state, record):
             return None
         # Fresh process/mount/reference checks also protect pre-lease saves and stragglers.
         with completed_check():
-            if _referenced(state, record) or wr.live_users(record):
+            if wr.live_users(record):
                 return None
             mounts = retention.mount_points()
             if mounts is None:

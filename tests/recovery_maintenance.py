@@ -2176,59 +2176,6 @@ with patch('os.readlink', side_effect=OSError('PID namespaces unavailable')):
         self.assertFalse(tree.exists())
         self.assertIsNone(proc.poll())  # unrelated replacement session remains healthy
 
-    def test_pending_verification_reference_withholds_only_its_tree(self):
-        expected = self.dirty()
-        tree = self.retained()
-        pending = self.cfg.state / "verification-pending" / "fixture.json"
-        wr.atomic_json(pending, dict(root=str(tree)))
-        self.tick()
-        self.assertTrue(tree.exists())
-        self.assertEqual(
-            maintenance._read_job(maintenance._job_path(self.cfg.state, tree))["next_action"],
-            "await-verification-reference",
-        )
-        subprocess.run(["git", "clone", "-q", str(self.origin), str(self.co)], check=True)
-        self.assertTrue(wr.guard(self.cfg, self.co).ok)
-        pending.unlink()
-        self.tick()
-        self.assertFalse(tree.exists())
-        saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
-        self.restored(saved, expected)
-
-    def test_pending_reference_to_original_path_protects_resumed_deletion(self):
-        self.dirty()
-        tree = self.retained()
-        rename = os.rename
-
-        def crash_after_rename(source, dest):
-            rename(source, dest)
-            if str(dest).endswith(".deleting"):
-                raise Crash()
-
-        with patch.object(maintenance.os, "rename", crash_after_rename), self.assertRaises(Crash):
-            self.tick()
-        doomed = tree.with_name(tree.name + ".deleting")
-        pending = self.cfg.state / "verification-pending" / "fixture.json"
-        wr.atomic_json(pending, dict(root=str(tree)))
-        maintenance._SWEEPS.clear()
-        self.tick()
-        self.assertTrue((doomed / "Draft.lean").exists())
-        pending.unlink()
-        self.tick()
-        self.assertFalse(doomed.exists())
-
-    def test_interrupted_verification_temp_files_do_not_block_cleanup(self):
-        expected = self.dirty()
-        tree = self.retained()
-        pending = self.cfg.state / "verification-pending"
-        pending.mkdir()
-        for name in (".verification-interrupted", ".job.json.abcd", "unpublished.tmp"):
-            (pending / name).write_text("{partial")
-        self.tick()
-        self.assertFalse(tree.exists())
-        saved = next((self.cfg.state / "recovery").glob("*/manifest.json")).parent
-        self.restored(saved, expected)
-
     def test_aliased_root_registrations_share_one_deletion_cursor(self):
         expected = self.dirty()
         tree = self.retained()

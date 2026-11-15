@@ -292,7 +292,7 @@ def _evict_tree(cfg, tree, anchor, report, *, dry=False, discard=False, owner=No
 
     if not safe(tree, anchor) or not tree.is_dir() or tree.name.endswith(".retention-deleting"):
         return
-    if referenced_attempt(cfg, tree) or recovery.live_users(tree):
+    if recovery.live_users(tree):
         note(report, "protected", str(tree))
         return
     decision = None
@@ -469,44 +469,28 @@ def recycle(cfg, *, now=None, dry=False):
     )
     if valid and not forced and now - born < LIFETIME and not pending:
         return report
-    with contextlib.ExitStack() as stack:
-        # Independent verification continuations may outlive the inference round. Their existing
-        # job locks protect private caches; holding round.lock prevents a new continuation launching.
-        for state in (cfg.state, cfg.state / "verification-state"):
-            for path in (state / "verification-jobs").glob("*.lock"):
-                try:
-                    stack.enter_context(locked(path, dry=dry))
-                except BlockingIOError:
-                    note(report, "protected", str(path))
-                    return report
-                except OSError as error:
-                    note(report, "errors", str(error))
-                    return report
-        # These paths were renamed only after being eligible for disposal. Retry them under
-        # the same job locks, without removing younger replacement workspaces.
-        for path, root in pending:
-            if referenced_attempt(cfg, path):
-                note(report, "protected", str(path))
-            else:
-                remove(path, root, report, dry=dry)
-        if not valid and not forced:
-            if not dry:
-                try:
-                    atomic_json(marker, dict(started_at=now))
-                except OSError as error:
-                    note(report, "errors", str(error))
-            return report
-        if not forced and now - born < LIFETIME:
-            return report
-        cache_result = fresh_report(now)
-        private_only = forced and not critical and (not valid or now - born < LIFETIME)
-        if private_only:
-            # Drop old private artifact-store references, retaining the warm build tree.
-            for path, anchor in cache_roots(cfg):
-                remove(path, anchor, cache_result, dry=dry)
-        else:
-            evict_workspace(cfg, cache_result, dry=dry)
-        merge_report(report, cache_result)
+    # These paths were renamed only after being eligible for disposal. Retry them without
+    # removing younger replacement workspaces.
+    for path, root in pending:
+        remove(path, root, report, dry=dry)
+    if not valid and not forced:
+        if not dry:
+            try:
+                atomic_json(marker, dict(started_at=now))
+            except OSError as error:
+                note(report, "errors", str(error))
+        return report
+    if not forced and now - born < LIFETIME:
+        return report
+    cache_result = fresh_report(now)
+    private_only = forced and not critical and (not valid or now - born < LIFETIME)
+    if private_only:
+        # Drop old private artifact-store references, retaining the warm build tree.
+        for path, anchor in cache_roots(cfg):
+            remove(path, anchor, cache_result, dry=dry)
+    else:
+        evict_workspace(cfg, cache_result, dry=dry)
+    merge_report(report, cache_result)
     # A blocked candidate must not keep every other cache in an expired generation. Renamed
     # deletions retry independently; paths still in use can wait for the next generation boundary.
     if not dry:
@@ -556,21 +540,41 @@ def worker_configs():
         )
 
 
-def referenced_attempt(cfg, attempt):
-    for state in (cfg.state, cfg.state / "verification-state"):
-        for path in (state / "verification-pending").glob("*.json"):
-            job = read_json(path)
-            for key in ("lease", "receipt", "lint_modules", "root"):
-                value = job.get(key)
-                if isinstance(value, str):
-                    reference = Path(value)
-                    if reference.is_relative_to("/opt/verification-state"):
-                        reference = state / reference.relative_to("/opt/verification-state")
-                    if not reference.is_absolute():
-                        reference = state / reference
-                    if reference.resolve().is_relative_to(attempt.resolve()):
-                        return True
-    return False
+# Verification continuation state from older releases: durable jobs, their locks and indexes,
+# preserved candidate workspaces and incomplete-copy markers. Verification now runs to
+# completion inside the round's own checkout, so this is only ever deleted, never migrated.
+LEGACY_VERIFICATION = (
+    "verification-pending",
+    "verification-copy-incomplete",
+    "verification-job-index",
+    "verification-storage-generations",
+    "verification-storage",
+    "verification-candidates",
+    "verification-jobs",
+)
+
+
+def purge_legacy_verification(state, report, *, dry=False):
+    """Delete legacy continuation state under ``state`` and its Bubble ``verification-state``.
+
+    Every path goes through ``remove``: no deletion through a symlink, of a mount point or of a
+    tree a live process still uses (such a tree is reported protected and retried next time).
+    Candidate trees only link into shared Mathlib and immutable installations by symlink, which
+    deletion never follows; hard links into a workspace lose only the candidate's own name.
+    """
+    for member in (state, state / "verification-state"):
+        if member != state and not safe(member, state):
+            continue
+        if not member.is_dir() or member.is_symlink():
+            continue
+        for name in LEGACY_VERIFICATION:
+            path = member / name
+            if path.is_symlink():
+                note(report, "protected", str(path))
+            elif path.exists() or path.with_name(name + ".retention-deleting").exists():
+                remove(path.with_name(name + ".retention-deleting"), state, report, dry=dry)
+                remove(path, state, report, dry=dry)
+    return report
 
 
 def past(deadline):
@@ -682,14 +686,8 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
                 discard = isinstance(idle_since, (int, float)) and now - idle_since >= LIFETIME
                 result = recycle(cfg, now=now, dry=dry)
                 merge_report(report, result)
-                try:
-                    with contextlib.ExitStack() as stack:
-                        for state in (cfg.state, cfg.state / "verification-state"):
-                            for lease in (state / "verification-jobs").glob("*.lock"):
-                                stack.enter_context(locked(lease, dry=dry))
-                        collect_retired(cfg, report, now=now, dry=dry, discard_checkout=discard)
-                except BlockingIOError:
-                    note(report, "protected", str(cfg.state / "verification-jobs"))
+                purge_legacy_verification(cfg.state, report, dry=dry)
+                collect_retired(cfg, report, now=now, dry=dry, discard_checkout=discard)
         except BlockingIOError:
             if not diagnostics_only:
                 note(report, "protected", str(cfg.state))
@@ -717,9 +715,6 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
                     if diagnostics_only and not path.is_file():
                         continue
                     if root == cfg.logdir and (not path.is_file() or path.suffix != ".log"):
-                        continue
-                    if root != cfg.logdir and referenced_attempt(cfg, path):
-                        note(report, "protected", str(path))
                         continue
                     if path.is_dir() and (path / "live.lock").exists():
                         try:
@@ -953,7 +948,7 @@ def pending_work(base):
     """Prepared counts and immediate queue entries, never materialized-tree walks."""
     from .recovery_maintenance import cached_summary
 
-    result = dict(recovery_backlog=cached_summary(base)["cleanup_backlog"], discarded_trees=0, verification_jobs=0)
+    result = dict(recovery_backlog=cached_summary(base)["cleanup_backlog"], discarded_trees=0)
     for state in base.iterdir() if base.is_dir() else ():
         if state.is_symlink() or not state.is_dir():
             continue
@@ -961,7 +956,6 @@ def pending_work(base):
             result["discarded_trees"] += sum(
                 path.is_dir() and not path.is_symlink() for path in (member / "recovery-cleanup/discarded").glob("*")
             )
-            result["verification_jobs"] += sum(1 for _ in (member / "verification-pending").glob("*.json"))
     return result
 
 

@@ -98,16 +98,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             from .config import rotate_console_log
 
             rotate_console_log()
-            from .verification_jobs import reap_continuations, resume_pending
-
-            reap_continuations(cfg)
             if reason := fleet_admission_reason(cfg.wid):
                 report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
                 time.sleep(5)
                 continue
-            # Verification owns an isolated candidate and a separate job lease. Its execution
-            # must not block model selection, and host CI reservations still precede launch.
-            resume_pending(cfg, background=True)
             from .repair_recovery import due
 
             recovery_only = (
@@ -423,9 +417,6 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
         log("loop interrupted — stopping")
         return 130
     finally:
-        from .verification_jobs import stop_continuations
-
-        stop_continuations(cfg)
         report_runtime("stopping", detail="loop stopping", phase=None, target=None, next_action_at=None)
         signal.signal(signal.SIGTERM, previous_sigterm)
 

@@ -1289,8 +1289,6 @@ class WorkerBackend:
                     env = dict(
                         os.environ, **view, TAUCETI_VERIFY_STATE=str(self.w.cfg.state), TAUCETI_VERIFY_POLICY=policy
                     )
-                    if self.w.rc.deadline is not None:
-                        env["TAUCETI_ROUND_DEADLINE"] = str(self.w.rc.deadline)
                     logpath = self.w.cfg.logdir / "recovery-verification.log"
                     with logpath.open("a") as output:
                         checked = run_process(
@@ -1320,7 +1318,6 @@ class WorkerBackend:
                         self.w.cfg.state,
                         base=base,
                         policy=policy,
-                        deadline=self.w.rc.deadline,
                     )
                     result = verifier.run()
                 # H3: a trusted build with no agent alongside; relinking is space, not a verdict.
@@ -1601,7 +1598,6 @@ class WorkerBackend:
             policy=scope_policy(
                 facts["labels"], facts["ref"], bump=m.get("authorization", {}).get("automatic_bump", False)
             ),
-            deadline=self.w.rc.deadline,
         )
         verifier.base = saved._rev(checkout, f"origin/{BASE_BRANCH}")
         with environment(**self.verification_environment(checkout)):

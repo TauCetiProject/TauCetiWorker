@@ -60,6 +60,18 @@ class RoundContext:
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
         atexit.register(self._cleanup)
+        # Verification never continues past a round; delete what older releases kept for that.
+        # Holding round.lock, nothing of this worker can be using it.
+        try:
+            from .retention import fresh_report, purge_legacy_verification
+
+            purged = purge_legacy_verification(self.cfg.state, fresh_report())
+            for error in purged["errors"]:
+                log(f"retention: {error}")
+            if purged["removed"]:
+                log(f"retention: deleted legacy verification continuation state: {', '.join(purged['removed'])}")
+        except Exception as error:
+            log(f"retention: legacy verification cleanup deferred: {error}")
         if self.record_activity:
             from .retention import recycle
 

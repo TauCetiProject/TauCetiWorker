@@ -373,9 +373,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_AUTO_REFRESH` | _(unset)_ | `1` is the same as `--auto-refresh`. |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = `60:40`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
-| `TAUCETI_VERIFY_CHECKPOINT_MARGIN` | `600` | Seconds reserved before the round deadline for checkpointing; verification returns incomplete at this boundary. |
 | `TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS` | unset | JSON mapping of absolute resolved installation paths to publisher provenance tokens. Only validated read-only installations use compact cached identities; writable inputs retain full validation. See [verification](verification.md). |
-| `TAUCETI_VERIFY_CONTINUATION` | `1` | Set `0` to pause new mechanical verification continuations, preserving pending jobs and active helpers. |
 | `TAUCETI_VERIFY_HELPER` | `0` | V0 dispatch remains the default. Set `1` only for an opt-in natural canary; helper CLI and receipts are available independently. Dispatch changes preserve running helpers and recovery jobs. |
 | `TAUCETI_VERIFY_CACHE_DIR` | actual host identity under `/tmp` | Shared immutable-installation identity cache; no verification admission limit. Bubble mounts it automatically. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
@@ -406,7 +404,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_BUBBLE_HOME` | per-worker cache dir | Override the private bubble home. |
 | `TAUCETI_REVIEW_ENGINE_DIR` | — | Use a local `tauceti-review` checkout instead of fetching the engine. |
 | `TAUCETI_POLL` | `300` | Seconds between quota checks while the loop waits. |
-| `TAUCETI_ROUND_TIMEOUT` | `5400` | Hard cap per round (seconds). |
+| `TAUCETI_ROUND_TIMEOUT` | `21600` | Hard safety cap per round (seconds), against a hung agent or tool: the loop kills the round's process group and abandons the round. Work, including verification, finishes inside the round; nothing is checkpointed or continued. |
 | `TAUCETI_INTERROUND` | `20` | Minimum gap after a productive round (seconds). |
 | `TAUCETI_BACKOFF_BASE` / `TAUCETI_BACKOFF_MAX` | `30` / `900` | The escalating no-progress back-off (seconds). |
 | `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress prose attempts (seconds; eight hours by default). Mechanical documentation retries do not spend this window. |
