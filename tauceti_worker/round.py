@@ -60,6 +60,18 @@ class RoundContext:
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
         atexit.register(self._cleanup)
+        # Rounds are all-or-nothing; delete the continuation and recovery state older releases kept.
+        # Holding round.lock, nothing of this worker can be using it.
+        try:
+            from .retention import fresh_report, purge_legacy
+
+            purged = purge_legacy(self.cfg.state, fresh_report(), checkout=self.cfg.checkout)
+            for error in purged["errors"]:
+                log(f"retention: {error}")
+            if purged["removed"]:
+                log(f"retention: deleted legacy continuation and recovery state: {', '.join(purged['removed'])}")
+        except Exception as error:
+            log(f"retention: legacy state cleanup deferred: {error}")
         if self.record_activity:
             from .retention import recycle
 
@@ -71,6 +83,14 @@ class RoundContext:
                     log(f"retention: recycled {result.get('removed_count', len(result['removed']))} generated paths")
             except Exception as error:
                 log(f"retention: cache recycling deferred: {error}")
+            # Every run mode passes here (one-off rounds, --loop, Docker, managed workers), so the
+            # collector reaches hosts without an installed service, at most hourly.
+            try:
+                from .retention import request_cleanup
+
+                request_cleanup(fallback=True)
+            except Exception as error:
+                log(f"retention: cleanup request deferred: {error}")
         if self.record_activity:
             from .cache_storage import admit
 
@@ -106,6 +126,10 @@ class RoundContext:
                 fn()
             except Exception as e:
                 log(f"cleanup step failed: {e}")
+        # Still under the round lock: save the round's worktree, then remove it (opt-in per host).
+        from .round_worktrees import release
+
+        release(self.cfg)
         if self._fd is not None:
             try:
                 if self.record_activity:
