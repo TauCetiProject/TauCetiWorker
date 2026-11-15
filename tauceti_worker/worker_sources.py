@@ -121,10 +121,10 @@ def native_source(cfg):
         path = str(cfg.home / ".config/tauceti-forgejo/worker-token")
     if path is None:
         raise Die("set TAUCETI_FORGEJO_TOKEN_FILE to a private Forgejo credential file")
-    from tauceti_queue.control_policy_file import read_control_policy
+    from tauceti_tools.git_credentials import read_private_token
 
     try:
-        token = read_control_policy(Path(path)).decode("ascii").strip()
+        token = read_private_token(Path(path))
     except FileNotFoundError:
         token = None
         path = None
