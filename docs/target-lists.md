@@ -81,7 +81,7 @@ The marks in the file go stale between edits, so each round overlays them:
 
 The overlay only moves an item forward: `[x]` in the file stays done and `[~]`
 stays in flight until the file changes. The merged side reads, on each forge,
-the 200 most recent merged pull requests that carry a target marker (on GitHub
+the 200 most recent pull requests merged into the base branch that carry a target marker (on GitHub
 the most recently updated, on Forgejo the most recently created among the closed
 pull requests its client's page bound reaches). A marker counts whatever the
 spacing of its JSON. An older

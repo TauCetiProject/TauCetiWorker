@@ -263,7 +263,7 @@ def live_targets(targets: Targets, gh, others: Iterable = ()) -> Targets:
             raise SourceUnavailable("open pull requests are unavailable for the target list")
         for d in rows:
             inflight |= marker_keys(d.get("body"))[0]
-        recent = source.merged_prs(f"{MERGED_SEARCH} sort:updated-desc", limit=MERGED_LIMIT)
+        recent = source.merged_prs(f"{MERGED_SEARCH} base:{content_base()} sort:updated-desc", limit=MERGED_LIMIT)
         done |= set(landed(targets.items(), recent))
     return overlay_live(targets, inflight, done)
 
@@ -331,7 +331,7 @@ class GitHubMarkerReads:
         if ident is None or len(self._listing()) < MERGED_LIMIT:
             return []
         if ident not in self._items:
-            term = '"' + _ID_TERM.format(ident) + '"'
+            term = '"' + _ID_TERM.format(ident) + f'" base:{content_base()}'
             self._items[ident] = self._read(lambda: self.gh.target_marker_prs(limit=30, search=term))
         return [d for d in self._items[ident] if d.get("state") == state and body_matches(d.get("body") or "", phrases)]
 
@@ -351,7 +351,7 @@ class GitHubMarkerReads:
 
 
 def _item_search(item: TargetItem) -> str:
-    return '"' + _ID_TERM.format(item.slug.replace('"', "")) + f'" {MERGED_SEARCH}'
+    return '"' + _ID_TERM.format(item.slug.replace('"', "")) + f'" {MERGED_SEARCH} base:{content_base()}'
 
 
 def landed_pr(item: TargetItem, gh) -> int | None:
