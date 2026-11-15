@@ -815,11 +815,14 @@ CLOSE = "close"
 CLOSE_ENV = "TAUCETI_DECIDE_CLOSE"
 CLOSES_ENV = "TAUCETI_DECIDE_MAX_CLOSES_PER_DAY"
 CLOSURES = "closures.log"
-_DECLARATION = re.compile(
+_HEAD = (
     r"^\s*(?:@\[[^\]]*\]\s*)*(?P<modifiers>(?:(?:private|protected|noncomputable|unsafe|partial|nonrec|scoped|local)\s+)*)"
-    r"(?:theorem|lemma|def|abbrev|instance|structure|class(?:\s+inductive)?|inductive|opaque|axiom)\s+"
-    r"(?:\(\s*priority\s*:=[^)]*\)\s*)?(?P<name>(?:«[^»]*»|[^\s:(\[{⦃⟨⟪|,«])+)"
+    r"(?:theorem|lemma|def|abbrev|instance|structure|class(?:\s+inductive)?|inductive|opaque|axiom)"
+    r"(?:\s+\(\s*priority\s*:=[^)]*\))?"
 )
+_DECLARATION = re.compile(_HEAD + r"\s+(?P<name>(?:«[^»]*»|[^\s:(\[{⦃⟨⟪|,«])+)")
+# A keyword whose name, if any, is on a later line: the line alone cannot say what it declares.
+_HEAD_ONLY = re.compile(_HEAD + r"\s*$")
 
 
 def close_enabled() -> bool:
@@ -903,7 +906,7 @@ class _Lexer:
                 self.unopened, i = True, i + 2
             elif c == "«":
                 end = text.find("»", i)
-                if end < 0:
+                if end < 0 or "\n" in text[i:end]:
                     raise _Unsure
                 i = end + 1
             elif c == '"':
@@ -958,6 +961,8 @@ def _added(diff: str, private: bool) -> set[str]:
                 raise _Unsure
         for (added, _), line in zip(hunk, code, strict=True):
             found = _DECLARATION.match(line) if added else None
+            if added and not found and _HEAD_ONLY.match(line):
+                raise _Unsure
             if found and (private or "private" not in found.group("modifiers").split()):
                 names.add(found.group("name"))
     return names

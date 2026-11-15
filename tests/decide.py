@@ -1253,6 +1253,19 @@ def test_close(tmp):
         ),
         ((False, "#41 do not add `«shared missing»`"), {"Foo.«bar baz».qux"}),
     )
+    for kind, head in (
+        ("a quoted name spanning lines", "theorem «missing\n+fact» : True := trivial"),
+        ("a name on the line after its keyword", "theorem\n+  missingFact : True := trivial"),
+        (
+            "an instance named after a priority clause on its own line",
+            "instance (priority := 100)\n+  missingInst : Inhabited Nat := ⟨0⟩",
+        ),
+    ):
+        check(
+            f"{kind} refuses the closure rather than going unread",
+            attempt(Hub(p1={"diff": quoted + f"+{head}\n"}, p41={"state": "MERGED", "diff": quoted}))[:2],
+            (False, "its diff cannot be read for declarations with certainty"),
+        )
     check(
         "a name ending in ?'x' is read whole",
         lexed('"x"', name="already_covered?'x'")[:2],

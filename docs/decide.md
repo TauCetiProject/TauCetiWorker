@@ -256,8 +256,10 @@ all of these hold at the moment of closing:
   from its recorded merge base, merged or not. Comments are read per diff hunk,
   so an added line in a hunk that lies wholly inside a comment opened outside
   it, closer included, still counts as a declaration. A hunk in which a
-  comment, literal, `«…»` name or interpolation does not end, or a plain string
-  holds an unmatched `{`, cannot be read with certainty and refuses the closure.
+  comment, literal, `«…»` name or interpolation does not end, a plain string
+  holds an unmatched `{`, a `«…»` name spans lines, or a declaration keyword has
+  its name on a later line cannot be read with certainty and refuses the
+  closure.
 
 A closure that does not complete when it is sent is not kept in the publication
 outbox for a later replay, which would skip these checks and the claim; the
