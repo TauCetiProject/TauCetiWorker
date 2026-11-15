@@ -148,15 +148,15 @@ try:
     legacy = root / "workers.conf"
     legacy.write_text(
         "./tauceti work --loop --worker-id worker2 --agent codex --only rebase,review --ignore-quota --auto-refresh\n"
-        "./tauceti work --loop --worker-id worker3 --medium-quality\n"
+        "./tauceti work --loop --worker-id worker3 --full-quality\n"
     )
     imported = wm.parse_legacy_config(legacy)
     assert imported[0].id == "worker2"
     assert imported[0].only == ("rebase", "review")
     assert imported[0].ignore_quota is True
     assert imported[0].auto_refresh is True
-    assert imported[0].medium_quality is False
-    assert imported[1].medium_quality is True
+    assert imported[0].full_quality is False
+    assert imported[1].full_quality is True
 
     # The full semantic model must remain parseable by the real work CLI.
     maximal = wm.WorkerSpec(
@@ -172,7 +172,7 @@ try:
         respect_claims=False,
         extra_roadmap_prompt="Work on the material relevant to Higher Topos Theory",
         self_tested=True,
-        medium_quality=True,
+        full_quality=True,
         source="https://example.invalid/source",
         author_model="gpt-5",
         author_effort="high",
@@ -198,17 +198,17 @@ try:
     )
     assert "--self-tested" not in wm.WorkerSpec(id="plain").work_argv()
     assert build_parser().parse_args(["work", "--no-self-tested"]).self_tested is False
-    # --medium-quality: only Q1, Q2 and Q5 of the quality pass instead of all five. Like --self-tested
-    # it only changes prompts, so turning it on waits for a round boundary.
-    assert parsed.medium_quality is True
-    assert wm.WorkerSpec.from_dict({"id": "medium", "medium_quality": True}, 0).as_dict()["medium_quality"] is True
-    assert "medium_quality" not in wm.WorkerSpec(id="plain").as_dict()
+    # --full-quality: all five quality-pass checks instead of Q1, Q2 and Q5. Like --self-tested it
+    # only changes prompts, so turning it on waits for a round boundary.
+    assert parsed.full_quality is True
+    assert wm.WorkerSpec.from_dict({"id": "full", "full_quality": True}, 0).as_dict()["full_quality"] is True
+    assert "full_quality" not in wm.WorkerSpec(id="plain").as_dict()
     assert wm._defer_read_policy_reload(
-        wm.WorkerSpec(id="attest", medium_quality=True), {"applied_spec": before, "state": "running"}
+        wm.WorkerSpec(id="attest", full_quality=True), {"applied_spec": before, "state": "running"}
     )
-    assert "--medium-quality" not in wm.WorkerSpec(id="plain").work_argv()
-    assert build_parser().parse_args(["work"]).medium_quality is None
-    assert build_parser().parse_args(["work", "--no-medium-quality"]).medium_quality is False
+    assert "--full-quality" not in wm.WorkerSpec(id="plain").work_argv()
+    assert build_parser().parse_args(["work"]).full_quality is None
+    assert build_parser().parse_args(["work", "--no-full-quality"]).full_quality is False
     # A worker that has NOT opted in must not emit the flag: the default is to leave the operator's
     # single-use refresh token alone.
     assert "--auto-refresh" not in wm.WorkerSpec(id="plain").work_argv()
