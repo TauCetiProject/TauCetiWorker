@@ -108,9 +108,7 @@ class LegacyDataRoot(unittest.TestCase):
                 self.assertIsInstance(report["free_before_bytes"], int)
                 self.assertIsInstance(report["free_bytes"], int)
                 by_root = {item["path"]: item for item in report["roots"]}
-                self.assertEqual(
-                    by_root[str(old)]["pending_work"], dict(recovery_backlog=4, discarded_trees=1)
-                )
+                self.assertEqual(by_root[str(old)]["pending_work"], dict(recovery_backlog=4, discarded_trees=1))
                 self.assertEqual(
                     by_root[str(current)]["pending_work"],
                     dict(recovery_backlog=0, discarded_trees=0),
