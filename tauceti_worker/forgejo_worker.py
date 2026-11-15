@@ -108,7 +108,7 @@ class ForgejoWorkerSource(ForgejoReadSource):
         return rows
 
     def merged_prs(self, search, *, limit=200):
-        """`GitHub.merged_prs` on this source: number, title, body and URL of the `limit` most recently
+        """`GitHub.merged_prs` on this source: number, title, body, URL and base branch of the `limit` most recently
         created merged pull requests whose body matches the GitHub-style `search` (`body_matches`;
         its qualifiers are not native and are ignored), among the closed pull requests the client's
         page bound reaches. One item's search (`landed_pr`) goes to the native keyword search for
@@ -134,6 +134,11 @@ class ForgejoWorkerSource(ForgejoReadSource):
                 return True
             return row.get("state") == "closed" and str(row.get("title") or "").startswith(BORS_MERGED_PREFIX)
 
+        def base(row):
+            if keyword is not None:  # an issue search row names no base branch
+                row = self.api.pull(self.repository, row["number"])
+            return (row.get("base") or {}).get("ref") or ""
+
         def fetch():
             rows = []
             # Stop at the client's page bound, where `pages` would raise, rather than fail the read.
@@ -147,6 +152,7 @@ class ForgejoWorkerSource(ForgejoReadSource):
                     "title": r.get("title") or "",
                     "body": r.get("body") or "",
                     "url": self.repository.pull_url(r["number"]),
+                    "baseRefName": base(r),
                 }
                 for r in rows[:limit]
             ]
