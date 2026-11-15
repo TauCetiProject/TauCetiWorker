@@ -724,6 +724,27 @@ class GitHubAdapter:
             pass
         return FastForwardResult(False, current, detail or "update is not a fast forward")
 
+    def publish_source_verdicts(self, repo: str, sha: str, verdicts: dict, target_url: str) -> None:
+        """Project verified source-CI verdicts onto the exact candidate's required checks.
+
+        repository_dispatch runs belong to the execution main commit, so their
+        job checks alone cannot satisfy protection on the tested candidate SHA.
+        The mixed coordinator calls this only after verifying its frozen result.
+        """
+        if not SHA.fullmatch(sha) or any(verdicts.get(key) != "success" for key in ("build", "bump_guard")):
+            raise ValueError("source promotion needs exact successful build and pin verdicts")
+        for context in ("build", "bump-guard"):
+            self.client.request(
+                "POST",
+                f"repos/{repo}/statuses/{sha}",
+                json_body={
+                    "state": "success",
+                    "context": context,
+                    "description": "Verified exact source-candidate CI result",
+                    "target_url": target_url,
+                },
+            )
+
     def fast_forward_leased(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult:
         """Publish GitHub main using Git's atomic expected-old check."""
         if self.clone_dir is None or self._tokens is None:

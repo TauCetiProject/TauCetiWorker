@@ -598,6 +598,19 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         self.assertEqual(len(self.execution.dispatches), 1)
         self.assertTrue(any(comment["number"] == 17 for comment in self.github.comments))
         self.assertTrue(any(comment["number"] == 17 for comment in self.native.comments))
+        for context in ("build", "bump-guard"):
+            status = self.github.statuses[(frozen.request.head, context)]
+            self.assertEqual(status.state, "success")
+            self.assertEqual(status.target_url, "https://github.com/team/Execution/actions/runs/101")
+
+    def test_failed_source_ci_does_not_publish_passing_candidate_statuses(self):
+        from tauceti_tools.ci_candidate_evidence import EvidenceUnavailable
+
+        frozen = self.start_mixed()
+        self.execution.add(frozen, classification="source_failure")
+        with self.assertRaises(EvidenceUnavailable):
+            self.ci.verify_promotion(frozen.attempt_id, self.controller._members(1), self.controller.source)
+        self.assertFalse(any(name == "publish_source_verdicts" for name, _ in self.github.calls))
 
     def test_admission_pause_keeps_accepted_waiting_inputs_and_lands_running_mixed_work(self):
         # Accept an input before pausing, including its pre-batch waiting state.

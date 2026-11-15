@@ -591,6 +591,11 @@ class FakeGitHub:
             self._call("commit_status", sha, context)
             return self.statuses.get((sha, context))
 
+    def publish_source_verdicts(self, repo: str, sha: str, verdicts: dict, target_url: str) -> None:
+        self._call("publish_source_verdicts", repo, sha, verdicts, target_url)
+        for context in ("build", "bump-guard"):
+            self.statuses[(sha, context)] = Status("success", "verified source CI", target_url, self.clock(), None)
+
     def fast_forward_leased(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult:
         return self.fast_forward(repo, branch, expected_parent, tip)
 

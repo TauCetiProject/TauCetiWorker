@@ -121,3 +121,11 @@ class MixedCandidateCI(SourceCandidateCI):
         # pushes, closure and re-review belong to follow-up work. The frozen
         # membership, exact CI result and current source/publication authority
         # remain the landing guards (ai-merge-queue.md, "Staging membership").
+        # GitHub's protected mirror still requires commit statuses on the tested
+        # SHA. The repository_dispatch run's job checks name execution main.
+        self.registry.github.publish_source_verdicts(
+            self.registry.repository,
+            frozen.request.head,
+            observation.result["verdicts"],
+            observation.run.html_url or "",
+        )

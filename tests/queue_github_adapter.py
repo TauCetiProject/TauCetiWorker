@@ -939,6 +939,20 @@ class Adapter(unittest.TestCase):
         self.assertFalse(a.reviewer("bob"))
         self.assertIsNone(a.collaborator_permission(TAUCETI, "nobody"))
 
+    def test_source_verdicts_target_candidate_instead_of_execution_main(self):
+        transport = FakeTransport()
+        transport.add("POST", f"https://api.github.com/repos/{TAUCETI}/statuses/{HEAD}", 201, {})
+        a = adapter(transport)
+        verdicts = {"build": "success", "bump_guard": "success"}
+        url = f"https://github.com/{TAUCETI}/actions/runs/42"
+        a.publish_source_verdicts(TAUCETI, HEAD, verdicts, url)
+        self.assertEqual([json.loads(call[3])["context"] for call in transport.calls], ["build", "bump-guard"])
+        self.assertTrue(all(json.loads(call[3])["target_url"] == url for call in transport.calls))
+        for bad in ("failure", "infrastructure", None):
+            with self.assertRaises(ValueError):
+                a.publish_source_verdicts(TAUCETI, HEAD, {**verdicts, "bump_guard": bad}, url)
+        self.assertEqual(len(transport.calls), 2)
+
     def test_user_for_token(self):
         transport = FakeTransport()
         transport.add("GET", "https://api.github.com/user", 200, {"login": "worker-login", "id": 99})
