@@ -318,10 +318,11 @@ class GitHubMarkerReads:
         ident = search_id(phrases)
         if ident is None or len(self._listing()) < MERGED_LIMIT:
             return []
-        if ident not in self._items:
-            term = '"' + _ID_TERM.format(ident) + f'" base:{content_base()}'
-            self._items[ident] = self._read(lambda: self.gh.target_marker_prs(limit=30, search=term))
-        return [d for d in self._items[ident] if d.get("state") == state and body_matches(d.get("body") or "", phrases)]
+        # A completion counts only on the base branch; an open pull request holds its item on any.
+        term = '"' + _ID_TERM.format(ident) + ('" is:open' if state == "OPEN" else f'" base:{content_base()}')
+        if term not in self._items:
+            self._items[term] = self._read(lambda: self.gh.target_marker_prs(limit=30, search=term))
+        return [d for d in self._items[term] if d.get("state") == state and body_matches(d.get("body") or "", phrases)]
 
     def open_prs(self) -> list[dict]:
         return [d for d in self._listing() if d.get("state") == "OPEN"]
@@ -355,10 +356,11 @@ def landed_pr(item: TargetItem, gh) -> int | None:
 
 
 def open_pr(item: TargetItem, gh) -> int | None:
-    """An open pull request for `item` that the source's open listing may not have held
-    (`open_beyond_listing`); None when there is none or the source's open listing is complete."""
+    """An open pull request for `item`, against any branch, that the source's open listing may not
+    have held (`open_beyond_listing`); None when there is none or the source's open listing is complete."""
     beyond = getattr(gh, "open_beyond_listing", None)
-    rows = beyond(_item_search(item)) if beyond is not None else []
+    search = '"' + _ID_TERM.format(item.slug.replace('"', "")) + f'" {MERGED_SEARCH}'
+    rows = beyond(search) if beyond is not None else []
     return next((d.get("number") for d in rows if (item.area, item.slug) in marker_keys(d.get("body"))[0]), None)
 
 
