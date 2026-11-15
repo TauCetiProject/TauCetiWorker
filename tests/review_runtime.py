@@ -70,6 +70,23 @@ class ReviewRuntime(unittest.TestCase):
         with patch.dict(os.environ, {"TAUCETI_REVIEW_REF": "floating-branch"}), self.assertRaises(NoProgress):
             review_runtime.resolve(SimpleNamespace(state=Path("/unused")))
 
+    def test_configured_native_publisher_requires_engine_support_before_inference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.engine(Path(directory) / "engine")
+            with patch.dict(
+                os.environ,
+                {
+                    "TAUCETI_REVIEW_ENGINE_DIR": str(root),
+                    "TAUCETI_REVIEW_REF": "",
+                    "TAUCETI_NATIVE_REVIEW_PUBLISHER": "configured:publisher",
+                },
+            ):
+                with self.assertRaisesRegex(NoProgress, "publication backend"):
+                    review_runtime.resolve(SimpleNamespace(state=Path(directory)))
+                (root / "runner/publication_transport.py").write_text("TAUCETI_NATIVE_REVIEW_PUBLISHER")
+                runtime = review_runtime.resolve(SimpleNamespace(state=Path(directory)))
+                self.assertEqual(runtime.directory, root)
+
     def test_archive_uses_the_same_resolved_runtime_and_preserves_failed_outbox(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

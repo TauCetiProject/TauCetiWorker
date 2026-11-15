@@ -81,6 +81,10 @@ def resolve(cfg):
                 raise NoProgress("review engine could not be prepared")
     if not (directory / "runner/cli.py").is_file() or not (directory / "rubrics").is_dir():
         raise NoProgress("review engine checkout is incomplete")
+    if os.environ.get("TAUCETI_NATIVE_REVIEW_PUBLISHER"):
+        transport = directory / "runner/publication_transport.py"
+        if not transport.is_file() or "TAUCETI_NATIVE_REVIEW_PUBLISHER" not in transport.read_text():
+            raise NoProgress("review engine does not support the configured native publication backend")
     current = subprocess.run(["git", "-C", str(directory), "rev-parse", "HEAD"], capture_output=True, text=True)
     return ReviewRuntime(directory, current.stdout.strip() if current.returncode == 0 else "")
 

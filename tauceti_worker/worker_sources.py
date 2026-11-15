@@ -217,6 +217,16 @@ def activate(source, cfg):
         from .paths import self_env
 
         os.environ.update(self_env())
+        publication_policy = original.get("TAUCETI_NATIVE_REVIEW_POLICY")
+        if publication_policy is None:
+            candidate = cfg.home / ".config/tauceti-forgejo/review-publication.json"
+            if candidate.is_file():
+                publication_policy = str(candidate)
+        if publication_policy:
+            os.environ.update(
+                TAUCETI_NATIVE_REVIEW_POLICY=publication_policy,
+                TAUCETI_NATIVE_REVIEW_PUBLISHER="tauceti_worker.native_review_publisher:QueueReviewPublisher",
+            )
         yield
     finally:
         os.environ.clear()
