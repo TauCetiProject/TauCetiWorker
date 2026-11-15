@@ -6896,6 +6896,8 @@ class Controller:
             due = [
                 e for e in self.store.rows("outbox", {"state": "pending"}, order="id") if e["next_attempt_at"] <= now
             ]
+            control = {"promote", "mixed-sync", "cancel_run", "retry_status_delivery"}
+            due.sort(key=lambda entry: (entry["kind"] not in control, entry["id"]))
         performed = 0
         retains = [e for e in due if e["kind"] == "retain_ref"]
         if len(retains) > 1 and hasattr(self.source, "update_refs"):
