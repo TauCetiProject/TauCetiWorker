@@ -629,7 +629,8 @@ tauceti workers logs --follow reviewer     # its durable console log
 there, `enable`, `disable`, `restart`, and `remove` adjust one worker each. The
 manager validates the whole file before applying it, starts missing enabled
 workers, gracefully stops disabled or removed ones, restarts only definitions
-that changed, and backs off repeated failures.
+that changed, and backs off repeated failures. Restarts wait for the worker's
+current round to finish; see [rolling deploys](docs/workers.md#restarts-and-rolling-deploys).
 
 For fields that `add` does not expose, run `tauceti workers edit`, validate with
 `tauceti workers apply --check`, then apply. Editing while the manager runs is

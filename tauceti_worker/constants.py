@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import signal
 
 TAUCETI = os.environ.get("TAUCETI_REPO", "TauCetiProject/TauCeti")
 BASE_BRANCH = os.environ.get("TAUCETI_BASE_BRANCH", "main")
@@ -150,6 +151,10 @@ POLL = int(os.environ.get("TAUCETI_POLL", "300"))  # seconds between quota check
 ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "21600"))  # 6 h
 
 INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
+
+# A managed worker's wrapper sends this to its loop driver (never to a round's process group) to
+# request a graceful restart: the loop exits at its next round boundary, or at once between rounds.
+DRAIN_SIGNAL = signal.SIGUSR1
 
 EX_DOCUMENTATION_WAIT = 79  # Progress plan/facts deployment churn, without failed-round backoff
 EX_NOPROGRESS = 75  # round did NO productive work (distinct from error=1 / success=0)

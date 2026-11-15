@@ -18,6 +18,7 @@ from .config import Config, NoProgress, log
 from .constants import (
     BACKOFF_BASE,
     BACKOFF_MAX,
+    DRAIN_SIGNAL,
     EX_ADMISSION_WAIT,
     EX_CLAIM_COLLISION,
     EX_DOCUMENTATION_WAIT,
@@ -39,6 +40,10 @@ from .runtime_status import report_runtime, runtime_snapshot
 
 class _LoopTerminated(KeyboardInterrupt):
     """SIGTERM translated to the same teardown path as Ctrl-C, with the right exit code."""
+
+
+class _LoopDrained(KeyboardInterrupt):
+    """SIGUSR1 outside a round: a graceful restart found the loop between rounds."""
 
 
 def _recheck_in(prov: Provider | None, now: float) -> int:
@@ -83,16 +88,31 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     admission_streak = 0
     collision_streak = 0
     previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_drain = signal.getsignal(DRAIN_SIGNAL)
     quota_wait = QuotaWait(cfg, agent)
+    # Rounds are all-or-nothing, so a restart must never interrupt one. While a round runs the drain
+    # request is only recorded; between rounds (sleeping, waiting for quota, budget or GitHub, or
+    # selecting work) it ends the loop at once, so an idle worker restarts promptly.
+    drain = {"requested": False, "in_round": False, "raised": False}
 
     def terminate(_signum, _frame) -> None:
         # run_round_subprocess catches KeyboardInterrupt and tears down the round's process
         # group before re-raising, so use that same proven cleanup path for Compose SIGTERM.
         raise _LoopTerminated
 
+    def request_drain(_signum, _frame) -> None:
+        drain["requested"] = True
+        # The wrapper repeats its request; only the first one may unwind the loop.
+        if not drain["in_round"] and not drain["raised"]:
+            drain["raised"] = True
+            raise _LoopDrained
+
     signal.signal(signal.SIGTERM, terminate)
+    signal.signal(DRAIN_SIGNAL, request_drain)
     try:
         while True:
+            if drain["requested"]:
+                raise _LoopDrained
             from .config import rotate_console_log
 
             rotate_console_log()
@@ -273,7 +293,14 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 wait_detail=None,
                 wait_cached=None,
             )
-            rc = run_round_subprocess(tail)
+            drain["in_round"] = True
+            try:
+                rc = run_round_subprocess(tail)
+            finally:
+                drain["in_round"] = False
+            if drain["requested"]:
+                log(f"round finished (rc={rc}); restart requested, exiting at the round boundary")
+                raise _LoopDrained
             if rc == EX_CLAIM_COLLISION:
                 streak = 0
                 collision_streak += 1
@@ -379,6 +406,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     next_action_at=time.time() + nap,
                 )
                 time.sleep(nap)
+    except _LoopDrained:
+        log("loop drained for restart; stopping between rounds")
+        return 0
     except _LoopTerminated:
         log("loop terminated — stopping")
         return 143
@@ -388,6 +418,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     finally:
         report_runtime("stopping", detail="loop stopping", phase=None, target=None, next_action_at=None)
         signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(DRAIN_SIGNAL, previous_drain)
 
 
 def _ignore_quota_verdict(chosen: str | None, prov: Provider | None) -> str:

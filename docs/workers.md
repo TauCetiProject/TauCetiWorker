@@ -49,7 +49,9 @@ available maintenance, the slot falls back to the ordinary global cascade.
 
 Fleet installers can query `_fleet-protocol` to verify this integration before
 starting workers. The response is local, contains no credentials, and launches
-no agents.
+no agents. `"graceful_restart": 1` there (and in the manager's `ping` reply)
+means a manager `restart` request waits for the worker's current round; see
+[Restarts and rolling deploys](#restarts-and-rolling-deploys).
 
 On Linux, Fleet sets `TAUCETI_WORKER_SLICE` to keep each worker's entire process
 tree in an independent systemd scope, sharing the existing pool's memory and CPU
@@ -138,7 +140,7 @@ Day-to-day controls:
 ```bash
 tauceti workers disable reviewer   # persist desired stopped state
 tauceti workers enable reviewer    # and start it again
-tauceti workers restart reviewer   # without changing desired state
+tauceti workers restart reviewer   # after its current round, without changing desired state
 tauceti workers remove reviewer    # drop the definition and stop it
 ```
 
@@ -243,7 +245,9 @@ other top-level key is an error, as is any unrecognized field inside a
 
 The manager fingerprints each definition. It stops a worker when `enabled`
 becomes false and restarts an enabled worker when any other field changes,
-without disturbing unchanged workers.
+without disturbing unchanged workers. Like `workers restart`, a changed
+definition takes effect after the worker's current round finishes, never by
+killing it; disabling or removing a worker stops it at once.
 
 `env` exists for running one worker differently from its peers when the
 difference has no flag: an A/B of a build setting, for instance. It is part of
@@ -493,7 +497,7 @@ always writes `enabled = true`. Use `workers edit` for those.
 | `apply [--check]` | Validate the TOML schema and manager-level rules, then reconcile. `--check` validates only |
 | `add [ID] [flags]` | Append an enabled definition and reconcile |
 | `enable ID` / `disable ID` | Persist desired running or stopped state |
-| `restart ID` | Request a restart without changing desired state; a disabled worker stays stopped |
+| `restart ID [--timeout SECONDS] [--no-wait]` | Restart on the current runtime once the round in flight finishes (at once between rounds), without changing desired state; a disabled worker stays stopped. Waits for the new instance unless `--no-wait`. See [Restarts and rolling deploys](#restarts-and-rolling-deploys) |
 | `remove ID` | Drop the definition and stop the worker |
 | `logs ID [--follow] [--lines N]` | The durable console log. `--follow` continues across worker restarts |
 | `tmux [--no-attach]` | Build the optional tmux viewing workspace |
@@ -506,6 +510,63 @@ always writes `enabled = true`. Use `workers edit` for those.
 `apply` without `--check`, `add`, `enable`, `disable`, `remove`, and `restart`
 start a manager if none is running and return only after it accepts control
 requests. `edit`, `import`, and `apply --check` do not start one.
+
+## Restarts and rolling deploys
+
+A round is all-or-nothing: anything it has not pushed when it is killed is
+discarded. Restarts therefore happen only between rounds. `tauceti workers
+restart ID` asks the worker to finish the round it is running and then exit;
+the manager starts it again on whatever code is installed now. The request
+reaches the loop as `SIGUSR1` from its managed wrapper. A worker that is
+between rounds (sleeping after a round, backing off, or waiting for quota,
+budget, GitHub or fleet capacity) exits at once instead of starting another
+round. A changed definition in `workers.toml` restarts the same way.
+
+By default the command waits as long as the round takes, then until the new
+instance is running; `TAUCETI_ROUND_TIMEOUT` (6 hours) still bounds any round.
+`workers status` shows `restart: after the current round` meanwhile. Two
+options change this:
+
+- `--timeout SECONDS` stops the worker if its round is still running after
+  that long, discarding the round, exactly as restarts did before.
+  `--timeout 0` stops it immediately.
+- `--no-wait` returns once the manager has accepted the request. The restart
+  still happens at the round boundary, and so does the deadline: the manager
+  enforces it, not the command. Interrupting a waiting command likewise leaves
+  the restart pending.
+
+`disable`, `remove` and `manager-stop` still stop workers at once.
+
+To deploy new worker code without losing work:
+
+1. Update the code the manager runs: `git pull` in a source checkout, or
+   install the new package or runtime.
+2. Restart the manager so that it, and the runners it launches, use the new
+   code. The workers keep running and are adopted:
+   `tauceti workers manager-stop --leave-workers`. The native service starts
+   the new manager within seconds; without it, `tauceti workers apply` starts
+   one. A manager that predates graceful restarts would kill the round, so
+   `workers restart` refuses to use one unless you pass `--timeout 0`.
+3. Restart the workers. One at a time, each finishing its round first, keeps
+   the rest of the fleet working throughout:
+
+   ```bash
+   for id in $(tauceti workers status --json | jq -r '.workers[] | select(.enabled) | .id'); do
+     tauceti workers restart "$id"
+   done
+   ```
+
+   Or restart them all at once, each still finishing its own round:
+
+   ```bash
+   for id in $(tauceti workers status --json | jq -r '.workers[] | select(.enabled) | .id'); do
+     tauceti workers restart --no-wait "$id"
+   done
+   ```
+
+A runner still executing the previous release does not understand the
+graceful request; the manager then waits until that worker reports that it is
+sleeping between rounds, and stops it then.
 
 ## The manager, and running past logout
 
