@@ -326,6 +326,12 @@ def main():
                 and "gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested" in text
                 and "do not post duplicate requests" in text,
             )
+            check(
+                f"self-tested helper={helper}: keep declaration across fix pushes",
+                "Keep the label in place through fix/rebase pushes" in text
+                and "--remove-label self-tested" in text
+                and "A push clears" not in text,
+            )
             for policy in ("bump", "full-lint", "lint-repair"):
                 check(
                     f"self-tested helper={helper}: excludes {policy}",

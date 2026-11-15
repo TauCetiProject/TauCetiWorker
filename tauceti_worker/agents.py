@@ -531,10 +531,13 @@ def self_tested_guidance(policy: str) -> str:
         "a new standalone `self-tested` comment with "
         "`gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested`. "
         "The comment handler is asynchronous; do not post duplicate requests while it runs. "
-        "A push clears the label, so reapply it after testing subsequent changes. "
-        "If a concurrent push workflow removes the label again, confirm the commit still matches "
-        "and reapply it once. Do not apply it for infrastructure or pin changes, or full-lint/lint-repair requests. "
-        "The trusted picker checks eligibility; reviews and all staging tests still run.\n\n"
+        "Keep the label in place through fix/rebase pushes after local verification succeeds. "
+        "The label is a persistent author declaration, not a per-commit receipt. "
+        "If verification fails or is incomplete, remove it with `gh pr edit <number> "
+        "--repo TauCetiProject/TauCeti --remove-label self-tested` (or post `-self-tested` "
+        "as the PR author if label permissions are missing). Do not leave it on work you "
+        "cannot stand behind. Do not apply it for infrastructure or pin changes, or full-lint/lint-repair requests. "
+        "Admission checks trusted-author and source-scope eligibility directly; reviews and all staging tests still run.\n\n"
     )
 
 

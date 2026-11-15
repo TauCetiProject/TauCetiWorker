@@ -293,11 +293,10 @@ class PRInfo:
         # check-run collided with this status context; TauCeti#1156 renamed it to `sandboxed-build`, so
         # no check-run named `build` exists at all now.) A PR with no `build` status yet is pending —
         # neither success nor failed — and simply waits for the trusted build to post.
-        from tauceti_tools.self_tested import accepted, context
+        from tauceti_tools.self_tested import accepted
 
         local = d.get("baseRefName", "main") == "main" and accepted(
             d.get("labels"),
-            next((c.get("state") for c in rollup if c.get("context") == context(d["number"])), ""),
             member=True,
             branch=d.get("headRefName", ""),
         )

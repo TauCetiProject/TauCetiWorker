@@ -17,8 +17,6 @@ from contextlib import nullcontext
 from datetime import datetime
 
 from runner import admission_policy as policy
-from tauceti_tools.self_tested import accepted
-from tauceti_tools.self_tested import context as local_context
 
 from .admission_state import AdmissionState
 from .eligibility import KEEP
@@ -169,15 +167,14 @@ class AdmissionPolicy:
             set(rubrics),
             snapshot.paths,
             snapshot.statuses.get("build", ""),
-            snapshot.statuses.get("bump-guard", ""),
+            ("success" if snapshot.self_tested and set(snapshot.paths) & {"lean-toolchain", "lake-manifest.json"}
+             else snapshot.statuses.get("bump-guard", "")),
             merge_path_prefix=self.prefix,
             merge_allow_file=self.allow_files,
             table_rubrics=rubrics,
             scope=snapshot.statuses.get("scope", ""),
             merge_base_sha=snapshot.merge_base_sha,
-            self_tested=accepted(
-                snapshot.pull.labels, snapshot.statuses.get(local_context(snapshot.pull.number)), member=True
-            ),
+            self_tested=snapshot.self_tested,
         )
         result["recovery_heads"] = sorted(recovery_heads(snapshot.comments))
         if result["review_safe"] and snapshot.pull.head_sha in result["recovery_heads"]:

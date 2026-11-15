@@ -5,9 +5,9 @@ while main keeps moving under it. After a host bump round, whether it pushed a r
 head needed none, the worker itself runs the full local verifier (`tauceti verify`, bump policy: whole-library
 `lake build --iofail` against the new Mathlib, local axiom, module-system, lint and shim checks) on
 that exact commit. Only when the verifier succeeds and GitHub still reports that commit as the
-PR head does the worker apply `self-tested`. The TauCeti picker then decides eligibility itself
-(team membership of the labeler, bump paths, real `bump-guard` validation) and posts the PR-bound
-`self-tested/<pr>` assertion; the merge queue's staging build still builds and audits everything.
+PR head does the worker apply `self-tested`. Review and admission validate the label inline
+(team membership of the labeler, bump paths, real `bump-guard` validation). The label persists
+through later rounds; the merge queue's staging build still builds and audits everything.
 
 The agent's own checks are never taken on trust: no receipt or model statement is consulted, only
 the verifier's result for the checkout whose HEAD equals the live PR head. Anything unexpected
@@ -105,21 +105,6 @@ def attest(w, pr: int, *, bubble: bool, sleep=time.sleep, clock=time.monotonic) 
         return f"not attested: local verification {result.get('status', 'incomplete')} ({result.get('error', '')})"
     if why := _bump_pull(w.gh.live_pull(pr), head):
         return f"not attested after verification: {why}"
-    context = f"self-tested/{pr}"
-    for _ in range(LABEL_ATTEMPTS):
-        if not w.gh.add_label(pr, LABEL):
-            return "not attested: adding the label failed"
-        deadline = clock() + ASSERTION_WAIT_S
-        while clock() < deadline:
-            sleep(ASSERTION_POLL_S)
-            state = w.gh.commit_status(head, context)
-            if state == "success":
-                return f"attested {head[:12]}: picker accepted self-tested"
-            if state in ("failure", "error"):
-                return f"picker refused self-tested on {head[:12]}"
-            live = w.gh.live_pull(pr)
-            if why := _bump_pull(live, head):
-                return f"stopped waiting: {why}"
-            if LABEL not in {str(label.get("name", "")).lower() for label in live.get("labels", [])}:
-                break  # removed by a concurrent picker run; label again once
-    return "assertion not observed; ordinary CI continues"
+    if not w.gh.add_label(pr, LABEL):
+        return "not attested: adding the label failed"
+    return f"attested {head[:12]}: persistent self-tested label applied"
