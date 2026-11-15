@@ -86,6 +86,33 @@ These fields are available in `workers.toml`. Credentials use the existing
 private Forgejo token-file configuration. Source changes wait for the worker's
 current round to finish; other workers retain their running processes and settings.
 
+## Locally verified publications
+
+With `self_tested = true` and `TAUCETI_VERIFY_HELPER=1`, the worker applies
+`self-tested` after an authoring or repair round publishes ordinary mathematics
+entirely under `TauCeti/`. Every verification phase must succeed in that round,
+and the receipt's source inventory must exactly match the published commit.
+Pin changes, infrastructure changes and full-lint/lint-repair requests do not
+qualify. This is the same eligibility check for GitHub and Forgejo.
+
+GitHub confirms through its existing picker. Forgejo confirms through the
+existing private native publisher policy, using the enrolled status publisher's
+native identity and repository permission. The native worker attests only its
+own PRs and respects existing refusals. Provision the `self-tested` repository
+label before enabling this route; no additional publisher grants are needed.
+
+The accepted observation requires both the label and a trusted
+`self-tested/<PR number>` success on the current head. A label left on a Forgejo
+PR after another push does not qualify that new head. An unavailable or invalid
+receipt, policy or assertion never counts as successful verification.
+
+Forgejo does not currently run an individual Actions build for each PR. Reviews
+still run, and every mixed merge-queue candidate requires its full CI build and
+audits before landing, including self-tested members. Source statuses cannot
+replace that candidate CI. For live deployments, preserve every per-worker
+`env` entry, including `TAUCETI_ROUND_WORKTREES=1`; the verification helper can
+also be enabled in the worker manager's service environment.
+
 ## Dependency bumps
 
 Bot-authored `bump-mathlib/` PRs hosted on TauCeti are repaired until they land.

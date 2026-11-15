@@ -34,6 +34,27 @@ REVIEW_CONTEXT = "tauceti-review/"
 RECOVERY_CONTEXT = "tauceti-recovery/"
 
 
+def ci_status_state(row, publishers, permission):
+    """One native status authority check shared by queue and worker observations."""
+    try:
+        actor = SourceActor.from_native(publishers.source.repository.forge, row.get("creator"))
+    except Incomplete:
+        return "error"
+    try:
+        writable = actor.principal in publishers.statuses and permission(actor) in {"write", "admin", "owner"}
+    except ForgeError as error:
+        if error.status != 404:
+            raise
+        writable = False
+    state = row.get("status") or row.get("state")
+    valid = (
+        writable
+        and row.get("description") == "tauceti-ci-status/v1:" + publishers.generation
+        and state in {"pending", "success", "error", "failure", "warning"}
+    )
+    return state if valid else "error"
+
+
 class PublicationSuperseded(RuntimeError):
     """A newer native publication superseded this frozen intent; do not resend it."""
 
@@ -663,31 +684,16 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             if status_id > newest.get(context, (0, None))[0]:
                 newest[context] = (status_id, row)
         permissions = {}
-        result = {}
-        for context, (_id, row) in newest.items():
-            try:
-                actor = SourceActor.from_native(self.repository.forge, row.get("creator"))
-            except Incomplete:
-                result[context] = "error"
-                continue
+
+        def permission(actor):
             if actor.principal not in permissions:
-                try:
-                    permissions[actor.principal] = (
-                        actor.principal in self.admission_policy.publishers.statuses
-                        and self._permission(actor) in {"write", "admin", "owner"}
-                    )
-                except ForgeError as error:
-                    if error.status != 404:
-                        raise
-                    permissions[actor.principal] = False
-            state = row.get("status") or row.get("state")
-            valid = (
-                permissions[actor.principal]
-                and row.get("description") == self.ci_status_description
-                and state in {"pending", "success", "error", "failure", "warning"}
-            )
-            result[context] = state if valid else "error"
-        return result
+                permissions[actor.principal] = self._permission(actor)
+            return permissions[actor.principal]
+
+        return {
+            context: ci_status_state(row, self.admission_policy.publishers, permission)
+            for context, (_id, row) in newest.items()
+        }
 
     @property
     def ci_status_description(self):

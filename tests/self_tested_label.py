@@ -175,7 +175,7 @@ CASES = [
         "labelled",
         1,
     ),
-    ("picker refusal is reported", {"receipt": verified}, lambda h: [pull(h)], ["failure"], "labelled", 1),
+    ("picker refusal is reported", {"receipt": verified}, lambda h: [pull(h)], ["failure"], "self-tested refused", 1),
     (
         "receipt for a different commit",
         {"receipt": other_commit},
@@ -264,7 +264,7 @@ CASES = [
         {"receipt": verified},
         lambda h: [pull(h), pull(h), pull("d" * 40)],
         [],
-        "labelled",
+        "self-tested stopped",
         1,
     ),
     (

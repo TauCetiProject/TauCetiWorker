@@ -1,7 +1,6 @@
 """Label a round's verified pushes `self-tested` from the worker, after the agent exits.
 
-The TauCeti review bot removes `self-tested` on every push, and a round that pushes after an
-earlier label rarely remembers to apply it again. So once a host round's agent has exited, the
+Once a host round's agent has exited, the
 worker labels each head the round published through git-safe-push itself, but only when:
 
 - the self-tested route is enabled (`TAUCETI_SELF_TESTED=1`) for TauCetiProject/TauCeti;
@@ -235,11 +234,11 @@ def label_push(w, stage: str, pr: int, commit: str, since: float, *, sleep=time.
     if outcome == "accepted":
         return f"labelled {commit[:12]}: self-tested confirmed"
     if outcome == "refused":
-        return f"labelled {commit[:12]}: self-tested refused"
+        return f"self-tested refused for {commit[:12]}"
     if outcome == "label failed":
         return "not labelled: adding the label failed"
     if outcome.startswith("stopped: "):
-        return f"labelled {commit[:12]}; stopped waiting: {outcome.removeprefix('stopped: ')}"
+        return f"self-tested stopped for {commit[:12]}: {outcome.removeprefix('stopped: ')}"
     return f"labelled {commit[:12]}; assertion not observed, ordinary CI continues"
 
 

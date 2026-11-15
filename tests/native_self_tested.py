@@ -46,7 +46,12 @@ class NativeSelfTested(unittest.TestCase):
         self.source.review_publication_policy = self.policy
         self.source.authenticated_actor = Mock(return_value=f.actor)
         self.live = dict(
-            state="open", draft=False, base=dict(ref="main"), head=dict(sha="a" * 40, ref="feature"), labels=[]
+            state="open",
+            draft=False,
+            base=dict(ref="main"),
+            head=dict(sha="a" * 40, ref="feature"),
+            user=dict(id=7, login="reviewer"),
+            labels=[],
         )
         self.source.live_pull = Mock(side_effect=lambda n: copy.deepcopy(self.live))
 
@@ -109,13 +114,13 @@ class NativeSelfTested(unittest.TestCase):
         self.assertEqual(self.confirm(), "accepted")
         self.record["publishers"]["generation"] = "2" * 32
         self.save_policy()
-        self.assertEqual(self.source.commit_status("a" * 40, "self-tested/1"), "")
+        self.assertEqual(self.source.commit_status("a" * 40, "self-tested/1"), "error")
         self.record["publishers"]["generation"] = self.fixture.publishers.generation
         self.save_policy()
         newest = copy.deepcopy(self.fixture.status_rows[-1])
         newest.update(id=999, creator=dict(id=999, login="outsider"))
         self.fixture.status_rows.append(newest)
-        self.assertEqual(self.source.commit_status("a" * 40, "self-tested/1"), "")
+        self.assertEqual(self.source.commit_status("a" * 40, "self-tested/1"), "error")
 
     def test_moved_closed_draft_held_scope_never_publishes(self):
         for key, value in (
@@ -124,6 +129,8 @@ class NativeSelfTested(unittest.TestCase):
             ("draft", True),
             ("base", dict(ref="other")),
             ("labels", [dict(name="full-lint")]),
+            ("head", dict(sha="a" * 40, ref="bump-mathlib/automatic")),
+            ("user", dict(id=999, login="other-author")),
         ):
             original = copy.deepcopy(self.live)
             self.live[key] = value
@@ -166,6 +173,37 @@ class NativeSelfTested(unittest.TestCase):
         self.assertEqual(self.confirm(), "unobserved")
         self.assertFalse(self.fixture.status_rows)
         self.assertEqual(sum(call.args[0] == "POST" for call in self.fixture.api.request.call_args_list), 1)
+
+    def test_existing_refusal_is_never_overwritten(self):
+        self.assertEqual(self.confirm(), "accepted")
+        self.fixture.status_rows[-1]["status"] = "failure"
+        self.source.add_label.reset_mock()
+        self.assertEqual(self.confirm(), "refused")
+        self.assertEqual(len(self.fixture.status_rows), 1)
+        self.source.add_label.assert_not_called()
+
+    def test_ambiguous_label_is_observed_with_case_normalization(self):
+        def lose_response(*args):
+            self.live["labels"] = [dict(name="Self-Tested")]
+            raise AmbiguousWrite("response lost")
+
+        self.source.add_label.side_effect = lose_response
+        self.assertEqual(self.confirm(), "accepted")
+        self.assertEqual(self.source.add_label.call_count, 1)
+
+    def test_failed_label_and_removed_publisher_fail_closed(self):
+        self.source.add_label.side_effect = ForgeError("outage", status=503)
+        self.assertEqual(self.confirm(), "label failed")
+        self.assertFalse(self.fixture.status_rows)
+        with patch(
+            "tauceti_queue.forgejo_source.ForgejoSourceAdapter._permission", side_effect=ForgeError("gone", status=404)
+        ):
+            self.assertEqual(self.confirm(), "refused")
+
+    def test_permission_is_reused_without_holding_the_review_lock(self):
+        with patch("tauceti_queue.forgejo_source.ForgejoSourceAdapter._permission", return_value="write") as permission:
+            self.assertEqual(self.confirm(), "accepted")
+            self.assertEqual(permission.call_count, 1)
 
 
 class CanonicalSource(unittest.TestCase):
