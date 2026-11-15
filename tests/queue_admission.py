@@ -7,10 +7,11 @@ import threading
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_queue import feeds, webhook
-from tauceti_queue.admission import AdmissionPolicy, AdmissionPoller
+from tauceti_queue.admission import AdmissionPolicy, AdmissionPoller, policy
 from tauceti_queue.fakes import make_controller, reopen_controller
 from tauceti_queue.github_adapter import GitHubClient, RateLimited, RequestDeferred
 from tauceti_queue.ports import GitHubUnavailable, Status
@@ -27,7 +28,7 @@ class AdmissionTests(unittest.TestCase):
         self.config = AdmissionPolicy(rubrics=["correctness", "reuse"], prefix="TauCeti/", allow_files=[])
         self.intake = AdmissionPoller(self.controller, self.github, REPO, self.config, clock=self.clock)
 
-    def review(self, number=1, *, state="green", round=1, comment=10):
+    def review(self, number=1, *, state="green", round=1, comment=10, rubrics=None):
         head = self.github.prs[number]["head_sha"]
         base = self.github.pr_merge_base(REPO, number, head)
         ts = datetime.fromtimestamp(self.clock(), UTC).isoformat()
@@ -38,7 +39,7 @@ class AdmissionTests(unittest.TestCase):
             "round": round,
             "ts": ts,
             "mode": "commit",
-            "states": {r: state for r in self.config.rubrics},
+            "states": {r: state for r in rubrics or self.config.rubrics},
         }
         self.github.review_comments[number] = [
             {
@@ -64,6 +65,57 @@ class AdmissionTests(unittest.TestCase):
         self.controller.store.close()
         self.controller = reopen_controller(self.tmp.name, self.github, self.repo, self.clock)
         self.intake = AdmissionPoller(self.controller, self.github, REPO, self.config, clock=self.clock)
+
+    def phase_in(self, cutoff):
+        """Stand in for the pinned policy's table: `quality-pass` is asked of PRs above `cutoff`."""
+
+        def with_phased_rubrics(rubrics, repo, pr):
+            return [*rubrics, "quality-pass"] if repo == REPO and int(pr) > cutoff else list(rubrics)
+
+        patcher = mock.patch.object(policy, "with_phased_rubrics", with_phased_rubrics, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.config = AdmissionPolicy(rubrics=self.config.rubrics, prefix="TauCeti/", allow_files=[], repository=REPO)
+        self.intake = AdmissionPoller(self.controller, self.github, REPO, self.config, clock=self.clock)
+
+    def test_a_rubric_being_phased_in_is_required_only_of_prs_above_its_cutoff(self):
+        self.phase_in(1)
+        self.ready(1)
+        self.ready(2)
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.assertEqual([row["number"] for row in self.controller.inputs()], [1])
+        phased = [*self.config.rubrics, "quality-pass"]
+        self.review(2, state="blocking_request", round=2, comment=11, rubrics=phased)
+        self.intake.invalidate(2)
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.review(2, round=3, comment=11, rubrics=phased)
+        self.intake.invalidate(2)
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.assertEqual(sorted(row["number"] for row in self.controller.inputs()), [1, 2])
+
+    def test_only_a_named_repository_with_a_pinned_table_takes_a_phased_rubric(self):
+        base = self.config.rubrics
+        unnamed = AdmissionPolicy(rubrics=base, prefix="TauCeti/", allow_files=[])
+        with mock.patch.object(policy, "with_phased_rubrics", None, create=True):
+            named = AdmissionPolicy(rubrics=base, prefix="TauCeti/", allow_files=[], repository=REPO)
+            self.assertEqual(named.rubrics_for(9), base, "a pin that predates the table")
+        self.phase_in(1)
+        self.assertEqual(self.config.rubrics_for(1), base)
+        self.assertEqual(self.config.rubrics_for(2), (*base, "quality-pass"))
+        self.assertEqual(unnamed.rubrics_for(2), base)
+        # Naming the repository must not re-evaluate every open PR when this is deployed.
+        self.assertEqual(unnamed.revision, self.config.revision)
+
+    def test_the_pinned_table_is_read_once_the_pin_has_one(self):
+        table = getattr(policy, "PHASED_RUBRICS", None)
+        if table is None:
+            self.skipTest("the pinned review policy predates the phase-in table")
+        named = AdmissionPolicy(rubrics=self.config.rubrics, prefix="TauCeti/", allow_files=[], repository=REPO)
+        with mock.patch.dict(table, {"quality-pass": {REPO: 100}}):
+            self.assertEqual(named.rubrics_for(100), self.config.rubrics)
+            self.assertEqual(named.rubrics_for(101), (*self.config.rubrics, "quality-pass"))
+        with mock.patch.dict(table, {"quality-pass": {REPO: None}}):
+            self.assertEqual(named.rubrics_for(101), self.config.rubrics)
 
     def test_self_tested_reviewed_head_enters_existing_staging_without_build_success(self):
         head = self.ready()

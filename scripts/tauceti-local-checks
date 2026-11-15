@@ -2,11 +2,19 @@
 """Shared local verification from the worker's pinned TauCetiTools installation."""
 
 import sys
+from pathlib import Path
 
-from tauceti_tools.templates import import_shared, run_script
+from tauceti_tools.templates import import_shared
 
 if __name__ == "__main__":
-    raise SystemExit(run_script("local_checks.py", sys.argv[1:]))
+    directory = Path(__file__).resolve().parent
+    for candidate in (directory, directory.parent / "tauceti_worker", directory.parent):
+        if (candidate / "verification_resources.py").is_file():
+            sys.path.insert(0, str(candidate))
+            break
+    from verification_resources import verify_shared
+
+    raise SystemExit(verify_shared(sys.argv[1:]))
 else:
     implementation = import_shared("local_checks.py", __name__)
     globals().update(vars(implementation))

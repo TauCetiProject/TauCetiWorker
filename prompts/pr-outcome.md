@@ -41,11 +41,11 @@ choose work supported by the existing roadmaps; do not change roadmaps.
 Continue repairs or the existing evidence-based review response process within the bounded
 attempts. When instructed that this is the final resolution attempt, repair and push or close
 your own PR with a concise explanation of the unresolved finding and what a fresh attempt should
-do differently. Preserve the branch. Re-read the live author, starting head and hold labels before
+do differently. A finding that only the PR description can answer is repaired by updating the
+description and replying on its thread. Preserve the branch. Re-read the live author, starting head and hold labels before
 commenting and closing, using the same checks above, then confirm closure succeeded.
 The closure authority above applies here too; never close somebody else's PR or a specially
-scoped automatic bump. For those repairs, preserve the existing retry/checkpoint policy.
+scoped automatic bump.
 
-Transient provider/GitHub failures, lost claims and deadlines use existing retry and checkpoint
-handling. A withdrawn request, changed head or lost claim needs no repetitive comment: stop
+Transient provider/GitHub failures and lost claims use the existing retry handling. A withdrawn request, changed head or lost claim needs no repetitive comment: stop
 safely; the changed shared state already routes future work.

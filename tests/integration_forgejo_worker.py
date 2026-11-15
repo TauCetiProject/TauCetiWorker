@@ -46,6 +46,83 @@ from tauceti_worker.worker_sources import activate, source_config
 
 @unittest.skipUnless(os.environ.get("FORGEJO_BINARY"), "set FORGEJO_BINARY for disposable native worker")
 class NativeWorker(unittest.TestCase):
+    def test_rebase_uses_git_proof_and_rechecks_a_changed_base(self):
+        from tauceti_tools.forge import Forgejo, Incomplete
+
+        from tauceti_queue.forgejo_git import ForgejoGitSource
+        from tauceti_worker.work_units import _still_actionable
+
+        with source_fixture() as (root, api, repository, row, tokens):
+            endpoint = "repos/" + repository.name
+
+            def write(branch, content, *, create=False, client=api, target=endpoint):
+                data = {"branch": branch, "message": "Acceptance input", "content": base64.b64encode(content).decode()}
+                if not create:
+                    data["sha"] = client.request("GET", target + "/contents/Conflict.txt?ref=" + branch)["sha"]
+                client.request("POST" if create else "PUT", target + "/contents/Conflict.txt", data)
+
+            write("main", b"base\n", create=True)
+            peer = Forgejo(repository.forge, token=tokens["contributor"])
+            fork = peer.request("POST", endpoint + "/forks", {})
+            fork_endpoint = "repos/" + fork["full_name"]
+            peer.request(
+                "POST", fork_endpoint + "/branches", {"old_branch_name": "main", "new_branch_name": "conflict"}
+            )
+            write("conflict", b"branch\n", client=peer, target=fork_endpoint)
+            write("main", b"main\n")
+            pull = api.request(
+                "POST", endpoint + "/pulls", {"base": "main", "head": "contributor:conflict", "title": "Conflict"}
+            )
+            number, head = pull["number"], pull["head"]["sha"]
+            self.assertFalse(api.pull(repository, number)["mergeable"])
+            token = root / "native-token"
+            token.write_text(tokens["operator"])
+            token.chmod(0o600)
+            source = ForgejoWorkerSource(RepositoryIdentity(repository, row["id"]), api, token_file=token)
+            cfg = dataclasses.replace(
+                Config.resolve("native-rebase", home=root), state=root / "state", store_dir=root / "store"
+            )
+            cfg = source_config(cfg, source)
+            counters = Counters(cfg)
+
+            def observe():
+                return survey(
+                    cfg, source, ReviewState(cfg, source), counters, deep=True, stages=["rebase"], numbers=(number,)
+                )
+
+            # A Git failure is not a conflict, and admits no model work.
+            with patch.object(ForgejoGitSource, "mergeability", side_effect=Incomplete("unavailable")):
+                self.assertEqual(observe().rebaseable.actionable, [])
+            result = observe()
+            self.assertEqual([pr.mergeable for pr in result.open_prs], ["CONFLICTING"])
+            [candidate] = result.rebaseable.actionable
+            worker = type("Worker", (), {"gh": source, "cfg": cfg})()
+            self.assertTrue(_still_actionable("rebase", worker, result, candidate))
+            self.assertEqual(api.pull(repository, number)["head"]["sha"], head)
+            # Changing only main invalidates the old proof, even with an unchanged PR head.
+            write("main", b"branch\n")
+            transport = ForgejoGitSource(
+                source.identity, api, cfg.state / "mergeability/objects.git", token=tokens["operator"]
+            )
+            new_base = transport.ref_sha(repository.name, "heads/main")
+            real_pull = api.pull
+
+            def ambiguous(repo, pr):
+                value = real_pull(repo, pr)
+                self.assertEqual(value["base"]["sha"], new_base)
+                value["mergeable"] = False
+                return value
+
+            original = ForgejoGitSource.mergeability
+            with (
+                patch.object(api, "pull", side_effect=ambiguous),
+                patch.object(ForgejoGitSource, "mergeability", autospec=True, side_effect=original) as proof,
+            ):
+                self.assertFalse(_still_actionable("rebase", worker, result, candidate))
+            proof.assert_called_once()
+            self.assertEqual(proof.call_args.args[2:], (head, new_base))
+            self.assertEqual(api.pull(repository, number)["head"]["sha"], head)
+
     def test_native_project_cli_uses_its_configured_source_and_recovers_unchanged(self):
         with source_fixture() as (root, api, repository, row, tokens):
             endpoint = "repos/" + repository.name
