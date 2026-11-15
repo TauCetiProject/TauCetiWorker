@@ -516,14 +516,14 @@ class RoundStorage:
         )
 
     def abandon(self) -> str:
-        """Move the checkout whole out of its place: no recovery record, nothing retained.
+        """Delete the checkout: rounds are all-or-nothing, so nothing in it is kept.
 
-        The discard queue is preferred: its collector deletes without following links or crossing
-        filesystems. A checkout with a mount inside, or one that cannot be moved there, is renamed
-        to a hidden sibling instead, which no collector deletes: callers then find no checkout to
-        preserve, and an operator removes the sibling. Nothing is deleted here.
+        Deletion goes through ``retention.remove``, which never follows links, never crosses
+        filesystems and never removes a mount point or a tree a live process still uses. A checkout
+        it will not delete is renamed to a hidden sibling instead, which no collector deletes:
+        callers then find no checkout, and an operator removes the sibling.
         """
-        from .retention import mount_points
+        from . import retention
 
         cwd = self.cwd
         try:
@@ -534,32 +534,18 @@ class RoundStorage:
                 return f"{cwd} overlaps shared state; left in place"
         except OSError as error:
             return f"{cwd} could not be inspected ({error}); left in place"
-        problem = None
-        state = getattr(self.cfg, "state", None)
-        mounts = mount_points()
-        if state is None:
+        if getattr(self.cfg, "state", None) is None:
             # Queue repair tasks own their worktrees and their cleanup; the caller ends the task.
-            return "no worker discard queue; the caller's worktree is left to its owner"
-        if mounts is None:
-            problem = "mounts are unobservable"
-        elif any(point == real or point.is_relative_to(real) for point in mounts):
-            problem = "a mount lies inside it"
-        else:
-            trash = Path(state) / "recovery-cleanup" / "discarded"
-            target = trash / f"abandoned-{cwd.name}-{secrets.token_hex(8)}"
-            try:
-                trash.mkdir(parents=True, exist_ok=True)
-                os.rename(cwd, target)
-            except OSError as error:
-                problem = f"moving it to the discard queue failed ({error})"
-            else:
-                _sync(cwd.parent, trash)
-                with contextlib.suppress(Exception):
-                    from .retention import request_cleanup
-
-                    request_cleanup()
-                log(f"round storage: moved {cwd} to {target} for deletion, unsaved")
-                return f"checkout moved to {target}"
+            return "no worker checkout to delete; the caller's worktree is left to its owner"
+        report = retention.fresh_report()
+        try:
+            retention.remove(cwd, cwd.parent.parent, report)
+        except OSError as error:
+            retention.note(report, "errors", f"{cwd}: {error}")
+        if not cwd.exists():
+            log(f"round storage: deleted {cwd}, unsaved")
+            return f"checkout {cwd} deleted"
+        problem = "; ".join(report["protected"] + report["errors"]) or "it could not be deleted"
         target = cwd.with_name(f".{cwd.name}.abandoned-{secrets.token_hex(8)}")
         try:
             os.rename(cwd, target)

@@ -31,16 +31,17 @@ before it does work. The positive answer is cached in ``<root>/admin-check.json`
 cached answer, or without one claims anyway, since the service enforces admin on every claim. Only the
 API saying the account is not an admin stops the worker.
 
-Phases, each checkpointed in ``<root>/tasks/<task_id>/task.json`` so a restarted runner can resume
-the same model session instead of starting over: claimed, sources_ready, artifacts_ready,
-agent_running, validated, pushed, submitted, then adopted / not_adopted / released / claim_lost.
+Phases, each recorded in ``<root>/tasks/<task_id>/task.json``: claimed, sources_ready, artifacts_ready,
+agent_running, validated, pushed, submitted, then adopted / not_adopted / released / claim_lost. A task
+is all-or-nothing: one stopped or killed before its result was delivered is abandoned, its claim
+released and its worktree removed. Only the delivery of a validated result (the push to the
+submission ref and the ``result`` call) is retried by a later start.
 
 CLI: ``python -m tauceti_queue.repair_task --service <url> [--once | --check]``. Without ``--once`` the
-runner is a long-running worker (``serve``): it resumes checkpointed tasks, claims, runs and submits,
+runner is a long-running worker (``serve``): it retries pending deliveries, claims, runs and submits,
 reports provider outcomes to ``POST /tasks/inference`` for the service's inference hold, sleeps the
 poll interval when nothing is claimable, survives a task's failure, and on SIGTERM stops the running
-agent while keeping its claim and checkpoint so the next start resumes the same session
-(``services/queue/tauceti-queue-repair.service``). The same ``RunnerConfig`` and ``claim_and_run`` are
+agent and releases its claim (``services/queue/tauceti-queue-repair.service``). The same ``RunnerConfig`` and ``claim_and_run`` are
 what the worker loop calls when the task is integrated as a work unit.
 """
 
@@ -99,7 +100,7 @@ RELEASE_REASONS = (
     "agent_failed",
     "push_failed",
     "submission_unavailable",  # preflight failed before inference; retry without settling preparation
-    "worker-stopped",  # the worker was stopped (SIGTERM) before the task reached a resumable phase
+    "worker-stopped",  # the worker was stopped (SIGTERM) or restarted before the result was delivered
     "prepared_clean",  # a ``prepare`` task's batch built without an error: nothing to repair
 )
 # Checkpoint states with the claim still ours and the task unfinished; everything else is settled.
@@ -116,9 +117,9 @@ IN_FLIGHT_STATES = (
     "submitted",
     "interrupted",
 )
-# In-flight states a restarted worker continues instead of releasing: the agent's session exists.
+# In-flight states whose validated result a restarted worker still delivers; any other in-flight
+# task is abandoned and its claim released. ``interrupted`` is only ever read from older records.
 DELIVERY_STATES = ("delivery_pending", "pushed", "submitted")
-RESUMABLE_STATES = ("agent_running", "interrupted", *DELIVERY_STATES)
 # ``run_repair_agent`` statuses that release the task under the same name.
 RELEASED_AGENT_STATUSES = ("inference_unavailable", "artifacts_unavailable", "agent_launch_failed")
 
@@ -792,8 +793,7 @@ class Stop:
     """The worker's stop latch: set by the signal handlers, waited on by ``serve``.
 
     Events attached to it (a running task's ``cancel``) are set with it, so a SIGTERM reaches the agent
-    through the same path a lost claim does; the task then records itself as interrupted instead of
-    lost, keeping its claim and checkpoint for the next start to resume.
+    through the same path a lost claim does; the task then releases its claim as ``worker-stopped``.
     """
 
     def __init__(self) -> None:
@@ -968,36 +968,11 @@ class TaskState:
     def state(self) -> str | None:
         return self.record.get("state")
 
-    @property
-    def resumable(self) -> bool:
-        """A checkpoint a restarted runner continues: mid-agent, or interrupted by a stop."""
-        return self.state in RESUMABLE_STATES
-
-    @property
-    def agent_started(self) -> bool:
-        """The agent had been launched when the checkpoint was written (resume its session)."""
-        return self.state == "agent_running" or (
-            self.state == "interrupted" and self.record.get("phase") == "agent_running"
-        )
-
     def session(self) -> str | None:
         from tauceti_worker.runtime_status import read_json
 
         value = read_json(self.session_path).get("session")
         return str(value) if value else None
-
-    def session_provider(self) -> str:
-        """The chain provider (``claude``, ``codex`` or ``api``) whose session the checkpoint records. A
-        checkpoint from before the chain existed names none; its session is the Claude subscription's,
-        the only provider there was, unless ``session.json``'s profile says otherwise."""
-        from tauceti_worker.runtime_status import read_json
-
-        value = self.record.get("provider")
-        if value in PROVIDERS:
-            return str(value)
-        profile = read_json(self.session_path).get("profile")
-        provider = profile.get("provider") if isinstance(profile, dict) else None
-        return str(provider) if provider in SUBSCRIPTION_PROVIDERS else "claude"
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1503,8 +1478,8 @@ def subscription_status(cfg: RunnerConfig, provider: str) -> tuple[bool, str]:
     windows against the pacing curve), under ``cfg.rate`` when the operator set one. The read never
     spends a request and never rotates a token. An unreadable or missing credential, a telemetry failure
     and a malformed usage response are all "not eligible", with the pacer's reason."""
+    from tauceti_worker.config import environment
     from tauceti_worker.quota import Quota, _unavail_reason
-    from tauceti_worker.repair_recovery import environment
 
     home = Path(os.environ.get("HOME", os.path.expanduser("~")))
     cache = cfg.root / "quota-cache"
@@ -1634,8 +1609,7 @@ def run_repair_agent(
         take_last_agent_infra_failure,
         take_last_agent_run,
     )
-    from tauceti_worker.config import NoProgress
-    from tauceti_worker.repair_recovery import environment
+    from tauceti_worker.config import NoProgress, environment
     from tauceti_worker.round_storage import RoundAbandoned
 
     if resume and resume_provider not in PROVIDERS:
@@ -1947,7 +1921,6 @@ def push_result(cfg: RunnerConfig, task: Task, worktree: Path, tip: str, logdir:
         TAUCETI_PUSH_OID=tip,
         TAUCETI_PUSH_SCOPE=f"queue-task-{task.task_id}",
     )
-    env.pop("TAUCETI_RECOVERY_CONTINUATION", None)
     record = repair.run_logged([str(GIT_SAFE_PUSH)], worktree, logdir / "push.log", env=env, timeout=600)
     if record["rc"] == 78 and not expect:
         observed = git(worktree, "ls-remote", remote, task.submission_ref, check=False).split()
@@ -2042,10 +2015,11 @@ def _run_task(
     """Run one claimed task to its outcome. The claim is renewed throughout and the result discarded
     if it is lost. Returns the outcome record (also written to the task's state directory).
 
-    ``stop`` is the worker's stop latch: when it is set while the agent runs, the agent is stopped and
-    the task recorded as ``interrupted`` with its claim and worktree kept, so ``resume_pending`` on
-    the next start renews the claim and continues the same session. A stop after validation lets the
-    push and submission finish; they are quick and end the task.
+    ``stop`` is the worker's stop latch: when it is set while the agent runs, the agent is stopped,
+    the claim released (``worker-stopped``) and the worktree removed; nothing of the attempt is
+    continued. A stop after validation lets the push and submission finish; they are quick and end
+    the task. ``resume_state`` is a recorded task whose validated result ``retry_deliveries`` is
+    delivering again.
     """
     require_task_execution(cfg=cfg, task=task)
     state_dir = cfg.tasks_dir / task.task_id
@@ -2056,7 +2030,7 @@ def _run_task(
     logdir = state_dir / "logs"
     state = resume_state or TaskState(state_dir, task)
     pending_delivery = state.record.get("delivery") if state.state in IN_FLIGHT_STATES else None
-    resuming = resume_state is not None and (resume_state.agent_started or bool(pending_delivery))
+    resuming = resume_state is not None and bool(pending_delivery)
     cancel = threading.Event()
     if stop is not None:
         stop.attach(cancel)
@@ -2127,24 +2101,12 @@ def _run_task(
 
     def cancelled(detail: str) -> dict:
         """The agent was cancelled: by the claim being lost (discard), or by the worker stopping. A
-        stop with the agent's session in hand renews the claim and checkpoints the task for the next
-        start to resume; before that the claim is released as ``worker-stopped`` so the service
+        stop abandons the attempt and releases the claim as ``worker-stopped``, so the service
         re-exposes the task at once instead of at the claim's expiry."""
         if not stopping() or lease.lost.is_set():
             return discard(lease.lost_reason or detail)
         phase = state.state
-        if phase == "agent_running" or state.session():
-            lease.stop()
-            try:
-                task.expires_at = client.renew(task)
-                renewed = f"claim renewed to {time.strftime('%H:%M:%S', time.gmtime(task.expires_at))}"
-            except (ClaimRefused, ServiceError) as error:
-                renewed = f"claim not renewed ({error})"
-            outcome.update(status="interrupted", detail=detail, phase=phase)
-            state.write("interrupted", phase=phase, detail=detail, outcome=outcome)
-            log(f"task {task.task_id}: interrupted while {phase}; {renewed}; the next start resumes the session")
-            return outcome
-        log(f"task {task.task_id}: stopped while {phase}, before the agent ran; releasing the claim (worker-stopped)")
+        log(f"task {task.task_id}: stopped while {phase}; abandoning the attempt and releasing the claim")
         return release_task(
             cfg, client, task, state, "worker-stopped", f"worker stopped while {phase}: {detail}", outcome, lease
         )
@@ -2243,7 +2205,7 @@ def _run_task(
                 )
         elif not worktree.is_dir():
             return release_task(
-                cfg, client, task, state, "agent_failed", "resume: the worktree is gone", outcome, lease
+                cfg, client, task, state, "agent_failed", "delivery retry: the worktree is gone", outcome, lease
             )
         if not resuming:
             access = check_submission_access(cfg, task, logdir)
@@ -2364,8 +2326,6 @@ def _run_task(
         resubmit = False
         agent_records: list[dict] = list(outcome.get("agent", []))
         agent = {"status": "ok"}
-        resume_session = state.session() if resuming else None
-        resume_provider = state.session_provider() if resuming else None
         skip_agent = bool(pending_delivery)
         while True:
             attempt += 1
@@ -2427,12 +2387,6 @@ def _run_task(
                 prompt = repair.compose_prompt(context, findings, prompt_chain, cfg.clone)
                 if stream is not None:
                     prompt = stream.annotate(prompt, worker_verifies=context.worker_verifies)
-                if resume_session:
-                    prompt = (
-                        "The worker running this task was interrupted and has resumed your session; the worktree is "
-                        "as you left it. Continue the task from where you were, and finish with the summary the "
-                        "original instructions ask for.\n\n" + prompt
-                    )
                 agent = run_repair_agent(
                     cfg,
                     task,
@@ -2442,11 +2396,8 @@ def _run_task(
                     cancel,
                     state,
                     env_lake,
-                    resume=resume_session,
-                    resume_provider=resume_provider,
                     label=f"attempt-{attempt}",
                 )
-                resume_session = None
                 agent_records.append(agent)
                 outcome["agent"] = agent_records
                 if agent["status"] == "cancelled":
@@ -2463,7 +2414,11 @@ def _run_task(
                     cfg,
                     task,
                     worktree,
-                    repair.explanation_prompt(report["unexplained"], chain_before),
+                    repair.explanation_prompt(
+                        report["unexplained"],
+                        repair.read_chain(cfg.clone, task.validation_base, tip),
+                        base=task.validation_base,
+                    ),
                     logdir,
                     cancel,
                     state,
@@ -2693,7 +2648,9 @@ def _run_task(
                     cfg,
                     task,
                     worktree,
-                    repair.explanation_prompt(named, chain_before),
+                    repair.explanation_prompt(
+                        named, repair.read_chain(cfg.clone, task.validation_base, tip), base=task.validation_base
+                    ),
                     logdir,
                     cancel,
                     state,
@@ -2751,13 +2708,9 @@ def _run_task(
             outcome["stream_build"] = stream.summary()
         outcome["seconds"] = round(time.monotonic() - started, 1)
         outcome["lease"] = {"renewals": lease.renewals, "errors": lease.errors, "lost": lease.lost.is_set()}
-        # An interrupted task keeps its worktree: the next start resumes the agent in it. A background
-        # publication owns it from its start and removes it when done.
-        if (
-            not cfg.keep_worktree
-            and outcome.get("status") not in ("error", "interrupted", "delivery_pending")
-            and not background
-        ):
+        # A task awaiting delivery keeps its worktree for the retry. A background publication owns it
+        # from its start and removes it when done.
+        if not cfg.keep_worktree and outcome.get("status") not in ("error", "delivery_pending") and not background:
             with contextlib.suppress(Exception):
                 repair.remove_worktree(cfg.clone, worktree)
         with contextlib.suppress(Exception):
@@ -2886,14 +2839,13 @@ def claim_and_run(
     return outcome
 
 
-def resume_pending(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None = None) -> list[dict]:
-    """Continue tasks a previous runner left mid-agent, or interrupted by a stop, while their claim is
-    still live.
+def retry_deliveries(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None = None) -> list[dict]:
+    """Deliver validated results a previous run could not, and release every other unfinished claim.
 
-    The checkpoint names the task, the claim token and the provider session; the claim is renewed
-    first, and if the service refuses the task is recorded as lost. A live claim resumes the same
-    model session in the same worktree instead of restarting the attempt; a task interrupted before
-    its agent started is run again from its sources.
+    Tasks are all-or-nothing: one a previous runner left mid-attempt (stopped, killed or crashed) is
+    abandoned, its claim released (``worker-stopped``) and its worktree removed. Only a result that
+    was validated and is being pushed or submitted is delivered again, while the claim is still live;
+    if the service refuses the claim the task is recorded as lost.
     """
     outcomes = []
     for directory, record in in_flight_checkpoints(cfg):
@@ -2954,31 +2906,34 @@ def resume_pending(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None =
                         with contextlib.suppress(Exception):
                             repair.remove_worktree(cfg.clone, cfg.root / "worktrees" / f"task-{task.task_id}")
                     continue
-            state.write("claim_lost", detail=f"resume: {error}")
+            state.write("claim_lost", detail=f"delivery retry: {error}")
             if not cfg.keep_worktree:
                 with contextlib.suppress(Exception):
                     repair.remove_worktree(cfg.clone, cfg.root / "worktrees" / f"task-{task.task_id}")
-            log(f"task {task.task_id}: claim no longer ours; not resumed")
+            log(f"task {task.task_id}: claim no longer ours; not delivered")
             continue
         except ServiceError as error:
-            log(f"task {task.task_id}: renew failed during resume ({error}); will retry on the next start")
+            log(f"task {task.task_id}: renew failed ({error}); will retry on the next start")
             continue
-        if record.get("delivery"):
-            if record.get("next_retry_at", 0) > time.time():
-                continue
-        elif record.get("state") not in ("agent_running", "interrupted"):
-            # Claimed and stopped before the agent ran (or past the agent, mid-submission): nothing
-            # to continue; give the claim back now and claim fresh rather than hold it to expiry.
+        if not record.get("delivery"):
+            # Stopped, killed or crashed before its result was validated: abandon the attempt and
+            # give the claim back now rather than hold it to expiry.
             log(
-                f"task {task.task_id}: claim still ours but stopped while {record.get('state')}; releasing (worker-stopped)"
+                f"task {task.task_id}: claim still ours but stopped while {record.get('state')}; "
+                "abandoning it and releasing the claim (worker-stopped)"
             )
             outcomes.append(
                 release_task(
                     cfg, client, task, state, "worker-stopped", f"worker restarted while {record.get('state')}"
                 )
             )
+            if not cfg.keep_worktree:
+                with contextlib.suppress(Exception):
+                    repair.remove_worktree(cfg.clone, cfg.root / "worktrees" / f"task-{task.task_id}")
             continue
-        log(f"resuming task {task.task_id} (session {state.session() or 'unknown'})")
+        if record.get("next_retry_at", 0) > time.time():
+            continue
+        log(f"retrying delivery of task {task.task_id}")
         outcomes.append(run_task(cfg, task, client, resume_state=state, stop=stop))
     return outcomes
 
@@ -3249,16 +3204,16 @@ def serve(
     log(f"serving {cfg.service} as {cfg.worker} (poll {cfg.poll_seconds:.0f}s, root {cfg.root})")
     if resume:
         try:
-            for outcome in resume_pending(cfg, client, stop=stop):
+            for outcome in retry_deliveries(cfg, client, stop=stop):
                 record(outcome)
         except Exception as error:
-            failed("resume", error, trace=True)
+            failed("delivery retry", error, trace=True)
     while not stop.is_set():
         outcome = None
         try:
             deliveries = [r for _, r in in_flight_checkpoints(cfg) if r.get("delivery")]
             if deliveries:
-                for completed in resume_pending(cfg, client, stop=stop):
+                for completed in retry_deliveries(cfg, client, stop=stop):
                     record(completed)
                 write_heartbeat(cfg, summary, "delivery")
                 stop.wait(cfg.poll_seconds)
@@ -3474,7 +3429,9 @@ def main(argv: list[str] | None = None) -> int:
         default=repair_parallel.parallel_agents_default(),
         help="concurrent agents for independent failing groups, 0 or 1 for sequential ($TAUCETI_QUEUE_PARALLEL_AGENTS)",
     )
-    parser.add_argument("--no-resume", action="store_true", help="do not continue checkpointed tasks on start")
+    parser.add_argument(
+        "--no-resume", action="store_true", help="do not retry pending deliveries or release abandoned claims on start"
+    )
     parser.add_argument(
         "--no-stream-repair",
         action="store_true",
@@ -3545,7 +3502,7 @@ def main(argv: list[str] | None = None) -> int:
     outcomes: list[dict] = []
     retry_releases(cfg, client)
     if not args.no_resume:
-        outcomes += resume_pending(cfg, client)
+        outcomes += retry_deliveries(cfg, client)
     outcome = claim_and_run(cfg, client, admin)
     if outcome is not None:
         outcomes.append(outcome)

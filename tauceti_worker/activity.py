@@ -908,36 +908,15 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                         + type(error).__name__
                         + ")"
                     )
-            from . import expanded_cache, shared_mathlib, work_recovery
+            from . import expanded_cache, shared_mathlib
 
-            try:
-                from . import retention
-
-                # Delete here too even when a collector is installed: deletion no longer waits on the
-                # housekeeping lock, and an installed timer that has stalled must not stop it.
-                housekeeping = work_recovery.housekeep(cleanup=True, **retention.COLLECTOR_SLICE)
-                if housekeeping.get("cleanup_pending") and read_json(root() / "cleanup-service.json").get("installed"):
-                    retention.request_cleanup()
-            except Exception as error:
-                errors.append(f"Recovery housekeeping deferred ({type(error).__name__}); retryable jobs retained")
-            from . import verification_storage
-
-            try:
-                from .retention import worker_configs
-
-                states = [state for cfg in worker_configs() for state in (cfg.state, cfg.state / "verification-state")]
-                verification_storage.housekeep(states)
-            except Exception as error:
-                errors.append(f"Verification storage housekeeping deferred ({type(error).__name__})")
             with db:
                 error_subjects = _observation_error_subjects(db)
                 sharing = shared_mathlib.summary()
                 value = dict(version=1, prepared_at=now, errors=errors, all=_summary(db, now), workers={}, groups={})
                 value["all"]["shared_mathlib"] = sharing
-                value["all"]["work_recovery"] = work_recovery.summary()
                 value["all"]["storage_cleanup"] = read_json(root() / "cleanup.json")
                 value["all"]["expanded_cache"] = expanded_cache.summary()
-                value["all"]["verification_storage"] = read_json(verification_storage.root() / "status.json")
                 from . import activity_live
 
                 report_paths = [root() / "summary.json"]
@@ -958,12 +937,6 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                         value[key][row[0]]["shared_mathlib"] = shared_mathlib.summary(
                             **{"scope" if key == "groups" else "worker": row[0]}
                         )
-                        members = (
-                            {r[0] for r in db.execute("SELECT worker FROM report_members WHERE scope=?", (row[0],))}
-                            if key == "groups"
-                            else {row[0]}
-                        )
-                        value[key][row[0]]["work_recovery"] = work_recovery.summary(workers=members)
                         if key == "groups":
                             # Storage belongs to the host, not to the accounting worker window.
                             value[key][row[0]]["storage_cleanup"] = value["all"]["storage_cleanup"]

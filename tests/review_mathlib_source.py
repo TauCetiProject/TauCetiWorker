@@ -281,13 +281,11 @@ def test_unknown_staging_and_published_sources_remain_while_owned_stale_trash_is
         markerless = base / "mathlib-src-tmp-disposed.retention-deleting"
         markerless.mkdir()
         (markerless / "partial").write_text("interrupted deletion after marker removal")
-        from tauceti_worker import retention, work_recovery
+        from tauceti_worker import live_use, retention
 
         for unavailable in ("processes", "mounts"):
             with (
-                patch.object(
-                    work_recovery, "process_references", return_value=None if unavailable == "processes" else []
-                ),
+                patch.object(live_use, "process_references", return_value=None if unavailable == "processes" else []),
                 patch.object(retention, "mount_points", return_value=None if unavailable == "mounts" else []),
             ):
                 agents._prune_review_mathlib_staging(base)

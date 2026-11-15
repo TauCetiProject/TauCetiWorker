@@ -376,11 +376,6 @@ def collect(configs, *, dry=False, now=None, opened=...):
                 # Reuse the open-file observation without taking work locks: even a
                 # brief probe could make a concurrently starting round lose its lock.
                 paths = [cfg.state / "round.lock"]
-                paths += [
-                    path
-                    for state in (cfg.state, cfg.state / "verification-state")
-                    for path in (state / "verification-jobs").glob("*.lock")
-                ]
                 for path in paths if opened is not None else ():
                     try:
                         info = path.stat()

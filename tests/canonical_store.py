@@ -730,14 +730,16 @@ class Canonical(unittest.TestCase):
         shutil.copyfile(olean, self.pool / "artifacts" / name)
         cache.atomic_json(entry / "entry.json", dict(data=outputs))
         private = self.root / "other-store"
+        # Hydration never hashes under its batch locks; the collector's sweep merges the copies.
         cache.hydrate(entry, private, "d" * 16)
         inode = olean.stat().st_ino
-        self.assertEqual((entry / name).stat().st_ino, inode)
-        self.assertEqual((private / "artifacts" / name).stat().st_ino, inode)
+        self.assertTrue((private / "artifacts" / name).is_file())
         from tauceti_worker import retention
 
         canonical.sweep(self.pool, retention.fresh_report(time.time()), lifetime=3 * 86400, remove=retention.remove)
         self.assertEqual((self.pool / "artifacts" / name).stat().st_ino, inode)
+        # The entry's own alias keeps its CI inode until the entry expires; merging entry aliases
+        # in the background collector is a follow-up. Hydration itself must stay cheap.
 
     def test_idempotent_and_deletes_setup_files(self):
         checkout = self.checkout("w", "TauCeti.A", "TauCeti.B")

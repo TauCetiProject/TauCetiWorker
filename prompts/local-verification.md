@@ -26,10 +26,11 @@ verification while the first is running. If Codex returns a session ID,
 wait on that session with write_stdin until it exits. If piping output, use `set -o pipefail`.
 After a failure, rerun the failing phase (`sources`, `axioms`, `module-system`, `style`,
 `environment` or `shim-expiry`) as needed; `lake build --iofail` is the build command. Repeat
-successful checks only if their inputs changed. Preserve unfinished work at the round deadline.
+successful checks only if their inputs changed. Push work when it is ready: anything unpushed is
+discarded when the round ends.
 
-If verification reports resource exhaustion or exits 75, stop retrying in this round. Preserve
-your changes; the worker will retain them and retry with backoff. Do not edit mathematics to
+If verification reports resource exhaustion or exits 75, stop retrying in this round; the worker
+retries with backoff. Do not edit mathematics to
 fix host resource failures, and never describe deferred verification as green.
 
 In your report quote the `scope:` and `local-axioms:` results and describe the verification as

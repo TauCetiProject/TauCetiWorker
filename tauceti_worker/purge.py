@@ -86,7 +86,7 @@ def inventory(include_config=False):
         with contextlib.suppress(Exception):
             delete.append(workers_runtime_dir())
     if not os.environ.get("TAUCETI_VERIFY_STORAGE_DIR"):
-        # verification_storage.root()'s default, which ignores XDG_STATE_HOME and macOS's location.
+        # The legacy verification-checkpoint ledger's default location (ignores XDG_STATE_HOME and macOS's location).
         delete.append(home / ".local" / "state" / "tauceti" / "verification-storage")
     overridden += [f"{name}={os.environ[name]}" for name in OVERRIDES if os.environ.get(name)]
     if include_config:

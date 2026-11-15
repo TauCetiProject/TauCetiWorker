@@ -65,8 +65,9 @@ replacing the operator’s Lake service configuration for that invocation. The p
 service stays configured throughout the agent invocation; after changing Git history, dependencies or
 repairing a malformed workspace, the agent is instructed to fetch both caches again.
 
-Host downloads retry once, with one twenty-minute deadline for the entire
-bootstrap. A transport, publication or partial-download failure stops the round
+Host downloads retry once. They have no wall-clock deadline of their own: Lake's HTTP timeouts
+cover a hung connection, waits for another round's cache entry last until that round releases it,
+and only the round's hard cap (`TAUCETI_ROUND_TIMEOUT`) bounds the bootstrap. A transport, publication or partial-download failure stops the round
 before the agent starts and never consumes a PR's attempt budget or its bounded
 provider-refund allowance. Missing published main outputs also stop the round
 rather than compiling the whole library. Workspace, dependency revision and invalid-toolchain errors reach the

@@ -72,14 +72,6 @@ class Resources(unittest.TestCase):
         )
         self.assertIsNone(result)
 
-    def test_recovery_preserves_queue_owned_source_without_starting_verification(self):
-        from tauceti_worker.repair_recovery import Block, WorkerBackend
-
-        backend = WorkerBackend(self.worker, SimpleNamespace())
-        with self.assertRaises(Block) as caught:
-            backend.policy({}, {"state": "OPEN", "labels": ["bors-staging"]})
-        self.assertEqual(caught.exception.code, "queue-owned")
-
     def test_native_verifier_applies_defaults_to_actual_child_without_mutating_parent(self):
         from tauceti_worker.verification import Verification
 

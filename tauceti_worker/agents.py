@@ -555,12 +555,10 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "For diagnosis, use `--stage build|axioms|module-system|lint|shim-expiry`; final verification uses all stages. "
         "Exact-input phase receipts avoid repeated successful work; use `--no-reuse` only to investigate evidence. "
         "Foreground verification may use the remaining round budget; do not impose a ten-minute timeout. "
-        "If an interrupted helper hands verification to a supervisor continuation, let it finish there. "
         "If Codex returns an execution session ID, keep waiting on that same session with write_stdin until it exits. "
         "Write diagnostic logs and module lists outside the checkout (the helper already keeps logs in worker state). "
-        "A failed/incomplete receipt is never green. Keep unfinished edits recoverable at the round deadline. "
-        "On disk-pressure, preserve edits; a pending result with a continuation job belongs to the supervisor. "
-        "An incomplete result without a continuation needs a later invocation in the preserved workspace; do not spin on unchanged checks. "
+        "A failed/incomplete receipt is never green; do not spin on unchanged checks. "
+        "Push work when it is ready: anything unpushed is discarded when the round ends. "
         "Do not background tools or wait with `pgrep`, and do not expect a background job to notify or resume you. "
         "Do not run the old scope recipe, raw final audit/lint commands or `scripts/lint-scope.sh` alongside the helper. "
         "If piping diagnostic commands, use `set -o pipefail`. In your report quote the `scope:` line, "
@@ -711,47 +709,57 @@ def repair_origin(co: Path) -> bool:
     return subprocess.run(["git", "-C", str(co), "remote", "add", "origin", checkout_url()]).returncode == 0
 
 
+def discard_checkout(path: Path, why: str) -> bool:
+    """Delete a checkout that cannot be reset in place; anything unpushed in it is abandoned.
+
+    Deletion goes through ``retention.remove``: never through a symlink, never a mount point, and
+    never a tree a live process still uses (that is reported and retried next round)."""
+    from . import retention
+
+    report = retention.fresh_report()
+    try:
+        # Anchored one level up, so a symlinked parent directory is refused like any other link.
+        retention.remove(path, path.parent.parent, report, check_users=True)
+    except OSError as error:
+        retention.note(report, "errors", f"{path}: {error}")
+    for error in report["errors"]:
+        log(f"checkout: deletion deferred: {error}")
+    if path.exists() or path.is_symlink():
+        log(f"checkout: could not delete {path} ({why}); retrying next round")
+        return False
+    log(f"checkout: deleted {path} ({why})")
+    return True
+
+
 def prepare_checkout(
     cfg: Config, *, work: str | None = None, pr: int | None = None, roadmap: str | None = None
 ) -> bool:
     """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover.
 
-    Leftovers are only dropped after `work_recovery.guard` saves them in a durable recovery record.
-    If the checkout cannot be reset safely (a process still uses it, or saving fails), the guard
-    moves it aside whole and this clones a fresh one, so preparation never waits for a human.
-    `work`/`pr`/`roadmap` name the round that takes the checkout, so a later record can say which
-    round left the source."""
-    from . import work_recovery
-
+    Rounds are all-or-nothing: whatever an earlier round pushed is on the remote, and anything it
+    left unpushed in the checkout is discarded here. A checkout that cannot be reset in place (no
+    git metadata, a failed forced checkout) is deleted and cloned afresh.
+    `work`/`pr`/`roadmap` name the round that takes the checkout (unused; kept for callers)."""
     sync_mathlib_pool(cfg)
     co = cfg.checkout
     from . import round_worktrees
+    from .live_use import checkout_kind
 
     if round_worktrees.enabled():
-        try:
-            work_recovery.detach_handoff_owner(cfg)
-        except OSError as error:
-            log(f"checkout ownership detach deferred: {error}")
-            return False
         if not round_worktrees.prepare(cfg, checkout_url()):
             return False
-        return _finish_checkout(cfg, co, work=work, pr=pr, roadmap=roadmap)
+        return _finish_checkout(cfg, co)
     if not round_worktrees.retire(cfg):
         return False
 
     def clone(why: str) -> bool:
         co.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            work_recovery.detach_handoff_owner(cfg)
-        except OSError as error:
-            log(f"checkout ownership detach deferred: {error}")
-            return False
         log(f"cloning {TAUCETI} → {co} ({why})")
         return subprocess.run(["git", "clone", "-q", checkout_url(), str(co)]).returncode == 0
 
-    if co.exists() and work_recovery.checkout_kind(co) is None:
+    if co.exists() and checkout_kind(co) is None:
         # An interrupted clone (or anything else without git metadata) would fail every round.
-        if not work_recovery.retain(cfg, co, "the checkout has no git metadata").ok:
+        if not discard_checkout(co, "the checkout has no git metadata"):
             return False
     if not (co / ".git").exists() and not clone("first run"):
         return False
@@ -760,55 +768,27 @@ def prepare_checkout(
     def g(*a) -> int:
         return subprocess.run(["git", "-C", str(co), *a]).returncode
 
-    # Before the fetch, so damaged metadata fails inspection and is moved aside rather than failing
-    # every round; a stale view of the remote only makes the guard save more.
-    decision = work_recovery.guard(cfg, co)
-    if not decision.ok:
-        log(f"checkout preparation refused: {decision.reason}")
-        return False
-    if decision.state == "retained" and not clone("previous checkout moved aside"):
-        return False
     if not repair_origin(co):
         log("checkout preparation refused: could not restore the canonical origin remote")
         return False
     if g("fetch", "-q", "origin"):
         return False  # usually the network; the next round retries
-    try:
-        work_recovery.detach_handoff_owner(cfg)
-    except OSError as error:
-        log(f"checkout ownership detach deferred: {error}")
-        return False
-    # -f discards a prior round's leftover edits (now saved) and lands us on main in one step; a plain
+    base = os.environ.get("TAUCETI_BASE_BRANCH", "main")
+    # -f discards a prior round's leftover edits and lands us on main in one step; a plain
     # switch/checkout would refuse on a dirty tree (two noisy errors) and could leave HEAD on the old
-    # branch with only main's content. A local failure (a stale index.lock, a damaged worktree) moves
-    # the checkout aside and starts again from a fresh clone instead of failing every round.
-    if g(
-        "checkout",
-        "-q",
-        "-f",
-        "-B",
-        os.environ.get("TAUCETI_BASE_BRANCH", "main"),
-        "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main"),
-    ):
-        if not work_recovery.retain(cfg, co, "forced checkout of main failed").ok:
+    # branch with only main's content. A local failure (a stale index.lock, a damaged worktree)
+    # deletes the checkout and starts again from a fresh clone instead of failing every round.
+    if g("checkout", "-q", "-f", "-B", base, "origin/" + base):
+        if not discard_checkout(co, "forced checkout of main failed"):
             return False
-        if not clone("forced checkout failed") or g(
-            "checkout",
-            "-q",
-            "-f",
-            "-B",
-            os.environ.get("TAUCETI_BASE_BRANCH", "main"),
-            "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main"),
-        ):
+        if not clone("forced checkout failed") or g("checkout", "-q", "-f", "-B", base, "origin/" + base):
             return False
     g("clean", "-fdxq", "-e", ".lake")
-    return _finish_checkout(cfg, co, work=work, pr=pr, roadmap=roadmap)
+    return _finish_checkout(cfg, co)
 
 
-def _finish_checkout(cfg: Config, co: Path, *, work, pr, roadmap) -> bool:
+def _finish_checkout(cfg: Config, co: Path) -> bool:
     """Shared tail of checkout preparation, once HEAD is canonical main."""
-    from . import work_recovery
-
     # Origin was validated and fetched above, and HEAD is now its main commit.
     # Carry that exact base into verification rather than asking the standalone
     # verifier to rediscover a canonical remote (which defaults to GitHub).
@@ -822,8 +802,6 @@ def _finish_checkout(cfg: Config, co: Path, *, work, pr, roadmap) -> bool:
     # Compare canonical main, rather than an arbitrary PR branch, and retire old-toolchain artifacts
     # before anything can begin writing this worker's private Lake store again.
     clean_lake_cache_after_toolchain_bump(cfg)
-    # Attribution only: a failure is logged by note_owner and never stops the round.
-    work_recovery.note_owner(cfg, work=work, pr=pr, roadmap=roadmap)
     return True
 
 
@@ -1032,11 +1010,7 @@ def run_agent_host(
             argv += [resume, "-" if stdin_text is not None else prompt]
         elif profile.provider == "claude":
             argv += ["--resume", resume]
-    if env.get("TAUCETI_RECOVERY_CONTINUATION") == "1":
-        env.pop("GH_TOKEN", None)
-        env.pop("GITHUB_TOKEN", None)
     if session_path:
-        from .repair_recovery import conversation_identity
         from .runtime_status import atomic_json
 
         try:
@@ -1045,14 +1019,13 @@ def run_agent_host(
                 dict(
                     profile=asdict(profile),
                     actor=session_actor,
-                    identity=conversation_identity(profile.provider),
                     scope=session_scope,
                     session=resume,
                     cwd=str(cwd),
                 ),
             )
         except OSError as error:
-            log(f"provider session identity could not be saved: {error}; starting without resumable identity")
+            log(f"provider session record could not be saved: {error}; follow-up turns start afresh")
             session_path = None
     if not env.get("TAUCETI_VERIFY_BASE") and (cwd / ".git").exists():
         from .verification_scope import local_main
@@ -1366,8 +1339,8 @@ def run_agent_proc(
                             else None
                         )
                         if session:
+                            from .live_use import fsync_dir as _fsync_dir
                             from .runtime_status import atomic_json, read_json
-                            from .work_recovery import _fsync_dir
 
                             value = read_json(session_path)
                             value["session"] = session
@@ -1376,7 +1349,7 @@ def run_agent_proc(
                     except (ValueError, AttributeError):
                         pass
                     except OSError as error:
-                        log(f"provider session identity could not be saved: {error}; source remains recoverable")
+                        log(f"provider session record could not be saved: {error}")
                 rendered = renderer.render_line(line)
                 if rendered:
                     write_rendered(destination, rendered)
@@ -1560,7 +1533,6 @@ class AgentLaunchUnavailable(BuildCacheUnavailable):
     """A process creation failure before the agent existed."""
 
 
-HOST_CACHE_TIMEOUT = 1200
 _LAKE_FALSE = {"0", "false", "no", "off", "n", "f"}
 
 
@@ -1720,7 +1692,7 @@ def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None
         warm_host_build_caches(cwd, warm_env, logdir, report=report)
 
 
-def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float) -> int:
+def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float | None) -> int:
     """Bind the downloader process group to the worker, including after parent SIGKILL.
 
     The pipe guardian retains the snapshot lease and kills its process group if
@@ -1774,7 +1746,8 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
 
     Genuine workspace errors must reach repair agents. Transport, publication and partial-download
     failures stop before an agent starts. Lake verifies and atomically installs artifacts, so retries
-    retain successful downloads. All fetches together have one twenty-minute deadline.
+    retain successful downloads. Fetches have no wall-clock deadline of their own: Lake's HTTP
+    timeouts cover a hung connection, and the round's hard cap (TAUCETI_ROUND_TIMEOUT) the rest.
     """
     from . import shared_mathlib
 
@@ -1783,7 +1756,6 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
     has_mathlib = shared_mathlib._names_mathlib(cwd)
     logdir.mkdir(parents=True, exist_ok=True)
     logf = logdir / f"build-cache-{time.strftime('%Y%m%d-%H%M%S')}.log"
-    deadline = time.monotonic() + HOST_CACHE_TIMEOUT
     log(f"host build caches: warming Mathlib and TauCeti; output → {logf}")
 
     def unavailable(reason: str):
@@ -1794,9 +1766,6 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
 
     def fetch(label: str, command: list[str]) -> str:
         for attempt in range(1, 3):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                unavailable("build cache preparation deadline exceeded")
             with logf.open("ab") as output:
                 offset = output.tell()
                 output.write(f"{label} cache, attempt {attempt}: {' '.join(command)}\n".encode())
@@ -1805,7 +1774,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
                     from .expanded_cache import measured
 
                     with measured(report, label.lower().replace(" ", "_") + "_fetch"):
-                        rc = _cache_fetch([*prefix, *command], cwd, env, output, remaining)
+                        rc = _cache_fetch([*prefix, *command], cwd, env, output, None)
                 except (OSError, subprocess.TimeoutExpired) as e:
                     output.write(f"cache command failed: {e}\n".encode())
                     rc = 1
@@ -1889,7 +1858,6 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
         and mathlib_private != home
         and (mathlib_pool.parent / "owner.json").is_file()
         and time.time() - read_json(marker).get("at", 0) > 86400
-        and deadline - time.monotonic() > 60
     ):
         try:
             # Failed housekeeping retries in an hour, never on every paid round.
@@ -1900,7 +1868,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
                     cwd,
                     env,
                     output,
-                    max(1, min(30, deadline - time.monotonic())),
+                    30,  # housekeeping only; a slow clean is retried in an hour
                 )
             if rc == 0:
                 build_caches.link_into(mathlib_private, mathlib_pool)
@@ -2384,9 +2352,7 @@ def bubble_work_cmd(inner: str, *, verify_helper=False) -> str:
     library from source, every round, for as long as the endpoint stayed down.
     """
     preliminary = (
-        '"$TAUCETI_VERIFY_PYTHON" "/opt/round/tauceti-verify" --stage build'
-        if verify_helper
-        else "timeout 1800 lake build"
+        '"$TAUCETI_VERIFY_PYTHON" "/opt/round/tauceti-verify" --stage build' if verify_helper else "lake build"
     )
     started = f"echo '{AGENT_STARTING}'"
     if not TAUCETI_CACHE_SERVICE:
@@ -2546,7 +2512,6 @@ def run_in_bubble(
     local_lint_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     if helper_on:
         from .verification import cache_root
-        from .verification_storage import root as storage_root
 
         package = rounddir / "tauceti_worker"
         shutil.copytree(
@@ -2558,8 +2523,6 @@ def run_in_bubble(
         (rounddir / "tauceti-verify").chmod(0o755)
         verify_state = cfg.state / "verification-state"
         verify_state.mkdir(parents=True, exist_ok=True)
-        verify_storage = storage_root().resolve()
-        verify_storage.mkdir(parents=True, exist_ok=True, mode=0o700)
         host_cache = None
         with contextlib.suppress(OSError, ValueError):
             host_cache = cache_root()
@@ -2586,8 +2549,6 @@ def run_in_bubble(
         mount_flags += [
             "--mount",
             f"{verify_state}:/opt/verification-state:rw",
-            "--mount",
-            f"{verify_storage}:{verify_storage}:rw",
         ]
         if host_cache is not None:
             mount_flags += ["--mount", f"{host_cache}:/opt/verification-cache:rw"]
@@ -2687,30 +2648,13 @@ def run_in_bubble(
         for key, value in {
             "TAUCETI_VERIFY_STATE": "/opt/verification-state",
             "TAUCETI_VERIFY_HOST_STATE": str(verify_state.resolve()),
-            "TAUCETI_VERIFY_STORAGE_DIR": str(verify_storage),
             "TAUCETI_VERIFY_CACHE_DIR": "/opt/verification-cache"
             if host_cache is not None
             else "/tmp/verification-cache",
             "TAUCETI_VERIFY_POLICY": os.environ.get("TAUCETI_VERIFY_POLICY", "ordinary"),
-            "TAUCETI_ROUND_DEADLINE": str(getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)),
-            "TAUCETI_VERIFY_CHECKPOINT_MARGIN": os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600"),
             "TAUCETI_VERIFY_BUBBLE": "1",
         }.items():
             tcenv += f" {key}={shlex.quote(value)}"
-        for name in (
-            "STORAGE_BYTES",
-            "CANDIDATE_BYTES",
-            "SOURCE_CANDIDATE_BYTES",
-            "CHECKPOINT_BYTES",
-            "CHECKPOINT_POOL_BYTES",
-            "MIN_FREE_BYTES",
-            "MIN_FREE_PERCENT",
-            "OWNERSHIP_SECONDS",
-            "COMPLETED_CACHE_SECONDS",
-            "IDLE_CACHE_SECONDS",
-        ):
-            if value := os.environ.get("TAUCETI_VERIFY_" + name):
-                tcenv += f" TAUCETI_VERIFY_{name}={shlex.quote(value)}"
     if snapshot:
         tcenv += " TAUCETI_CONF=/opt/project.toml TAUCETI_CONF_SOURCE=/opt/project.toml TAUCETI_CONF_SNAPSHOT=/opt/project.toml"
         from tauceti_tools.project import active
@@ -2903,7 +2847,7 @@ _REVIEW_SOURCE_STAGING = ".tauceti-source-staging.json"
 
 def _prune_review_mathlib_staging(base):
     """Only marked, unlocked temporary producers; published Bubble mounts stay alone."""
-    from . import retention, work_recovery
+    from . import live_use, retention
 
     try:
         candidates = list(base.glob("mathlib-src-tmp-*"))
@@ -2931,9 +2875,9 @@ def _prune_review_mathlib_staging(base):
                         continue
                 original = path.stat()
                 if observations is None:
-                    observations = work_recovery.process_references(), retention.mount_points()
+                    observations = live_use.process_references(), retention.mount_points()
                 references, mounts = observations
-                if work_recovery.referenced_users(path, references) or mounts is None:
+                if live_use.referenced_users(path, references) or mounts is None:
                     continue
                 current = path.stat()
                 if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
