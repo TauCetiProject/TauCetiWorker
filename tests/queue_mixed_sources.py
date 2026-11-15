@@ -612,6 +612,18 @@ class MixedExecution(MixedFixture, unittest.TestCase):
             self.ci.verify_promotion(frozen.attempt_id, self.controller._members(1), self.controller.source)
         self.assertFalse(any(name == "publish_source_verdicts" for name, _ in self.github.calls))
 
+    def test_status_publication_outage_retries_same_green_candidate(self):
+        frozen = self.start_mixed()
+        self.execution.add(frozen, classification="passed")
+        self.github.fail_next["publish_source_verdicts"] = 1
+        self.clock.advance(60)
+        self.controller.tick()
+        self.assertNotEqual(self.repo.main_sha(), frozen.request.head)
+        self.clock.advance(60)
+        self.controller.tick()
+        self.assertEqual(self.repo.main_sha(), frozen.request.head, self.controller._reasons)
+        self.assertEqual(self.execution.dispatches, [frozen])
+
     def test_admission_pause_keeps_accepted_waiting_inputs_and_lands_running_mixed_work(self):
         # Accept an input before pausing, including its pre-batch waiting state.
         native = self.native.create_pr(17, {"Native.lean": "native\n"})
