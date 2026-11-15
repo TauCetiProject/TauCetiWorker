@@ -610,10 +610,10 @@ ci="one/project"
         self.assertEqual(counters.read("review-err-1"), 0)
         self.assertTrue(counters.unchanged_review_recent(1, "a" * 40))
 
-    def test_native_recovery_runs_without_provider_admission(self):
+    def test_native_review_publication_runs_without_provider_admission(self):
         import contextlib
 
-        from tauceti_worker.multi_source import recover_native
+        from tauceti_worker.multi_source import publish_native_reviews
 
         with (
             patch("tauceti_worker.multi_source.native_source", return_value=self.source),
@@ -623,7 +623,7 @@ ci="one/project"
             patch("tauceti_worker.cli.resolve_work_model", side_effect=AssertionError("provider admission")),
         ):
             self.source.anonymous_discovery = False
-            self.assertTrue(recover_native(self.cfg, None, SimpleNamespace()))
+            self.assertTrue(publish_native_reviews(self.cfg))
             pending.assert_called_once()
 
     def test_native_execution_failure_does_not_invalidate_github_authoring_inventory(self):
@@ -764,9 +764,6 @@ ci="one/project"
                     patch("tauceti_worker.loop.run_round_subprocess", side_effect=KeyboardInterrupt) as launch,
                     patch("tauceti_worker.loop.github_budget", return_value={}),
                     patch("tauceti_worker.loop.fleet_admission_reason", return_value=None),
-                    patch("tauceti_worker.verification_jobs.resume_pending"),
-                    patch("tauceti_worker.verification_jobs.reap_continuations"),
-                    patch("tauceti_worker.repair_recovery.due", return_value=False),
                 ):
                     cmd_loop(args, self.cfg, only=["review"], agent="deepseek")
                 child = build_parser().parse_args(["_round", *launch.call_args.args[0]])
@@ -863,7 +860,7 @@ ci="one/project"
         self.assertTrue(work.is_dir())
         self.assertEqual(json.loads(receipt.read_text())["threads"][0]["body"], "paid finding")
         receipt.write_text(json.dumps(dict(state="published")))
-        with patch("tauceti_worker.work_recovery.live_users", return_value=[]):
+        with patch("tauceti_worker.live_use.live_users", return_value=[]):
             collect_review_scratch(self.cfg, fresh_report())
         self.assertFalse(work.exists())
 
@@ -876,18 +873,18 @@ ci="one/project"
         (work / "review-context.json").write_text(
             json.dumps({"source": self.identity.record(), "store": str(self.cfg.store), "pr": 1, "process": {"pid": 7}})
         )
-        with patch("tauceti_worker.work_recovery.owner_stopped", return_value=False):
+        with patch("tauceti_worker.live_use.owner_stopped", return_value=False):
             self.assertFalse(pending(self.source, self.cfg))
             self.assertTrue(work.exists())
         with (
-            patch("tauceti_worker.work_recovery.owner_stopped", return_value=True),
-            patch("tauceti_worker.work_recovery.live_users", return_value=["active reviewer"]),
+            patch("tauceti_worker.live_use.owner_stopped", return_value=True),
+            patch("tauceti_worker.live_use.live_users", return_value=["active reviewer"]),
         ):
             self.assertFalse(pending(self.source, self.cfg))
             self.assertTrue(work.exists())
         with (
-            patch("tauceti_worker.work_recovery.owner_stopped", return_value=True),
-            patch("tauceti_worker.work_recovery.live_users", return_value=[]),
+            patch("tauceti_worker.live_use.owner_stopped", return_value=True),
+            patch("tauceti_worker.live_use.live_users", return_value=[]),
         ):
             self.assertFalse(pending(self.source, self.cfg))
             self.assertFalse(work.exists())

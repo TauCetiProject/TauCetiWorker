@@ -33,13 +33,12 @@ uv run python -m tauceti_queue.repair_task --service https://queue.example [--on
     [--providers claude,codex,api] [--rate T:B[,T:B...]] [--parallel-agents N]
 ```
 
-Without `--once` the runner is the long-running worker (`serve`): resume checkpointed tasks, claim,
+Without `--once` the runner is the long-running worker (`serve`): retry pending deliveries, claim,
 run, submit, report the provider outcome to `POST /tasks/inference` (a success lifts the service's
 inference hold; a release for `inference_unavailable` counts toward it), sleep `--poll` seconds when
 nothing is claimable, and log and retry rather than exit when a task, the service or the
-authorization check fails. SIGTERM and SIGINT stop a running agent and record the task as
-`interrupted` with its claim and worktree kept; the next start resumes the session
-(`resume_pending`). It writes a heartbeat to `<root>/worker.json`. `--check` prints the host checks
+authorization check fails. SIGTERM and SIGINT stop a running agent, abandon the attempt and
+release the claim as `worker-stopped`. It writes a heartbeat to `<root>/worker.json`. `--check` prints the host checks
 (tools, token source, repository admin, service, clone, Claude credentials, build sandbox, free
 disk) and exits.
 `--service`, `--worker`, `--clone`, `--poll`, `--seed-packages`, `--providers` and `--rate` default to
@@ -427,8 +426,7 @@ the build under `stream_build`. When worker verification is enabled, the agent r
 checks and the worker runs the final full verification. Other configurations retain the agent's
 whole-library `lake build --iofail` verdict. A build still running when the task ends or is interrupted is stopped and
 its lock removed. Rebase-conflict and pre-rebase tasks fetch caches and go directly to the agent,
-which finishes the replay before building the resulting chain. Resumed tasks continue their agent
-session. For repairs without known audit/lint findings, `--no-stream-repair` keeps the sequential
+which finishes the replay before building the resulting chain. For repairs without known audit/lint findings, `--no-stream-repair` keeps the sequential
 flow: the preparation's own incremental build, then the agent.
 
 **Preparing an open batch** (`kind: "prepare"`; `docs/queue/controller.md`, "Background
@@ -576,8 +574,8 @@ there. Every group's status, timing, worktree and agent record, the fold, the ve
 the lock wait are in the outcome's `parallel` record and in the checkpoint (state `agent_running`,
 label `parallel`), with each group's job, prompt, checkpoint and result under
 `tasks/<id>/groups/<name>/` and its agent logs under `tasks/<id>/logs/<name>/`. A stop or lost claim
-during the parallel phase terminates every group's child, which stops its agent; a resumed task
-restarts sequentially from the tip.
+during the parallel phase terminates every group's child, which stops its agent, and the task is
+abandoned.
 
 ## Inference unavailability
 
@@ -621,7 +619,7 @@ credential, their session and weekly windows against the pacing curve) reports i
 `RunnerConfig.rate` (`TAUCETI_QUEUE_RATE` / `--rate`, the worker's `--pace` spec) as that curve. The
 read spends nothing and rotates no token. A subscription over its pace, with no credential, or with an
 unreadable usage response is skipped with the pacer's reason logged; the `api` provider is skipped
-without a key. A resumed session's provider is not re-checked: the work was admitted when it started.
+without a key.
 
 The eligible providers are tried in order (`run_repair_agent`). One that fails to launch, or exits
 before doing any work with a refusal (`prework_failure`: for Claude a `rate_limit_event` status other
@@ -633,31 +631,29 @@ the task's, as before. When the whole chain fails before any work the pass is re
 `inference_delays` up to `inference_attempts` times and the task released as `inference_unavailable`
 (as `agent_launch_failed` when no provider's process could start at all). Every provider tried or
 skipped is recorded in the run's `provider_attempts` (`provider`, `status` `ran` / `skipped` / `failed`,
-`reason`, `seconds`), the run's `provider` names the one whose agent ran, the checkpoint records it for
-resumption, and `worker.json` counts them per provider (`providers`) and repeats the last task's list
+`reason`, `seconds`), the run's `provider` names the one whose agent ran, the task record notes it,
+and `worker.json` counts them per provider (`providers`) and repeats the last task's list
 (`last_outcome.provider_attempts`).
 
-## Recovery
+## Stopped and abandoned tasks
 
-The checkpoint `tasks/<id>/task.json` (written with `runtime_status.atomic_json`, the style of
-`repair_recovery.py`'s journal) records the task, the claim token and expiry, the current phase and
-a history of phases; `session.json` records the provider session. On start, `resume_pending`
-looks for checkpoints in `agent_running`, renews their claim, and when the claim is still the
-worker's resumes the same model session in the same worktree with a short continuation prefix on the
-original prompt, skipping source and artifact preparation. A claim the service no longer recognises
-is recorded as `claim_lost` and not resumed. Bookkeeping loss therefore never restarts a model
-session while the claim is live, and a lost claim never produces a late submission.
+Tasks are all-or-nothing. The task record `tasks/<id>/task.json` (written with
+`runtime_status.atomic_json`) records the task, the claim token and expiry, the current phase and a
+history of phases; `session.json` records the provider session for follow-up turns within the same
+run (the explanation turn). Nothing continues a model session across runs.
 
-A claim never outlives the worker that holds it. On SIGTERM with the agent running, the claim is
-renewed and the task checkpointed as `interrupted` for the next start to resume; a stop before the
-agent ran (fetching sources, preparing artifacts) releases the claim with reason `worker-stopped`
-so the service re-exposes the task at once, and the log says which. On start, every checkpoint of
-this worker still in flight (`claimed`, `sources_ready`, `artifacts_ready`, `artifacts_unavailable`,
-`agent_running`, `validated`, `pushed`, `submitted`, `interrupted`) has its claim renewed: a
-resumable one (`agent_running`, `interrupted`) continues, any other is released as `worker-stopped`
-and the task claimed fresh. When a claim comes back empty while such a checkpoint of ours holds a
-live claim (the service refused the claim for concurrency because of it), the stale claim is
-released with its token and the claim retried at once rather than at the next poll.
+A claim never outlives the worker that holds it. On SIGTERM, at any phase before the result is
+validated, the attempt is abandoned and the claim released with reason `worker-stopped` so the
+service re-exposes the task at once; the worktree is removed. On start (`retry_deliveries`), every
+record of this worker still in flight (`claimed`, `sources_ready`, `artifacts_ready`,
+`artifacts_unavailable`, `agent_running`, `validated`, and `interrupted` from older releases) has its
+claim renewed and then released as `worker-stopped`, its worktree removed. Only a validated result
+whose delivery was under way (`delivery_pending`, `pushed`, `submitted`) is delivered again: the push
+to the submission ref and the `result` call are retried while the claim is live, and a claim the
+service no longer recognises is recorded as `claim_lost`, so a lost claim never produces a late
+submission. When a claim comes back empty while such a record of ours holds a live claim (the
+service refused the claim for concurrency because of it), the stale claim is released with its
+token and the claim retried at once rather than at the next poll.
 
 A task that ends in an error releases its claim (`artifacts_unavailable` before the agent ran,
 `agent_failed` after) so the service re-exposes it at once rather than at the claim's expiry. When
@@ -680,12 +676,12 @@ fetches. Each retry attempt fetches only the refs the earlier attempts did not g
 
 The runner is importable: `RunnerConfig` (service, clone, root, worker identity, profile and the
 bounds above), `make_client`, `AdminCheck`, `claim_and_run(cfg, client, admin)` for one claim and
-run, `resume_pending(cfg, client)` for checkpointed tasks. Integrating it as a work unit in
+run, `retry_deliveries(cfg, client)` for pending deliveries and abandoned claims. Integrating it as a work unit in
 `tauceti_worker/work_units.py` needs:
 
 - a unit that calls `agents.prepare_checkout` for the content checkout, builds a `RunnerConfig`
   with `clone=cfg.checkout`, `root=$TAUCETI_ACTIVITY_DIR/queue-repair` and the round's authoring
-  profile, and runs `resume_pending` then `claim_and_run`; `None` from `claim_and_run` means nothing
+  profile, and runs `retry_deliveries` then `claim_and_run`; `None` from `claim_and_run` means nothing
   was claimable and the unit made no progress;
 - the service URL and the token source as worker configuration (`TAUCETI_QUEUE_SERVICE`,
   `TAUCETI_QUEUE_TOKEN`);
@@ -717,7 +713,7 @@ the same session, a terminal rejection, a superseded claim at submission, a loca
 retried with the local report, the local explanation follow-up turn, artifacts unavailable with and
 without a `release` route, inference unavailable after bounded retries, an ordinary agent failure
 and the worker's attempt cap released as `agent_failed`, a second claimant and a stale token refused,
-resumption of a checkpointed session, the task record and prompt for a rebase conflict, the
+abandonment of a stopped task, the task record and prompt for a rebase conflict, the
 provider chain (the same stub installed as `codex`: chain order, a subscription over pace or
 unmeasurable skipped, a launch failure or a refusal before any work handed to the next provider, the
 `api` provider's key and credential-free config dir, the attempts in the outcome and the heartbeat, and

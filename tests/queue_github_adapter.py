@@ -777,7 +777,7 @@ class Adapter(unittest.TestCase):
             "jobs": [
                 {
                     "id": 70,
-                    "name": "sandboxed-build",
+                    "name": "candidate / sandboxed-build",
                     "runner_name": "h7",
                     "labels": [],
                     "status": "completed",

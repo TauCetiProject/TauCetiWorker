@@ -17,17 +17,124 @@ from pathlib import Path
 
 _pkg = Path(__file__).resolve().parent  # …/tauceti_worker
 HERE = _pkg if (_pkg / "prompts").is_dir() else _pkg.parent
+INSTALLED = HERE == _pkg  # a wheel (uv tool, pip, Fleet runtime), not a source checkout
+
+
+def login_home() -> Path:
+    """The account's home from the password database. Worker isolation changes $HOME."""
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        return Path(os.path.expanduser("~"))
+
+
+def user_data_root() -> Path:
+    """Per-user worker data for installed packages, outside the replaceable install.
+
+    Anchored at the login home, never $HOME: an isolated worker runs with $HOME inside its own
+    state, and must keep selecting the root that holds that state."""
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg and Path(xdg).expanduser().is_absolute():  # the spec ignores relative values
+        return Path(xdg).expanduser() / "tauceti"
+    if sys.platform == "darwin":
+        return login_home() / "Library" / "Application Support" / "tauceti" / "data"
+    return login_home() / ".local" / "share" / "tauceti"
+
+
+def held_lock_files() -> set[tuple[int, int]] | None:
+    """(st_dev, st_ino) of files that are locked (Linux) or open (macOS) right now, or None.
+
+    Observed without taking any lock: probing with flock could make an older worker's own
+    exclusive acquisition fail, and an unmanaged loop then runs without its slot reservation."""
+    import re
+
+    try:
+        text = Path("/proc/locks").read_text()
+    except OSError:
+        text = None
+    if text is not None:
+        held = set()
+        for line in text.splitlines():
+            if "->" in line:
+                continue  # a waiter, not a holder
+            for token in line.split():
+                if match := re.fullmatch(r"([0-9a-f]+):([0-9a-f]+):(\d+)", token):
+                    held.add((os.makedev(int(match[1], 16), int(match[2], 16)), int(match[3])))
+        return held
+    if sys.platform != "darwin":
+        return None
+    try:
+        import psutil
+    except ImportError:
+        return None
+    held = set()
+    for process in psutil.process_iter():
+        try:
+            if process.uids().real != os.getuid():
+                continue
+            files = process.open_files()
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error:
+            continue  # system agents; worker processes are always inspectable
+        for item in files:
+            try:
+                info = os.stat(item.path)
+            except OSError:
+                continue
+            held.add((info.st_dev, info.st_ino))
+    return held
+
+
+def _older_generation_live(root: Path) -> bool:
+    """Whether a worker or round of an earlier installation still holds a lock under ``root``.
+
+    Such a loop keeps its package-relative root until it exits, and the rounds it starts run the
+    upgraded code; they must keep using its root rather than split from it. Unknown counts as
+    live: the package directory then simply stays selected, as before this change."""
+    try:
+        locks = [*root.glob("state/*/instance.lock"), *root.glob("state/*/round.lock")]
+    except OSError:
+        return False
+    if not locks:
+        return False
+    held = held_lock_files()
+    if held is None:
+        return True
+    # On overlayfs, stat() can report a layer's device while /proc/locks reports the overlay's,
+    # so an inode number alone also counts; a false match only keeps the old root selected.
+    inodes = {ino for _dev, ino in held}
+    for lock in locks:
+        try:
+            info = lock.stat()
+        except OSError:
+            continue
+        if (info.st_dev, info.st_ino) in held or info.st_ino in inodes:
+            return True
+    return False
 
 
 def legacy_data_root(default: Path | None = None) -> Path:
-    """Keep existing worker data when changing the installed code revision.
+    """Where worker state/, checkouts/ and logs/ live.
 
-    Assets stay beside the code. An explicit data root is inherited by round,
-    verification and cleanup subprocesses, including isolated worker homes.
+    An explicit TAUCETI_LEGACY_DATA_ROOT wins and is inherited by round, verification and
+    cleanup subprocesses, including isolated worker homes. A source checkout keeps them beside
+    the code (gitignored). An installed package uses user_data_root(): data inside the package
+    directory was silently kept across `uv tool upgrade` yet destroyed by `--force` or
+    `uninstall`, and the collector deletes what earlier installations left there. The default
+    is resolved once per process and exported, so every descendant agrees on it.
     """
     raw = os.environ.get("TAUCETI_LEGACY_DATA_ROOT")
     if not raw:
-        return HERE if default is None else default
+        if default is not None and default != HERE:
+            return default
+        if not INSTALLED:
+            return HERE
+        root = HERE if _older_generation_live(HERE) else user_data_root()
+        os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(root)
+        return root
     root = Path(raw).expanduser()
     if not root.is_absolute():
         raise ValueError("TAUCETI_LEGACY_DATA_ROOT must be an absolute path")
