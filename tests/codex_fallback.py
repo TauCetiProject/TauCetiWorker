@@ -138,6 +138,22 @@ check(
     any("cli_auth_credentials_store" in a for a in calls[0][0]),
     False,
 )
+_, _, _, calls, _ = run(
+    [OK],
+    user_config='cli_auth_credentials_store = "file"\n',
+    project_config='cli_auth_credentials_store = "keyring"\n',
+)
+check(
+    "a user file setting under a project keyring store adds no override",
+    any("cli_auth_credentials_store" in a for a in calls[0][0]),
+    False,
+)
+_, _, _, calls, _ = run(
+    [OK],
+    user_config='cli_auth_credentials_store = "file"\n',
+    project_config='cli_auth_credentials_store = "file"\n',
+)
+check("a user file setting under a project file store keeps the override", STORE in calls[0][0], True)
 _, _, _, calls, _ = run([OK], user_config='cli_auth_credentials_store = "file; x"\n')
 check("an unknown value adds no override", any("cli_auth_credentials_store" in a for a in calls[0][0]), False)
 
