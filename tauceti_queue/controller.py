@@ -5020,6 +5020,44 @@ class Controller:
             ):
                 return {"retried": False, "reason": "request-identity-required"}
             if candidate_ci is not None:
+                hold_key = f"source-ci:promotion-hold:{current_attempt['id']}"
+                hold = self.store.get_setting(hold_key)
+                if hold:
+                    # Repair a refused promotion without discarding its exact
+                    # successful CI request or starting another expensive build.
+                    members = self._members(head["id"])
+                    try:
+                        with self._lock.unlocked():
+                            candidate_ci.verify_promotion(current_attempt["id"], members, self.source)
+                    except Exception as error:  # noqa: BLE001 - preserve the hold on any failed guard
+                        return {"retried": False, "reason": "promotion-refused", "error": type(error).__name__}
+                    if self.source_authority is not None:
+                        source_access = self._refresh_source_access(source_access, source_refresh)
+                    if (
+                        self._head() != head
+                        or self._current_attempt(head) != current_attempt
+                        or self._members(head["id"]) != members
+                        or self.store.get_setting(hold_key) != hold
+                    ):
+                        return {"retried": False, "reason": "head-changed"}
+                    with self.store.transaction():
+                        self.store.set_setting(hold_key, None)
+                        self.store.update(
+                            "ci_attempts",
+                            {"id": current_attempt["id"]},
+                            needs_observation=1,
+                            outcome_detail="promotion hold repaired; rechecking exact CI request",
+                        )
+                        self.store.journal(
+                            self.clock(),
+                            "retry-source-promotion",
+                            head["id"],
+                            actor=actor,
+                            attempt_id=current_attempt["id"],
+                            request_id=request_id,
+                        )
+                    self._wake.set()
+                    return {"retried": True, "promotion_only": True, "request_id": request_id}
                 prepared = current_attempt["dispatch_state"] == "prepared"
                 if prepared and current_attempt["outcome"] == OUTCOME_PENDING:
                     with self.store.transaction():
@@ -6087,7 +6125,8 @@ class Controller:
                 )
                 if outcome == OUTCOME_SOURCE_FAILURE:
                     values["diagnostics"] = dumps(
-                        list(run.diagnostics) or [
+                        list(run.diagnostics)
+                        or [
                             {
                                 "kind": "status",
                                 "module": "",

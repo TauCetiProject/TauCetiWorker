@@ -360,6 +360,27 @@ class SourceController(unittest.TestCase):
         self.assertEqual(self.store.row("outbox", {"kind": "promote"})["result"], "source-reconciliation-required")
         self.assertTrue(self.controller.status()["head"]["ci"]["reconciliation_required"])
 
+    def test_operator_resumes_repaired_promotion_with_same_successful_request(self):
+        attempt = self.start()
+        frozen = self.ledger.load(attempt["id"])
+        self.execution.add(frozen, classification="passed")
+        self.deny_approval = True
+        self.clock.advance(60)
+        self.controller.tick()
+
+        def retry(nonce):
+            return self.controller.retry_ci(PROJECT, "operator", request_id=nonce)
+
+        self.assertEqual(retry("0" * 32)["reason"], "request-identity-required")
+        self.assertEqual(retry(frozen.request.request_id)["reason"], "promotion-refused")
+        self.assertTrue(self.store.get_setting(f"source-ci:promotion-hold:{attempt['id']}"))
+        self.deny_approval = False
+        self.assertTrue(retry(frozen.request.request_id)["promotion_only"])
+        self.controller.tick()
+        self.assertEqual(self.repo.main_sha(), frozen.request.head, self.controller._reasons)
+        self.assertEqual(self.store.count("ci_attempts"), 1)
+        self.assertEqual(self.execution.dispatches, [frozen])
+
     def test_retryable_nonsend_reuses_frozen_request_and_preflights_before_retention(self):
         def unavailable(_frozen):
             raise DispatchNotAccepted("temporary preflight outage", retryable=True)
@@ -596,6 +617,7 @@ class SourceController(unittest.TestCase):
         self.clock.advance(60)
         self.controller.tick()
         import json
+
         task = self.store.rows("tasks", {"kind": "repair"})[-1]
         self.assertIn(finding, json.loads(task["diagnostics"]))
         self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "source-failure")

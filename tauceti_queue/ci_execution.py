@@ -315,11 +315,23 @@ class GitHubSourceExecution:
             # Logs are repair context only. The verified result above remains the
             # sole verdict/ownership authority, even if diagnostics are unavailable.
             try:
-                adapter = GitHubAdapter(GitHubClient(self.tokens, self.transport), frozen.policy.execution.repository.name)
+                adapter = GitHubAdapter(
+                    GitHubClient(self.tokens, self.transport), frozen.policy.execution.repository.name
+                )
                 details = adapter.read_run(frozen.policy.execution.repository.name, run_id, with_jobs=True)
-                if details is not None and (details.run_id, details.attempt, details.status) == (run.run_id, run.attempt, run.status):
-                    run = replace(run, diagnostics=details.diagnostics, phases=details.phases,
-                                  runner_name=details.runner_name, runner_labels=details.runner_labels, host=details.host)
+                if details is not None and (details.run_id, details.attempt, details.status) == (
+                    run.run_id,
+                    run.attempt,
+                    run.status,
+                ):
+                    run = replace(
+                        run,
+                        diagnostics=details.diagnostics,
+                        phases=details.phases,
+                        runner_name=details.runner_name,
+                        runner_labels=details.runner_labels,
+                        host=details.host,
+                    )
             except Exception:
                 pass  # Optional context cannot erase a verified failure or create a pass.
         return CandidateObservation(run, ownership, result, absent)
