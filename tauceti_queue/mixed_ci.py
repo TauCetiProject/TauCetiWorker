@@ -115,28 +115,9 @@ class MixedCandidateCI(SourceCandidateCI):
             number = member["number"]
             if isinstance(number, SourceNumber):
                 self.registry.check_native(number)
-                snapshot = self.registry.native.admission_snapshot(
-                    self.registry.profile.forgejo.repository.name, int(number)
-                )
-                decision, _, _, _, _ = self.registry.native.admission_policy.evaluate(snapshot)
             else:
                 self.registry.check_github()
-                snapshot = self.registry.github.admission_snapshot(self.registry.repository, int(number))
-                admission = self.controller.admission.github
-                if admission is None:
-                    raise PromotionRefused("mixed candidate needs the current GitHub admission policy")
-                decision, _, _, _, _ = admission.policy.evaluate(snapshot)
-            if (
-                snapshot.pull.head_sha != member["accepted_head"]
-                or snapshot.pull.state != "open"
-                or snapshot.pull.draft
-                or snapshot.pull.base_ref != self.controller.canonical_branch
-            ):
-                raise PromotionRefused("an original source head or target changed after candidate CI")
-            if (
-                self.controller._blocking_labels(snapshot.pull)
-                or not decision["review_safe"]
-                or decision.get("recovery_authority_hold")
-                or member["accepted_head"] in decision.get("recovery_heads", ())
-            ):
-                raise PromotionRefused("an original source review or hold no longer authorizes this candidate")
+        # Admission freezes the contribution, not the mutable original PR. Later
+        # pushes, closure and re-review belong to follow-up work. The frozen
+        # membership, exact CI result and current source/publication authority
+        # remain the landing guards (ai-merge-queue.md, "Staging membership").

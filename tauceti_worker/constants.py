@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import signal
 
 TAUCETI = os.environ.get("TAUCETI_REPO", "TauCetiProject/TauCeti")
 BASE_BRANCH = os.environ.get("TAUCETI_BASE_BRANCH", "main")
@@ -51,7 +52,7 @@ REVIEW_PROVIDER_DOWN_EXIT = 3
 # not recognise and every report wedges. Bump this together with the two pins in
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
 PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
-PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "f1bbda821ca37f509074e1e088fde673e368e329")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "70e8970f917cd5e1e06473ffef21385c2e94db91")
 # A repaired tool gets a fresh error budget. Failures of an older pinned release must not
 # permanently suppress progress after an upgrade; the attempt gap still limits retries.
 # Keep the usual immutable SHA readable, and hash other refs so a branch name containing
@@ -144,15 +145,21 @@ STATUS_LABELS = (
 # Loop timing. Env-overridable for tuning and tests.
 POLL = int(os.environ.get("TAUCETI_POLL", "300"))  # seconds between quota checks while waiting
 
-ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "5400"))  # 90 min hard cap per round
+# Hard safety cap per round, against a hung agent or tool: the loop kills the round's whole process
+# group and abandons it (nothing is checkpointed or continued). Work, including verification, is
+# expected to finish inside the round, so this is set far above any healthy round, not as a budget.
+ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "21600"))  # 6 h
 
 INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
+
+# A managed worker's wrapper sends this to its loop driver (never to a round's process group) to
+# request a graceful restart: the loop exits at its next round boundary, or at once between rounds.
+DRAIN_SIGNAL = signal.SIGUSR1
 
 EX_DOCUMENTATION_WAIT = 79  # Progress plan/facts deployment churn, without failed-round backoff
 EX_NOPROGRESS = 75  # round did NO productive work (distinct from error=1 / success=0)
 EX_ADMISSION_WAIT = 76  # Fleet capacity/API funding/queue/throughput wait, outside the round timeout
 EX_GITHUB_WAIT = 77  # GitHub quota/publication recovery pause, without failed-round backoff
-EX_RECOVERY_IDLE = 80  # Mechanical recovery found no available work; select normal work immediately
 EX_CLAIM_COLLISION = 81  # Peer owns the candidate; skip or briefly reselect, never failure backoff
 REVIEW_HEAD_CHANGED_EXIT = 82  # Review command refused a superseded selection before inference
 REVIEW_PREPARATION_WAIT_EXIT = 83  # Transport/host preparation failed before any paid review
@@ -167,13 +174,11 @@ BACKOFF_MAX = int(os.environ.get("TAUCETI_BACKOFF_MAX", "900"))  # cap on the es
 # GitHub REST rate-limit handling. We pace LLM quota carefully; GitHub's REST budget needs the same
 # care, or a 403 mid-round throws away the agent's (expensive) work. Two layers:
 #  - gh_run() waits IN PLACE for a rate limit to clear and retries (so a transient limit costs a pause,
-#    not a lost round), bounded by GH_INROUND_WAIT so it can't blow ROUND_TIMEOUT.
+#    not a lost round); only the round's hard cap bounds the wait.
 #  - cmd_loop preflights core budget BEFORE launching a round (no hard cap there) — the right place to
 #    wait out an hourly primary reset, and what keeps us from launching the review engine (whose own
 #    diff fetch would 403) without enough budget to finish.
 GH_MIN_BUDGET = int(os.environ.get("TAUCETI_GH_MIN_BUDGET", "200"))  # core requests a round needs to finish
-
-GH_INROUND_WAIT = int(os.environ.get("TAUCETI_GH_INROUND_WAIT", "900"))  # cap on gh_run's in-place wait (15 min)
 
 GH_SECONDARY_BASE = 60  # first secondary-limit sleep when no Retry-After is given (then exponential)
 

@@ -310,7 +310,8 @@ Before an update, take an online backup with `services/queue/backup.sh`, verify 
 and fast-forward the checkout. Use the service installer for controller deployment or explicitly
 bake `_revision.py` and restart `tauceti-queue.service`. Since the checkout is shared, an update
 that changes repair code also needs each repair worker restarted through its unit; a running task
-is checkpointed and resumed. Keep ordinary admissions enabled. Verify public revision, accepted
+is abandoned and its claim released, so restart a worker right after `worker.json` reports `idle`
+to avoid losing its task. Keep ordinary admissions enabled. Verify public revision, accepted
 members, claims, CI identity and useful progress after the update; do not use the retired shell
 helpers on chungus.
 
@@ -379,8 +380,8 @@ old data is kept until an operator authorizes cleanup.
 When a head's CI fails with attributable diagnostics the service creates a repair task (or a
 rebase-conflict task when a canonical advance conflicts); nothing happens to it until a worker claims
 it. `tauceti_queue/repair_task.py` ([repair-task.md](repair-task.md)) is that worker, and
-`services/queue/tauceti-queue-repair.service` runs it continuously as a systemd user unit: resume
-checkpointed tasks, claim, prepare warm artifacts, run the repair agent, push the chain to the task's
+`services/queue/tauceti-queue-repair.service` runs it continuously as a systemd user unit: retry
+pending deliveries, claim, prepare warm artifacts, run the repair agent, push the chain to the task's
 submission ref, submit it, report the provider outcome to `/tasks/inference` (the inference hold),
 sleep the poll interval when nothing is claimable. A task's failure, a service outage or a refused
 authorization is logged and retried on the next pass; the loop never exits for them. The worker's
@@ -597,9 +598,8 @@ worker identity and task root. Both service forms execute the virtual environmen
 so `MainPID` matches `worker.json`. `Restart=always`, `OOMPolicy=kill` and disabled start-rate limiting
 keep worker-cgroup kills recoverable without an external restart loop or a new memory cap.
 
-A restart (or `systemctl --user stop`) sends SIGTERM: a running agent is stopped, its claim and
-checkpoint are kept (`tasks/<id>/task.json` in state `interrupted`, the worktree in place), and the
-restarted worker renews the claim and resumes the same model session. A task that has already
+A restart (or `systemctl --user stop`) sends SIGTERM: a running agent is stopped, the attempt
+abandoned, its claim released (`worker-stopped`) and its worktree removed. A task that has already
 validated its chain finishes the push and submission first. `TimeoutStopSec=300`; a worker killed
 beyond that leaves the claim to expire (`claim_ttl_seconds`, 900) and the task is re-exposed.
 
@@ -622,8 +622,8 @@ and `last_error`, `last_outcome` (with the task's `provider` and `provider_attem
 the status document. Each task's record is `<task root>/tasks/<id>/` (`task.json`, `outcome.json`,
 `logs/` with the agent transcript, prompt, push and build logs).
 
-To stop the worker: `systemctl --user stop tauceti-queue-repair` (a running task is interrupted and
-resumed at the next start, as above); to stop it from coming back, `systemctl --user disable --now
+To stop the worker: `systemctl --user stop tauceti-queue-repair` (a running task is abandoned and
+its claim released, as above); to stop it from coming back, `systemctl --user disable --now
 tauceti-queue-repair`. To stop without interrupting a task (finish the current one, claim no more),
 stop it right after `worker.json` reports `idle`. For instances 2 and 3, use
 `tauceti-queue-repair@2.service` and `tauceti-queue-repair@3.service` in the same commands. Current repair workers use these units even
@@ -955,7 +955,7 @@ identity, so a branch exception alone does not distinguish those processes.
 Keep it out of updates to a fenced host without the explicit authority decision.
 Record the identity behind each repair token and fallback login; retain any
 repository-admin credential only in the named administrative profile, outside
-retired unattended repair runtimes. Preserve the corresponding recovery records.
+retired unattended repair runtimes.
 
 This is a cutover condition, not an instruction to stop current production during
 preparation. Keep normal worker/CI admissions enabled until the authorized
