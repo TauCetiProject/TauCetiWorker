@@ -56,7 +56,10 @@ The queue TOML must explicitly name `repository`, `canonical_branch`,
 `listen_port`, `public_url`, `admission_source`, `admission_rubrics`, and
 `admission_lean_root`. Paths are absolute. Source/branch, project Lean root,
 and source/execution policy must agree. The project must declare a nonempty
-`review.rubrics` list matching `admission_rubrics` in the same order.
+`review.rubrics` list matching `admission_rubrics` in the same order. A rubric the
+pinned review policy is phasing in for the source repository is required as well,
+of PRs above that repository's own cutoff; the review engine adds it to the
+project's list by the same table, so neither list names it.
 `admission_source` must be `policy`. Start rehearsal profiles with
 `publication_enabled = false`; persisted runtime controls keep their existing
 precedence after startup.

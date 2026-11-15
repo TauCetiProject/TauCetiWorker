@@ -146,8 +146,8 @@ with patch.object(w, "run_in_bubble", return_value=0) as launch:
         == 0
     )
     prompt = launch.call_args.args[2]
-    assert "1970-01-01 00:18:43 UTC" in prompt
-    assert "push it once" in prompt
+    assert "round ends at" not in prompt and "checkpoint" not in prompt
+    assert "anything unpushed is discarded" in prompt
     assert "CI red" in prompt
     assert "You may NOT close this PR" in prompt
 
