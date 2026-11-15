@@ -314,20 +314,33 @@ def main():
             text = tc.agents.local_verification("ordinary")
             check(
                 f"self-tested helper={helper}: label the PR after verification",
-                "worker applies `self-tested`" in text
+                "Apply the `self-tested` label to the PR" in text
                 and "gh-safe-pr-create" in text
-                and "PR/head-bound assertion through the selected forge" in text
+                and "matching verification receipt" in text
                 and "failed, incomplete, or outdated" in text,
+            )
+            check(
+                f"self-tested helper={helper}: author-only comment fallback for missing label permissions",
+                "lack of label permissions" in text
+                and "you are the PR author" in text
+                and "gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested" in text
+                and "do not post duplicate requests" in text,
+            )
+            check(
+                f"self-tested helper={helper}: keep declaration across fix pushes",
+                "Keep the label in place through fix/rebase pushes" in text
+                and "--remove-label self-tested" in text
+                and "A push clears" not in text,
             )
             for policy in ("bump", "full-lint", "lint-repair"):
                 check(
                     f"self-tested helper={helper}: excludes {policy}",
-                    "Verification for self-tested publication" not in tc.agents.local_verification(policy),
+                    "Apply the self-tested label after verification" not in tc.agents.local_verification(policy),
                 )
         with patch.dict(os.environ, TAUCETI_SELF_TESTED="0"):
             check(
                 f"self-tested helper={helper}: off by default",
-                "Verification for self-tested publication" not in tc.agents.local_verification("ordinary"),
+                "Apply the self-tested label after verification" not in tc.agents.local_verification("ordinary"),
             )
 
     with (

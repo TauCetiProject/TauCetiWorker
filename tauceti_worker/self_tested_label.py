@@ -10,9 +10,9 @@ worker labels each head the round published through git-safe-push itself, but on
 - this round left a successful, complete `tauceti-verify` receipt (every stage, policy
   `ordinary`) whose recorded sources are exactly the pushed commit's tree.
 
-Confirmation uses the selected source: GitHub's picker or the enrolled native status publisher.
-A label alone never proves that the current head was verified. Staging still builds and audits
-everything. Any doubt leaves the PR without an accepted self-tested assertion.
+The label is a persistent author declaration. Reviews and admission check eligibility inline;
+all staging builds and audits still run. The worker's optional automatic labeling uses the same
+receipt and source checks on either forge, without a picker or status-publication protocol.
 """
 
 from __future__ import annotations
@@ -21,10 +21,9 @@ import hashlib
 import json
 import os
 import subprocess
-import time
 from pathlib import Path
 
-from .bump_attestation import LABEL, confirm_label
+from .bump_attestation import LABEL
 from .verification import SCHEMA, STAGES, digest
 from .verification_scope import git, local_main
 
@@ -193,7 +192,7 @@ def _changed_paths(checkout: Path, base: str, commit: str) -> list[str]:
     return sorted(p.decode(errors="surrogateescape") for p in raw.split(b"\0") if p)
 
 
-def label_push(w, stage: str, pr: int, commit: str, since: float, *, sleep=time.sleep, clock=time.monotonic) -> str:
+def label_push(w, stage: str, pr: int, commit: str, since: float) -> str:
     """Label one pushed head `self-tested` when it qualifies; return the one-line outcome."""
     from tauceti_tools.self_tested import allowed_paths
 
@@ -206,11 +205,7 @@ def label_push(w, stage: str, pr: int, commit: str, since: float, *, sleep=time.
         return "not eligible (PR unreadable)"
     if why := _live_reason(live, commit):
         return f"not eligible ({why})"
-    if (
-        live.get("head", {}).get("sha") == commit
-        and LABEL in _labels(live)
-        and w.gh.commit_status(commit, f"self-tested/{pr}") == "success"
-    ):
+    if LABEL in _labels(live):
         return "already labelled"
     checkout = w.cfg.checkout
     receipt, base = matching_receipt(Path(w.cfg.state), checkout, commit, since)
@@ -227,16 +222,11 @@ def label_push(w, stage: str, pr: int, commit: str, since: float, *, sleep=time.
     # Receipt discovery takes a while; never label a head that moved meanwhile.
     if why := _live_reason(w.gh.live_pull(pr), commit):
         return f"not eligible ({why})"
-    outcome = confirm_label(w, pr, commit, lambda now: _live_reason(now, commit), sleep=sleep, clock=clock)
-    if outcome == "accepted":
-        return f"labelled {commit[:12]}: self-tested confirmed"
-    if outcome == "refused":
-        return f"self-tested refused for {commit[:12]}"
-    if outcome == "label failed":
+    if not w.gh.add_label(pr, LABEL):
         return "not labelled: adding the label failed"
-    if outcome.startswith("stopped: "):
-        return f"self-tested stopped for {commit[:12]}: {outcome.removeprefix('stopped: ')}"
-    return f"self-tested unconfirmed for {commit[:12]}; reviews and staging CI still apply"
+    if why := _live_reason(w.gh.live_pull(pr), commit):
+        return f"self-tested stopped for {commit[:12]}: {why}"
+    return f"labelled {commit[:12]}: persistent self-tested label applied"
 
 
 def round_pushes(c) -> list[tuple[int | None, str, str]]:
@@ -268,7 +258,7 @@ def scoped_publications(checkout: Path, scope: str) -> dict[str, str]:
     return out
 
 
-def label_round_pushes(w, c, stage: str, since: float, **wait) -> list[tuple[int | None, str]]:
+def label_round_pushes(w, c, stage: str, since: float) -> list[tuple[int | None, str]]:
     """Apply `label_push` to every head the round published; one (PR, outcome) per push."""
     owner = str((c.progress or {}).get("published_owner") or "")
     results = []
@@ -281,5 +271,5 @@ def label_round_pushes(w, c, stage: str, since: float, **wait) -> list[tuple[int
             if pr is None:
                 results.append((None, f"{branch}: not eligible (no open PR for {owner or '?'}:{branch})"))
                 continue
-        results.append((pr, label_push(w, stage, pr, commit, since, **wait)))
+        results.append((pr, label_push(w, stage, pr, commit, since)))
     return results

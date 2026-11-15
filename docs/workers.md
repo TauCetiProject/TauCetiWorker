@@ -95,17 +95,17 @@ and the receipt's source inventory must exactly match the published commit.
 Pin changes, infrastructure changes and full-lint/lint-repair requests do not
 qualify. This is the same eligibility check for GitHub and Forgejo.
 
-GitHub confirms through its existing picker. Forgejo confirms through the
-existing private native publisher policy, using the enrolled status publisher's
-native identity and repository permission. The native worker attests only its
-own PRs and respects existing refusals. Provision the `self-tested` repository
-label before enabling this route. This rollout reuses the enrolled worker
-identity and does not change publisher grants.
+Both forges use the same add-label flow through their source adapters; no picker
+or separate status publication is required. Provision the `self-tested`
+repository label on Forgejo before enabling this route. This rollout does not
+change publisher grants.
 
-The accepted observation requires both the label and a trusted
-`self-tested/<PR number>` success on the current head. A label left on a Forgejo
-PR after another push does not qualify that new head. An unavailable or invalid
-receipt, policy or assertion never counts as successful verification.
+The label is a persistent author declaration. Keep it through fix/rebase pushes
+after successful verification; remove it when verification fails or is
+incomplete. Authors can apply it themselves after verification, and the worker
+also applies it when it finds the complete matching receipt after a round.
+An unavailable or invalid receipt never produces an automatic label. Ordinary
+PR-CI eligibility is checked independently at admission.
 
 Forgejo does not currently run an individual Actions build for each PR. Reviews
 still run, and every mixed merge-queue candidate requires its full CI build and

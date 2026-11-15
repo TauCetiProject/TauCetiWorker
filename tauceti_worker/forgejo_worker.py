@@ -13,6 +13,7 @@ from .forgejo_reads import ForgejoReadSource
 
 class ForgejoWorkerSource(ForgejoReadSource):
     supports_contest_reactions = False
+    supports_label_requests = False
     worker_capable = True
     supports_review_sandbox = False
 
@@ -167,20 +168,8 @@ class ForgejoWorkerSource(ForgejoReadSource):
         return matches[0] if len(matches) == 1 else None
 
     def commit_status(self, sha, context):
-        from .native_self_tested import status
-
-        try:
-            return status(self, sha, context)
-        except (ForgeError, OSError, ValueError, PermissionError):
-            return ""
-
-    def confirm_self_tested(self, pr, head, recheck):
-        from .native_self_tested import confirm
-
-        try:
-            return confirm(self, pr, head, recheck)
-        except (ForgeError, OSError, ValueError, PermissionError):
-            return "unobserved"
+        # Native source statuses do not grant execution authority.
+        return ""
 
     def rebase_requested(self, pr, head):
         return False

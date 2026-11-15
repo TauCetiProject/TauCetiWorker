@@ -508,25 +508,57 @@ def scope_policy(labels=(), head_ref: str = "", *, bump: bool = False) -> str:
 
 def self_tested_guidance(policy: str) -> str:
     from .self_tested_label import enabled
+    from .worker_sources import current
 
     if policy != "ordinary" or enabled():
         return ""
+    comment_requests = getattr(current(), "supports_label_requests", True)
+    fallback = (
+        (
+            " If that command fails for lack of label permissions, confirm you are the PR author and its head still "
+            "matches the verified commit, then post a new standalone `self-tested` comment with "
+            "`gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested`. "
+            "The comment handler is asynchronous; do not post duplicate requests while it runs. "
+        )
+        if comment_requests
+        else " "
+    )
+    remove_fallback = (
+        " (or post `-self-tested` as the PR author if label permissions are missing)" if comment_requests else ""
+    )
     return (
-        "### Verification for self-tested publication\n"
-        "For an ordinary mathematics PR entirely under `TauCeti/`, after the final source changes, "
+        "### Apply the self-tested label after verification\n"
+        "For an ordinary mathematics PR entirely under `TauCeti/`, after the final source changes "
         "successfully complete the local verification below (equivalent to "
         "`lake build --iofail && lake test && lake lint`). Wait for its successful exit; "
         "failed, incomplete, or outdated checks do not qualify. Reuse successful checks whose inputs "
         "have not changed; this adds no verification pass.\n"
-        "Create new PRs through the existing "
-        "worker flow; leave the self-tested label and assertion to the worker. Use the "
+        "Apply the `self-tested` label to the PR. Create new PRs through the existing "
         "`gh-safe-pr-create` wrapper; do not bypass it. After creation or pushing an update, "
-        "confirm the live PR commit matches your verified commit. After the round, the worker applies "
-        "`self-tested` and confirms a PR/head-bound assertion through the selected forge, only for "
-        "heads that match a successful complete verification receipt and qualify. "
-        "Verify again after source changes; a label on an earlier head does not qualify a new head. "
-        "Infrastructure or pin changes and full-lint/lint-repair requests do not qualify. "
-        "Reviews and all staging tests still run.\n\n"
+        "confirm the live PR commit matches your verified commit, then use "
+        "`gh pr edit <number> --repo TauCetiProject/TauCeti "
+        "--add-label self-tested`."
+        + fallback
+        + "Keep the label in place through fix/rebase pushes after local verification succeeds. "
+        "The label is a persistent author declaration, not a per-commit receipt. "
+        "If verification fails or is incomplete, remove it with `gh pr edit <number> "
+        "--repo TauCetiProject/TauCeti --remove-label self-tested`" + remove_fallback + ". Do not leave it on work you "
+        "cannot stand behind. Do not apply it for infrastructure or pin changes, or full-lint/lint-repair requests. "
+        "After the round, the worker also applies the label to pushed heads with a successful complete "
+        "matching verification receipt. Admission checks trusted-author and source-scope eligibility directly; reviews and all staging tests still run.\n\n"
+    )
+
+
+def quality_scope() -> str:
+    """Which quality-pass checks agents run: all of them under `--full-quality`, else the duplicate and
+    proof-length checks, named as the template titles them. A PR keeps the template its branch was cut
+    with, which numbers proof length Q5 of five checks or Q3 of three (TauCeti#40207)."""
+    if os.environ.get("TAUCETI_FULL_QUALITY", "0") == "1":
+        return "Run every check."
+    return (
+        "Run only the Mathlib duplicates, Tau Ceti duplicates and Proofs of at most 50 lines checks: Q1, Q2 "
+        "and Q5 when the template has five checks, Q1 to Q3 when it has three. Each other line, such as "
+        "Hypotheses or Section variables, reads `declined — not run`."
     )
 
 

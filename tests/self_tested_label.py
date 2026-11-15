@@ -103,10 +103,10 @@ def pull(head, *, labels=(), ref="feature"):
 
 
 class FakeGitHub:
-    """Serves scripted PR reads in order (repeating the last), commit statuses and head lookups."""
+    """Serves scripted PR reads in order (repeating the last), head lookups."""
 
-    def __init__(self, pulls, statuses, heads=None):
-        self.pulls, self.statuses, self.labelled, self.heads = list(pulls), list(statuses), 0, heads or {}
+    def __init__(self, pulls, heads=None):
+        self.pulls, self.labelled, self.heads = list(pulls), 0, heads or {}
         self.reads = 0
 
     def live_pull(self, pr):
@@ -118,15 +118,11 @@ class FakeGitHub:
         self.labelled += 1
         return True
 
-    def commit_status(self, sha, context):
-        assert context == "self-tested/9"
-        return self.statuses.pop(0) if self.statuses else ""
-
     def pull_for_head(self, owner, branch):
         return self.heads.get(f"{owner}:{branch}")
 
 
-def run(tmp, pulls, statuses, *, stage="fix", receipt=None, since=None, env="1", **shape):
+def run(tmp, pulls, *, stage="fix", receipt=None, since=None, env="1", **shape):
     """One fix round on PR 9 that pushed HEAD; `receipt(state, root, base, head)` writes the evidence."""
     root, base, head = checkout(tmp, **shape)
     state = Path(tmp) / "state"
@@ -134,14 +130,13 @@ def run(tmp, pulls, statuses, *, stage="fix", receipt=None, since=None, env="1",
     started = time.time() - 5 if since is None else since
     if receipt:
         receipt(state, root, base, head)
-    gh = FakeGitHub(pulls(head), statuses)
+    gh = FakeGitHub(pulls(head))
     w = SimpleNamespace(cfg=SimpleNamespace(checkout=root, state=state, logdir=state), gh=gh)
     c = SimpleNamespace(pr=9, progress={"published": head})
-    ticks = iter(range(0, 10**6, 5))
     saved = os.environ.get("TAUCETI_SELF_TESTED")
     os.environ["TAUCETI_SELF_TESTED"] = env
     try:
-        results = stl.label_round_pushes(w, c, stage, started, sleep=lambda _s: None, clock=lambda: next(ticks))
+        results = stl.label_round_pushes(w, c, stage, started)
     finally:
         if saved is None:
             os.environ.pop("TAUCETI_SELF_TESTED", None)
@@ -166,21 +161,11 @@ def stale(state, root, base, head):
 
 
 CASES = [
-    # name, run options, PR reads, statuses, outcome prefix, labels added
-    (
-        "verified push is labelled",
-        {"receipt": verified},
-        lambda h: [pull(h), pull(h, labels=LABELLED)],
-        ["success"],
-        "labelled",
-        1,
-    ),
-    ("picker refusal is reported", {"receipt": verified}, lambda h: [pull(h)], ["failure"], "self-tested refused", 1),
+    ("verified push is labelled", {"receipt": verified}, lambda h: [pull(h), pull(h, labels=LABELLED)], "labelled", 1),
     (
         "receipt for a different commit",
         {"receipt": other_commit},
         lambda h: [pull(h)],
-        [],
         "no matching receipt (verified sources differ",
         0,
     ),
@@ -188,7 +173,6 @@ CASES = [
         "untracked file in the verified sources",
         {"receipt": lambda s, r, b, h: write_receipt(s, r, b, extra="TauCeti/Scratch.lean")},
         lambda h: [pull(h)],
-        [],
         "no matching receipt",
         0,
     ),
@@ -196,7 +180,6 @@ CASES = [
         "failed verification",
         {"receipt": lambda s, r, b, h: write_receipt(s, r, b, status="failed")},
         lambda h: [pull(h)],
-        [],
         "no matching receipt",
         0,
     ),
@@ -204,7 +187,6 @@ CASES = [
         "incomplete verification",
         {"receipt": lambda s, r, b, h: write_receipt(s, r, b, status="incomplete")},
         lambda h: [pull(h)],
-        [],
         "no matching receipt",
         0,
     ),
@@ -212,7 +194,6 @@ CASES = [
         "stage-only verification",
         {"receipt": lambda s, r, b, h: write_receipt(s, r, b, phases=("build",))},
         lambda h: [pull(h)],
-        [],
         "no matching receipt",
         0,
     ),
@@ -220,42 +201,30 @@ CASES = [
         "full-lint policy verification",
         {"receipt": lambda s, r, b, h: write_receipt(s, r, b, policy="full-lint")},
         lambda h: [pull(h)],
-        [],
         "no matching receipt",
         0,
     ),
-    ("receipt from an earlier round", {"receipt": stale}, lambda h: [pull(h)], [], "no matching receipt", 0),
-    ("no receipt at all", {}, lambda h: [pull(h)], [], "no matching receipt (no verification this round)", 0),
+    ("receipt from an earlier round", {"receipt": stale}, lambda h: [pull(h)], "no matching receipt", 0),
+    ("no receipt at all", {}, lambda h: [pull(h)], "no matching receipt (no verification this round)", 0),
     (
         "infrastructure change",
         {"receipt": verified, "infra": True},
         lambda h: [pull(h)],
-        [],
         "not eligible (changes outside TauCeti/: lakefile.toml)",
         0,
     ),
-    ("already confirmed", {"receipt": verified}, lambda h: [pull(h, labels=LABELLED)], ["success"], "already labelled", 0),
+    ("already labelled", {"receipt": verified}, lambda h: [pull(h, labels=LABELLED)], "already labelled", 0),
     (
-        "stale label does not bypass verification",
+        "persistent label is retained without another receipt",
         {},
         lambda h: [pull(h, labels=LABELLED)],
-        [],
-        "no matching receipt",
+        "already labelled",
         0,
-    ),
-    (
-        "stale label is confirmed after fresh verification",
-        {"receipt": verified},
-        lambda h: [pull(h, labels=LABELLED)],
-        ["", "success"],
-        "labelled",
-        1,
     ),
     (
         "live head moved since the push",
         {"receipt": verified},
         lambda h: [pull("d" * 40, labels=LABELLED)],
-        [],
         "not eligible (PR head moved",
         0,
     ),
@@ -263,7 +232,6 @@ CASES = [
         "head moving while waiting stops",
         {"receipt": verified},
         lambda h: [pull(h), pull(h), pull("d" * 40)],
-        [],
         "self-tested stopped",
         1,
     ),
@@ -271,7 +239,6 @@ CASES = [
         "head moving during receipt discovery adds no label",
         {"receipt": verified},
         lambda h: [pull(h), pull("d" * 40)],
-        [],
         "not eligible (PR head moved",
         0,
     ),
@@ -279,16 +246,14 @@ CASES = [
         "receipt verified against a base past an infrastructure commit",
         {"receipt": lambda s, r, b, h: write_receipt(s, r, git(r, "rev-parse", "HEAD~1")), "middle": True},
         lambda h: [pull(h)],
-        [],
         "not eligible (changes outside TauCeti/: lakefile.toml)",
         0,
     ),
-    ("symlink in the sources", {"receipt": verified, "symlink": True}, lambda h: [pull(h)], [], "no matching", 0),
+    ("symlink in the sources", {"receipt": verified, "symlink": True}, lambda h: [pull(h)], "no matching", 0),
     (
         "lint-repair label",
         {"receipt": verified},
         lambda h: [pull(h, labels=("lint-repair",))],
-        [],
         "not eligible (full-lint or lint-repair",
         0,
     ),
@@ -296,7 +261,6 @@ CASES = [
         "full-lint label",
         {"receipt": verified},
         lambda h: [pull(h, labels=("full-lint",))],
-        [],
         "not eligible (full-lint or lint-repair",
         0,
     ),
@@ -304,25 +268,16 @@ CASES = [
         "lint-repair branch",
         {"receipt": verified},
         lambda h: [pull(h, ref="lint-repair/x")],
-        [],
         "not eligible (full-lint or lint-repair",
         0,
     ),
-    ("lint-repair round", {"receipt": verified, "stage": "lint-repair"}, lambda h: [pull(h)], [], "not eligible", 0),
-    ("disabled", {"receipt": verified, "env": "0"}, lambda h: [pull(h)], [], "not eligible (TAUCETI_SELF_TESTED", 0),
-    (
-        "removed label is applied again",
-        {"receipt": verified},
-        lambda h: [pull(h), pull(h), pull(h), pull(h, labels=LABELLED)],
-        ["", "", "success"],
-        "labelled",
-        2,
-    ),
+    ("lint-repair round", {"receipt": verified, "stage": "lint-repair"}, lambda h: [pull(h)], "not eligible", 0),
+    ("disabled", {"receipt": verified, "env": "0"}, lambda h: [pull(h)], "not eligible (TAUCETI_SELF_TESTED", 0),
 ]
 
-for name, options, pulls, statuses, prefix, labels in CASES:
+for name, options, pulls, prefix, labels in CASES:
     with tempfile.TemporaryDirectory() as tmp:
-        results, gh = run(tmp, pulls, statuses, **options)
+        results, gh = run(tmp, pulls, **options)
     check(f"{name}: one outcome", len(results), 1)
     check(name, results[0][1] if results else "", lambda got, p=prefix: got.startswith(p))
     check(f"{name}: labels added", gh.labelled, labels)
@@ -351,14 +306,14 @@ with tempfile.TemporaryDirectory() as tmp:
     state = Path(tmp) / "state"
     state.mkdir()
     write_receipt(state, root, base)
-    gh = FakeGitHub([pull(head), pull(head, labels=LABELLED)], ["success"], heads={"me:roadmap/x": 9})
+    gh = FakeGitHub([pull(head), pull(head, labels=LABELLED)], heads={"me:roadmap/x": 9})
     w = SimpleNamespace(cfg=SimpleNamespace(checkout=root, state=state, logdir=state), gh=gh)
     c = SimpleNamespace(pr=None, progress={"published_branches": published, "published_owner": "me"})
     os.environ["TAUCETI_SELF_TESTED"] = "1"
     try:
-        results = stl.label_round_pushes(w, c, "roadmap", time.time() - 5, sleep=lambda _s: None, clock=lambda: 0)
+        results = stl.label_round_pushes(w, c, "roadmap", time.time() - 5)
         check("roadmap PR labelled", results, lambda got: got and got[0][0] == 9 and got[0][1].startswith("labelled"))
-        gh = FakeGitHub([pull(head)], [], heads={})
+        gh = FakeGitHub([pull(head)], heads={})
         w.gh = gh
         results = stl.label_round_pushes(w, c, "roadmap", time.time() - 5)
         check("roadmap branch without a PR", results, lambda got: "no open PR" in got[0][1])
