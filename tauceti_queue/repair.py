@@ -2021,7 +2021,7 @@ def prepare_errors_lines(record: dict | None) -> list[str]:
     return lines
 
 
-def explanation_prompt(unexplained: list[str], chain: list[ChainCommit]) -> str:
+def explanation_prompt(unexplained: list[str], chain: list[ChainCommit], *, base: str | None = None) -> str:
     """The short follow-up turn when content changed without an appended explanation."""
     by_pr = {c.pr: c for c in chain if c.pr is not None}
     lines = [
@@ -2038,7 +2038,8 @@ def explanation_prompt(unexplained: list[str], chain: list[ChainCommit]) -> str:
         "Append a very concise explanation of what changed and why to each of these messages, preserving the existing "
         "message text as a prefix and keeping the `Source-PR:` and `Accepted-Head:` trailers. Change nothing else: no "
         "content edits, no reordering, no new commits. Leave HEAD (detached) at the reworded chain tip, still a linear "
-        f"chain on `{(chain[0].parent[:12] if chain else '?')}`, with a clean working tree, then stop.",
+        f"chain on `{(base[:12] if base else chain[0].parent[:12] if chain else '?')}`, "
+        "with a clean working tree, then stop.",
     ]
     return "\n".join(lines)
 
