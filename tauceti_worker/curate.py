@@ -465,13 +465,17 @@ def _push(path: Path, still=None) -> bool:
     return False
 
 
-def _holds(path: Path, message: str) -> bool:
-    """Whether HEAD is still this look's unpushed commit with `message`: a rebase drops it when the
-    branch it tracks already has the same change."""
-    if _git(path, "log", "-1", "--format=%B", "HEAD").stdout.strip() != message.strip():
-        return False
+def _holds(path: Path, made: str) -> bool:
+    """Whether HEAD is still this look's unpushed commit `made`, or its rebased copy: a rebase drops
+    it when the branch it tracks already has the same change (`git cherry` marks it `-`)."""
+    head = _git(path, "rev-parse", "HEAD").stdout.strip()
+    if head == made:
+        return True
     ahead = _git(path, "rev-list", "--count", "@{upstream}..HEAD")
-    return ahead.returncode != 0 or ahead.stdout.strip() not in ("", "0")
+    if ahead.returncode == 0 and ahead.stdout.strip() in ("", "0"):
+        return False
+    cherry = _git(path, "cherry", "@{upstream}", made, f"{made}~1")
+    return not cherry.stdout.startswith("-")
 
 
 def merge3(base: str, ours: str, theirs: str) -> str | None:
@@ -537,12 +541,13 @@ def publish(path: Path, base: str, ours: str, notes: list[str], *, still=None) -
             else:
                 _write(path, undone)
             return None
+        made = _git(path, "rev-parse", "HEAD").stdout.strip()
     if tracked and not _push(path, still) and still is not None and merged != theirs:
         # A verdict is published in the look that made it or not at all: a later push could carry
         # it onto a goal or item line it was never given.
         # The commit can also hold the operator's uncommitted edits, so only this look's edit is
         # taken out of the file, which stays uncommitted.
-        if not _holds(path, message):
+        if not _holds(path, made):
             log(f"curate: {path.name} already has these edits upstream; the rebased list is kept")
             return None
         undone = merge3(ours, path.read_text(), base)

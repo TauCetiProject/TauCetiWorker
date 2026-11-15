@@ -506,6 +506,26 @@ class Publish(Tmp):
         self.assertEqual(curate.publish(path, EXAMPLE, a, ["n"], still=lambda text: True), a)
         self.assertEqual(git(remote, "show", "main:targets.md") + "\n", a)
 
+    def test_a_verdict_commit_a_message_hook_rewrote_is_still_taken_back(self):
+        first, second = self.clone("first"), self.clone("second")
+        listed = t.parse_targets(EXAMPLE)
+        item = listed.find("kolmogorov-zero-one")
+        ticked = t.rewrite_item(EXAMPLE, item, "done", add=("landed elsewhere: A.lean a_b",))
+        broadened = EXAMPLE.replace("i.i.d. integrable", "i.i.d. measurable")
+        second.write_text(broadened)
+        git(second.parent, "commit", "-q", "-m", "goal", "targets.md")
+        hooks = first.parent / ".git" / "hooks"
+        (hooks / "commit-msg").write_text('#!/bin/sh\nprintf "\\nSigned-off-by: list owner\\n" >> "$1"\n')
+        (hooks / "post-commit").write_text(f"#!/bin/sh\ngit -C {second.parent} push -q origin HEAD:main\n")
+        for hook in hooks.glob("*-*"):
+            if hook.name in ("commit-msg", "post-commit"):
+                hook.chmod(0o755)
+        self.assertIsNone(curate.publish(first, EXAMPLE, ticked, ["n"], still=curate._unchanged(first, listed, [item])))
+        self.assertEqual(
+            (first.read_text(), git(first.parent, "rev-list", "--count", "@{upstream}..HEAD")), (broadened, "0")
+        )
+        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
+
     def test_a_verdict_another_host_already_published_leaves_the_rebased_clone_alone(self):
         first, second = self.clone("first"), self.clone("second")
         listed = t.parse_targets(EXAMPLE)
