@@ -41,7 +41,7 @@ def github(open_bodies=(), merged=(), older=()):
 
     def merged_prs(search, limit):
         rows = merged if "sort:updated-desc" in search else [*merged, *older]
-        return [{"number": n, "body": body} for n, body in rows]
+        return [{"number": n, "body": body, "baseRefName": "main"} for n, body in rows]
 
     return SimpleNamespace(
         open_prs=lambda: [{"number": 900 + i, "body": body} for i, body in enumerate(open_bodies)],
@@ -598,11 +598,19 @@ class Forgejo(unittest.TestCase):
         self.closed = []  # the closed-pull listing's pages; `found` is the keyword search's
         self.found = []
         self.api.pages.side_effect = lambda path: iter(self.closed if "/pulls?" in path else self.found)
+        self.api.pull.side_effect = lambda _repository, number: {"number": number, "base": {"ref": "main"}}
         self.source.open_prs = Mock(return_value=[])
 
     @staticmethod
-    def pull(number, body, merged=True):
-        return {"number": number, "title": "t", "body": body, "state": "closed", "merged": merged}
+    def pull(number, body, merged=True, base="main"):
+        return {
+            "number": number,
+            "title": "t",
+            "body": body,
+            "state": "closed",
+            "merged": merged,
+            "base": {"ref": base},
+        }
 
     def test_merged_listing_and_keyword_search(self):
         self.closed = [
@@ -654,7 +662,12 @@ class Forgejo(unittest.TestCase):
         item = listed.find("a")
         self.assertEqual(t.landed([item], [{"number": 5, "body": marker("Algebra", "a"), "url": url}]), {})
         self.assertEqual(t.landed([item], [{"number": 5, "body": marker("Algebra", "a")}]), {})
-        other = {"number": 5, "body": marker("Algebra", "a"), "url": self.repo.pull_url(6).replace("/6", "/5x")}
+        other = {
+            "number": 5,
+            "body": marker("Algebra", "a"),
+            "url": self.repo.pull_url(6).replace("/6", "/5x"),
+            "baseRefName": "main",
+        }
         self.assertEqual(t.landed([item], [other]), {("Algebra", "a"): 5})
 
     def test_author_claims_stay_in_the_shared_github_namespace(self):
@@ -825,7 +838,10 @@ class ClaimsBeforeAuthoring(unittest.TestCase):
 
 
 class GitHubHistoryLookup(unittest.TestCase):
-    NEWER = [{"number": 500 + i, "body": marker("Algebra", f"x{i}"), "state": "MERGED"} for i in range(200)]
+    NEWER = [
+        {"number": 500 + i, "body": marker("Algebra", f"x{i}"), "state": "MERGED", "baseRefName": "main"}
+        for i in range(200)
+    ]
 
     def reads(self, listing, found=()):
         """A GitHubMarkerReads over `listing`, whose per-item search finds `found`."""
@@ -840,21 +856,32 @@ class GitHubHistoryLookup(unittest.TestCase):
 
     def test_a_full_snapshot_falls_back_to_the_per_item_search(self):
         old = t.TargetItem("Algebra", "old", "open", "x")
-        reads = self.reads(self.NEWER, [{"number": 1, "body": marker("Algebra", "old"), "state": "MERGED"}])
+        reads = self.reads(
+            self.NEWER, [{"number": 1, "body": marker("Algebra", "old"), "state": "MERGED", "baseRefName": "main"}]
+        )
         self.assertEqual(self.landed(reads, old), 1)
         self.assertEqual(self.landed(reads, t.TargetItem("Algebra", "x3", "open", "x")), 503)
         searches = [c.kwargs.get("search", "") for c in self.gh.target_marker_prs.call_args_list]
         self.assertEqual(len(searches), 2)
         self.assertIn('"id":"old"', searches[1].replace("\\", ""))
-        self.assertIsNone(self.landed(self.reads(self.NEWER[:5], [{"number": 1, "body": "", "state": "MERGED"}]), old))
+        self.assertIsNone(
+            self.landed(
+                self.reads(self.NEWER[:5], [{"number": 1, "body": "", "state": "MERGED", "baseRefName": "main"}]), old
+            )
+        )
         self.assertEqual(len(self.gh.target_marker_prs.call_args_list), 1)
 
     def test_a_snapshot_match_that_does_not_complete_the_item_still_falls_back(self):
-        full = {"number": 300, "body": marker("Algebra", "old"), "state": "MERGED"}
-        partial = {"number": 1, "body": marker("Algebra", "old", partial=True), "state": "MERGED"}
+        full = {"number": 300, "body": marker("Algebra", "old"), "state": "MERGED", "baseRefName": "main"}
+        partial = {
+            "number": 1,
+            "body": marker("Algebra", "old", partial=True),
+            "state": "MERGED",
+            "baseRefName": "main",
+        }
         old = t.TargetItem("Algebra", "old", "open", "x")
         self.assertEqual(self.landed(self.reads([partial, *self.NEWER[:199]], [partial, full]), old), 300)
-        named = {"number": 1, "body": marker("Algebra", "old"), "state": "MERGED"}
+        named = {"number": 1, "body": marker("Algebra", "old"), "state": "MERGED", "baseRefName": "main"}
         excused = t.TargetItem("Algebra", "old", "open", "x", meta=("partial: #1",))
         self.assertEqual(self.landed(self.reads([named, *self.NEWER[:199]], [named, full]), excused), 300)
 
@@ -921,7 +948,7 @@ class ForgejoRound(unittest.TestCase):
 
     def test_a_forgejo_only_round_reads_the_lists_github_history_in_one_request(self):
         self.github_rows = [
-            {"number": 30, "title": "t", "body": marker("Algebra", "first"), "state": "MERGED"},
+            {"number": 30, "title": "t", "body": marker("Algebra", "first"), "state": "MERGED", "baseRefName": "main"},
             {"number": 31, "title": "t", "body": marker("Algebra", "third"), "state": "OPEN"},
         ]
         prompt = self.author()
@@ -936,7 +963,7 @@ class ForgejoRound(unittest.TestCase):
             patch.object(tc.GitHub, "_gh", return_value=listed) as gh,
         ):
             rows = TARGET_MARKER_PRS(tc.GitHub(), limit=200)
-        self.assertIn("number,title,body,state,headRefOid", gh.call_args.args[0])
+        self.assertIn("number,title,body,state,headRefOid,baseRefName", gh.call_args.args[0])
         self.assertEqual(rows[0]["headRefOid"], "c" * 40)
         self.github_rows = [closed]
         self.assertEqual(t.GitHubMarkerReads()._listing()[0]["headRefOid"], "c" * 40)
@@ -985,6 +1012,57 @@ class ForgejoRound(unittest.TestCase):
         with self.assertRaisesRegex(tc.NoProgress, "cannot read pull requests for the target list"):
             self.author()
         self.claims.begin_target_work.assert_not_called()
+
+
+class LandingBase(unittest.TestCase):
+    """A marked pull request completes its item only when it merged into the worker's base branch."""
+
+    LIST = "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `prerequisite` — p\n- [ ] `dependent` — d (needs: prerequisite)\n"
+    CASES = [  # (base of #41, marked?) -> the item assigned and claimed
+        ("integration", True, "prerequisite"),
+        ("main", True, "dependent"),
+        ("integration", False, "prerequisite"),
+    ]
+
+    def setUp(self):
+        Round.setUp(self)
+        self.path.write_text(self.LIST)
+
+    author = Round.author
+
+    def body(self, marked):
+        return marker("Algebra", "prerequisite") if marked else "no marker"
+
+    def test_on_a_github_source(self):
+        for base, marked, assigned in self.CASES:
+            row = {"number": 41, "title": "t", "body": self.body(marked), "state": "MERGED", "baseRefName": base}
+            self.w.gh = SimpleNamespace(open_prs=lambda: [], merged_prs=lambda search, limit, row=row: [row])
+            self.claims.begin_target_work.reset_mock()
+            self.assertIn(f"Your target is assigned: `{assigned}` in `Algebra`", self.author(), (base, marked))
+            self.claims.begin_target_work.assert_called_once_with("Algebra", assigned)
+
+    def test_on_a_forgejo_source(self):
+        fixture = Forgejo()
+        fixture.setUp()
+        self.w.gh = fixture.source
+        for base, marked, assigned in self.CASES:
+            fixture.closed = [[Forgejo.pull(41, self.body(marked), base=base)]]
+            fixture.found = [[{"number": 41, "body": self.body(marked), "pull_request": {"merged": True}}]]
+            fixture.api.pull.side_effect = lambda _r, n, base=base: {"number": n, "base": {"ref": base}}
+            fixture.source.cache.invalidate()
+            self.claims.begin_target_work.reset_mock()
+            with patch("tauceti_worker.worker_sources.current", return_value=fixture.source):
+                prompt = self.author()
+            self.assertIn(f"Your target is assigned: `{assigned}` in `Algebra`", prompt, (base, marked))
+            self.claims.begin_target_work.assert_called_once_with("Algebra", assigned)
+
+    def test_the_base_branch_setting_names_the_content_base(self):
+        row = {"number": 41, "body": marker("Algebra", "prerequisite"), "baseRefName": "integration"}
+        item = t.TargetItem("Algebra", "prerequisite", "open", "p")
+        with patch.dict(os.environ, {"TAUCETI_BASE_BRANCH": "integration"}):
+            self.assertEqual(t.landed([item], [row]), {("Algebra", "prerequisite"): 41})
+        self.assertEqual(t.landed([item], [row]), {})
+        self.assertEqual(t.landed([item], [{"number": 41, "body": row["body"]}]), {})
 
 
 class Wiring(unittest.TestCase):
