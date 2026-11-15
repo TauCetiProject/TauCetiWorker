@@ -147,6 +147,25 @@ class ForgejoWorkerSource(ForgejoReadSource):
         self.invalidate(pr)
         return True
 
+    def pull_for_head(self, owner, branch):
+        """Fresh, unambiguous PR lookup for a branch published by a roadmap round."""
+        if not owner or not branch:
+            return None
+        rows = self._read(
+            "pull_for_head",
+            [owner, branch],
+            lambda: self.reader.pulls(self.repository, ["number", "headRefName", "headRepositoryOwner"], state="open"),
+            fresh=True,
+            cacheable=False,
+        )
+        matches = [
+            row["number"]
+            for row in rows or []
+            if row.get("headRefName") == branch
+            and (row.get("headRepositoryOwner") or {}).get("login", "").casefold() == owner.casefold()
+        ]
+        return matches[0] if len(matches) == 1 else None
+
     def commit_status(self, sha, context):
         from .native_self_tested import status
 

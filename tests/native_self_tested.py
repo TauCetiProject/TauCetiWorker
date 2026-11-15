@@ -40,6 +40,7 @@ class NativeSelfTested(unittest.TestCase):
         )
         self.save_policy()
         f.api._token = "token"
+        f.api.max_bytes = 1024 * 1024
         f.api._repo = lambda repository: "repos/" + repository.name
         f.api.repository.return_value = dict(id=41, full_name=f.repository.name, archived=False)
         self.source = ForgejoWorkerSource(f.identity, f.api, token_file=f.clone / "token")
@@ -204,6 +205,17 @@ class NativeSelfTested(unittest.TestCase):
         with patch("tauceti_queue.forgejo_source.ForgejoSourceAdapter._permission", return_value="write") as permission:
             self.assertEqual(self.confirm(), "accepted")
             self.assertEqual(permission.call_count, 1)
+
+    def test_roadmap_branch_lookup_is_fresh_owner_bound_and_unambiguous(self):
+        row = dict(number=1, headRefName="roadmap/x", headRepositoryOwner=dict(login="team"))
+        self.source.reader.pulls = Mock(return_value=[row])
+        self.assertEqual(self.source.pull_for_head("team", "roadmap/x"), 1)
+        self.assertIsNone(self.source.pull_for_head("other", "roadmap/x"))
+        self.source.reader.pulls.return_value = [row, {**row, "number": 2}]
+        self.assertIsNone(self.source.pull_for_head("team", "roadmap/x"))
+        self.source.reader.pulls.side_effect = ForgeError("outage", status=503)
+        self.assertIsNone(self.source.pull_for_head("team", "roadmap/x"))
+        self.assertEqual(self.source.reader.pulls.call_count, 4)
 
 
 class CanonicalSource(unittest.TestCase):
