@@ -2414,7 +2414,11 @@ def _run_task(
                     cfg,
                     task,
                     worktree,
-                    repair.explanation_prompt(report["unexplained"], chain_before),
+                    repair.explanation_prompt(
+                        report["unexplained"],
+                        repair.read_chain(cfg.clone, task.validation_base, tip),
+                        base=task.validation_base,
+                    ),
                     logdir,
                     cancel,
                     state,
@@ -2644,7 +2648,9 @@ def _run_task(
                     cfg,
                     task,
                     worktree,
-                    repair.explanation_prompt(named, chain_before),
+                    repair.explanation_prompt(
+                        named, repair.read_chain(cfg.clone, task.validation_base, tip), base=task.validation_base
+                    ),
                     logdir,
                     cancel,
                     state,

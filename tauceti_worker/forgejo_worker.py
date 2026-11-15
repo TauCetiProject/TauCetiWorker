@@ -27,6 +27,27 @@ class ForgejoWorkerSource(ForgejoReadSource):
         self.anonymous_discovery = token_file is None
         self.repo = self.repository.name
         self._mergeability_cache = {}
+        self.review_publication_policy = None
+
+    def issue_comments(self, number, *, fresh=False):
+        rows = super().issue_comments(number, fresh=fresh)
+        if rows is None or not self.review_publication_policy or self.anonymous_discovery:
+            return rows
+        from types import SimpleNamespace
+
+        from .native_review_publisher import QueueReviewPublisher
+
+        try:
+            pull = self.live_pull(number)
+            if pull is None:
+                return None
+            transport = SimpleNamespace(source=self, number=number, head=pull["head"]["sha"])
+            trusted = QueueReviewPublisher(transport, policy_path=self.review_publication_policy).comments()
+        except (ForgeError, OSError, ValueError):
+            return None  # Withhold this PR's metadata, not every native PR.
+        # Ordinary discussion remains visible, but mutable unreceipted boards
+        # cannot suppress a review or seed another worker's completion decision.
+        return [row for row in rows if "<!--tauceti-scoreboard-->" not in (row.get("body") or "")] + trusted
 
     def resolve_mergeability(self, state, number, head):
         from .source_mergeability import resolve

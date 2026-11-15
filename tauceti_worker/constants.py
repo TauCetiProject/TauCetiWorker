@@ -52,7 +52,7 @@ REVIEW_PROVIDER_DOWN_EXIT = 3
 # not recognise and every report wedges. Bump this together with the two pins in
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
 PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
-PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "f1bbda821ca37f509074e1e088fde673e368e329")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "70e8970f917cd5e1e06473ffef21385c2e94db91")
 # A repaired tool gets a fresh error budget. Failures of an older pinned release must not
 # permanently suppress progress after an upgrade; the attempt gap still limits retries.
 # Keep the usual immutable SHA readable, and hash other refs so a branch name containing
@@ -163,6 +163,7 @@ EX_GITHUB_WAIT = 77  # GitHub quota/publication recovery pause, without failed-r
 EX_CLAIM_COLLISION = 81  # Peer owns the candidate; skip or briefly reselect, never failure backoff
 REVIEW_HEAD_CHANGED_EXIT = 82  # Review command refused a superseded selection before inference
 REVIEW_PREPARATION_WAIT_EXIT = 83  # Transport/host preparation failed before any paid review
+REVIEW_PUBLICATION_SUPERSEDED_EXIT = 87  # Saved paid review superseded by a newer publication
 
 BACKOFF_BASE = int(os.environ.get("TAUCETI_BACKOFF_BASE", "30"))  # first no-progress sleep (doubles each round)
 

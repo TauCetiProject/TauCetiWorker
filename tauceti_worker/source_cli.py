@@ -33,8 +33,7 @@ def execute(args, source):
 def load_source():
     from tauceti_tools.ci_candidate import RepositoryIdentity
     from tauceti_tools.forge import Forgejo
-
-    from tauceti_queue.control_policy_file import read_control_policy
+    from tauceti_tools.git_credentials import read_private_token
 
     from .forgejo_worker import ForgejoWorkerSource
 
@@ -42,7 +41,7 @@ def load_source():
     if identity.repository.forge.url != os.environ["TAUCETI_FORGEJO_ORIGIN"]:
         raise ValueError("Forgejo credential origin differs from the selected source")
     path = Path(os.environ["TAUCETI_FORGEJO_TOKEN_FILE"])
-    token = read_control_policy(path).decode("ascii").strip()
+    token = read_private_token(path)
     source = ForgejoWorkerSource(identity, Forgejo(identity.repository.forge, token=token), token_file=path)
     source.validate_binding()
     expected = os.environ.get("TAUCETI_FORGEJO_USER_ID")

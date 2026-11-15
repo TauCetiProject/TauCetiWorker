@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Cross-forge routing, independent outages, identities and budgets."""
 
+import contextlib
 import io
 import json
 import os
@@ -28,6 +29,52 @@ from tauceti_worker.worker_sources import configure, source_config
 
 
 class Sources(unittest.TestCase):
+    def test_native_cli_token_loading_does_not_require_host_root_uid_mapping(self):
+        from tauceti_queue.control_policy_file import ControlPolicyError
+        from tauceti_worker.source_cli import load_source
+
+        credential = self.root / "worker-token"
+        credential.write_text("private-test-token\n")
+        credential.chmod(0o600)
+        environment = dict(
+            TAUCETI_SOURCE_BINDING=json.dumps(self.identity.record()),
+            TAUCETI_FORGEJO_ORIGIN=self.repo.forge.url,
+            TAUCETI_FORGEJO_TOKEN_FILE=str(credential),
+            TAUCETI_FORGEJO_USER_ID="3",
+        )
+        with (
+            patch.dict(os.environ, environment),
+            patch("tauceti_queue.control_policy_file._directory", side_effect=ControlPolicyError("unmapped root UID")),
+            patch("tauceti_worker.forgejo_worker.ForgejoWorkerSource", return_value=self.source),
+            patch("tauceti_tools.forge.Forgejo") as client,
+        ):
+            self.assertIs(load_source(), self.source)
+            client.assert_called_once_with(self.repo.forge, token="private-test-token")
+            self.source.validate_binding.assert_called_once()
+            credential.chmod(0o644)
+            with self.assertRaises(ValueError):
+                load_source()
+            credential.chmod(0o600)
+            link = self.root / "symlink-token"
+            link.symlink_to(credential)
+            os.environ["TAUCETI_FORGEJO_TOKEN_FILE"] = str(link)
+            with self.assertRaises(OSError):
+                load_source()
+
+    def test_native_author_claim_uses_shared_github_namespace_resolution(self):
+        from tauceti_worker.source_claims import main
+
+        with (
+            patch.object(sys, "argv", ["claim-source", "acquire", "author/Algebra/test"]),
+            patch.dict(os.environ, {"TAUCETI_WORKER_ID": "native-worker"}),
+            patch("tauceti_worker.worker_sources.shared_github_environment", return_value=contextlib.nullcontext()),
+            patch("tauceti_worker.github.claims_repo", return_value="team/shared-claims"),
+            patch("tauceti_tools.claims.GitClaim") as claim,
+        ):
+            claim.return_value.command.return_value = 0
+            self.assertEqual(main(), 0)
+            self.assertEqual(claim.call_args.args[:3], ("team/shared-claims", "author/Algebra/test", "native-worker"))
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

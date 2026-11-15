@@ -1621,6 +1621,14 @@ class Controller:
                     self._renewing.pop(claim_token, None)
 
     def _task_checks_owner(self, task: dict[str, Any]) -> str:
+        if task["kind"] == TASK_REPAIR and any(
+            diagnostic.get("kind")
+            in {"audit", "duplicate_declaration", "import_collision", "lint", "environment_linter"}
+            for diagnostic in loads(task["diagnostics"], [])
+        ):
+            # A diagnosed check failure is required repair verification, not optional
+            # background work to hand off for another serial staging round.
+            return "worker"
         if task["kind"] not in BACKGROUND_TASKS:
             return "staging"
         head = self._head()
@@ -3954,6 +3962,8 @@ class Controller:
         assert canonical is not None
         task_claims = [c for c in self._active_claims(head["id"]) if c["task_id"] is not None]
         if task_claims:
+            if head["base"] != canonical:
+                self._cancel_superseded_runs(head["id"], now, reason="canonical advanced; rebase waits for worker")
             # A speculative repair runs alongside its own candidate CI, whose observation
             # continues without permitting promotion or replacing the claimed task.
             active = self._open_task(head)
@@ -3971,6 +3981,7 @@ class Controller:
             return
         if head["base"] != canonical:
             if not self._rebase_head(head, canonical, now):
+                self._cancel_superseded_runs(head["id"], now, reason="canonical advanced; rebase incomplete")
                 return
             head = self._head()
             assert head is not None
@@ -6893,6 +6904,8 @@ class Controller:
             due = [
                 e for e in self.store.rows("outbox", {"state": "pending"}, order="id") if e["next_attempt_at"] <= now
             ]
+            control = {"promote", "mixed-sync", "cancel_run", "retry_status_delivery"}
+            due.sort(key=lambda entry: (entry["kind"] not in control, entry["id"]))
         performed = 0
         retains = [e for e in due if e["kind"] == "retain_ref"]
         if len(retains) > 1 and hasattr(self.source, "update_refs"):

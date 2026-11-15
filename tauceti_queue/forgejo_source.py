@@ -55,6 +55,10 @@ class PublicationDamaged(Incomplete):
         self.head = None
 
 
+class PublicationSequenceConflict(Incomplete):
+    """Independent allocators reused one sequence; require operator reconciliation."""
+
+
 def principal(actor):
     return f"{actor.principal.forge.key}/users/{actor.principal.native_id}"
 
@@ -217,6 +221,48 @@ class NativePullNotFound(LookupError):
 
 class ForgejoSourceAdapter(ForgejoGitSource):
     task_git_transport = NATIVE_GIT_REFS
+
+    @classmethod
+    def for_publication(cls, publishers, client, directory, *, token):
+        """Use the receipt protocol without asserting any admission decision.
+
+        Only policy.binding/source_revision are used for publication. Actual
+        queue admission retains its configured rubric, scope and CI policy.
+        """
+        policy = NativeAdmissionPolicy(publishers, rubrics=("publication",), prefix="/", allow_files=())
+        return cls(publishers.source, client, directory, token=token, admission_policy=policy)
+
+    def validate_review_publisher(self):
+        self._bound(self.repository.name)
+        actor = SourceActor.from_native(self.repository.forge, self.client.current_user())
+        if actor.principal not in self.admission_policy.publishers.reviews or self._permission(actor) not in {
+            "write",
+            "admin",
+            "owner",
+        }:
+            raise PublisherNotGranted("native review actor is not an enrolled writable publisher")
+        return actor
+
+    def latest_publication_sequence(self, number, head, *, kind="review"):
+        self._positive(number)
+        self._sha(head)
+        if kind not in {"review", "recovery"}:
+            raise ValueError("unknown native publication kind")
+        context = (REVIEW_CONTEXT if kind == "review" else RECOVERY_CONTEXT) + str(number)
+        latest = self._publication_latest(self.client.statuses(self.repository, head), context)
+        return latest[1]["_sequence"] if latest is not None else 0
+
+    def review_publication_comments(self, number, head):
+        """Return only the current generation's receipt-selected review body."""
+        self._bound(self.repository.name)
+        comment, _state = self._publication_comment(
+            number,
+            self.client.statuses(self.repository, head),
+            REVIEW_CONTEXT + str(number),
+            self.admission_policy.publishers.reviews,
+            self.client.comments(self.repository, number),
+        )
+        return [comment] if comment is not None else []
 
     def __init__(self, identity, client, clone, *, token, admission_policy, timeout=120, clock=time.time):
         super().__init__(identity, client, clone, token=token, timeout=timeout)
@@ -477,7 +523,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         floor = max((r[0] for r in entries), default=0)
         floor_rows = [r for r in entries if r[0] == floor]
         if len({(r[1], r[3], principal(r[4])) for r in floor_rows}) > 1:
-            raise Incomplete("native publication sequence names different intents")
+            raise PublicationSequenceConflict("native publication sequence names different intents")
         if unknown_barrier:
             entries = [r for r in entries if r[5]["id"] > unknown_barrier and r[0] >= floor]
             if not any(r[2] in {"pending", "clear-pending"} for r in entries):
@@ -500,7 +546,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         selected = [r for r in entries if r[0] == sequence]
         identities = {(r[1], r[3], principal(r[4]) if r[4] is not None else None) for r in selected}
         if len(identities) != 1:
-            raise Incomplete("native publication sequence names different intents")
+            raise PublicationSequenceConflict("native publication sequence names different intents")
         registrations = [r for r in selected if r[2] in {"pending", "clear-pending"}]
         if not registrations:
             raise Incomplete("native publication has no intent registration")
@@ -813,7 +859,9 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             result = self.client.post_comment(self.repository, number, full)
         return str(self._positive(result.get("id")) if isinstance(result, dict) else self._positive(None))
 
-    def prepare_publication(self, repo, number, head, body, marker, *, sequence, kind="review", clear=False):
+    def prepare_publication(
+        self, repo, number, head, body, marker, *, sequence, kind="review", clear=False, nonce=None
+    ):
         """Freeze this record in the existing outbox before any remote write.
 
         sequence is a durable, strictly increasing number for this PR, kind and
@@ -836,7 +884,10 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         allowed = getattr(self.admission_policy.publishers, "reviews" if kind == "review" else "recoveries")
         if actor.principal not in allowed:
             raise PublisherNotGranted("native actor is not a configured publisher")
-        nonce = secrets.token_hex(16)
+        if nonce is None:
+            nonce = secrets.token_hex(16)
+        if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{32}", nonce) is None:
+            raise ValueError("native publication requires a valid reserved nonce")
         unique_marker = marker + ":" + nonce
         full = (
             ""
@@ -939,7 +990,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
                 )
             if stamp["_sequence"] == intent["sequence"]:
                 if issuer != actor or stamp["_nonce"] != intent["nonce"] or stamp["_digest"] != intent["digest"]:
-                    raise Incomplete("native publication sequence was reused for another intent")
+                    raise PublicationSequenceConflict("native publication sequence was reused for another intent")
                 if stamp["_stage"] not in {"pending", "clear-pending", "unverified"}:
                     comment, state = self._publication_comment(
                         intent["number"],

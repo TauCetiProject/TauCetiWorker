@@ -1484,6 +1484,42 @@ class RebaseArtifacts(Fixture):
     def fetches(self) -> list[str]:
         return [c.split("--rev=")[1] for c in self.lake_calls() if c.startswith("cache get")]
 
+    def test_explanation_follow_up_preserves_the_new_rebase_target(self):
+        self.raw["kind"] = "pre_rebase"
+        os.environ["STUB_AGENT_MODE"] = "no-explanation"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["resume"], "sess-1")
+        self.assertIn(f"chain on `{self.onto[:12]}`", calls[1]["prompt"])
+        self.assertNotIn(f"chain on `{self.content.base[:12]}`", calls[1]["prompt"])
+        described = re.search(re.escape(f"{PROJECT}#2") + r": `([0-9a-f]{12})`", calls[1]["prompt"])
+        self.assertIsNotNone(described)
+        sh(cfg.clone, "merge-base", "--is-ancestor", self.onto, described[1])
+        self.assertNotIn("BROKEN", sh(cfg.clone, "show", f"{described[1]}:TauCeti/Two.lean"))
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        comparison = chain_tool.compare(self.content.bare, self.content.base, self.content.tip, self.onto, pushed)
+        self.assertTrue(comparison.ok, comparison)
+
+    def test_service_explanation_retry_preserves_the_new_rebase_target(self):
+        self.service.result_script = [
+            {
+                "accepted": False,
+                "reason": "explanation-required",
+                "violations": [{"code": "explanation-required", "source_pr": f"{PROJECT}#2"}],
+            }
+        ]
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(self.service.results), 2)
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn(f"chain on `{self.onto[:12]}`", calls[1]["prompt"])
+        self.assertNotIn(f"chain on `{self.content.base[:12]}`", calls[1]["prompt"])
+
     def observe_log(self) -> list[str]:
         lines: list[str] = []
         original = repair_task.log

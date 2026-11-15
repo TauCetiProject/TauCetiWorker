@@ -121,10 +121,10 @@ def native_source(cfg):
         path = str(cfg.home / ".config/tauceti-forgejo/worker-token")
     if path is None:
         raise Die("set TAUCETI_FORGEJO_TOKEN_FILE to a private Forgejo credential file")
-    from tauceti_queue.control_policy_file import read_control_policy
+    from tauceti_tools.git_credentials import read_private_token
 
     try:
-        token = read_control_policy(Path(path)).decode("ascii").strip()
+        token = read_private_token(Path(path))
     except FileNotFoundError:
         token = None
         path = None
@@ -141,6 +141,7 @@ def native_source(cfg):
 
 
 def source_config(cfg, source):
+    source.review_publication_policy = review_publication_policy(cfg, source)
     suffix = hashlib.sha256(
         json.dumps({"repository": source.repository.key, "id": source.identity.native_id}, sort_keys=True).encode()
     ).hexdigest()[:24]
@@ -153,6 +154,15 @@ def source_config(cfg, source):
         sbcache=state / "cache/scoreboard",
         logdir=cfg.logdir / "sources" / suffix,
     )
+
+
+def review_publication_policy(cfg, source):
+    explicit = os.environ.get("TAUCETI_NATIVE_REVIEW_POLICY")
+    if explicit:
+        return explicit
+    candidate = cfg.home / ".config/tauceti-forgejo/review-publication.json"
+    canonical = source.repository.key == "forgejo:https://git.taucetiproject.org/taucetiproject/tauceti"
+    return str(candidate) if canonical and candidate.is_file() else None
 
 
 @contextlib.contextmanager
@@ -217,6 +227,12 @@ def activate(source, cfg):
         from .paths import self_env
 
         os.environ.update(self_env())
+        publication_policy = review_publication_policy(cfg, source)
+        if publication_policy:
+            os.environ.update(
+                TAUCETI_NATIVE_REVIEW_POLICY=publication_policy,
+                TAUCETI_NATIVE_REVIEW_PUBLISHER="tauceti_worker.native_review_publisher:QueueReviewPublisher",
+            )
         yield
     finally:
         os.environ.clear()
