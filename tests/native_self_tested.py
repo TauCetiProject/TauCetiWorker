@@ -4,7 +4,9 @@
 import copy
 import json
 import os
+import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -223,6 +225,69 @@ class NativeSelfTested(unittest.TestCase):
         self.source.reader.pulls.side_effect = ForgeError("outage", status=503)
         self.assertIsNone(self.source.pull_for_head("team", "roadmap/x"))
         self.assertEqual(self.source.reader.pulls.call_count, 4)
+
+    def test_native_roadmap_receipt_through_label_and_assertion(self):
+        from types import SimpleNamespace
+
+        from tauceti_worker import self_tested_label, verification
+
+        root, state = self.fixture.clone / "content", self.fixture.clone / "verification-state"
+        (root / "TauCeti").mkdir(parents=True)
+
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+
+        git("init", "-q", "-b", "main")
+        git("config", "user.name", "test")
+        git("config", "user.email", "test@example.com")
+        (root / "TauCeti/A.lean").write_text("-- base\n")
+        git("add", ".")
+        git("commit", "-q", "-m", "base")
+        base = git("rev-parse", "HEAD")
+        git("remote", "add", "origin", self.source.repository.clone_url)
+        git("update-ref", "refs/remotes/origin/main", base)
+        (root / "TauCeti/A.lean").write_text("-- verified change\n")
+        git("commit", "-q", "-am", "change")
+        head = git("rev-parse", "HEAD")
+        self.live["head"].update(sha=head, ref="roadmap/x")
+        self.source.reader.pulls = Mock(
+            return_value=[dict(number=1, headRefName="roadmap/x", headRepositoryOwner=dict(login="team"))]
+        )
+        project = self.fixture.clone / "project.toml"
+        self.source.write_cli_configuration(project)
+        inputs = dict(base=base, sources=verification.inventory(root, base))
+        fingerprint = verification.digest(inputs)
+        inputs_path = state / "inputs.json"
+        inputs_path.parent.mkdir()
+        inputs_path.write_text(json.dumps(inputs))
+        receipt = state / "verification" / "run" / "receipt.json"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(
+            json.dumps(
+                dict(
+                    schema=verification.SCHEMA,
+                    status="success",
+                    requested_phases=list(verification.STAGES),
+                    phases={name: dict(status="success") for name in verification.STAGES},
+                    scope=dict(policy="ordinary"),
+                    inputs=dict(path=str(inputs_path), sha256=fingerprint),
+                    fingerprint=fingerprint,
+                )
+            )
+        )
+        worker = SimpleNamespace(gh=self.source, cfg=SimpleNamespace(checkout=root, state=state))
+        candidate = SimpleNamespace(
+            pr=None, progress=dict(published_branches={"roadmap/x": head}, published_owner="team")
+        )
+        with (
+            patch.dict(os.environ, TAUCETI_SELF_TESTED="1", TAUCETI_CONF=str(project)),
+            patch("tauceti_worker.worker_sources.canonical_mathematics_source", return_value=True),
+        ):
+            result = self_tested_label.label_round_pushes(worker, candidate, "roadmap", time.time() - 5)
+        self.assertEqual(result, [(1, f"labelled {head[:12]}: self-tested confirmed")])
+        posts = [call for call in self.fixture.api.request.call_args_list if call.args[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        self.assertTrue(posts[0].args[1].endswith("/statuses/" + head))
 
 
 class CanonicalSource(unittest.TestCase):

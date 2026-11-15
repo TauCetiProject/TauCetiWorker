@@ -28,6 +28,7 @@ from .bump_attestation import LABEL, confirm_label
 from .verification import SCHEMA, STAGES, digest
 from .verification_scope import git, local_main
 
+
 def enabled() -> str:
     """Why the worker must not label anything, or "" when the self-tested route is on."""
     from .worker_sources import canonical_mathematics_source
