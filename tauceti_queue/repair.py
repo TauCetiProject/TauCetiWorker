@@ -2022,7 +2022,7 @@ def prepare_errors_lines(record: dict | None) -> list[str]:
 
 
 def explanation_prompt(unexplained: list[str], chain: list[ChainCommit], *, base: str | None = None) -> str:
-    """The short follow-up turn when content changed without an appended explanation."""
+    """Ask for missing explanations using the current result's commits and target base."""
     by_pr = {c.pr: c for c in chain if c.pr is not None}
     lines = [
         "The chain at HEAD changes the content of these constituent commits without appending an explanation to "
