@@ -8,8 +8,8 @@ import socket
 import sys
 import unittest
 import urllib.error
-from datetime import datetime
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch

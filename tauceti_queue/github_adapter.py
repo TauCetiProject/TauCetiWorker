@@ -980,7 +980,11 @@ class GitHubAdapter:
         """Source findings from the failed build job's log plus infrastructure findings of the run."""
         findings: list[dict] = []
         for job in jobs:
-            if job.get("conclusion") == "failure" and str(job.get("name") or "").rsplit(" / ", 1)[-1] == BUILD_JOB and job.get("id"):
+            if (
+                job.get("conclusion") == "failure"
+                and str(job.get("name") or "").rsplit(" / ", 1)[-1] == BUILD_JOB
+                and job.get("id")
+            ):
                 log = self.job_log(repo, int(job["id"]))
                 if log is not None:
                     findings.extend(diagnostics.parse_log(log.splitlines()))
