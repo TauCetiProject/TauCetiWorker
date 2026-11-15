@@ -26,7 +26,6 @@ from .constants import (
     CLAIMS,
     CONTEST_CLAIM_EMOJI,
     CONTEST_CLAIM_TTL,
-    GH_INROUND_WAIT,
     GH_SECONDARY_BASE,
     GH_TRANSIENT_BASE,
     GH_TRANSIENT_TRIES,
@@ -521,9 +520,9 @@ def _parse_iso8601(s: str | None) -> int | None:
 # ============================================================================
 # GitHub REST rate limits. A 403 mid-round wastes the agent's work, so we wait the limit out and retry
 # rather than failing the round (see GH_* constants). gh prints the limit kind on stdout/stderr.
-# Two kinds, handled differently because of the ROUND_TIMEOUT hard cap on a child round:
-#  - SECONDARY ("abuse") limits clear after a short, unspecified cooldown → wait IN PLACE and retry,
-#    bounded by GH_INROUND_WAIT so the wait can't blow the round timeout.
+# Two kinds, handled differently:
+#  - SECONDARY ("abuse") limits clear after a short, unspecified cooldown → wait IN PLACE and retry
+#    until it clears; only the round's hard cap (TAUCETI_ROUND_TIMEOUT) bounds the wait.
 #  - PRIMARY limits clear only at the hourly bucket reset → too long to wait under the round cap, so
 #    surface immediately and let the loop preflight (cmd_loop, no hard cap) wait the reset out before
 #    relaunching. (GitHub buckets core and graphql resets independently; the preflight watches both.)
@@ -591,10 +590,10 @@ def github_budget() -> dict | None:
 
 def _gh_secondary_wait(text: str, attempt: int) -> int:
     """Seconds to wait before retrying a SECONDARY-limited `gh` call: honor a Retry-After if gh echoed
-    one, else exponential from GH_SECONDARY_BASE. >= 1s, clamped to the in-round budget."""
+    one, else exponential from GH_SECONDARY_BASE. >= 1s."""
     ra = _parse_retry_after(_gh_retry_after(text))
     nap = int(ra) if ra is not None else GH_SECONDARY_BASE * (1 << min(attempt, 4))
-    return max(1, min(nap, GH_INROUND_WAIT))
+    return max(1, nap)
 
 
 def _gh_retry_after(text: str) -> str | None:
@@ -603,9 +602,9 @@ def _gh_retry_after(text: str) -> str | None:
     return m.group(1) if m else None
 
 
-def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROUND_WAIT) -> subprocess.CompletedProcess:
+def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int | None = None) -> subprocess.CompletedProcess:
     """Run a `gh` command, waiting out a SECONDARY GitHub rate limit IN PLACE and retrying so the limit
-    costs a pause, not a discarded round (bounded by max_wait so it can't blow ROUND_TIMEOUT). A PRIMARY
+    costs a pause, not a discarded round (``max_wait`` optionally bounds the total wait). A PRIMARY
     (hourly) limit is surfaced immediately — waiting an hour inside a round under the 90-min cap would
     just be SIGKILLed; the loop preflight waits that reset out instead.
 
@@ -632,7 +631,7 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
             if not (_gh_transient(text) and _gh_read_only(argv)) or tries >= GH_TRANSIENT_TRIES:
                 return p
             nap = GH_TRANSIENT_BASE << tries
-            if waited + nap > max_wait:
+            if max_wait is not None and waited + nap > max_wait:
                 return p
             log(f"gh: {one_line(text, 120)} — transient, retrying in {nap}s ({' '.join(argv[1:3])})")
             time.sleep(nap)
@@ -651,7 +650,7 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
             )
             return p
         nap = _gh_secondary_wait(text, attempt)
-        if waited + nap > max_wait:
+        if max_wait is not None and waited + nap > max_wait:
             log(
                 f"gh: secondary rate limit, but the in-round wait budget is spent ({waited}s) — "
                 f"surfacing the error so the round backs off"

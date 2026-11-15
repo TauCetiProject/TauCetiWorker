@@ -555,12 +555,10 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "For diagnosis, use `--stage build|axioms|module-system|lint|shim-expiry`; final verification uses all stages. "
         "Exact-input phase receipts avoid repeated successful work; use `--no-reuse` only to investigate evidence. "
         "Foreground verification may use the remaining round budget; do not impose a ten-minute timeout. "
-        "If an interrupted helper hands verification to a supervisor continuation, let it finish there. "
         "If Codex returns an execution session ID, keep waiting on that same session with write_stdin until it exits. "
         "Write diagnostic logs and module lists outside the checkout (the helper already keeps logs in worker state). "
-        "A failed/incomplete receipt is never green. Keep unfinished edits recoverable at the round deadline. "
-        "On disk-pressure, preserve edits; a pending result with a continuation job belongs to the supervisor. "
-        "An incomplete result without a continuation needs a later invocation in the preserved workspace; do not spin on unchanged checks. "
+        "A failed/incomplete receipt is never green; do not spin on unchanged checks. "
+        "Push work when it is ready: anything unpushed is discarded when the round ends. "
         "Do not background tools or wait with `pgrep`, and do not expect a background job to notify or resume you. "
         "Do not run the old scope recipe, raw final audit/lint commands or `scripts/lint-scope.sh` alongside the helper. "
         "If piping diagnostic commands, use `set -o pipefail`. In your report quote the `scope:` line, "
@@ -711,82 +709,86 @@ def repair_origin(co: Path) -> bool:
     return subprocess.run(["git", "-C", str(co), "remote", "add", "origin", checkout_url()]).returncode == 0
 
 
+def discard_checkout(path: Path, why: str) -> bool:
+    """Delete a checkout that cannot be reset in place; anything unpushed in it is abandoned.
+
+    Deletion goes through ``retention.remove``: never through a symlink, never a mount point, and
+    never a tree a live process still uses (that is reported and retried next round)."""
+    from . import retention
+
+    report = retention.fresh_report()
+    try:
+        # Anchored one level up, so a symlinked parent directory is refused like any other link.
+        retention.remove(path, path.parent.parent, report, check_users=True)
+    except OSError as error:
+        retention.note(report, "errors", f"{path}: {error}")
+    for error in report["errors"]:
+        log(f"checkout: deletion deferred: {error}")
+    if path.exists() or path.is_symlink():
+        log(f"checkout: could not delete {path} ({why}); retrying next round")
+        return False
+    log(f"checkout: deleted {path} ({why})")
+    return True
+
+
 def prepare_checkout(
     cfg: Config, *, work: str | None = None, pr: int | None = None, roadmap: str | None = None
 ) -> bool:
     """Clean checkout of TauCeti main; keep .lake for fast rebuilds, drop every other leftover.
 
-    Leftovers are only dropped after `work_recovery.guard` saves them in a durable recovery record.
-    If the checkout cannot be reset safely (a process still uses it, or saving fails), the guard
-    moves it aside whole and this clones a fresh one, so preparation never waits for a human.
-    `work`/`pr`/`roadmap` name the round that takes the checkout, so a later record can say which
-    round left the source."""
-    from . import work_recovery
-
+    Rounds are all-or-nothing: whatever an earlier round pushed is on the remote, and anything it
+    left unpushed in the checkout is discarded here. A checkout that cannot be reset in place (no
+    git metadata, a failed forced checkout) is deleted and cloned afresh.
+    `work`/`pr`/`roadmap` name the round that takes the checkout (unused; kept for callers)."""
     sync_mathlib_pool(cfg)
     co = cfg.checkout
+    from . import round_worktrees
+    from .live_use import checkout_kind
+
+    if round_worktrees.enabled():
+        if not round_worktrees.prepare(cfg, checkout_url()):
+            return False
+        return _finish_checkout(cfg, co)
+    if not round_worktrees.retire(cfg):
+        return False
 
     def clone(why: str) -> bool:
         co.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            work_recovery.detach_handoff_owner(cfg)
-        except OSError as error:
-            log(f"checkout ownership detach deferred: {error}")
-            return False
         log(f"cloning {TAUCETI} → {co} ({why})")
         return subprocess.run(["git", "clone", "-q", checkout_url(), str(co)]).returncode == 0
 
-    if co.exists() and not (co / ".git").is_dir():
+    if co.exists() and checkout_kind(co) is None:
         # An interrupted clone (or anything else without git metadata) would fail every round.
-        if not work_recovery.retain(cfg, co, "the checkout has no git metadata").ok:
+        if not discard_checkout(co, "the checkout has no git metadata"):
             return False
-    if not (co / ".git").is_dir() and not clone("first run"):
+    if not (co / ".git").exists() and not clone("first run"):
         return False
+    round_worktrees.restore_parked(cfg)
 
     def g(*a) -> int:
         return subprocess.run(["git", "-C", str(co), *a]).returncode
 
-    # Before the fetch, so damaged metadata fails inspection and is moved aside rather than failing
-    # every round; a stale view of the remote only makes the guard save more.
-    decision = work_recovery.guard(cfg, co)
-    if not decision.ok:
-        log(f"checkout preparation refused: {decision.reason}")
-        return False
-    if decision.state == "retained" and not clone("previous checkout moved aside"):
-        return False
     if not repair_origin(co):
         log("checkout preparation refused: could not restore the canonical origin remote")
         return False
     if g("fetch", "-q", "origin"):
         return False  # usually the network; the next round retries
-    try:
-        work_recovery.detach_handoff_owner(cfg)
-    except OSError as error:
-        log(f"checkout ownership detach deferred: {error}")
-        return False
-    # -f discards a prior round's leftover edits (now saved) and lands us on main in one step; a plain
+    base = os.environ.get("TAUCETI_BASE_BRANCH", "main")
+    # -f discards a prior round's leftover edits and lands us on main in one step; a plain
     # switch/checkout would refuse on a dirty tree (two noisy errors) and could leave HEAD on the old
-    # branch with only main's content. A local failure (a stale index.lock, a damaged worktree) moves
-    # the checkout aside and starts again from a fresh clone instead of failing every round.
-    if g(
-        "checkout",
-        "-q",
-        "-f",
-        "-B",
-        os.environ.get("TAUCETI_BASE_BRANCH", "main"),
-        "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main"),
-    ):
-        if not work_recovery.retain(cfg, co, "forced checkout of main failed").ok:
+    # branch with only main's content. A local failure (a stale index.lock, a damaged worktree)
+    # deletes the checkout and starts again from a fresh clone instead of failing every round.
+    if g("checkout", "-q", "-f", "-B", base, "origin/" + base):
+        if not discard_checkout(co, "forced checkout of main failed"):
             return False
-        if not clone("forced checkout failed") or g(
-            "checkout",
-            "-q",
-            "-f",
-            "-B",
-            os.environ.get("TAUCETI_BASE_BRANCH", "main"),
-            "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main"),
-        ):
+        if not clone("forced checkout failed") or g("checkout", "-q", "-f", "-B", base, "origin/" + base):
             return False
+    g("clean", "-fdxq", "-e", ".lake")
+    return _finish_checkout(cfg, co)
+
+
+def _finish_checkout(cfg: Config, co: Path) -> bool:
+    """Shared tail of checkout preparation, once HEAD is canonical main."""
     # Origin was validated and fetched above, and HEAD is now its main commit.
     # Carry that exact base into verification rather than asking the standalone
     # verifier to rediscover a canonical remote (which defaults to GitHub).
@@ -800,9 +802,6 @@ def prepare_checkout(
     # Compare canonical main, rather than an arbitrary PR branch, and retire old-toolchain artifacts
     # before anything can begin writing this worker's private Lake store again.
     clean_lake_cache_after_toolchain_bump(cfg)
-    g("clean", "-fdxq", "-e", ".lake")
-    # Attribution only: a failure is logged by note_owner and never stops the round.
-    work_recovery.note_owner(cfg, work=work, pr=pr, roadmap=roadmap)
     return True
 
 
@@ -960,10 +959,15 @@ def run_agent_host(
     session_scope=None,
     quota_cfg=None,
     cache_note: bool = True,
+    queue_mathlib: bool = False,
 ) -> int:
     """``cache_note=False`` leaves out the build-cache appendix (fetch commands and the
     ``TAUCETI_PR_CACHE_MISS`` stop rule): the queue's repair worker warms the tree itself and its own
-    prompt tells the agent not to fetch, and a queue head's tip is never in the public cache."""
+    prompt tells the agent not to fetch, and a queue head's tip is never in the public cache.
+
+    ``queue_mathlib=True`` is only for the queue's repair service, whose own sandboxed builds run
+    outside any shared view on a Mathlib it prepares itself; moving that producer onto the shared
+    layout is a later step. Worker rounds never pass it."""
     global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
     if (
@@ -972,11 +976,15 @@ def run_agent_host(
         and any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean"))
     ):
         prompt += (
-            "\n\nBuild cache preparation: the worker attempted to warm Mathlib and TauCeti artifacts for this "
-            "checkout and current main. The public `tauceti-public` Lake service remains configured "
-            "during this run. After merging/rebasing, changing the toolchain or dependencies, or "
-            "repairing a malformed workspace, fetch both caches before building:\n"
-            "lake exe cache get\n"
+            "\n\nBuild cache preparation: Mathlib and its dependencies (Batteries, Aesop, Qq, ProofWidgets "
+            "and the rest) come from this host's shared, read-only build, attached under "
+            "`.lake/packages`; the worker also warmed TauCeti artifacts for this checkout and current "
+            "main. Never run `lake exe cache get` or `lake update`: there is nothing to fetch, and the "
+            "shared sources cannot be changed from this round. If merging/rebasing changes the Mathlib "
+            "pin in `lake-manifest.json`, `lake` refuses to build until it matches the shared build "
+            "again; stop and report instead of working around it. The public `tauceti-public` Lake "
+            "service remains configured during this run. After merging/rebasing, fetch TauCeti's cache "
+            "before building:\n"
             f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI} "
             f"--max-revs={lake_cache_max_revs(os.environ)}\n"
             "A transport or incomplete-artifact download failure is infrastructure trouble: report "
@@ -1002,11 +1010,7 @@ def run_agent_host(
             argv += [resume, "-" if stdin_text is not None else prompt]
         elif profile.provider == "claude":
             argv += ["--resume", resume]
-    if env.get("TAUCETI_RECOVERY_CONTINUATION") == "1":
-        env.pop("GH_TOKEN", None)
-        env.pop("GITHUB_TOKEN", None)
     if session_path:
-        from .repair_recovery import conversation_identity
         from .runtime_status import atomic_json
 
         try:
@@ -1015,14 +1019,13 @@ def run_agent_host(
                 dict(
                     profile=asdict(profile),
                     actor=session_actor,
-                    identity=conversation_identity(profile.provider),
                     scope=session_scope,
                     session=resume,
                     cwd=str(cwd),
                 ),
             )
         except OSError as error:
-            log(f"provider session identity could not be saved: {error}; starting without resumable identity")
+            log(f"provider session record could not be saved: {error}; follow-up turns start afresh")
             session_path = None
     if not env.get("TAUCETI_VERIFY_BASE") and (cwd / ".git").exists():
         from .verification_scope import local_main
@@ -1036,7 +1039,9 @@ def run_agent_host(
         print(f"HOST cwd={cwd}\n  " + " ".join(_shq(a) for a in argv))
         return 0
     _LAST_AGENT_FAILURE = None
-    with host_build_cache_context(cwd, env, logdir) as prefix:
+    from . import round_storage
+
+    with host_build_cache_context(cwd, env, logdir, **({"queue_mathlib": True} if queue_mathlib else {})) as prefix:
         if not cache_note:
             env.pop("TAUCETI_PR_CACHE_MISS", None)  # the convention belongs to the appendix left out
         rc = run_agent_proc(
@@ -1050,11 +1055,19 @@ def run_agent_host(
             session_path=session_path,
             quota_cfg=quota_cfg,
             stdin_text=stdin_text,
+            # Before launch, after preparation: the baseline is the build state the round inherits.
+            storage=round_storage.start(cwd, env, quota_cfg),
         )
         if env.get("TAUCETI_SHARED_MATHLIB_KEY"):
             from .shared_mathlib import record_result
 
             record_result(env, rc)
+        # H2: the agent's process group has been reaped, so no Lake can be writing the checkout.
+        # Exit 70 is the guardian's "child lifetime cleanup incomplete": no quiescent boundary.
+        if rc == 70:
+            log("canonical store (round-end): agent cleanup incomplete; relinking left for the next round")
+        else:
+            relink_build_outputs(cwd, env, phase="round-end")
     if rc == 75:
         from .claude_api import blocked_reason
 
@@ -1198,6 +1211,7 @@ def run_agent_proc(
     session_path=None,
     quota_cfg=None,
     stdin_text: str | None = None,
+    storage=None,
 ) -> int:
     """Run an agent subprocess through its readable transcript renderer.
 
@@ -1206,6 +1220,8 @@ def run_agent_proc(
     failures aren't silent. ``stdin_text`` (a prompt too long for argv, see ``host_agent_launch``) is
     written to the process's stdin from a separate thread, so a prompt larger than the pipe buffer
     cannot deadlock against the transcript being read here, and stdin is closed once it is delivered.
+    ``storage`` (a ``round_storage.RoundStorage``) watches the round's private bytes while the agent
+    runs; past its cap it kills the group and, once the group is reaped, raises ``RoundAbandoned``.
     """
     global _LAST_AGENT_FAILURE, _LAST_AGENT_RUN
     _LAST_AGENT_FAILURE = None
@@ -1293,6 +1309,8 @@ def run_agent_proc(
                 thread = threading.Thread(target=cancel_on_lease_loss, daemon=True)
                 thread.start()
                 monitor = thread
+            if storage is not None:
+                storage.watch(proc, finished)
             for line in proc.stdout:
                 if session_path:
                     try:
@@ -1305,8 +1323,8 @@ def run_agent_proc(
                             else None
                         )
                         if session:
+                            from .live_use import fsync_dir as _fsync_dir
                             from .runtime_status import atomic_json, read_json
-                            from .work_recovery import _fsync_dir
 
                             value = read_json(session_path)
                             value["session"] = session
@@ -1315,7 +1333,7 @@ def run_agent_proc(
                     except (ValueError, AttributeError):
                         pass
                     except OSError as error:
-                        log(f"provider session identity could not be saved: {error}; source remains recoverable")
+                        log(f"provider session record could not be saved: {error}")
                 rendered = renderer.render_line(line)
                 if rendered:
                     write_rendered(destination, rendered)
@@ -1329,6 +1347,10 @@ def run_agent_proc(
                     monitor.join(3)
                 if feeder is not None:
                     feeder.join(3)
+                if storage is not None:
+                    # The group is reaped. Also on an exceptional exit, so a killed round is
+                    # still abandoned; past the cap this raises RoundAbandoned.
+                    storage.conclude(proc.returncode)
         from .overlap_support import atomic
 
         telemetry = {
@@ -1489,7 +1511,6 @@ class AgentLaunchUnavailable(BuildCacheUnavailable):
     """A process creation failure before the agent existed."""
 
 
-HOST_CACHE_TIMEOUT = 1200
 _LAKE_FALSE = {"0", "false", "no", "off", "n", "f"}
 
 
@@ -1501,16 +1522,55 @@ def lake_cache_max_revs(env: dict) -> str:
 
 
 @contextlib.contextmanager
-def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
+def host_build_cache_context(cwd: Path, env: dict, logdir: Path, *, queue_mathlib: bool = False):
     """Keep the public service available through repairs, merges and dependency changes."""
     from .build_resources import defaults
 
     defaults(env)
-    if not TAUCETI_CACHE_SERVICE:
-        yield
-        return
     if not any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
         yield
+        return
+    logdir.mkdir(parents=True, exist_ok=True)  # callers append their own logs here afterwards
+    from . import shared_mathlib
+
+    def mathlib_view():
+        if queue_mathlib:
+            # The queue repair service's checkout keeps the Mathlib it prepares (see run_agent_host).
+            return contextlib.nullcontext([])
+        return shared_mathlib.view(cwd, env, logdir, _cache_fetch)
+
+    if queue_mathlib:
+        env["TAUCETI_QUEUE_MATHLIB"] = "1"
+    try:
+        with _host_build_cache_context(cwd, env, logdir, mathlib_view) as prefix:
+            yield prefix
+    finally:
+        env.pop("TAUCETI_QUEUE_MATHLIB", None)
+
+
+@contextlib.contextmanager
+def _host_build_cache_context(cwd: Path, env: dict, logdir: Path, mathlib_view):
+    if not TAUCETI_CACHE_SERVICE:
+        # No TauCeti artifact service to warm, but Mathlib must still come from the shared
+        # build: without the view the agent's first `lake build` compiles it privately.
+        from . import shared_mathlib
+
+        try:
+            with (
+                shared_mathlib.rebase_target(cwd, env) as restore,
+                mathlib_view() as prefix,
+            ):
+                if prefix:
+                    env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
+                try:
+                    restore()
+                    yield prefix
+                finally:
+                    env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)
+        except shared_mathlib.Unavailable as error:
+            raise BuildCacheUnavailable(
+                f"shared Mathlib preparation unavailable: {error}", log_file=logdir / "shared-mathlib-prepare.log"
+            ) from error
         return
     with tempfile.TemporaryDirectory(prefix="tauceti-lake-config-") as tmp:
         config = Path(tmp) / "lake.toml"
@@ -1528,19 +1588,30 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
         report = {}
         mathlib_started = expanded_cache.clock()
         try:
-            with shared_mathlib.view(cwd, env, logdir, _cache_fetch) as prefix:
+            with (
+                shared_mathlib.rebase_target(cwd, env) as restore,
+                mathlib_view() as prefix,
+            ):
                 expanded_cache.record_phase(report, "mathlib_view", mathlib_started)
                 if prefix:
                     env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(prefix)
                 try:
                     try:
                         prepare_host_build_caches(cwd, env, logdir, report=report)
+                    except expanded_cache.Unavailable as error:
+                        if prefix:
+                            shared_mathlib.preparation_status(env, error=error)
+                        message = f"shared build outputs unavailable: {error}; agent not started"
+                        log(message)
+                        raise BuildCacheUnavailable(message) from error
                     except Exception as error:
                         if prefix:
                             shared_mathlib.preparation_status(env, error=error)
                         raise
                     if prefix:
                         shared_mathlib.preparation_status(env)
+                    restore()  # a rebase round's agent starts on its own branch's files
+                    relink_build_outputs(cwd, env, phase="prepare", prefix=prefix)  # H1
                     yield prefix
                 finally:
                     env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)
@@ -1548,6 +1619,25 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path):
             raise BuildCacheUnavailable(
                 f"shared Mathlib preparation unavailable: {error}", log_file=logdir / "shared-mathlib-prepare.log"
             ) from error
+
+
+def relink_build_outputs(cwd: Path, env: dict, *, phase: str, prefix=()) -> dict | None:
+    """Converge the checkout's TauCeti outputs on the host's canonical objects (one inode each).
+
+    `prepare` runs before the agent starts and probes hard links in its namespace: a failed probe
+    stops the round, because Lake would silently copy. Relinking itself is maintenance: failures
+    are logged and retried at the next boundary, never allowed to discard or block a round.
+    """
+    from . import canonical_store
+
+    try:
+        return canonical_store.boundary(cwd, env, phase=phase, prefix=prefix or ())
+    except canonical_store.expanded_cache.Unavailable as error:
+        message = f"canonical build outputs ({phase}): {error}"
+        log(message)
+        if phase == "prepare":
+            raise BuildCacheUnavailable(message + "; agent not started") from error
+        return None
 
 
 def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -> None:
@@ -1580,7 +1670,7 @@ def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None
         warm_host_build_caches(cwd, warm_env, logdir, report=report)
 
 
-def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float) -> int:
+def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float | None) -> int:
     """Bind the downloader process group to the worker, including after parent SIGKILL.
 
     The pipe guardian retains the snapshot lease and kills its process group if
@@ -1634,13 +1724,16 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
 
     Genuine workspace errors must reach repair agents. Transport, publication and partial-download
     failures stop before an agent starts. Lake verifies and atomically installs artifacts, so retries
-    retain successful downloads. All fetches together have one twenty-minute deadline.
+    retain successful downloads. Fetches have no wall-clock deadline of their own: Lake's HTTP
+    timeouts cover a hung connection, and the round's hard cap (TAUCETI_ROUND_TIMEOUT) the rest.
     """
+    from . import shared_mathlib
+
     prefix = json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]"))
     max_revs = lake_cache_max_revs(env)
+    has_mathlib = shared_mathlib._names_mathlib(cwd)
     logdir.mkdir(parents=True, exist_ok=True)
     logf = logdir / f"build-cache-{time.strftime('%Y%m%d-%H%M%S')}.log"
-    deadline = time.monotonic() + HOST_CACHE_TIMEOUT
     log(f"host build caches: warming Mathlib and TauCeti; output → {logf}")
 
     def unavailable(reason: str):
@@ -1651,9 +1744,6 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
 
     def fetch(label: str, command: list[str]) -> str:
         for attempt in range(1, 3):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                unavailable("build cache preparation deadline exceeded")
             with logf.open("ab") as output:
                 offset = output.tell()
                 output.write(f"{label} cache, attempt {attempt}: {' '.join(command)}\n".encode())
@@ -1662,7 +1752,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
                     from .expanded_cache import measured
 
                     with measured(report, label.lower().replace(" ", "_") + "_fetch"):
-                        rc = _cache_fetch([*prefix, *command], cwd, env, output, remaining)
+                        rc = _cache_fetch([*prefix, *command], cwd, env, output, None)
                 except (OSError, subprocess.TimeoutExpired) as e:
                     output.write(f"cache command failed: {e}\n".encode())
                     rc = 1
@@ -1717,8 +1807,19 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
             unavailable(f"{label} build cache download failed")
         raise AssertionError("unreachable")
 
-    if fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
-        return
+    shared_view = bool(json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]")))
+    if not has_mathlib:
+        log("host build caches: the workspace does not depend on Mathlib; no Mathlib cache to fetch")
+    elif shared_view:
+        # The shared entry holds the build of Mathlib and its whole dependency closure. Running
+        # `lake exe cache get` inside the view re-extracts every archive, and each new file lands in
+        # this checkout's private overlay upper: a full private copy under a "shared" round.
+        log("host build caches: Mathlib and its dependencies come from the shared build; not fetching them")
+    elif env.get("TAUCETI_QUEUE_MATHLIB") != "1":
+        # Sharing is the only way a round gets Mathlib; a private `cache get` is a private copy.
+        unavailable("this workspace needs Mathlib but has no shared Mathlib view")
+    elif fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
+        return  # the queue repair service's own Mathlib, until that producer shares too
     # Mathlib itself knows which compressed archives the selected dependency tree
     # needs. Prune stale private links daily so pool GC can actually release them;
     # otherwise the old promote/hydrate-all exchange resurrects dead archives forever.
@@ -1735,7 +1836,6 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
         and mathlib_private != home
         and (mathlib_pool.parent / "owner.json").is_file()
         and time.time() - read_json(marker).get("at", 0) > 86400
-        and deadline - time.monotonic() > 60
     ):
         try:
             # Failed housekeeping retries in an hour, never on every paid round.
@@ -1746,7 +1846,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
                     cwd,
                     env,
                     output,
-                    max(1, min(30, deadline - time.monotonic())),
+                    30,  # housekeeping only; a slow clean is retried in an hour
                 )
             if rc == 0:
                 build_caches.link_into(mathlib_private, mathlib_pool)
@@ -2230,9 +2330,7 @@ def bubble_work_cmd(inner: str, *, verify_helper=False) -> str:
     library from source, every round, for as long as the endpoint stayed down.
     """
     preliminary = (
-        '"$TAUCETI_VERIFY_PYTHON" "/opt/round/tauceti-verify" --stage build'
-        if verify_helper
-        else "timeout 1800 lake build"
+        '"$TAUCETI_VERIFY_PYTHON" "/opt/round/tauceti-verify" --stage build' if verify_helper else "lake build"
     )
     if not TAUCETI_CACHE_SERVICE:
         return f"set -e; lake exe cache get || lake exe cache get; {preliminary} || true; exec {inner}"
@@ -2391,7 +2489,6 @@ def run_in_bubble(
     local_lint_cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     if helper_on:
         from .verification import cache_root
-        from .verification_storage import root as storage_root
 
         package = rounddir / "tauceti_worker"
         shutil.copytree(
@@ -2403,8 +2500,6 @@ def run_in_bubble(
         (rounddir / "tauceti-verify").chmod(0o755)
         verify_state = cfg.state / "verification-state"
         verify_state.mkdir(parents=True, exist_ok=True)
-        verify_storage = storage_root().resolve()
-        verify_storage.mkdir(parents=True, exist_ok=True, mode=0o700)
         host_cache = None
         with contextlib.suppress(OSError, ValueError):
             host_cache = cache_root()
@@ -2431,8 +2526,6 @@ def run_in_bubble(
         mount_flags += [
             "--mount",
             f"{verify_state}:/opt/verification-state:rw",
-            "--mount",
-            f"{verify_storage}:{verify_storage}:rw",
         ]
         if host_cache is not None:
             mount_flags += ["--mount", f"{host_cache}:/opt/verification-cache:rw"]
@@ -2532,30 +2625,13 @@ def run_in_bubble(
         for key, value in {
             "TAUCETI_VERIFY_STATE": "/opt/verification-state",
             "TAUCETI_VERIFY_HOST_STATE": str(verify_state.resolve()),
-            "TAUCETI_VERIFY_STORAGE_DIR": str(verify_storage),
             "TAUCETI_VERIFY_CACHE_DIR": "/opt/verification-cache"
             if host_cache is not None
             else "/tmp/verification-cache",
             "TAUCETI_VERIFY_POLICY": os.environ.get("TAUCETI_VERIFY_POLICY", "ordinary"),
-            "TAUCETI_ROUND_DEADLINE": str(getattr(getattr(w, "rc", None), "deadline", time.time() + 7200)),
-            "TAUCETI_VERIFY_CHECKPOINT_MARGIN": os.environ.get("TAUCETI_VERIFY_CHECKPOINT_MARGIN", "600"),
             "TAUCETI_VERIFY_BUBBLE": "1",
         }.items():
             tcenv += f" {key}={shlex.quote(value)}"
-        for name in (
-            "STORAGE_BYTES",
-            "CANDIDATE_BYTES",
-            "SOURCE_CANDIDATE_BYTES",
-            "CHECKPOINT_BYTES",
-            "CHECKPOINT_POOL_BYTES",
-            "MIN_FREE_BYTES",
-            "MIN_FREE_PERCENT",
-            "OWNERSHIP_SECONDS",
-            "COMPLETED_CACHE_SECONDS",
-            "IDLE_CACHE_SECONDS",
-        ):
-            if value := os.environ.get("TAUCETI_VERIFY_" + name):
-                tcenv += f" TAUCETI_VERIFY_{name}={shlex.quote(value)}"
     if snapshot:
         tcenv += " TAUCETI_CONF=/opt/project.toml TAUCETI_CONF_SOURCE=/opt/project.toml TAUCETI_CONF_SNAPSHOT=/opt/project.toml"
         from tauceti_tools.project import active
@@ -2747,7 +2823,7 @@ _REVIEW_SOURCE_STAGING = ".tauceti-source-staging.json"
 
 def _prune_review_mathlib_staging(base):
     """Only marked, unlocked temporary producers; published Bubble mounts stay alone."""
-    from . import retention, work_recovery
+    from . import live_use, retention
 
     try:
         candidates = list(base.glob("mathlib-src-tmp-*"))
@@ -2775,9 +2851,9 @@ def _prune_review_mathlib_staging(base):
                         continue
                 original = path.stat()
                 if observations is None:
-                    observations = work_recovery.process_references(), retention.mount_points()
+                    observations = live_use.process_references(), retention.mount_points()
                 references, mounts = observations
-                if work_recovery.referenced_users(path, references) or mounts is None:
+                if live_use.referenced_users(path, references) or mounts is None:
                     continue
                 current = path.stat()
                 if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
@@ -2815,11 +2891,46 @@ def _review_mathlib_staging(base):
         _prune_review_mathlib_staging(base)
 
 
-def _review_mathlib_source(cfg: Config, head: str) -> Path | None:
-    """Mathlib source at the reviewed head's pin, for the reviewers' greps. Staged host-side
-    because the bubble's repo-scoped proxy cannot reach mathlib4; one snapshot per revision, the
-    two newest kept. None means the manifest declares no Mathlib dependency; staging failures
-    stop the round before a reviewer can run without required sources."""
+REVIEW_SOURCE_MIN_AGE = 86400
+
+
+def _review_source_base() -> Path:
+    """One host-wide directory of exact Mathlib sources for Bubble reviewers, shared by workers."""
+    from .shared_repositories import root
+
+    return root() / "mathlib-sources-v1"
+
+
+def _discard_legacy_review_sources(cfg: Config) -> None:
+    """Delete the per-worker snapshots earlier workers kept under their own state."""
+    legacy = cfg.state / "refs"
+    with contextlib.suppress(OSError):
+        _prune_review_mathlib_staging(legacy)
+        for old in legacy.glob("mathlib-src-*"):
+            if not old.name.startswith("mathlib-src-tmp-") and old.is_dir() and not old.is_symlink():
+                shutil.rmtree(old, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _review_source_lease(base: Path, rev: str, *, exclusive=False, blocking=True):
+    locks = base / "locks"
+    locks.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (locks / f"{rev}.lock").open("a+") as stream:
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(stream, mode | (0 if blocking else fcntl.LOCK_NB))
+        yield stream.fileno()
+
+
+@contextlib.contextmanager
+def _review_mathlib_source(cfg: Config, head: str):
+    """Mathlib source at the reviewed head's pin, for the reviewers' greps, held while in use.
+
+    Staged host-side because the bubble's repo-scoped proxy cannot reach mathlib4. One read-only
+    snapshot per revision for the whole host, the two newest kept; a review holds a shared lease
+    on its revision, so pruning never removes a mounted snapshot. Yields None when the manifest
+    declares no Mathlib dependency; staging failures stop the round before a reviewer can run
+    without required sources.
+    """
     from .github import gh_run
 
     got = gh_run(
@@ -2839,59 +2950,85 @@ def _review_mathlib_source(cfg: Config, head: str) -> Path | None:
             raise ValueError("invalid package list")
         mathlib = next((p for p in packages if p.get("name") == "mathlib"), None)
         if mathlib is None:
-            return None
+            yield None
+            return
         rev = mathlib["rev"]
     except (ValueError, KeyError, TypeError) as error:
         raise NoProgress("review: invalid exact-head dependency manifest; no review started") from error
     if not isinstance(rev, str) or not re.fullmatch(r"[0-9a-f]{40}", rev):
         raise NoProgress("review: Mathlib revision is not pinned to a commit; no review started")
-    base = cfg.state / "refs"
+    _discard_legacy_review_sources(cfg)
+    base = _review_source_base()
+    base.mkdir(parents=True, exist_ok=True)
     _prune_review_mathlib_staging(base)
     src = base / f"mathlib-src-{rev}"
-    if (src / "Mathlib.lean").is_file():
-        return src
-    base.mkdir(parents=True, exist_ok=True)
-    with _review_mathlib_staging(base) as (tmp, lease_fd):
-        steps = (
-            ["git", "init", "-q", str(tmp)],
-            [
-                "git",
-                "-C",
-                str(tmp),
-                "fetch",
-                "-q",
-                "--depth",
-                "1",
-                "https://github.com/leanprover-community/mathlib4",
-                rev,
-            ],
-            ["git", "-C", str(tmp), "checkout", "-q", "FETCH_HEAD"],
-        )
-        try:
-            failed = any(subprocess.run(step, timeout=600, pass_fds=(lease_fd,)).returncode for step in steps)
-        except (OSError, subprocess.TimeoutExpired):
-            failed = True
-        if failed:
-            raise NoProgress("review: could not stage the pinned Mathlib sources; no review started")
-        shutil.rmtree(tmp / ".git", ignore_errors=True)
-        try:
-            tmp.rename(src)
-        except OSError:  # a concurrent worker staged the same revision first
-            pass  # This producer's private staging is removed before releasing its lease.
-    snapshots = sorted(
-        (p for p in base.glob("mathlib-src-*") if not p.name.startswith("mathlib-src-tmp-")),
-        key=lambda p: p.stat().st_mtime,
-    )
-    for old in snapshots[:-2]:
-        if old != src:
-            shutil.rmtree(old, ignore_errors=True)
-    if not (src / "Mathlib.lean").is_file():
-        raise NoProgress("review: the pinned Mathlib source snapshot is incomplete; no review started")
-    return src
+    with _review_source_lease(base, rev):
+        if not (src / "Mathlib.lean").is_file():
+            with _review_mathlib_staging(base) as (tmp, lease_fd):
+                steps = (
+                    ["git", "init", "-q", str(tmp)],
+                    [
+                        "git",
+                        "-C",
+                        str(tmp),
+                        "fetch",
+                        "-q",
+                        "--depth",
+                        "1",
+                        "https://github.com/leanprover-community/mathlib4",
+                        rev,
+                    ],
+                    ["git", "-C", str(tmp), "checkout", "-q", "FETCH_HEAD"],
+                )
+                try:
+                    failed = any(subprocess.run(step, timeout=600, pass_fds=(lease_fd,)).returncode for step in steps)
+                except (OSError, subprocess.TimeoutExpired):
+                    failed = True
+                if failed:
+                    raise NoProgress("review: could not stage the pinned Mathlib sources; no review started")
+                shutil.rmtree(tmp / ".git", ignore_errors=True)
+                # Shared by every worker on the host: nobody writes the published files.
+                for directory, _, files in os.walk(tmp):
+                    for name in files:
+                        path = Path(directory, name)
+                        if not path.is_symlink():
+                            path.chmod(0o444)
+                try:
+                    tmp.rename(src)
+                except OSError:  # a concurrent worker staged the same revision first
+                    pass  # This producer's private staging is removed before releasing its lease.
+        if not (src / "Mathlib.lean").is_file():
+            raise NoProgress("review: the pinned Mathlib source snapshot is incomplete; no review started")
+        os.utime(src)
+        ages = {}
+        for path in base.glob("mathlib-src-*"):
+            if not path.name.startswith("mathlib-src-tmp-"):
+                with contextlib.suppress(FileNotFoundError):  # another worker pruned it
+                    ages[path] = path.stat().st_mtime
+        snapshots = sorted(ages, key=ages.get)
+        for old in snapshots[:-2]:
+            # The lease covers a live worker; the age also covers a container that outlived
+            # its worker (a failed pop, or a killed worker), since each use refreshes the mtime.
+            if old == src or time.time() - ages[old] < REVIEW_SOURCE_MIN_AGE:
+                continue
+            try:
+                with _review_source_lease(base, old.name.removeprefix("mathlib-src-"), exclusive=True, blocking=False):
+                    shutil.rmtree(old, ignore_errors=True)
+            except BlockingIOError:
+                pass  # Another worker's reviewer still mounts it; a later review prunes it.
+        yield src
 
 
 def _review_in_bubble(
     w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts, *, result_file: Path | None = None
+) -> int:
+    # The Mathlib source lease lasts as long as the container that mounts it.
+    with contextlib.ExitStack() as stack:
+        return _review_in_bubble_with(stack, w, pr, head, reviewers, opts, result_file=result_file)
+
+
+def _review_in_bubble_with(
+    stack, w: Worker, pr: int, head: str, reviewers: str, opts: RoundOpts, *, result_file: Path | None = None
 ) -> int:
     """Run the tauceti-review engine INSIDE bubble — a hard container boundary around an engine that
     reads an untrusted PR diff and runs a model on it (and, once review gains tool use, runs that
@@ -2924,7 +3061,7 @@ def _review_in_bubble(
         mounts.append(f"{result_file.parent}:/opt/review-result:rw")
     # The reuse rubric greps Mathlib, and the merge gate does not count an approval whose judge
     # says Mathlib was missing from its checkout.
-    mathlib = _review_mathlib_source(cfg, head)
+    mathlib = stack.enter_context(_review_mathlib_source(cfg, head))
     if mathlib is not None:
         mounts.append(f"{mathlib}:/opt/mathlib:ro")
     mathlib_flag = "--mathlib-dir /opt/mathlib" if mathlib is not None else "--no-mathlib"

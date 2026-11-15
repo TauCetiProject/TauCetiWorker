@@ -46,6 +46,7 @@ from .config import (
     GitHubUnavailable,
     NoProgress,
     SharedStateUnavailable,
+    environment,
     extra_roadmap_prompt,
     is_git_url,
     log,
@@ -79,7 +80,6 @@ from .constants import (
     REVIEW_PREPARATION_WAIT_EXIT,
     REVIEW_PROVIDER_DOWN_EXIT,
     ROADMAP,
-    ROUND_TIMEOUT,
     SANDBOX_DEFAULT,
     TAUCETI,
 )
@@ -98,7 +98,6 @@ from .review_diagnostics import (
 from .review_state import ReviewState
 from .round import Claims, RoundContext
 from .runtime_status import report_failure, report_runtime, runtime_snapshot
-from .source_execution import authorization as source_authorization
 from .survey import (
     TARGET_MARKER_RE,
     Candidate,
@@ -1330,6 +1329,13 @@ def _check_stage_read_quota(stage):
         raise GitHubUnavailable("GitHub read quota exhausted — waiting for reset", retry_at=max(exhausted.values()))
 
 
+BUBBLE_WORK_REFUSED = (
+    "bubble work rounds are refused: their container would unpack a private Mathlib build and "
+    "build TauCeti privately. Run this worker on the host (drop --bubble, or set sandbox = 'host'), "
+    "where rounds share the host's Mathlib and TauCeti outputs; review rounds may stay in bubble"
+)
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
     """Perform one stage. Return its rc, or None to decline this candidate and try another.
 
@@ -1344,6 +1350,11 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             f"sandbox={'bubble' if bubble else 'host'}"
         )
         return 0
+    if bubble and stage != "review":
+        # Bubble's bootstrap unpacks Mathlib's cache and builds TauCeti inside the container, a
+        # private copy per round. Until Bubble rounds see the host's read-only shared views,
+        # they do not run. Review only greps a shared, read-only Mathlib source.
+        raise NoProgress(BUBBLE_WORK_REFUSED)
     from .github_outbox import pending_for
 
     if (
@@ -1354,12 +1365,6 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     ):
         log(f"  #{c.pr}: retained publication pending; selecting unrelated work")
         return None
-    if c.pr and stage in FILE_CHANGE_STAGES and w is not None:
-        from .repair_recovery import pending_for as retained_repair
-
-        if retained_repair(getattr(w, "cfg", None), getattr(getattr(w, "gh", None), "repo", TAUCETI), c.pr):
-            log(f"  #{c.pr}: retained source recovery has priority; selecting unrelated work")
-            return None
     from .build_resources import queue_owned
 
     selected = next((p for p in getattr(sv, "open_prs", ()) if p.number == c.pr), None) if c.pr else None
@@ -1431,6 +1436,9 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         checked = validate_kiro_model_access(w.cfg, kiro_probe_profile)
         if stage != "review":
             opts.authoring_profile = checked
+    from . import shared_mathlib
+
+    shared_mathlib.set_round_purpose(None)  # stages that need one set it themselves
     fn = {
         "review": do_review,
         "fix": do_fix,
@@ -1991,6 +1999,18 @@ def _do_fixlike(
         getattr(p, "labels", ()), p.head_ref, bump=label == "bump" or getattr(p, "automatic_bump", False)
     )
     os.environ["TAUCETI_VERIFY_POLICY"] = policy
+    # Shared Mathlib follows the round's purpose: a rebase prepares main's Mathlib, which the
+    # branch is about to move to, and a bump may use the next Mathlib it pins.
+    from . import shared_mathlib
+
+    bump = label == "bump" or getattr(p, "automatic_bump", False)
+    shared_mathlib.set_round_purpose(
+        getattr(getattr(w, "cfg", None), "checkout", None),
+        rebase=label == "rebase",
+        bump=bump,
+        repair=not bump and label in ("fix", "fix-ci", "lint-repair"),
+    )
+
     prompt = fill_prompt(
         HERE / "prompts" / prompt_file,
         PR=pr,
@@ -2046,17 +2066,13 @@ def _do_fixlike(
     if getattr(c, "final_resolution", False) and may_close:
         prompt += FINAL_ATTEMPT_INSTRUCTION
     if getattr(p, "automatic_bump", False):
-        deadline = getattr(getattr(w, "rc", None), "deadline", time.time() + ROUND_TIMEOUT)
         prompt += (
             "\nThis is an automatic Mathlib bump. Preserve its dependency target. "
-            "Prepare one coherent source repair checkpoint and push it once through git-safe-push, "
-            "then end this session. A pending Mathlib migration may leave full-library CI red; "
+            "Push coherent source repairs through git-safe-push; anything unpushed is discarded when "
+            "the round ends. A pending Mathlib migration may leave full-library CI red; "
             "build each repaired module group where possible and report the remaining "
             "failures honestly. Never add sorry, admit, native_decide, axioms, or option overrides. "
-            "Full CI and review decide when the whole PR can merge. "
-            f"The round ends at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(deadline))}; "
-            "stop starting new groups ten minutes before then and push completed repairs before "
-            "the timeout. Run builds in the foreground. A correct conflict resolution may be pushed "
+            "Full CI and review decide when the whole PR can merge. Run builds in the foreground. A correct conflict resolution may be pushed "
             "while unrelated migration failures remain. These instructions override any earlier "
             "requirement to never push red or to finish the entire library before pushing.\n"
         )
@@ -2090,22 +2106,22 @@ def _do_fixlike(
             )
     else:
         if not prepare_checkout(w.cfg, work=label, pr=pr):
-            from .work_recovery import LAST_REFUSAL
-
             log(f"checkout failed for #{pr} — skipping this attempt")
-            report_failure(
-                f"{label} #{pr}: checkout preparation failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}", code=1
-            )
+            report_failure(f"{label} #{pr}: checkout preparation failed", code=1)
             return 1
         co = w.cfg.checkout
         from .activity import current_round_id
 
-        conversation_round = current_round_id()
-        conversation_path = w.cfg.state / "provider-conversations" / f"{conversation_round or time.time_ns()}.json"
-        conversation_scope = dict(repository=TAUCETI, pr=pr, source_round=conversation_round)
         # Capture the checkout's git chatter ("Switched to a new branch …", "set up to track …") instead
         # of letting it spill into the main log; surface a one-line summary, and the stderr only on failure.
-        chk = subprocess.run(["gh", "pr", "checkout", str(pr), "--force"], cwd=str(co), capture_output=True, text=True)
+        from .round_worktrees import enabled as worktree_rounds
+        from .round_worktrees import local_branch
+
+        # Worktrees share branches: a PR's branch name (often `patch-1`) must be this worker's own.
+        unique = ["--branch", local_branch(w.cfg, pr)] if worktree_rounds() else []
+        chk = subprocess.run(
+            ["gh", "pr", "checkout", str(pr), "--force", *unique], cwd=str(co), capture_output=True, text=True
+        )
         if chk.returncode:
             detail = ((chk.stderr or "") + (chk.stdout or "")).strip()[-200:]
             log(f"  {label} #{pr}: gh pr checkout failed — skipping this attempt ({detail})")
@@ -2123,140 +2139,40 @@ def _do_fixlike(
         if foreign:
             os.environ["TAUCETI_VERIFY_BASE"] = foreign
         os.environ["TAUCETI_PUSH_EXPECT"] = checked  # CAS against what we actually checked out
-        if rev.returncode == 0:
-            from .work_recovery import mark_published, note_owner
-
-            # The remote head is published by definition; a later recovery record names it as the
-            # expected head and bundles only commits made on top of it.
-            mark_published(co, f"pr/{pr}", checked)
-            from dataclasses import asdict
-
-            note_owner(
-                w.cfg,
-                expected_head=checked,
-                authorization=dict(
-                    **source_authorization(w, p),
-                    actor=getattr(sv, "me_login", ""),
-                    git_author=dict(
-                        name=subprocess.run(
-                            ["git", "config", "user.name"], cwd=co, capture_output=True, text=True
-                        ).stdout.strip(),
-                        email=subprocess.run(
-                            ["git", "config", "user.email"], cwd=co, capture_output=True, text=True
-                        ).stdout.strip(),
-                    ),
-                    author=getattr(p, "author", ""),
-                    repository=f"{p.head_owner}/{p.head_repo}",
-                    ref=p.head_ref,
-                    foreign=bool(foreign),
-                    automatic_bump=getattr(p, "automatic_bump", False),
-                    profile=asdict(_effective_authoring_profile(opts)),
-                    billing="api" if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else "subscription",
-                    account=getattr(opts, "account", None),
-                    sandbox_host=getattr(opts, "sandbox_host", True),
-                    charged=list(charged),
-                    budget=getattr(c, "budget", 0) or 3,
-                    roadmap=getattr(sv, "roadmap_only", None),
-                ),
-                conversation_path=str(conversation_path),
-            )
         log(f"  {label} #{pr}: checked out @ {checked[:12]}")
-        from .work_recovery import _rev
+        from .live_use import rev as _rev
 
-        push_marker = f"refs/tauceti/published/push/{p.head_ref.removeprefix('refs/heads/')}"
-        published_before = _rev(co, push_marker)
-        push_scope = conversation_round or os.urandom(16).hex()
+        push_scope = current_round_id() or os.urandom(16).hex()
         scoped_push_marker = f"refs/tauceti/published/scope/{push_scope}/{p.head_ref.removeprefix('refs/heads/')}"
         scoped_published_before = _rev(co, scoped_push_marker)
-        note_owner(w.cfg, publication_marker=dict(ref=push_marker, before=published_before, scope=push_scope))
-        handoffs = []
-        if (
-            not foreign
-            and label != "bump"
-            and not getattr(p, "automatic_bump", False)
-            and owns_pr(sv, p, casefold_legacy=True)
-        ):
-            from .repair_recovery import Wait as RecoveryWait
-            from .repair_recovery import handoff_context
-            from .work_recovery import RecordError as RecoveryRecordError
-
-            try:
-                retained, handoffs = handoff_context(
-                    w.cfg,
-                    getattr(getattr(w, "gh", None), "repo", TAUCETI),
-                    pr,
-                    head=checked,
-                    actor=getattr(sv, "me_login", ""),
-                    checkout=co,
-                    push_marker=push_marker,
-                    published_before=published_before,
-                    push_scope=push_scope,
-                )
-                prompt += retained
-            except (OSError, RuntimeError, RecoveryWait, RecoveryRecordError) as error:
-                log(f"  #{pr}: source handoff deferred without model launch: {error}")
-                return decline_repair()
-        agent_rc = None
-        from .config import AdmissionUnavailable
-
         try:
-            from .repair_recovery import environment
-
-            with environment(TAUCETI_PUSH_SCOPE=push_scope), MaintenanceStop(w, c, explicit=explicit) as stop:
+            with (
+                environment(TAUCETI_PUSH_SCOPE=push_scope),
+                MaintenanceStop(w, c, explicit=explicit) as stop,
+            ):
                 rc = run_agent_host(
                     co,
                     prompt,
                     _effective_authoring_profile(opts),
                     w.cfg.logdir,
                     cancel_event=stop,
-                    session_path=conversation_path,
-                    session_actor=getattr(sv, "me_login", ""),
-                    session_scope=conversation_scope,
                     quota_cfg=w.cfg,
                 )
-            agent_rc = rc
         except BuildCacheUnavailable:
             # Unlike a transcript-derived provider failure, we know the agent never started.
             # A persistent cache outage must not exhaust the bounded provider-refund allowance.
             for key in charged:
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
-            from .repair_recovery import return_handoffs
-
-            return_handoffs(handoffs)
-            raise
-        except AdmissionUnavailable:
-            from .repair_recovery import return_handoffs
-
-            return_handoffs(handoffs)
             raise
         finally:
-            # The owned agent process group has been swept before this returns or raises.
-            # Capture the final source now, so a quota-blocked loop can recover it
-            # without needing another paid round to reach checkout preparation.
-            from .work_recovery import guard, note_owner
-
+            # git-safe-push records each push of this session under its scope; whatever it pushed
+            # is the round's published work. Anything unpushed is discarded with the checkout.
             if (co / ".git").exists():
                 published_after = _rev(co, scoped_push_marker)
                 if published_after and published_after != scoped_published_before:
                     if c.progress is None:
                         c.progress = {}
                     c.progress["published"] = published_after
-                note_owner(
-                    w.cfg,
-                    recovery_handoffs=handoffs,
-                    round_outcome=dict(
-                        exit_code=agent_rc,
-                        published_head=published_after if published_after != scoped_published_before else None,
-                    ),
-                )
-                if handoffs and published_after and published_after != scoped_published_before:
-                    from .repair_recovery import complete_handoffs
-
-                    try:
-                        complete_handoffs(w.cfg, handoffs, published_after)
-                    except OSError as error:
-                        log(f"recovery handoff acknowledgement deferred; durable push marker retained: {error}")
-                guard(w.cfg, co)
     if rc == 0:
         w.rs.bust(pr)
     elif not foreign:
@@ -2570,16 +2486,6 @@ def _progress_documentation_wait(w, reason, *, recovery=False):
     raise DocumentationUnavailable(f"waiting-documentation: {reason}", retry_at=retry_at)
 
 
-def _progress_deadline_wait(w):
-    from .config import ProgressPreparationUnavailable
-
-    _progress_mechanical_delay(w, 60)
-    raise ProgressPreparationUnavailable(
-        "waiting-progress-preparation: insufficient round time; artifacts retained for the next ordinary round",
-        retry_at=w.counters.read("progress-mechanical-retry-at"),
-    )
-
-
 def _prepare_progress(w, run_tool, roadmap_dir, work):
     """Retry only free mechanical work. Keep the last coherent artifacts until replacement succeeds."""
     from . import progress_publication as publication
@@ -2759,7 +2665,6 @@ def _do_progress_inner(w, opts) -> int | None:
     # A writable clone with a real `origin/main`, not the depth-1 throwaway mirror `fetch_ref` makes:
     # `apply` branches from origin/main and pushes. The roadmap repo is small, so a full clone is cheap.
     roadmap_dir = w.cfg.state / "progress" / "roadmap"
-    from .work_recovery import guard, note_owner, retain
 
     if retained and (roadmap_dir / ".git").is_dir():
         # A prepared local branch is an immutable publication artifact. Fetch
@@ -2767,21 +2672,21 @@ def _do_progress_inner(w, opts) -> int | None:
         if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
             return _defer_progress_publication(w, retained, f"temporary fetch failure in {roadmap_dir}")
     else:
+        from .agents import discard_checkout
+
         if roadmap_dir.exists() and not (roadmap_dir / ".git").is_dir():
-            retain(w.cfg, roadmap_dir, "the roadmap clone has no git metadata", label="progress-roadmap")
+            if not discard_checkout(roadmap_dir, "the roadmap clone has no git metadata"):
+                raise Die(f"refreshing {roadmap_dir} failed: it could not be replaced")
         if (roadmap_dir / ".git").is_dir():
-            # `apply` commits and pushes here; an interrupted apply's leftovers are saved, not discarded.
-            decision = guard(w.cfg, roadmap_dir, label="progress-roadmap", repository=ROADMAP)
-            if not decision.ok:
-                raise Die(f"refreshing {roadmap_dir} refused: {decision.reason}")
-        if (roadmap_dir / ".git").is_dir():  # still in place unless the guard moved it aside
+            # An interrupted `apply` left only unpushed leftovers: rounds are all-or-nothing.
             if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
                 raise Die(f"refreshing {roadmap_dir} failed")  # usually the network; retried next round
             if subprocess.run(
                 ["git", "-C", str(roadmap_dir), "checkout", "-q", "-f", "-B", "main", "origin/main"]
             ).returncode:
-                # A local failure (a stale lock): move the clone aside and clone afresh below.
-                retain(w.cfg, roadmap_dir, "forced checkout of the roadmap clone failed", label="progress-roadmap")
+                # A local failure (a stale lock): delete the clone and clone afresh below.
+                if not discard_checkout(roadmap_dir, "forced checkout of the roadmap clone failed"):
+                    raise Die(f"refreshing {roadmap_dir} failed: it could not be replaced")
             else:
                 subprocess.run(["git", "-C", str(roadmap_dir), "clean", "-fdxq"])
         if not (roadmap_dir / ".git").is_dir():
@@ -2790,13 +2695,10 @@ def _do_progress_inner(w, opts) -> int | None:
                 if retained:
                     return _defer_progress_publication(w, retained, f"temporary clone failure for {ROADMAP}")
                 raise Die(f"cloning {ROADMAP} failed")
-    note_owner(w.cfg, "progress-roadmap", work="progress")  # attribution only; never stops the round
 
     # `plan` and `facts` read TauCeti history, so they need the full-history checkout, not a shallow one.
     if not retained and not prepare_checkout(w.cfg, work="progress"):
-        from .work_recovery import LAST_REFUSAL
-
-        raise Die(f"checkout failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}")
+        raise Die("checkout failed")
 
     work = w.cfg.state / "progress" / "work"
     work.mkdir(parents=True, exist_ok=True)
@@ -2806,16 +2708,12 @@ def _do_progress_inner(w, opts) -> int | None:
     status_body = work / "status-body.md"
     section_body = work / "section-body.md"
 
-    deadline = float(os.environ.get("TAUCETI_ROUND_DEADLINE") or time.time() + ROUND_TIMEOUT)
-
     def run_tool(*args: str, capture: bool = False, docs_cache=None):
         # `errors="replace"`: text mode decodes strictly by default, so a tool that emits one invalid
         # byte raises UnicodeDecodeError inside subprocess.run — before there is a CompletedProcess to
         # inspect. The failure would then skip the counter, the saved output and the Die path entirely,
         # and surface as a bare decode error naming nothing. Mojibake beats losing the diagnostic.
-        remaining = deadline - time.time() - 15
-        if remaining < 30 and args[0] in ("plan", "facts", "prompt"):
-            _progress_deadline_wait(w)
+        # No timeout of its own: the round's hard cap (TAUCETI_ROUND_TIMEOUT) bounds a hung tool.
         log(f"  $ tauceti-progress {args[0]} …")
         try:
             proc = subprocess.run(
@@ -2823,7 +2721,6 @@ def _do_progress_inner(w, opts) -> int | None:
                 capture_output=capture,
                 text=True,
                 errors="replace",
-                timeout=max(1, min(1800, remaining)),
                 env={
                     **os.environ,
                     "TAUCETI_FACTS_CACHE": os.environ.get("TAUCETI_FACTS_CACHE")
@@ -2844,9 +2741,7 @@ def _do_progress_inner(w, opts) -> int | None:
             )
             _progress_tool_output(w, args[0], proc)
             if args[0] == "apply":
-                raise  # publication transport waits keep their existing recovery path
-            if isinstance(exc, subprocess.TimeoutExpired) and remaining < 1800:
-                _progress_deadline_wait(w)
+                raise  # publication transport waits keep their existing retry path
         _progress_tool_output(w, args[0], proc)
         return proc
 
@@ -2933,8 +2828,6 @@ def _do_progress_inner(w, opts) -> int | None:
         SECTION_OUT=str(section_out),
         AGENT=opts.agent_name,
     )
-    if deadline - time.time() < 300:
-        _progress_deadline_wait(w)
     w.counters.write("progress-mechanical-retry-at", 0)
     w.counters.write("progress-attempt-ts", int(time.time()))
     rc = run_agent_host(writing, prompt, opts.work_model, w.cfg.logdir, quota_cfg=w.cfg)
@@ -3212,9 +3105,7 @@ other contributors' claims, or the hard rules of the repo.
             allow_push=fork,  # bubble grants git fetch/push to the fork (kim-em/bubble#320)
         )
     if not prepare_checkout(w.cfg, work="roadmap", roadmap=only or None):
-        from .work_recovery import LAST_REFUSAL
-
-        raise Die(f"checkout failed{': ' + LAST_REFUSAL if LAST_REFUSAL else ''}")
+        raise Die("checkout failed")
     prompt = fill_prompt(
         HERE / "prompts" / "roadmap.md",
         ONLY=only,
