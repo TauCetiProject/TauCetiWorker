@@ -1621,6 +1621,14 @@ class Controller:
                     self._renewing.pop(claim_token, None)
 
     def _task_checks_owner(self, task: dict[str, Any]) -> str:
+        if task["kind"] == TASK_REPAIR and any(
+            diagnostic.get("kind")
+            in {"audit", "duplicate_declaration", "import_collision", "lint", "environment_linter"}
+            for diagnostic in loads(task["diagnostics"], [])
+        ):
+            # A diagnosed check failure is required repair verification, not optional
+            # background work to hand off for another serial staging round.
+            return "worker"
         if task["kind"] not in BACKGROUND_TASKS:
             return "staging"
         head = self._head()
