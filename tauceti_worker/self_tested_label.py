@@ -104,10 +104,47 @@ def commit_sources(checkout: Path, commit: str, base: str) -> dict:
 
     Mirrors `verification.inventory`: every path of the commit and of the base, with each
     file's bytes; a base path the commit removes is missing. File modes are compared only by
-    their executable bit, which is all git records. The verifier records a symlink with the
-    bytes it followed, which a tree cannot reproduce, so a symlink never matches."""
+    their executable bit, which is all git records. File symlinks bind both their link text
+    and the contents of their committed target. External targets, directory links and
+    cycles cannot be reconstructed from the commit and never match."""
     tree, base_names = _tree(checkout, commit), set(_tree(checkout, base))
     contents = _blobs(checkout, (oid for _, oid in tree.values() if oid))
+    directories = {""} | {"/".join(name.split("/")[:i]) for name in tree for i in range(1, len(name.split("/")))}
+
+    def target_path(name, target):
+        if not target or target.startswith("/") or "\0" in target:
+            return None
+        parts = name.split("/")[:-1] + target.split("/")
+        path = []
+        for index, part in enumerate(parts):
+            if part == "..":
+                if not path:
+                    return None
+                path.pop()
+            elif part not in ("", "."):
+                path.append(part)
+            # Do not normalize through a symlinked directory or nonexistent
+            # prefix: its filesystem resolution need not match lexical '..'.
+            if index < len(parts) - 1 and "/".join(path) not in directories:
+                return None
+        return "/".join(path)
+
+    def linked_blob(name):
+        seen = set()
+        for _ in range(40):
+            if name in seen or name not in tree:
+                return None
+            seen.add(name)
+            mode, oid = tree[name]
+            if mode in ("100644", "100755"):
+                return oid
+            if mode != "120000":
+                return None
+            name = target_path(name, contents[oid].decode(errors="surrogateescape"))
+            if name is None:
+                return None
+        return None
+
     out = {}
     for name in sorted(set(tree) | base_names):
         if name not in tree:
@@ -117,6 +154,12 @@ def commit_sources(checkout: Path, commit: str, base: str) -> dict:
         if mode in ("100644", "100755"):
             sha = hashlib.sha256(contents[oid]).hexdigest()
             out[name] = {"kind": "file", "sha256": sha, "executable": mode == "100755"}
+        elif mode == "120000" and (target := linked_blob(name)):
+            out[name] = {
+                "kind": "symlink",
+                "target": contents[oid].decode(errors="surrogateescape"),
+                "sha256": hashlib.sha256(contents[target]).hexdigest(),
+            }
         else:
             out[name] = {"kind": "unsupported", "mode": mode}
     return out
@@ -131,6 +174,8 @@ def _comparable(record) -> dict:
         return {"kind": "file", "sha256": record.get("sha256"), "executable": bool(int(mode or 0) & 0o100)}
     if kind == "missing":
         return {"kind": "missing"}
+    if kind == "symlink":
+        return {"kind": "symlink", "target": record.get("target"), "sha256": record.get("sha256")}
     return {"kind": f"unsupported {kind}"}
 
 

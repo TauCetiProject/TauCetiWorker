@@ -29,7 +29,7 @@ def git(root, *args):
     return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
-def checkout(tmp, *, infra=False, middle=False, symlink=False):
+def checkout(tmp, *, infra=False, middle=False, symlink=False, base_symlink=False):
     """origin/main is the base; HEAD edits one module, deletes another and adds an executable.
 
     `middle` puts an infrastructure commit between main and the change; `symlink` adds one."""
@@ -41,6 +41,10 @@ def checkout(tmp, *, infra=False, middle=False, symlink=False):
     (root / "TauCeti/A.lean").write_text("a\n")
     (root / "TauCeti/B.lean").write_text("b\n")
     (root / "lakefile.toml").write_text("name = 't'\n")
+    if base_symlink:
+        (root / "AGENTS.md").write_text("instructions\n")
+        (root / ".claude").mkdir()
+        (root / ".claude/CLAUDE.md").symlink_to("../AGENTS.md")
     git(root, "add", ".")
     git(root, "commit", "-q", "-m", "base")
     base = git(root, "rev-parse", "HEAD")
@@ -56,7 +60,13 @@ def checkout(tmp, *, infra=False, middle=False, symlink=False):
     if infra:
         (root / "lakefile.toml").write_text("name = 'u'\n")
     if symlink:
-        (root / "TauCeti/Link.lean").symlink_to("A.lean")
+        if symlink in ("external", "escaping"):
+            outside = Path(tmp) / "outside.lean"
+            outside.write_text("external input\n")
+            target = str(outside) if symlink == "external" else "../../outside.lean"
+        else:
+            target = "A.lean"
+        (root / "TauCeti/Link.lean").symlink_to(target)
     git(root, "add", ".")
     git(root, "commit", "-q", "-m", "change")
     return root, base, git(root, "rev-parse", "HEAD")
@@ -229,7 +239,7 @@ CASES = [
         0,
     ),
     (
-        "head moving while waiting stops",
+        "head moving during the label write stops",
         {"receipt": verified},
         lambda h: [pull(h), pull(h), pull("d" * 40)],
         "self-tested stopped",
@@ -249,7 +259,10 @@ CASES = [
         "not eligible (changes outside TauCeti/: lakefile.toml)",
         0,
     ),
-    ("symlink in the sources", {"receipt": verified, "symlink": True}, lambda h: [pull(h)], "no matching", 0),
+    ("internal file symlink", {"receipt": verified, "symlink": True}, lambda h: [pull(h)], "labelled", 1),
+    ("unchanged repository symlink", {"receipt": verified, "base_symlink": True}, lambda h: [pull(h)], "labelled", 1),
+    ("external file symlink", {"receipt": verified, "symlink": "external"}, lambda h: [pull(h)], "no matching", 0),
+    ("escaping file symlink", {"receipt": verified, "symlink": "escaping"}, lambda h: [pull(h)], "no matching", 0),
     (
         "lint-repair label",
         {"receipt": verified},
@@ -295,6 +308,30 @@ with tempfile.TemporaryDirectory() as tmp:
     (root / "TauCeti/run.sh").chmod(0o644)
     real = {k: stl._comparable(v) for k, v in verification.inventory(root, base).items()}
     check("a dropped executable bit differs", records == real, False)
+
+# Link text and transitive committed contents must match; unsupported links stay ineligible.
+with tempfile.TemporaryDirectory() as tmp:
+    root, base, head = checkout(tmp, symlink=True, base_symlink=True)
+    (root / "TauCeti/Alias.lean").symlink_to("Link.lean")
+    git(root, "add", ".")
+    git(root, "commit", "-q", "-m", "link chain")
+    head = git(root, "rev-parse", "HEAD")
+    real = {k: stl._comparable(v) for k, v in verification.inventory(root, base).items()}
+    records = stl.commit_sources(root, head, base)
+    check("committed link chains mirror verifier inventory", records, real)
+    check("relative parent link binds its target", records[".claude/CLAUDE.md"]["target"], "../AGENTS.md")
+    (root / "TauCeti/Link.lean").unlink()
+    (root / "TauCeti/Link.lean").symlink_to("Alias.lean")
+    git(root, "add", ".")
+    git(root, "commit", "-q", "-m", "cycle")
+    records = stl.commit_sources(root, git(root, "rev-parse", "HEAD"), base)
+    check("link cycles never match", records["TauCeti/Link.lean"]["kind"], "unsupported")
+    (root / "TauCeti/Link.lean").unlink()
+    (root / "TauCeti/Link.lean").symlink_to("../TauCeti")
+    git(root, "add", ".")
+    git(root, "commit", "-q", "-m", "directory link")
+    records = stl.commit_sources(root, git(root, "rev-parse", "HEAD"), base)
+    check("directory links never match", records["TauCeti/Link.lean"]["kind"], "unsupported")
 
 # A roadmap round labels the PR opened from the branch it published on the fork.
 with tempfile.TemporaryDirectory() as tmp:
