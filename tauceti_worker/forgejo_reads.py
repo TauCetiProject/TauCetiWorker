@@ -10,9 +10,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
-import re
-import stat
 import threading
 import time
 from collections import OrderedDict
@@ -22,6 +19,7 @@ from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
 from . import github_transport as transport
+from .read_cache import prune_read_cache as prune_state_cache  # noqa: F401
 
 
 @dataclass(frozen=True)
@@ -37,81 +35,6 @@ class ReadInvalidated(RuntimeError):
 
 class SourceBindingChanged(RuntimeError):
     """This client no longer holds the origin/credential it was constructed for."""
-
-
-def prune_state_cache(root, *, max_files=384, max_bytes=16 * 1024 * 1024):
-    """Bound disposable source sidecars across credential scopes under one root.
-
-    Only owned regular files with review-state cache names in digest directories
-    are eligible. Outboxes, unrelated files and symlinks are never followed or
-    removed. Concurrent readers tolerate disappearing cache files. This is
-    best-effort cache maintenance; it cannot affect a fresh observation's result.
-    """
-    if type(max_files) is not int or type(max_bytes) is not int or min(max_files, max_bytes) < 1:
-        raise ValueError("state cache bounds must be positive integers")
-    directories, files = [], []
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    try:
-        root_fd = os.open(root, flags)
-    except OSError:
-        return
-    try:
-        for directory in os.listdir(root_fd):
-            if not re.fullmatch(r"[0-9a-f]{64}", directory):
-                continue
-            try:
-                fd = os.open(directory, flags, dir_fd=root_fd)
-            except OSError:
-                continue
-            try:
-                if os.fstat(fd).st_uid != os.getuid():
-                    continue
-                directories.append(directory)
-                for name in os.listdir(fd):
-                    if not re.fullmatch(r"[1-9][0-9]*(?:\.(?:key|contest))?(?:\.json|\.[0-9a-f]{32}\.tmp)", name):
-                        continue
-                    try:
-                        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                    except FileNotFoundError:
-                        continue
-                    if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
-                        files.append((info.st_mtime_ns, directory, name, info.st_size, info.st_dev, info.st_ino))
-            finally:
-                os.close(fd)
-        files.sort()
-        count, size = len(files), sum(row[3] for row in files)
-        for _, directory, name, length, device, inode in files:
-            if count <= max_files and size <= max_bytes:
-                break
-            try:
-                fd = os.open(directory, flags, dir_fd=root_fd)
-            except OSError:
-                continue
-            try:
-                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                if (info.st_dev, info.st_ino) != (device, inode) or not stat.S_ISREG(info.st_mode):
-                    continue  # Another writer replaced it; leave the newer value.
-                os.unlink(name, dir_fd=fd)
-                count -= 1
-                size -= length
-            except FileNotFoundError:
-                count -= 1
-                size -= length
-            finally:
-                os.close(fd)
-        for directory in directories:
-            try:
-                # Another process may have just made an empty namespace and be
-                # about to open it for an atomic write. Leave recent ones alone.
-                if time.time() - os.stat(directory, dir_fd=root_fd, follow_symlinks=False).st_mtime < 30:
-                    continue
-                os.rmdir(directory, dir_fd=root_fd)
-            except OSError:
-                pass
-    except OSError:
-        return
-    finally:
-        os.close(root_fd)
 
 
 @dataclass
@@ -356,6 +279,20 @@ class ForgejoReadSource:
     """
 
     direct_source = True
+    inventory_fields = (
+        "number",
+        "title",
+        "body",
+        "headRefOid",
+        "headRefName",
+        "headRepository",
+        "headRepositoryOwner",
+        "isDraft",
+        "mergeable",
+        "author",
+        "labels",
+        "updatedAt",
+    )
 
     def __init__(self, repository, api, *, cache=None, ttl=15):
         from tauceti_tools.forge import RepositoryRef
@@ -406,6 +343,16 @@ class ForgejoReadSource:
         if number is not None:
             self.repository.pull_url(number)
         self.cache.invalidate(scope=(self.repository.key, number))
+        if getattr(self, "shared_inventory", False) is True:
+            from .source_identity import advisory_scope
+
+            transport.invalidate_shared(advisory_scope(self, number))
+
+    def invalidate_discovery(self):
+        if getattr(self, "shared_inventory", False) is True:
+            from .source_identity import discovery_scope
+
+            transport.invalidate_shared(discovery_scope(self))
 
     def _read(self, operation, args, fetch, *, fresh=False, number=None, cacheable=True):
         from tauceti_tools.forge import ForgeError, Incomplete
@@ -432,14 +379,50 @@ class ForgejoReadSource:
                 return value
 
             key = (self.cache_namespace, operation, json.dumps(args, sort_keys=True), revision)
-            if cacheable:
+            shared = (
+                getattr(self, "shared_inventory", False) is True
+                and transport.advisory_reads()
+                and not (fresh or force)
+                and cacheable
+                and number is not None
+            )
+            if shared:
+                from .source_identity import advisory_policy, advisory_scope
+
+                shared_scope = advisory_scope(self, number)
+                policy = advisory_policy(self)
+                if policy is None:
+                    raise ReadInvalidated("publication policy unavailable for advisory read")
+                global_epoch = transport.shared_generation(advisory_scope(self, None))
+
+                def fresh_fetch():
+                    # Reusing nested cached observations would restart their
+                    # age in this outer cache. Only the outermost read shares.
+                    with transport.read_context(fresh=True, advisory=False):
+                        return bounded_fetch()
+
+                value = transport.shared_read(
+                    [*shared_scope, operation, args, policy, global_epoch],
+                    fresh_fetch,
+                    ttl=self.ttl,
+                    identity=self.cache_namespace,
+                    lock_timeout=300,
+                    generation_scope=shared_scope,
+                    coalesce_failures=True,
+                )
+                # A cached projection never survives a credential/origin or
+                # publication-policy change in this process.
+                self._bound()
+                if advisory_policy(self) != policy:
+                    raise ReadInvalidated("publication policy changed during advisory read")
+            elif cacheable:
                 value, hit = self.cache.read(
                     key, bounded_fetch, ttl=self.ttl, fresh=fresh or force, scope=(self.repository.key, number)
                 )
             else:
                 value, hit = bounded_fetch(), False
             self._bound()
-            if hit:
+            if not shared and hit:
                 transport.note_cache_hit()
             return value
         except ForgeError as error:
@@ -472,6 +455,7 @@ class ForgejoReadSource:
 
     def refresh_pr_state(self, number, expected, observed=""):
         """Correct a selected observation using only this bound source."""
+        self.invalidate_discovery()
         self.invalidate(number)
         data = self.pr_view(number, ["headRefOid"], fresh=True)
         if data is None:
@@ -485,20 +469,7 @@ class ForgejoReadSource:
         needed. Concurrent changes can still move rows between pages; this is a
         short-lived discovery observation, not a source snapshot or merge proof.
         """
-        fields = [
-            "number",
-            "title",
-            "body",
-            "headRefOid",
-            "headRefName",
-            "headRepository",
-            "headRepositoryOwner",
-            "isDraft",
-            "mergeable",
-            "author",
-            "labels",
-            "updatedAt",
-        ]
+        fields = list(self.inventory_fields)
         return self._read("open_prs", [], lambda: self.reader.pulls(self.repository, fields, state="open"), fresh=fresh)
 
     def authenticated_actor(self):

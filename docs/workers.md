@@ -68,6 +68,52 @@ Persistent workers are declarative. You describe the workers you want in
 starting missing workers, stopping removed ones, restarting changed ones, and
 backing off repeated failures. They do not belong to a terminal session.
 
+## Source selection
+
+Worker definitions select the same sources as `tauceti work`. Existing definitions
+keep their GitHub-only defaults. For a Forgejo worker, set:
+
+```toml
+github = false
+forgejo = true
+new_pr_forge = "forgejo"
+```
+
+Set both source booleans to `true` to maintain PRs from both sources. New PRs use
+`new_pr_forge`, independently of maintenance selection. Configure all three fields
+for native authoring; without an explicit destination, new PRs still default to GitHub.
+These fields are available in `workers.toml`. Credentials use the existing
+private Forgejo token-file configuration. Source changes wait for the worker's
+current round to finish; other workers retain their running processes and settings.
+
+## Locally verified publications
+
+With `self_tested = true` and `TAUCETI_VERIFY_HELPER=1`, the worker applies
+`self-tested` after an authoring or repair round publishes ordinary mathematics
+entirely under `TauCeti/`. Every verification phase must succeed in that round,
+and the receipt's source inventory must exactly match the published commit.
+Pin changes, infrastructure changes and full-lint/lint-repair requests do not
+qualify. This is the same eligibility check for GitHub and Forgejo.
+
+Both forges use the same add-label flow through their source adapters; no picker
+or separate status publication is required. Provision the `self-tested`
+repository label on Forgejo before enabling this route. This rollout does not
+change publisher grants.
+
+The label is a persistent author declaration. Keep it through fix/rebase pushes
+after successful verification; remove it when verification fails or is
+incomplete. Authors can apply it themselves after verification, and the worker
+also applies it when it finds the complete matching receipt after a round.
+An unavailable or invalid receipt never produces an automatic label. Ordinary
+PR-CI eligibility is checked independently at admission.
+
+Forgejo does not currently run an individual Actions build for each PR. Reviews
+still run, and every mixed merge-queue candidate requires its full CI build and
+audits before landing, including self-tested members. Source statuses cannot
+replace that candidate CI. For live deployments, preserve every per-worker
+`env` entry, including `TAUCETI_ROUND_WORKTREES=1`; the verification helper can
+also be enabled in the worker manager's service environment.
+
 ## Dependency bumps
 
 Bot-authored `bump-mathlib/` PRs hosted on TauCeti are repaired until they land.

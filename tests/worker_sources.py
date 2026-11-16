@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Cross-forge routing, independent outages, identities and budgets."""
 
+import contextlib
 import io
 import json
 import os
@@ -29,6 +30,58 @@ from tauceti_worker.worker_sources import configure, source_config
 
 
 class Sources(unittest.TestCase):
+    def test_native_cli_token_loading_does_not_require_host_root_uid_mapping(self):
+        from tauceti_queue.control_policy_file import ControlPolicyError
+        from tauceti_worker.source_cli import load_source
+        from tauceti_worker.worker_sources import native_source
+
+        credential = self.root / "worker-token"
+        credential.write_text("private-test-token\n")
+        credential.chmod(0o600)
+        environment = dict(
+            TAUCETI_SOURCE_BINDING=json.dumps(self.identity.record()),
+            TAUCETI_FORGEJO_ORIGIN=self.repo.forge.url,
+            TAUCETI_FORGEJO_REPO=self.repo.name,
+            TAUCETI_FORGEJO_REPOSITORY_ID=str(self.identity.native_id),
+            TAUCETI_FORGEJO_TOKEN_FILE=str(credential),
+            TAUCETI_FORGEJO_USER_ID="3",
+        )
+        with (
+            patch.dict(os.environ, environment),
+            patch("tauceti_queue.control_policy_file._directory", side_effect=ControlPolicyError("unmapped root UID")),
+            patch("tauceti_worker.forgejo_worker.ForgejoWorkerSource", return_value=self.source),
+            patch("tauceti_tools.forge.Forgejo") as client,
+        ):
+            self.assertIs(native_source(self.cfg), self.source)
+            self.assertIs(self.source.shared_inventory, True)
+            client.reset_mock()
+            self.assertIs(load_source(), self.source)
+            client.assert_called_once_with(self.repo.forge, token="private-test-token")
+            self.source.validate_binding.assert_called_once()
+            credential.chmod(0o644)
+            with self.assertRaises(ValueError):
+                load_source()
+            credential.chmod(0o600)
+            link = self.root / "symlink-token"
+            link.symlink_to(credential)
+            os.environ["TAUCETI_FORGEJO_TOKEN_FILE"] = str(link)
+            with self.assertRaises(OSError):
+                load_source()
+
+    def test_native_author_claim_uses_shared_github_namespace_resolution(self):
+        from tauceti_worker.source_claims import main
+
+        with (
+            patch.object(sys, "argv", ["claim-source", "acquire", "author/Algebra/test"]),
+            patch.dict(os.environ, {"TAUCETI_WORKER_ID": "native-worker"}),
+            patch("tauceti_worker.worker_sources.shared_github_environment", return_value=contextlib.nullcontext()),
+            patch("tauceti_worker.github.claims_repo", return_value="team/shared-claims"),
+            patch("tauceti_tools.claims.GitClaim") as claim,
+        ):
+            claim.return_value.command.return_value = 0
+            self.assertEqual(main(), 0)
+            self.assertEqual(claim.call_args.args[:3], ("team/shared-claims", "author/Algebra/test", "native-worker"))
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -114,7 +167,7 @@ class Sources(unittest.TestCase):
             "updatedAt": "2026-11-11T00:00:00Z",
         }
 
-    def native_survey(self, rows, *, blocking=False, metadata=None):
+    def native_survey(self, rows, *, blocking=False, metadata=None, numbers=()):
         self.source.open_prs.return_value = rows
         rs = Mock()
         if metadata is None and blocking:
@@ -133,9 +186,27 @@ class Sources(unittest.TestCase):
             skip=[],
             deep=True,
             stages=["review", "fix", "rebase"],
-            numbers=(),
+            numbers=numbers,
             count_all_roadmaps=True,
         )
+
+    def test_shared_inventory_surveys_preserve_explicit_targets_and_binding_checks(self):
+        self.source.shared_inventory = True
+        self.source.cache_namespace = "d" * 64
+        self.source.inventory_fields = tuple(self.row())
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.root / "shared-discovery")):
+            first = self.native_survey([self.row()])
+            cached = self.native_survey([self.row(2)])
+            self.assertEqual([p.number for p in first.open_prs], [1])
+            self.assertEqual([p.number for p in cached.open_prs], [1])
+            self.assertEqual(self.source.open_prs.call_count, 1)
+            explicit = self.native_survey([self.row(2)], numbers=(2,))
+            self.assertEqual([p.number for p in explicit.open_prs], [2])
+            self.assertEqual(self.source.open_prs.call_count, 2)
+            self.source.binding_current.return_value = False
+            rejected = self.native_survey([self.row(2)])
+            self.assertTrue(rejected.github_failed)
+            self.assertEqual(rejected.dependency_wait["operation"], "binding")
 
     def test_bound_round_gh_runs_this_runtimes_shim_in_the_round_checkout(self):
         from tauceti_worker import github, worker_sources

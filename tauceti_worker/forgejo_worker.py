@@ -13,6 +13,7 @@ from .forgejo_reads import ForgejoReadSource
 
 class ForgejoWorkerSource(ForgejoReadSource):
     supports_contest_reactions = False
+    supports_label_requests = False
     worker_capable = True
     supports_review_sandbox = False
 
@@ -27,6 +28,34 @@ class ForgejoWorkerSource(ForgejoReadSource):
         self.anonymous_discovery = token_file is None
         self.repo = self.repository.name
         self._mergeability_cache = {}
+        self.review_publication_policy = None
+
+    def issue_comments(self, number, *, fresh=False):
+        from .github_transport import advisory_reads
+
+        def fetch():
+            rows = super(ForgejoWorkerSource, self).issue_comments(number, fresh=fresh)
+            if rows is None or not self.review_publication_policy or self.anonymous_discovery:
+                return rows
+            from types import SimpleNamespace
+
+            from .native_review_publisher import QueueReviewPublisher
+
+            try:
+                pull = self.live_pull(number)
+                if pull is None:
+                    return None
+                transport = SimpleNamespace(source=self, number=number, head=pull["head"]["sha"])
+                trusted = QueueReviewPublisher(transport, policy_path=self.review_publication_policy).comments()
+            except (ForgeError, OSError, ValueError):
+                return None  # Withhold this PR's metadata, not every native PR.
+            # Ordinary discussion remains visible, but mutable unreceipted boards
+            # cannot suppress a review or seed another worker's completion decision.
+            return [row for row in rows if "<!--tauceti-scoreboard-->" not in (row.get("body") or "")] + trusted
+
+        if getattr(self, "shared_inventory", False) is True and advisory_reads():
+            return self._read("trusted_issue_comments", [number], fetch, fresh=fresh, number=number)
+        return fetch()
 
     def resolve_mergeability(self, state, number, head):
         from .source_mergeability import resolve
@@ -124,10 +153,33 @@ class ForgejoWorkerSource(ForgejoReadSource):
         self.validate_binding()
         ForgejoWriter(self.api).edit(self.repository, pr, pull=True, add_labels=[name])
         self.invalidate(pr)
+        self.invalidate_discovery()
         return True
 
+    def pull_for_head(self, owner, branch):
+        """Fresh, unambiguous PR lookup for a branch published by a roadmap round."""
+        if not owner or not branch:
+            return None
+        # Narrow discovery on the server; still verify its branch and owner below.
+        rows = self._read(
+            "pull_for_head",
+            [owner, branch],
+            lambda: self.reader.pulls(
+                self.repository, ["number", "headRefName", "headRepositoryOwner"], state="open", head=branch
+            ),
+            fresh=True,
+            cacheable=False,
+        )
+        matches = [
+            row["number"]
+            for row in rows or []
+            if row.get("headRefName") == branch
+            and (row.get("headRepositoryOwner") or {}).get("login", "").casefold() == owner.casefold()
+        ]
+        return matches[0] if len(matches) == 1 else None
+
     def commit_status(self, sha, context):
-        # Source statuses remain observations. Stage 1C supplies execution authority.
+        # Native source statuses do not grant execution authority.
         return ""
 
     def rebase_requested(self, pr, head):

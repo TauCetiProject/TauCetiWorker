@@ -85,6 +85,31 @@ def source_pr_info(row, repository):
     )
 
 
+def discovery_inventory(source, *, numbers=None):
+    """Share advisory discovery, leaving explicit targets and fresh reads direct.
+
+    A shared list can lag writes for 60 seconds after its completed fetch. It
+    never supplies a claim, review verdict or permission to publish; dispatch
+    still validates the selected PR through its source. Selected-state corrections
+    invalidate the qualified discovery generation.
+    """
+    if getattr(source, "shared_inventory", False) is not True or numbers:
+        return source.open_prs()
+    from . import github_transport as transport
+    from .source_identity import discovery_scope
+
+    scope = discovery_scope(source)
+    return transport.shared_read(
+        [*scope, list(source.inventory_fields)],
+        lambda: source.open_prs(fresh=True),
+        identity=source.cache_namespace,
+        ttl=60,
+        lock_timeout=300,
+        generation_scope=scope,
+        coalesce_failures=True,
+    )
+
+
 def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count_all_roadmaps):
     from .survey_facts import in_scope
 
@@ -109,7 +134,7 @@ def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count
     actor = source.authenticated_actor()
     if actor is None and getattr(source, "anonymous_discovery", False) is not True:
         return unavailable("authenticated_actor", source.last_failure)
-    raw = source.open_prs()
+    raw = discovery_inventory(source, numbers=numbers)
     if raw is None:
         return unavailable("open_prs", source.last_failure)
     try:
@@ -202,17 +227,20 @@ def worker_survey(cfg, source, rs, counters, *, roadmap, skip, deep, stages, num
             else pr
             for pr in result.open_prs
         ]
-    classify_survey(
-        cfg,
-        source,
-        rs,
-        counters,
-        result,
-        enabled=set(stages) & {"review", "fix", "rebase"},
-        deep=deep,
-        review_without_ci=True,
-        supports_external_repair=False,
-    )
+    from .github_transport import read_context
+
+    with read_context(advisory=True):
+        classify_survey(
+            cfg,
+            source,
+            rs,
+            counters,
+            result,
+            enabled=set(stages) & {"review", "fix", "rebase"},
+            deep=deep,
+            review_without_ci=True,
+            supports_external_repair=False,
+        )
     for stage in ("rebase", "review", "fix", "fix-ci", "bump", "lint-repair"):
         kind = result.kind(stage)
         for candidate in kind.actionable + kind.suppressed:

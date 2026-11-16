@@ -41,9 +41,33 @@ def repository_url(name=TAUCETI):
     ).url
 
 
+def canonical_mathematics_source():
+    """The enrolled TauCeti content repositories, with native identity checked too."""
+    source = current()
+    if source is None:
+        return repository_url().lower() == "https://github.com/taucetiproject/tauceti"
+    return (
+        source.repository.key == "forgejo:https://git.taucetiproject.org/taucetiproject/tauceti"
+        and source.identity.native_id == 1
+    )
+
+
 def pull_url(number):
     source = current()
     return (source.repository if source else RepositoryRef(GITHUB, TAUCETI)).pull_url(number)
+
+
+def resolve_selection(github, forgejo, new_pr_forge=None):
+    """Validate the source switches shared by direct and managed workers."""
+    if not github and not forgejo:
+        raise Die("enable at least one source with --github or --forgejo")
+    requested = "both" if github and forgejo else "github" if github else "forgejo"
+    destination = new_pr_forge or "github"
+    if destination not in ("github", "forgejo"):
+        raise Die("new PR forge must be github or forgejo")
+    if requested != "both" and destination != requested and new_pr_forge is not None:
+        raise Die("the new PR forge must be among the selected forges")
+    return requested, destination
 
 
 def configure(args):
@@ -61,14 +85,7 @@ def configure(args):
         # project configuration must never turn an ordinary worker into a trial.
         github = True if github is None else github
         forgejo = False if forgejo is None else forgejo
-    if not github and not forgejo:
-        raise Die("enable at least one source with --github or --forgejo")
-    requested = "both" if github and forgejo else "github" if github else "forgejo"
-    destination = getattr(args, "new_pr_forge", None) or "github"
-    if destination not in ("github", "forgejo"):
-        raise Die("new PR forge must be github or forgejo")
-    if requested != "both" and destination != requested and getattr(args, "new_pr_forge", None) is not None:
-        raise Die("the new PR forge must be among the selected forges")
+    requested, destination = resolve_selection(github, forgejo, getattr(args, "new_pr_forge", None))
     if (getattr(args, "pr", None) or os.environ.get("TAUCETI_PR", "").strip()) and requested == "both":
         raise Die("numeric --pr targets need one source: use --no-github --forgejo or --no-forgejo")
     if (
@@ -121,10 +138,10 @@ def native_source(cfg):
         path = str(cfg.home / ".config/tauceti-forgejo/worker-token")
     if path is None:
         raise Die("set TAUCETI_FORGEJO_TOKEN_FILE to a private Forgejo credential file")
-    from tauceti_queue.control_policy_file import read_control_policy
+    from tauceti_tools.git_credentials import read_private_token
 
     try:
-        token = read_control_policy(Path(path)).decode("ascii").strip()
+        token = read_private_token(Path(path))
     except FileNotFoundError:
         token = None
         path = None
@@ -133,14 +150,17 @@ def native_source(cfg):
     from .paths import ensure_ssl_cert_file
 
     ensure_ssl_cert_file()
-    return ForgejoWorkerSource(
+    source = ForgejoWorkerSource(
         RepositoryIdentity(repository, int(raw_id)),
         Forgejo(repository.forge, token=token),
         token_file=Path(path) if path else None,
     )
+    source.shared_inventory = True
+    return source
 
 
 def source_config(cfg, source):
+    source.review_publication_policy = review_publication_policy(cfg, source)
     suffix = hashlib.sha256(
         json.dumps({"repository": source.repository.key, "id": source.identity.native_id}, sort_keys=True).encode()
     ).hexdigest()[:24]
@@ -153,6 +173,15 @@ def source_config(cfg, source):
         sbcache=state / "cache/scoreboard",
         logdir=cfg.logdir / "sources" / suffix,
     )
+
+
+def review_publication_policy(cfg, source):
+    explicit = os.environ.get("TAUCETI_NATIVE_REVIEW_POLICY")
+    if explicit:
+        return explicit
+    candidate = cfg.home / ".config/tauceti-forgejo/review-publication.json"
+    canonical = source.repository.key == "forgejo:https://git.taucetiproject.org/taucetiproject/tauceti"
+    return str(candidate) if canonical and candidate.is_file() else None
 
 
 @contextlib.contextmanager
@@ -217,6 +246,12 @@ def activate(source, cfg):
         from .paths import self_env
 
         os.environ.update(self_env())
+        publication_policy = review_publication_policy(cfg, source)
+        if publication_policy:
+            os.environ.update(
+                TAUCETI_NATIVE_REVIEW_POLICY=publication_policy,
+                TAUCETI_NATIVE_REVIEW_PUBLISHER="tauceti_worker.native_review_publisher:QueueReviewPublisher",
+            )
         yield
     finally:
         os.environ.clear()

@@ -52,6 +52,8 @@ BIN.mkdir()
 HOME = TMP / "home"
 HOME.mkdir()
 os.environ["PATH"] = f"{BIN}:{os.environ.get('PATH', '')}"
+# Bind inference to this fixture even when another launch context supplies its own PATH.
+os.environ["TAUCETI_CLAUDE_CMD"] = str(BIN / "claude")
 os.environ["HOME"] = str(HOME)
 os.environ["TAUCETI_CACHE_SERVICE"] = ""  # the worker's own cache warming is not exercised here
 os.environ["TAUCETI_WORKER_ID"] = "queue-repair-test"

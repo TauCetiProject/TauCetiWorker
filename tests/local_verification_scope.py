@@ -316,7 +316,7 @@ def main():
                 f"self-tested helper={helper}: label the PR after verification",
                 "Apply the `self-tested` label to the PR" in text
                 and "gh-safe-pr-create" in text
-                and "--add-label self-tested" in text
+                and "matching verification receipt" in text
                 and "failed, incomplete, or outdated" in text,
             )
             check(

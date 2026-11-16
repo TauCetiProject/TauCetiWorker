@@ -36,8 +36,7 @@ def execute(args, source, *, cwd=None):
 def load_source():
     from tauceti_tools.ci_candidate import RepositoryIdentity
     from tauceti_tools.forge import Forgejo
-
-    from tauceti_queue.control_policy_file import read_control_policy
+    from tauceti_tools.git_credentials import read_private_token
 
     from .forgejo_worker import ForgejoWorkerSource
 
@@ -45,7 +44,7 @@ def load_source():
     if identity.repository.forge.url != os.environ["TAUCETI_FORGEJO_ORIGIN"]:
         raise ValueError("Forgejo credential origin differs from the selected source")
     path = Path(os.environ["TAUCETI_FORGEJO_TOKEN_FILE"])
-    token = read_control_policy(path).decode("ascii").strip()
+    token = read_private_token(path)
     source = ForgejoWorkerSource(identity, Forgejo(identity.repository.forge, token=token), token_file=path)
     source.validate_binding()
     expected = os.environ.get("TAUCETI_FORGEJO_USER_ID")
@@ -75,6 +74,7 @@ def checkout(args, source):
 
     repository = RepositoryRef(source.repository.forge, head["repo"]["full_name"])
     sha, remote_branch = head["sha"], head["ref"]
+
     # Round worktrees share one repository, so each worker names its own local branch.
     branch = opts.branch if opts.branch is not None else remote_branch
     if not re.fullmatch(r"[0-9a-f]{40}", sha):

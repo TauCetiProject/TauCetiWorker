@@ -1,4 +1,4 @@
-"""Shared GitHub reads and allow-listed HTTP accounting, including gh subprocesses.
+"""Shared read caching and allow-listed GitHub HTTP accounting, including gh subprocesses.
 
 No tokens, query strings, request/response bodies or raw debug traces enter accounting.
 Cache entries are credential-scoped; fresh checks bypass them, and writes invalidate them.
@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 
 _fresh = contextvars.ContextVar("github_fresh", default=False)
 _direct = contextvars.ContextVar("github_direct", default=False)
+_advisory = contextvars.ContextVar("source_advisory", default=False)
 _retry_reads = contextvars.ContextVar("github_retry_reads", default=True)
 _revision = contextvars.ContextVar("github_revision", default="")
 _cache_hit = contextvars.ContextVar("github_cache_hit", default=False)
@@ -76,12 +77,15 @@ def register_principal(user_id: int, login: str, env=None):
 
 
 @contextlib.contextmanager
-def read_context(*, fresh: bool = False, revision: str = "", direct: bool = False, retry: bool = True):
+def read_context(
+    *, fresh: bool = False, revision: str = "", direct: bool = False, retry: bool = True, advisory: bool | None = None
+):
     a = _fresh.set(_fresh.get() or fresh)
     b = _revision.set(revision or _revision.get())
     c = _cache_hit.set(False)
     d = _direct.set(_direct.get() or direct)
     e = _retry_reads.set(_retry_reads.get() and retry)
+    f = _advisory.set(_advisory.get() if advisory is None else advisory)
     try:
         yield
     finally:
@@ -90,6 +94,11 @@ def read_context(*, fresh: bool = False, revision: str = "", direct: bool = Fals
         _cache_hit.reset(c)
         _direct.reset(d)
         _retry_reads.reset(e)
+        _advisory.reset(f)
+
+
+def advisory_reads():
+    return _advisory.get()
 
 
 def direct_reads():
@@ -185,6 +194,21 @@ def invalidate_permissions(repo, env=None):
         pass
 
 
+def shared_generation(scope):
+    """An explicitly scoped cache generation, independent of unrelated writes."""
+    try:
+        return _generation_file(scope).read_text()
+    except OSError:
+        return ""
+
+
+def invalidate_shared(scope):
+    try:
+        atomic(_generation_file(scope), uuid.uuid4().hex)
+    except OSError:
+        pass
+
+
 def invalidate(args=None):
     """Invalidate mutable reads affected by a write, without expiring permissions or immutable data."""
     try:
@@ -242,24 +266,74 @@ def event(value: dict):
         pass
 
 
-def shared_read(key, fetch, *, ttl: float = 30, identity=None, immutable: bool = False):
+def prune_shared_cache():
+    """Cap persisted read data, with one inexpensive cleanup per five minutes."""
+    from tauceti_worker.read_cache import prune_read_cache
+
+    cache = root() / "cache"
+    marker = cache / ".pruned.json"
+
+    def recent():
+        try:
+            return 0 <= time.time() - marker.stat().st_mtime < 300
+        except OSError:
+            return False
+
+    if recent():
+        return
+    try:
+        with locked(cache / ".prune.lock", timeout=0.05):
+            if recent():
+                return
+            prune_read_cache(cache, max_files=1024, max_bytes=64 * 1024 * 1024)
+            atomic(marker, {"time": time.time()})
+    except OSError:
+        pass  # Cache cleanup never gates a source read.
+
+
+def shared_read(
+    key,
+    fetch,
+    *,
+    ttl: float = 30,
+    identity=None,
+    immutable: bool = False,
+    lock_timeout: float = 30,
+    generation_scope=None,
+    coalesce_failures: bool = False,
+):
     """Coalesce a complete logical read under a per-key lock. Never cache failures.
 
     Network/parser exceptions propagate; unavailable storage merely disables caching. Generation
     checks prevent an overlapping write from publishing a pre-write result after invalidation.
+    Explicit generation scopes use invalidate_shared rather than unrelated GitHub writes.
+    Opt-in completion markers share unavailable reads only with existing waiters.
+    The default invokes each caller's fetch after failures, preserving fetch side effects.
     """
     identity = identity or scope()
     if not identity or _fresh.get() or os.environ.get("TAUCETI_GITHUB_CACHE_BYPASS") == "1":
         return fetch()
+    requested_at = time.time()
     digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
     path = root() / "cache" / identity / (digest + ".json")
+    attempt = path.with_suffix(".attempt")
+
+    def current_generation():
+        return generation(key) if generation_scope is None else shared_generation(generation_scope)
+
+    def finished(outcome):
+        if not coalesce_failures:
+            return
+        with contextlib.suppress(OSError):
+            atomic(attempt, {"finished_at": time.time(), "revision": _revision.get(), "outcome": outcome})
+
     try:
-        cm = locked(path.with_suffix(".lock"))
+        cm = locked(path.with_suffix(".lock"), timeout=lock_timeout)
         cm.__enter__()
     except OSError:
         return fetch()
     try:
-        epoch = generation(key)
+        epoch = current_generation()
         try:
             cached = json.loads(path.read_text())
             if (
@@ -267,20 +341,78 @@ def shared_read(key, fetch, *, ttl: float = 30, identity=None, immutable: bool =
                 and cached.get("revision", "") == _revision.get()
                 and 0 <= time.time() - cached["time"] < ttl
             ):
+                with contextlib.suppress(OSError):
+                    os.utime(path, follow_symlinks=False)
                 event({"kind": "cache_hit", "read": key[0]})
                 _cache_hit.set(True)
                 return cached["value"]
         except (OSError, ValueError, KeyError, TypeError):
             pass
-        value = fetch()
-        if value is not None and (immutable or generation(key) == epoch):
+        retry_unlocked = False
+        refetched = False
+        if coalesce_failures:
             try:
-                atomic(path, {"time": time.time(), "generation": epoch, "revision": _revision.get(), "value": value})
-            except OSError:
+                previous = json.loads(attempt.read_text())
+                completed = previous["finished_at"]
+                if (
+                    previous["revision"] == _revision.get()
+                    and requested_at < completed
+                    and 0 <= time.time() - completed <= lock_timeout
+                ):
+                    if previous["outcome"] == "unavailable":
+                        # Coalesce only callers that already waited for this attempt.
+                        # A request starting after it ended still gets its own fetch.
+                        return None
+                    # A successful read invalidated by an overlapping write
+                    # needs one new leader, not one full read per waiter.
+                    refetched = previous["outcome"] == "invalidated"
+                    retry_unlocked = not refetched
+            except (OSError, ValueError, KeyError, TypeError):
                 pass
-        return value
+            if not retry_unlocked:
+                try:
+                    # If storage cannot record completion, do not serialize network
+                    # reads behind a cache that cannot publish anything.
+                    atomic(attempt, {"revision": _revision.get(), "outcome": "pending"})
+                except OSError:
+                    retry_unlocked = True
+        if not retry_unlocked:
+            try:
+                value = fetch()
+                saved = False
+                generation_current = immutable or current_generation() == epoch
+                if value is not None and generation_current:
+                    try:
+                        atomic(
+                            path,
+                            {"time": time.time(), "generation": epoch, "revision": _revision.get(), "value": value},
+                        )
+                        saved = True
+                    except OSError:
+                        pass
+                if saved:
+                    prune_shared_cache()
+                if saved and coalesce_failures:
+                    with contextlib.suppress(OSError):
+                        attempt.unlink(missing_ok=True)
+                else:
+                    # At most one replacement fetch per waiting cohort. A
+                    # second overlapping write leaves no shareable inventory;
+                    # later callers can try again without a parallel stampede.
+                    outcome = (
+                        "unavailable"
+                        if value is None or refetched and not generation_current
+                        else ("retry" if generation_current else "invalidated")
+                    )
+                    finished(outcome)
+                return value
+            except BaseException:
+                finished("retry")
+                raise
     finally:
         cm.__exit__(None, None, None)
+    # Exceptions or broken cache storage must not serialize every full fetch.
+    return fetch()
 
 
 def remember_quota(record, identity):

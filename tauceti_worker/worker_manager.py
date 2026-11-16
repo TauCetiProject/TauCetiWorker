@@ -50,6 +50,9 @@ _WORKER_KEYS = {
     "github_state_token_file",
     "id",
     "github_account",
+    "github",
+    "forgejo",
+    "new_pr_forge",
     "enabled",
     "agent",
     "only",
@@ -305,6 +308,9 @@ class WorkerSpec:
     github_state_url: str | None = None
     github_state_token_file: str | None = None
     github_account: str | None = None
+    github: bool = True
+    forgejo: bool = False
+    new_pr_forge: str | None = None
     enabled: bool = True
     agent: str = "auto"
     only: tuple[str, ...] = ()
@@ -374,6 +380,9 @@ class WorkerSpec:
             enabled=enabled,
             agent=agent,
             github_account=_string(raw.get("github_account"), f"workers[{index}].github_account", optional=True),
+            github=_boolean(raw.get("github", True), f"workers[{index}].github"),
+            forgejo=_boolean(raw.get("forgejo", False), f"workers[{index}].forgejo"),
+            new_pr_forge=_string(raw.get("new_pr_forge"), f"workers[{index}].new_pr_forge", optional=True),
             only=only,
             sandbox=sandbox,
             ignore_quota=_boolean(raw.get("ignore_quota", False), f"workers[{index}].ignore_quota"),
@@ -403,6 +412,13 @@ class WorkerSpec:
             restart=restart,
             env=_env_pairs(raw.get("env", {}), f"workers[{index}].env"),
         )
+        from .config import Die
+        from .worker_sources import resolve_selection
+
+        try:
+            resolve_selection(spec.github, spec.forgejo, spec.new_pr_forge)
+        except Die as error:
+            raise WorkersError(f"workers[{index}]: {error}") from None
         if spec.github_account is not None:
             try:
                 validate_github_account(spec.github_account)
@@ -432,6 +448,12 @@ class WorkerSpec:
 
     def as_dict(self) -> dict:
         value: dict = {"id": self.id, "enabled": self.enabled}
+        if not self.github:
+            value["github"] = False
+        if self.forgejo:
+            value["forgejo"] = True
+        if self.new_pr_forge is not None:
+            value["new_pr_forge"] = self.new_pr_forge
         if self.max_open_prs != MAX_OPEN_PRS:
             value["max_open_prs"] = self.max_open_prs
         if self.agent != "auto":
@@ -494,6 +516,10 @@ class WorkerSpec:
 
     def work_argv(self) -> list[str]:
         argv = self_argv("work", "--loop", "--worker-id", self.id)
+        if not self.github or self.forgejo:
+            argv += ["--github" if self.github else "--no-github", "--forgejo" if self.forgejo else "--no-forgejo"]
+        if self.new_pr_forge is not None:
+            argv += ["--new-pr-forge", self.new_pr_forge]
         if self.conf:
             argv += ["--conf", self.conf]
         argv += ["--max-open-prs", str(self.max_open_prs)]
@@ -1056,7 +1082,16 @@ def _defer_read_policy_reload(spec: WorkerSpec, live: dict) -> bool:
             applied = previous.as_dict()
     old = dict(applied)
     desired = spec.as_dict()
-    for field in ("max_open_prs", "github_state_url", "github_state_token_file", "self_tested", "full_quality"):
+    for field in (
+        "max_open_prs",
+        "github_state_url",
+        "github_state_token_file",
+        "self_tested",
+        "full_quality",
+        "github",
+        "forgejo",
+        "new_pr_forge",
+    ):
         old.pop(field, None)
         desired.pop(field, None)
     if old != desired:
@@ -1157,6 +1192,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     "config": str(config),
                     "error": last_error,
                     "self_tested": 1,
+                    "source_selection": 1,
                     "graceful_restart": 1,
                 }
             if action == "restart":

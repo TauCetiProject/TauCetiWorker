@@ -507,14 +507,25 @@ def scope_policy(labels=(), head_ref: str = "", *, bump: bool = False) -> str:
 
 
 def self_tested_guidance(policy: str) -> str:
-    from .worker_sources import repository_url
+    from .self_tested_label import enabled
+    from .worker_sources import current
 
-    if (
-        policy != "ordinary"
-        or os.environ.get("TAUCETI_SELF_TESTED", "0") != "1"
-        or repository_url().lower() != "https://github.com/taucetiproject/tauceti"
-    ):
+    if policy != "ordinary" or enabled():
         return ""
+    comment_requests = getattr(current(), "supports_label_requests", True)
+    fallback = (
+        (
+            " If that command fails for lack of label permissions, confirm you are the PR author and its head still "
+            "matches the verified commit, then post a new standalone `self-tested` comment with "
+            "`gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested`. "
+            "The comment handler is asynchronous; do not post duplicate requests while it runs. "
+        )
+        if comment_requests
+        else " "
+    )
+    remove_fallback = (
+        " (or post `-self-tested` as the PR author if label permissions are missing)" if comment_requests else ""
+    )
     return (
         "### Apply the self-tested label after verification\n"
         "For an ordinary mathematics PR entirely under `TauCeti/`, after the final source changes "
@@ -526,18 +537,15 @@ def self_tested_guidance(policy: str) -> str:
         "`gh-safe-pr-create` wrapper; do not bypass it. After creation or pushing an update, "
         "confirm the live PR commit matches your verified commit, then use "
         "`gh pr edit <number> --repo TauCetiProject/TauCeti "
-        "--add-label self-tested`. If GitHub denies that command for lack of label permissions, "
-        "confirm you are the PR author and its head still matches the verified commit, then post "
-        "a new standalone `self-tested` comment with "
-        "`gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested`. "
-        "The comment handler is asynchronous; do not post duplicate requests while it runs. "
-        "Keep the label in place through fix/rebase pushes after local verification succeeds. "
+        "--add-label self-tested`."
+        + fallback
+        + "Keep the label in place through fix/rebase pushes after local verification succeeds. "
         "The label is a persistent author declaration, not a per-commit receipt. "
         "If verification fails or is incomplete, remove it with `gh pr edit <number> "
-        "--repo TauCetiProject/TauCeti --remove-label self-tested` (or post `-self-tested` "
-        "as the PR author if label permissions are missing). Do not leave it on work you "
+        "--repo TauCetiProject/TauCeti --remove-label self-tested`" + remove_fallback + ". Do not leave it on work you "
         "cannot stand behind. Do not apply it for infrastructure or pin changes, or full-lint/lint-repair requests. "
-        "Admission checks trusted-author and source-scope eligibility directly; reviews and all staging tests still run.\n\n"
+        "After the round, the worker also applies the label to pushed heads with a successful complete "
+        "matching verification receipt. Admission checks trusted-author and source-scope eligibility directly; reviews and all staging tests still run.\n\n"
     )
 
 

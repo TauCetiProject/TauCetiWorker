@@ -86,6 +86,8 @@ RUN_STDLIB=(
   auto_stage_priority.py
   automatic_bump.py
   bump_attestation.py
+  self_tested_label.py
+  native_self_tested.py
   authoring_profiles.py
   bubble_cache.py
   bubble_version.py
@@ -223,6 +225,7 @@ RUN_STDLIB=(
   review_provider_down.py
   review_outcomes.py
   review_runtime.py
+  native_review_publisher.py
   review_unchanged_memo.py
   synchronous_state_repair.py
   source_mergeability.py
