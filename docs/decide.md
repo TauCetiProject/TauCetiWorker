@@ -253,13 +253,13 @@ all of these hold at the moment of closing:
   diff`, on Forgejo through the source's command layer, which returns the pull
   request's own diff from its recorded merge base, merged or not.
 
-  Each diff hunk is read as Lean source, its unchanged lines included:
-  comments, literals and syntax quotations are not code, and every added line
-  holding a declaration keyword must read as a complete declaration header at
-  the hunk's outer level. A hunk that cannot be read that way, because a token,
-  bracket or header does not end within it or a keyword stands where no header
-  begins, refuses the closure. The one case the diff cannot show is a hunk lying
-  wholly inside a comment or quotation that opens and closes outside it.
+  Each diff hunk is read as Lean source, its unchanged lines included, and
+  every declaration keyword on an added line must read as a complete
+  declaration header outside comments, literals and syntax quotations;
+  anything the reader cannot settle from the hunk refuses the closure, including
+  a hunk whose reading would change if it started inside a string. What a diff
+  cannot show at all is a hunk lying wholly inside a comment, string or
+  quotation that opens and closes outside it.
 
 A closure that does not complete when it is sent is not kept in the publication
 outbox for a later replay, which would skip these checks and the claim; the

@@ -815,15 +815,19 @@ CLOSE = "close"
 CLOSE_ENV = "TAUCETI_DECIDE_CLOSE"
 CLOSES_ENV = "TAUCETI_DECIDE_MAX_CLOSES_PER_DAY"
 CLOSURES = "closures.log"
-_MODIFIERS = r"(?:(?:private|protected|public|noncomputable|unsafe|partial|nonrec|scoped|local|meta)\s+)*"
-_KINDS = r"theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom"
-_KEYWORD = re.compile(rf"\s*(?P<modifiers>{_MODIFIERS})(?P<kind>class\s+inductive|{_KINDS})(?![^\s(])")
-# A declaration keyword standing as a token; `.`, `_`, `'`, `?`, `!` continue a name.
-_KEYWORD_TOKEN = re.compile(rf"(?<![\w.'?!»])(?:{_KINDS})(?![\w'?!])")
-# Commands that may lead a declaration on its own line: `set_option … in theorem foo`.
-_PREFIX = re.compile(r"\s*(?:(?:set_option|open|variable|include|omit)\b[^\n]*?\bin\s+)*")
-_NAME = re.compile(r"(?:«[^»]*»|[^\s:(\[{⦃⟨⟪|,«])+")
-_PRIORITY = re.compile(r"\(\s*priority\s*:=")
+_MODIFIERS = {
+    "private",
+    "protected",
+    "public",
+    "noncomputable",
+    "unsafe",
+    "partial",
+    "nonrec",
+    "scoped",
+    "local",
+    "meta",
+}
+_KINDS = {"theorem", "lemma", "def", "abbrev", "instance", "structure", "class", "inductive", "opaque", "axiom"}
 _OPEN, _CLOSE = "([{", ")]}"
 
 
@@ -835,75 +839,120 @@ def _skip_quoted(line: str, j: int) -> int:
     return end + 1
 
 
-def _group(line: str, i: int) -> int:
-    """The end of the bracketed group opening at `line[i]`, nested brackets included and `«…»`
-    names skipped. Raises `_Unsure` when it does not close in `line`."""
-    stack, j = [], i
+def _tokens(line: str) -> list[tuple[int, int, str]]:
+    """`line` as (start, end, kind) tokens, whitespace left out: `word` (an identifier part,
+    dots and Lean's continuation characters included), `quoted` (a whole `«…»` name), `open`
+    and `close` brackets, and `mark` for any other character."""
+    out, j = [], 0
     while j < len(line):
         c = line[j]
-        if c == "«":
-            j = _skip_quoted(line, j)
-            continue
-        if c in _OPEN:
-            stack.append(_CLOSE[_OPEN.index(c)])
-        elif c in _CLOSE:
-            if not stack or c != stack.pop():
+        if c.isspace():
+            j += 1
+        elif c == "«":
+            end = _skip_quoted(line, j)
+            out.append((j, end, "quoted"))
+            j = end
+        elif _ident(c) or c == ".":
+            end = j
+            while end < len(line) and (_ident(line[end]) or line[end] == "."):
+                end += 1
+            out.append((j, end, "word"))
+            j = end
+        else:
+            out.append((j, j + 1, "open" if c in _OPEN else "close" if c in _CLOSE else "mark"))
+            j += 1
+    return out
+
+
+def _matching(line: str, tokens: list, k: int, step: int) -> int:
+    """The index of the token closing (`step` 1) or opening (`step` -1) the bracket at `tokens[k]`,
+    brackets of every kind nesting. Raises `_Unsure` when there is none or they cross."""
+    opens, closes = (_OPEN, _CLOSE) if step > 0 else (_CLOSE, _OPEN)
+    stack = []
+    while 0 <= k < len(tokens):
+        c = line[tokens[k][0]]
+        if tokens[k][2] in ("open", "close"):
+            if c in opens:
+                stack.append(closes[opens.index(c)])
+            elif not stack or stack.pop() != c:
                 raise _Unsure
             if not stack:
-                return j + 1
-        j += 1
+                return k
+        k += step
     raise _Unsure
 
 
 def _depth(line: str) -> tuple[int, int]:
     """(the bracket depth `line` ends at, the lowest it reaches), from 0 at its start."""
-    depth = low = j = 0
-    while j < len(line):
-        c = line[j]
-        if c == "«":
-            j = _skip_quoted(line, j)
-            continue
-        depth += (c in _OPEN) - (c in _CLOSE)
-        low, j = min(low, depth), j + 1
+    depth = low = 0
+    for _start, _end, kind in _tokens(line):
+        depth += (kind == "open") - (kind == "close")
+        low = min(low, depth)
     return depth, low
 
 
-def _keyword_outside_groups(line: str) -> bool:
-    """Whether a declaration keyword stands as a token in `line` outside the brackets it opens."""
-    depth, j = 0, 0
-    while j < len(line):
-        c = line[j]
-        if c == "«":
-            j = _skip_quoted(line, j)
+def _declarations(line: str, start: int) -> list[tuple[str, str] | None]:
+    """For each declaration keyword token at or after `start` in a lexed header text, outside
+    the brackets the text opens: (modifiers, name), or None for an anonymous instance. The first
+    keyword's header must begin the text or follow a command ending in `in`; any header that is not
+    complete in `line` raises `_Unsure`."""
+    tokens, found, depth, enclosed = _tokens(line), [], 0, False
+    word = lambda k: line[tokens[k][0] : tokens[k][1]] if 0 <= k < len(tokens) else ""  # noqa: E731
+    for k, (begin, _end, kind) in enumerate(tokens):
+        if kind in ("open", "close"):
+            depth += 1 if kind == "open" else -1
             continue
-        if depth <= 0 and _KEYWORD_TOKEN.match(line, j) and not (j and (_ident(line[j - 1]) or line[j - 1] in ".»")):
-            return True
-        depth += (c in _OPEN) - (c in _CLOSE)
-        j += 1
-    return False
-
-
-def _declared(line: str) -> tuple[str, str] | None:
-    """(modifiers, name) of the declaration a lexed header opens, or None for an anonymous
-    instance. `line` holds a declaration keyword; raises `_Unsure` unless it reads as a complete
-    header (commands ending in `in`, attributes, modifiers, keyword, priority clause, name)."""
-    i = _PREFIX.match(line).end()
-    while line.startswith("@[", i):
-        i = _group(line, i + 1)
-        i += len(line[i:]) - len(line[i:].lstrip())
-    head = _KEYWORD.match(line, i)
-    if not head:
+        if kind != "word" or word(k) not in _KINDS or begin < start:
+            continue
+        if depth > 0:
+            enclosed = True  # inside brackets: `attribute [instance] f`, unless they never close
+            continue
+        if word(k) == "inductive" and word(k - 1) == "class":
+            continue
+        # Back over modifiers and complete `@[…]` groups to where the header begins.
+        h, modifiers = k, []
+        while True:
+            if h - 1 >= 0 and tokens[h - 1][2] == "word" and word(h - 1) in _MODIFIERS:
+                modifiers.insert(0, word(h - 1))
+                h -= 1
+            elif h - 1 >= 0 and line[tokens[h - 1][0]] == "]":
+                opening = _matching(line, tokens, h - 1, -1)
+                if line[tokens[opening][0]] != "[" or opening == 0 or line[tokens[opening - 1][0]] != "@":
+                    raise _Unsure
+                h = opening - 1
+            else:
+                break
+        if not found and h > 0 and word(h - 1) != "in":
+            raise _Unsure  # a keyword where no header begins: `deriving instance`, text before it
+        after = k + 1
+        if word(k) == "class" and word(after) == "inductive":
+            after += 1
+        if after < len(tokens) and line[tokens[after][0]] == "(":
+            close = _matching(line, tokens, after, 1)
+            if word(after + 1) != "priority":
+                if word(k) != "instance":
+                    raise _Unsure
+                found.append(None)  # an anonymous instance's binder
+                continue
+            after = close + 1
+        if after >= len(tokens):
+            raise _Unsure  # the name is on a later line
+        name_end = after
+        while (
+            name_end < len(tokens)
+            and tokens[name_end][2] in ("word", "quoted")
+            and (name_end == after or tokens[name_end][0] == tokens[name_end - 1][1])
+        ):
+            name_end += 1
+        if name_end == after:
+            if word(k) != "instance":
+                raise _Unsure
+            found.append(None)  # `instance : C`
+            continue
+        found.append((" ".join(modifiers), line[tokens[after][0] : tokens[name_end - 1][1]]))
+    if enclosed and depth > 0:
         raise _Unsure
-    rest = line[head.end() :].lstrip()
-    if rest.startswith("("):
-        end = _group(rest, 0)
-        if not _PRIORITY.match(rest):
-            return None  # an anonymous instance's binder
-        rest = rest[end:].lstrip()
-    if not rest:
-        raise _Unsure
-    name = _NAME.match(rest)
-    return (head.group("modifiers"), name.group()) if name else None
+    return found
 
 
 def _lean_path(header: str) -> bool:
@@ -944,8 +993,9 @@ class _Lexer:
     interpolated strings (`s!"…{…}…"`) hold code in braces, and `«…»` is a name. Raises `_Unsure`
     where a token does not end within the text."""
 
-    def __init__(self, text: str):
-        self.text, self.out, self.unopened = text, list(text), False
+    def __init__(self, text: str, *, open_end: bool = False):
+        # `open_end`: a string still open where the text ends is read as running past it.
+        self.text, self.out, self.unopened, self.open_end = text, list(text), False, open_end
 
     def blank(self, start: int, end: int) -> int:
         for k in range(start, end):
@@ -966,9 +1016,12 @@ class _Lexer:
 
     def string(self, i: int, *, interpolated: bool) -> int:
         start, text, braces = i, self.text, 0
+        opened = i
         i += 1
         while True:
             if i >= len(text):
+                if self.open_end:
+                    return self.blank(start, len(text))
                 raise _Unsure
             c = text[i]
             if c == "\\":
@@ -976,6 +1029,9 @@ class _Lexer:
             elif c == '"':
                 if braces > 0:
                     raise _Unsure  # `{` with no `}`: possibly an interpolation this reader cannot see
+                if "\n" in text[opened:i]:
+                    # The hunk may start inside a string, so quotes across lines may pair the other way.
+                    raise _Unsure
                 return self.blank(start, i + 1)
             elif c == "{" and interpolated:
                 self.blank(start, i + 1)
@@ -1013,7 +1069,10 @@ class _Lexer:
             elif c == "r" and not _ident(before) and (raw := _RAW.match(text, i)):
                 close = '"' + raw.group(1)
                 end = text.find(close, raw.end())
-                if end < 0:
+                if end < 0 and self.open_end:
+                    i = self.blank(i, len(text))
+                    continue
+                if end < 0 or "\n" in text[i:end]:
                     raise _Unsure
                 i = self.blank(i, end + len(close))
             elif c == "'" and not _ident(before) and (char := _CHAR.match(text, i)):
@@ -1031,40 +1090,93 @@ class _Lexer:
         return i
 
 
-def _code(lines: list[str], *, depth: int = 0) -> tuple[list[str], bool]:
-    """`lines` with comments and literals blanked by `_Lexer`, starting `depth` block comments deep;
-    and whether a block comment closed that had not opened in them. Raises `_Unsure`."""
-    lexer = _Lexer("\n".join(lines))
-    lexer.code(lexer.comment(0, 0, depth) if depth else 0)
+def _code(lines: list[str], *, depth: int = 0, string: int | None = None) -> tuple[list[str], bool]:
+    """`lines` with comments and literals blanked by `_Lexer`, starting `depth` block comments deep,
+    or with `string` inside a string: an ordinary one for -1, else a raw one with that many `#`;
+    and whether a block comment closed that had not opened in them. Raises `_Unsure`. A text read
+    as starting inside a string may also end inside one."""
+    text = "\n".join(lines)
+    lexer = _Lexer(text, open_end=string is not None)
+    if string is None:
+        lexer.code(lexer.comment(0, 0, depth) if depth else 0)
+    else:
+        if string < 0:
+            end = 0
+            while end < len(text) and text[end] != '"':
+                end += 2 if text[end] == "\\" else 1
+        else:
+            end = text.find('"' + "#" * string)
+        if end < 0 or end >= len(text):
+            raise _Unsure
+        lexer.code(lexer.blank(0, end + 1 + max(string, 0)))
     return "".join(lexer.out).split("\n"), lexer.unopened
+
+
+_HUNK = re.compile(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+
+
+def _hunks(diff: str) -> list[list[tuple[bool, str]]]:
+    """The hunks of `.lean` files in a unified diff, each as (added, text) for its unchanged and
+    added lines. Within a hunk, as counted from its `@@` line, every line is content; `+++ ` names
+    a file only between hunks. Framing that does not add up raises `_Unsure`."""
+    hunks: list[list[tuple[bool, str]]] = []
+    lean, old, new = False, 0, 0
+    for line in diff.splitlines():
+        if old or new:
+            if line.startswith("\\"):
+                continue  # "\ No newline at end of file"
+            mark = line[:1] or " "
+            if mark not in " +-":
+                raise _Unsure
+            old, new = old - (mark in " -"), new - (mark in " +")
+            if old < 0 or new < 0:
+                raise _Unsure
+            if lean and mark != "-":
+                hunks[-1].append((mark == "+", line[1:]))
+        elif line.startswith("+++ "):
+            lean = _lean_path(line)
+        elif header := _HUNK.match(line):
+            old, new = (int(n) if n is not None else 1 for n in header.groups())
+            hunks.append([])
+        elif line.startswith("diff "):
+            lean = False
+        elif line[:1] in "+- " and not line.startswith("--- "):
+            raise _Unsure  # content outside any hunk
+    if old or new:
+        raise _Unsure
+    return hunks
 
 
 def _added(diff: str, private: bool) -> set[str]:
     names: set[str] = set()
-    hunks: list[list[tuple[bool, str]]] = []
-    lean = False
-    for line in diff.splitlines():
-        if line.startswith("+++ "):
-            lean = _lean_path(line)
-            hunks.append([])
-        elif line.startswith("@@"):
-            hunks.append([])
-        elif lean and hunks and line[:1] in ("+", " "):
-            hunks[-1].append((line[0] == "+", line[1:]))
-    for hunk in filter(None, hunks):
+    for hunk in filter(None, _hunks(diff)):
         text = [line for _, line in hunk]
         code, unopened = _code(text)
         if unopened:
             code, unopened = _code(text, depth=1)
             if unopened:
                 raise _Unsure
-        names |= _hunk_names(hunk, code, private)
+        found = _hunk_names(hunk, code, private)
+        # The hunk may instead start inside a string that one of its quotes closes. Where that
+        # reading is also consistent and finds other declarations, the diff cannot settle it.
+        joined = "\n".join(text)
+        if '"' in joined:
+            hashes = {len(m.group(1)) for m in re.finditer(r'"(#+)', joined)}
+            for string in [-1, *sorted(hashes), *([0] if '\\"' in joined else [])]:
+                try:
+                    other, unopened = _code(text, string=string)
+                    if unopened or _hunk_names(hunk, other, private) == found:
+                        continue
+                except _Unsure:
+                    continue
+                raise _Unsure
+        names |= found
     return names
 
 
 def _hunk_names(hunk: list[tuple[bool, str]], code: list[str], private: bool) -> set[str]:
-    """The declarations an added line of one hunk names. Every added line holding a declaration
-    keyword must read as a header, its attribute list possibly opened on earlier lines of the
+    """The declarations an added line of one hunk names. Every declaration keyword on an added
+    line must read as a complete header, its attribute list possibly opened on earlier lines of the
     hunk, at the hunk's outermost bracket depth; otherwise the hunk is `_Unsure`."""
     starts, depth, low = [], 0, 0
     for line in code:
@@ -1073,7 +1185,7 @@ def _hunk_names(hunk: list[tuple[bool, str]], code: list[str], private: bool) ->
         low, depth = min(low, depth + lowest), depth + end
     names: set[str] = set()
     for k, ((added, _), line) in enumerate(zip(hunk, code, strict=True)):
-        if not added or not _keyword_outside_groups(line):
+        if not added or not any(kind == "word" and line[a:b] in _KINDS for a, b, kind in _tokens(line)):
             continue
         first = k
         # An attribute list opened on an earlier line: read the header from that line.
@@ -1081,19 +1193,21 @@ def _hunk_names(hunk: list[tuple[bool, str]], code: list[str], private: bool) ->
             first -= 1
         if starts[first] > low or (first < k and not code[first].lstrip().startswith("@[")):
             raise _Unsure
-        found = _declared(" ".join(code[first : k + 1]))
-        if found and (private or "private" not in found[0].split()):
-            names.add(found[1])
+        text = " ".join(code[first : k + 1])
+        for found in _declarations(text, len(text) - len(line)):
+            if found and (private or "private" not in found[0].split()):
+                names.add(found[1])
     return names
 
 
 def added_declarations(diff: str, *, private: bool = False) -> set[str] | None:
     """The names, as written, of the declarations a unified diff adds to `.lean` files, outside
     comments, literals and syntax quotations; None where a hunk cannot be read with certainty. Each
-    hunk's added and unchanged lines are read together, and every added line holding a declaration
-    keyword must read as a complete header at the hunk's outer bracket level, else the hunk is
-    unreadable. A hunk lying wholly inside a comment or quotation opened and closed outside it cannot
-    be told from code by the diff alone. `private` ones are left out unless asked for."""
+    hunk's added and unchanged lines are read together; every declaration keyword on an added line
+    must read as a complete header at the hunk's outer bracket level, and the hunk must read the
+    same if it started inside a string one of its quotes closes. A hunk lying wholly inside a
+    comment, string or quotation opened and closed outside it cannot be told from code by the diff
+    alone. `private` ones are left out unless asked for."""
     try:
         return _added(diff, private)
     except _Unsure:

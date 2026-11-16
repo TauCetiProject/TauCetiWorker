@@ -38,6 +38,43 @@ real_gmtime = time.gmtime
 LEAN = "+++ b/TauCeti/A.lean\n+theorem strong_law : True := trivial\n+private lemma aux : True := trivial\n"
 
 
+def frame(diff):
+    """`diff` with each hunk's `@@` header counted from its lines, and one added where a file's
+    body has none: fixtures name the lines a hunk holds, not their counts. Every `+++ ` line is
+    taken as a file header."""
+    out, body = [], []
+
+    def flush():
+        hunks, header = [], None
+        for line in body:
+            if line.startswith("@@"):
+                hunks.append((line, []))
+            elif not hunks:
+                hunks.append(("@@ -0,0 +1 @@", [line]))
+            else:
+                hunks[-1][1].append(line)
+        for header, lines in hunks:
+            found = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)", header)
+            old = sum(line[:1] in " -" for line in lines)
+            new = sum(line[:1] in " +" for line in lines)
+            out.append(f"@@ -{found[1]},{old} +{found[2]},{new} @@{found[3]}")
+            out.extend(lines)
+        body.clear()
+
+    for line in diff.split("\n")[:-1] if diff.endswith("\n") else diff.split("\n"):
+        if line.startswith("+++ "):
+            flush()
+            out.append(line)
+        else:
+            body.append(line)
+    flush()
+    return "\n".join(out) + "\n"
+
+
+def added(diff, **options):
+    return decide.added_declarations(frame(diff), **options)
+
+
 def check(name, got, want=True):
     global fails
     ok = got == want
@@ -112,9 +149,12 @@ class Hub:
     def merged_prs(self, search, limit=200):
         return []
 
+    raw = False  # a fixture diff already framed exactly, given to the reader as it is
+
     def pr_diff(self, n):
         self.on_diff(n)
-        return self.prs[n].get("diff", LEAN)
+        diff = self.prs[n].get("diff", LEAN)
+        return diff if diff is None or self.raw else frame(diff)
 
     def on_diff(self, n):
         pass
@@ -1146,19 +1186,19 @@ def test_close(tmp):
     more = "+++ b/README.md\n+theorem prose : x\n+++ b/B.lean\n+@[simp] noncomputable def Foo.bar := 1\n+instance : Inhabited Nat := ⟨0⟩\n"
     check(
         "added declarations: named ones, in Lean files",
-        decide.added_declarations(LEAN + more),
+        added(LEAN + more),
         {"strong_law", "Foo.bar"},
     )
-    check("…private ones on request", decide.added_declarations(LEAN, private=True), {"strong_law", "aux"})
+    check("…private ones on request", added(LEAN, private=True), {"strong_law", "aux"})
     priority = "+++ b/B.lean\n@@ -1 +1,2 @@\n theorem old : True := trivial\n+instance (priority := 100) extra : Inhabited Nat := ⟨0⟩\n"
-    check("…an instance with a priority clause", decide.added_declarations(priority), {"extra"})
+    check("…an instance with a priority clause", added(priority), {"extra"})
     commented = (
         "+++ b/B.lean\n@@ -1,2 +1,6 @@\n /-! An example:\n+theorem in_docs : True := trivial\n -/\n"
         "+/- another\n+  theorem in_block : True := trivial -/\n+theorem real : True := trivial -- theorem in_line\n"
     )
     check(
         "…but none inside a comment, even one opened on an unchanged line",
-        decide.added_declarations(commented),
+        added(commented),
         {"real"},
     )
     closed_only = (
@@ -1167,7 +1207,7 @@ def test_close(tmp):
     )
     check(
         "…nor in a comment whose opener lies above the hunk, which shows only its close",
-        decide.added_declarations(closed_only),
+        added(closed_only),
         {"real"},
     )
     strings = (
@@ -1177,7 +1217,7 @@ def test_close(tmp):
     )
     check(
         "…and a comment delimiter inside a string or character literal is not one",
-        decide.added_declarations(strings),
+        added(strings),
         {"before", "closer", "opener", "after", "quote", "last"},
     )
 
@@ -1238,7 +1278,19 @@ def test_close(tmp):
         ("an ordinary string holding an opener", '"/-"'),
         ("an ordinary string holding a closer", '"-/"'),
     ):
-        check(f"a declaration after {kind} is still read", lexed(marker), (False, "#41 do not add `missingFact`", []))
+        # A hunk whose only quotes are on one line also reads as starting inside a string, so it
+        # may be refused as unreadable rather than for the missing name; either way nothing closes.
+        result = lexed(marker)
+        check(
+            f"a declaration after {kind} still keeps the closure from going ahead",
+            (
+                result[0],
+                result[2],
+                result[1]
+                in ("#41 do not add `missingFact`", "its diff cannot be read for declarations with certainty"),
+            ),
+            (False, [], True),
+        )
     quoted = "+++ b/A.lean\n@@ -0,0 +1,2 @@\n+theorem «shared fact» : True := trivial\n"
     check(
         "a quoted name is read whole, also inside a qualified name",
@@ -1249,7 +1301,7 @@ def test_close(tmp):
                     p41={"state": "MERGED", "diff": quoted},
                 )
             )[:2],
-            decide.added_declarations("+++ b/A.lean\n@@ -0,0 +1 @@\n+def Foo.«bar baz».qux : Nat := 1\n"),
+            added("+++ b/A.lean\n@@ -0,0 +1 @@\n+def Foo.«bar baz».qux : Nat := 1\n"),
         ),
         ((False, "#41 do not add `«shared missing»`"), {"Foo.«bar baz».qux"}),
     )
@@ -1380,6 +1432,92 @@ def test_close(tmp):
             covers("+++ b/H.lean\n@@ -1,2 +1,2 @@\n" + header),
             missing,
         )
+    for kind, line, replacement, want in (
+        (
+            "a second theorem on a line",
+            "+theorem first : True := True.intro theorem missingFact : True := True.intro\n",
+            "+theorem first : True := True.intro\n",
+            missing,
+        ),
+        (
+            "a second def on a line",
+            "+def firstValue : Nat := 0 def missingValue : Nat := 1\n",
+            "+def firstValue : Nat := 0\n",
+            (False, "#41 do not add `missingValue`"),
+        ),
+        (
+            "an `in` inside a quoted name before the declaration",
+            "+open «N in theorem shared» in theorem missingFact : True := True.intro\n",
+            "+open «N in theorem shared» in theorem coveredFact : True := True.intro\n",
+            missing,
+        ),
+        (
+            "a quoted name without `in` before the declaration",
+            "+open «N shared» in theorem missingFact : True := True.intro\n",
+            "+open «N shared» in theorem coveredFact : True := True.intro\n",
+            missing,
+        ),
+    ):
+        check(f"{kind} is read", covers(line, replacement), want)
+
+    def exact(*files):
+        """A diff whose framing is as written, read without `frame`."""
+        hub = Hub(p1={"diff": "".join(files)}, p41={"state": "MERGED", "diff": exactly_base})
+        hub.raw = True
+        return attempt(hub, TAUCETI_DECIDE_MAX_CLOSES_PER_DAY="999")[:2]
+
+    exactly_base = "+++ b/A.lean\n@@ -0,0 +1 @@\n+theorem already_covered : True := trivial\n"
+    check(
+        "a hunk between two strings whose other ends it does not show refuses the closure",
+        exact(
+            exactly_base,
+            '+++ b/S.lean\n@@ -14,6 +15,7 @@ fifth line\n sixth line\n seventh line\n eighth line"\n'
+            "+theorem missingFact : True := trivial\n"
+            ' def afterText : String := "first line\n second line\n third line\n',
+        ),
+        unsure,
+    )
+    inside = Hub(
+        p1={"diff": exactly_base + "+++ b/B.lean\n@@ -0,0 +1 @@\n+theorem missingFact : True := trivial\n"},
+        p41={
+            "state": "MERGED",
+            "diff": exactly_base
+            + "+++ b/T.lean\n@@ -5,3 +5,4 @@\n template line\n+theorem missingFact : True := trivial\n"
+            ' end of one" ++ "start of another\n more\n',
+        },
+    )
+    inside.raw = True
+    check(
+        "a replacement hunk that may lie between two strings it shows neither end of refuses the closure",
+        attempt(inside, TAUCETI_DECIDE_MAX_CLOSES_PER_DAY="999")[:2],
+        unsure,
+    )
+    check(
+        "…while one-line strings around a declaration are read",
+        exact(
+            exactly_base,
+            '+++ b/S.lean\n@@ -1,2 +1,3 @@\n def before : String := "a"\n'
+            '+theorem missingFact : True := trivial\n def after : String := "b"\n',
+        ),
+        missing,
+    )
+    check(
+        "an added line reading `+++ …` inside a hunk is content, not a file header",
+        exact(
+            exactly_base,
+            "+++ b/C.lean\n@@ -17,4 +18,6 @@ Existing line 5.\n Existing line 6.\n Existing line 7.\n Old tail.\n"
+            "+++ extra note\n -/\n+theorem missingFact : True := trivial\n",
+        ),
+        missing,
+    )
+    for kind, body in (
+        (
+            "a hunk holding fewer lines than its header counts",
+            "+++ b/C.lean\n@@ -0,0 +1,2 @@\n+theorem missingFact : True := trivial\n",
+        ),
+        ("an added line outside any hunk", "+++ b/C.lean\n+theorem missingFact : True := trivial\n"),
+    ):
+        check(f"{kind} refuses the closure", exact(exactly_base, body), unsure)
     real = "+theorem missingFact : True := trivial\n"
     for layout, quotation in (
         (
@@ -1398,14 +1536,12 @@ def test_close(tmp):
         )
     check(
         "a quotation with an antiquotation and nested parentheses is read past",
-        decide.added_declarations(
-            "+++ b/A.lean\n@@ -0,0 +1,2 @@\n+def t := `(term| f ($(x) (g y)))\n+theorem after : True := trivial\n"
-        ),
+        added("+++ b/A.lean\n@@ -0,0 +1,2 @@\n+def t := `(term| f ($(x) (g y)))\n+theorem after : True := trivial\n"),
         {"t", "after"},
     )
     check(
         "a name ending in ?'x' is read whole",
-        lexed('"x"', name="already_covered?'x'")[:2],
+        lexed("default", name="already_covered?'x'")[:2],
         (False, "#41 do not add `already_covered?'x'`"),
     )
     check(
