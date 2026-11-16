@@ -763,6 +763,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `prepare_quiet_seconds` | `600` | integer, at least 0 |
 | `pre_rebase_enabled` | `true` | `true` or `false` |
 | `prepare_pre_rebased` | `true` | `true` or `false` |
+| `withdraw_emptied_at_adoption` | `true` | `true` or `false` ([reject-empty-commits.md](reject-empty-commits.md)) |
 
 
 ## Primary admission
