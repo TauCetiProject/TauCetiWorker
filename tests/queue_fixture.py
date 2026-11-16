@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 from unittest.mock import patch
 
@@ -416,29 +417,33 @@ class Repair(QueueFixture):
         self.assertIsNone(self.repo.file_at("main", "Hopeless.lean"))
         self.assertIn("Dropped Hopeless.lean", self.github.comments_for(102)[0]["body"])
         self.assertEqual(self.controller.status()["counters"]["shrink_to_empty"], 1)
-        rejected = self.controller.inputs()[1]
-        self.assertEqual((rejected["state"], rejected["reason"]), ("cancelled", "empty-commit"))
-        self.assertIsNone(rejected["landed_at"])
-        self.assertIsNone(rejected["landed_sha"])
+        withdrawn = self.controller.inputs()[1]
+        self.assertEqual((withdrawn["state"], withdrawn["reason"]), ("cancelled", "empty-commit"))
+        self.assertIsNone(withdrawn["landed_at"])
+        self.assertIsNone(withdrawn["landed_sha"])
         self.assertEqual(self.controller.status()["counters"]["prs_landed"], 1)
         self.assertEqual(self.controller.status()["counters"]["prs_edited_landed"], 0)
-        self.assertEqual(self.controller.status()["counters"]["prs_rejected"], 1)
-        self.assertEqual(self.github.closed[102], "Change 102")
+        self.assertEqual(self.controller.status()["counters"]["prs_withdrawn_empty"], 1)
+        self.assertNotIn("prs_rejected", self.controller.status()["counters"])
+        # Sent back to its author at adoption: the PR stays open and is not closed at landing.
+        self.assertNotIn(102, self.github.closed)
         self.assertEqual(self.github.closed[101], MERGED_TITLE_PREFIX + "Change 101")
         [comment] = self.github.comments_for(102)
-        self.assertIn("rejected during staging repair", comment["body"])
+        self.assertIn("withdrew this PR from batch", comment["body"])
+        self.assertIn("What to do next", comment["body"])
         self.assertNotIn("successfully merged", comment["body"])
         self.assertNotIn("bors-staging", self.github.labels[102])
         self.assertNotIn("repaired-in-queue", self.github.labels[102])
         outcomes = feeds.ControllerFeedSource(self.controller).outcomes(PROJECT, "main")
         self.assertEqual({o.pr: o.state for o in outcomes}, {101: "ok", 102: "canceled"})
         landed = self.controller.store.journal_entries("landed")[0]["detail"]
-        self.assertEqual((landed["members"], landed["rejected"]), ([101], [102]))
+        self.assertEqual((landed["members"], landed["withdrawn"]), ([101], [102]))
+        self.assertNotIn("rejected", landed)
         exported = monitoring.project(
             self.controller.store.path, clock=self.clock, facts=monitoring.CommitFacts(self.repo.clone)
         )
         item = next(m for m in exported["members"] if m["pr"] == "102")
-        self.assertEqual(item["disposition"], "rejected_empty")
+        self.assertEqual(item["disposition"], "withdrawn_empty")
         self.assertIsNone(item["landed_at"])
 
     def test_s17_two_source_failures_land_with_three_full_runs_and_no_singletons(self):
@@ -496,7 +501,129 @@ class Repair(QueueFixture):
         self.assertTrue(adoption.accepted, adoption)
 
 
+class WithdrawnAtAdoption(QueueFixture):
+    """An adopted repair that empties an ordinary member sends it back to its author at once."""
+
+    def emptied(self, numbers=(102,), explanation="Dropped {file}: it cannot compile against #101."):
+        self.github.ci_policy = fail_members(*numbers)
+        self.approve(101, {"A.lean": "a\n"})
+        for number in numbers:
+            self.approve(number, {f"F{number}.lean": "broken\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        agent = self.agent(
+            script=lambda task: {
+                f"{PROJECT}#{number}": Resolution(empty=True, explanation=explanation.format(file=f"F{number}.lean"))
+                for number in numbers
+            }
+        )
+        self.github.ci_policy = verdicts()
+        adoption = agent.run(self.controller)
+        self.assertTrue(adoption.accepted, adoption)
+        return adoption
+
+    def test_the_author_gets_one_explanatory_comment_at_adoption_and_the_pr_stays_open(self):
+        admission = self.controller.admission = unittest.mock.Mock()
+        adoption = self.emptied()
+        self.assertEqual(adoption.provenance[f"{PROJECT}#102"], "withdrawn")
+        row = self.controller.input_for(PROJECT, 102)
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "empty-commit"))
+        admission.withdraw.assert_called_once_with(102, row["head_sha"])
+        self.controller.admission = None  # the stand-in only records the approval withdrawal
+        member = next(m for m in self.members(self.head()) if m["number"] == 102)
+        self.assertEqual(member["withdrawn"], 1)
+        self.tick()  # drains the outbox
+        [comment] = self.github.comments_for(102)
+        body = comment["body"]
+        self.assertIn("withdrew this PR from batch", body)
+        self.assertIn("What failed (repair task", body)
+        self.assertIn("TauCeti/Pr102.lean", body)
+        self.assertIn("error in PR 102", body)
+        self.assertIn("https://github.invalid/actions/runs/", body)
+        self.assertIn(f"Accepted revision: `{row['head_sha']}`", body)
+        self.assertIn("> Dropped F102.lean: it cannot compile against #101.", body)
+        self.assertIn("What to do next: rebase onto `main`", body)
+        self.assertNotIn("bors-staging", self.github.labels[102])
+        self.assertEqual(self.controller.store.journal_entries("member-withdrawn-empty")[0]["detail"]["number"], 102)
+        # The batch lands without it: no second comment, no close, not counted as landed or rejected.
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.head())
+        self.assertEqual(len(self.github.comments_for(102)), 1)
+        self.assertNotIn(102, self.github.closed)
+        self.assertEqual(self.github.prs[102]["state"], "open")
+        counters = self.controller.status()["counters"]
+        self.assertEqual((counters["prs_landed"], counters.get("prs_rejected", 0)), (1, 0))
+        self.assertEqual(self.controller.input_for(PROJECT, 102)["reason"], "empty-commit")
+
+    def test_a_later_repair_cannot_restore_a_withdrawn_member(self):
+        self.emptied()
+        self.github.ci_policy = verdicts("fail")
+        self.tick()
+        self.run_ci()
+        self.tick()
+        restorer = self.agent(
+            name="restorer",
+            script=lambda task: {
+                f"{PROJECT}#102": Resolution({"F102.lean": "fixed\n"}, explanation="Restored a working contribution.")
+            },
+        )
+        rejection = restorer.run(self.controller)
+        self.assertFalse(rejection.accepted)
+        self.assertEqual(rejection.reason, "no-repair-edited")
+
+    def test_comment_delivery_survives_a_lost_response_and_restart_without_duplicates(self):
+        post = self.github.post_comment
+
+        def post_then_fail(*args):
+            post(*args)
+            raise RuntimeError("lost comment response")
+
+        with patch.object(self.github, "post_comment", side_effect=post_then_fail):
+            self.emptied()
+            self.tick()
+        self.assertEqual(len(self.github.comments_for(102)), 1)
+        restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(restarted.store.close)
+        restarted.recover()
+        self.clock.advance(restarted.setting("outbox_retry_max_seconds"))
+        restarted.tick()
+        self.assertEqual(restarted.store.count("outbox", {"key": "withdrawn-comment:2", "state": "done"}), 1)
+        self.assertEqual(len(self.github.comments_for(102)), 1)
+
+    def test_a_withdrawn_member_merged_outside_the_queue_lands_with_its_batch(self):
+        self.emptied()
+        self.repo.advance_main({"F102.lean": "fixed elsewhere\n"}, message="Change 102 (#102)")
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.head())
+        self.assertEqual(self.controller.input_for(PROJECT, 102)["state"], "landed")
+        self.assertEqual(self.controller.status()["counters"]["prs_landed"], 2)
+
+    def test_disabled_setting_defers_the_decision_to_landing(self):
+        self.controller.set_setting("withdraw_emptied_at_adoption", False, "test")
+        self.emptied()
+        self.assertEqual(self.controller.input_for(PROJECT, 102)["state"], "inserted")
+        self.tick()
+        self.assertEqual(self.github.comments_for(102), [])
+        self.run_ci()
+        self.tick(2)
+        [comment] = self.github.comments_for(102)
+        self.assertIn("rejected during staging repair", comment["body"])
+        self.assertIn("What failed (repair task", comment["body"])
+        self.assertIn("What to do next", comment["body"])
+        self.assertEqual(self.github.closed[102], "Change 102")
+
+
 class EmptyContributions(QueueFixture):
+    """The landing-time backstop: an empty final commit not withdrawn at adoption is rejected when its batch lands."""
+
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("withdraw_emptied_at_adoption", False, "test")
+
     def assert_unrelated_history_still_rejects(self, message, *, empty=False):
         self.repaired_empty()
         self.repo.advance_main({} if empty else {"Other.lean": "other\n"}, message=message)

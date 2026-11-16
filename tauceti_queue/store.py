@@ -20,7 +20,8 @@ Tables:
   tip a `prepare` task last built and repaired on the head's tip).
 - `members`: per batch and position, the member's commit and provenance (`clean` or `edited`),
   the task that edited it, the explanation collected from its message, the `no_repair` opt-out and
-  whether it was `withdrawn` (an emptied `no_repair` member whose commit stays until the head lands).
+  whether it was `withdrawn` (a member the queue sent back, an emptied `no_repair` member or one an
+  adopted repair emptied, whose empty commit stays until the head lands).
 - `claims`: batch identity and version, operation, worker identity, token, expiry, release.
 - `tasks`: repair, rebase-conflict, pre-rebase and prepare tasks with their diagnostics and state; a
   `prepare` task of a batch's pre-rebased chain carries the batch tip that chain covers

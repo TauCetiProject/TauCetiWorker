@@ -125,6 +125,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # edited; when it would need an edit the agent empties it and the queue withdraws it as
     # `problem-anticipated` (`_anticipate`).
     "no_repair_labels": ["dont-repair-in-queue"],
+    # A member an adopted repair reduces to an empty commit (and whose PR is not simply already on
+    # `main`) is withdrawn at adoption: input cancelled as `empty-commit`, approval withdrawn, one
+    # explanatory comment to its author (`_withdraw_member`). False defers the decision to landing,
+    # where an empty final commit is rejected and its PR closed (`_enqueue_rejection_effects`).
+    "withdraw_emptied_at_adoption": True,
 }
 
 # The actor of the values `seed_setting` writes from the configuration file's `[settings]`.
@@ -144,6 +149,11 @@ MISSING_SOURCE_IN_FLIGHT = "missing-source-in-flight"  # an input waiting for a 
 # The cancellation reason of a `no_repair` member the agent emptied: withdrawn until the PR it
 # interacts with lands on `main` (then `needs-rebase`) or leaves the queue (then re-admitted).
 PROBLEM_ANTICIPATED = "problem-anticipated"
+# The cancellation reason of a member whose final commit is empty: withdrawn when an adopted repair
+# empties it (`withdraw_emptied_at_adoption`), else rejected when its batch lands.
+EMPTY_COMMIT = "empty-commit"
+# The most CI findings a withdrawal or rejection comment quotes.
+COMMENT_FINDINGS = 8
 NEEDS_REBASE_LABEL = "needs-rebase"
 # How `repaired_label` is created when the repository lacks it.
 REPAIRED_LABEL_COLOR = "d4c5f9"
@@ -2086,6 +2096,27 @@ class Controller:
                             continue
                         self._count("shrink_to_empty")
                         shrunk = True
+                        if (
+                            self.setting("withdraw_emptied_at_adoption")
+                            and not member["withdrawn"]
+                            and not chain.landed_commit(landed, member["source_pr"])
+                        ):
+                            # The agent left this contribution out: send it back to its author now
+                            # rather than discovering the empty commit when the batch lands.
+                            emptied = dict(member, **values)
+                            self.store.update("members", {"id": member["id"]}, **values)
+                            self._withdraw_member(
+                                batch,
+                                emptied,
+                                reason=EMPTY_COMMIT,
+                                comment=self._emptied_comment(batch, emptied, task, outcome.explanation.strip()),
+                                journal_kind="member-withdrawn-empty",
+                                now=now,
+                                task_id=task["id"],
+                            )
+                            self._count("prs_withdrawn_empty")
+                            provenance[member["source_pr"]] = "withdrawn"
+                            continue
                 self.store.update("members", {"id": member["id"]}, **values)
                 provenance[member["source_pr"]] = values.get("provenance", member["provenance"])
             # An adopted preparation keeps its batch open: the repaired members are what it seals with.
@@ -6223,16 +6254,21 @@ class Controller:
         if batch["state"] == BATCH_LANDED:
             return
         # A withdrawn member's empty commit lands with the head but the PR does not: it is not marked
-        # landed, commented on or closed (`_anticipate` told its author why).
+        # landed, commented on or closed (`_anticipate` or `_withdraw_member` told its author why). The
+        # one exception is a member withdrawn as emptied whose PR has meanwhile landed on `main` by other
+        # means: it lands as any externally merged member does.
         everyone = self._members(batch["id"])
-        withdrawn = [m["number"] for m in everyone if m["withdrawn"]]
+        withdrawn = []
         rejected = []
         members = []
         external_members: set[int] = set()
         landed_ranges: dict[str, dict[str, str]] = {}
         for member in everyone:
             if member["withdrawn"]:
-                continue
+                source = self.store.row("inputs", {"id": member["input_id"]}) or {}
+                if source.get("reason") != EMPTY_COMMIT or source.get("state") != INPUT_CANCELLED:
+                    withdrawn.append(member["number"])
+                    continue
             commit = chain.read_commit(self.clone, member["commit_sha"])
             empty = len(commit.parents) == 1 and commit.tree == chain.tree_of(self.clone, commit.parents[0])
             external = empty and chain.carries_landed_note(commit.message)
@@ -6243,7 +6279,9 @@ class Controller:
                 external = chain.landed_commit(landed_ranges[since], member["source_pr"]) is not None
             if external:
                 external_members.add(member["id"])
-            if empty and not external:
+            if member["withdrawn"] and not external:
+                withdrawn.append(member["number"])
+            elif empty and not external:
                 rejected.append(member)
             else:
                 members.append(member)
@@ -6278,7 +6316,7 @@ class Controller:
                     "inputs",
                     {"id": member["input_id"]},
                     state=INPUT_CANCELLED,
-                    reason="empty-commit",
+                    reason=EMPTY_COMMIT,
                     landed_at=None,
                     landed_sha=None,
                 )
@@ -6331,7 +6369,15 @@ class Controller:
         if member["explanation"].strip():
             lines += ["", "The repair agent's explanation:", ""]
             lines += [f"> {line}" if line else ">" for line in member["explanation"].splitlines()]
-        lines += ["", f"The staging history is retained under `{self.batch_ref(batch['id'], batch['version'])}`."]
+        task = self.store.row("tasks", {"id": member["task_id"]}) if member["task_id"] else None
+        lines += self._failure_lines(task)
+        lines += [
+            "",
+            f"The staging history is retained under `{self.batch_ref(batch['id'], batch['version'])}`.",
+            "",
+            f"What to do next: if the contribution is still wanted, rebase it onto `{self.canonical_branch}`, "
+            "address the problem described above, and reopen the PR (or open a new one) for approval.",
+        ]
         marker = f"<!-- {COMMENT_MARKER} rejected:{self._source_pr(number)}:{batch['id']}:{member['commit_sha']} -->"
         self._enqueue(
             "comment",
@@ -6350,6 +6396,120 @@ class Controller:
             f"rejected-close:{batch['id']}:{number}",
             {"number": number, "rejected": True, "head_sha": member["accepted_head"], "input_id": member["input_id"]},
         )
+
+    def _withdraw_member(
+        self,
+        batch: dict[str, Any],
+        member: dict[str, Any],
+        *,
+        reason: str,
+        comment: str,
+        journal_kind: str,
+        now: float,
+        **detail: Any,
+    ) -> None:
+        """Send a member back to its author: the PR leaves the batch without landing and stays open.
+
+        The member's empty commit stays in the chain, so the chain keeps its bijection, and the member is
+        `withdrawn`: landing neither marks it landed nor closes it, and no agent may give it content again
+        (`_no_repair_edits`). Its input is cancelled with `reason`, its approval is withdrawn (a new
+        approval brings it back), and the author gets `comment` once through the outbox, keyed by the
+        input, with the membership label removed. Called inside the caller's transaction.
+        """
+        self.store.update("members", {"id": member["id"]}, withdrawn=1)
+        self.store.update(
+            "inputs",
+            {"id": member["input_id"]},
+            state=INPUT_CANCELLED,
+            reason=reason,
+            landed_at=None,
+            landed_sha=None,
+        )
+        if self.admission is not None:
+            self.admission.withdraw(member["number"], member["accepted_head"])
+        self.store.journal(
+            now,
+            journal_kind,
+            batch["id"],
+            number=member["number"],
+            member_id=member["id"],
+            commit=member["commit_sha"],
+            reason=reason,
+            **detail,
+        )
+        if not self.setting("publication_enabled"):
+            return
+        number = member["number"]
+        marker = f"<!-- {COMMENT_MARKER} withdrawn:{self._source_pr(number)}:{member['input_id']} -->"
+        self._enqueue(
+            "comment",
+            f"withdrawn-comment:{member['input_id']}",
+            {"number": number, "body": comment + "\n\n" + marker, "marker": marker},
+        )
+        label = self.setting("membership_label")
+        if label:
+            self._enqueue(
+                "labels",
+                f"withdrawn-labels:{member['input_id']}",
+                {"number": number, "add": [], "remove": [label], "input_id": member["input_id"]},
+            )
+
+    def _failure_lines(self, task: dict[str, Any] | None) -> list[str]:
+        """What the task that changed a member was given to fix: the CI findings (at most
+        `COMMENT_FINDINGS`) and the run, or the rebase conflict, as comment lines."""
+        if task is None:
+            return []
+        findings = [
+            d
+            for d in loads(task["diagnostics"], [])
+            if isinstance(d, dict) and d.get("kind") not in ("admission_predictions", "cross_batch", "prepare_errors")
+        ]
+        attempt = self.store.row("ci_attempts", {"id": task["ci_attempt_id"]}) if task["ci_attempt_id"] else None
+        lines = [
+            "",
+            f"What failed ({task['kind'].replace('_', ' ')} task {task['id']}, batch version {task['batch_version']}):",
+        ]
+        if attempt is not None:
+            run = (
+                f"[run {attempt['run_id']}]({attempt['html_url']})"
+                if attempt["html_url"]
+                else f"run {attempt['run_id']}"
+            )
+            lines.append(f"- CI {run}: {attempt['outcome_detail'] or attempt['outcome']}")
+        for finding in findings[:COMMENT_FINDINGS]:
+            if finding.get("kind") == "conflict":
+                paths = ", ".join(f"`{path}`" for path in finding.get("paths") or []) or "unknown paths"
+                lines.append(f"- rebase conflict in {paths} replaying onto `{str(finding.get('onto') or '')[:12]}`")
+                continue
+            where = f" `{finding['module']}`" if finding.get("module") else ""
+            message = " ".join(str(finding.get("message") or "").split())[:300]
+            lines.append(f"- {finding.get('kind') or 'finding'}{where}: {message}")
+        if len(findings) > COMMENT_FINDINGS:
+            lines.append(f"- and {len(findings) - COMMENT_FINDINGS} more findings")
+        if attempt is None and not findings:
+            lines.append("- no findings were recorded")
+        return lines
+
+    def _emptied_comment(
+        self, batch: dict[str, Any], member: dict[str, Any], task: dict[str, Any], explanation: str
+    ) -> str:
+        """The withdrawal notice of a member an adopted repair reduced to an empty commit."""
+        lines = [
+            f"The merge queue withdrew this PR from batch {batch['id']}: while repairing the batch, the repair agent "
+            "could not make this contribution pass and reduced it to an empty commit. The PR was not merged and "
+            "stays open; its approval was withdrawn.",
+        ]
+        lines += self._failure_lines(task)
+        lines += ["", f"Accepted revision: `{member['accepted_head']}`."]
+        if explanation:
+            lines += ["", "The repair agent's explanation:", ""]
+            lines += [f"> {line}" if line else ">" for line in explanation.splitlines()]
+        lines += [
+            "",
+            f"What to do next: rebase onto `{self.canonical_branch}`, address the problem described above, push, "
+            "and approve the PR again. A new approval brings it back into the queue.",
+        ]
+        return "\n".join(lines)
 
     def _enqueue_landing_effects(
         self, batch: dict[str, Any], member: dict[str, Any], *, landed_externally: bool = False
