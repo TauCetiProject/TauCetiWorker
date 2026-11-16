@@ -18,7 +18,6 @@ Only `ask` starts a model. Its answer reaches the list as a file path and a decl
 from __future__ import annotations
 
 import contextlib
-import difflib
 import fcntl
 import hashlib
 import json
@@ -480,17 +479,38 @@ def _push(path: Path, still=None) -> bool | None:
 
 
 def _taken_back(base: str, ours: str, parent: str, current: str) -> str | None:
-    """`current` with each line `ours` rewrote from `base` put back as `base` had it, unless
-    `parent` already holds the rewritten line. None when `ours` is not line-for-line rewrites."""
-    before, after = base.splitlines(keepends=True), ours.splitlines(keepends=True)
-    back: dict[str, str] = {}
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=before, b=after, autojunk=False).get_opcodes():
-        if tag == "replace" and i2 - i1 == j2 - j1:
-            back.update(zip(after[j1:j2], before[i1:i2], strict=True))
-        elif tag != "equal":
+    """`current` with each item `ours` changed from `base` set back to its `base` status and
+    clauses, found by area and slug so a line a hook reformatted is still found; an item `parent`
+    already holds as `ours` has it stays. None when an item cannot be put back."""
+
+    def listed(text: str) -> Targets | None:
+        try:
+            return parse_targets(text)
+        except Die:
             return None
-    kept = set(parent.splitlines(keepends=True))
-    return "".join(line if line in kept else back.get(line, line) for line in current.splitlines(keepends=True))
+
+    before, after, held = listed(base), listed(ours), listed(parent)
+    if before is None or after is None:
+        return None
+    text = current
+    for item in after.items():
+        old = before.find(item.slug)
+        if old is None or (old.status, old.meta) == (item.status, item.meta):
+            continue
+        kept = held.find(item.slug) if held else None
+        if kept is not None and (kept.status, kept.meta) == (item.status, item.meta):
+            continue
+        now = listed(text)
+        found = now.find(item.slug) if now else None
+        if found is None:
+            return None
+        added = [m.partition(":")[0] for m in item.meta if m not in old.meta]
+        restored = [m for m in old.meta if m not in item.meta]
+        text = rewrite_item(text, found, old.status, drop=added, add=restored)
+        again = listed(text)
+        if again is None or again.find(item.slug) is None or again.find(item.slug).status != old.status:
+            return None
+    return text
 
 
 def merge3(base: str, ours: str, theirs: str) -> str | None:

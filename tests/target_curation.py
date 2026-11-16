@@ -607,6 +607,29 @@ class Publish(Tmp):
                 done = t.parse_targets(text).find("strong-law").status == "done"
                 self.assertEqual((published is None, done), (goal != "i.i.d. integrable", goal == "i.i.d. integrable"))
 
+    def test_a_verdict_line_a_formatting_hook_changed_is_still_taken_back(self):
+        first, second = self.clone("first"), self.clone("second")
+        listed = t.parse_targets(EXAMPLE)
+        item = listed.find("kolmogorov-zero-one")
+        ticked = t.rewrite_item(EXAMPLE, item, "done", add=("landed elsewhere: A.lean a_b",))
+        broadened = EXAMPLE.replace("i.i.d. integrable", "i.i.d. measurable")
+        second.write_text(broadened)
+        git(second.parent, "commit", "-q", "-m", "goal", "targets.md")
+        hooks = first.parent / ".git" / "hooks"
+        (hooks / "pre-commit").write_text(
+            "#!/bin/sh\nsed 's/^- \\[x\\] \\(.*landed elsewhere\\)/- [X] \\1/' targets.md > t.tmp"
+            " && mv t.tmp targets.md && git add targets.md\n"
+        )
+        (hooks / "post-commit").write_text(f"#!/bin/sh\ngit -C {second.parent} push -q origin HEAD:main\n")
+        for name in ("pre-commit", "post-commit"):
+            (hooks / name).chmod(0o755)
+        self.assertIsNone(curate.publish(first, EXAMPLE, ticked, ["n"], still=curate._unchanged(first, listed, [item])))
+        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
+        self.assertEqual(t.parse_targets(first.read_text()).find("kolmogorov-zero-one").status, "open")
+        self.assertNotIn("landed elsewhere", first.read_text())
+        curate._sync(first)
+        self.assertEqual(first.read_text(), broadened)
+
     def test_a_verdict_another_host_already_published_leaves_the_rebased_clone_alone(self):
         first, second = self.clone("first"), self.clone("second")
         listed = t.parse_targets(EXAMPLE)
