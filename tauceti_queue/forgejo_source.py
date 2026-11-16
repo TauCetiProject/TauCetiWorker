@@ -19,7 +19,7 @@ from tauceti_tools.forge import ForgeError, Incomplete, PrincipalRef, Unsupporte
 
 from tauceti_worker.source_identity import SourceActor
 
-from . import ports
+from . import diff_guard, ports
 from .admission import AdmissionPolicy, digest, policy, timestamp
 from .eligibility import KEEP
 from .forgejo_git import ForgejoGitSource
@@ -722,6 +722,8 @@ class ForgejoSourceAdapter(ForgejoGitSource):
                 "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", base, pull.head_sha, "--"
             ).stdout
             paths = tuple(p.decode("utf-8") for p in raw.split(b"\0") if p)
+            # Native PRs have no PR-level CI diff guards, so admission runs them for every head.
+            guard = diff_guard.violations(self.clone_dir, base, pull.head_sha)
         rows = self.client.statuses(self.repository, pull.head_sha)
         try:
             comments, review_state, recovery_state = self._comments(number, pull.head_sha, rows)
@@ -755,7 +757,9 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         if any(getattr(fresh, key, None) != getattr(pull, key, None) for key in fields):
             raise Incomplete("native pull changed while reading admission evidence")
         version = base + ":" + digest({"comments": comments, "policy": self.admission_policy.revision})
-        return ports.AdmissionSnapshot(fresh, base, paths, comments, statuses, version, self._discovery_version(fresh))
+        return ports.AdmissionSnapshot(
+            fresh, base, paths, comments, statuses, version, self._discovery_version(fresh), diff_guard=guard
+        )
 
     def _discovery_version(self, pull):
         # The bounded polling backstop rechecks permissions and source evidence

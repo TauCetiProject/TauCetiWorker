@@ -8,8 +8,8 @@ version = "0.1.0"
 description = "Autonomous worker for the TauCetiProject/TauCeti Lean library"
 requires-python = ">=3.11"
 dependencies = [
-    "tauceti-review @ git+https://github.com/TauCetiProject/TauCetiReview@04517015e663937bbfbd67c1bc4030ab8a67cba0",
-    "tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@e4ed3eab96457b7425b494b0ea1952319f1d12d6",
+    "tauceti-review @ git+https://github.com/TauCetiProject/TauCetiReview@b61841007a843fe44e6207c2b1c2fad13c31f426",
+    "tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@c550fa3a21518b7d055116d0cf94a60aa2041d1a",
     "rich>=13",
     "textual>=8,<9",
     "psutil>=7; sys_platform == 'darwin'",
