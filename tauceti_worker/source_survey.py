@@ -101,7 +101,7 @@ def discovery_inventory(source, *, numbers=None):
     scope = discovery_scope(source)
     return transport.shared_read(
         [*scope, list(source.inventory_fields)],
-        source.open_prs,
+        lambda: source.open_prs(fresh=True),
         identity=source.cache_namespace,
         ttl=60,
         lock_timeout=300,

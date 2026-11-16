@@ -1979,7 +1979,7 @@ def _do_fixlike(
         return None
 
     current_labels = getattr(p, "labels", ())
-    if label == "fix" or bubble:
+    if label in {"fix", "rebase"} or bubble:
         c.progress = _progress_snapshot(w, c)
         live = None
         if c.progress and all(key in c.progress for key in ("isDraft", "labels", "state")):

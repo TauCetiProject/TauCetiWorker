@@ -75,6 +75,36 @@ class NativeSelfTested(unittest.TestCase):
             self.source.pr_view.assert_called_once_with(1, ["headRefOid"], fresh=True)
             self.assertEqual(discovery_inventory(self.source), [dict(number=2)])
 
+    def test_shared_refill_bypasses_adapter_local_inventory(self):
+        from tauceti_worker.github_transport import invalidate_shared
+        from tauceti_worker.source_identity import discovery_scope
+        from tauceti_worker.source_survey import discovery_inventory
+
+        self.source.shared_inventory = True
+        first, second = [dict(number=1)], [dict(number=2)]
+        self.source.reader.pulls = Mock(side_effect=[first, second])
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.fixture.clone / "shared-reads")):
+            self.assertEqual(discovery_inventory(self.source), first)
+            invalidate_shared(discovery_scope(self.source))
+            self.assertEqual(discovery_inventory(self.source), second)
+        self.assertEqual(self.source.reader.pulls.call_count, 2)
+
+    def test_native_label_write_invalidates_shared_discovery(self):
+        from tauceti_worker.github_transport import shared_generation
+        from tauceti_worker.source_identity import discovery_scope
+
+        self.source.shared_inventory = True
+        scope = discovery_scope(self.source)
+        with (
+            patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.fixture.clone / "shared-reads")),
+            patch.object(self.source, "validate_binding"),
+            patch("tauceti_tools.forge_write.ForgejoWriter.edit") as edit,
+        ):
+            before = shared_generation(scope)
+            ForgejoWorkerSource.add_label(self.source, 1, "self-tested")
+            self.assertNotEqual(shared_generation(scope), before)
+            edit.assert_called_once_with(self.source.repository, 1, pull=True, add_labels=["self-tested"])
+
     def test_native_roadmap_receipt_through_persistent_label(self):
         from types import SimpleNamespace
 
@@ -195,7 +225,7 @@ def shared_discovery_child(directory, start=None, outcome="success", fallback=No
 
     repository = RepositoryRef(Forge("forgejo", "https://example.test"), "team/project")
 
-    def fetch():
+    def fetch(**kwargs):
         with (Path(directory) / "fetches").open("a+") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             f.seek(0)
@@ -203,13 +233,12 @@ def shared_discovery_child(directory, start=None, outcome="success", fallback=No
             f.write("network\n")
         if outcome == "legacy-invalidate" and ordinal == 1:
             transport.invalidate()
-        if outcome in {"invalidate", "exception"}:
+        if outcome == "invalidate" and ordinal == 1:
+            transport.invalidate_shared(discovery_scope(source))
+        if outcome == "exception":
             if ordinal == 1:
-                if outcome == "invalidate":
-                    transport.invalidate_shared(discovery_scope(source))
-                else:
-                    time.sleep(0.15)
-                    raise OSError("network unavailable")
+                time.sleep(0.15)
+                raise OSError("network unavailable")
             else:
                 fallback.wait(10)
         if outcome == "storage":
@@ -284,7 +313,7 @@ class SharedDiscovery(unittest.TestCase):
             cache_namespace="a" * 64,
             shared_inventory=True,
             inventory_fields=("number",),
-            open_prs=Mock(side_effect=lambda: [dict(number=self.source.open_prs.call_count)]),
+            open_prs=Mock(side_effect=lambda **kw: [dict(number=self.source.open_prs.call_count)]),
         )
 
     def read(self, **kwargs):
@@ -388,8 +417,8 @@ class SharedDiscovery(unittest.TestCase):
         self.assertEqual(self.read(), [dict(number=1)])
         self.assertEqual(self.source.open_prs.call_count, 1)
 
-    def test_generation_change_retries_waiters_outside_the_lock(self):
-        self.assertEqual(self.concurrent("invalidate"), ["network"] * 4)
+    def test_generation_change_refetches_once_then_shares_under_lock(self):
+        self.assertEqual(self.concurrent("invalidate"), ["network"] * 2)
 
     def test_fetch_exception_retries_waiters_outside_the_lock(self):
         self.assertEqual(self.concurrent("exception"), ["network"] * 4)

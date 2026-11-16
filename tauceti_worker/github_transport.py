@@ -326,7 +326,9 @@ def shared_read(
                         # Coalesce only callers that already waited for this attempt.
                         # A request starting after it ended still gets its own fetch.
                         return None
-                    retry_unlocked = True
+                    # A successful read invalidated by an overlapping write
+                    # needs one new leader, not one full read per waiter.
+                    retry_unlocked = previous["outcome"] != "invalidated"
             except (OSError, ValueError, KeyError, TypeError):
                 pass
             if not retry_unlocked:
@@ -340,7 +342,8 @@ def shared_read(
             try:
                 value = fetch()
                 saved = False
-                if value is not None and (immutable or current_generation() == epoch):
+                generation_current = immutable or current_generation() == epoch
+                if value is not None and generation_current:
                     try:
                         atomic(
                             path,
@@ -353,7 +356,7 @@ def shared_read(
                     with contextlib.suppress(OSError):
                         attempt.unlink(missing_ok=True)
                 else:
-                    finished("unavailable" if value is None else "retry")
+                    finished("unavailable" if value is None else "retry" if generation_current else "invalidated")
                 return value
             except BaseException:
                 finished("retry")

@@ -643,21 +643,22 @@ class GlobalMaintenance(unittest.TestCase):
         p = work.replace(p, labels=["full-lint"])
         sv.open_prs = [p]
         self.w.claims.begin_branch_work = lambda *args: True
-        for live, expected in (
-            (dict(head=HEAD, state="OPEN", isDraft=False, labels=[dict(name="full-lint")]), ["full-lint"]),
-            (dict(head=HEAD, state="OPEN", isDraft=False, labels=[]), []),
-            (None, ["full-lint"]),
-        ):
-            with (
-                patch.object(work, "_progress_snapshot", return_value=live),
-                patch.object(self.w.gh, "pr_view", return_value=None, create=True),
-                patch.object(work, "scope_policy", side_effect=RuntimeError("policy observed")) as policy,
-                self.assertRaisesRegex(RuntimeError, "policy observed"),
+        for label in ("fix", "rebase"):
+            for live, expected in (
+                (dict(head=HEAD, state="OPEN", isDraft=False, labels=[dict(name="full-lint")]), ["full-lint"]),
+                (dict(head=HEAD, state="OPEN", isDraft=False, labels=[]), []),
+                (None, ["full-lint"]),
             ):
-                work._do_fixlike(
-                    self.w, sv, work.Candidate(10, HEAD), self.opts, False, prompt_file="fix.md", label="fix"
-                )
-            self.assertEqual(policy.call_args.args[0], expected)
+                with (
+                    patch.object(work, "_progress_snapshot", return_value=live),
+                    patch.object(self.w.gh, "pr_view", return_value=None, create=True),
+                    patch.object(work, "scope_policy", side_effect=RuntimeError("policy observed")) as policy,
+                    self.assertRaisesRegex(RuntimeError, "policy observed"),
+                ):
+                    work._do_fixlike(
+                        self.w, sv, work.Candidate(10, HEAD), self.opts, False, prompt_file="fix.md", label=label
+                    )
+                self.assertEqual(policy.call_args.args[0], expected)
 
     def test_stale_fix_never_reaches_paid_provider_probes(self):
         self.opts.work_model = "claude"
