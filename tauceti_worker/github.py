@@ -616,7 +616,7 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int | None = N
     if source is not None:
         from .source_cli import execute
 
-        return execute(argv[1:] if argv[0] == "gh" else argv, source)
+        return execute(argv[1:] if argv[0] == "gh" else argv, source, cwd=cwd)
     waited = 0
     attempt = 0
     tries = 0
