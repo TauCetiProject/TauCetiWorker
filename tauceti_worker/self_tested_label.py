@@ -171,7 +171,11 @@ def _comparable(record) -> dict:
     kind = record.get("kind")
     if kind == "file":
         mode = record.get("mode")
-        return {"kind": "file", "sha256": record.get("sha256"), "executable": bool(int(mode or 0) & 0o100)}
+        try:
+            executable = bool(int(mode or 0) & 0o100)
+        except (ValueError, TypeError):
+            return {"kind": "unreadable"}
+        return {"kind": "file", "sha256": record.get("sha256"), "executable": executable}
     if kind == "missing":
         return {"kind": "missing"}
     if kind == "symlink":
@@ -183,13 +187,17 @@ def _complete(receipt) -> bool:
     if not isinstance(receipt, dict):
         return False
     phases = receipt.get("phases")
+    requested, scope = receipt.get("requested_phases"), receipt.get("scope")
     return bool(
         receipt.get("schema") == SCHEMA
         and receipt.get("status") == "success"
-        and sorted(receipt.get("requested_phases") or []) == sorted(STAGES)
+        and isinstance(requested, list)
+        and all(isinstance(name, str) for name in requested)
+        and sorted(requested) == sorted(STAGES)
         and isinstance(phases, dict)
         and all(isinstance(phases.get(s), dict) and phases[s].get("status") == "success" for s in STAGES)
-        and (receipt.get("scope") or {}).get("policy") == "ordinary"
+        and isinstance(scope, dict)
+        and scope.get("policy") == "ordinary"
     )
 
 

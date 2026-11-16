@@ -170,6 +170,17 @@ def stale(state, root, base, head):
     os.utime(path, (time.time() - 3600, time.time() - 3600))
 
 
+def malformed_mode(state, root, base, head):
+    path = write_receipt(state, root, base)
+    receipt = json.loads(path.read_text())
+    inputs_path = Path(receipt["inputs"]["path"])
+    inputs = json.loads(inputs_path.read_text())
+    inputs["sources"]["TauCeti/A.lean"]["mode"] = ["not a mode"]
+    inputs_path.write_text(json.dumps(inputs))
+    receipt["fingerprint"] = receipt["inputs"]["sha256"] = verification.digest(inputs)
+    path.write_text(json.dumps(receipt))
+
+
 CASES = [
     ("verified push is labelled", {"receipt": verified}, lambda h: [pull(h), pull(h, labels=LABELLED)], "labelled", 1),
     (
@@ -216,6 +227,13 @@ CASES = [
     ),
     ("receipt from an earlier round", {"receipt": stale}, lambda h: [pull(h)], "no matching receipt", 0),
     ("no receipt at all", {}, lambda h: [pull(h)], "no matching receipt (no verification this round)", 0),
+    (
+        "malformed source mode is not a match",
+        {"receipt": malformed_mode},
+        lambda h: [pull(h)],
+        "no matching receipt",
+        0,
+    ),
     (
         "infrastructure change",
         {"receipt": verified, "infra": True},
@@ -332,6 +350,58 @@ with tempfile.TemporaryDirectory() as tmp:
     git(root, "commit", "-q", "-m", "directory link")
     records = stl.commit_sources(root, git(root, "rev-parse", "HEAD"), base)
     check("directory links never match", records["TauCeti/Link.lean"]["kind"], "unsupported")
+
+with tempfile.TemporaryDirectory() as tmp:
+    root, base, head = checkout(tmp, symlink=True)
+    (root / "TauCeti/Same.lean").write_bytes((root / "TauCeti/A.lean").read_bytes())
+    git(root, "add", ".")
+    git(root, "commit", "-q", "-m", "identical target")
+    head = git(root, "rev-parse", "HEAD")
+    (root / "TauCeti/Link.lean").unlink()
+    (root / "TauCeti/Link.lean").symlink_to("Same.lean")
+    records = stl.commit_sources(root, head, base)
+    observed = {k: stl._comparable(v) for k, v in verification.inventory(root, base).items()}
+    check(
+        "retargeted link has identical bytes",
+        records["TauCeti/Link.lean"]["sha256"],
+        observed["TauCeti/Link.lean"]["sha256"],
+    )
+    check("link text still distinguishes the verified tree", records == observed, False)
+    (root / "TauCeti/Sub").mkdir()
+    (root / "TauCeti/Sub/Keep").write_text("directory\n")
+    link = root / "TauCeti/Prefix.lean"
+    link.symlink_to("Sub/../A.lean")
+    git(root, "add", ".")
+    git(root, "commit", "-q", "-m", "real prefix")
+    records = stl.commit_sources(root, git(root, "rev-parse", "HEAD"), base)
+    check("parent resolution through a real directory", records["TauCeti/Prefix.lean"]["kind"], "symlink")
+    (root / "TauCeti/Sub/Keep").unlink()
+    (root / "TauCeti/Sub").rmdir()
+    (root / "TauCeti/Sub").symlink_to("../TauCeti")
+    git(root, "add", ".")
+    git(root, "commit", "-q", "-m", "symlink prefix")
+    records = stl.commit_sources(root, git(root, "rev-parse", "HEAD"), base)
+    check(
+        "parent resolution through a directory link is refused", records["TauCeti/Prefix.lean"]["kind"], "unsupported"
+    )
+    link.unlink()
+    link.symlink_to("Missing/../A.lean")
+    (root / "TauCeti/Absolute.lean").symlink_to(root / "TauCeti/A.lean")
+    git(root, "add", ".")
+    git(root, "commit", "-q", "-m", "missing prefix and absolute link")
+    records = stl.commit_sources(root, git(root, "rev-parse", "HEAD"), base)
+    check("missing directory prefix is refused", records["TauCeti/Prefix.lean"]["kind"], "unsupported")
+    check("absolute link is refused", records["TauCeti/Absolute.lean"]["kind"], "unsupported")
+
+for malformed in (dict(scope=True), dict(requested_phases=1), dict(requested_phases=["build", {}])):
+    receipt = dict(
+        schema=verification.SCHEMA,
+        status="success",
+        phases={name: dict(status="success") for name in verification.STAGES},
+        requested_phases=list(verification.STAGES),
+        scope=dict(policy="ordinary"),
+    )
+    check("malformed receipt shape is incomplete", stl._complete({**receipt, **malformed}), False)
 
 # A roadmap round labels the PR opened from the branch it published on the fork.
 with tempfile.TemporaryDirectory() as tmp:
