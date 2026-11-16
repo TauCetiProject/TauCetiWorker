@@ -268,7 +268,7 @@ def event(value: dict):
 
 def prune_shared_cache():
     """Cap persisted read data, with one inexpensive cleanup per five minutes."""
-    from .read_cache import prune_read_cache
+    from tauceti_worker.read_cache import prune_read_cache
 
     cache = root() / "cache"
     marker = cache / ".pruned.json"
@@ -341,6 +341,8 @@ def shared_read(
                 and cached.get("revision", "") == _revision.get()
                 and 0 <= time.time() - cached["time"] < ttl
             ):
+                with contextlib.suppress(OSError):
+                    os.utime(path, follow_symlinks=False)
                 event({"kind": "cache_hit", "read": key[0]})
                 _cache_hit.set(True)
                 return cached["value"]

@@ -317,6 +317,33 @@ class NativeSelfTested(unittest.TestCase):
         self.assertTrue(link.is_symlink())
         self.assertEqual(foreign.read_text(), "publication must survive")
 
+    def test_common_cleanup_is_amortized_and_cache_hits_keep_expiry(self):
+        from tauceti_worker import github_transport as transport
+        from tauceti_worker.source_identity import discovery_scope
+        from tauceti_worker.source_survey import discovery_inventory
+
+        self.source.shared_inventory = True
+        self.source.open_prs = Mock(return_value=[dict(number=1)])
+        with (
+            patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.fixture.clone / "shared-reads")),
+            patch("tauceti_worker.read_cache.prune_read_cache") as prune,
+        ):
+            discovery_inventory(self.source)
+            cache_root = transport.root() / "cache"
+            path = next((cache_root / self.source.cache_namespace).glob("*.json"))
+            cached_at = json.loads(path.read_text())["time"]
+            os.utime(path, (1, 1))
+            discovery_inventory(self.source)
+            self.assertGreater(path.stat().st_mtime, 1)
+            self.assertEqual(json.loads(path.read_text())["time"], cached_at)
+            transport.invalidate_shared(discovery_scope(self.source))
+            discovery_inventory(self.source)
+            self.assertEqual(prune.call_count, 1)
+            os.utime(cache_root / ".pruned.json", (1, 1))
+            transport.invalidate_shared(discovery_scope(self.source))
+            discovery_inventory(self.source)
+            self.assertEqual(prune.call_count, 2)
+
     def test_native_roadmap_receipt_through_persistent_label(self):
         from types import SimpleNamespace
 
