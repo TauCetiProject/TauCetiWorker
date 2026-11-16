@@ -79,6 +79,13 @@ def main():
         agents.CHECKOUT_URL = str(origin)
         main_oid = git(origin, "rev-parse", "main").strip()
 
+        # 0. Worktrees are the default; only an explicit opt-out turns them off.
+        check("unset means worktrees", rw.enabled({}))
+        check("empty means worktrees", rw.enabled({"TAUCETI_ROUND_WORKTREES": ""}))
+        check("1 means worktrees", rw.enabled({"TAUCETI_ROUND_WORKTREES": "1"}))
+        for off in ("0", "false", "No", " off "):
+            check(f"{off!r} opts out", not rw.enabled({"TAUCETI_ROUND_WORKTREES": off}))
+
         # 1. An old permanent checkout is deleted with its unpushed work; its .lake survives.
         one = worker(root, "w1")
         subprocess.run(["git", "clone", "-q", str(origin), str(one.checkout)], check=True)

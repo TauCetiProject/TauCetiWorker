@@ -1,6 +1,6 @@
-"""Run each round in its own worktree of one host clone (opt-in per host).
+"""Run each round in its own worktree of one host clone (on unless a host opts out).
 
-With `TAUCETI_ROUND_WORKTREES=1`, a host keeps one bare clone of TauCeti (one object store and one
+Unless `TAUCETI_ROUND_WORKTREES=0`, a host keeps one bare clone of TauCeti (one object store and one
 set of refs) and every round works in a linked worktree of it at the worker's ordinary checkout
 path, `cfg.checkout`:
 
@@ -54,8 +54,9 @@ UNSAFE_CONFIG = (
 
 
 def enabled(env=None) -> bool:
+    """Per-round worktrees are the default; `TAUCETI_ROUND_WORKTREES=0` (or false/no/off) opts a host out."""
     env = os.environ if env is None else env
-    return env.get("TAUCETI_ROUND_WORKTREES", "").strip().lower() in {"1", "true", "yes", "on"}
+    return env.get("TAUCETI_ROUND_WORKTREES", "").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def root() -> Path:
