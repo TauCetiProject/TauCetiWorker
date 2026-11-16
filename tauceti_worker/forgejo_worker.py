@@ -152,10 +152,13 @@ class ForgejoWorkerSource(ForgejoReadSource):
         """Fresh, unambiguous PR lookup for a branch published by a roadmap round."""
         if not owner or not branch:
             return None
+        # Narrow discovery on the server; still verify its branch and owner below.
         rows = self._read(
             "pull_for_head",
             [owner, branch],
-            lambda: self.reader.pulls(self.repository, ["number", "headRefName", "headRepositoryOwner"], state="open"),
+            lambda: self.reader.pulls(
+                self.repository, ["number", "headRefName", "headRepositoryOwner"], state="open", head=branch
+            ),
             fresh=True,
             cacheable=False,
         )

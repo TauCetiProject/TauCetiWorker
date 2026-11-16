@@ -48,12 +48,14 @@ class NativeSelfTested(unittest.TestCase):
         row = dict(number=1, headRefName="roadmap/x", headRepositoryOwner=dict(login="team"))
         self.source.reader.pulls = Mock(return_value=[row])
         self.assertEqual(self.source.pull_for_head("team", "roadmap/x"), 1)
+        self.assertEqual(self.source.reader.pulls.call_args.kwargs, dict(state="open", head="roadmap/x"))
         self.assertIsNone(self.source.pull_for_head("other", "roadmap/x"))
+        self.assertIsNone(self.source.pull_for_head("team", "roadmap/other"))
         self.source.reader.pulls.return_value = [row, {**row, "number": 2}]
         self.assertIsNone(self.source.pull_for_head("team", "roadmap/x"))
         self.source.reader.pulls.side_effect = ForgeError("outage", status=503)
         self.assertIsNone(self.source.pull_for_head("team", "roadmap/x"))
-        self.assertEqual(self.source.reader.pulls.call_count, 4)
+        self.assertEqual(self.source.reader.pulls.call_count, 5)
 
     def test_native_roadmap_receipt_through_persistent_label(self):
         from types import SimpleNamespace
