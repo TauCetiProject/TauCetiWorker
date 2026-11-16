@@ -2763,6 +2763,7 @@ class StatusShape(ControllerCase):
                 "reasons",
                 "alerts",
                 "escalations",
+                "loop_termination",
                 "counters",
                 "head_cycle_seconds",
                 "insertion_passes",
