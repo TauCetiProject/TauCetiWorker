@@ -269,6 +269,54 @@ class NativeSelfTested(unittest.TestCase):
                 process.join(10)
         self.assertEqual((directory / "fetches").read_text().splitlines(), ["network"])
 
+    def test_nested_advisory_reads_do_not_restart_cached_observation_age(self):
+        from tauceti_worker import github_transport as transport
+
+        self.source.shared_inventory = True
+        fetch = Mock(side_effect=lambda: [dict(number=fetch.call_count)])
+
+        def inner():
+            return self.source._read("inner", [1], fetch, number=1)
+
+        def outer():
+            self.assertFalse(transport.advisory_reads())
+            self.assertTrue(transport.read_policy()[0])
+            return inner()
+
+        with (
+            patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.fixture.clone / "shared-reads")),
+            transport.read_context(advisory=True),
+        ):
+            self.assertEqual(inner(), [dict(number=1)])
+            with patch("tauceti_worker.github_transport.time.time", return_value=time.time() + 10):
+                self.assertEqual(self.source._read("outer", [1], outer, number=1), [dict(number=2)])
+            self.assertTrue(transport.advisory_reads())
+        self.assertFalse(transport.advisory_reads())
+
+    def test_common_cleanup_bounds_histories_without_unlinking_locks_or_symlinks(self):
+        from tauceti_worker.read_cache import prune_read_cache
+
+        root = self.fixture.clone / "cache"
+        namespace = root / ("a" * 64)
+        namespace.mkdir(parents=True)
+        old = namespace / ("1" * 64 + ".json")
+        new = namespace / ("2" * 64 + ".json")
+        old.write_text("old" * 20)
+        new.write_text("new")
+        os.utime(old, (1, 1))
+        lock = old.with_suffix(".lock")
+        lock.write_text("held lock inode")
+        foreign = self.fixture.clone / "outbox.json"
+        foreign.write_text("publication must survive")
+        link = namespace / ("3" * 64 + ".json")
+        link.symlink_to(foreign)
+        prune_read_cache(root, max_files=1, max_bytes=50)
+        self.assertFalse(old.exists())
+        self.assertEqual(new.read_text(), "new")
+        self.assertEqual(lock.read_text(), "held lock inode")
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(foreign.read_text(), "publication must survive")
+
     def test_native_roadmap_receipt_through_persistent_label(self):
         from types import SimpleNamespace
 

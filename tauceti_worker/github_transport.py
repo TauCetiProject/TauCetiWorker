@@ -78,14 +78,14 @@ def register_principal(user_id: int, login: str, env=None):
 
 @contextlib.contextmanager
 def read_context(
-    *, fresh: bool = False, revision: str = "", direct: bool = False, retry: bool = True, advisory: bool = False
+    *, fresh: bool = False, revision: str = "", direct: bool = False, retry: bool = True, advisory: bool | None = None
 ):
     a = _fresh.set(_fresh.get() or fresh)
     b = _revision.set(revision or _revision.get())
     c = _cache_hit.set(False)
     d = _direct.set(_direct.get() or direct)
     e = _retry_reads.set(_retry_reads.get() and retry)
-    f = _advisory.set(_advisory.get() or advisory)
+    f = _advisory.set(_advisory.get() if advisory is None else advisory)
     try:
         yield
     finally:
@@ -266,6 +266,31 @@ def event(value: dict):
         pass
 
 
+def prune_shared_cache():
+    """Cap persisted read data, with one inexpensive cleanup per five minutes."""
+    from .read_cache import prune_read_cache
+
+    cache = root() / "cache"
+    marker = cache / ".pruned.json"
+
+    def recent():
+        try:
+            return 0 <= time.time() - marker.stat().st_mtime < 300
+        except OSError:
+            return False
+
+    if recent():
+        return
+    try:
+        with locked(cache / ".prune.lock", timeout=0.05):
+            if recent():
+                return
+            prune_read_cache(cache, max_files=1024, max_bytes=64 * 1024 * 1024)
+            atomic(marker, {"time": time.time()})
+    except OSError:
+        pass  # Cache cleanup never gates a source read.
+
+
 def shared_read(
     key,
     fetch,
@@ -363,6 +388,8 @@ def shared_read(
                         saved = True
                     except OSError:
                         pass
+                if saved:
+                    prune_shared_cache()
                 if saved and coalesce_failures:
                     with contextlib.suppress(OSError):
                         attempt.unlink(missing_ok=True)
