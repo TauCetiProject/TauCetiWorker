@@ -33,6 +33,7 @@ EXPLICIT_WITHDRAWALS = frozenset(
         "landed-externally",
         "problem-anticipated",
         "empty-commit",
+        "queue-withdrawn",
     }
 )
 CONTEXTS = ("build", "scope", "bump-guard")
@@ -518,6 +519,18 @@ class AdmissionPoller:
         elif reason == "empty-commit":
             rows = self.controller.store.rows(
                 "journal", {"kind": "landed", "batch_id": current["batch_id"]}, order="id DESC", limit=1
+            )
+            withdrawn = self.controller.store.query(
+                "SELECT at FROM journal WHERE kind='member-withdrawn-empty' AND batch_id=? "
+                "AND json_extract(detail, '$.number')=? ORDER BY id DESC LIMIT 1",
+                (current["batch_id"], current["number"]),
+            )
+            boundary = withdrawn[0]["at"] if withdrawn else (rows[0]["at"] if rows else None)
+        elif reason == "queue-withdrawn":
+            rows = self.controller.store.query(
+                "SELECT at FROM journal WHERE kind='queue-withdrawn' AND batch_id=? "
+                "AND json_extract(detail, '$.number')=? ORDER BY id DESC LIMIT 1",
+                (current["batch_id"], current["number"]),
             )
             boundary = rows[0]["at"] if rows else None
         # Missing history is held conservatively. Never infer approval from a comment edit.

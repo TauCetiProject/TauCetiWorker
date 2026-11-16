@@ -18,7 +18,7 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from tauceti_queue import admission_planning, chain, feeds, monitoring  # noqa: E402
+from tauceti_queue import admission_planning, chain, escalation, feeds, monitoring  # noqa: E402
 from tauceti_queue.approval_poll import ApprovalPoller  # noqa: E402
 from tauceti_queue.controller import LOG_GRACE_SECONDS, MERGED_TITLE_PREFIX, ControllerError, TaskError  # noqa: E402
 from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller  # noqa: E402
@@ -501,6 +501,344 @@ class Repair(QueueFixture):
         self.assertTrue(adoption.accepted, adoption)
 
 
+class RecordingNotifier:
+    """A Zulip stand-in: records each delivered message; `lose` replies are lost after delivery."""
+
+    def __init__(self, lose=0):
+        self.messages = []
+        self.calls = []
+        self.lose = lose
+
+    def send(self, marker, content, *, reconcile):
+        self.calls.append((marker, reconcile))
+        if reconcile and any(marker in message for message in self.messages):
+            return "zulip reconciled"
+        self.messages.append(content)
+        if self.lose:
+            self.lose -= 1
+            raise RuntimeError("lost Zulip reply")
+        return f"zulip {len(self.messages)}"
+
+
+class FailureFingerprints(unittest.TestCase):
+    def test_line_numbers_shas_and_urls_do_not_change_a_fingerprint(self):
+        first = [
+            {"kind": "compiler", "module": "TauCeti/A.lean", "message": "TauCeti/A.lean:12:3: error: boom at 0123abcd"}
+        ]
+        moved = [
+            {"kind": "compiler", "module": "TauCeti/A.lean", "message": "TauCeti/A.lean:40:7: error: boom at 99aa00ff"}
+        ]
+        other = [{"kind": "compiler", "module": "TauCeti/A.lean", "message": "TauCeti/A.lean:12:3: error: other"}]
+        identity = [
+            escalation.fingerprint("build", [], escalation.finding_lines(d))["fingerprint"]
+            for d in (first, moved, other)
+        ]
+        self.assertEqual(identity[0], identity[1])
+        self.assertNotEqual(identity[0], identity[2])
+        infrastructure = first + [{"kind": "infrastructure", "message": "runner lost"}]
+        self.assertEqual(escalation.finding_lines(first), escalation.finding_lines(infrastructure))
+
+    def test_verdict_class_names_the_classification_and_failed_contexts(self):
+        verdicts = {"build": {"state": "success"}, "scope": {"state": "failure"}, "bump-guard": {"state": "success"}}
+        self.assertEqual(
+            escalation.verdict_class("verified source CI: policy_failure", verdicts), "policy_failure:scope"
+        )
+        self.assertEqual(escalation.verdict_class("Build failed", {"build": {"state": "failure"}}), "build")
+        self.assertEqual(
+            escalation.named_members([{"kind": "status", "source_pr": "o/r#4"}, {"kind": "compiler", "pr": 7}]),
+            ["o/r#4", 7],
+        )
+
+    def test_zulip_notifier_reconciles_a_retry_by_its_marker(self):
+        notifier = escalation.ZulipNotifier(
+            {"site": "https://zulip.invalid", "email": "bot@x", "api_key": "k", "recipient_id": 5}
+        )
+        calls = []
+
+        def request(method, params):
+            calls.append((method, params))
+            if method == "GET":
+                return {"messages": [{"id": 77, "content": "earlier text with marker-1"}]}
+            return {"id": 78}
+
+        with patch.object(notifier, "_request", side_effect=request):
+            self.assertEqual(notifier.send("marker-1", "body marker-1", reconcile=True), "zulip 77 (reconciled)")
+            self.assertEqual([method for method, _ in calls], ["GET"])
+            self.assertEqual(notifier.send("marker-2", "body marker-2", reconcile=True), "zulip 78")
+            self.assertEqual(notifier.send("marker-3", "body marker-3", reconcile=False), "zulip 78")
+        self.assertEqual([method for method, _ in calls], ["GET", "GET", "POST", "POST"])
+        self.assertEqual(json.loads(calls[-1][1]["to"]), [5])
+
+    def test_notifier_configuration_comes_from_the_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "zulip.json"
+            path.write_text(json.dumps({"site": "https://z.invalid", "email": "b", "api_key": "k", "recipient_id": 3}))
+            notifier = escalation.notifier_from_environment({escalation.ZULIP_CONFIG_ENV: str(path)})
+            self.assertEqual(notifier.config["recipient_id"], 3)
+            self.assertIsNone(escalation.notifier_from_environment({}))
+            path.write_text("{}")
+            with self.assertRaises(ValueError):
+                escalation.notifier_from_environment({escalation.ZULIP_CONFIG_ENV: str(path)})
+
+
+class LoopTermination(QueueFixture):
+    """The queue never re-dispatches an unchanged candidate after the same failure: every failure is
+    followed by an adopted repair, a withdrawal, a split or an alert (docs/queue/escalation.md)."""
+
+    def setUp(self):
+        super().setUp()
+        self.notifier = self.controller.notifier = RecordingNotifier()
+
+    def fails_on(self, path, verdict="fail", attributed=None):
+        """A CI policy failing any candidate whose tree holds `path`: a property of the content, as real CI's is."""
+
+        def policy(head, _base, _members):
+            if self.repo.file_at(head, path) is None:
+                return "pass", []
+            if verdict != "fail":
+                return verdict, []
+            finding = {"kind": "compiler", "module": f"TauCeti/{path}", "message": f"TauCeti/{path}:3:1: error: boom"}
+            if attributed is not None:
+                finding["source_pr"] = f"{PROJECT}#{attributed}"
+            return "fail", [finding]
+
+        return policy
+
+    def give_up(self, times):
+        """Workers claim the head's task and give it back without a submission."""
+        for _ in range(times):
+            task = self.controller.claim_task("flaky-worker", "admin-worker")
+            self.assertIsNotNone(task)
+            self.controller.release_task(task.task_id, task.claim_token, "agent_failed", "no result")
+
+    def unhelpful_repair(self, number, path):
+        """An agent that changes content without fixing the failure."""
+        agent = self.agent(
+            name=f"unhelpful-{number}-{len(self.github.dispatches)}",
+            script=lambda task: {
+                f"{PROJECT}#{number}": Resolution(
+                    {path: f"tweak {len(self.github.dispatches)}\n"}, explanation="Tweaked."
+                )
+            },
+        )
+        adoption = agent.run(self.controller)
+        self.assertTrue(adoption.accepted, adoption)
+
+    def test_a_recurring_failure_naming_a_member_withdraws_it_and_the_rest_lands(self):
+        self.github.ci_policy = self.fails_on("Bad.lean", attributed=102)
+        self.approve(101, {"A.lean": "a\n"})
+        self.approve(102, {"Bad.lean": "bad\n"})
+        self.approve(103, {"C.lean": "c\n"})
+        self.tick()
+        head = self.head()
+        self.run_ci()
+        self.tick()
+        self.assertEqual(self.controller.status()["head"]["stage"], "repair")
+        self.unhelpful_repair(101, "A.lean")
+        self.tick()
+        self.run_ci()
+        self.tick()
+        # The same failure again: no second repair, the named member is withdrawn.
+        failures = self.controller.store.rows("failures", {"batch_id": head["id"]}, order="id")
+        self.assertEqual(len({f["fingerprint"] for f in failures}), 1)
+        self.assertEqual([f["action"] for f in failures], ["repair", "withdraw"])
+        self.assertEqual(json.loads(failures[0]["members"]), [f"{PROJECT}#102"])
+        row = self.controller.input_for(PROJECT, 102)
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "queue-withdrawn"))
+        member = next(m for m in self.members(self.head()) if m["number"] == 102)
+        self.assertEqual(member["withdrawn"], 1)
+        self.assertTrue(self.controller._commit_empty(member["commit_sha"]))
+        self.assertIn("Withdrawn by the merge queue", member["explanation"])
+        status = self.controller.status()
+        self.assertTrue(any("escalation (withdraw)" in alert for alert in status["alerts"]), status["alerts"])
+        self.assertEqual(status["escalations"][-1]["action"], "withdraw")
+        self.tick()
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.assertIn("withdraw on head batch", self.notifier.messages[0])
+        self.assertIn("withdrew #102", self.notifier.messages[0])
+        [comment] = self.github.comments_for(102)
+        self.assertIn("The merge queue withdrew this PR from batch", comment["body"])
+        self.assertIn("What to do next", comment["body"])
+        self.assertIn("boom", comment["body"])
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.head())
+        self.assertEqual(self.repo.file_at("main", "C.lean"), "c\n")
+        self.assertIsNone(self.repo.file_at("main", "Bad.lean"))
+        self.assertNotIn(102, self.github.closed)
+        self.assertEqual(len(self.github.comments_for(102)), 1)
+        self.assertEqual(len(self.github.dispatches), 3)
+        self.assertEqual(len(self.notifier.messages), 1, "one message per escalation")
+
+    def test_an_unattributed_policy_failure_with_fruitless_repairs_is_bisected_until_isolated(self):
+        # The 2026-11-16 incident: a policy verdict names no member and no worker can submit a repair.
+        self.github.ci_policy = self.fails_on("Huge.lean", verdict="scope-fail")
+        for number in range(101, 107):
+            self.approve(number, {f"F{number}.lean": f"{number}\n", **({"Huge.lean": "x\n"} if number == 104 else {})})
+        self.tick()
+        head = self.head()
+        order = [m["number"] for m in self.members(head)]
+        self.assertEqual(sorted(order), list(range(101, 107)))
+        self.run_ci()
+        self.tick()
+        self.give_up(2)
+        self.tick()
+        self.assertEqual(self.controller.status()["head"]["stage"], "repair", "two fruitless claims are not enough")
+        self.give_up(1)
+        self.tick()
+        # Three fruitless claims: the head keeps its first half; the rest wait again at their age.
+        self.assertEqual([m["number"] for m in self.members(self.head())], order[:3])
+        self.assertEqual(self.controller.store.journal_entries("bisected")[0]["detail"]["moved"], order[3:])
+        self.assertTrue(all(self.controller.input_for(PROJECT, n)["state"] == "waiting" for n in order[3:]))
+        for _ in range(40):
+            self.tick()
+            if all(self.controller.input_for(PROJECT, n)["state"] in ("landed", "cancelled") for n in range(101, 107)):
+                break
+            stage = self.controller.status()["head"]["stage"] if self.head() else None
+            if stage == "ci":
+                self.run_ci()
+            elif stage == "repair":
+                task = self.controller.status()["head"]["task"]
+                if self.controller._fruitless_claims({"id": task["task_id"]}) == 0:
+                    self.unhelpful_repair(self.members(self.head())[0]["number"], "Tweak.lean")
+                else:
+                    self.give_up(1)
+            self.clock.advance(60)
+        states = {n: self.controller.input_for(PROJECT, n) for n in range(101, 107)}
+        self.assertEqual(
+            {n: r["state"] for n, r in states.items() if n != 104}, {n: "landed" for n in (101, 102, 103, 105, 106)}
+        )
+        self.assertEqual((states[104]["state"], states[104]["reason"]), ("cancelled", "queue-withdrawn"))
+        self.assertIsNone(self.repo.file_at("main", "Huge.lean"))
+        actions = [e["action"] for e in self.controller.status()["escalations"]]
+        self.assertIn("bisect", actions)
+        self.assertEqual(actions[-1], "withdraw")
+        self.tick()
+        self.assertEqual(len(self.notifier.messages), len(actions))
+        [comment] = self.github.comments_for(104)
+        self.assertIn("withdrew this PR", comment["body"])
+        self.assertIn("verdict: `scope`", comment["body"])
+        self.assertIn("restricted paths changed", comment["body"])
+        self.assertIn("the only member left", comment["body"])
+        # No candidate was ever dispatched twice with the same content after the same failure.
+        trees = [
+            (d["client_payload"]["batch_id"], chain.tree_of(self.repo.origin, d["client_payload"]["head_sha"]))
+            for d in self.github.dispatches
+        ]
+        self.assertEqual(len(trees), len(set(trees)))
+
+    def test_a_repair_that_leaves_the_content_unchanged_is_not_dispatched(self):
+        self.github.ci_policy = self.fails_on("Bad.lean")
+        self.approve(101, {"Bad.lean": "bad\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        task = self.controller.claim_task("w", "admin-worker")
+        adoption = self.controller.submit_task(task.task_id, task.claim_token, task.tip)
+        self.assertTrue(adoption.accepted, adoption)
+        self.tick()
+        self.assertEqual(len(self.github.dispatches), 1, "the unchanged content is not built again")
+        self.assertEqual(self.controller.status()["escalations"][-1]["action"], "bisect")
+        self.assertIn("unchanged", self.controller.status()["escalations"][-1]["cause"])
+
+    def test_repeated_infrastructure_failures_hold_with_an_alert_until_retry_ci(self):
+        self.controller.set_setting("infrastructure_failure_limit", 2, "test")
+        self.github.ci_policy = lambda *_: ("infrastructure", [])
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        for _ in range(6):
+            self.run_ci()
+            self.clock.advance(3600)
+            self.tick()
+        self.assertEqual(len(self.github.dispatches), 2)
+        status = self.controller.status()
+        self.assertTrue(any("infrastructure-hold" in alert for alert in status["alerts"]), status["alerts"])
+        self.assertTrue(any("automatic re-dispatch stopped" in reason for reason in status["reasons"]))
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.assertIn("infrastructure-hold", self.notifier.messages[0])
+        self.github.ci_policy = lambda *_: ("pass", [])
+        self.assertTrue(self.controller.retry_ci(PROJECT, "kim")["retried"])
+        self.tick()
+        self.assertEqual(len(self.github.dispatches), 3)
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.head())
+
+    def test_a_rebase_conflict_nobody_resolves_withdraws_the_conflicting_member(self):
+        self.approve(101, {"Shared.lean": "one\ntwo by 101\nthree\n"})
+        self.tick()
+        self.approve(102, {"Shared.lean": "one\ntwo by 102\nthree\n"})
+        self.approve(103, {"C.lean": "c\n"})
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.controller.status()["head"]["stage"], "rebase_conflict")
+        self.give_up(3)
+        self.tick()
+        row = self.controller.input_for(PROJECT, 102)
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "queue-withdrawn"))
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.head())
+        self.assertEqual(self.repo.file_at("main", "C.lean"), "c\n")
+        self.assertEqual(self.repo.file_at("main", "Shared.lean"), "one\ntwo by 101\nthree\n")
+        self.assertIn("rebase conflict task", self.github.comments_for(102)[0]["body"])
+
+    def test_notification_delivery_retries_without_a_second_message(self):
+        self.notifier.lose = 1
+        self.github.ci_policy = self.fails_on("Bad.lean", attributed=101)
+        self.approve(101, {"Bad.lean": "bad\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.give_up(3)
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.clock.advance(self.controller.setting("outbox_retry_max_seconds"))
+        self.tick()
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.assertEqual([reconcile for _, reconcile in self.notifier.calls], [False, True])
+        self.assertEqual(self.controller.store.count("outbox", {"kind": "notify", "state": "done"}), 1)
+
+    def test_an_escalation_that_cannot_act_holds_the_head_with_an_alert(self):
+        self.github.ci_policy = self.fails_on("Bad.lean", attributed=101)
+        self.approve(101, {"Bad.lean": "bad\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.give_up(3)
+        with patch.object(chain, "replay", side_effect=chain.ChainError("object store unavailable")):
+            self.tick()
+        head = self.head()
+        self.assertEqual(self.controller.status()["escalations"][-1]["action"], "hold")
+        alerts = self.controller.status()["alerts"]
+        self.assertTrue(any("holds after escalation" in a and "object store unavailable" in a for a in alerts), alerts)
+        self.tick(3)
+        self.assertEqual(self.head()["version"], head["version"])
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.assertIn("hold on head batch", self.notifier.messages[0])
+
+    def test_without_a_notifier_the_alert_remains_and_the_outbox_settles(self):
+        self.controller.notifier = None
+        self.github.ci_policy = self.fails_on("Bad.lean", attributed=101)
+        self.approve(101, {"Bad.lean": "bad\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.give_up(3)
+        self.tick(2)
+        entry = self.controller.store.row("outbox", {"kind": "notify"})
+        self.assertEqual((entry["state"], entry["result"]), ("done", "notifier-unconfigured"))
+        self.assertTrue(any("escalation (withdraw)" in a for a in self.controller.status()["alerts"]))
+
+
 class WithdrawnAtAdoption(QueueFixture):
     """An adopted repair that empties an ordinary member sends it back to its author at once."""
 
@@ -728,6 +1066,8 @@ class EmptyContributions(QueueFixture):
         self.assertEqual({o.state for o in outcomes}, {"canceled"})
 
     def test_a_later_repair_restoring_content_is_merged(self):
+        # The scripted failure repeats verbatim; allow it a second repair instead of escalating.
+        self.controller.set_setting("failure_repeat_limit", 3, "test")
         self.repaired_empty()
         self.github.ci_policy = verdicts("fail")
         self.tick()

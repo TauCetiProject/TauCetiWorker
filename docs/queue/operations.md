@@ -764,6 +764,15 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `pre_rebase_enabled` | `true` | `true` or `false` |
 | `prepare_pre_rebased` | `true` | `true` or `false` |
 | `withdraw_emptied_at_adoption` | `true` | `true` or `false` ([reject-empty-commits.md](reject-empty-commits.md)) |
+| `failure_repeat_limit` | `2` | integer, at least 0; 0 disables ([escalation.md](escalation.md)) |
+| `repair_fruitless_claim_limit` | `3` | integer, at least 0; 0 disables |
+| `source_failure_round_limit` | `6` | integer, at least 0; 0 disables |
+| `infrastructure_failure_limit` | `5` | integer, at least 0; 0 disables |
+| `escalation_alert_seconds` | `86400` | integer, at least 0 |
+
+Escalations (withdrawals, bisections, infrastructure holds) are sent as Zulip direct messages when
+`TAUCETI_QUEUE_ZULIP_CONFIG` in `~/.config/tauceti-queue/environment` names a mode-0600 bot
+configuration file; see [escalation.md](escalation.md), "Alerts and notifications".
 
 
 ## Primary admission
