@@ -115,7 +115,6 @@ CASES = [
         0,
     ),
     ("no receipt is needed", {}, lambda h: [pull(h)], [], "attested", 1, 1),
-
 ]
 
 for name, options, pulls, statuses, prefix, verify_calls, labels in CASES:

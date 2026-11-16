@@ -167,8 +167,11 @@ class AdmissionPolicy:
             set(rubrics),
             snapshot.paths,
             snapshot.statuses.get("build", ""),
-            ("success" if snapshot.self_tested and set(snapshot.paths) & {"lean-toolchain", "lake-manifest.json"}
-             else snapshot.statuses.get("bump-guard", "")),
+            (
+                "success"
+                if snapshot.self_tested and set(snapshot.paths) & {"lean-toolchain", "lake-manifest.json"}
+                else snapshot.statuses.get("bump-guard", "")
+            ),
             merge_path_prefix=self.prefix,
             merge_allow_file=self.allow_files,
             table_rubrics=rubrics,
