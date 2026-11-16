@@ -29,6 +29,7 @@ from .agents import (
     host_agent_argv,
     local_verification,
     prepare_checkout,
+    quality_scope,
     resolve_authoring_profile,
     resolve_codex_model_access,
     review_in_bubble,
@@ -2136,6 +2137,7 @@ def _do_fixlike(
         BIN=wrapper_bin(bubble),
         SCOPE_POLICY=policy,
         LOCAL_VERIFICATION=local_verification(policy, bubble),
+        QUALITY_SCOPE=quality_scope(),
     )
     if label == "rebase":
         evidence = w.gh.rebase_request_body(pr, head)
@@ -3331,6 +3333,7 @@ other contributors' claims, or the hard rules of the repo.
                 EXTRA_ROADMAP_PROMPT=extra_guidance,
                 TARGET_LIST=assignment,
                 LOCAL_VERIFICATION=local_verification("ordinary", bubble),
+                QUALITY_SCOPE=quality_scope(),
                 BIN=wrapper_bin(bubble=True),
             ),
             opts,
@@ -3354,6 +3357,7 @@ other contributors' claims, or the hard rules of the repo.
         EXTRA_ROADMAP_PROMPT=extra_guidance,
         TARGET_LIST=assignment,
         LOCAL_VERIFICATION=local_verification("ordinary", bubble),
+        QUALITY_SCOPE=quality_scope(),
         BIN=wrapper_bin(),
     )
     return run_agent_host(w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir, quota_cfg=w.cfg)
