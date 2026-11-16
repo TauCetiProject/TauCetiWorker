@@ -767,10 +767,14 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `failure_repeat_limit` | `2` | integer, at least 0; 0 disables ([escalation.md](escalation.md)) |
 | `repair_fruitless_claim_limit` | `3` | integer, at least 0; 0 disables |
 | `source_failure_round_limit` | `6` | integer, at least 0; 0 disables |
-| `infrastructure_failure_limit` | `5` | integer, at least 0; 0 disables |
+| `policy_rejection_withdraw` | `true` | `true` or `false` |
+| `attribution_max_members` | `10` | integer, at least 0; 0: no bound |
+| `infrastructure_failure_limit` | `5` | integer, at least 0; 0 disables the automatic backoff |
+| `automatic_retry_seconds` | `1800` | integer, at least 0; below 60 counts as 60 |
+| `automatic_retry_max_seconds` | `14400` | integer, at least 0 |
 | `escalation_alert_seconds` | `86400` | integer, at least 0 |
 
-Escalations (withdrawals, bisections, infrastructure holds) are sent as Zulip direct messages when
+Escalations (withdrawals, bisections, the start and end of an infrastructure backoff) are sent as Zulip direct messages when
 `TAUCETI_QUEUE_ZULIP_CONFIG` in `~/.config/tauceti-queue/environment` names a mode-0600 bot
 configuration file; see [escalation.md](escalation.md), "Alerts and notifications".
 
