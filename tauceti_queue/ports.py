@@ -85,6 +85,7 @@ class AdmissionSnapshot:
     statuses: dict[str, str]
     diff_version: str = ""
     discovery_version: str = ""
+    self_tested: bool = False  # Inline trusted-author/scope eligibility, never a workflow receipt.
 
     def source(self) -> dict[str, Any]:
         return {

@@ -526,10 +526,31 @@ def self_tested_guidance(policy: str) -> str:
         "`gh-safe-pr-create` wrapper; do not bypass it. After creation or pushing an update, "
         "confirm the live PR commit matches your verified commit, then use "
         "`gh pr edit <number> --repo TauCetiProject/TauCeti "
-        "--add-label self-tested`. A push clears the label, so reapply it after testing subsequent changes. "
-        "If a concurrent push workflow removes the label again, confirm the commit still matches "
-        "and reapply it once. Do not apply it for infrastructure or pin changes, or full-lint/lint-repair requests. "
-        "The trusted picker checks eligibility; reviews and all staging tests still run.\n\n"
+        "--add-label self-tested`. If GitHub denies that command for lack of label permissions, "
+        "confirm you are the PR author and its head still matches the verified commit, then post "
+        "a new standalone `self-tested` comment with "
+        "`gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested`. "
+        "The comment handler is asynchronous; do not post duplicate requests while it runs. "
+        "Keep the label in place through fix/rebase pushes after local verification succeeds. "
+        "The label is a persistent author declaration, not a per-commit receipt. "
+        "If verification fails or is incomplete, remove it with `gh pr edit <number> "
+        "--repo TauCetiProject/TauCeti --remove-label self-tested` (or post `-self-tested` "
+        "as the PR author if label permissions are missing). Do not leave it on work you "
+        "cannot stand behind. Do not apply it for infrastructure or pin changes, or full-lint/lint-repair requests. "
+        "Admission checks trusted-author and source-scope eligibility directly; reviews and all staging tests still run.\n\n"
+    )
+
+
+def quality_scope() -> str:
+    """Which quality-pass checks agents run: all of them under `--full-quality`, else the duplicate and
+    proof-length checks, named as the template titles them. A PR keeps the template its branch was cut
+    with, which numbers proof length Q5 of five checks or Q3 of three (TauCeti#40207)."""
+    if os.environ.get("TAUCETI_FULL_QUALITY", "0") == "1":
+        return "Run every check."
+    return (
+        "Run only the Mathlib duplicates, Tau Ceti duplicates and Proofs of at most 50 lines checks: Q1, Q2 "
+        "and Q5 when the template has five checks, Q1 to Q3 when it has three. Each other line, such as "
+        "Hypotheses or Section variables, reads `declined — not run`."
     )
 
 

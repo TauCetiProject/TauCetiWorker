@@ -110,6 +110,7 @@ class PullRequest(ports.PullRequest):
     base_sha: str = ""
     author_id: int = 0
     head_repo: str = ""
+    head_ref: str = ""
     merged: bool = False
     updated_at: str = ""
     comments_count: int = 0
@@ -132,6 +133,7 @@ class PullRequest(ports.PullRequest):
             base_sha=str(base.get("sha") or ""),
             author_id=int(user.get("id") or 0),
             head_repo=str(((head.get("repo") or {}).get("full_name")) or ""),
+            head_ref=str(head.get("ref") or ""),
             merged=bool(data.get("merged")),
             updated_at=str(data.get("updated_at") or ""),
             comments_count=int(data.get("comments") or 0),
@@ -1155,6 +1157,17 @@ class GitHubAdapter:
         comments = tuple(
             self.client.paginate(f"repos/{repo}/issues/{number}/comments", progress=progress.setdefault("comments", {}))
         )
+        from tauceti_tools.self_tested import eligible, gh_read, requested
+
+        local = False
+        if requested(pull.labels):
+            raw = {
+                "number": number, "state": pull.state, "labels": pull.labels,
+                "base": {"ref": pull.base_ref}, "head": {"sha": pull.head_sha,
+                "ref": pull.head_ref, "repo": {"full_name": pull.head_repo}},
+                "user": {"login": pull.author_login},
+            }
+            local = eligible(raw, repo, paths=paths, read=lambda path: self.client.get_json(path)[1], member_read=gh_read)
         fresh, statuses = self._admission_fence(repo, number, pull, labels_progress=progress.setdefault("labels", {}))
         if (
             fresh.head_sha,
@@ -1181,7 +1194,8 @@ class GitHubAdapter:
             raise GitHubError("PR inputs changed while admission was reading source evidence")
         self._admission_reads.pop((repo, number), None)
         return ports.AdmissionSnapshot(
-            fresh, merge_base, paths, comments, statuses, self._diff_version(pull.base_sha, pull.head_sha)
+            fresh, merge_base, paths, comments, statuses, self._diff_version(pull.base_sha, pull.head_sha),
+            self_tested=local
         )
 
     def _admission_fence(self, repo, number, pull, *, labels_progress=None):

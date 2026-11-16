@@ -728,7 +728,9 @@ class FakeGitHub:
             )
         else:
             paths = ()
-        return AdmissionSnapshot(pull, base, paths, tuple(source["comments"]), source["statuses"], base)
+        from tauceti_tools.self_tested import accepted, allowed_paths
+        local = accepted(pull.labels, member=pull.author_login in getattr(self, "self_tested_members", set())) and allowed_paths(paths)
+        return AdmissionSnapshot(pull, base, paths, tuple(source["comments"]), source["statuses"], base, self_tested=local)
 
     def list_open_pull_requests(
         self, repo: str, *, review_app_id: int, admission=False, on_page=None
