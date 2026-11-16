@@ -117,31 +117,25 @@ class AdmissionTests(unittest.TestCase):
         with mock.patch.dict(table, {"quality-pass": {REPO: None}}):
             self.assertEqual(named.rubrics_for(101), self.config.rubrics)
 
-    def test_self_tested_reviewed_head_enters_existing_staging_without_build_success(self):
+    def test_persistent_self_tested_enters_staging_without_any_ci_receipt(self):
         head = self.ready()
         del self.github.statuses[(head, "build")]
+        del self.github.statuses[(head, "scope")]
         self.github.labels[1].add("self-tested")
-        self.github.statuses[(head, "self-tested/1")] = Status(
-            "success", "PR CI skipped: self-tested.", "", self.clock(), None
-        )
+        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
         self.assertEqual(self.intake.run_once()["approved"], 1)
         self.controller.tick()
         self.assertEqual(self.controller.inputs()[0]["state"], "inserted")
-        self.assertTrue(self.controller.store.rows("members"))
         self.assertNotIn((head, "build"), self.github.statuses)
+        self.assertNotIn((head, "self-tested/1"), self.github.statuses)
 
-    def test_label_and_dedicated_status_changes_invalidate_admission(self):
+    def test_untrusted_label_and_label_removal_cannot_bypass_ci(self):
         head = self.ready()
         del self.github.statuses[(head, "build")]
-        self.assertEqual(self.intake.run_once()["approved"], 0)
         self.github.labels[1].add("self-tested")
-        self.github.statuses[(head, "self-tested/2")] = Status("success", "other PR", "", self.clock(), None)
-        self.event("pull_request", {"number": 1, "action": "labeled", "label": {"name": "self-tested"}})
         self.assertEqual(self.intake.run_once()["approved"], 0)
-        self.github.statuses[(head, "self-tested/1")] = Status(
-            "success", "PR CI skipped: self-tested.", "", self.clock(), None
-        )
-        self.event("status", {"sha": head, "context": "self-tested/1"})
+        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
+        self.event("pull_request", {"number": 1, "action": "labeled", "label": {"name": "self-tested"}})
         self.assertEqual(self.intake.run_once()["approved"], 1)
         generation = self.intake.state.get(1)["generation"]
         self.event("pull_request", {"number": 1, "action": "unlabeled", "label": {"name": "self-tested"}})

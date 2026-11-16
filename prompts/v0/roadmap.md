@@ -69,7 +69,7 @@ from `__RUBRICS__` — the angles that most often send a PR back:
 Then, if `.github/pull_request_template.md` in this checkout has a `Quality pass:` block, run
 the quality pass: the block's checks, which the `quality-pass` rubric holds your report of. Run
 each over every declaration you added or changed, fix what it finds, and fill in the block's
-lines, one per check, for the PR body.
+lines, one per check, for the PR body. __QUALITY_SCOPE__
 
 Make only fixes you can justify against a rubric. Do NOT broaden the PR, add speculative
 generality, or invent findings to look diligent: scope is itself a rubric, and a sound small PR
