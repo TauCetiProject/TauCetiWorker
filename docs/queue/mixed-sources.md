@@ -200,6 +200,17 @@ credential origin and enrolled member roles must match enrollment; a candidate
 branch cannot select a caller or grant credentials. The execution repository
 can be separate from the GitHub content repository.
 
+The policy's `harness_revision` is the only record of the shared harness revision.
+The captured caller must pin every harness literal (`uses: <harness>/...@` and
+`tools_ref`) to it, or request preparation refuses that main. Immediately before
+the single dispatch POST, when the configuration names a hosted fleet
+(`[services.fleet] mode = "hosted"`), the queue asks its broker
+(`GET <url>/v1/harness?revision=<sha>`) whether every restricted runner group
+admits that revision. The broker derives those allow-list entries from the same
+protected main. Anything other than an explicit readiness answer is a proven
+non-send, retried after 15 seconds, so a new pin never strands a run that waits
+for a runner the allow-list refuses.
+
 Ordinary reviewed changes to `.github`, `.tauceti`, `scripts` and `tauceti.toml`
 on protected execution `main` are available to the next request without a
 private caller approval or service restart. Existing frozen requests retain their
