@@ -431,6 +431,8 @@ def test_declined_foreign_claim_lifecycle_before_next_candidate():
             claims = round_mod.Claims(SimpleNamespace(), SimpleNamespace(add_cleanup=cleanups.append))
 
             def command(cmd, *, claims=claims, refusal=refusal, live=live, events=events, **kwargs):
+                if cmd[:2] == ["git", "ls-remote"]:  # the branch tip still matches the selected head
+                    return SimpleNamespace(returncode=0, stdout=f"{HEAD}\t{cmd[-1]}\n")
                 operation, key = cmd[1:3]
                 assert kwargs["env"]["CLAIM_REPO"] == "test/claims"
                 if operation == "acquire":
