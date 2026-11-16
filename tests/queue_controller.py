@@ -2762,6 +2762,7 @@ class StatusShape(ControllerCase):
                 "outbox",
                 "reasons",
                 "alerts",
+                "escalations",
                 "counters",
                 "head_cycle_seconds",
                 "insertion_passes",

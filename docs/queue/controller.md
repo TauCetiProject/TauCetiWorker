@@ -35,7 +35,8 @@ Tables:
 | `batch_tips` | every tip a batch has had: batch, version, tip SHA and the time it was recorded (written wherever the tip changes: insertion, adoption, rebase, rebuild, and at dispatch for a version not yet recorded) |
 | `submissions` | every submitted chain with its retained ref, accepted flag and reason |
 | `ci_attempts` | every dispatch: head and base SHA, dispatch id, bound run id and attempt, status, conclusion, runner, labels, host, phases, progress timestamps, outcome (`pending`, `pass`, `source-failure`, `infrastructure`, `superseded`), diagnostics and the `repair_outputs_revs` the dispatch sent |
-| `outbox` | pending side effects (`promote`, `comment`, `close_pr`, `labels`, `retain_ref`) with an idempotency key, attempt count, history and next attempt time |
+| `outbox` | pending side effects (`promote`, `comment`, `close_pr`, `labels`, `retain_ref`, `notify`) with an idempotency key, attempt count, history and next attempt time |
+| `failures` | one row per failed head CI attempt: its fingerprint, the members it names, its finding lines and what the controller did (`repair`, `withdraw`, `bisect`, `hold`); see [escalation.md](escalation.md) |
 | `journal` | append-only log of what the controller did (`approved`, `inserted`, `sealed`, `rebased`, `dispatched`, `ci-pass`, `task`, `claimed`, `adopted`, `landed`, ...) for status and tests |
 
 Retained refs in the clone and, when publication is enabled, on GitHub through the outbox:
@@ -57,7 +58,9 @@ dispatch pushes the head's batch ref itself only when the outbox has not already
 Inputs: `waiting` -> `reserved` (during a probe) -> `inserted` (a member) -> `landed`; or
 `cancelled` with a reason (`unapproved`, `cancelled`, `closed`, `head-changed`, `draft`,
 `merged-externally`, `landed-externally`, `conflicts-with-main`, `superseded-by-new-approval`,
-`problem-anticipated`, `empty-commit`). An ordinary member an adopted repair reduces to an empty commit
+`problem-anticipated`, `empty-commit`, `queue-withdrawn`). A head failure that repair does not
+resolve is escalated (withdrawal of the members it names, bisection, or a hold with an alert and a
+Zulip direct message): [`escalation.md`](escalation.md). An ordinary member an adopted repair reduces to an empty commit
 is withdrawn at adoption with reason `empty-commit` (`_withdraw_member`; see
 [`reject-empty-commits.md`](reject-empty-commits.md)).
 A member is never withdrawn by its author or reviewers: `unapprove`, `cancel`, a closing or
