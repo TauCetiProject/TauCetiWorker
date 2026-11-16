@@ -4,6 +4,7 @@
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -19,7 +20,7 @@ from tauceti_tools.forge import GITHUB, Forge, RepositoryRef
 from tauceti_worker.config import Config, Die
 from tauceti_worker.multi_source import collect, deduplicate
 from tauceti_worker.review_state import Meta
-from tauceti_worker.source_cli import api_command
+from tauceti_worker.source_cli import api_command, checkout
 from tauceti_worker.source_execution import still_actionable
 from tauceti_worker.source_identity import SourceActor
 from tauceti_worker.source_survey import worker_survey
@@ -52,6 +53,50 @@ class Sources(unittest.TestCase):
             self.root / "logs",
             self.root / "quota",
         )
+
+    def checkout_fixture(self):
+        def git(*args, cwd):
+            return subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@example.org", *args],
+                cwd=cwd,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        remote = self.root / "remote"
+        remote.mkdir()
+        git("init", "-q", "-b", "main", cwd=remote)
+        git("commit", "-q", "--allow-empty", "-m", "base", cwd=remote)
+        git("checkout", "-q", "-b", "patch-1", cwd=remote)
+        git("commit", "-q", "--allow-empty", "-m", "proposal", cwd=remote)
+        sha = git("rev-parse", "HEAD", cwd=remote)
+        local = self.root / "local"
+        git("clone", "-q", str(remote), str(local), cwd=self.root)
+        self.source.api.pull.return_value = {
+            "head": {"sha": sha, "ref": "patch-1", "repo": {"full_name": "one/project"}}
+        }
+        return remote, local, sha, git
+
+    def test_pr_checkout_accepts_the_worker_branch_that_round_worktrees_pass(self):
+        from tauceti_worker.round_worktrees import local_branch
+
+        remote, local, sha, git = self.checkout_fixture()
+        branch = local_branch(self.cfg, 9)
+        cwd = os.getcwd()
+        os.chdir(local)
+        self.addCleanup(os.chdir, cwd)
+        with patch("tauceti_tools.forge.RepositoryRef", return_value=Mock(clone_url=str(remote))):
+            # The same argument shape as the fix/rebase checkout in work_units.
+            self.assertEqual(checkout(["9", "--force", "--branch", branch], self.source), 0)
+        self.assertEqual(git("rev-parse", "--abbrev-ref", "HEAD", cwd=local), branch)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=local), sha)
+        self.assertEqual(git("config", f"branch.{branch}.merge", cwd=local), "refs/heads/patch-1")
+        self.assertEqual(git("config", f"branch.{branch}.remote", cwd=local), str(remote))
+        # Without --branch the local branch keeps the PR's own name, as gh does.
+        with patch("tauceti_tools.forge.RepositoryRef", return_value=Mock(clone_url=str(remote))):
+            self.assertEqual(checkout(["9", "--force"], self.source), 0)
+        self.assertEqual(git("rev-parse", "--abbrev-ref", "HEAD", cwd=local), "patch-1")
 
     def row(self, number=1, *, author=3, login="worker", head="a" * 40):
         return {
