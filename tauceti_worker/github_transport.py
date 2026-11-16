@@ -1111,15 +1111,20 @@ def _install_proxy(*, bindir=None):
         if not real:
             return
         os.environ["TAUCETI_REAL_GH"] = real
-    # A stable directory survives HOME isolation and uvx's interpreter changes.
-    bindir = bindir or root() / "bin"
-    bindir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    proxy = bindir / "gh"
     import shlex
 
     content = (
         f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} --proxy "$@"\n'
     )
+    # A stable directory survives HOME isolation and uvx's interpreter changes.
+    # Each runtime gets its own launcher: during a live rollout several runtimes
+    # run side by side, and a shared launcher would let one runtime's rounds
+    # execute another runtime's gh routing code.
+    if bindir is None:
+        (root() / "bin").mkdir(parents=True, exist_ok=True, mode=0o700)
+        bindir = root() / "bin" / hashlib.sha256(content.encode()).hexdigest()[:16]
+    bindir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    proxy = bindir / "gh"
     if not proxy.exists() or proxy.read_text() != content:
         atomic_script = proxy.with_name("gh." + uuid.uuid4().hex)
         atomic_script.write_text(content)
