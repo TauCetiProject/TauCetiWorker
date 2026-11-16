@@ -313,6 +313,7 @@ def shared_read(
         except (OSError, ValueError, KeyError, TypeError):
             pass
         retry_unlocked = False
+        refetched = False
         if coalesce_failures:
             try:
                 previous = json.loads(attempt.read_text())
@@ -328,7 +329,8 @@ def shared_read(
                         return None
                     # A successful read invalidated by an overlapping write
                     # needs one new leader, not one full read per waiter.
-                    retry_unlocked = previous["outcome"] != "invalidated"
+                    refetched = previous["outcome"] == "invalidated"
+                    retry_unlocked = not refetched
             except (OSError, ValueError, KeyError, TypeError):
                 pass
             if not retry_unlocked:
@@ -356,15 +358,22 @@ def shared_read(
                     with contextlib.suppress(OSError):
                         attempt.unlink(missing_ok=True)
                 else:
-                    finished("unavailable" if value is None else "retry" if generation_current else "invalidated")
+                    # At most one replacement fetch per waiting cohort. A
+                    # second overlapping write leaves no shareable inventory;
+                    # later callers can try again without a parallel stampede.
+                    outcome = (
+                        "unavailable"
+                        if value is None or refetched and not generation_current
+                        else ("retry" if generation_current else "invalidated")
+                    )
+                    finished(outcome)
                 return value
             except BaseException:
                 finished("retry")
                 raise
     finally:
         cm.__exit__(None, None, None)
-    # An overlapping write or a failed publication must not make each waiter
-    # hold the lock for another complete slow fetch.
+    # Exceptions or broken cache storage must not serialize every full fetch.
     return fetch()
 
 

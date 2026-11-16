@@ -233,7 +233,7 @@ def shared_discovery_child(directory, start=None, outcome="success", fallback=No
             f.write("network\n")
         if outcome == "legacy-invalidate" and ordinal == 1:
             transport.invalidate()
-        if outcome == "invalidate" and ordinal == 1:
+        if outcome == "repeated-invalidate" or outcome == "invalidate" and ordinal == 1:
             transport.invalidate_shared(discovery_scope(source))
         if outcome == "exception":
             if ordinal == 1:
@@ -293,7 +293,10 @@ def shared_discovery_child(directory, start=None, outcome="success", fallback=No
         except OSError:
             assert outcome == "exception"
         else:
-            assert value == (None if outcome in {"unavailable", "legacy-unavailable"} else [dict(number=1)])
+            if outcome == "repeated-invalidate":
+                assert value is None or value == [dict(number=1)]
+            else:
+                assert value == (None if outcome in {"unavailable", "legacy-unavailable"} else [dict(number=1)])
 
 
 class SharedDiscovery(unittest.TestCase):
@@ -419,6 +422,12 @@ class SharedDiscovery(unittest.TestCase):
 
     def test_generation_change_refetches_once_then_shares_under_lock(self):
         self.assertEqual(self.concurrent("invalidate"), ["network"] * 2)
+
+    def test_repeated_invalidation_bounds_cohort_to_two_fetches(self):
+        self.assertEqual(self.concurrent("repeated-invalidate"), ["network"] * 2)
+        # Rejected inventories never poison subsequent requests.
+        self.assertEqual(self.read(), [dict(number=1)])
+        self.assertEqual(self.source.open_prs.call_count, 1)
 
     def test_fetch_exception_retries_waiters_outside_the_lock(self):
         self.assertEqual(self.concurrent("exception"), ["network"] * 4)

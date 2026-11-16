@@ -1484,7 +1484,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
 
     select(stage)
     report_runtime("running", phase=stage, target=what, detail=detail, next_action_at=None)
-    claimed_baseline = stage == "fix" or bubble and c.pr and stage in FILE_CHANGE_STAGES
+    claimed_baseline = stage in {"fix", "rebase"} or bubble and c.pr and stage in FILE_CHANGE_STAGES
     pre = _progress_snapshot(w, c) if stage in PROGRESS_GUARDED and not claimed_baseline else None
     c.progress = pre
     if pre is not None:
