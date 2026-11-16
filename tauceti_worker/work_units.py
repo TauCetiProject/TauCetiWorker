@@ -2142,9 +2142,9 @@ def _do_fixlike(
 
         # Worktrees share branches: a PR's branch name (often `patch-1`) must be this worker's own.
         unique = ["--branch", local_branch(w.cfg, pr)] if worktree_rounds() else []
-        chk = subprocess.run(
-            ["gh", "pr", "checkout", str(pr), "--force", *unique], cwd=str(co), capture_output=True, text=True
-        )
+        # In-process routing: a Forgejo round reaches its own runtime's shim, never
+        # whichever gh happens to be first on PATH.
+        chk = gh_run(["gh", "pr", "checkout", str(pr), "--force", *unique], cwd=co)
         if chk.returncode:
             detail = ((chk.stderr or "") + (chk.stdout or "")).strip()[-200:]
             log(f"  {label} #{pr}: gh pr checkout failed — skipping this attempt ({detail})")

@@ -131,7 +131,9 @@ with tempfile.TemporaryDirectory() as tmp:
         compact[1]["pr"]["statusCheckRollup"].pop()
         with patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)):
             ordinary = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review"])
-        assert 2 in [c.pr for c in ordinary.reviewable.actionable], "persistent label must schedule review without a receipt"
+        assert 2 in [c.pr for c in ordinary.reviewable.actionable], (
+            "persistent label must schedule review without a receipt"
+        )
         compact[1]["pr"]["labels"].pop()
         compact[1]["pr"]["statusCheckRollup"] = old_rollup
         compact[0]["review"]["contest"] = {"id": 101, "rubric": "reuse", "created_at": "now"}

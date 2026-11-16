@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -20,7 +21,7 @@ from tauceti_tools.forge import GITHUB, Forge, RepositoryRef
 from tauceti_worker.config import Config, Die
 from tauceti_worker.multi_source import collect, deduplicate
 from tauceti_worker.review_state import Meta
-from tauceti_worker.source_cli import api_command
+from tauceti_worker.source_cli import api_command, checkout
 from tauceti_worker.source_execution import still_actionable
 from tauceti_worker.source_identity import SourceActor
 from tauceti_worker.source_survey import worker_survey
@@ -106,6 +107,50 @@ class Sources(unittest.TestCase):
             self.root / "quota",
         )
 
+    def checkout_fixture(self):
+        def git(*args, cwd):
+            return subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@example.org", *args],
+                cwd=cwd,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        remote = self.root / "remote"
+        remote.mkdir()
+        git("init", "-q", "-b", "main", cwd=remote)
+        git("commit", "-q", "--allow-empty", "-m", "base", cwd=remote)
+        git("checkout", "-q", "-b", "patch-1", cwd=remote)
+        git("commit", "-q", "--allow-empty", "-m", "proposal", cwd=remote)
+        sha = git("rev-parse", "HEAD", cwd=remote)
+        local = self.root / "local"
+        git("clone", "-q", str(remote), str(local), cwd=self.root)
+        self.source.api.pull.return_value = {
+            "head": {"sha": sha, "ref": "patch-1", "repo": {"full_name": "one/project"}}
+        }
+        return remote, local, sha, git
+
+    def test_pr_checkout_accepts_the_worker_branch_that_round_worktrees_pass(self):
+        from tauceti_worker.round_worktrees import local_branch
+
+        remote, local, sha, git = self.checkout_fixture()
+        branch = local_branch(self.cfg, 9)
+        cwd = os.getcwd()
+        os.chdir(local)
+        self.addCleanup(os.chdir, cwd)
+        with patch("tauceti_tools.forge.RepositoryRef", return_value=Mock(clone_url=str(remote))):
+            # The same argument shape as the fix/rebase checkout in work_units.
+            self.assertEqual(checkout(["9", "--force", "--branch", branch], self.source), 0)
+        self.assertEqual(git("rev-parse", "--abbrev-ref", "HEAD", cwd=local), branch)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=local), sha)
+        self.assertEqual(git("config", f"branch.{branch}.merge", cwd=local), "refs/heads/patch-1")
+        self.assertEqual(git("config", f"branch.{branch}.remote", cwd=local), str(remote))
+        # Without --branch the local branch keeps the PR's own name, as gh does.
+        with patch("tauceti_tools.forge.RepositoryRef", return_value=Mock(clone_url=str(remote))):
+            self.assertEqual(checkout(["9", "--force"], self.source), 0)
+        self.assertEqual(git("rev-parse", "--abbrev-ref", "HEAD", cwd=local), "patch-1")
+
     def row(self, number=1, *, author=3, login="worker", head="a" * 40):
         return {
             "number": number,
@@ -162,6 +207,36 @@ class Sources(unittest.TestCase):
             rejected = self.native_survey([self.row(2)])
             self.assertTrue(rejected.github_failed)
             self.assertEqual(rejected.dependency_wait["operation"], "binding")
+
+    def test_bound_round_gh_runs_this_runtimes_shim_in_the_round_checkout(self):
+        from tauceti_worker import github, worker_sources
+
+        checkout = self.root / "checkout"
+        # A PR checkout is untrusted: it must not shadow the runtime's own modules.
+        (checkout / "tauceti_worker").mkdir(parents=True)
+        (checkout / "tauceti_worker" / "__init__.py").write_text("raise SystemExit('shadowed')\n")
+        self.source.token_file = self.root / "token"
+        self.source.identity = self.identity
+        marker = worker_sources._selected.set(self.source)
+        self.addCleanup(worker_sources._selected.reset, marker)
+        with (
+            patch.dict(os.environ, {"PATH": str(self.root / "no-gh-here")}),
+            patch("tauceti_worker.source_cli.subprocess.run") as run,
+        ):
+            github.gh_run(["gh", "pr", "checkout", "9", "--force"], cwd=checkout)
+        argv, kwargs = run.call_args.args[0], run.call_args.kwargs
+        self.assertEqual(argv[0], sys.executable)
+        self.assertEqual(argv[1:4], ["-P", "-m", "tauceti_worker.source_cli"])
+        self.assertEqual(argv[4:], ["pr", "checkout", "9", "--force"])
+        self.assertEqual(kwargs["cwd"], checkout)
+        probe = subprocess.run(
+            [sys.executable, "-P", "-c", "import tauceti_worker; print(tauceti_worker.__file__)"],
+            cwd=checkout,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertNotIn(str(checkout), probe.stdout)
 
     def test_default_sources_and_new_pr_destination(self):
         with patch.dict(os.environ, {}, clear=True):

@@ -14,15 +14,18 @@ from urllib.parse import urlsplit
 from tauceti_tools.forge import ForgeError, Unsupported
 
 
-def execute(args, source):
+def execute(args, source, *, cwd=None):
     env = dict(
         os.environ,
         TAUCETI_SOURCE_BINDING=json.dumps(source.identity.record()),
         TAUCETI_FORGEJO_TOKEN_FILE=str(source.token_file),
         TAUCETI_FORGEJO_ORIGIN=source.repository.forge.url,
     )
+    # -P: the working directory may be an untrusted PR checkout, which must
+    # never shadow this runtime's own modules on sys.path.
     return subprocess.run(
-        [sys.executable, "-m", "tauceti_worker.source_cli", *args],
+        [sys.executable, "-P", "-m", "tauceti_worker.source_cli", *args],
+        cwd=cwd,
         env=env,
         capture_output=True,
         text=True,
@@ -71,6 +74,8 @@ def checkout(args, source):
 
     repository = RepositoryRef(source.repository.forge, head["repo"]["full_name"])
     sha, remote_branch = head["sha"], head["ref"]
+
+    # Round worktrees share one repository, so each worker names its own local branch.
     branch = opts.branch if opts.branch is not None else remote_branch
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise ValueError("PR checkout requires an exact commit")

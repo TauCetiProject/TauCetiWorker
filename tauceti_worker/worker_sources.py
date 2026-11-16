@@ -200,12 +200,12 @@ def activate(source, cfg):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         real_gh = original.get("TAUCETI_REAL_GH") or shutil.which("gh")
         wrapper = directory / "gh"
-        wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' -m tauceti_worker.source_cli "$@"\n')
+        wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' -P -m tauceti_worker.source_cli "$@"\n')
         wrapper.chmod(0o700)
         source.write_cli_configuration(cfg.state / "gh-project.toml")
         claim_wrapper = directory / "claim-source"
         claim_wrapper.write_text(
-            "#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' -m tauceti_worker.source_claims "$@"\n'
+            "#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' -P -m tauceti_worker.source_claims "$@"\n'
         )
         claim_wrapper.chmod(0o700)
         env = scoped_git_environment(source.repository.forge, token_file=source.token_file, purpose="workspace")
