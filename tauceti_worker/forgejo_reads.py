@@ -420,6 +420,10 @@ class ForgejoReadSource:
         if number is not None:
             self.repository.pull_url(number)
         self.cache.invalidate(scope=(self.repository.key, number))
+        if getattr(self, "shared_inventory", False) is True:
+            from .source_identity import advisory_scope
+
+            transport.invalidate_shared(advisory_scope(self, number))
 
     def invalidate_discovery(self):
         if getattr(self, "shared_inventory", False) is True:
@@ -452,14 +456,43 @@ class ForgejoReadSource:
                 return value
 
             key = (self.cache_namespace, operation, json.dumps(args, sort_keys=True), revision)
-            if cacheable:
+            shared = (
+                getattr(self, "shared_inventory", False) is True
+                and transport.advisory_reads()
+                and not (fresh or force)
+                and cacheable
+                and number is not None
+            )
+            if shared:
+                from .source_identity import advisory_policy, advisory_scope
+
+                shared_scope = advisory_scope(self, number)
+                policy = advisory_policy(self)
+                if policy is None:
+                    raise ReadInvalidated("publication policy unavailable for advisory read")
+                global_epoch = transport.shared_generation(advisory_scope(self, None))
+                value = transport.shared_read(
+                    [*shared_scope, operation, args, policy, global_epoch],
+                    bounded_fetch,
+                    ttl=self.ttl,
+                    identity=self.cache_namespace,
+                    lock_timeout=300,
+                    generation_scope=shared_scope,
+                    coalesce_failures=True,
+                )
+                # A cached projection never survives a credential/origin or
+                # publication-policy change in this process.
+                self._bound()
+                if advisory_policy(self) != policy:
+                    raise ReadInvalidated("publication policy changed during advisory read")
+            elif cacheable:
                 value, hit = self.cache.read(
                     key, bounded_fetch, ttl=self.ttl, fresh=fresh or force, scope=(self.repository.key, number)
                 )
             else:
                 value, hit = bounded_fetch(), False
             self._bound()
-            if hit:
+            if not shared and hit:
                 transport.note_cache_hit()
             return value
         except ForgeError as error:

@@ -227,17 +227,20 @@ def worker_survey(cfg, source, rs, counters, *, roadmap, skip, deep, stages, num
             else pr
             for pr in result.open_prs
         ]
-    classify_survey(
-        cfg,
-        source,
-        rs,
-        counters,
-        result,
-        enabled=set(stages) & {"review", "fix", "rebase"},
-        deep=deep,
-        review_without_ci=True,
-        supports_external_repair=False,
-    )
+    from .github_transport import read_context
+
+    with read_context(advisory=True):
+        classify_survey(
+            cfg,
+            source,
+            rs,
+            counters,
+            result,
+            enabled=set(stages) & {"review", "fix", "rebase"},
+            deep=deep,
+            review_without_ci=True,
+            supports_external_repair=False,
+        )
     for stage in ("rebase", "review", "fix", "fix-ci", "bump", "lint-repair"):
         kind = result.kind(stage)
         for candidate in kind.actionable + kind.suppressed:

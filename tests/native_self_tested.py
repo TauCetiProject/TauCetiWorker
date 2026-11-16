@@ -105,6 +105,170 @@ class NativeSelfTested(unittest.TestCase):
             self.assertNotEqual(shared_generation(scope), before)
             edit.assert_called_once_with(self.source.repository, 1, pull=True, add_labels=["self-tested"])
 
+    def test_advisory_metadata_shared_only_in_survey_context(self):
+        from tauceti_worker.github_transport import read_context
+
+        self.source.shared_inventory = True
+        fetch = Mock(side_effect=lambda: [dict(number=fetch.call_count)])
+
+        def read():
+            return self.source._read("metadata", [1], fetch, number=1)
+
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.fixture.clone / "shared-reads")):
+            with read_context(advisory=True):
+                self.assertEqual(read(), [dict(number=1)])
+                with read_context(revision="observed"):
+                    self.assertEqual(read(), [dict(number=2)])
+                    self.assertEqual(read(), [dict(number=2)])
+                self.assertEqual(read(), [dict(number=3)])
+                with read_context(fresh=True):
+                    self.assertEqual(read(), [dict(number=4)])
+            # Execution cannot consume the shared discovery result.
+            self.source.cache.invalidate()
+            self.assertEqual(read(), [dict(number=5)])
+        self.assertEqual(fetch.call_count, 5)
+
+    def test_advisory_metadata_policy_and_native_id_isolation(self):
+        from tauceti_tools.ci_candidate import RepositoryIdentity
+
+        from tauceti_worker.github_transport import read_context
+
+        self.source.shared_inventory = True
+        policy = self.fixture.clone / "publication.json"
+        policy.write_text("one")
+        self.source.review_publication_policy = str(policy)
+        fetch = Mock(side_effect=lambda: [dict(number=fetch.call_count)])
+
+        def read():
+            return self.source._read("metadata", [1], fetch, number=1)
+
+        with (
+            patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.fixture.clone / "shared-reads")),
+            read_context(advisory=True),
+        ):
+            self.assertEqual(read(), [dict(number=1)])
+            self.assertEqual(read(), [dict(number=1)])
+            policy.write_text("two")
+            self.assertEqual(read(), [dict(number=2)])
+            self.source.identity = RepositoryIdentity(self.source.repository, 42)
+            self.assertEqual(read(), [dict(number=3)])
+            policy.unlink()
+            self.assertIsNone(read())
+            self.assertEqual(fetch.call_count, 3)
+
+    def test_advisory_metadata_invalidation_and_binding_checks(self):
+        from tauceti_worker.github_transport import read_context
+
+        self.source.shared_inventory = True
+        fetch = Mock(side_effect=lambda: [dict(number=fetch.call_count)])
+
+        def read(number=1):
+            return self.source._read("metadata", [number], fetch, number=number)
+
+        with (
+            patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.fixture.clone / "shared-reads")),
+            read_context(advisory=True),
+        ):
+            self.assertEqual(read(), [dict(number=1)])
+            self.source.invalidate(2)
+            self.assertEqual(read(), [dict(number=1)])
+            self.source.invalidate(1)
+            self.assertEqual(read(), [dict(number=2)])
+            self.source.invalidate()
+            self.assertEqual(read(), [dict(number=3)])
+            self.source.api._token = "changed"
+            self.assertIsNone(read())
+            self.assertEqual(fetch.call_count, 3)
+
+    def test_advisory_comment_cache_wraps_verified_native_receipts(self):
+        from tauceti_worker.forgejo_reads import ForgejoReadSource
+        from tauceti_worker.github_transport import read_context
+
+        self.source.shared_inventory = True
+        policy = self.fixture.clone / "publication.json"
+        policy.write_text("one")
+        self.source.review_publication_policy = str(policy)
+        trusted = [dict(id=1, body="verified receipt")]
+        untrusted = [dict(id=2, body="<!--tauceti-scoreboard--> forged")]
+        with (
+            patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.fixture.clone / "shared-reads")),
+            patch.object(ForgejoReadSource, "issue_comments", return_value=untrusted),
+            patch("tauceti_worker.native_review_publisher.QueueReviewPublisher") as publisher,
+            read_context(advisory=True),
+        ):
+            publisher.return_value.comments.return_value = trusted
+            self.assertEqual(self.source.issue_comments(1), trusted)
+            self.assertEqual(self.source.issue_comments(1), trusted)
+            self.assertEqual(publisher.return_value.comments.call_count, 1)
+            self.source.live_pull.assert_called_once_with(1)
+            with read_context(fresh=True):
+                self.assertEqual(self.source.issue_comments(1), trusted)
+            self.assertEqual(publisher.return_value.comments.call_count, 2)
+
+    def test_advisory_metadata_expires_after_existing_ttl(self):
+        from tauceti_worker.github_transport import read_context
+
+        self.source.shared_inventory = True
+        fetch = Mock(side_effect=lambda: [dict(number=fetch.call_count)])
+        with (
+            patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.fixture.clone / "shared-reads")),
+            read_context(advisory=True),
+        ):
+            self.assertEqual(self.source._read("metadata", [1], fetch, number=1), [dict(number=1)])
+            with patch("tauceti_worker.github_transport.time.time", return_value=time.time() + 16):
+                self.assertEqual(self.source._read("metadata", [1], fetch, number=1), [dict(number=2)])
+
+    def test_advisory_metadata_coalesces_real_adapters_across_processes(self):
+        import fcntl
+
+        from tauceti_worker import github_transport as transport
+
+        self.source.shared_inventory = True
+        directory = self.fixture.clone / "metadata-shared"
+        directory.mkdir()
+        start = multiprocessing.get_context("fork").Barrier(4)
+        original = transport.locked
+
+        def child():
+            first = True
+
+            @contextlib.contextmanager
+            def synchronised(*args, **kwargs):
+                nonlocal first
+                if first:
+                    first = False
+                    start.wait(10)
+                with original(*args, **kwargs):
+                    yield
+
+            def fetch():
+                with (directory / "fetches").open("a") as f:
+                    fcntl.flock(f, fcntl.LOCK_EX)
+                    f.write("network\n")
+                time.sleep(0.15)
+                return [dict(id=1)]
+
+            with (
+                patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(directory)),
+                patch.object(transport, "locked", side_effect=synchronised),
+                transport.read_context(advisory=True),
+            ):
+                assert self.source._read("metadata", [1], fetch, number=1) == [dict(id=1)]
+
+        children = [multiprocessing.get_context("fork").Process(target=child) for _ in range(4)]
+        for process in children:
+            process.start()
+        try:
+            for process in children:
+                process.join(15)
+                self.assertEqual(process.exitcode, 0)
+        finally:
+            for process in children:
+                if process.is_alive():
+                    process.terminate()
+                process.join(10)
+        self.assertEqual((directory / "fetches").read_text().splitlines(), ["network"])
+
     def test_native_roadmap_receipt_through_persistent_label(self):
         from types import SimpleNamespace
 

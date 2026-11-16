@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 
 _fresh = contextvars.ContextVar("github_fresh", default=False)
 _direct = contextvars.ContextVar("github_direct", default=False)
+_advisory = contextvars.ContextVar("source_advisory", default=False)
 _retry_reads = contextvars.ContextVar("github_retry_reads", default=True)
 _revision = contextvars.ContextVar("github_revision", default="")
 _cache_hit = contextvars.ContextVar("github_cache_hit", default=False)
@@ -76,12 +77,15 @@ def register_principal(user_id: int, login: str, env=None):
 
 
 @contextlib.contextmanager
-def read_context(*, fresh: bool = False, revision: str = "", direct: bool = False, retry: bool = True):
+def read_context(
+    *, fresh: bool = False, revision: str = "", direct: bool = False, retry: bool = True, advisory: bool = False
+):
     a = _fresh.set(_fresh.get() or fresh)
     b = _revision.set(revision or _revision.get())
     c = _cache_hit.set(False)
     d = _direct.set(_direct.get() or direct)
     e = _retry_reads.set(_retry_reads.get() and retry)
+    f = _advisory.set(_advisory.get() or advisory)
     try:
         yield
     finally:
@@ -90,6 +94,11 @@ def read_context(*, fresh: bool = False, revision: str = "", direct: bool = Fals
         _cache_hit.reset(c)
         _direct.reset(d)
         _retry_reads.reset(e)
+        _advisory.reset(f)
+
+
+def advisory_reads():
+    return _advisory.get()
 
 
 def direct_reads():
