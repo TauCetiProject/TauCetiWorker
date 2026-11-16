@@ -231,6 +231,7 @@ class Service:
                     self.config.repository,
                     AdmissionPolicy(
                         rubrics=self.config.admission_rubrics.split(","),
+                        repository=self.config.repository,
                         prefix=root.replace(".", "/") + "/",
                         allow_files=policy.default_allow_files(root)
                         + [s for s in self.config.admission_extra_files.split(",") if s],

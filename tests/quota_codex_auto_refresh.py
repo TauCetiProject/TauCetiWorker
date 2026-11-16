@@ -492,14 +492,13 @@ for name, files, kwargs, want in (
 
 
 # 6k) Codex loads every .codex/config.toml between its working directory and the project root, above
-#     the user layer. The worker launches it from the checkout, the state directory, a fresh progress
-#     writer directory and recovery checkouts, so a store set in any of their ancestors refuses.
+#     the user layer. The worker launches it from the checkout, the state directory and fresh progress
+#     writer and overlap-scan directories, so a store set in any of their ancestors refuses.
 PROJECT_MARKERS = 'cli_auth_credentials_store = "file"\nproject_root_markers = ["outer.marker"]\n'
 for name, files, want in (
     ("an ancestor of the progress writer", {**BOTH, "state/progress/.codex/config.toml": KEYRING}, 0),
     ("the progress-writing directory itself", {**BOTH, "state/progress/writing/.codex/config.toml": KEYRING}, 0),
     ("an ancestor of the state directory", {**BOTH, "state/.codex/config.toml": KEYRING}, 0),
-    ("a recovery checkout", {**BOTH, "state/recovery/r1/checkout/.codex/config.toml": KEYRING}, 0),
     ("the overlap-scan directory", {**BOTH, "state/overlap-runs/.codex/config.toml": KEYRING}, 0),
     (
         "an ancestor of the checkout under configured markers",

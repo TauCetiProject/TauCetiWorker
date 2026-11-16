@@ -2119,9 +2119,9 @@ class Quota:
 
     def _codex_launch_dirs(self) -> list[Path]:
         """Every directory the worker starts Codex from on this host: the checkout (authoring, repair,
-        overlap fixes), the state directory (the model-access probe), recovery checkouts, and the fresh
-        directories made per launch for the progress writer, an overlap scan, a new recovery and the
-        security audit, each represented by a not-yet-existing child of the directory it is made in."""
+        overlap fixes), the state directory (the model-access probe), and the fresh directories made per
+        launch for the progress writer, an overlap scan and the security audit, each represented by a
+        not-yet-existing child of the directory it is made in."""
         dirs = []
         if (checkout := getattr(self.cfg, "checkout", None)) is not None:
             dirs.append(Path(checkout))
@@ -2131,12 +2131,7 @@ class Quota:
                 state,
                 state / "progress/writing/writer-",
                 state / "overlap-runs/run-",
-                state / "recovery/record-/checkout",
             ]
-            try:
-                dirs += [record / "checkout" for record in (state / "recovery").iterdir()]
-            except FileNotFoundError:
-                pass
         dirs.append(Path(tempfile.gettempdir()) / "tauceti-security-review-")
         return dirs
 
@@ -2148,11 +2143,7 @@ class Quota:
         home = codex_dir(self.cfg.home)
         skip = {Path(os.path.abspath(home)), home.resolve()}
         seen: set[Path] = set()
-        try:
-            launch = self._codex_launch_dirs()
-        except OSError as e:
-            return f"project:unreadable:{type(e).__name__}"
-        for directory in launch:
+        for directory in self._codex_launch_dirs():
             for base in {Path(os.path.abspath(directory)), directory.resolve()}:
                 for ancestor in (base, *base.parents):
                     dot = ancestor / ".codex"

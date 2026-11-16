@@ -12,6 +12,7 @@ from .forgejo_reads import ForgejoReadSource
 
 
 class ForgejoWorkerSource(ForgejoReadSource):
+    supports_contest_reactions = False
     worker_capable = True
     supports_review_sandbox = False
 
@@ -25,6 +26,12 @@ class ForgejoWorkerSource(ForgejoReadSource):
         self.token_file = Path(token_file) if token_file else None
         self.anonymous_discovery = token_file is None
         self.repo = self.repository.name
+        self._mergeability_cache = {}
+
+    def resolve_mergeability(self, state, number, head):
+        from .source_mergeability import resolve
+
+        return resolve(self, state, number, head)
 
     def validate_binding(self):
         row = self.api.repository(self.repository)

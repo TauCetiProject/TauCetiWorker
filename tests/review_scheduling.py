@@ -5,6 +5,7 @@ import random
 import sys
 import types
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -49,6 +50,43 @@ check("missing owner fails open", ordered([unknown_owner]), ([6], []))
 check("missing current login disables affinity", ordered([foreign], reviewer=""), ([3], []))
 check("scoreboard publisher is read", tc._scoreboard_reviewer(tc.Meta({"submitted_by": "alice"}, "fresh")), "alice")
 check("malformed publisher fails open", tc._scoreboard_reviewer(tc.Meta({"submitted_by": 7}, "fresh")), "")
+
+# Native scoreboards use the stable, origin-qualified user ID. A display login would
+# defer the publisher's own contests and fail after account renames.
+from tauceti_tools.ci_candidate import RepositoryIdentity
+from tauceti_tools.forge import Forge, RepositoryRef
+from tauceti_tools.review_source import ForgejoReviewSource
+
+from tauceti_worker.github import review_publisher
+from tauceti_worker.source_identity import SourceActor
+
+forge = Forge("forgejo", "https://git.example.org")
+actor = SourceActor.from_native(forge, {"id": 3, "login": "renamed"})
+source = types.SimpleNamespace(authenticated_actor=lambda: actor)
+native_owner = "forgejo:https://git.example.org/users/3"
+repository = RepositoryRef(forge, "one/project")
+api = Mock()
+api.repository.return_value = {"id": 7, "full_name": repository.name}
+api.current_user.return_value = {"id": 3, "login": "renamed"}
+native_owner = ForgejoReviewSource(RepositoryIdentity(repository, 7), api).publisher_key()
+with patch("tauceti_worker.worker_sources.current", return_value=source):
+    reviewer = review_publisher()
+    check("review publisher uses native identity", reviewer, native_owner)
+    check(
+        "native publisher can pick its own contest",
+        ordered([candidate(70, age=10, owner=native_owner)], reviewer),
+        ([70], []),
+    )
+    check(
+        "same ID on another origin is deferred",
+        ordered([candidate(71, age=10, owner="forgejo:https://other.example.org/users/3")], reviewer),
+        ([], [71]),
+    )
+with (
+    patch("tauceti_worker.worker_sources.current", return_value=None),
+    patch("tauceti_worker.github.me", return_value="alice"),
+):
+    check("legacy GitHub publisher remains a login", review_publisher(), "alice")
 
 
 class ContestComments:
