@@ -25,7 +25,6 @@ set -uo pipefail
 # 77 means permission refusal; 78 is stale-head rejection; 79 is server policy;
 # 80 means local infrastructure failed before push.
 # Other failures may have an uncertain remote outcome and must be reconciled.
-[[ "${TAUCETI_RECOVERY_CONTINUATION:-}" != "1" ]] || { echo "git-safe-push: recovery supervisor must reverify and publish" >&2; exit 77; }
 
 REF="${1:-${TAUCETI_PUSH_REF:-}}"
 EXPECT="${TAUCETI_PUSH_EXPECT:-}"

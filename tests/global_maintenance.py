@@ -245,7 +245,6 @@ class GlobalMaintenance(unittest.TestCase):
         sv.open_prs[0] = SimpleNamespace(number=10, author="bot", automatic_bump=True)
         with (
             patch("tauceti_worker.github_outbox.pending_for", return_value=False),
-            patch("tauceti_worker.repair_recovery.pending_for", return_value=False),
             patch.object(work, "_check_stage_read_quota"),
             patch.object(work, "_close_spent_pr") as close,
             patch.object(work, "_effective_authoring_profile", side_effect=RuntimeError("normal model path")),
@@ -645,7 +644,6 @@ class GlobalMaintenance(unittest.TestCase):
         sv.open_prs = [PRInfo.from_json(row(10, "Other")["pr"])]
         with (
             patch("tauceti_worker.github_outbox.pending_for", return_value=False),
-            patch("tauceti_worker.repair_recovery.pending_for", return_value=False),
             patch.object(work, "_host_agent_binary", return_value=None),
             patch.object(work, "resolve_codex_model_access") as entitlement,
             patch("tauceti_worker.fleet_capacity.admission_reason") as admission,

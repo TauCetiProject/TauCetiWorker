@@ -470,6 +470,14 @@ class ForgejoReadSource:
             number=number,
         )
 
+    def refresh_pr_state(self, number, expected, observed=""):
+        """Correct a selected observation using only this bound source."""
+        self.invalidate(number)
+        data = self.pr_view(number, ["headRefOid"], fresh=True)
+        if data is None:
+            return dict(status="unavailable", reason="refresh_unavailable")
+        return dict(status="ok", outcome="refreshed", data=data)
+
     def open_prs(self, *, fresh=False):
         """Complete bounded open inventory, excluding unverified CI observations.
 
