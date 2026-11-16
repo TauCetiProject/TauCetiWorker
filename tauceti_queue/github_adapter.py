@@ -1162,12 +1162,16 @@ class GitHubAdapter:
         local = False
         if requested(pull.labels):
             raw = {
-                "number": number, "state": pull.state, "labels": pull.labels,
-                "base": {"ref": pull.base_ref}, "head": {"sha": pull.head_sha,
-                "ref": pull.head_ref, "repo": {"full_name": pull.head_repo}},
+                "number": number,
+                "state": pull.state,
+                "labels": pull.labels,
+                "base": {"ref": pull.base_ref},
+                "head": {"sha": pull.head_sha, "ref": pull.head_ref, "repo": {"full_name": pull.head_repo}},
                 "user": {"login": pull.author_login},
             }
-            local = eligible(raw, repo, paths=paths, read=lambda path: self.client.get_json(path)[1], member_read=gh_read)
+            local = eligible(
+                raw, repo, paths=paths, read=lambda path: self.client.get_json(path)[1], member_read=gh_read
+            )
         fresh, statuses = self._admission_fence(repo, number, pull, labels_progress=progress.setdefault("labels", {}))
         if (
             fresh.head_sha,
@@ -1194,8 +1198,13 @@ class GitHubAdapter:
             raise GitHubError("PR inputs changed while admission was reading source evidence")
         self._admission_reads.pop((repo, number), None)
         return ports.AdmissionSnapshot(
-            fresh, merge_base, paths, comments, statuses, self._diff_version(pull.base_sha, pull.head_sha),
-            self_tested=local
+            fresh,
+            merge_base,
+            paths,
+            comments,
+            statuses,
+            self._diff_version(pull.base_sha, pull.head_sha),
+            self_tested=local,
         )
 
     def _admission_fence(self, repo, number, pull, *, labels_progress=None):
