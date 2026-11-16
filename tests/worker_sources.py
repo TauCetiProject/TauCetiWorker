@@ -137,6 +137,36 @@ class Sources(unittest.TestCase):
             count_all_roadmaps=True,
         )
 
+    def test_bound_round_gh_runs_this_runtimes_shim_in_the_round_checkout(self):
+        from tauceti_worker import github, worker_sources
+
+        checkout = self.root / "checkout"
+        # A PR checkout is untrusted: it must not shadow the runtime's own modules.
+        (checkout / "tauceti_worker").mkdir(parents=True)
+        (checkout / "tauceti_worker" / "__init__.py").write_text("raise SystemExit('shadowed')\n")
+        self.source.token_file = self.root / "token"
+        self.source.identity = self.identity
+        marker = worker_sources._selected.set(self.source)
+        self.addCleanup(worker_sources._selected.reset, marker)
+        with (
+            patch.dict(os.environ, {"PATH": str(self.root / "no-gh-here")}),
+            patch("tauceti_worker.source_cli.subprocess.run") as run,
+        ):
+            github.gh_run(["gh", "pr", "checkout", "9", "--force"], cwd=checkout)
+        argv, kwargs = run.call_args.args[0], run.call_args.kwargs
+        self.assertEqual(argv[0], sys.executable)
+        self.assertEqual(argv[1:4], ["-P", "-m", "tauceti_worker.source_cli"])
+        self.assertEqual(argv[4:], ["pr", "checkout", "9", "--force"])
+        self.assertEqual(kwargs["cwd"], checkout)
+        probe = subprocess.run(
+            [sys.executable, "-P", "-c", "import tauceti_worker; print(tauceti_worker.__file__)"],
+            cwd=checkout,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertNotIn(str(checkout), probe.stdout)
+
     def test_default_sources_and_new_pr_destination(self):
         with patch.dict(os.environ, {}, clear=True):
             configure(SimpleNamespace())
