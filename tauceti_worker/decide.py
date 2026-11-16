@@ -815,41 +815,85 @@ CLOSE = "close"
 CLOSE_ENV = "TAUCETI_DECIDE_CLOSE"
 CLOSES_ENV = "TAUCETI_DECIDE_MAX_CLOSES_PER_DAY"
 CLOSURES = "closures.log"
-_KEYWORD = re.compile(
-    r"\s*(?P<modifiers>(?:(?:private|protected|noncomputable|unsafe|partial|nonrec|scoped|local)\s+)*)"
-    r"(?P<kind>theorem|lemma|def|abbrev|instance|structure|class(?:\s+inductive)?|inductive|opaque|axiom)(?![^\s(])"
-)
+_MODIFIERS = r"(?:(?:private|protected|public|noncomputable|unsafe|partial|nonrec|scoped|local|meta)\s+)*"
+_KINDS = r"theorem|lemma|def|abbrev|instance|structure|class|inductive|opaque|axiom"
+_KEYWORD = re.compile(rf"\s*(?P<modifiers>{_MODIFIERS})(?P<kind>class\s+inductive|{_KINDS})(?![^\s(])")
+# A declaration keyword standing as a token; `.`, `_`, `'`, `?`, `!` continue a name.
+_KEYWORD_TOKEN = re.compile(rf"(?<![\w.'?!»])(?:{_KINDS})(?![\w'?!])")
+# Commands that may lead a declaration on its own line: `set_option … in theorem foo`.
+_PREFIX = re.compile(r"\s*(?:(?:set_option|open|variable|include|omit)\b[^\n]*?\bin\s+)*")
 _NAME = re.compile(r"(?:«[^»]*»|[^\s:(\[{⦃⟨⟪|,«])+")
 _PRIORITY = re.compile(r"\(\s*priority\s*:=")
+_OPEN, _CLOSE = "([{", ")]}"
+
+
+def _skip_quoted(line: str, j: int) -> int:
+    """The index past the `«…»` name at `line[j]`. Raises `_Unsure` when it does not end."""
+    end = line.find("»", j)
+    if end < 0:
+        raise _Unsure
+    return end + 1
 
 
 def _group(line: str, i: int) -> int:
-    """The end of the bracketed group opening at `line[i]`, nested brackets included. Raises
-    `_Unsure` when it does not close on this line."""
-    pairs, stack = {"(": ")", "[": "]", "{": "}"}, []
-    for j in range(i, len(line)):
-        if line[j] in pairs:
-            stack.append(pairs[line[j]])
-        elif stack and line[j] == stack[-1]:
-            stack.pop()
+    """The end of the bracketed group opening at `line[i]`, nested brackets included and `«…»`
+    names skipped. Raises `_Unsure` when it does not close in `line`."""
+    stack, j = [], i
+    while j < len(line):
+        c = line[j]
+        if c == "«":
+            j = _skip_quoted(line, j)
+            continue
+        if c in _OPEN:
+            stack.append(_CLOSE[_OPEN.index(c)])
+        elif c in _CLOSE:
+            if not stack or c != stack.pop():
+                raise _Unsure
             if not stack:
                 return j + 1
-        elif line[j] in ")]}":
-            raise _Unsure
+        j += 1
     raise _Unsure
 
 
+def _depth(line: str) -> tuple[int, int]:
+    """(the bracket depth `line` ends at, the lowest it reaches), from 0 at its start."""
+    depth = low = j = 0
+    while j < len(line):
+        c = line[j]
+        if c == "«":
+            j = _skip_quoted(line, j)
+            continue
+        depth += (c in _OPEN) - (c in _CLOSE)
+        low, j = min(low, depth), j + 1
+    return depth, low
+
+
+def _keyword_outside_groups(line: str) -> bool:
+    """Whether a declaration keyword stands as a token in `line` outside the brackets it opens."""
+    depth, j = 0, 0
+    while j < len(line):
+        c = line[j]
+        if c == "«":
+            j = _skip_quoted(line, j)
+            continue
+        if depth <= 0 and _KEYWORD_TOKEN.match(line, j) and not (j and (_ident(line[j - 1]) or line[j - 1] in ".»")):
+            return True
+        depth += (c in _OPEN) - (c in _CLOSE)
+        j += 1
+    return False
+
+
 def _declared(line: str) -> tuple[str, str] | None:
-    """(modifiers, name) of the declaration a lexed line opens, or None when it opens none or an
-    anonymous instance. Raises `_Unsure` when the header (attributes, priority clause, name) does
-    not end on the line, since the line alone cannot then say what is declared."""
-    i = len(line) - len(line.lstrip())
+    """(modifiers, name) of the declaration a lexed header opens, or None for an anonymous
+    instance. `line` holds a declaration keyword; raises `_Unsure` unless it reads as a complete
+    header (commands ending in `in`, attributes, modifiers, keyword, priority clause, name)."""
+    i = _PREFIX.match(line).end()
     while line.startswith("@[", i):
         i = _group(line, i + 1)
         i += len(line[i:]) - len(line[i:].lstrip())
     head = _KEYWORD.match(line, i)
     if not head:
-        return None
+        raise _Unsure
     rest = line[head.end() :].lstrip()
     if rest.startswith("("):
         end = _group(rest, 0)
@@ -860,6 +904,18 @@ def _declared(line: str) -> tuple[str, str] | None:
         raise _Unsure
     name = _NAME.match(rest)
     return (head.group("modifiers"), name.group()) if name else None
+
+
+def _lean_path(header: str) -> bool:
+    """Whether a `+++` header names a `.lean` file; Git's C-style quoted paths are decoded.
+    Raises `_Unsure` for a quoted path that does not decode."""
+    path = header[4:].rstrip()
+    if path.startswith('"'):
+        try:
+            path = path[1:-1].encode("latin-1").decode("unicode_escape").encode("latin-1").decode("utf-8")
+        except (UnicodeError, ValueError):
+            raise _Unsure from None
+    return path.endswith(".lean")
 
 
 def close_enabled() -> bool:
@@ -989,7 +1045,7 @@ def _added(diff: str, private: bool) -> set[str]:
     lean = False
     for line in diff.splitlines():
         if line.startswith("+++ "):
-            lean = line.rstrip().endswith(".lean")
+            lean = _lean_path(line)
             hunks.append([])
         elif line.startswith("@@"):
             hunks.append([])
@@ -1002,21 +1058,42 @@ def _added(diff: str, private: bool) -> set[str]:
             code, unopened = _code(text, depth=1)
             if unopened:
                 raise _Unsure
-        for (added, _), line in zip(hunk, code, strict=True):
-            found = _declared(line) if added else None
-            if found and (private or "private" not in found[0].split()):
-                names.add(found[1])
+        names |= _hunk_names(hunk, code, private)
+    return names
+
+
+def _hunk_names(hunk: list[tuple[bool, str]], code: list[str], private: bool) -> set[str]:
+    """The declarations an added line of one hunk names. Every added line holding a declaration
+    keyword must read as a header, its attribute list possibly opened on earlier lines of the
+    hunk, at the hunk's outermost bracket depth; otherwise the hunk is `_Unsure`."""
+    starts, depth, low = [], 0, 0
+    for line in code:
+        starts.append(depth)
+        end, lowest = _depth(line)
+        low, depth = min(low, depth + lowest), depth + end
+    names: set[str] = set()
+    for k, ((added, _), line) in enumerate(zip(hunk, code, strict=True)):
+        if not added or not _keyword_outside_groups(line):
+            continue
+        first = k
+        # An attribute list opened on an earlier line: read the header from that line.
+        while starts[first] > low and first and code[first - 1].strip():
+            first -= 1
+        if starts[first] > low or (first < k and not code[first].lstrip().startswith("@[")):
+            raise _Unsure
+        found = _declared(" ".join(code[first : k + 1]))
+        if found and (private or "private" not in found[0].split()):
+            names.add(found[1])
     return names
 
 
 def added_declarations(diff: str, *, private: bool = False) -> set[str] | None:
     """The names, as written, of the declarations a unified diff adds to `.lean` files, outside
-    comments and literals; None where a hunk cannot be read with certainty (a literal, comment or
-    interpolation that does not end within it). Each hunk's added and unchanged lines are read
-    together, so a comment opened on an unchanged line covers the added lines inside it, and a hunk
-    that closes a comment it did not open is read as starting inside one. A hunk lying wholly inside
-    a comment opened above it cannot be told from code by the diff alone. `private` ones are left
-    out unless asked for."""
+    comments, literals and syntax quotations; None where a hunk cannot be read with certainty. Each
+    hunk's added and unchanged lines are read together, and every added line holding a declaration
+    keyword must read as a complete header at the hunk's outer bracket level, else the hunk is
+    unreadable. A hunk lying wholly inside a comment or quotation opened and closed outside it cannot
+    be told from code by the diff alone. `private` ones are left out unless asked for."""
     try:
         return _added(diff, private)
     except _Unsure:

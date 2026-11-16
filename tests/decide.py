@@ -1297,6 +1297,12 @@ def test_close(tmp):
             "an attribute list closed on the next line",
             "+@[simp,\n+  norm_cast] theorem missingFact : True := trivial\n",
             "",
+            (False, "#41 do not add `missingFact`"),
+        ),
+        (
+            "an attribute list that does not close before the declaration",
+            "+@[simp,\n+theorem missingFact : True := trivial\n",
+            "",
             unsure,
         ),
         (
@@ -1316,6 +1322,63 @@ def test_close(tmp):
             f"{kind}: the instance is read or the closure refused",
             attempt(Hub(p1={"diff": base + candidate}, p41={"state": "MERGED", "diff": base + replacement}))[:2],
             want,
+        )
+
+    def covers(candidate, replacement=""):
+        hub = Hub(p1={"diff": base + candidate}, p41={"state": "MERGED", "diff": base + replacement})
+        return attempt(hub, TAUCETI_DECIDE_MAX_CLOSES_PER_DAY="999")[:2]
+
+    missing = (False, "#41 do not add `missingFact`")
+    for kind, name in (("a quoted name holding `]`", "«doc]source»"), ("a plain quoted name", "«doc_source»")):
+        check(
+            f"an attribute naming {kind} is read whole before its declaration",
+            covers(
+                f"+theorem {name} : True := trivial\n+@[inherit_doc {name}] theorem missingFact : True := trivial\n",
+                f"+theorem {name} : True := trivial\n",
+            ),
+            missing,
+        )
+    for kind, path in (("a quoted non-ASCII path", '"b/Caf\\303\\251.lean"'), ("a plain path", "b/Cafe.lean")):
+        check(
+            f"a Lean file under {kind} is read",
+            covers(f"+++ {path}\n@@ -0,0 +1 @@\n+theorem missingFact : True := trivial\n"),
+            missing,
+        )
+    check(
+        "a path whose quoting cannot be decoded refuses the closure",
+        covers('+++ "b/Caf\\303.lean"\n@@ -0,0 +1 @@\n+theorem missingFact : True := trivial\n'),
+        unsure,
+    )
+    check(
+        "public and meta declarations are read",
+        covers("+public theorem missingFact : True := trivial\n+meta def missingValue : Nat := 1\n"),
+        (False, "#41 do not add `missingFact`, `missingValue`"),
+    )
+    check(
+        "a declaration keyword the header reader cannot place refuses the closure",
+        covers("+deriving instance Repr for Foo\n+open Foo in theorem missingFact : True := trivial\n"),
+        unsure,
+    )
+    check(
+        "a declaration closing a group opened above its hunk refuses the closure",
+        covers(
+            "+theorem missingFact : True := trivial\n",
+            "+++ b/T.lean\n@@ -11,4 +12,4 @@\n     -- a template\n     -- of syntax\n     -- data\n"
+            "-    theorem placeholder : True := trivial)\n+    theorem missingFact : True := trivial)\n",
+        ),
+        unsure,
+    )
+    for kind, header in (
+        (
+            "an attribute opened on an unchanged line",
+            " @[inherit_doc docSource\n-  ] theorem oldFact : True := trivial\n+  ] theorem missingFact : True := trivial\n",
+        ),
+        ("an attribute on the same line", "+@[inherit_doc docSource] theorem missingFact : True := trivial\n"),
+    ):
+        check(
+            f"a declaration after {kind} is read",
+            covers("+++ b/H.lean\n@@ -1,2 +1,2 @@\n" + header),
+            missing,
         )
     real = "+theorem missingFact : True := trivial\n"
     for layout, quotation in (

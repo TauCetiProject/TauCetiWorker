@@ -247,20 +247,19 @@ all of these hold at the moment of closing:
   again with the pull request just before closing.
 - Every non-private declaration the pull request's diff adds to a `.lean` file
   (`theorem`, `lemma`, `def`, `abbrev`, `instance`, `structure`, `class`,
-  `inductive`, `opaque`, `axiom`, an instance's name after any priority clause,
-  outside comments, syntax quotations (`` `(…) ``) and string, raw-string,
-  interpolated-string and character literals, compared by name as written) is also added by the diff of one of
-  those merged pull requests. A pull request that adds no named declaration
-  cannot be closed this way. Each diff is read with `gh pr diff`, on Forgejo
-  through the source's command layer, which returns the pull request's own diff
-  from its recorded merge base, merged or not. Comments are read per diff hunk,
-  so an added line in a hunk that lies wholly inside a comment opened outside
-  it, closer included, still counts as a declaration. A hunk in which a
-  comment, literal, `«…»` name or interpolation does not end, a plain string
-  holds an unmatched `{`, a `«…»` name spans lines, or a declaration's header
-  (its attribute list, an instance's priority clause and its name, with nested
-  brackets) does not end on its keyword's line cannot be read with certainty and
-  refuses the closure.
+  `inductive`, `opaque`, `axiom`, compared by name as written) is also added by
+  the diff of one of those merged pull requests. A pull request that adds no
+  named declaration cannot be closed this way. Each diff is read with `gh pr
+  diff`, on Forgejo through the source's command layer, which returns the pull
+  request's own diff from its recorded merge base, merged or not.
+
+  Each diff hunk is read as Lean source, its unchanged lines included:
+  comments, literals and syntax quotations are not code, and every added line
+  holding a declaration keyword must read as a complete declaration header at
+  the hunk's outer level. A hunk that cannot be read that way, because a token,
+  bracket or header does not end within it or a keyword stands where no header
+  begins, refuses the closure. The one case the diff cannot show is a hunk lying
+  wholly inside a comment or quotation that opens and closes outside it.
 
 A closure that does not complete when it is sent is not kept in the publication
 outbox for a later replay, which would skip these checks and the claim; the
