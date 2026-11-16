@@ -271,7 +271,7 @@ Deviations from the plan:
 - Rebase rounds, and repair rounds whose pin is refused, prepare current `main`'s
   Mathlib, and the agent's `lake` refuses to run until it has integrated `main`. Bump
   rounds record the next Mathlib so it is allowed and not evicted first.
-- Per-round worktrees are enabled per host with `TAUCETI_ROUND_WORKTREES=1`.
+- Per-round worktrees are on by default; a host opts out with `TAUCETI_ROUND_WORKTREES=0`.
 
 Follow-ups:
 

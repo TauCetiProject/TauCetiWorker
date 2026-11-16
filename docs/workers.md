@@ -111,8 +111,8 @@ Forgejo does not currently run an individual Actions build for each PR. Reviews
 still run, and every mixed merge-queue candidate requires its full CI build and
 audits before landing, including self-tested members. Source statuses cannot
 replace that candidate CI. For live deployments, preserve every per-worker
-`env` entry, including `TAUCETI_ROUND_WORKTREES=1`; the verification helper can
-also be enabled in the worker manager's service environment.
+`env` entry, including any `TAUCETI_ROUND_WORKTREES=0` opt-out; the verification
+helper can also be enabled in the worker manager's service environment.
 
 ## Dependency bumps
 
@@ -417,8 +417,8 @@ The pool defaults to `~/.cache/tauceti/builds` under the login user's home. Conf
 cache overrides are preserved. Only directories carrying a valid TauCeti ownership record
 are collected; an arbitrary nonempty directory is never adopted or deleted.
 
-`TAUCETI_ROUND_WORKTREES=1` (off by default; set it in a host's `workers.toml` `env` table)
-makes every round work in its own linked worktree of one bare host clone,
+Every round works in its own linked worktree (a host opts out with `TAUCETI_ROUND_WORKTREES=0` in
+its `workers.toml` `env` table) of one bare host clone,
 `<state>/host-repositories/TauCeti.git` (override with `TAUCETI_HOST_REPOSITORIES`). The worktree
 sits at the worker's usual checkout path, detached at `origin/main`; the host clone is fetched at
 most once a minute under `host-repositories/TauCeti.lock`. At round end the worktree is removed
