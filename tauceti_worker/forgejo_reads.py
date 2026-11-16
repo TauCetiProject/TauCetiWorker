@@ -356,6 +356,20 @@ class ForgejoReadSource:
     """
 
     direct_source = True
+    inventory_fields = (
+        "number",
+        "title",
+        "body",
+        "headRefOid",
+        "headRefName",
+        "headRepository",
+        "headRepositoryOwner",
+        "isDraft",
+        "mergeable",
+        "author",
+        "labels",
+        "updatedAt",
+    )
 
     def __init__(self, repository, api, *, cache=None, ttl=15):
         from tauceti_tools.forge import RepositoryRef
@@ -406,6 +420,12 @@ class ForgejoReadSource:
         if number is not None:
             self.repository.pull_url(number)
         self.cache.invalidate(scope=(self.repository.key, number))
+
+    def invalidate_discovery(self):
+        if getattr(self, "shared_inventory", False) is True:
+            from .source_identity import discovery_scope
+
+            transport.invalidate_shared(discovery_scope(self))
 
     def _read(self, operation, args, fetch, *, fresh=False, number=None, cacheable=True):
         from tauceti_tools.forge import ForgeError, Incomplete
@@ -472,6 +492,7 @@ class ForgejoReadSource:
 
     def refresh_pr_state(self, number, expected, observed=""):
         """Correct a selected observation using only this bound source."""
+        self.invalidate_discovery()
         self.invalidate(number)
         data = self.pr_view(number, ["headRefOid"], fresh=True)
         if data is None:
@@ -485,20 +506,7 @@ class ForgejoReadSource:
         needed. Concurrent changes can still move rows between pages; this is a
         short-lived discovery observation, not a source snapshot or merge proof.
         """
-        fields = [
-            "number",
-            "title",
-            "body",
-            "headRefOid",
-            "headRefName",
-            "headRepository",
-            "headRepositoryOwner",
-            "isDraft",
-            "mergeable",
-            "author",
-            "labels",
-            "updatedAt",
-        ]
+        fields = list(self.inventory_fields)
         return self._read("open_prs", [], lambda: self.reader.pulls(self.repository, fields, state="open"), fresh=fresh)
 
     def authenticated_actor(self):

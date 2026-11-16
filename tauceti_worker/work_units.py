@@ -998,7 +998,7 @@ def raise_on_account_mismatch(cfg: Config, account: str | None, work_model: str,
         raise Die(f"{where}: {problem}")
 
 
-def _selected_pr_matches(stage: str, c: Candidate, live) -> bool | None:
+def _selected_pr_matches(stage: str, c: Candidate, live, *, explicit=False) -> bool | None:
     if live is None:
         return None
     if live.get("state") != "OPEN" or live.get("isDraft") or live.get("headRefOid") != c.head:
@@ -1006,13 +1006,18 @@ def _selected_pr_matches(stage: str, c: Candidate, live) -> bool | None:
             f"  {stage} #{c.pr}: selected {c.head[:12]}, current {(live.get('headRefOid') or '')[:12]} — selecting other work"
         )
         return False
+    from .build_resources import queue_owned
+
+    if not explicit and queue_owned(live.get("labels")):
+        log(f"  {stage} #{c.pr}: merge queue owns this PR; skipping ordinary maintenance")
+        return False
     paused = {"hold", "wip", "human", "on-hold"}
     if stage != "review":
         paused |= {"keep", "do-not-close"}
     return not ({str(label.get("name", "")).lower() for label in live.get("labels", [])} & paused)
 
 
-def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool | None:
+def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate, *, explicit=False) -> bool | None:
     from tauceti_tools.forge import GITHUB, RepositoryRef
 
     if not c.pr and stage in ("roadmap",):
@@ -1039,7 +1044,7 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool |
     try:
         # Fix selection must be current; unrelated discovery retains its existing mirror/cache policy.
         with read_context(fresh=True, direct=True, retry=False) if stage == "fix" else contextlib.nullcontext():
-            return _still_actionable_direct(stage, w, sv, c)
+            return _still_actionable_direct(stage, w, sv, c, explicit=explicit)
     except (GitHubError, GitHubUnavailable, OSError):
         if stage != "fix":
             raise
@@ -1047,7 +1052,7 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool |
         return None
 
 
-def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) -> bool | None:
+def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate, *, explicit=False) -> bool | None:
     """Re-read THIS PR's review state live and confirm the candidate the survey chose still stands.
 
     The survey triages on cached comment reads keyed to each PR's `updatedAt` (see
@@ -1091,6 +1096,8 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) ->
                 or live.get("isDraft")
                 or live.get("baseRefName") != os.environ.get("TAUCETI_BASE_BRANCH", "main")
             ):
+                return False
+            if _selected_pr_matches(stage, c, live, explicit=explicit) is not True:
                 return False
             labels = {str(label.get("name", "")).lower() for label in live.get("labels", [])}
             if labels & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}:
@@ -1142,7 +1149,7 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate) ->
         from .state_repair import repair_selected
 
         repair_selected(w, c, live.get("headRefOid") or "")
-    matches = _selected_pr_matches(stage, c, live)
+    matches = _selected_pr_matches(stage, c, live, explicit=explicit)
     if matches is not True:
         return matches if stage == "fix" else False
     if stage == "review" and getattr(c, "partial_history", False):
@@ -1371,19 +1378,16 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         return None
     from .build_resources import queue_owned
 
+    explicit = c.pr in (getattr(opts, "prs", ()) or ())
     selected = next((p for p in getattr(sv, "open_prs", ()) if p.number == c.pr), None) if c.pr else None
-    if (
-        selected is not None
-        and queue_owned(getattr(selected, "labels", ()))
-        and c.pr not in (getattr(opts, "prs", ()) or ())
-    ):
+    if selected is not None and queue_owned(getattr(selected, "labels", ())) and not explicit:
         log(f"{stage} #{c.pr}: merge queue owns this PR; skipping ordinary maintenance")
         return None
     os.environ["TAUCETI_GITHUB_PR"] = str(c.pr or "")
     _check_stage_read_quota(stage)
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
     if stage == "fix" and c.final_resolution and w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS:
-        return _close_spent_pr(w, sv, c)
+        return _close_spent_pr(w, sv, c, explicit=explicit)
     profile = _effective_authoring_profile(opts) if stage != "review" else None
     kiro_probe_profile = profile
     if stage == "review" and opts.work_model == "kiro":
@@ -1421,7 +1425,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         raise_on_account_mismatch(w.cfg, opts.account, opts.work_model, stage)
     # Last free check before the entitlement probe can spend a provider request. Everything above this line is local (a binary on PATH, the
     # configured account), so it stays ahead of a network read that only matters if we get this far.
-    actionable = _still_actionable(stage, w, sv, c)
+    actionable = _still_actionable(stage, w, sv, c, explicit=explicit)
     if actionable is False:
         return None
     from .claude_api import admission_failure
@@ -1974,6 +1978,7 @@ def _do_fixlike(
             w.counters.write(key, max(0, w.counters.read(key) - 1))
         return None
 
+    current_labels = getattr(p, "labels", ())
     if label == "fix" or bubble:
         c.progress = _progress_snapshot(w, c)
         live = None
@@ -1989,12 +1994,14 @@ def _do_fixlike(
                 pass
         # Unknown optional reads keep the checkout/agent path running. Known
         # changes release ownership immediately, before caches or model calls.
-        if _selected_pr_matches(label, c, live) is False:
+        if _selected_pr_matches(label, c, live, explicit=explicit) is False:
             if live and (live.get("headRefOid") != c.head or live.get("state") != "OPEN" or live.get("isDraft")):
                 from .state_repair import repair_selected
 
                 repair_selected(w, c, live.get("headRefOid") or "")
             return decline_repair()
+        if live is not None and isinstance(live.get("labels"), list):
+            current_labels = [str(item.get("name", "")) for item in live["labels"]]
         if bubble and c.progress is not None:
             c.progress["claimed_bubble"] = bool(held)
 
@@ -2011,10 +2018,8 @@ def _do_fixlike(
             for key in charged:
                 w.counters.write(key, max(0, w.counters.read(key) - 1))
             return None
-    # Labels and branch come from the survey; local scope never fetches them (CI's lint-scope.sh does).
-    policy = scope_policy(
-        getattr(p, "labels", ()), p.head_ref, bump=label == "bump" or getattr(p, "automatic_bump", False)
-    )
+    # Prefer the selected PR's live labels; incomplete optional reads retain survey policy.
+    policy = scope_policy(current_labels, p.head_ref, bump=label == "bump" or getattr(p, "automatic_bump", False))
     os.environ["TAUCETI_VERIFY_POLICY"] = policy
     # Shared Mathlib follows the round's purpose: a rebase prepares main's Mathlib, which the
     # branch is about to move to, and a bump may use the next Mathlib it pins.
@@ -2212,7 +2217,7 @@ FINAL_ATTEMPT_INSTRUCTION = (
 )
 
 
-def _close_spent_pr(w, sv, c) -> int | None:
+def _close_spent_pr(w, sv, c, *, explicit=False) -> int | None:
     """Retire an owned, still-blocked head after its existing repair attempts; no model call."""
     from .github_transport import read_context
 
@@ -2229,7 +2234,7 @@ def _close_spent_pr(w, sv, c) -> int | None:
         return None
     try:
         with read_context(fresh=True, direct=True):
-            if not _still_actionable("fix", w, sv, replace(c, partial_history=False)):
+            if not _still_actionable("fix", w, sv, replace(c, partial_history=False), explicit=explicit):
                 return None
             live = w.gh.pr_view(c.pr, ["state", "headRefOid", "author", "labels", "isDraft"])
             if (
@@ -2237,6 +2242,7 @@ def _close_spent_pr(w, sv, c) -> int | None:
                 or live.get("state") != "OPEN"
                 or live.get("headRefOid") != c.head
                 or live.get("isDraft") is not False
+                or _selected_pr_matches("fix", c, live, explicit=explicit) is not True
                 or not owns_author(sv, live.get("author"))
                 or {str(label.get("name", "")).lower() for label in live.get("labels", [])}
                 & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}

@@ -152,3 +152,8 @@ class SourceRepositoryAccess:
             row["archived"],
             row["mirror"],
         )
+
+
+def discovery_scope(source):
+    """One qualified repository incarnation; credentials partition its cache separately."""
+    return ["source_inventory_v1", source.repository.key, source.identity.native_id]

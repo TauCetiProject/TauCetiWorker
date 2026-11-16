@@ -32,6 +32,7 @@ class Sources(unittest.TestCase):
     def test_native_cli_token_loading_does_not_require_host_root_uid_mapping(self):
         from tauceti_queue.control_policy_file import ControlPolicyError
         from tauceti_worker.source_cli import load_source
+        from tauceti_worker.worker_sources import native_source
 
         credential = self.root / "worker-token"
         credential.write_text("private-test-token\n")
@@ -39,6 +40,8 @@ class Sources(unittest.TestCase):
         environment = dict(
             TAUCETI_SOURCE_BINDING=json.dumps(self.identity.record()),
             TAUCETI_FORGEJO_ORIGIN=self.repo.forge.url,
+            TAUCETI_FORGEJO_REPO=self.repo.name,
+            TAUCETI_FORGEJO_REPOSITORY_ID=str(self.identity.native_id),
             TAUCETI_FORGEJO_TOKEN_FILE=str(credential),
             TAUCETI_FORGEJO_USER_ID="3",
         )
@@ -48,6 +51,9 @@ class Sources(unittest.TestCase):
             patch("tauceti_worker.forgejo_worker.ForgejoWorkerSource", return_value=self.source),
             patch("tauceti_tools.forge.Forgejo") as client,
         ):
+            self.assertIs(native_source(self.cfg), self.source)
+            self.assertIs(self.source.shared_inventory, True)
+            client.reset_mock()
             self.assertIs(load_source(), self.source)
             client.assert_called_once_with(self.repo.forge, token="private-test-token")
             self.source.validate_binding.assert_called_once()
@@ -116,7 +122,7 @@ class Sources(unittest.TestCase):
             "updatedAt": "2026-11-11T00:00:00Z",
         }
 
-    def native_survey(self, rows, *, blocking=False, metadata=None):
+    def native_survey(self, rows, *, blocking=False, metadata=None, numbers=()):
         self.source.open_prs.return_value = rows
         rs = Mock()
         if metadata is None and blocking:
@@ -135,9 +141,27 @@ class Sources(unittest.TestCase):
             skip=[],
             deep=True,
             stages=["review", "fix", "rebase"],
-            numbers=(),
+            numbers=numbers,
             count_all_roadmaps=True,
         )
+
+    def test_shared_inventory_surveys_preserve_explicit_targets_and_binding_checks(self):
+        self.source.shared_inventory = True
+        self.source.cache_namespace = "d" * 64
+        self.source.inventory_fields = tuple(self.row())
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.root / "shared-discovery")):
+            first = self.native_survey([self.row()])
+            cached = self.native_survey([self.row(2)])
+            self.assertEqual([p.number for p in first.open_prs], [1])
+            self.assertEqual([p.number for p in cached.open_prs], [1])
+            self.assertEqual(self.source.open_prs.call_count, 1)
+            explicit = self.native_survey([self.row(2)], numbers=(2,))
+            self.assertEqual([p.number for p in explicit.open_prs], [2])
+            self.assertEqual(self.source.open_prs.call_count, 2)
+            self.source.binding_current.return_value = False
+            rejected = self.native_survey([self.row(2)])
+            self.assertTrue(rejected.github_failed)
+            self.assertEqual(rejected.dependency_wait["operation"], "binding")
 
     def test_default_sources_and_new_pr_destination(self):
         with patch.dict(os.environ, {}, clear=True):

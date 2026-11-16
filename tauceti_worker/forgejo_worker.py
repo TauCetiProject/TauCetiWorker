@@ -146,6 +146,7 @@ class ForgejoWorkerSource(ForgejoReadSource):
         self.validate_binding()
         ForgejoWriter(self.api).edit(self.repository, pr, pull=True, add_labels=[name])
         self.invalidate(pr)
+        self.invalidate_discovery()
         return True
 
     def pull_for_head(self, owner, branch):

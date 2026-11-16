@@ -150,11 +150,13 @@ def native_source(cfg):
     from .paths import ensure_ssl_cert_file
 
     ensure_ssl_cert_file()
-    return ForgejoWorkerSource(
+    source = ForgejoWorkerSource(
         RepositoryIdentity(repository, int(raw_id)),
         Forgejo(repository.forge, token=token),
         token_file=Path(path) if path else None,
     )
+    source.shared_inventory = True
+    return source
 
 
 def source_config(cfg, source):

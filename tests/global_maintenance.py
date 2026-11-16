@@ -637,6 +637,28 @@ class GlobalMaintenance(unittest.TestCase):
         ):
             work._do_fixlike(self.w, sv, work.Candidate(10, HEAD), self.opts, False, prompt_file="fix.md", label="fix")
 
+    def test_fix_policy_uses_live_labels_and_retains_survey_on_incomplete_read(self):
+        sv = work.Survey(worker_id="test", me_login="science")
+        p = PRInfo.from_json(row(10, "Other")["pr"])
+        p = work.replace(p, labels=["full-lint"])
+        sv.open_prs = [p]
+        self.w.claims.begin_branch_work = lambda *args: True
+        for live, expected in (
+            (dict(head=HEAD, state="OPEN", isDraft=False, labels=[dict(name="full-lint")]), ["full-lint"]),
+            (dict(head=HEAD, state="OPEN", isDraft=False, labels=[]), []),
+            (None, ["full-lint"]),
+        ):
+            with (
+                patch.object(work, "_progress_snapshot", return_value=live),
+                patch.object(self.w.gh, "pr_view", return_value=None, create=True),
+                patch.object(work, "scope_policy", side_effect=RuntimeError("policy observed")) as policy,
+                self.assertRaisesRegex(RuntimeError, "policy observed"),
+            ):
+                work._do_fixlike(
+                    self.w, sv, work.Candidate(10, HEAD), self.opts, False, prompt_file="fix.md", label="fix"
+                )
+            self.assertEqual(policy.call_args.args[0], expected)
+
     def test_stale_fix_never_reaches_paid_provider_probes(self):
         self.opts.work_model = "claude"
         self.w.gh.pr_view = lambda *_: dict(headRefOid="b" * 40, isDraft=False, state="OPEN", labels=[])
