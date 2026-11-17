@@ -706,6 +706,42 @@ class ServedJudgments(unittest.TestCase):
             advance.assert_called_once()
         self.assertFalse((self.work / "blocked.json").exists())
 
+    def test_haiku_api_key_file_replaces_subscription_credentials_and_is_not_retained(self):
+        key_file = self.work / "anthropic-key"
+        key_file.write_text("sk-ant-fixture-secret\n")
+        key_file.chmod(0o600)
+        value = {"verdict": "pass", "findings": []}
+        attempt = self.work / "attempt-api-key"
+        attempt.mkdir()
+        seen = {}
+
+        def model(argv, **kwargs):
+            seen.update(kwargs["env"])
+            self.assertFalse((kwargs["cwd"] / ".claude/.credentials.json").exists())
+            config = json.loads(argv[argv.index("--mcp-config") + 1])
+            args = config["mcpServers"]["audit"]["args"]
+            r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
+            for page in range(len(r.pages)):
+                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            events = read_events("claude", range(len(r.pages))) + [
+                {"type": "result", "subtype": "success", "structured_output": value}
+            ]
+            return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
+
+        with (
+            patch.dict(sa.os.environ, {sa.API_KEY_FILE_ENV: str(key_file)}),
+            patch.object(sa, "claude_dir", return_value=self.work / "no-subscription"),
+            patch.object(sa, "run_process", side_effect=model),
+        ):
+            self.assertEqual(sa.inspect(self.batch, "claude", attempt), sa.bind_verdict(value, self.batch))
+            key_file.chmod(0o644)
+            with self.assertRaises(Die):
+                sa.anthropic_api_key()
+        self.assertEqual(seen["ANTHROPIC_API_KEY"], "sk-ant-fixture-secret")
+        for path in attempt.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(b"sk-ant-fixture-secret", path.read_bytes(), str(path))
+
     def test_coverage_turns_serving_new_pages_continue_in_one_invocation(self):
         (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture","refresh_token":"fixture"}}')
         calls = 0
