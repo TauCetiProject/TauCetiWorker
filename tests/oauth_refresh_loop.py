@@ -233,6 +233,27 @@ with tempfile.TemporaryDirectory() as temporary:
             oauth.refresh_if_due(provider, 5400, attempt_interval_seconds=600) == "refreshed",
         )
 
+    # The token endpoint sits behind Cloudflare, which answers urllib's default `Python-urllib/3.x`
+    # agent with HTTP 403 (error 1010) before the OAuth server sees the request. Every rotation then
+    # failed and an unattended worker stalled at expiry; the request must name its own client.
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    with patch.object(oauth.urllib.request, "urlopen", return_value=_Response()) as opened:
+        oauth._post_json("https://example.test/claude", {"refresh_token": "secret-token"})
+    agent = opened.call_args.args[0].get_header("User-agent") or ""
+    check("the token request sends an explicit User-Agent", agent == oauth.TOKEN_USER_AGENT)
+    check("the token request does not use urllib's default agent", not agent.startswith("Python-urllib"))
+
     # A truncated or malformed response raises out of http.client, which is NOT under OSError. Left
     # uncaught it would kill the refresher daemon that is supposed to back off, and crash a quota read.
     # Only the exception type is reported: a token endpoint may echo request details into a body.
