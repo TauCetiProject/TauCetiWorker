@@ -213,6 +213,8 @@ class RoundOpts:
     dry_run: bool
     source: str | None = None  # local directory or Git URL used read-only by a single-area roadmap PR
     authoring_profile: AuthoringProfile | None = None
+    # The unresolved default that authoring_profile was resolved from, kept for every later candidate.
+    codex_default_profile: AuthoringProfile | None = None
     # --account: the Codex account this round is REQUIRED to spend under. Checked, never switched to.
     account: str | None = None
     # The two UNDOCUMENTED review throttles (see throttle_review). 0 = off, which is the default and
@@ -1394,7 +1396,6 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     if stage == "review" and opts.work_model == "kiro":
         kiro_probe_profile = resolve_authoring_profile("kiro", cli_model=_kiro_review_model("kiro"))
     needs_codex_probe = bool(profile and profile.provider == "codex" and profile.fallback_model)
-    codex_default = profile if needs_codex_probe else None
     needs_kiro_probe = bool(kiro_probe_profile and kiro_probe_profile.provider == "kiro")
     # Preflight the host agent binary. A host round shells out to `codex`/`claude`/`pi`; if that binary
     # has slipped off the worker's PATH (an npm reinstall relocating codex is the case that bit us), the
@@ -1439,6 +1440,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         # Resolve Sol/Luna before the banner and before opening the authoring checkout. The probe is
         # checkout-independent and the selected profile is then consumed exactly once by either backend.
         opts.authoring_profile = resolve_codex_model_access(w.cfg, profile)
+        opts.codex_default_profile = profile
     if needs_kiro_probe:
         # `--list-models` is authenticated but sends no model prompt. Require
         # the exact pin before entering either backend; Kiro Auto is never a
@@ -1518,6 +1520,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             if not api_mode():
                 raise
             raise admission_failure(str(error)) from None
+        codex_default = getattr(opts, "codex_default_profile", None) if profile else None
         try:
             rc = _run_github_stage(stage, fn, w, sv, c, opts, bubble)
         finally:

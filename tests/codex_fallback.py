@@ -224,5 +224,59 @@ check(
 )
 check("no account fingerprint: reported, not cached", round_outcome(METADATA_MISS, account=False)[2], True)
 
+
+def consecutive_dispatches(*, decline_first):
+    """One run_round's opts across a declined progress candidate and a roadmap round the model rejects."""
+    from unittest.mock import patch
+
+    wu = tc.work_units
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        cfg = make_cfg(root)
+        cfg.wid, cfg.checkout, cfg.logdir = "test", root / "checkout", root / "logs"
+        w = SimpleNamespace(cfg=cfg, counters=SimpleNamespace(read=lambda key: 0, write=lambda *a: None))
+        opts = tc.RoundOpts(only=[], agent="codex", work_model="codex", sandbox_host=True, dry_run=False)
+        renderer = tc.agents.AgentTranscriptRenderer("codex")
+        for line in METADATA_MISS.splitlines():
+            renderer.render_line(line + "\n")
+
+        def rejected_round(*args):
+            tc.agents._LAST_AGENT_RUN = {
+                "provider": "codex",
+                "rc": 1,
+                "saw_work": renderer.saw_work,
+                "terminal_failure": renderer.terminal_failure_text,
+            }
+            return 1
+
+        with (
+            patch.object(tc.agents, "run_process", return_value=OK),
+            patch.object(tc.agents, "warn_red"),
+            patch.object(wu, "do_progress", return_value=None),
+            patch.object(wu, "do_roadmap", side_effect=rejected_round),
+            patch.object(wu, "_bubble", return_value=False),
+            patch.object(wu.shutil, "which", return_value="/usr/bin/codex"),
+            patch.object(wu, "_still_actionable", return_value=True),
+            patch.object(wu, "_check_stage_read_quota"),
+            patch.object(wu, "_progress_snapshot", return_value=None),
+            patch.object(wu, "_checkout_head", return_value=None),
+            patch.object(wu, "log_round_file_changes"),
+            patch.object(wu, "report_runtime"),
+            patch("tauceti_worker.activity.select"),
+            patch("tauceti_worker.claude_api.api_mode", return_value=False),
+        ):
+            if decline_first:
+                wu.dispatch("progress", w, SimpleNamespace(open_prs=[]), tc.Candidate(0, "", "report"), opts)
+            try:
+                wu.dispatch("roadmap", w, SimpleNamespace(open_prs=[]), tc.Candidate(0, "", "any"), opts)
+            except tc.NoProgress:
+                pass
+            following = tc.resolve_codex_model_access(cfg, make_profile())
+        return following.model
+
+
+check("a rejected round records its miss", consecutive_dispatches(decline_first=False), LUNA)
+check("a rejected round after a declined candidate records its miss", consecutive_dispatches(decline_first=True), LUNA)
+
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)
