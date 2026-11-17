@@ -100,6 +100,90 @@ class Cache(unittest.TestCase):
         self.assertEqual(json.loads(one.read_text())["data"], data)
         self.assertEqual((self.root / "1/artifacts" / artifact).read_bytes(), b"cached")
 
+    def _trace(self, checkout, module, dep, outputs):
+        trace = checkout / ".lake/build/lib/lean" / (module + ".trace")
+        atomic_json(trace, dict(schemaVersion="2025-09-10", depHash=dep, outputs=outputs))
+        for name in cache.descriptions(outputs):
+            extension = name.split(".", 1)[1]
+            base = checkout / ".lake/build" / ("lib/lean" if extension in ("olean", "ilean") else "ir")
+            (base / (module + "." + extension + ".hash")).parent.mkdir(parents=True, exist_ok=True)
+            (base / (module + "." + extension + ".hash")).write_text(name[:16])
+        return trace
+
+    def test_local_traces_that_disagree_with_ci_are_dropped(self):
+        checkout = self.root / "checkout"
+        ci = dict(o=["1" * 16 + ".olean"], i="2" * 16 + ".ilean", c="3" * 16 + ".c", m=True, l="4" * 16 + ".ltar")
+        local = dict(o=["5" * 16 + ".olean"], i="2" * 16 + ".ilean", c="3" * 16 + ".c", m=True)
+        agreeing = self._trace(checkout, "A/Same", "a" * 16, {k: v for k, v in ci.items() if k != "l"})
+        restored = self._trace(checkout, "A/Restored", "b" * 16, dict(ci))
+        stale = self._trace(checkout, "A/Stale", "c" * 16, local)
+        own = self._trace(checkout, "A/Own", "d" * 16, local)  # CI never published this input
+        ci_outputs = {"a" * 16: ci, "b" * 16: ci, "c" * 16: ci}
+        report = {}
+        cache.drop_disagreeing_traces(checkout, ci_outputs, report)
+        self.assertTrue(agreeing.exists(), "only the archive name differs")
+        self.assertTrue(restored.exists())
+        self.assertTrue(own.exists())
+        self.assertFalse(stale.exists())
+        lib = checkout / ".lake/build/lib/lean/A"
+        self.assertFalse((lib / "Stale.olean.hash").exists())
+        self.assertFalse((checkout / ".lake/build/ir/A/Stale.c.hash").exists())
+        self.assertTrue((lib / "Own.olean.hash").exists())
+        self.assertTrue((lib / "Same.olean.hash").exists())
+        self.assertEqual(
+            {k: v for k, v in report.items() if k.startswith("ci_")},
+            dict(ci_disagreeing_traces=1, ci_disagreeing_removed=1, ci_disagreeing_skipped=0),
+        )
+        report = {}
+        with patch.object(Path, "unlink", side_effect=AssertionError("second pass removed something")):
+            cache.drop_disagreeing_traces(checkout, ci_outputs, report)
+        self.assertEqual(report["ci_disagreeing_traces"], 0)
+
+    def test_busy_disagreeing_trace_is_deferred(self):
+        from tauceti_worker.canonical_store import Guard
+
+        checkout = self.root / "checkout"
+        ci = dict(o=["1" * 16 + ".olean"], i="2" * 16 + ".ilean")
+        trace = self._trace(checkout, "Busy", "c" * 16, dict(o=["5" * 16 + ".olean"], i="2" * 16 + ".ilean"))
+        info = trace.lstat()
+        report = {}
+        cache.drop_disagreeing_traces(
+            checkout, {"c" * 16: ci}, report, guard=Guard(writable={(info.st_dev, info.st_ino)})
+        )
+        self.assertTrue(trace.exists())
+        self.assertTrue((checkout / ".lake/build/lib/lean/Busy.olean.hash").exists())
+        self.assertEqual((report["ci_disagreeing_traces"], report["ci_disagreeing_skipped"]), (1, 1))
+
+    def test_preparation_drops_traces_that_disagree_with_hydrated_ci_outputs(self):
+        archive = "4" * 16 + ".ltar"
+        entry = self.pool / "entries" / archive[:-5]
+        entry.mkdir(parents=True)
+        ci = dict(o=["1" * 16 + ".olean"], i="2" * 16 + ".ilean", m=True, l=archive)
+        for name in cache.descriptions(ci):
+            (entry / name).write_bytes(b"ci")
+        atomic_json(entry / "entry.json", dict(data=ci))
+        checkout = self.root / "checkout"
+        stale = self._trace(checkout, "Stale", "c" * 16, dict(o=["5" * 16 + ".olean"], i="2" * 16 + ".ilean", m=True))
+        private = self.root / "private"
+        env = dict(LAKE_CACHE_DIR=str(private), TAUCETI_BUILD_CACHE_ROOT=str(self.pool))
+        report = {}
+        with cache.preparation(checkout, env, report=report) as warm:
+            atomic_json(Path(warm["LAKE_CACHE_DIR"]) / "outputs/TauCeti" / ("c" * 16 + ".json"), dict(data=archive))
+        self.assertFalse(stale.exists())
+        self.assertEqual(report["ci_disagreeing_removed"], 1)
+        self.assertEqual(json.loads((private / "outputs/TauCeti" / ("c" * 16 + ".json")).read_text())["data"], ci)
+
+    def test_hydration_records_the_ci_outputs_it_installs(self):
+        entry = self.pool / "entries" / ("a" * 16)
+        entry.mkdir(parents=True)
+        data = dict(o=["b" * 16 + ".olean"], i="c" * 16 + ".ilean", l="a" * 16 + ".ltar")
+        for name in cache.descriptions(data):
+            (entry / name).write_bytes(b"cached")
+        atomic_json(entry / "entry.json", dict(data=data))
+        recorded = {}
+        cache.hydrate(entry, self.root / "private", ["d" * 16, "e" * 16], ci_outputs=recorded)
+        self.assertEqual(recorded, {"d" * 16: data, "e" * 16: data})
+
     def test_download_context_never_promotes_agent_outputs(self):
         private = self.root / "private"
         (private / "outputs/TauCeti").mkdir(parents=True)
@@ -479,6 +563,66 @@ class Cache(unittest.TestCase):
         shutil.rmtree(self.pool / "entries" / archive_hash)
         with self.assertRaisesRegex(ValueError, "hash mismatch"):
             cache.expand(bad, self.root / "third", project, env, self.pool, dict(hits=0, expanded=0))
+
+    @unittest.skipUnless(shutil.which("lean") and shutil.which("lake"), "Lean/Lake needed for native fixture")
+    def test_real_lake_restores_ci_outputs_after_a_disagreeing_trace_is_dropped(self):
+        prefix = Path(subprocess.check_output(["lean", "--print-prefix"], text=True).strip())
+        if not (prefix / "bin/leantar").is_file():
+            self.skipTest("toolchain has no leantar")
+        project = self.root / "project"
+        project.mkdir()
+        (project / "lakefile.toml").write_text('name = "cache_fixture"\n[[lean_lib]]\nname = "CacheFixture"\n')
+        (project / "CacheFixture.lean").write_text("module\npublic def answer : Nat := 42\n")
+        env = dict(
+            os.environ,
+            PATH=str(prefix / "bin") + ":" + os.environ["PATH"],
+            LAKE_ARTIFACT_CACHE="0",
+            LAKE_RESTORE_ARTIFACTS="1",
+        )
+
+        def lake(*args, **extra):
+            return subprocess.run(
+                [str(prefix / "bin/lake"), *args],
+                cwd=project,
+                env={**env, **extra},
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            ).stdout
+
+        lake("build", "+CacheFixture:ltar")
+        archive = next((project / ".lake/build").rglob("*.ltar"))
+        trace_path = project / ".lake/build/lib/lean/CacheFixture.trace"
+        input_hash = json.loads(trace_path.read_text())["depHash"]
+        olean = project / ".lake/build/lib/lean/CacheFixture.olean"
+        ci_bytes = olean.read_bytes()
+        program = cache.native(project, env, self.pool)
+        archive_hash = cache.hashes(program, [archive], self.root)[str(archive)]
+        download = self.root / "download"
+        (download / "artifacts").mkdir(parents=True)
+        shutil.copyfile(archive, download / "artifacts" / (archive_hash + ".ltar"))
+        atomic_json(download / "outputs/TauCeti" / (input_hash + ".json"), dict(data=archive_hash + ".ltar"))
+        private = self.root / "private"
+        ci_outputs = {}
+        cache.expand(download, private, project, env, self.pool, dict(hits=0, expanded=0), ci_outputs=ci_outputs)
+        mapping = private / "outputs/TauCeti" / (input_hash + ".json")
+        scoped = private / "outputs/cache_fixture" / mapping.name
+        scoped.parent.mkdir(parents=True)
+        shutil.copyfile(mapping, scoped)
+        # A local build of the same input whose bytes differ from CI's, as serial elaboration made.
+        trace = json.loads(trace_path.read_text())
+        trace["outputs"].pop("l", None)
+        trace["outputs"]["o"][0] = "f" * 16 + ".olean"
+        trace_path.write_text(json.dumps(trace))
+        olean.unlink()
+        olean.write_bytes(ci_bytes + b"local")
+        report = {}
+        cache.drop_disagreeing_traces(project, ci_outputs, report)
+        self.assertEqual(report["ci_disagreeing_removed"], 1)
+        result = lake("build", "CacheFixture", LAKE_CACHE_DIR=str(private), LAKE_ARTIFACT_CACHE="1")
+        self.assertNotIn("Built CacheFixture", result)
+        self.assertEqual(olean.read_bytes(), ci_bytes)
 
 
 if __name__ == "__main__":

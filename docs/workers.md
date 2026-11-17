@@ -406,6 +406,15 @@ Archive seeding skips duplicates, and an archive removed concurrently by pool co
 is an individual cache miss for Lake to fetch. Native fetch arguments and Mathlib snapshot
 keys/inventory checks are unchanged.
 
+A worker's build tree outlives its rounds, so it can hold modules an earlier round compiled
+locally. When CI has published outputs for the same input hash and they differ from the
+local ones, Lake would still trust the local trace. Locally built bytes need not match CI's,
+and every module downstream would then miss the cache and compile locally. After hydration,
+preparation therefore removes each such module's trace (and its `.hash` sidecars), and Lake
+restores CI's outputs by hard link. Modules CI has not published are the agent's own work and
+are left alone. The receipt counts `ci_disagreeing_traces`, `ci_disagreeing_removed` and
+`ci_disagreeing_skipped` (deferred because a file was busy).
+
 The existing pool status receipt also records mapping/seed/install counts and per-phase
 elapsed and CPU seconds for seeding, fetching, transfer, expansion/hydration, and Mathlib
 view preparation. CPU includes the preparator and reaped children. Phases can be nested,

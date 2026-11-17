@@ -291,7 +291,9 @@ def private_mapping(private, key, known):
     return known[key]
 
 
-def hydrate(entry, private, input_hash, *, private_mappings=None, report=None, guard=None, refused=None):
+def hydrate(
+    entry, private, input_hash, *, private_mappings=None, report=None, guard=None, refused=None, ci_outputs=None
+):
     row = read_json(entry / "entry.json")
     names = list(dict.fromkeys(descriptions(row["data"])))
     try:
@@ -320,6 +322,8 @@ def hydrate(entry, private, input_hash, *, private_mappings=None, report=None, g
     for key in changed:
         atomic_json(private / "outputs/TauCeti" / (key + ".json"), desired)
         known[key] = desired
+    if ci_outputs is not None:
+        ci_outputs.update(dict.fromkeys(keys, row["data"]))  # what Lake now restores for each key
     if report is not None:
         report["installed_artifacts"] = report.get("installed_artifacts", 0) + len(missing)
         report["written_mappings"] = report.get("written_mappings", 0) + len(changed)
@@ -329,7 +333,9 @@ def hydrate(entry, private, input_hash, *, private_mappings=None, report=None, g
         os.utime(entry / "entry.json", None)
 
 
-def expand(download, private, cwd, env, pool, report, *, manifest=None, private_mappings=None, deadline=None):
+def expand(
+    download, private, cwd, env, pool, report, *, manifest=None, private_mappings=None, deadline=None, ci_outputs=None
+):
     """Expand and hydrate every selected archive, or raise: partial hydration is not a fallback.
 
     Entry locks held by another round are waited for: their holder is publishing or reading an
@@ -364,6 +370,7 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
                     report=report,
                     guard=guard,
                     refused=refused,
+                    ci_outputs=ci_outputs,
                 )
                 report["hits"] += 1
 
@@ -497,6 +504,7 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
                         report=report,
                         guard=guard,
                         refused=refused,
+                        ci_outputs=ci_outputs,
                     )
                     report["expanded"] += 1
                     completed += 1
@@ -546,6 +554,72 @@ def transfer(download, private, seeded=(), *, manifest=None, private_mappings=No
                 atomic_json(target, data)
             if key in manifest:
                 known[key] = data
+
+
+def drop_disagreeing_traces(checkout, ci_outputs, report, *, guard=None):
+    """Remove module traces whose input hash CI published with different outputs.
+
+    A checkout outlives its rounds. A module an earlier round compiled keeps a trace naming its
+    own input hash and its locally built outputs, and Lake trusts that trace over the CI outputs
+    hydration has just mapped for the same hash. Local bytes need not equal CI's (a compiler option
+    can change them), and every downstream input hash then diverges from CI's, so one stale trace
+    turns into a local rebuild of everything above it. Without the trace, Lake restores CI's
+    outputs by hard link from the private mapping `hydrate` wrote.
+
+    Traces CI has not published are the agent's own work and stay. The output files stay too:
+    restoring replaces them, and the canonical store's collector releases what nothing names.
+    Maintenance only: an I/O failure is logged and the next preparation retries.
+    """
+    lib = Path(checkout) / ".lake/build/lib/lean"
+    if not ci_outputs or not lib.is_dir():
+        return
+    from .canonical_store import LIBRARY, Guard
+
+    guard = Guard() if guard is None else guard
+    ir = lib.parent.parent / "ir"
+    found = removed = skipped = 0
+    try:
+        for base, dirs, files in os.walk(lib, followlinks=False):
+            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(base, d))]
+            for file in files:
+                if not file.endswith(".trace") or file.endswith(".ir.trace"):
+                    continue
+                trace = Path(base) / file
+                try:
+                    before = trace.lstat()
+                except FileNotFoundError:
+                    continue
+                row = read_json(trace)
+                ci = ci_outputs.get(row.get("depHash"))
+                local = row.get("outputs")
+                if not isinstance(ci, dict) or not isinstance(local, dict):
+                    continue
+                # "l" names the archive a restored module came from; a local build has none.
+                if {k: v for k, v in local.items() if k != "l"} == {k: v for k, v in ci.items() if k != "l"}:
+                    continue
+                found += 1
+                if not guard.unlink(trace, before):
+                    skipped += 1
+                    continue
+                removed += 1
+                module, relative = file[: -len(".trace")], trace.parent.relative_to(lib)
+                with contextlib.suppress(ValueError):
+                    for name in descriptions(local):
+                        extension = name.split(".", 1)[1]
+                        output = (lib if extension in LIBRARY else ir) / relative / (module + "." + extension)
+                        # Lake's per-checkout hash sidecars: never shared, rewritten on restore.
+                        output.with_name(output.name + ".hash").unlink(missing_ok=True)
+    except OSError as error:
+        log(f"expanded cache: checking local traces against CI deferred ({error})")
+    finally:
+        report["ci_disagreeing_traces"] = report.get("ci_disagreeing_traces", 0) + found
+        report["ci_disagreeing_removed"] = report.get("ci_disagreeing_removed", 0) + removed
+        report["ci_disagreeing_skipped"] = report.get("ci_disagreeing_skipped", 0) + skipped
+    if found:
+        log(
+            f"expanded cache: {found} local module traces disagree with CI's outputs for the same input; "
+            f"removed {removed} so Lake restores CI's, deferred {skipped} busy"
+        )
 
 
 @contextlib.contextmanager
@@ -613,6 +687,7 @@ def preparation(cwd, env, *, refetch=None, report=None):
         report["seeded_artifacts"] = len(seeded)
         warm_env = dict(env, LAKE_CACHE_DIR=str(download))
         ready = False
+        ci_outputs = {}  # input hash -> CI's output description, as hydration installs it
         try:
             with measured(report, "native_fetch"):
                 yield warm_env
@@ -654,6 +729,7 @@ def preparation(cwd, env, *, refetch=None, report=None):
                                 manifest=manifest,
                                 private_mappings=private_mappings,
                                 deadline=deadline,
+                                ci_outputs=ci_outputs,
                             )
                     except CorruptArchive as error:
                         # A stale local .ltar must not poison every future round. Detach
@@ -685,7 +761,10 @@ def preparation(cwd, env, *, refetch=None, report=None):
                                 manifest=manifest,
                                 private_mappings=private_mappings,
                                 deadline=deadline,
+                                ci_outputs=ci_outputs,
                             )
+                    with measured(report, "ci_disagreeing"):
+                        drop_disagreeing_traces(cwd, ci_outputs, report)
                 except Unavailable:
                     raise
                 except Exception as error:
