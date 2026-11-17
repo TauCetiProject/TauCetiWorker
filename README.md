@@ -415,6 +415,39 @@ The active GitHub credential must have repository-admin permission, checked befo
 spending and again before updating the cursor. New toolchain tags must be at or
 behind the cursor; see [the policy](https://github.com/TauCetiProject/TauCeti/blob/main/docs/security-audit.md).
 
+To catch up a large backlog, an admin can run several isolated reviewers at once
+on the same audit state:
+
+```bash
+python3 -m tauceti_worker.security_audit pool --state /path/to/worker/state/security-audit \
+  --parallel 8
+```
+
+The pool plans a window of consecutive batches ahead of the cursor, each exactly as
+`work` would plan it from that batch's start, and inspects them concurrently in
+separate attempt directories. The cursor advances only through the ordinary admin
+update, one batch at a time and only past validated passes, so a later batch that
+finishes first waits for its predecessors. A finding or incomplete verdict is
+binding: it is never inspected again, nothing beyond it advances, and the usual
+block and alert are recorded. Operational failures with no recorded judgment get
+at most two more attempts before blocking. An operational block left at the cursor
+by an ordinary round is archived and inspected afresh; source findings never are.
+Passing results persist under `pool/` and are reused after a restart only when the
+rebuilt input is byte-identical and still the next main prefix. While the pool
+holds `pool.lock`, ordinary audit rounds for that state defer to it. A GitHub rate
+limit defers admin checks and cursor updates until reset without failing reviews.
+
+Each new batch gets the first available reviewer: Codex `gpt-6-luna` while the Codex
+subscription is under pace, then Haiku on the Claude subscription while that is under
+pace, then Haiku billed to the API key in `TAUCETI_SECURITY_AUDIT_ANTHROPIC_API_KEY_FILE`
+regardless of pace. With none available, new batches wait. Pacing is the ordinary
+`work` verdict, and `--ignore-quota` overrides soft pacing only. A batch keeps its
+provider for life: Codex retries continue the same native session, and Claude retries
+start a fresh Haiku session, preferring the same credential and moving from the
+subscription to the API key when the subscription goes over pace. `--agent codex` or
+`--agent claude` pins one provider. The ledger and `pool/` result files record each
+review's provider, model and credential kind, never the key.
+
 An admin initializes the protections and original audited snapshot once with:
 
 ```bash

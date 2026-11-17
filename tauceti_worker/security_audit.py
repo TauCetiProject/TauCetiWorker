@@ -1470,8 +1470,16 @@ def inspect(
     allowed_history=(),
     continue_reading: bool = False,
     protocol: int | None = None,
+    claude_credential: str | None = None,
 ) -> dict:
+    """Run one isolated reviewer launch.
+
+    `claude_credential` selects Haiku's billing: "subscription" never uses a configured
+    API key, "api-key" requires one, and None prefers a configured key."""
     from .audit_clients import selected_protocol
+
+    if claude_credential not in (None, "subscription", "api-key"):
+        raise Die("security-audit: unknown Claude credential kind")
 
     if resume_from is not None:
         retained_protocol = attempt_protocol(resume_from)
@@ -1521,7 +1529,9 @@ def inspect(
         )
         dest = home / (".codex/auth.json" if provider == "codex" else ".claude/.credentials.json")
         dest.parent.mkdir(parents=True)
-        api_key = anthropic_api_key() if provider == "claude" else None
+        api_key = anthropic_api_key() if provider == "claude" and claude_credential != "subscription" else None
+        if provider == "claude" and claude_credential == "api-key" and not api_key:
+            raise Die(f"security-audit: API-key Haiku review requires {API_KEY_FILE_ENV}")
         if api_key:
             # API billing, independent of subscription pacing. The key reaches only
             # the isolated client process; the reviewer has no tool to read it.
@@ -1757,11 +1767,70 @@ def dispatch_advanced(work: Path, landed: str) -> None:
         log("security-audit: advanced, but readiness-report dispatch failed; dispatch toolchain-tags manually")
 
 
+def reviewer_model(provider: str) -> str:
+    return "gpt-6-luna" if provider == "codex" else "haiku"
+
+
+def credential_kind(provider: str) -> str:
+    """The billing credential an unpinned inspect() uses: a configured key wins for Haiku."""
+    return "api-key" if provider == "claude" and anthropic_api_key() else "subscription"
+
+
+def review_record(
+    actor: str, provider: str, protocol: int, batch: dict, attempt: Path, verdict: dict, credential: str
+) -> dict:
+    """The ledger entry for one isolated reviewer verdict on one exact batch. Never includes a key."""
+    return {
+        "actor": actor,
+        "provider": provider,
+        "model": reviewer_model(provider),
+        "credential": credential,
+        "batch": batch["input_digest"],
+        "prompt_digest": hashlib.sha256(
+            (
+                (SERVED_MODEL_PROMPT if provider == "codex" else SERVED_CLAUDE_PROMPT)
+                if protocol == 4
+                else MODEL_PROMPT
+            ).encode()
+        ).hexdigest(),
+        "protocol_version": protocol,
+        "launcher_profile": reviewer_argv(provider, protocol=protocol),
+        "execution_record": str(attempt / "execution.json"),
+        "catalog_digest": hashlib.sha256(serialize(inspection_catalog(protocol)).encode()).hexdigest()
+        if provider == "codex"
+        else None,
+        "reader_digest": hashlib.sha256(reader_path(protocol).read_bytes()).hexdigest(),
+        "input_policy": "compacting-session-v1",
+        "output_repairs": len((attempt / "output-repairs.jsonl").read_text().splitlines())
+        if (attempt / "output-repairs.jsonl").exists()
+        else 0,
+        "from_sha": batch["from_sha"],
+        "to_sha": batch["commits"][-1]["sha"],
+        "verdict": verdict,
+    }
+
+
+def pool_active(work: Path) -> bool:
+    """True while a parallel pool holds this audit state's exclusive cursor lock."""
+    path = work / "pool.lock"
+    if not path.exists():
+        return False
+    with path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    return False
+
+
 def run(cfg, opts, *, min_commits: int = 1) -> int:
     if type(min_commits) is not int or min_commits < 1:
         raise Die("security-audit: minimum pending commits must be a positive integer")
-    require_admin()
     work = cfg.state / CURSOR
+    if pool_active(work):
+        raise AuditNotDue("security-audit: a parallel audit pool owns this cursor")
+    require_admin()
     repo = work / "objects.git"
     cursor, main = remote_sha(CURSOR), remote_sha(os.environ.get("TAUCETI_BASE_BRANCH", "main"))
     refresh(repo, cursor, main)
@@ -1831,7 +1900,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
     from .audit_clients import selected_protocol
 
     protocol = selected_protocol(provider, work)
-    model = "gpt-6-luna" if provider == "codex" else "haiku"
+    model = reviewer_model(provider)
     log(f"security-audit: isolated reviewer {provider}/{model}, protocol {protocol}")
     try:
         if any(c["files"] for c in batch["commits"]):
@@ -1845,33 +1914,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
             }
         record(
             work / "ledger.jsonl",
-            {
-                "actor": actor,
-                "provider": provider,
-                "model": model,
-                "batch": batch["input_digest"],
-                "prompt_digest": hashlib.sha256(
-                    (
-                        (SERVED_MODEL_PROMPT if provider == "codex" else SERVED_CLAUDE_PROMPT)
-                        if protocol == 4
-                        else MODEL_PROMPT
-                    ).encode()
-                ).hexdigest(),
-                "protocol_version": protocol,
-                "launcher_profile": reviewer_argv(provider, protocol=protocol),
-                "execution_record": str(attempt / "execution.json"),
-                "catalog_digest": hashlib.sha256(serialize(inspection_catalog(protocol)).encode()).hexdigest()
-                if provider == "codex"
-                else None,
-                "reader_digest": hashlib.sha256(reader_path(protocol).read_bytes()).hexdigest(),
-                "input_policy": "compacting-session-v1",
-                "output_repairs": len((attempt / "output-repairs.jsonl").read_text().splitlines())
-                if (attempt / "output-repairs.jsonl").exists()
-                else 0,
-                "from_sha": cursor,
-                "to_sha": target,
-                "verdict": verdict,
-            },
+            review_record(actor, provider, protocol, batch, attempt, verdict, credential_kind(provider)),
         )
         if verdict["verdict"] != "pass":
             raise Die("security-audit: " + "; ".join(verdict["findings"]))
@@ -2259,14 +2302,32 @@ def setup(state: Path) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["setup", "attest", "resume", "retry-service", "repair-output"])
+    parser.add_argument("command", choices=["setup", "attest", "resume", "retry-service", "repair-output", "pool"])
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--through", help="full main commit SHA reviewed by the human administrator")
     parser.add_argument("--reason", help="human review evidence; never a model re-roll")
     parser.add_argument("--ignore-quota", action="store_true", help="ignore pacing, retaining hard quota limits")
+    parser.add_argument("--parallel", type=int, default=4, help="pool: concurrent isolated reviewers")
+    parser.add_argument(
+        "--agent", choices=["codex", "claude"], help="pool: pin one provider (default: codex, then haiku)"
+    )
     args = parser.parse_args()
     if args.command == "setup":
         setup(args.state)
+    elif args.command == "pool":
+        from .audit_pool import Chooser, Pool
+        from .config import Config
+
+        cfg = Config.resolve(args.state.parent.name)
+        if (cfg.state / CURSOR).resolve() != args.state.resolve():
+            parser.error("pool --state must identify this checkout's existing worker audit state")
+        min_commits = int(os.environ.get("TAUCETI_SECURITY_AUDIT_MIN_COMMITS") or 1)
+        Pool(
+            args.state,
+            parallel=args.parallel,
+            chooser=Chooser(cfg, pin=args.agent, ignore_quota=args.ignore_quota),
+            min_commits=min_commits,
+        ).serve()
     elif args.command in ("resume", "retry-service", "repair-output"):
         from .config import Config
         from .round import RoundContext
