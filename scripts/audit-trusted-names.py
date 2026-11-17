@@ -23,7 +23,7 @@ ATTRIBUTE = [
     re.compile(r"mk\w*Attr\w*\s+`([A-Za-z_][\w.]*)"),
 ]
 DECLARATION = re.compile(
-    r'^\s*(?:@\[[^\]]*\]\s*)?(?:(?:scoped|local)\s+)?(?:syntax|macro|elab|notation|infix[lr]?|prefix|postfix)\b'
+    r"^\s*(?:@\[[^\]]*\]\s*)?(?:(?:scoped|local)\s+)?(?:syntax|macro|elab|notation|infix[lr]?|prefix|postfix)\b"
     r'(?:\s*:\s*\w+)?(?:\s*\((?:name|priority|kind)\s*:=[^)]*\))*\s*"([^"]+)"'
 )
 PARSER = re.compile(r'leading_parser(?::\w+)?\s*(?:\(withAnonymousAntiquot := false\)\s*)?"([^"]+)"')

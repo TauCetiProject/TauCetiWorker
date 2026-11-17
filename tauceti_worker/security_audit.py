@@ -1394,7 +1394,13 @@ def validate_output_profile(
     if recorded_names is not None and recorded_names != trusted_names_digest():
         raise Die("security-audit: retained inspection used a different trusted baseline name list")
     if prompt != inspection_prompt(
-        batch, paged, token, policy=policy_prompt, goals=goals, protocol=protocol, trusted_names=recorded_names is not None
+        batch,
+        paged,
+        token,
+        policy=policy_prompt,
+        goals=goals,
+        protocol=protocol,
+        trusted_names=recorded_names is not None,
     ):
         raise Die("security-audit: retained prompt differs from the immutable inspection")
     thread = retained_thread(original) if "resume" in argv else None
