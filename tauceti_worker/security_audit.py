@@ -490,7 +490,7 @@ def reviewer_argv(provider: str, *, goals: bool = True, protocol: int = 3) -> li
             "claude",
             "-p",
             "--model",
-            "haiku",
+            "claude-haiku-5-5",
             "--output-format",
             "stream-json",
             "--verbose",
@@ -1121,6 +1121,7 @@ def run_client(
     legacy_history=False,
     allowed_history=(),
     protocol=3,
+    trusted_names=False,
 ):
     """At most three requests, resuming one conversation for service/output recovery."""
     continue_prompt = SERVED_CONTINUE_PROMPT if protocol == 4 else CONTINUE_PROMPT
@@ -1165,6 +1166,7 @@ def run_client(
                     else None,
                     "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
                     **inspection_profile(protocol),
+                    "trusted_names_digest": trusted_names_digest() if trusted_names else None,
                 }
             )
         )
@@ -1388,7 +1390,18 @@ def validate_output_profile(
             and Path(json.loads(commands[0].split("=", 1)[1])).resolve() == Path(sys.executable).resolve()
         ):
             argv[argv.index(commands[0])] = "mcp_servers.audit.command=" + json.dumps(sys.executable)
-    if prompt != inspection_prompt(batch, paged, token, policy=policy_prompt, goals=goals, protocol=protocol):
+    recorded_names = execution.get("trusted_names_digest")
+    if recorded_names is not None and recorded_names != trusted_names_digest():
+        raise Die("security-audit: retained inspection used a different trusted baseline name list")
+    if prompt != inspection_prompt(
+        batch,
+        paged,
+        token,
+        policy=policy_prompt,
+        goals=goals,
+        protocol=protocol,
+        trusted_names=recorded_names is not None,
+    ):
         raise Die("security-audit: retained prompt differs from the immutable inspection")
     thread = retained_thread(original) if "resume" in argv else None
     if goals and execution.get("protocol_version") in (3, 4):
@@ -1438,11 +1451,46 @@ Manifest:
 """
 
 
+TRUSTED_ORIGIN_POLICY = """
+Origin of constructs. The pinned Lean toolchain and pinned dependencies are the
+trusted baseline. Tau Ceti modules that this bundle does not change were inspected
+by earlier audits and are trusted as well. So a construct that this bundle uses
+but does not define or change has a trusted origin: do not return incomplete merely
+because its definition is absent from the bundle. To help identify the baseline,
+the trusted Worker (not the bundle) lists attribute and syntax names that the
+pinned baseline defines. The list establishes origin only. It never makes safe a
+use that this policy flags, such as #eval, run_cmd, run_tac, run_elab, extern,
+implemented_by or initialize, and any definition or redefinition inside this
+bundle is new code to inspect.
+Trusted baseline names: """
+
+
+def trusted_names_text() -> str:
+    from .audit_trusted_names import NAMES
+
+    return TRUSTED_ORIGIN_POLICY + ", ".join(NAMES) + "\n"
+
+
+def trusted_names_digest() -> str:
+    return hashlib.sha256(trusted_names_text().encode()).hexdigest()
+
+
 def inspection_prompt(
-    batch: dict, paged: bool, token: str = "", *, policy: str = MODEL_PROMPT, goals: bool = True, protocol: int = 3
+    batch: dict,
+    paged: bool,
+    token: str = "",
+    *,
+    policy: str = MODEL_PROMPT,
+    goals: bool = True,
+    protocol: int = 3,
+    trusted_names: bool = False,
 ) -> str:
     if protocol == 4 and policy == MODEL_PROMPT:
         policy = SERVED_MODEL_PROMPT
+    if trusted_names:
+        if protocol != 4:
+            raise Die("security-audit: trusted baseline names require protocol 4")
+        policy = policy + trusted_names_text()
     policy = policy + (SERVED_GOAL_REQUEST if protocol == 4 else GOAL_REQUEST) if goals else policy
     if not paged:
         if policy.startswith((MODEL_PROMPT, SERVED_MODEL_PROMPT)):
@@ -1497,6 +1545,15 @@ def inspect(
         raise Die("security-audit: unknown inspection protocol")
     if protocol == 4 and repair_output:
         raise Die("security-audit: token output repair is unavailable in protocol 4")
+    # Fresh protocol-4 launches carry the trusted baseline names. A continuation
+    # keeps exactly the prompt its retained attempt recorded.
+    if resume_from is None:
+        names = protocol == 4
+    else:
+        recorded = json.loads((resume_from / "execution.json").read_text()).get("trusted_names_digest")
+        if recorded is not None and recorded != trusted_names_digest():
+            raise Die("security-audit: retained inspection used a different trusted baseline name list")
+        names = recorded is not None
     cmd = reviewer_argv(provider, protocol=protocol)
     continue_prompt = SERVED_CONTINUE_PROMPT if protocol == 4 else CONTINUE_PROMPT
     thread = None
@@ -1567,7 +1624,9 @@ def inspect(
             if provider == "codex"
             else V2_MODEL_PROMPT
         )
-        prompt = inspection_prompt(batch, False, policy=policy, goals=provider == "codex", protocol=protocol)
+        prompt = inspection_prompt(
+            batch, False, policy=policy, goals=provider == "codex", protocol=protocol, trusted_names=names
+        )
         schema_value = MODEL_SCHEMA
         receipt = (work / "read-receipt.json").resolve()
         if provider == "codex":
@@ -1601,7 +1660,9 @@ def inspect(
             source.write_text(serialize(batch))
             token = secrets.token_hex(16) if protocol < 4 else ""
             reader = [str(reader_path(protocol)), str(source), str(receipt), *([token] if protocol < 4 else [])]
-            prompt = inspection_prompt(batch, True, token, policy=policy, goals=provider == "codex", protocol=protocol)
+            prompt = inspection_prompt(
+                batch, True, token, policy=policy, goals=provider == "codex", protocol=protocol, trusted_names=names
+            )
             if resume_from is not None:
                 prompt = continue_prompt + prompt
             if provider == "claude":
@@ -1639,6 +1700,7 @@ def inspect(
             legacy_history=legacy_history,
             allowed_history=allowed_history,
             protocol=protocol,
+            trusted_names=names,
         )
         if p.returncode:
             raise Die(f"security-audit: {provider} failed; see {work / 'model-stderr.txt'}")
@@ -1768,7 +1830,7 @@ def dispatch_advanced(work: Path, landed: str) -> None:
 
 
 def reviewer_model(provider: str) -> str:
-    return "gpt-6-luna" if provider == "codex" else "haiku"
+    return "gpt-6-luna" if provider == "codex" else "claude-haiku-5-5"
 
 
 def credential_kind(provider: str) -> str:

@@ -231,7 +231,7 @@ class Providers(PoolFixture):
         self.serve(lambda batch, attempt: self.verdict(batch))
         self.assertEqual({(p, c) for _, p, c, _ in self.launches}, {("claude", "api-key")})
         rows = [row for row in self.ledger() if row.get("credential") == "api-key"]
-        self.assertEqual({row["model"] for row in rows}, {"haiku"})
+        self.assertEqual({row["model"] for row in rows}, {"claude-haiku-5-5"})
 
     def test_nothing_launches_when_all_subscriptions_are_over_pace_and_no_key(self):
         self.pace = {"codex": False, "claude": False}
