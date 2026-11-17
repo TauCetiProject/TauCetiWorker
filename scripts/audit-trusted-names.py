@@ -10,6 +10,7 @@ reviewers use it only to recognise a construct's origin; it never makes safe a
 use the inspection policy flags.
 """
 
+import json
 import pathlib
 import re
 import sys
@@ -59,7 +60,7 @@ def main(argv):
     print("")
     print("NAMES = (")
     for name in listed:
-        print(f"    {name!r},")
+        print(f"    {json.dumps(name)},")
     print(")")
 
 
