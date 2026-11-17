@@ -27,6 +27,7 @@ from .agents import (
     fill_prompt,
     host_agent_argv,
     local_verification,
+    note_codex_round_rejection,
     prepare_checkout,
     quality_scope,
     resolve_authoring_profile,
@@ -1393,6 +1394,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     if stage == "review" and opts.work_model == "kiro":
         kiro_probe_profile = resolve_authoring_profile("kiro", cli_model=_kiro_review_model("kiro"))
     needs_codex_probe = bool(profile and profile.provider == "codex" and profile.fallback_model)
+    codex_default = profile if needs_codex_probe else None
     needs_kiro_probe = bool(kiro_probe_profile and kiro_probe_profile.provider == "kiro")
     # Preflight the host agent binary. A host round shells out to `codex`/`claude`/`pi`; if that binary
     # has slipped off the worker's PATH (an npm reinstall relocating codex is the case that bit us), the
@@ -1516,7 +1518,11 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             if not api_mode():
                 raise
             raise admission_failure(str(error)) from None
-        rc = _run_github_stage(stage, fn, w, sv, c, opts, bubble)
+        try:
+            rc = _run_github_stage(stage, fn, w, sv, c, opts, bubble)
+        finally:
+            if codex_default is not None:
+                note_codex_round_rejection(w.cfg, codex_default, opts.authoring_profile)
     if c.pr and stage in FILE_CHANGE_STAGES:
         pre = c.progress
         if pre is not None:
