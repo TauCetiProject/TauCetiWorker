@@ -552,15 +552,45 @@ class Pass:
         computed = self.lakes.get(fingerprint(info))
         return None if computed is None else computed == name.split(".", 1)[0]
 
+    def mislabelled(self, path, name, info):
+        """True if bytes that fail `name` are another known artifact of the same kind.
+
+        A stale trace beside outputs Lake restored for the same input (local and CI builds of one
+        module can differ, e.g. in `.olean.private`) names them wrongly, but the bytes are right:
+        their own Lake hash names a canonical object, pool copy or private-store file that is this
+        inode, or a canonical object with the same sha256. Such bytes must not be rejected host-wide.
+        """
+        computed = self.lakes.get(fingerprint(info))
+        if computed is None:
+            return False
+        other = computed + "." + name.split(".", 1)[1]
+        aliases = [self.objects / other, legacy(self.pool, other)] + ([self.private / other] if self.private else [])
+        for alias in aliases:
+            with contextlib.suppress(FileNotFoundError):
+                found = alias.lstat()
+                if (found.st_dev, found.st_ino) == (info.st_dev, info.st_ino):
+                    return True
+        # Read-only and lock-free (the caller holds `name`'s object lock): trust only a sidecar
+        # that still describes its object.
+        row = read_json(sidecar(self.directory, other))
+        try:
+            if not recorded(self.directory, other, (self.objects / other).stat()) or row.get("size") != info.st_size:
+                return False
+            return self.sha(path, info) == (row.get("sha256"), info.st_size)
+        except (OSError, TimeoutError):
+            return False
+
     def invalidate(self, path, name, info, private):
         """Remove bytes that fail their own Lake hash so Lake rebuilds them.
 
         The module trace stays: Lake's up-to-date check requires every recorded output to exist,
         so one missing output already forces a rebuild, and the trace still lists the module's
-        unfinished siblings for the next relink pass.
+        unfinished siblings for the next relink pass. Only bytes that are no known artifact are
+        rejected host-wide; a mislabelled alias is just removed.
         """
         self.suspect.add(name)
-        self.remember(info)
+        if not self.mislabelled(path, name, info):
+            self.remember(info)
         if not private:
             self.drop_private_alias(name, info)
         if not self.guard.unlink(path, info):
@@ -1013,17 +1043,48 @@ def release(pool, name, guard, *, dry=False):
     return freed
 
 
-def reconcile(pool, name, path, *, blocking=True, guard=None):
+def supersede(pool, name, fresh, refused, guard):
+    """Replace `name`'s pool-owned names that hold rejected bytes with `fresh`, verified bytes.
+
+    Expansion's re-extraction is the only repair for a rejected canonical object or legacy alias:
+    adopting either would put the rejected inode back into every entry it publishes. Under the
+    exclusive object lock and through `guard`; a deferred replacement leaves the name in place,
+    and `reconcile` and expansion refuse to adopt it.
+    """
+    if not refused:
+        return
+    directory = store(pool)
+    fresh_info = fresh.lstat()
+    if fingerprint(fresh_info) in refused:
+        return  # Never spread rejected bytes, even over other rejected bytes.
+    with object_lock(directory, name, exclusive=True):
+        for path in (directory / "objects" / name, legacy(pool, name)):
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode) or fingerprint(info) not in refused:
+                continue
+            if guard.replace(fresh, fresh_info, path, info, recent_ok=True) and path.parent.name == "objects":
+                sidecar(directory, name).unlink(missing_ok=True)  # Our metadata; `expected` heals it.
+                log(f"canonical store: replaced rejected object {name} with re-expanded bytes")
+
+
+def reconcile(pool, name, path, *, blocking=True, guard=None, refused=None):
     """Make a pool alias of `name` (an entry file, `artifacts/`) the canonical inode, if identical.
 
     Expansion publishes CI outputs independently; this keeps one inode when a local publication
     came first. Best effort: any doubt, or (with `blocking` False) a busy shard, leaves the alias.
+    A canonical object holding bytes relinking rejected is never adopted.
     """
     directory = store(pool)
     canonical = directory / "objects" / name
+    refused = rejected(pool) if refused is None else refused
     try:
         canonical_info = canonical.stat()
         info = path.lstat()
+        if fingerprint(canonical_info) in refused:
+            return False
         if canonical_info.st_ino == info.st_ino:
             return True
     except FileNotFoundError:
@@ -1115,6 +1176,7 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, 
     freed = 0
     # Open descriptors add no link: protect every inode the collector saw open.
     guard = Guard(opened=opened)
+    refused = rejected(pool)
     reconciling_until = time.monotonic() + reconcile_budget
     for lease in (directory / "uses").glob("*.list"):
         with contextlib.suppress(FileNotFoundError):
@@ -1133,7 +1195,8 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, 
                     old.lstat().st_ino != info.st_ino
                     and not dry
                     and time.monotonic() < reconciling_until
-                    and reconcile(pool, name, old, blocking=False, guard=guard)  # Busy shards wait for the next sweep.
+                    # Busy shards wait for the next sweep.
+                    and reconcile(pool, name, old, blocking=False, guard=guard, refused=refused)
                 ):
                     info = path.lstat()  # Expansion had published a second inode; now one.
                 if old.lstat().st_ino == info.st_ino:

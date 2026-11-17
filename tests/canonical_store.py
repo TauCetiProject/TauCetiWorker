@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -516,6 +517,30 @@ class Canonical(unittest.TestCase):
         cache.hydrate(entry, private, "d" * 16)
         self.assertTrue((private / "outputs/TauCeti" / ("d" * 16 + ".json")).exists())
 
+    def test_restored_outputs_beside_a_stale_trace_are_removed_not_rejected(self):
+        # CI's build of TauCeti.A is published; a local build of the same input differs in one
+        # output. Lake restores CI's outputs over it but keeps the local trace's names.
+        ci = self.checkout("ci", "TauCeti.A", seed="ci")
+        self.relink(ci)
+        checkout = self.checkout("w", "TauCeti.A", seed="local")
+        objects = canonical.store(self.pool) / "objects"
+        restored = {}
+        for (path, name), (_, theirs) in zip(paths(checkout), paths(ci), strict=True):
+            self.assertNotEqual(name, theirs)
+            path.unlink()
+            if path.name == "A.olean.server":
+                os.link(objects / theirs, path)  # shared with the CI canonical object
+            else:
+                shutil.copyfile(objects / theirs, path)  # a private copy of CI's bytes
+            restored[theirs] = path.lstat()
+        report = self.relink(checkout)
+        self.assertEqual(report["invalidated_outputs"], len(restored))
+        self.assertFalse(any(path.exists() for path, _ in paths(checkout)))  # Lake rebuilds the module.
+        self.assertEqual(canonical.rejected(self.pool), set())
+        entry = self.entry_for(ci)
+        cache.hydrate(entry, self.root / "other-store", "d" * 16)  # CI's objects stay usable.
+        self.assertTrue(all((objects / theirs).exists() for theirs in restored))
+
     def test_rejected_bytes_are_never_rehydrated_or_kept_privately(self):
         checkout = self.checkout("w", "TauCeti.A")
         self.relink(checkout)
@@ -538,6 +563,82 @@ class Canonical(unittest.TestCase):
         report = canonical.relink(checkout, private, self.pool, sweep_private=True)
         self.assertEqual(report["stale_store_files"], 1)
         self.assertFalse((private / "artifacts" / name).exists())
+
+    def rejected_pool_alias(self):
+        """A pool whose `artifacts/` alias, canonical object and entry share one rejected inode.
+
+        The bytes are even correct, so only the rejection keeps them from being adopted. Returns
+        `(expand, name, bad)`, where `expand()` runs one CI expansion of the module's archive.
+        """
+        checkout = self.checkout("w", "TauCeti.A")
+        olean, name = next((p, n) for p, n in paths(checkout) if p.name == "A.olean")
+        payload = b"archive of TauCeti.A"
+        archive = lake_hash(payload) + ".ltar"
+        download = self.root / "download"
+        (download / "artifacts").mkdir(parents=True)
+        (download / "artifacts" / archive).write_bytes(payload)
+        cache.atomic_json(download / "outputs/TauCeti" / ("d" * 16 + ".json"), dict(data=archive))
+        shared = self.pool / "artifacts" / name
+        shared.parent.mkdir(parents=True)
+        shutil.copyfile(olean, shared)
+        directory = canonical.store(self.pool)
+        (directory / "objects").mkdir(parents=True, exist_ok=True)
+        os.link(shared, directory / "objects" / name)
+        canonical.record(directory, name, *canonical.digest(shared), "test")
+        bad = shared.lstat()
+        canonical.reject(self.pool, bad)
+        entry = self.pool / "entries" / archive[:-5]
+        entry.mkdir(parents=True)
+        outputs = json.loads((checkout / ".lake/build/lib/lean/TauCeti/A.trace").read_text())["outputs"]
+        for path, descriptor in paths(checkout):
+            if descriptor == name:
+                os.link(shared, entry / descriptor)
+            else:
+                shutil.copyfile(path, entry / descriptor)
+        os.link(download / "artifacts" / archive, entry / archive)
+        cache.atomic_json(entry / "entry.json", dict(data=dict(outputs, l=archive)))
+        build = checkout / ".lake/build"
+
+        def run(args, *, input, **kwargs):  # leantar: fresh inodes of the archived outputs
+            for job in json.loads(input):
+                shutil.copytree(build / "lib/lean", job["base"][0], dirs_exist_ok=True)
+                shutil.copytree(build / "ir", job["base"][1], dirs_exist_ok=True)
+
+        tools = SimpleNamespace(check_output=lambda *a, **k: str(self.root / "toolchain"), run=run)
+
+        def expand():
+            report = dict(hits=0, expanded=0)
+            with patch.object(cache, "subprocess", tools):
+                cache.expand(download, self.root / "private", self.root, {}, self.pool, report)
+            return report["hits"], report["expanded"]
+
+        return expand, name, bad
+
+    def test_reexpansion_replaces_a_rejected_shared_alias_and_canonical_object(self):
+        expand, name, bad = self.rejected_pool_alias()
+        self.assertEqual(expand(), (0, 1))
+        entry = next((self.pool / "entries").iterdir()) / name
+        fresh = entry.lstat()
+        self.assertNotEqual(fresh.st_ino, bad.st_ino)
+        objects = canonical.store(self.pool) / "objects"
+        for alias in (self.pool / "artifacts" / name, objects / name, self.root / "private/artifacts" / name):
+            self.assertEqual(alias.lstat().st_ino, fresh.st_ino, alias)
+        self.assertEqual(canonical.expected(canonical.store(self.pool), name)[2], True)
+        # The rejected inode is gone from the pool, so the next round simply hydrates.
+        self.assertEqual(expand(), (1, 0))
+
+    def test_reexpansion_never_adopts_a_rejected_alias_it_cannot_replace(self):
+        expand, name, bad = self.rejected_pool_alias()
+        shared = self.pool / "artifacts" / name
+        os.chmod(shared, 0o644)
+        with open(shared, "r+b"):  # Busy: neither name may be replaced, nor adopted.
+            self.assertEqual(expand(), (0, 1))
+            self.assertEqual(expand(), (1, 0))
+        entry = next((self.pool / "entries").iterdir()) / name
+        self.assertNotEqual(entry.lstat().st_ino, bad.st_ino)
+        self.assertEqual((self.root / "private/artifacts" / name).lstat().st_ino, entry.lstat().st_ino)
+        self.assertEqual(shared.lstat().st_ino, bad.st_ino)
+        self.assertEqual((canonical.store(self.pool) / "objects" / name).lstat().st_ino, bad.st_ino)
 
     def test_private_alias_is_dropped_only_while_it_is_the_rejected_snapshot(self):
         checkout = self.checkout("w", "TauCeti.A")
