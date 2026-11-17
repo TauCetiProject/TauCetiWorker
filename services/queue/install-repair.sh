@@ -24,6 +24,12 @@
 #                    restart picks up the new revision).
 #   --wait SECONDS   how long to wait for the restarted worker to report serving (default: 60).
 #
+# WARNING: repair workers run origin/main HEAD from ~/TauCetiQueue. Never use a systemd drop-in
+# (~/.config/systemd/user/tauceti-queue-repair*.service.d/*.conf) for them: this script refuses to
+# run while one exists for the unit it installs. Running any other revision (--revision, --checkout
+# or TAUCETI_QUEUE_CHECKOUT) requires explicit permission from a human operator, and whoever does it
+# must rerun this script with no arguments as soon as their change lands on main.
+#
 # Exit status: 0 when the worker is active and serving; 1 on a setup or host-check failure;
 # 2 when the unit is not active or does not report serving within --wait.
 set -euo pipefail
@@ -46,7 +52,7 @@ while [ $# -gt 0 ]; do
     --instance) INSTANCE="$2"; shift 2 ;;
     --no-restart) RESTART=0; shift ;;
     --wait) WAIT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
     *) echo "install-repair.sh: unknown argument $1" >&2; exit 1 ;;
   esac
 done
@@ -59,6 +65,25 @@ if [ -n "$INSTANCE" ]; then
   UNIT="tauceti-queue-repair@$INSTANCE.service"
   ENV_FILE="$CONFIG_DIR/repair-environment-$INSTANCE"
 fi
+
+override_warning() {
+  log "WARNING: $1. Running a repair worker at anything other than origin/main HEAD requires explicit"
+  log "WARNING: permission from a human operator, and must be undone (rerun install-repair.sh with no"
+  log "WARNING: arguments) as soon as the change lands on main."
+}
+if [ "$REVISION" != "origin/main" ]; then override_warning "installing --revision $REVISION, not origin/main"; fi
+if [ "$CHECKOUT" != "$HOME/TauCetiQueue" ]; then override_warning "installing from $CHECKOUT, not ~/TauCetiQueue"; fi
+# Drop-ins silently override the installed unit (and each other), so the running code stops being
+# the checkout's. A template drop-in (tauceti-queue-repair@.service.d) applies to every instance.
+dropin_dirs=("$UNIT_DIR/$UNIT.d")
+if [ -n "$INSTANCE" ]; then dropin_dirs+=("$UNIT_DIR/tauceti-queue-repair@.service.d"); fi
+for dir in "${dropin_dirs[@]}"; do
+  for dropin in "$dir"/*.conf; do
+    if [ -e "$dropin" ]; then
+      die "systemd drop-in $dropin overrides the installed unit; queue units must not use drop-ins. Move it out of $dir, then rerun"
+    fi
+  done
+done
 
 command -v git >/dev/null || die "git is required"
 command -v uv >/dev/null || die "uv is required (https://docs.astral.sh/uv/)"
