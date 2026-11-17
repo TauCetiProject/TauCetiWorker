@@ -415,6 +415,31 @@ The active GitHub credential must have repository-admin permission, checked befo
 spending and again before updating the cursor. New toolchain tags must be at or
 behind the cursor; see [the policy](https://github.com/TauCetiProject/TauCeti/blob/main/docs/security-audit.md).
 
+To catch up a large backlog, an admin can run several isolated reviewers at once
+on the same audit state:
+
+```bash
+python3 -m tauceti_worker.security_audit pool --state /path/to/worker/state/security-audit \
+  --parallel 8 --agent codex
+```
+
+The pool plans a window of consecutive batches ahead of the cursor, each exactly as
+`work` would plan it from that batch's start, and inspects them concurrently in
+separate attempt directories. The cursor advances only through the ordinary admin
+update, one batch at a time and only past validated passes, so a later batch that
+finishes first waits for its predecessors. A finding or incomplete verdict is
+binding: it is never inspected again, nothing beyond it advances, and the usual
+block and alert are recorded. Operational failures with no recorded judgment get
+at most two fresh attempts before blocking. An operational block left at the cursor
+by an ordinary round is archived and inspected afresh; source findings never are.
+Passing results persist under `pool/` and are reused after a restart only when the
+rebuilt input is byte-identical and still the next main prefix. While the pool
+holds `pool.lock`, ordinary audit rounds for that state defer to it. Planning reads
+refs with `git ls-remote`; admin checks and cursor updates still use the API, and a
+rate limit defers them until reset without failing reviews. `--agent` fixes the
+reviewer for the whole run. Subscription pacing applies to new launches unless
+`--ignore-quota` is given; Haiku reviews billed to an API key are not paced.
+
 An admin initializes the protections and original audited snapshot once with:
 
 ```bash
