@@ -671,7 +671,7 @@ class FailureAttribution(unittest.TestCase):
         self.assertIsNone(Controller._policy_member({"head": "c" * 40, "number": 7}, members))
         self.assertEqual(
             attribution.policy_references([{"kind": "policy", "member_head": "b" * 40, "source_pr": 7}]),
-            [{"head": "b" * 40, "number": 7, "source": None}],
+            [{"head": "b" * 40, "number": 7, "source": None, "measured": "accepted-head"}],
         )
         self.assertEqual(escalation.named_members([{"kind": "policy", "member_head": "b" * 40, "source_pr": 7}]), [])
 
