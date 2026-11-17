@@ -129,6 +129,40 @@ class AdmissionTests(unittest.TestCase):
         self.assertNotIn((head, "build"), self.github.statuses)
         self.assertNotIn((head, "self-tested/1"), self.github.statuses)
 
+    def self_tested(self, files):
+        head = self.github.create_pr(1, files)
+        self.review(1)
+        self.github.labels[1].add("self-tested")
+        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
+        return head
+
+    def test_self_tested_heads_must_pass_the_pr_level_diff_guards(self):
+        long = "".join(f"theorem t{i} : {i} = {i} := rfl\n" for i in range(1001))
+        head = self.self_tested({"TauCeti/Long.lean": long})
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(self.controller.inputs(), [])
+        decision = json.loads(self.intake.state.get(1)["decision"])
+        self.assertIn("TauCeti/Long.lean: new Lean files must be at most 1000 lines", decision["reason"])
+        comments = [json.loads(row["payload"]) for row in self.controller.store.rows("outbox", {"kind": "comment"})]
+        self.assertEqual(len(comments), 1)
+        self.assertIn("cannot join the merge queue", comments[0]["body"])
+        self.assertIn(f"diff-guard:{head}", comments[0]["marker"])
+        # Re-evaluating the same head does not repeat the explanation.
+        self.intake.invalidate(1)
+        self.intake.run_once()
+        self.assertEqual(len(self.controller.store.rows("outbox", {"kind": "comment"})), 1)
+
+    def test_self_tested_heads_within_the_diff_guards_are_admitted(self):
+        self.self_tested({"TauCeti/Short.lean": "-- short\n" * 1000})
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.assertEqual(self.controller.store.rows("outbox", {"kind": "comment"}), [])
+
+    def test_ci_built_heads_rely_on_pr_ci_for_the_diff_guards(self):
+        with mock.patch("tauceti_queue.diff_guard.violations") as measure:
+            self.ready()
+            self.assertEqual(self.intake.run_once()["approved"], 1)
+        measure.assert_not_called()
+
     def test_untrusted_label_and_label_removal_cannot_bypass_ci(self):
         head = self.ready()
         del self.github.statuses[(head, "build")]

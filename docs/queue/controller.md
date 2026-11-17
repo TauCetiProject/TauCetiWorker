@@ -29,13 +29,14 @@ Tables:
 | `settings` | runtime settings and controller state (`state:*` keys: canonical SHA, inference hold, counters, Bors's external head, the last approval poll) as JSON, with actor and time |
 | `inputs` | approved inputs: repository, PR, accepted head, title, description, author, evidence, reviewer, priority, urgent flag, state, age (`approved_at`), retained ref, probe history (`probes`, `last_probe`, `last_probe_tip`, `passes_waited`), the `no_repair` opt-out and, for a `problem-anticipated` withdrawal, `anticipated` (JSON: batch, member, commit, `interacting`, `file`, `finding`, the agent's `explanation`, `stage`, times) |
 | `batches` | identity, version, base, tip, sealed flag, state (`open`, `head`, `landed`, `removed`), expected parent for promotion, urgent flag, first dispatch time |
-| `members` | per batch and position: input, `Source-PR`, accepted head, current commit, provenance (`clean` or `edited`), the task that edited it, the accumulated explanation, every edited commit SHA, the `no_repair` opt-out, `withdrawn` (an emptied `no_repair` member: its empty commit stays in the chain, the PR does not land) |
+| `members` | per batch and position: input, `Source-PR`, accepted head, current commit, provenance (`clean` or `edited`), the task that edited it, the accumulated explanation, every edited commit SHA, the `no_repair` opt-out, `withdrawn` (a member the queue sent back: an emptied `no_repair` member, or one an adopted repair emptied; its empty commit stays in the chain, the PR does not land) |
 | `claims` | batch identity and version, operation (`insert`, `rebase`, `task:repair`, `task:rebase_conflict`), worker identity and GitHub login, token, starting tip, expiry, renewal, release and its reason |
 | `tasks` | repair and rebase-conflict tasks: batch and version, base, tip, `onto`, diagnostics, state (`open`, `submitted`, `superseded`), counts of claims and submissions |
 | `batch_tips` | every tip a batch has had: batch, version, tip SHA and the time it was recorded (written wherever the tip changes: insertion, adoption, rebase, rebuild, and at dispatch for a version not yet recorded) |
 | `submissions` | every submitted chain with its retained ref, accepted flag and reason |
 | `ci_attempts` | every dispatch: head and base SHA, dispatch id, bound run id and attempt, status, conclusion, runner, labels, host, phases, progress timestamps, outcome (`pending`, `pass`, `source-failure`, `infrastructure`, `superseded`), diagnostics and the `repair_outputs_revs` the dispatch sent |
-| `outbox` | pending side effects (`promote`, `comment`, `close_pr`, `labels`, `retain_ref`) with an idempotency key, attempt count, history and next attempt time |
+| `outbox` | pending side effects (`promote`, `comment`, `close_pr`, `labels`, `retain_ref`, `notify`) with an idempotency key, attempt count, history and next attempt time |
+| `failures` | one row per failed head CI attempt: its fingerprint, the members it names, its finding lines and what the controller did (`repair`, `withdraw`, `bisect`, `dissolve`, `hold`); see [escalation.md](escalation.md) |
 | `journal` | append-only log of what the controller did (`approved`, `inserted`, `sealed`, `rebased`, `dispatched`, `ci-pass`, `task`, `claimed`, `adopted`, `landed`, ...) for status and tests |
 
 Retained refs in the clone and, when publication is enabled, on GitHub through the outbox:
@@ -57,7 +58,11 @@ dispatch pushes the head's batch ref itself only when the outbox has not already
 Inputs: `waiting` -> `reserved` (during a probe) -> `inserted` (a member) -> `landed`; or
 `cancelled` with a reason (`unapproved`, `cancelled`, `closed`, `head-changed`, `draft`,
 `merged-externally`, `landed-externally`, `conflicts-with-main`, `superseded-by-new-approval`,
-`problem-anticipated`, `empty-commit`).
+`problem-anticipated`, `empty-commit`, `queue-withdrawn`). A head failure that repair does not
+resolve is escalated, each time with an alert and a Zulip direct message: withdrawal of the members
+it names or that attribution finds, else bisection as the last resort; see [`escalation.md`](escalation.md). An ordinary member an adopted repair reduces to an empty commit
+is withdrawn at adoption with reason `empty-commit` (`_withdraw_member`; see
+[`reject-empty-commits.md`](reject-empty-commits.md)).
 A member is never withdrawn by its author or reviewers: `unapprove`, `cancel`, a closing or
 relabelling event on a member PR are journaled (`member-event-ignored`, `withdrawal-refused`) and
 change nothing, except that a `labeled`/`unlabeled` event for one of the `no_repair_labels` updates

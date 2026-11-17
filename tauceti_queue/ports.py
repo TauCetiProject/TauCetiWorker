@@ -86,6 +86,8 @@ class AdmissionSnapshot:
     diff_version: str = ""
     discovery_version: str = ""
     self_tested: bool = False  # Inline trusted-author/scope eligibility, never a workflow receipt.
+    # Failed PR-level diff guards (diff_guard.violations) for heads admission measured; empty passes.
+    diff_guard: tuple[str, ...] = ()
 
     def source(self) -> dict[str, Any]:
         return {

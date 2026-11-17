@@ -109,6 +109,8 @@ scripted already-landed notes remain separate. Historical ambiguous empties stay
 `empty_unknown`.
 
 Members rejected at batch landing are shown as `rejected_empty`, with no `landed_at` timestamp.
+Members an adopted repair emptied, which the queue withdrew at once and sent back to their authors,
+are shown as `withdrawn_empty`.
 The input's landing timestamp, rather than the batch's, is used for each member.
 
 The module's local JSON output is prepared public data; keep its parent directory

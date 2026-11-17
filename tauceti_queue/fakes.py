@@ -733,8 +733,11 @@ class FakeGitHub:
         local = accepted(
             pull.labels, member=pull.author_login in getattr(self, "self_tested_members", set())
         ) and allowed_paths(paths)
+        from . import diff_guard
+
+        guard = diff_guard.violations(self.repo.clone, base, pull.head_sha) if local else ()
         return AdmissionSnapshot(
-            pull, base, paths, tuple(source["comments"]), source["statuses"], base, self_tested=local
+            pull, base, paths, tuple(source["comments"]), source["statuses"], base, self_tested=local, diff_guard=guard
         )
 
     def list_open_pull_requests(
