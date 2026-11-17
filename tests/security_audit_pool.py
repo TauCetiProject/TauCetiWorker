@@ -63,6 +63,7 @@ class PoolFixture(unittest.TestCase):
             patch.object(sa, "refresh"),
             patch.object(sa, "require_admin"),
             patch.object(sa, "api", return_value={"login": "admin"}),
+            patch.object(sa, "admin_login", return_value="admin"),
             patch.object(sa, "advance", side_effect=advance),
             patch.object(sa, "dispatch_advanced"),
             patch.object(sa, "remote_sha", side_effect=remote_sha),
