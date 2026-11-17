@@ -181,6 +181,19 @@ git clone https://github.com/TauCetiProject/TauCetiWorker.git ~/TauCetiQueue
 ~/TauCetiQueue/services/queue/install.sh --revision <sha>    # a pinned revision
 ```
 
+**The controller and the repair workers run origin/main HEAD from `~/TauCetiQueue`.** Never use
+systemd drop-ins (`~/.config/systemd/user/tauceti-queue*.service.d/*.conf`) for queue units: they
+silently override the installed unit and each other, so `~/TauCetiQueue`, `git log` and the
+installers stop describing what runs. `install.sh` and `install-repair.sh` refuse to run while one
+exists for the unit they install. Settings belong in `~/.config/tauceti-queue/environment` (or
+`repair-environment*`) or in the unit files in this repository.
+
+Running any revision other than origin/main HEAD (`--revision`, `--checkout` or
+`TAUCETI_QUEUE_CHECKOUT`) requires explicit permission from a human operator, and the installers
+print a warning when it happens. Whoever does it must rerun the installer with no arguments as soon
+as their change lands on main. `/status` reports the running revision, so such a deployment stays
+visible.
+
 `services/queue/install.sh` is idempotent. It fetches, fast-forwards the checkout to the requested
 revision (refusing local modifications or a non-fast-forward target rather than forcing), runs `uv
 sync`, bakes the revision into `tauceti_queue/_revision.py`, writes `config.toml` and `environment` from
@@ -581,6 +594,9 @@ git clone https://github.com/TauCetiProject/TauCetiWorker.git ~/TauCetiQueue   #
 ~/TauCetiQueue/services/queue/install-repair.sh --revision <sha>  # a pinned revision
 ~/TauCetiQueue/services/queue/install-repair.sh --instance 2      # another worker
 ```
+
+The rules in [Install and update](#install-and-update) apply here too: no drop-ins, and origin/main HEAD
+unless a human operator has given permission for another revision.
 
 `install-repair.sh` is idempotent and live. It fast-forwards the checkout, runs `uv sync`, writes
 `~/.config/tauceti-queue/repair-environment` from `services/queue/repair-environment.example` when

@@ -62,7 +62,11 @@ class Attribution:
 
 
 def policy_references(diagnostics: Iterable[Any]) -> list[dict[str, Any]]:
-    """The members the review-size policy's findings name, as `{"head", "number", "source"}`."""
+    """The members the review-size policy's findings name, as `{"head", "number", "source", "measured"}`.
+
+    `measured` is `"batch-commit"` when the policy measured the member's own commit in the batch chain,
+    which a repair inside the batch can change, else `"accepted-head"`, which no repair can change.
+    """
     references = []
     for finding in diagnostics:
         if isinstance(finding, Mapping) and finding.get("kind") == "policy" and finding.get("member_head"):
@@ -71,6 +75,7 @@ def policy_references(diagnostics: Iterable[Any]) -> list[dict[str, Any]]:
                     "head": finding["member_head"],
                     "number": finding.get("source_pr"),
                     "source": finding.get("source"),
+                    "measured": "batch-commit" if finding.get("measured") == "batch-commit" else "accepted-head",
                 }
             )
     return references

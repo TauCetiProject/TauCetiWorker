@@ -18,6 +18,12 @@
 #                    restart picks up the new revision; verification then reports the old one).
 #   --wait SECONDS   how long to wait for /status after the restart (default: 90).
 #
+# WARNING: the controller runs origin/main HEAD from ~/TauCetiQueue. Never use a systemd drop-in
+# (~/.config/systemd/user/tauceti-queue.service.d/*.conf) for it: this script refuses to run while
+# one exists. Running any other revision (--revision, --checkout or TAUCETI_QUEUE_CHECKOUT) requires
+# explicit permission from a human operator, and whoever does it must rerun this script with no
+# arguments as soon as their change lands on main.
+#
 # Exit status: 0 when the service answers with the installed revision; 1 on a setup failure;
 # 2 when the service answers with a different revision (or not at all).
 set -euo pipefail
@@ -36,13 +42,27 @@ while [ $# -gt 0 ]; do
     --checkout) CHECKOUT="$2"; shift 2 ;;
     --no-restart) RESTART=0; shift ;;
     --wait) WAIT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown argument $1" >&2; exit 1 ;;
   esac
 done
 
 log() { echo "install.sh: $*" >&2; }
 die() { log "$*"; exit 1; }
+override_warning() {
+  log "WARNING: $1. Running the controller at anything other than origin/main HEAD requires explicit"
+  log "WARNING: permission from a human operator, and must be undone (rerun install.sh with no"
+  log "WARNING: arguments) as soon as the change lands on main."
+}
+# Drop-ins silently override the installed unit (and each other), so the running code stops being
+# the checkout's. Refuse before touching anything.
+for dropin in "$UNIT_DIR"/tauceti-queue.service.d/*.conf "$UNIT_DIR"/tauceti-queue-backup.service.d/*.conf; do
+  if [ -e "$dropin" ]; then
+    die "systemd drop-in $dropin overrides the installed unit; queue units must not use drop-ins. Move it out of $(dirname "$dropin"), then rerun"
+  fi
+done
+if [ "$REVISION" != "origin/main" ]; then override_warning "installing --revision $REVISION, not origin/main"; fi
+if [ "$CHECKOUT" != "$HOME/TauCetiQueue" ]; then override_warning "installing from $CHECKOUT, not ~/TauCetiQueue"; fi
 
 command -v git >/dev/null || die "git is required"
 command -v uv >/dev/null || die "uv is required (https://docs.astral.sh/uv/)"

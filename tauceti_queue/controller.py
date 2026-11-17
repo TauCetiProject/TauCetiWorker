@@ -142,8 +142,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "failure_repeat_limit": 2,
     "repair_fruitless_claim_limit": 3,
     "source_failure_round_limit": 6,
-    # A member the source member review-size policy rejects by name is withdrawn at its first failure:
-    # the policy measures the member's accepted head, which no repair can change.
+    # A member the source member review-size policy rejects by name, measured on its accepted head (a
+    # TauCetiTools before the batch-chain measure, or a member whose batch commit it could not identify),
+    # is withdrawn at its first failure: no repair can change that head. A rejection measured on the
+    # member's own commit in the batch chain is repairable and follows the ladder above.
     "policy_rejection_withdraw": True,
     # Attribution that implicates more members than this is not trusted (a systemic failure, such as a
     # broken base, implicates many); the head is bisected instead. 0: no bound.
@@ -6393,13 +6395,21 @@ class Controller:
         repeat_limit = int(self.setting("failure_repeat_limit"))
         round_limit = int(self.setting("source_failure_round_limit"))
         if self.setting("policy_rejection_withdraw"):
+            # Only a rejection measured on a member's accepted head is beyond repair. One measured on the
+            # member's own commit in the batch chain goes to repair like any other failure (a repair may
+            # split the change inside the batch), and the thresholds below withdraw it if that fails.
             diagnostics = loads(attempt["diagnostics"], [])
             active = [m for m in self._members(head["id"]) if not m["withdrawn"]]
-            if self._resolve_members(attribution.policy_references(diagnostics), active):
+            unrepairable = [
+                reference
+                for reference in attribution.policy_references(diagnostics)
+                if reference["measured"] != "batch-commit"
+            ]
+            if self._resolve_members(unrepairable, active):
                 self._escalate(
                     head,
                     failure,
-                    "the member review-size policy rejected it, and the policy measures the accepted head, "
+                    "the member review-size policy rejected it, and the policy measured the accepted head, "
                     "which no repair can change",
                     now,
                 )
