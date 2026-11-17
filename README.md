@@ -442,8 +442,13 @@ subscription is under pace, then Haiku on the Claude subscription while that is 
 pace, then Haiku billed to the API key in `TAUCETI_SECURITY_AUDIT_ANTHROPIC_API_KEY_FILE`
 regardless of pace. With none available, new batches wait. Pacing is the ordinary
 `work` verdict, and `--ignore-quota` overrides soft pacing only. A batch keeps its
-provider for life: Codex retries continue the same native session, and Claude retries
-start a fresh Haiku session, preferring the same credential and moving from the
+provider for life, and retries continue the reviewer's own session: Codex resumes its
+native rollout, and protocol-4 Haiku resumes its Claude session (`claude -p --resume`),
+which the Worker retains under the attempt's `claude-projects/`. Haiku may return
+`unfinished` with no findings to continue reading, exactly as Luna does. Any earlier
+finding or uncertainty in the session or the captured stream-json output binds the
+batch, and a fresh Haiku attempt starts only when no valid session is retained and
+that output holds none. Claude retries prefer the same credential, moving from the
 subscription to the API key when the subscription goes over pace. `--agent codex` or
 `--agent claude` pins one provider. The ledger and `pool/` result files record each
 review's provider, model and credential kind, never the key.
