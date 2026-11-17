@@ -942,8 +942,12 @@ def strip_recovery_prefixes(prompt: str, work: Path, batch: dict, *, protocol=3)
         SERVED_CONTINUE_PROMPT,
         INLINE_CONTINUE_PROMPT,
     ]
-    if (work / "coverage-before.json").exists():
-        prefixes.append(continuation_prompt(batch, work / "coverage-before.json", protocol=protocol))
+    # coverage-before.json is rewritten when the next coverage turn is prepared,
+    # before that turn's prompt.txt. If the Worker stops in between, the retained
+    # prompt was built from the launch checkpoint that reconcile_coverage saved.
+    for name in ("coverage-before.json", "coverage-before-launch.json"):
+        if (work / name).exists():
+            prefixes.append(continuation_prompt(batch, work / name, protocol=protocol))
     while any(prompt.startswith(p) for p in prefixes):
         prompt = prompt[len(next(p for p in prefixes if prompt.startswith(p))) :]
     return prompt

@@ -706,6 +706,59 @@ class ServedJudgments(unittest.TestCase):
             advance.assert_called_once()
         self.assertFalse((self.work / "blocked.json").exists())
 
+    def test_worker_killed_between_coverage_turns_resumes_the_retained_attempt(self):
+        (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture","refresh_token":"fixture"}}')
+        calls = 0
+
+        class Killed(BaseException):
+            pass
+
+        def model(argv, **kwargs):
+            nonlocal calls
+            calls += 1
+            args = json.loads(next(v.split("=", 1)[1] for v in argv if v.startswith("mcp_servers.audit.args=")))
+            r = ar.Reader(self.batch, Path(args[3]))
+            pages = list(range(len(r.pages))) if calls == 3 else [len(r.coverage()["served"])]
+            for page in pages:
+                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            value = {"verdict": "pass" if calls == 3 else "unfinished", "findings": []}
+            append_native_reads(kwargs["cwd"], pages, self.thread, self.batch)
+            historical.append_native(kwargs["cwd"], value, self.thread)
+            events = [
+                {"type": "thread.started", "thread_id": self.thread},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(value)}},
+                {"type": "turn.completed"},
+            ]
+            events = read_events("codex", pages) + events
+            return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
+
+        sleeps = 0
+
+        def sleep(_):
+            # The Worker is killed while waiting to launch the next coverage turn,
+            # after the continuation for that unlaunched turn has been prepared.
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps == 2:
+                raise Killed
+
+        with (
+            patch.object(sa, "codex_dir", return_value=self.work),
+            patch.object(sa, "run_process", side_effect=model),
+            patch.object(sa.time, "sleep", side_effect=sleep),
+            patch.object(sa, "advance", return_value="b" * 40) as advance,
+        ):
+            with patch.object(recovery.time, "time", return_value=1000), self.assertRaises(Killed):
+                recovery.recover(self.cfg, self.opts, self.block)
+            self.assertEqual(calls, 2)
+            previous = json.loads((self.work / "blocked.json").read_text())
+            self.assertEqual(previous["reason"], "security-audit: operational recovery interrupted")
+            with patch.object(recovery.time, "time", return_value=1301):
+                self.assertTrue(recovery.recover(self.cfg, self.opts, previous))
+            self.assertEqual(calls, 3)
+            advance.assert_called_once()
+        self.assertFalse((self.work / "blocked.json").exists())
+
 
 class FreshRun(unittest.TestCase):
     setUp = historical.Run.setUp
