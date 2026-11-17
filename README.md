@@ -406,6 +406,10 @@ pacing only when explicitly selected; hard limits still apply.
 This phase can run alone or alongside bump/progress maintenance. It cannot use `--pr` or authoring-model overrides,
 and is never enabled by `--skip` alone. `--agent codex` uses `gpt-6-luna`;
 `--agent claude` uses Haiku, with ordinary subscription pacing and no expensive fallback.
+To bill Haiku reviews to the Claude API instead, set
+`TAUCETI_SECURITY_AUDIT_ANTHROPIC_API_KEY_FILE` to an absolute path to a mode-0600 file
+containing only the key. Only the isolated client process receives it, and retained
+evidence records a placeholder instead of the key.
 It uses its own isolated launcher regardless of the ordinary host/Bubble setting.
 The active GitHub credential must have repository-admin permission, checked before
 spending and again before updating the cursor. New toolchain tags must be at or

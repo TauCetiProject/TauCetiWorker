@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -372,6 +373,31 @@ def bind_verdict(value, batch: dict) -> dict:
     return validate_verdict(
         {"input_digest": batch["input_digest"], "commits": [c["sha"] for c in batch["commits"]], **value}, batch
     )
+
+
+API_KEY_FILE_ENV = "TAUCETI_SECURITY_AUDIT_ANTHROPIC_API_KEY_FILE"
+
+
+def anthropic_api_key() -> str | None:
+    """Return the configured Claude API key for Haiku reviews, if any.
+
+    The setting names an absolute path to a regular, owner-only file holding
+    only the key. Without it, Haiku reviews use the subscription credential.
+    """
+    value = os.environ.get(API_KEY_FILE_ENV)
+    if not value:
+        return None
+    path = Path(value)
+    try:
+        st = path.lstat()
+    except OSError as exc:
+        raise Die(f"security-audit: cannot read {API_KEY_FILE_ENV}") from exc
+    if not path.is_absolute() or not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise Die(f"security-audit: {API_KEY_FILE_ENV} must name an absolute mode-0600 file owned by this user")
+    key = path.read_text().strip()
+    if not key or any(c.isspace() for c in key):
+        raise Die(f"security-audit: {API_KEY_FILE_ENV} must contain only the API key")
+    return key
 
 
 def reviewer_argv(provider: str, *, goals: bool = True, protocol: int = 3) -> list[str]:
@@ -1039,7 +1065,10 @@ def run_client(
             serialize(
                 {
                     "argv": cmd,
-                    "environment": env,
+                    # Never persist a provider API key in retained evidence.
+                    "environment": {
+                        k: ("<anthropic-api-key-file>" if k == "ANTHROPIC_API_KEY" else v) for k, v in env.items()
+                    },
                     "paged": paged,
                     "protocol_version": protocol,
                     "legacy_history": legacy_history,
@@ -1408,7 +1437,12 @@ def inspect(
         )
         dest = home / (".codex/auth.json" if provider == "codex" else ".claude/.credentials.json")
         dest.parent.mkdir(parents=True)
-        if source.is_file():
+        api_key = anthropic_api_key() if provider == "claude" else None
+        if api_key:
+            # API billing, independent of subscription pacing. The key reaches only
+            # the isolated client process; the reviewer has no tool to read it.
+            env["ANTHROPIC_API_KEY"] = api_key
+        elif source.is_file():
             _mirror_creds_file(
                 source,
                 dest,
@@ -1428,9 +1462,10 @@ def inspect(
             dest.chmod(0o600)
         else:
             raise Die("security-audit: no Codex subscription credential available")
-        if not dest.is_file():
-            raise Die("security-audit: no usable subscription access token available")
-        dest.chmod(0o600)
+        if not api_key:
+            if not dest.is_file():
+                raise Die("security-audit: no usable subscription access token available")
+            dest.chmod(0o600)
         policy = (
             (SERVED_MODEL_PROMPT if provider == "codex" else SERVED_CLAUDE_PROMPT)
             if protocol == 4
