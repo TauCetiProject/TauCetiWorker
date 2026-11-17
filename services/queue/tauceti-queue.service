@@ -5,6 +5,11 @@
 # through /status afterwards. The process reads ~/.config/tauceti-queue/config.toml and the
 # optional environment file below; secrets live in ~/.config/tauceti-queue/ (mode 0600), never in
 # this unit. Logs go to the journal: `journalctl --user -u tauceti-queue -f`.
+#
+# WARNING: the controller runs origin/main HEAD from ~/TauCetiQueue. A drop-in under
+# ~/.config/systemd/user/tauceti-queue.service.d/ (or an install.sh --revision/--checkout) that runs
+# anything else requires explicit permission from a human operator, and whoever adds it must remove
+# it and rerun install.sh with no arguments as soon as their change lands on main.
 
 [Unit]
 Description=Tau Ceti AI merge queue service

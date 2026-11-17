@@ -18,6 +18,12 @@
 #                    restart picks up the new revision; verification then reports the old one).
 #   --wait SECONDS   how long to wait for /status after the restart (default: 90).
 #
+# WARNING: the controller runs origin/main HEAD from ~/TauCetiQueue. Running it at anything else
+# (--revision, --checkout or TAUCETI_QUEUE_CHECKOUT here, or a systemd drop-in under
+# ~/.config/systemd/user/tauceti-queue.service.d/) requires explicit permission from a human
+# operator. Whoever sets such an override must remove it as soon as their change lands on main:
+# delete the drop-in and rerun this script with no arguments.
+#
 # Exit status: 0 when the service answers with the installed revision; 1 on a setup failure;
 # 2 when the service answers with a different revision (or not at all).
 set -euo pipefail
@@ -36,13 +42,20 @@ while [ $# -gt 0 ]; do
     --checkout) CHECKOUT="$2"; shift 2 ;;
     --no-restart) RESTART=0; shift ;;
     --wait) WAIT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown argument $1" >&2; exit 1 ;;
   esac
 done
 
 log() { echo "install.sh: $*" >&2; }
 die() { log "$*"; exit 1; }
+override_warning() {
+  log "WARNING: $1. Running the controller at anything other than origin/main HEAD requires explicit"
+  log "WARNING: permission from a human operator, and must be undone (remove the drop-in, rerun"
+  log "WARNING: install.sh with no arguments) as soon as the change lands on main."
+}
+if [ "$REVISION" != "origin/main" ]; then override_warning "installing --revision $REVISION, not origin/main"; fi
+if [ "$CHECKOUT" != "$HOME/TauCetiQueue" ]; then override_warning "installing from $CHECKOUT, not ~/TauCetiQueue"; fi
 
 command -v git >/dev/null || die "git is required"
 command -v uv >/dev/null || die "uv is required (https://docs.astral.sh/uv/)"
@@ -114,6 +127,9 @@ for unit in tauceti-queue.service tauceti-queue-backup.service tauceti-queue-bac
   install -m 0644 "services/queue/$unit" "$UNIT_DIR/$unit"
 done
 systemctl --user daemon-reload
+for dropin in "$UNIT_DIR"/tauceti-queue.service.d/*.conf; do
+  if [ -e "$dropin" ]; then override_warning "systemd drop-in $dropin overrides the installed unit"; fi
+done
 systemctl --user enable --quiet tauceti-queue.service tauceti-queue-backup.timer
 systemctl --user start tauceti-queue-backup.timer
 

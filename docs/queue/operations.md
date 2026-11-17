@@ -181,6 +181,13 @@ git clone https://github.com/TauCetiProject/TauCetiWorker.git ~/TauCetiQueue
 ~/TauCetiQueue/services/queue/install.sh --revision <sha>    # a pinned revision
 ```
 
+**The controller runs origin/main HEAD from `~/TauCetiQueue`.** Running it at anything else, whether
+by `install.sh --revision`, `--checkout` or `TAUCETI_QUEUE_CHECKOUT`, or by a systemd drop-in under
+`~/.config/systemd/user/tauceti-queue.service.d/` pointing at another directory, requires explicit
+permission from a human operator. Whoever sets such an override must remove it as soon as their change
+lands on main: delete the drop-in, `systemctl --user daemon-reload`, and rerun `install.sh` with no
+arguments. `install.sh` prints a warning whenever it sees one of these overrides.
+
 `services/queue/install.sh` is idempotent. It fetches, fast-forwards the checkout to the requested
 revision (refusing local modifications or a non-fast-forward target rather than forcing), runs `uv
 sync`, bakes the revision into `tauceti_queue/_revision.py`, writes `config.toml` and `environment` from
