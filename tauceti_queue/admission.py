@@ -19,6 +19,7 @@ from datetime import datetime
 from runner import admission_policy as policy
 
 from .admission_state import AdmissionState
+from .controller import COMMENT_MARKER
 from .eligibility import KEEP
 from .github_adapter import RequestDeferred
 from .store import dumps, loads
@@ -33,6 +34,7 @@ EXPLICIT_WITHDRAWALS = frozenset(
         "landed-externally",
         "problem-anticipated",
         "empty-commit",
+        "queue-withdrawn",
     }
 )
 CONTEXTS = ("build", "scope", "bump-guard")
@@ -179,6 +181,16 @@ class AdmissionPolicy:
             merge_base_sha=snapshot.merge_base_sha,
             self_tested=snapshot.self_tested,
         )
+        if snapshot.diff_guard:
+            # The PR-level diff guards PR CI would have run. A violating head is never admitted;
+            # review state is untouched, so a head a human already queued is not withdrawn here.
+            result = {
+                **result,
+                "merge": False,
+                "diff_guard": list(snapshot.diff_guard),
+                "reason": "PR-level diff guards failed: " + "; ".join(snapshot.diff_guard),
+            }
+            result.pop("self_tested", None)
         result["recovery_heads"] = sorted(recovery_heads(snapshot.comments))
         if result["review_safe"] and snapshot.pull.head_sha in result["recovery_heads"]:
             result.update(merge=False, reason="waiting on a trusted recovery request for this head")
@@ -519,6 +531,18 @@ class AdmissionPoller:
             rows = self.controller.store.rows(
                 "journal", {"kind": "landed", "batch_id": current["batch_id"]}, order="id DESC", limit=1
             )
+            withdrawn = self.controller.store.query(
+                "SELECT at FROM journal WHERE kind='member-withdrawn-empty' AND batch_id=? "
+                "AND json_extract(detail, '$.number')=? ORDER BY id DESC LIMIT 1",
+                (current["batch_id"], current["number"]),
+            )
+            boundary = withdrawn[0]["at"] if withdrawn else (rows[0]["at"] if rows else None)
+        elif reason == "queue-withdrawn":
+            rows = self.controller.store.query(
+                "SELECT at FROM journal WHERE kind='queue-withdrawn' AND batch_id=? "
+                "AND json_extract(detail, '$.number')=? ORDER BY id DESC LIMIT 1",
+                (current["batch_id"], current["number"]),
+            )
             boundary = rows[0]["at"] if rows else None
         # Missing history is held conservatively. Never infer approval from a comment edit.
         return boundary or self.clock(), evidence.get("authorization", "")
@@ -600,6 +624,8 @@ class AdmissionPoller:
             if human_review and approval_binding(current) != approval_binding(current_input):
                 self.state.dirty(work["number"], urgent=True)
                 return
+            if result.get("diff_guard") and pull.state == "open" and not pull.draft:
+                self._diff_guard_comment(pull, result["diff_guard"])
             requested = result["recovery_heads"]
             labels = {label.lower() for label in pull.labels}
             if (
@@ -697,6 +723,26 @@ class AdmissionPoller:
                 self.controller._count("admission_approvals")
             summary["evaluated"] += 1
         self.controller._wake.set()
+
+    def _diff_guard_comment(self, pull, violations):
+        """Tell the author once per head why admission refused it, through the existing outbox."""
+        if not self.controller.setting("publication_enabled"):
+            return
+        body = (
+            "This PR cannot join the merge queue: it fails the PR-level diff guards that PR CI runs, "
+            "which admission checks itself because the PR skipped PR CI.\n\n"
+            + "\n".join(f"- {line}" for line in violations)
+            + "\n\nRun `lake lint` locally to reproduce. Push a fix and admission will reconsider the new head."
+        )
+        self.controller._enqueue(
+            "comment",
+            f"diff-guard:{pull.number}:{pull.head_sha}",
+            {
+                "number": pull.number,
+                "body": body,
+                "marker": f"<!-- {COMMENT_MARKER} diff-guard:{pull.head_sha} -->",
+            },
+        )
 
     def _human_owned_approval(self, snapshot, current, scoreboard):
         """Keep an exact, live admin approval only where machine review is absent.

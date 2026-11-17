@@ -24,6 +24,7 @@ from tauceti_tools.ci_candidate_evidence import EvidenceUnavailable
 
 from tauceti_queue.ci_execution import ExecutionEvidence, GitHubSourceExecution
 from tauceti_queue.github_app import AppCredentials, CredentialsError, InstallationToken, InstallationTokenSource
+from tauceti_queue.harness_admission import RunnerAdmission
 from tauceti_queue.ports import DispatchNotAccepted
 
 
@@ -90,6 +91,14 @@ class Reader:
         return proof
 
 
+def caller_text(revision):
+    return (
+        "jobs:\n  candidate:\n"
+        f"    uses: team/Tools/.github/workflows/pr-build.yml@{revision}\n"
+        f"    with:\n      tools_repository: team/Tools\n      tools_ref: {revision}\n"
+    )
+
+
 class Execution(unittest.TestCase):
     def setUp(self):
         config = policy()
@@ -144,12 +153,14 @@ class Execution(unittest.TestCase):
             self.adapter.dispatch(self.frozen)
         self.assertEqual(len(self.posts), 2)  # exactly one POST per explicit call
 
-    def caller_reader(self, *, revision="b" * 40, protected=True, configuration=CONFIG, configured=None):
+    def caller_reader(
+        self, *, revision="b" * 40, protected=True, configuration=CONFIG, configured=None, caller_pin=None
+    ):
         selected = configured or policy(configuration)
         files = {
             ".tauceti/ci-source.toml": configuration,
             ".tauceti/ci-source.json": cc.canonical(selected.record(with_config=False)),
-            selected.workflow: b"# reviewed caller at an immutable commit\n",
+            selected.workflow: caller_text(caller_pin or selected.harness_revision).encode(),
         }
         reads = []
 
@@ -189,6 +200,21 @@ class Execution(unittest.TestCase):
         self.reader.metadata["full_name"] = "team/Math"
         self.caller_reader(revision="d" * 40, configured=shared, configuration=configuration)
         self.assertEqual(self.adapter.caller(shared), ("d" * 40, shared, configuration))
+
+    def test_caller_refuses_literals_that_differ_from_the_policy_harness(self):
+        # A caller that runs another harness than ci-source.json names would fail its own
+        # context check after occupying a runner, or wait on an allow-list derived from the policy.
+        self.caller_reader(caller_pin="e" * 40)
+        with self.assertRaisesRegex(ValueError, "names harness " + "a" * 40):
+            self.adapter.caller(policy())
+        files, _ = self.caller_reader()
+        files[policy().workflow] = caller_text("a" * 40).replace("tools_ref: " + "a" * 40, "tools_ref: main").encode()
+        with self.assertRaisesRegex(ValueError, "derive the literals"):
+            self.adapter.caller(policy())
+        files[policy().workflow] = b"# no harness call at all\n"
+        with self.assertRaisesRegex(ValueError, "no harness"):
+            self.adapter.caller(policy())
+        self.assertEqual(self.posts, [])
 
     def test_caller_refuses_a_configuration_that_changes_the_source_location(self):
         configuration = CONFIG.replace(b'name="team/Math"', b'name="other/Untrusted"')
@@ -486,6 +512,84 @@ class Execution(unittest.TestCase):
             observation = self.adapter.observe(self.frozen, "101", owned=True)
         self.assertIsNone(observation.result)
         self.assertFalse(observation.result_absent)
+
+
+FLEET_CONFIG = (
+    CONFIG
+    + b"""[services.fleet]
+mode="hosted"
+url="https://fleet.example"
+"""
+)
+
+
+class Opener:
+    def __init__(self, answer):
+        self.answer, self.urls = answer, []
+
+    def open(self, request, timeout):
+        self.urls.append(request.full_url)
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        body = json.dumps(self.answer).encode()
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self, limit):
+                return body[:limit]
+
+        return Response()
+
+
+class HarnessAdmission(unittest.TestCase):
+    def frozen(self, configuration=FLEET_CONFIG):
+        return SimpleNamespace(policy=policy(configuration), configuration=configuration)
+
+    def test_dispatch_waits_until_the_fleet_admits_the_frozen_harness(self):
+        revision = "a" * 40
+        for answer in (
+            {"revision": revision, "ready": False, "main_revision": "b" * 40},
+            {"revision": "b" * 40, "ready": True},
+            {"ready": True},
+            [],
+            OSError("broker unavailable"),
+        ):
+            opener = Opener(answer)
+            with self.subTest(answer=answer), self.assertRaises(DispatchNotAccepted) as caught:
+                RunnerAdmission(opener=opener, clock=lambda: 100.0).check(self.frozen())
+            self.assertTrue(caught.exception.retryable)
+            self.assertEqual(caught.exception.retry_at, 115.0)
+            self.assertEqual(opener.urls, ["https://fleet.example/v1/harness?revision=" + revision])
+        RunnerAdmission(opener=Opener({"revision": revision, "ready": True})).check(self.frozen())
+
+    def test_projects_without_a_hosted_fleet_are_not_asked(self):
+        opener = Opener(OSError("must not be called"))
+        RunnerAdmission(opener=opener).check(self.frozen(CONFIG))
+        self.assertEqual(opener.urls, [])
+
+    def test_the_fleet_origin_must_be_plain_https(self):
+        for url in (b"http://fleet.example", b"https://user@fleet.example", b"https://fleet.example/?x=1"):
+            configuration = FLEET_CONFIG.replace(b"https://fleet.example", url)
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                RunnerAdmission(opener=Opener({})).check(self.frozen(configuration))
+
+    def test_preflight_refuses_before_the_post_when_not_admitted(self):
+        execution = Execution("test_canonical_dispatch_and_no_mutation_retry_after_lost_response")
+        execution.setUp()
+        frozen = SimpleNamespace(**vars(execution.frozen), configuration=FLEET_CONFIG)
+        execution.adapter.admission = RunnerAdmission(opener=Opener({"revision": "a" * 40, "ready": False}))
+        with self.assertRaises(DispatchNotAccepted) as caught:
+            execution.adapter.dispatch(frozen)
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(execution.posts, [])
+        execution.adapter.admission = RunnerAdmission(opener=Opener({"revision": "a" * 40, "ready": True}))
+        self.assertEqual(execution.adapter.dispatch(frozen), frozen.request.request_id)
+        self.assertEqual(len(execution.posts), 1)
 
 
 if __name__ == "__main__":

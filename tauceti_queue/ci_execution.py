@@ -21,6 +21,7 @@ from tauceti_tools.forge import GITHUB
 
 from . import github_app
 from .github_adapter import GitHubAdapter, GitHubClient, UrllibTransport
+from .harness_admission import RunnerAdmission, check_caller
 from .ports import CandidateRun, DispatchNotAccepted
 from .workflow_token import WorkflowTokenSource
 
@@ -68,7 +69,7 @@ class ExecutionEvidence(GitHubEvidence):
 
 
 class GitHubSourceExecution:
-    def __init__(self, tokens, *, transport=None, reader_factory=None, clock=time.time, max_pages=10):
+    def __init__(self, tokens, *, transport=None, reader_factory=None, clock=time.time, max_pages=10, admission=None):
         if (
             not isinstance(tokens, (github_app.InstallationTokenSource, WorkflowTokenSource))
             or tokens.repository_id is None
@@ -81,6 +82,7 @@ class GitHubSourceExecution:
         if type(max_pages) is not int or not 1 <= max_pages <= 100:
             raise ValueError("invalid execution discovery page bound")
         self.tokens, self.clock, self.max_pages = tokens, clock, max_pages
+        self.admission = admission or RunnerAdmission(clock=clock)
         self.transport = transport or UrllibTransport()
         opener = (
             None
@@ -145,7 +147,8 @@ class GitHubSourceExecution:
         RequestLedger.check_configuration(policy, configuration)
         if RequestLedger.binding(policy) != RequestLedger.binding(enrolled_policy) or policy.execution_branch != "main":
             raise ValueError("protected caller changes enrolled repository or credential roles")
-        content(policy.workflow)  # The configured caller must exist at this exact revision.
+        # The configured caller must exist at this exact revision and run the policy's harness.
+        check_caller(content(policy.workflow).decode("utf-8"), policy)
         return revision, policy, configuration
 
     def _post(self, frozen, path, payload=None, *, token=None):
@@ -187,6 +190,8 @@ class GitHubSourceExecution:
                 raise DispatchNotAccepted(
                     "trusted CI caller revision changed before dispatch; prepare a fresh request", retryable=False
                 )
+            # Last, so the answer is as fresh as possible when the POST follows.
+            self.admission.check(frozen)
         except DispatchNotAccepted:
             raise
         except Exception as error:

@@ -20,7 +20,8 @@ Tables:
   tip a `prepare` task last built and repaired on the head's tip).
 - `members`: per batch and position, the member's commit and provenance (`clean` or `edited`),
   the task that edited it, the explanation collected from its message, the `no_repair` opt-out and
-  whether it was `withdrawn` (an emptied `no_repair` member whose commit stays until the head lands).
+  whether it was `withdrawn` (a member the queue sent back, an emptied `no_repair` member or one an
+  adopted repair emptied, whose empty commit stays until the head lands).
 - `claims`: batch identity and version, operation, worker identity, token, expiry, release.
 - `tasks`: repair, rebase-conflict, pre-rebase and prepare tasks with their diagnostics and state; a
   `prepare` task of a batch's pre-rebased chain carries the batch tip that chain covers
@@ -34,6 +35,10 @@ Tables:
   (`cancelled_by`, empty otherwise), why (`cancel_reason`) and GitHub's answer (`cancel_result`).
 - `outbox`: pending side effects (promotion, comments, closes, labels, ref retention) with an
   idempotency key and attempt history.
+- `failures`: one row per failed CI attempt of a head (`attempt_id` unique): its fingerprint
+  (`tauceti_queue/escalation.py`: verdict class, attributed members, digest of the finding lines),
+  the lines themselves, and what the controller did about it (`action`: `repair`, `withdraw`,
+  `bisect`, `dissolve`, `hold`), so the same failure on the same batch is recognised however often it recurs.
 - `journal`: an append-only log of what the controller did, for status and tests.
 - `identity_cache`: answers GitHub gave about workers and operators, kept across restarts so a
   restart during a quota outage does not lock them out: per `namespace` (`bearer`, a token's
@@ -302,6 +307,20 @@ CREATE TABLE IF NOT EXISTS outbox (
     result TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS outbox_state ON outbox (state, next_attempt_at);
+CREATE TABLE IF NOT EXISTS failures (
+    id INTEGER PRIMARY KEY,
+    batch_id INTEGER NOT NULL,
+    batch_version INTEGER NOT NULL,
+    attempt_id INTEGER NOT NULL UNIQUE,
+    fingerprint TEXT NOT NULL,
+    verdict_class TEXT NOT NULL,
+    members TEXT NOT NULL DEFAULT '[]',
+    digest TEXT NOT NULL,
+    lines TEXT NOT NULL DEFAULT '[]',
+    at REAL NOT NULL,
+    action TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS failures_batch ON failures (batch_id, fingerprint);
 CREATE TABLE IF NOT EXISTS identity_cache (
     namespace TEXT NOT NULL,
     key TEXT NOT NULL,
