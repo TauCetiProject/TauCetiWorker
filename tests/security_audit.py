@@ -1518,6 +1518,24 @@ class Authority(unittest.TestCase):
             cli.cmd_work(SimpleNamespace(), only=["review", "security-audit"], agent="claude", one_round=True, prs=(1,))
         admin.assert_not_called()
 
+    def test_concurrent_saves_of_one_state_file_never_collide(self):
+        import concurrent.futures
+
+        from tauceti_worker.audit_alerts import save
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "blocked.json"
+
+            def write(i):
+                for _ in range(50):
+                    save(path, {"writer": i})
+
+            with concurrent.futures.ThreadPoolExecutor(8) as pool:
+                list(pool.map(write, range(8)))
+            self.assertIn(json.loads(path.read_text())["writer"], range(8))
+            self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["blocked.json"])
+
     def test_admin_must_be_literal_true(self):
         for value in (False, None, "true", 1):
             with self.subTest(value=value), patch.object(sa, "api", return_value={"permissions": {"admin": value}}):
