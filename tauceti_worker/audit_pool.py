@@ -210,6 +210,7 @@ class Pool:
                 provider="codex" if pending_escalation else meta.get("provider"),
                 credential="subscription" if pending_escalation else meta.get("credential"),
                 escalation=meta.get("escalation"),
+                attempts=list(meta.get("attempts") or []),
             )
             if slot.status == "pass" and (not slot.verdict or slot.verdict.get("verdict") != "pass"):
                 break
@@ -682,12 +683,17 @@ class Pool:
         if (cursor, main) != self.fetched:
             sa.refresh(self.repo, cursor, main)
             self.fetched = (cursor, main)
+        self.sync(cursor, main)
         blocked = self.work / "blocked.json"
         hold = False
         if blocked.exists():
             previous = json.loads(blocked.read_text())
-            hold = previous.get("from_sha") == cursor and not self.supersede(previous)
-        self.sync(cursor, main)
+            # A launch journals its own attempt in blocked.json. One of this pool's
+            # own attempts is not a block: its slot's status already binds it.
+            mine = {str(attempt) for _, attempt in self.running.values()}
+            mine.update(a for slot in self.slots for a in slot.attempts)
+            ours = previous.get("attempt") in mine
+            hold = previous.get("from_sha") == cursor and not ours and not self.supersede(previous)
         if hold and not (self.slots and self.slots[0].status in ("pass", "blocked")):
             # The batch at the cursor holds a binding judgment this pool cannot
             # identify in its window; never plan or inspect it again. Wait for review.

@@ -63,6 +63,7 @@ class PoolFixture(unittest.TestCase):
             patch.object(sa, "refresh"),
             patch.object(sa, "require_admin"),
             patch.object(sa, "api", return_value={"login": "admin"}),
+            patch.object(sa, "admin_login", return_value="admin"),
             patch.object(sa, "advance", side_effect=advance),
             patch.object(sa, "dispatch_advanced"),
             patch.object(sa, "remote_sha", side_effect=remote_sha),
@@ -516,6 +517,60 @@ class Escalation(PoolFixture):
         self.serve(lambda batch, attempt: self.verdict(batch))
         self.assertEqual([i for i, _, _, _ in self.launches if i == 0], [])
         self.assertEqual(self.advanced, [])
+
+
+class OwnJournal(PoolFixture):
+    def test_a_running_launch_journal_at_the_cursor_does_not_idle_the_pool(self):
+        self.pace["codex"] = False
+        self.key = "sk-ant-fixture-secret"
+
+        def inspect(batch, attempt):
+            if self.index(batch) == 0:
+                # Launches journal their attempt; this one is escalated and still running.
+                (self.state / "blocked.json").write_text(
+                    sa.serialize(
+                        {
+                            "from_sha": batch["from_sha"],
+                            "to_sha": batch["commits"][-1]["sha"],
+                            "attempt": str(attempt),
+                            "reason": "security-audit: operational recovery interrupted",
+                        }
+                    )
+                )
+                if self.launches[-1][1] == "claude":
+                    return self.verdict(batch, "incomplete", ["unclear"])
+            return self.verdict(batch)
+
+        self.serve(inspect)
+        self.assertEqual(len(self.advanced), 3)
+
+
+class OwnJournalRestart(PoolFixture):
+    def test_restart_with_own_journal_at_cursor_still_runs_the_escalation(self):
+        self.pace["codex"] = False
+        self.key = "sk-ant-fixture-secret"
+
+        def first(batch, attempt):
+            if self.index(batch) == 0:
+                (self.state / "blocked.json").write_text(
+                    sa.serialize(
+                        {
+                            "from_sha": batch["from_sha"],
+                            "to_sha": batch["commits"][-1]["sha"],
+                            "attempt": str(attempt),
+                            "reason": "security-audit: operational recovery interrupted",
+                        }
+                    )
+                )
+                return self.verdict(batch, "incomplete", ["unclear"])
+            return self.verdict(batch)
+
+        with patch.object(pool.Chooser, "retry", lambda chooser, slot: None):
+            self.serve(first, stop=lambda p: any(s.escalation == "pending" for s in p.slots) and not p.running)
+        self.launches.clear()
+        self.serve(lambda batch, attempt: self.verdict(batch))
+        self.assertEqual([p for i, p, _, _ in self.launches if i == 0], ["codex"])
+        self.assertEqual(len(self.advanced), 3)
 
 
 class Lookahead(PoolFixture):
