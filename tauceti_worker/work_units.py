@@ -958,14 +958,21 @@ def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool | None
     # An unrelated/human PR (or, under multi-worker, another worker's concurrent PR) that shows up
     # mid-round must not mask this round's no-op. Conservative: if we can't read a body, assume ours.
     marked = unknown = False
+    suffix, owner = pre.get("authored_suffix"), pre.get("authored_owner")
     for num in sorted(new):
-        v = w.gh.pr_view(num, ["body", "headRefName"])
+        v = w.gh.pr_view(num, ["body", "headRefName", "headRepositoryOwner"])
         if v is None:
             unknown = True
             continue
         if TARGET_MARKER_RE.search(v.get("body") or ""):
             marked = True
-            if (v.get("headRefName") or "").endswith("-" + w.cfg.wid):
+            head_owner = (v.get("headRepositoryOwner") or {}).get("login") or ""
+            if (
+                suffix
+                and owner
+                and (v.get("headRefName") or "").endswith(suffix)
+                and head_owner.lower() == owner.lower()
+            ):
                 _record_authored(num)
     return True if marked else None if unknown else False
 
@@ -3055,6 +3062,12 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     # builds against canonical main (the bubble/checkout still targets TAUCETI) — only the push redirects.
     fork = ensure_fork()
     fork_owner = fork.split("/", 1)[0]
+    from .activity import current_round_id
+
+    # Worker ids may contain hyphens, so `-<wid>` alone can be the tail of another worker's branch.
+    branch_tag = f"{w.cfg.wid}-{(current_round_id() or os.urandom(16).hex())[:12]}"
+    if c.progress is not None:
+        c.progress.update(authored_suffix="-" + branch_tag, authored_owner=fork_owner)
     os.environ["TAUCETI_PUSH_REMOTE"] = source_repository_url(fork)
     os.environ.pop("TAUCETI_PUSH_EXPECT", None)  # a fresh branch ⇒ create-only CAS on the fork
     source = getattr(opts, "source", None)
@@ -3129,7 +3142,7 @@ other contributors' claims, or the hard rules of the repo.
                 CLAIMED=claimed_str,
                 AGENT=opts.agent_name,
                 FORK=fork_owner,
-                WORKERID=w.cfg.wid,
+                WORKERID=branch_tag,
                 ROADMAP_DIR="/opt/roadmap/" + os.environ.get("TAUCETI_ROADMAP_DIR", "TauCetiRoadmap"),
                 REVIEW_DIR="/opt/review",
                 RUBRICS=(
@@ -3156,7 +3169,7 @@ other contributors' claims, or the hard rules of the repo.
         CLAIMED=claimed_str,
         AGENT=opts.agent_name,
         FORK=fork_owner,
-        WORKERID=w.cfg.wid,
+        WORKERID=branch_tag,
         ROADMAP_DIR=str(refs / "roadmap" / os.environ.get("TAUCETI_ROADMAP_DIR", "TauCetiRoadmap")),
         REVIEW_DIR=str(refs / "review"),
         RUBRICS=(str(bundle) if bundle is not None else f"{refs / 'review' / 'rubrics'} (read every .md file in it)"),
@@ -3166,8 +3179,6 @@ other contributors' claims, or the hard rules of the repo.
         QUALITY_SCOPE=quality_scope(),
         BIN=wrapper_bin(),
     )
-    from .activity import current_round_id
-
     # Scope git-safe-push's publication records to this round so its pushes can be labelled.
     push_scope = current_round_id() or os.urandom(16).hex()
     try:

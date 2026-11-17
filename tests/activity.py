@@ -964,19 +964,33 @@ class ActivityTests(unittest.TestCase):
 
         self.finish(60)
         marker = '<!--tauceti-target:v1 {"focus":"area","id":"t"}-->'
+
+        def view(branch, owner, body=marker):
+            return dict(body=body, headRefName=branch, headRepositoryOwner=dict(login=owner))
+
         views = {
-            2: dict(body=marker, headRefName="roadmap/mine-worker"),
-            3: dict(body=marker, headRefName="roadmap/theirs-worker-2"),
-            4: dict(body="no marker", headRefName="roadmap/plain-worker"),
+            2: view("roadmap/mine-worker1-0123456789ab", "Me"),
+            # A worker whose id ends in this one's, on the same account, old and new branch shapes.
+            3: view("roadmap/peer-host-worker1", "me"),
+            4: view("roadmap/peer-host-worker1-ba9876543210", "me"),
+            # Another contributor's fork with the same worker id and even the same tag.
+            5: view("roadmap/other-worker1-0123456789ab", "someone-else"),
+            6: view("roadmap/plain-worker1-0123456789ab", "me", body="no marker"),
         }
         w = SimpleNamespace(
-            cfg=SimpleNamespace(wid="worker"),
+            cfg=SimpleNamespace(wid="worker1"),
             gh=SimpleNamespace(
-                pr_list=lambda fields, state: [dict(number=n) for n in (1, 2, 3, 4)],
+                pr_list=lambda fields, state: [dict(number=n) for n in range(1, 7)],
                 pr_view=lambda number, fields: views[number],
             ),
         )
-        self.assertIs(work_units._progressed_direct(w, SimpleNamespace(pr=None), {"prs": {1}}), True)
+        candidate = SimpleNamespace(pr=None)
+        # Without the round's own branch tag and fork owner, nothing is attributed.
+        self.assertIs(work_units._progressed_direct(w, candidate, {"prs": {1}}), True)
+        a.prepare(now=self.now + 1)
+        self.assertEqual(a.cached()["summary"]["pr_windows"]["total"]["authored"], 0)
+        pre = {"prs": {1}, "authored_suffix": "-worker1-0123456789ab", "authored_owner": "me"}
+        self.assertIs(work_units._progressed_direct(w, candidate, pre), True)
         a.prepare(now=self.now + 1)
         self.assertEqual(a.cached()["summary"]["pr_windows"]["total"]["authored"], 1)
         url = f"https://github.com/{TAUCETI}/pull/2"
