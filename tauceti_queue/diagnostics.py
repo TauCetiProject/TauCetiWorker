@@ -1,7 +1,7 @@
 """Source and infrastructure findings of a completed candidate run.
 
 The controller hands `CandidateRun.diagnostics` to the repair task unchanged and classifies the run
-by them: dicts with `kind` (`compiler`, `audit`, `lint` or `infrastructure`), `module` and
+by them: dicts with `kind` (`compiler`, `audit`, `lint`, `policy` or `infrastructure`), `module` and
 `message` (`tauceti_queue/ports.py`). The source findings are read from the `sandboxed-build` job
 log with the patterns bors-ng's `priv/failure_diagnostics.py` uses, which the staging CI contract
 guarantees (every independently failing module is reported; audit and lint findings carry the
@@ -15,6 +15,7 @@ defining module path):
 | `LINT-ENV-LOCATIONS {...}` (the environment linter's JSON findings) | `lint` on the defining path, `unknown` kept when the linter could not locate it |
 | `Some required targets logged failures:` followed by `- TauCeti.A.B` lines | `compiler` on each target, only when no located finding exists |
 | `TauCeti/A.lean: missing project import ...` and other located import-header findings | `compiler` on the importing module |
+| `MEMBER-POLICY-REJECTED {...}` (the source member review-size policy's JSON record of one member) | `policy` naming that member by its accepted head and source identity |
 
 Infrastructure findings come from the run and jobs rather than the log: a cancelled, timed out or
 startup-failed run, a lost runner (the job log says so), and a finalizer that failed to publish the
@@ -45,6 +46,11 @@ DUPLICATE = re.compile(
     r"^duplicate-declarations: (\S{1,1024}) is declared in both (" + ANY_MODULE + r") and (" + ANY_MODULE + r")$"
 )
 ENV_LOCATIONS = "LINT-ENV-LOCATIONS "
+# One line per member the source member review-size policy rejects (TauCetiTools
+# `ci_candidate_workflow.member_size_policy`): `source_pr` (the PR number), `source` (the repository
+# identity record), `source_forge`, `head` (the accepted head), `reasons` and the measured sizes.
+MEMBER_POLICY_REJECTED = "MEMBER-POLICY-REJECTED "
+SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 ENV_PATH = re.compile(r"TauCeti(?:/[A-Za-z_][A-Za-z0-9_']*)+\.lean")
 IMPORT_HEADER = re.compile(
     r"^(TauCeti(?:/[A-Za-z_][A-Za-z0-9_']*)*\.lean): "
@@ -84,6 +90,11 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
         if len(located) >= MAX_FINDINGS:
             break
         line = STAMP.sub("", ANSI.sub("", raw.rstrip("\r\n").lstrip("﻿")))
+        if line.startswith(MEMBER_POLICY_REJECTED):
+            finding = member_policy_finding(line[len(MEMBER_POLICY_REJECTED) :])
+            if finding is not None:
+                located.setdefault(("policy", finding["member_head"], finding["source_pr"]), finding)
+            continue
         if line.startswith(ENV_LOCATIONS):
             for finding in environment_findings(line[len(ENV_LOCATIONS) :]):
                 located.setdefault(("lint", finding["module"], finding.get("declaration")), finding)
@@ -147,6 +158,38 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
     if runner_lost is not None:
         findings.append(runner_lost)
     return findings
+
+
+def member_policy_finding(payload: str) -> dict | None:
+    """A `policy` finding naming the member a review-size rejection record describes, or None when the
+    record is malformed: the queue then attributes the failure as it would without the line."""
+    try:
+        data = json.loads(payload[: 16 * 1024])
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    number, head = data.get("source_pr"), data.get("head")
+    if type(number) is not int or number <= 0 or not isinstance(head, str) or not SHA.fullmatch(head):
+        return None
+    reasons = [str(r)[:200] for r in data.get("reasons") or [] if isinstance(r, str)][:8]
+    sizes = {k: data[k] for k in ("additions", "deletions", "files") if type(data.get(k)) is int}
+    forge = data.get("source_forge") if isinstance(data.get("source_forge"), str) else ""
+    measured = ", ".join(f"{k} {v}" for k, v in sizes.items())
+    message = f"member review-size policy rejected #{number} at {head[:12]}: " + ("; ".join(reasons) or "rejected")
+    finding = _finding(
+        "policy",
+        "",
+        message + (f" ({measured})" if measured else ""),
+        source_pr=number,
+        member_head=head,
+        source_forge=forge[:512],
+        reasons=reasons,
+        **sizes,
+    )
+    if isinstance(data.get("source"), dict):
+        finding["source"] = data["source"]
+    return finding
 
 
 def environment_findings(payload: str) -> list[dict]:

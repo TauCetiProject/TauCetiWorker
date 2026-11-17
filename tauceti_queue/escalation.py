@@ -81,6 +81,8 @@ def named_members(diagnostics: Iterable[Any]) -> list[Any]:
     for finding in diagnostics:
         if not isinstance(finding, Mapping) or finding.get("kind") in NON_SOURCE_KINDS:
             continue
+        if finding.get("kind") == "policy" and finding.get("member_head"):
+            continue  # named by accepted head and source (`attribution.policy_references`), not by number
         values = list(finding.get("source_prs") or [])
         values += [finding.get(key) for key in ("source_pr", "pr", "number")]
         named += [value for value in values if value not in (None, "")]
