@@ -246,7 +246,25 @@ def _exclusive(root: Path, source=None):
 
 
 def _text(low: int, high: int, *, line: bool = False):
-    return lambda v: isinstance(v, str) and low <= len(v.strip()) <= high and not (line and "\n" in v.strip())
+    """A check that a value is a string of `low` to `high` characters once stripped, on one line
+    if `line`. Its `why` says what is wrong with a value it refuses."""
+
+    def why(v) -> str:
+        if not isinstance(v, str):
+            return "not a string"
+        if not v.strip() and low:
+            return "empty"
+        if len(v.strip()) < low:
+            return f"{len(v.strip())} characters, at least {low}"
+        if len(v.strip()) > high:
+            return f"{len(v.strip())} characters, at most {high}"
+        return "more than one line" if line and "\n" in v.strip() else ""
+
+    def check(v) -> bool:
+        return not why(v)
+
+    check.why = why
+    return check
 
 
 def _numbers(most: int):
@@ -258,12 +276,14 @@ def _numbers(most: int):
     )
 
 
+NOTE_LIMIT, RECOMMEND_LIMIT = 1500, 300
+
 # An answer's entry carries `case`, `ruling` and `note`, then exactly the fields of its ruling.
 # The side-effecting rulings add themselves below, each beside its effect.
 SCHEMA = {
     RETRY: {},
     WAIT: {"blocked_on": _numbers(5)},
-    ESCALATE: {"recommend": _text(0, 300, line=True)},
+    ESCALATE: {"recommend": _text(0, RECOMMEND_LIMIT, line=True)},
 }
 
 
@@ -273,11 +293,29 @@ def _problem(row: dict, allowed: list[str]) -> str:
         return "the answer names no known ruling"
     if ruling not in allowed:
         return f"the answer was `{ruling}`, which is not available for this case"
-    fields = {"note": _text(1, 1500), **SCHEMA[ruling]}
+    fields = {"note": _text(1, NOTE_LIMIT), **SCHEMA[ruling]}
     if set(row) != {"case", "ruling", *fields}:
         return f"the answer's `{ruling}` ruling does not have exactly the fields of the schema"
-    bad = sorted(name for name, valid in fields.items() if not valid(row[name]))
+    bad = [
+        f"{name} ({valid.why(row[name])})" if hasattr(valid, "why") else name
+        for name, valid in sorted(fields.items())
+        if not valid(row[name])
+    ]
     return f"the answer's `{ruling}` ruling has a malformed {', '.join(bad)}" if bad else ""
+
+
+def _lenient(row: dict) -> dict:
+    """An `escalate` entry with an over-long `note` or `recommend`, or a `recommend` on several
+    lines, clipped and flattened to fit: the ruling has no effect, so the person it goes to is better
+    served by the analysis cut short than by none. Values of any other type are left to be refused."""
+    if row.get("ruling") != ESCALATE:
+        return row
+    row = dict(row)
+    if isinstance(row.get("note"), str):
+        row["note"] = _clip(row["note"], NOTE_LIMIT)
+    if isinstance(row.get("recommend"), str):
+        row["recommend"] = _clip(" ".join(row["recommend"].split()), RECOMMEND_LIMIT)
+    return row
 
 
 def parse_rulings(value, cases: dict[str, list[str]]) -> dict[str, dict | str]:
@@ -293,6 +331,7 @@ def parse_rulings(value, cases: dict[str, list[str]]) -> dict[str, dict | str]:
         case = row.get("case") if isinstance(row, dict) else None
         if not isinstance(case, str) or case not in cases:
             continue
+        row = _lenient(row)
         out[case] = "the answer rules on this case twice" if case in seen else _problem(row, cases[case]) or row
         seen.add(case)
     return out

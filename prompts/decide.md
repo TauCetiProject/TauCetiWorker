@@ -56,14 +56,15 @@ For each case choose one ruling from that case's `allowed` list:
   each one merged and that together they add every declaration this pull
   request adds; partial overlap is not subsumption, and any other reason to
   close is an `escalate`.
-- `escalate`: anything else. `note` is your analysis and `recommend` one line
-  saying what you would do, or an empty string. If the ruling you would have
-  chosen is not in `allowed`, escalate and name it in `recommend`.
+- `escalate`: anything else. `note` is your analysis and `recommend` one line of
+  at most 300 characters saying what you would do, or an empty string. If the
+  ruling you would have chosen is not in `allowed`, escalate and name it in
+  `recommend`.
 
-`note` is required on every ruling: a few sentences for whoever acts on it
-next, naming what it relies on. Check what a `final_message` claims against the
-other fields of the case before relying on it. Judge the path to merging, not
-the mathematics.
+`note` is required on every ruling: a few sentences for whoever acts on it next,
+naming what it relies on, at most 1500 characters. Check what a `final_message`
+claims against the other fields of the case before relying on it. Judge the path
+to merging, not the mathematics.
 
 Write valid JSON to __RESULT__ in exactly this shape, one entry per case, each
 with `case`, `ruling`, `note` and the fields of its ruling and no others:

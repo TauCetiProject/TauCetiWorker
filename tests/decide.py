@@ -453,7 +453,51 @@ def test_schema():
         "the answer's `wait` ruling has a malformed blocked_on",
     )
     check("…a boolean is not a number", "malformed" in verdict({**wait, "blocked_on": [True]}), True)
-    check("an empty note is refused", "malformed note" in verdict({**wait, "note": " "}), True)
+    check(
+        "an empty note is refused, saying so",
+        verdict({**wait, "note": " "}),
+        "the answer's `wait` ruling has a malformed note (empty)",
+    )
+    check(
+        "…as is a note too long for a ruling with an effect",
+        verdict({**wait, "note": "x" * 1600}),
+        "the answer's `wait` ruling has a malformed note (1600 characters, at most 1500)",
+    )
+    escalate = {"case": "c", "ruling": "escalate", "note": "n", "recommend": ""}
+    kept = decide.parse_rulings(
+        {"rulings": [{**escalate, "note": "x" * 1600, "recommend": "first line\nsecond " + "y" * 400}]},
+        {"c": ["escalate"]},
+    )["c"]
+    check(
+        "an escalation's long note and long multi-line recommendation are clipped and kept",
+        (isinstance(kept, dict), len(kept["note"]), len(kept["recommend"]), "\n" in kept["recommend"]),
+        (True, 1500, 300, False),
+    )
+    check(
+        "…but one with a value of the wrong type is still refused, saying so",
+        verdict({**escalate, "recommend": ["do it"]}),
+        "the answer's `escalate` ruling has a malformed recommend (not a string)",
+    )
+    check(
+        "…or with no note at all",
+        verdict({**escalate, "note": ""}),
+        "the answer's `escalate` ruling has a malformed note (empty)",
+    )
+    check(
+        "a one-line field on several lines says so",
+        "malformed title (more than one line)"
+        in verdict(
+            {
+                "case": "c",
+                "ruling": "roadmap",
+                "note": "n",
+                "area": "Probability",
+                "title": "a\nb title",
+                "proposal": "p" * 90,
+            }
+        ),
+        True,
+    )
     check("an unknown ruling is refused", verdict({**wait, "ruling": "merge"}), "the answer names no known ruling")
     check("one that is not offered is refused", "not available" in verdict(wait, ["escalate"]), True)
     several = decide.parse_rulings({"rulings": [wait, wait, {**wait, "case": "x"}]}, {"c": ["wait"], "d": ["wait"]})

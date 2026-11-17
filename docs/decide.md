@@ -169,13 +169,17 @@ the worker reads it, with the open and merged pull requests carrying its marker
 applied; that overlay is not written to the list.
 
 The answer is `{"rulings": [...]}` with one object per case: `case`, `ruling`,
-`note`, and exactly the fields of that ruling.
+`note` (1 to 1500 characters), and exactly the fields of that ruling. An entry
+that does not fit is recorded as an `escalate` whose note says which field was
+wrong and how. An `escalate` entry is the exception: a longer `note` or
+`recommend`, or a `recommend` over several lines, is clipped and flattened to fit
+and kept, since that ruling has no effect beyond its record.
 
 | Ruling | Fields |
 | --- | --- |
 | `retry` | none |
 | `wait` | `blocked_on`: 1 to 5 pull request numbers |
-| `escalate` | `recommend`: one line, may be empty |
+| `escalate` | `recommend`: one line of at most 300 characters, may be empty |
 | `prerequisite` | `items`: 1 to 3 of `{area, slug, text, needs}` |
 | `roadmap` | `area`; `title`: one line; `proposal`: 80 to 12000 characters |
 | `close` | `subsumed_by`: 1 to 3 pull request numbers; `comment`: 40 to 1500 characters |
