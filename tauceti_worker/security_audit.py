@@ -1386,8 +1386,16 @@ def inspect(
     allowed_history=(),
     continue_reading: bool = False,
     protocol: int | None = None,
+    claude_credential: str | None = None,
 ) -> dict:
+    """Run one isolated reviewer launch.
+
+    `claude_credential` selects Haiku's billing: "subscription" never uses a configured
+    API key, "api-key" requires one, and None prefers a configured key."""
     from .audit_clients import selected_protocol
+
+    if claude_credential not in (None, "subscription", "api-key"):
+        raise Die("security-audit: unknown Claude credential kind")
 
     if resume_from is not None:
         retained_protocol = attempt_protocol(resume_from)
@@ -1437,7 +1445,9 @@ def inspect(
         )
         dest = home / (".codex/auth.json" if provider == "codex" else ".claude/.credentials.json")
         dest.parent.mkdir(parents=True)
-        api_key = anthropic_api_key() if provider == "claude" else None
+        api_key = anthropic_api_key() if provider == "claude" and claude_credential != "subscription" else None
+        if provider == "claude" and claude_credential == "api-key" and not api_key:
+            raise Die(f"security-audit: API-key Haiku review requires {API_KEY_FILE_ENV}")
         if api_key:
             # API billing, independent of subscription pacing. The key reaches only
             # the isolated client process; the reviewer has no tool to read it.
@@ -1675,12 +1685,20 @@ def reviewer_model(provider: str) -> str:
     return "gpt-6-luna" if provider == "codex" else "haiku"
 
 
-def review_record(actor: str, provider: str, protocol: int, batch: dict, attempt: Path, verdict: dict) -> dict:
-    """The ledger entry for one isolated reviewer verdict on one exact batch."""
+def credential_kind(provider: str) -> str:
+    """The billing credential an unpinned inspect() uses: a configured key wins for Haiku."""
+    return "api-key" if provider == "claude" and anthropic_api_key() else "subscription"
+
+
+def review_record(
+    actor: str, provider: str, protocol: int, batch: dict, attempt: Path, verdict: dict, credential: str
+) -> dict:
+    """The ledger entry for one isolated reviewer verdict on one exact batch. Never includes a key."""
     return {
         "actor": actor,
         "provider": provider,
         "model": reviewer_model(provider),
+        "credential": credential,
         "batch": batch["input_digest"],
         "prompt_digest": hashlib.sha256(
             (
@@ -1808,7 +1826,10 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
                 "verdict": "pass",
                 "findings": [],
             }
-        record(work / "ledger.jsonl", review_record(actor, provider, protocol, batch, attempt, verdict))
+        record(
+            work / "ledger.jsonl",
+            review_record(actor, provider, protocol, batch, attempt, verdict, credential_kind(provider)),
+        )
         if verdict["verdict"] != "pass":
             raise Die("security-audit: " + "; ".join(verdict["findings"]))
         landed = advance(repo, batch)
@@ -2201,21 +2222,24 @@ if __name__ == "__main__":
     parser.add_argument("--reason", help="human review evidence; never a model re-roll")
     parser.add_argument("--ignore-quota", action="store_true", help="ignore pacing, retaining hard quota limits")
     parser.add_argument("--parallel", type=int, default=4, help="pool: concurrent isolated reviewers")
-    parser.add_argument("--agent", choices=["codex", "claude"], help="pool: reviewer for every batch in this run")
+    parser.add_argument(
+        "--agent", choices=["codex", "claude"], help="pool: pin one provider (default: codex, then haiku)"
+    )
     args = parser.parse_args()
     if args.command == "setup":
         setup(args.state)
     elif args.command == "pool":
-        from .audit_pool import Pool, quota_check
+        from .audit_pool import Chooser, Pool
+        from .config import Config
 
-        if args.agent is None:
-            parser.error("pool requires --agent codex or --agent claude")
+        cfg = Config.resolve(args.state.parent.name)
+        if (cfg.state / CURSOR).resolve() != args.state.resolve():
+            parser.error("pool --state must identify this checkout's existing worker audit state")
         min_commits = int(os.environ.get("TAUCETI_SECURITY_AUDIT_MIN_COMMITS") or 1)
         Pool(
             args.state,
             parallel=args.parallel,
-            provider=args.agent,
-            quota=quota_check(args.state, args.agent, ignore_quota=args.ignore_quota),
+            chooser=Chooser(cfg, pin=args.agent, ignore_quota=args.ignore_quota),
             min_commits=min_commits,
         ).serve()
     elif args.command in ("resume", "retry-service", "repair-output"):

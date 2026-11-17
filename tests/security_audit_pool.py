@@ -46,8 +46,17 @@ class PoolFixture(unittest.TestCase):
                 self.advanced.append((batch["from_sha"], self.cursor))
                 return self.cursor
 
-        def ls_remote(branch):
+        def remote_sha(branch):
             return self.cursor if branch == sa.CURSOR else self.shas[-1]
+
+        # Subscription pace by provider and the configured API key; tests flip these.
+        self.pace = {"codex": True, "claude": True}
+        self.key = None
+
+        def resolve(cfg, provider, **kwargs):
+            if not self.pace[provider]:
+                raise NoProgress(f"no model under pace right now (agent={provider})")
+            return provider
 
         patches = [
             patch.object(sa, "MAX_COMMITS", self.per_batch),
@@ -56,12 +65,15 @@ class PoolFixture(unittest.TestCase):
             patch.object(sa, "api", return_value={"login": "admin"}),
             patch.object(sa, "advance", side_effect=advance),
             patch.object(sa, "dispatch_advanced"),
-            patch.object(pool, "ls_remote", side_effect=ls_remote),
+            patch.object(sa, "remote_sha", side_effect=remote_sha),
+            patch("tauceti_worker.loop.resolve_work_model", side_effect=resolve),
+            patch.object(sa, "anthropic_api_key", side_effect=lambda: self.key),
+            patch.object(pool.Chooser, "TTL", 0),
             patch.object(pool, "notify_block"),
             patch.object(pool, "RETRY_SECONDS", 0),
             patch.object(pool.time, "sleep"),
             patch.object(clients, "selected_protocol", return_value=4),
-            patch.object(sa, "review_record", side_effect=lambda *a: {"batch": a[3]["input_digest"], "verdict": a[5]}),
+            patch.object(sa, "reader_path", return_value=Path(__file__)),
         ]
         for p in patches:
             p.start()
@@ -100,14 +112,17 @@ class PoolFixture(unittest.TestCase):
     def index(self, batch):
         return self.shas.index(batch["from_sha"]) // self.per_batch
 
-    def serve(self, inspect, parallel=3, stop=None):
-        def fake(batch, provider, attempt, *, protocol=None):
+    def serve(self, inspect, parallel=3, stop=None, pin=None):
+        self.launches = getattr(self, "launches", [])
+
+        def fake(batch, provider, attempt, *, protocol=None, claude_credential=None, **kwargs):
             with self.lock:
                 self.calls.append(self.index(batch))
+                self.launches.append((self.index(batch), provider, claude_credential, "resume_from" in kwargs))
             return inspect(batch, attempt)
 
         with patch.object(sa, "inspect", side_effect=fake):
-            p = pool.Pool(self.state, parallel=parallel, provider="codex")
+            p = pool.Pool(self.state, parallel=parallel, chooser=pool.Chooser(None, pin=pin))
             p.serve(stop=stop or (lambda p: self.cursor == self.shas[-1] and not p.running))
         return p
 
@@ -189,6 +204,94 @@ class Ordering(PoolFixture):
         self.assertEqual(self.calls.count(0), 1)
 
 
+class Providers(PoolFixture):
+    def test_codex_under_pace_reviews_every_batch_and_ledger_names_the_reviewer(self):
+        self.key = "sk-ant-fixture-secret"
+        self.serve(lambda batch, attempt: self.verdict(batch))
+        self.assertEqual({(prov, cred) for _, prov, cred, _ in self.launches}, {("codex", None)})
+        reviews = [row for row in self.ledger() if "verdict" in row]
+        self.assertEqual(len(reviews), 3)
+        for row in reviews:
+            self.assertEqual(
+                (row["provider"], row["model"], row["credential"]), ("codex", "gpt-6-luna", "subscription")
+            )
+        self.assertNotIn("sk-ant-fixture-secret", (self.state / "ledger.jsonl").read_text())
+
+    def test_over_pace_codex_falls_back_to_subscription_then_api_key_haiku(self):
+        self.pace["codex"] = False
+        self.serve(lambda batch, attempt: self.verdict(batch))
+        self.assertEqual({(p, c) for _, p, c, _ in self.launches}, {("claude", "subscription")})
+        self.launches.clear()
+        self.cursor = self.shas[0]
+        for path in (self.state / "pool").glob("*"):
+            path.unlink()
+        self.pace["claude"] = False
+        self.key = "sk-ant-fixture-secret"
+        self.serve(lambda batch, attempt: self.verdict(batch))
+        self.assertEqual({(p, c) for _, p, c, _ in self.launches}, {("claude", "api-key")})
+        rows = [row for row in self.ledger() if row.get("credential") == "api-key"]
+        self.assertEqual({row["model"] for row in rows}, {"haiku"})
+
+    def test_nothing_launches_when_all_subscriptions_are_over_pace_and_no_key(self):
+        self.pace = {"codex": False, "claude": False}
+        passes = []
+        self.serve(lambda batch, attempt: self.verdict(batch), stop=lambda p: passes.append(1) or len(passes) > 3)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.advanced, [])
+
+    def test_a_batch_keeps_its_provider_and_claude_may_move_to_the_api_key(self):
+        self.pace["codex"] = False
+        failures = []
+
+        def inspect(batch, attempt):
+            if self.index(batch) == 0 and not failures:
+                failures.append(1)
+                # Codex comes back under pace and Claude's subscription goes over pace.
+                self.pace.update(codex=True, claude=False)
+                self.key = "sk-ant-fixture-secret"
+                raise Die("security-audit: reviewer failed")
+            return self.verdict(batch)
+
+        self.serve(inspect, parallel=1)
+        first = [(p, c) for i, p, c, _ in self.launches if i == 0]
+        self.assertEqual(first, [("claude", "subscription"), ("claude", "api-key")])
+        self.assertIn(("codex", None), {(p, c) for i, p, c, _ in self.launches if i > 0})
+
+    def test_codex_retry_continues_the_retained_session_when_one_exists(self):
+        stopped = []
+
+        def inspect(batch, attempt):
+            if self.index(batch) == 0 and not stopped:
+                stopped.append(attempt)
+                raise Die("security-audit: inspection unfinished; retained for same-session continuation")
+            return self.verdict(batch)
+
+        retained = []
+
+        def fake_retained(work, previous):
+            retained.append(previous["attempt"])
+            batch = json.loads(Path(previous["attempt"], "input.json").read_text())
+            return Path(previous["attempt"]), batch, {"paged": True}, False
+
+        with (
+            patch("tauceti_worker.audit_recovery.retained", side_effect=fake_retained),
+            patch("tauceti_worker.audit_progress.continuable", return_value=True),
+        ):
+            self.serve(inspect)
+        self.assertEqual(retained, [str(stopped[0])])
+        first = [(p, resumed) for i, p, _, resumed in self.launches if i == 0]
+        self.assertEqual(first, [("codex", False), ("codex", True)])
+
+    def test_pinned_codex_waits_rather_than_using_haiku(self):
+        self.pace["codex"] = False
+        self.key = "sk-ant-fixture-secret"
+        passes = []
+        self.serve(
+            lambda batch, attempt: self.verdict(batch), pin="codex", stop=lambda p: passes.append(1) or len(passes) > 3
+        )
+        self.assertEqual(self.calls, [])
+
+
 class Restart(PoolFixture):
     def persisted(self, *, tamper=False):
         batch = sa.plan_batch(self.repo, self.shas[0], self.shas[-1])
@@ -196,8 +299,8 @@ class Restart(PoolFixture):
             batch["commits"][0]["files"][0]["after"] += "-- edited\n"
             body = {k: v for k, v in batch.items() if k != "input_digest"}
             batch["input_digest"] = sa.hashlib.sha256(sa.serialize(body).encode()).hexdigest()
-        p = pool.Pool(self.state, parallel=3, provider="codex")
-        slot = pool.Slot(batch, status="pass", verdict=self.verdict(batch))
+        p = pool.Pool(self.state, parallel=3, chooser=pool.Chooser(None))
+        slot = pool.Slot(batch, status="pass", verdict=self.verdict(batch), provider="codex", credential="subscription")
         p.persist(slot)
 
     def test_identical_persisted_pass_is_reused(self):

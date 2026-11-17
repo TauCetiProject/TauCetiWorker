@@ -742,6 +742,52 @@ class ServedJudgments(unittest.TestCase):
             if path.is_file():
                 self.assertNotIn(b"sk-ant-fixture-secret", path.read_bytes(), str(path))
 
+    def test_pinned_claude_credential_selects_subscription_or_api_key(self):
+        key_file = self.work / "anthropic-key"
+        key_file.write_text("sk-ant-fixture-secret\n")
+        key_file.chmod(0o600)
+        (self.work / ".credentials.json").write_text('{"claudeAiOauth":{"accessToken":"subscription-fixture"}}')
+        value = {"verdict": "pass", "findings": []}
+        seen = []
+
+        def model(argv, **kwargs):
+            seen.append(
+                (
+                    kwargs["env"].get("ANTHROPIC_API_KEY"),
+                    (kwargs["cwd"] / ".claude/.credentials.json").exists(),
+                )
+            )
+            config = json.loads(argv[argv.index("--mcp-config") + 1])
+            args = config["mcpServers"]["audit"]["args"]
+            r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
+            for page in range(len(r.pages)):
+                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            events = read_events("claude", range(len(r.pages))) + [
+                {"type": "result", "subtype": "success", "structured_output": value}
+            ]
+            return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
+
+        with (
+            patch.dict(sa.os.environ, {sa.API_KEY_FILE_ENV: str(key_file)}),
+            patch.object(sa, "claude_dir", return_value=self.work),
+            patch.object(sa, "run_process", side_effect=model),
+        ):
+            for kind in ("subscription", "api-key"):
+                attempt = self.work / f"attempt-{kind}"
+                attempt.mkdir()
+                verdict = sa.inspect(self.batch, "claude", attempt, claude_credential=kind)
+                self.assertEqual(verdict, sa.bind_verdict(value, self.batch))
+        self.assertEqual(seen, [(None, True), ("sk-ant-fixture-secret", False)])
+        with (
+            patch.dict(sa.os.environ, {sa.API_KEY_FILE_ENV: ""}),
+            patch.object(sa, "run_process", side_effect=model),
+            self.assertRaises(Die),
+        ):
+            attempt = self.work / "attempt-missing-key"
+            attempt.mkdir()
+            sa.inspect(self.batch, "claude", attempt, claude_credential="api-key")
+        self.assertEqual(len(seen), 2)
+
     def test_coverage_turns_serving_new_pages_continue_in_one_invocation(self):
         (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture","refresh_token":"fixture"}}')
         calls = 0

@@ -54,6 +54,10 @@ class Slot:
     verdict: dict | None = None
     failure: dict | None = None
     attempts: list[str] = field(default_factory=list)
+    # A batch keeps its reviewer for life; retries never switch provider.
+    provider: str | None = None
+    credential: str | None = None
+    resume: dict | None = None  # Codex: the stopped attempt to continue in the same session.
 
     @property
     def digest(self) -> str:
@@ -62,24 +66,6 @@ class Slot:
     @property
     def target(self) -> str:
         return self.batch["commits"][-1]["sha"]
-
-
-def ls_remote(branch: str) -> str:
-    """Read a public branch head without spending GitHub REST quota.
-
-    Used for planning only. `advance` re-reads the cursor and main through the
-    authenticated API, with admin and ancestry checks, before any update."""
-    p = subprocess.run(
-        ["git", "ls-remote", f"https://github.com/{sa.TAUCETI}.git", f"refs/heads/{branch}"],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        env={**{k: v for k, v in os.environ.items() if k in ("PATH", "SSL_CERT_FILE")}, "GIT_TERMINAL_PROMPT": "0"},
-    )
-    rows = [line.split("\t") for line in p.stdout.splitlines() if line.strip()]
-    if p.returncode or len(rows) != 1 or rows[0][1] != f"refs/heads/{branch}" or not sa.SHA.fullmatch(rows[0][0]):
-        raise NoProgress(f"security-audit: cannot read {branch} with git ls-remote")
-    return rows[0][0]
 
 
 def operational(exc: BaseException, attempt: Path, provider: str) -> bool:
@@ -108,24 +94,21 @@ def clean_history(attempt: Path) -> bool:
 
 
 class Pool:
-    def __init__(self, state: Path, *, parallel: int, provider: str, quota=None, min_commits: int = 1):
+    def __init__(self, state: Path, *, parallel: int, chooser, min_commits: int = 1):
         if parallel < 1:
             raise Die("security-audit: pool parallelism must be positive")
-        if provider not in ("codex", "claude"):
-            raise Die("security-audit: pool reviewer must be codex or claude")
         self.work = state
         self.repo = state / "objects.git"
         self.store = state / "pool"
         self.parallel = parallel
-        self.provider = provider
-        self.quota = quota  # Callable raising NoProgress while launches must wait.
+        self.chooser = chooser  # Picks (provider, credential) for new batches and retries, or None to wait.
         self.min_commits = min_commits
         self.slots: list[Slot] = []
         self.running: dict[concurrent.futures.Future, tuple[Slot, Path]] = {}
         self.admin_at = 0.0
         self.api_wait_until = 0.0
         self.actor: str | None = None
-        self.protocol: int | None = None
+        self.protocols: dict[str, int] = {}
         self.started = time.time()
         self.advanced_commits = 0
         self.planning_blocked: str | None = None
@@ -146,7 +129,9 @@ class Pool:
                 "verdict": slot.verdict,
                 "failure": slot.failure,
                 "attempts": slot.attempts,
-                "provider": self.provider,
+                "provider": slot.provider,
+                "model": sa.reviewer_model(slot.provider) if slot.provider else None,
+                "credential": slot.credential,
             },
         )
 
@@ -187,6 +172,8 @@ class Pool:
                 failures=meta.get("failures", 0),
                 verdict=meta.get("verdict"),
                 failure=meta.get("failure"),
+                provider=meta.get("provider"),
+                credential=meta.get("credential"),
             )
             if slot.status == "pass" and (not slot.verdict or slot.verdict.get("verdict") != "pass"):
                 break
@@ -225,9 +212,13 @@ class Pool:
             return True
 
         def check():
-            sa.require_admin()
-            if self.actor is None:
-                self.actor = sa.api("user")["login"]
+            login = getattr(sa, "admin_login", None)
+            if login is not None:
+                self.actor = login()  # Checks ADMIN and returns the viewer in one request.
+            else:
+                sa.require_admin()
+                if self.actor is None:
+                    self.actor = sa.api("user")["login"]
             return True
 
         if self.github(check):
@@ -290,15 +281,12 @@ class Pool:
         log(f"security-audit pool: cannot plan a batch from {frm[:12]}: {exc}")
 
     # Inspection ------------------------------------------------------------
-    def launchable(self) -> bool:
-        if self.quota is None:
-            return True
-        try:
-            self.quota()
-            return True
-        except (NoProgress, SystemExit) as exc:
-            log(f"security-audit pool: launches waiting for quota: {exc}")
-            return False
+    def protocol(self, provider: str) -> int:
+        if provider not in self.protocols:
+            from .audit_clients import selected_protocol
+
+            self.protocols[provider] = selected_protocol(provider, self.work)
+        return self.protocols[provider]
 
     def submit(self, executor) -> None:
         busy = len(self.running)
@@ -308,8 +296,14 @@ class Pool:
                 return
             if slot.status != "planned" or slot.retry_at > now:
                 continue
-            if not self.launchable():
-                return
+            choice = self.chooser.retry(slot) if slot.provider else self.chooser.choose()
+            if choice is None:
+                if not slot.provider:
+                    return  # No reviewer under pace and no API key: wait.
+                continue  # This batch's provider is unavailable; never switch it.
+            if slot.provider and choice[0] != slot.provider:
+                raise Die("security-audit: a retry may not change a batch's reviewer")
+            slot.provider, slot.credential = choice
             attempt = self.work / f"attempt-{time.time_ns()}"
             attempt.mkdir()
             (attempt / "input.json").write_text(sa.serialize(slot.batch))
@@ -317,14 +311,24 @@ class Pool:
             slot.attempts.append(str(attempt))
             self.persist(slot)
             commits = len(slot.batch["commits"])
+            resume = f" continuing {Path(slot.resume['attempt']).name}" if slot.resume else ""
             log(
-                f"security-audit pool: inspect {slot.batch['from_sha'][:12]}..{slot.target[:12]} ({commits} commits) in {attempt.name}"
+                f"security-audit pool: inspect {slot.batch['from_sha'][:12]}..{slot.target[:12]} ({commits} commits)"
+                f" with {slot.provider}/{sa.reviewer_model(slot.provider)} ({slot.credential}){resume} in {attempt.name}"
             )
-            future = executor.submit(self.inspect, slot.batch, attempt)
+            future = executor.submit(
+                self.inspect,
+                slot.batch,
+                attempt,
+                slot.provider,
+                slot.credential,
+                self.protocol(slot.provider),
+                slot.resume,
+            )
             self.running[future] = (slot, attempt)
             busy += 1
 
-    def inspect(self, batch: dict, attempt: Path) -> dict:
+    def inspect(self, batch, attempt, provider, credential, protocol, resume) -> dict:
         if not any(c["files"] for c in batch["commits"]):
             return {
                 "input_digest": batch["input_digest"],
@@ -332,7 +336,47 @@ class Pool:
                 "verdict": "pass",
                 "findings": [],
             }
-        return sa.inspect(batch, self.provider, attempt, protocol=self.protocol)
+        if provider == "codex" and resume is not None:
+            continued = self.continue_codex(batch, attempt, protocol, resume)
+            if continued is not None:
+                return continued
+        if provider == "claude":
+            return sa.inspect(batch, provider, attempt, protocol=protocol, claude_credential=credential)
+        return sa.inspect(batch, provider, attempt, protocol=protocol)
+
+    def continue_codex(self, batch, attempt, protocol, resume) -> dict | None:
+        """Continue a stopped Codex attempt in its own native session, as ordinary recovery does."""
+        from .audit_progress import continuable
+        from .audit_recovery import retained
+
+        try:
+            original, retained_batch, execution, legacy = retained(self.work, resume)
+        except (Die, OSError, ValueError, KeyError, TypeError):
+            return None  # Nothing launched or nothing valid to continue: start a fresh session.
+        if retained_batch != batch:
+            raise Die("security-audit: retained pool attempt belongs to another batch")
+        transcript = original / "model-transcript.jsonl"
+        allowed = execution.get("_allowed_history", ())
+        progress = continuable(
+            transcript.read_text() if transcript.exists() else "",
+            batch,
+            original / "read-receipt.json",
+            original,
+            legacy=legacy,
+            allowed=allowed,
+            paged=execution["paged"],
+            protocol=protocol,
+        )
+        return sa.inspect(
+            batch,
+            "codex",
+            attempt,
+            resume_from=original,
+            legacy_history=legacy,
+            allowed_history=allowed,
+            continue_reading=progress,
+            protocol=protocol,
+        )
 
     def finished(self, future, cursor: str) -> None:
         slot, attempt = self.running.pop(future)
@@ -345,20 +389,24 @@ class Pool:
                 "to_sha": slot.target,
                 "reason": str(exc) or type(exc).__name__,
                 "attempt": str(attempt),
+                **self.reviewer(slot),
             }
             if isinstance(exc, subprocess.TimeoutExpired):
                 failure["failure_kind"] = "provider-timeout"
             sa.record(self.work / "ledger.jsonl", failure)
-            if operational(exc, attempt, self.provider) and slot.failures < MAX_RETRIES:
+            if operational(exc, attempt, slot.provider) and slot.failures < MAX_RETRIES:
                 slot.failures += 1
                 slot.status = "planned"
+                # Codex continues the same native session; Claude retries in a fresh one.
+                slot.resume = failure if slot.provider == "codex" else None
                 slot.retry_at = time.time() + RETRY_SECONDS * 2 ** (slot.failures - 1)
                 self.persist(slot)
                 log(
-                    f"security-audit pool: {span} operational failure ({exc}); fresh retry {slot.failures}/{MAX_RETRIES}"
+                    f"security-audit pool: {span} operational failure on {slot.provider} ({exc}); "
+                    f"retry {slot.failures}/{MAX_RETRIES}"
                 )
                 return
-            if operational(exc, attempt, self.provider):
+            if operational(exc, attempt, slot.provider):
                 failure["pool_retries_exhausted"] = True
             slot.status = "blocked"
             self.block(slot, failure, head=slot.batch["from_sha"] == cursor)
@@ -366,7 +414,15 @@ class Pool:
             return
         sa.record(
             self.work / "ledger.jsonl",
-            sa.review_record(self.actor or "", self.provider, self.protocol, slot.batch, attempt, verdict),
+            sa.review_record(
+                self.actor or "",
+                slot.provider,
+                self.protocol(slot.provider),
+                slot.batch,
+                attempt,
+                verdict,
+                slot.credential,
+            ),
         )
         slot.verdict = verdict
         if verdict["verdict"] == "pass":
@@ -380,10 +436,15 @@ class Pool:
             "to_sha": slot.target,
             "reason": "security-audit: " + "; ".join(verdict["findings"]),
             "attempt": str(attempt),
+            **self.reviewer(slot),
         }
         sa.record(self.work / "ledger.jsonl", failure)
         self.block(slot, failure, head=slot.batch["from_sha"] == cursor)
         log(f"security-audit pool: {span} {verdict['verdict']}; human review required")
+
+    @staticmethod
+    def reviewer(slot: Slot) -> dict:
+        return {"provider": slot.provider, "model": sa.reviewer_model(slot.provider), "credential": slot.credential}
 
     def block(self, slot: Slot, failure: dict, *, head: bool) -> None:
         slot.failure = failure
@@ -460,7 +521,7 @@ class Pool:
     # Loop ------------------------------------------------------------------
     def step(self, executor) -> bool:
         """One control pass. Returns False when a binding block at the cursor stops the pool."""
-        cursor, main = ls_remote(sa.CURSOR), ls_remote(os.environ.get("TAUCETI_BASE_BRANCH", "main"))
+        cursor, main = sa.remote_sha(sa.CURSOR), sa.remote_sha(os.environ.get("TAUCETI_BASE_BRANCH", "main"))
         if (cursor, main) != self.fetched:
             sa.refresh(self.repo, cursor, main)
             self.fetched = (cursor, main)
@@ -492,12 +553,7 @@ class Pool:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise Die("security-audit: another pool already owns this audit state") from None
-            from .audit_clients import selected_protocol
-
-            self.protocol = selected_protocol(self.provider, self.work)
-            log(
-                f"security-audit pool: {self.parallel} isolated {self.provider}/{sa.reviewer_model(self.provider)} reviewers, protocol {self.protocol}"
-            )
+            log(f"security-audit pool: up to {self.parallel} isolated reviewers; {self.chooser.describe()}")
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.parallel) as executor:
                 while True:
                     try:
@@ -515,25 +571,77 @@ class Pool:
                         list(self.running), timeout=timeout, return_when=concurrent.futures.FIRST_COMPLETED
                     )
                     if done:
-                        cursor = ls_remote(sa.CURSOR)
+                        cursor = sa.remote_sha(sa.CURSOR)
                         for future in done:
                             self.finished(future, cursor)
 
 
-def quota_check(state: Path, provider: str, *, ignore_quota: bool):
-    """Subscription pacing for new launches. API-key Haiku reviews are billed per use and are not paced."""
-    if provider == "claude" and getattr(sa, "anthropic_api_key", lambda: None)():
+class Chooser:
+    """Pick each new batch's reviewer: Codex Luna under pace, then subscription Haiku under pace,
+    then Haiku billed to the configured API key regardless of pace. None means wait.
+
+    Pacing uses the ordinary `resolve_work_model` verdict. `--ignore-quota` overrides soft
+    pacing for subscription reviewers, never hard limits. `pin` restricts the run to one provider."""
+
+    TTL = 300
+
+    def __init__(self, cfg, *, pin: str | None = None, ignore_quota: bool = False):
+        if pin not in (None, "codex", "claude"):
+            raise Die("security-audit: pool reviewer must be codex or claude")
+        self.cfg = cfg
+        self.pin = pin
+        self.ignore_quota = ignore_quota
+        self.checked: dict[str, tuple[float, bool]] = {}
+
+    def describe(self) -> str:
+        order = {
+            None: "codex, then subscription haiku, then API-key haiku",
+            "codex": "codex only",
+            "claude": "subscription haiku, then API-key haiku",
+        }[self.pin]
+        return f"reviewer order: {order}" + (" (--ignore-quota)" if self.ignore_quota else "")
+
+    def under_pace(self, provider: str) -> bool:
+        at, ok = self.checked.get(provider, (0.0, False))
+        if time.time() - at < self.TTL:
+            return ok
+        from .loop import resolve_work_model
+
+        try:
+            resolve_work_model(self.cfg, provider, dry=False, ignore_quota=self.ignore_quota, fresh=True)
+            ok = True
+        except (NoProgress, SystemExit) as exc:
+            log(f"security-audit pool: {provider} subscription unavailable for new launches: {exc}")
+            ok = False
+        self.checked[provider] = (time.time(), ok)
+        return ok
+
+    @staticmethod
+    def api_key() -> bool:
+        try:
+            return bool(getattr(sa, "anthropic_api_key", lambda: None)())
+        except Die as exc:
+            log(f"security-audit pool: API-key Haiku unavailable: {exc}")
+            return False
+
+    def claude(self, prefer: str | None = None):
+        if prefer == "api-key" and self.api_key():
+            return ("claude", "api-key")
+        if self.under_pace("claude"):
+            return ("claude", "subscription")
+        if self.api_key():
+            return ("claude", "api-key")
         return None
-    from .config import Config
-    from .loop import resolve_work_model
 
-    cfg = Config.resolve(state.parent.name)
-    checked = {"at": 0.0}
+    def choose(self):
+        if self.pin != "claude" and self.under_pace("codex"):
+            return ("codex", "subscription")
+        if self.pin == "codex":
+            return None
+        return self.claude()
 
-    def check():
-        if time.time() - checked["at"] < 300:
-            return
-        resolve_work_model(cfg, provider, dry=False, ignore_quota=ignore_quota, fresh=True)
-        checked["at"] = time.time()
-
-    return check
+    def retry(self, slot: Slot):
+        """Same provider for life; Claude may move from subscription to the API key."""
+        if slot.provider == "codex":
+            return ("codex", "subscription") if self.under_pace("codex") else None
+        return self.claude(prefer=slot.credential)
