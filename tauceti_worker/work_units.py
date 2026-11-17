@@ -957,13 +957,31 @@ def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool | None
     # A new PR appeared — but only one carrying a tauceti-target marker is THIS round's authoring work.
     # An unrelated/human PR (or, under multi-worker, another worker's concurrent PR) that shows up
     # mid-round must not mask this round's no-op. Conservative: if we can't read a body, assume ours.
-    for num in new:
-        v = w.gh.pr_view(num, ["body"])
+    marked = unknown = False
+    for num in sorted(new):
+        v = w.gh.pr_view(num, ["body", "headRefName"])
         if v is None:
-            return None
+            unknown = True
+            continue
         if TARGET_MARKER_RE.search(v.get("body") or ""):
-            return True
-    return False
+            marked = True
+            if (v.get("headRefName") or "").endswith("-" + w.cfg.wid):
+                _record_authored(num)
+    return True if marked else None if unknown else False
+
+
+def _record_authored(number: int) -> None:
+    """Record a PR this worker's round opened outside the host outbox, as `pr_created`.
+
+    A bubble agent's `gh pr create` goes through Bubble's auth proxy, so the outbox never reports it.
+    The key matches the outbox's, so a PR both paths see is counted once."""
+    url = source_pull_url(number)
+    if not url.startswith("https://github.com/"):
+        return
+    with contextlib.suppress(Exception):
+        from .fleet_events import emit
+
+        emit("pr_created", key=url, repository=TAUCETI, pr=number)
 
 
 def _host_agent_binary(stage: str, model: str) -> str | None:

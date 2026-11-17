@@ -958,6 +958,37 @@ class ActivityTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM prs").fetchone()[0], 5)
             self.assertEqual(db.execute("SELECT value FROM meta WHERE key='history_cutoff'").fetchone()[0], cutoff)
 
+    def test_authoring_round_records_its_new_pr_without_the_outbox(self):
+        from tauceti_worker import work_units
+        from tauceti_worker.constants import TAUCETI
+
+        self.finish(60)
+        marker = '<!--tauceti-target:v1 {"focus":"area","id":"t"}-->'
+        views = {
+            2: dict(body=marker, headRefName="roadmap/mine-worker"),
+            3: dict(body=marker, headRefName="roadmap/theirs-worker-2"),
+            4: dict(body="no marker", headRefName="roadmap/plain-worker"),
+        }
+        w = SimpleNamespace(
+            cfg=SimpleNamespace(wid="worker"),
+            gh=SimpleNamespace(
+                pr_list=lambda fields, state: [dict(number=n) for n in (1, 2, 3, 4)],
+                pr_view=lambda number, fields: views[number],
+            ),
+        )
+        self.assertIs(work_units._progressed_direct(w, SimpleNamespace(pr=None), {"prs": {1}}), True)
+        a.prepare(now=self.now + 1)
+        self.assertEqual(a.cached()["summary"]["pr_windows"]["total"]["authored"], 1)
+        url = f"https://github.com/{TAUCETI}/pull/2"
+        fleet_events.mutation(
+            dict(argv=["pr", "create", "--repo", TAUCETI], context={}), SimpleNamespace(stdout=url + "\n")
+        )
+        a.prepare(now=self.now + 2)
+        self.assertEqual(a.cached()["summary"]["pr_windows"]["total"]["authored"], 1)
+        with contextlib.closing(a._connect()) as db:
+            rows = db.execute("SELECT repo,number,worker FROM prs").fetchall()
+        self.assertEqual([tuple(r) for r in rows], [(TAUCETI, 2, "worker")])
+
     def test_landing_window_migration_replays_discarded_prs_without_double_counting(self):
         receipt = dict(
             version=1,
