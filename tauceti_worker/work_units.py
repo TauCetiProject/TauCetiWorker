@@ -977,6 +977,14 @@ def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool | None
     return True if marked else None if unknown else False
 
 
+def _branch_tag(wid: str, round_id: str | None) -> str:
+    """The authored-branch suffix: a per-round token, then the worker id.
+
+    Operators select their workers' branches by an end-anchored `-<wid>`, so the id stays last. Ids may
+    contain hyphens, so `-<wid>` alone can be the tail of another worker's branch; the token is not."""
+    return f"{(round_id or os.urandom(16).hex())[:12]}-{wid}"
+
+
 def _record_authored(number: int) -> None:
     """Record a PR this worker's round opened outside the host outbox, as `pr_created`.
 
@@ -3064,8 +3072,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     fork_owner = fork.split("/", 1)[0]
     from .activity import current_round_id
 
-    # Worker ids may contain hyphens, so `-<wid>` alone can be the tail of another worker's branch.
-    branch_tag = f"{w.cfg.wid}-{(current_round_id() or os.urandom(16).hex())[:12]}"
+    branch_tag = _branch_tag(w.cfg.wid, current_round_id())
     if c.progress is not None:
         c.progress.update(authored_suffix="-" + branch_tag, authored_owner=fork_owner)
     os.environ["TAUCETI_PUSH_REMOTE"] = source_repository_url(fork)

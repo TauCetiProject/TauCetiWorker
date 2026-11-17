@@ -968,19 +968,23 @@ class ActivityTests(unittest.TestCase):
         def view(branch, owner, body=marker):
             return dict(body=body, headRefName=branch, headRepositoryOwner=dict(login=owner))
 
+        tag = work_units._branch_tag("worker1", "0123456789abcdef")
+        self.assertEqual(tag, "0123456789ab-worker1")
+        self.assertTrue(f"roadmap/mine-{tag}".endswith("-worker1"))
         views = {
-            2: view("roadmap/mine-worker1-0123456789ab", "Me"),
-            # A worker whose id ends in this one's, on the same account, old and new branch shapes.
+            2: view(f"roadmap/mine-{tag}", "Me"),
+            # A worker whose id ends in this one's, on the same account: old shape, its own tag, ours.
             3: view("roadmap/peer-host-worker1", "me"),
-            4: view("roadmap/peer-host-worker1-ba9876543210", "me"),
+            4: view("roadmap/peer-ba9876543210-host-worker1", "me"),
+            5: view("roadmap/peer-0123456789ab-host-worker1", "me"),
             # Another contributor's fork with the same worker id and even the same tag.
-            5: view("roadmap/other-worker1-0123456789ab", "someone-else"),
-            6: view("roadmap/plain-worker1-0123456789ab", "me", body="no marker"),
+            6: view(f"roadmap/other-{tag}", "someone-else"),
+            7: view(f"roadmap/plain-{tag}", "me", body="no marker"),
         }
         w = SimpleNamespace(
             cfg=SimpleNamespace(wid="worker1"),
             gh=SimpleNamespace(
-                pr_list=lambda fields, state: [dict(number=n) for n in range(1, 7)],
+                pr_list=lambda fields, state: [dict(number=n) for n in range(1, 8)],
                 pr_view=lambda number, fields: views[number],
             ),
         )
@@ -989,7 +993,7 @@ class ActivityTests(unittest.TestCase):
         self.assertIs(work_units._progressed_direct(w, candidate, {"prs": {1}}), True)
         a.prepare(now=self.now + 1)
         self.assertEqual(a.cached()["summary"]["pr_windows"]["total"]["authored"], 0)
-        pre = {"prs": {1}, "authored_suffix": "-worker1-0123456789ab", "authored_owner": "me"}
+        pre = {"prs": {1}, "authored_suffix": "-" + tag, "authored_owner": "me"}
         self.assertIs(work_units._progressed_direct(w, candidate, pre), True)
         a.prepare(now=self.now + 1)
         self.assertEqual(a.cached()["summary"]["pr_windows"]["total"]["authored"], 1)
