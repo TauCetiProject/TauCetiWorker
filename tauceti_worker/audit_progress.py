@@ -206,3 +206,32 @@ def continuable(
         )
     except (Die, OSError, ValueError, KeyError, TypeError, AttributeError):
         return False
+
+
+def claude_continuable(transcript: str, batch: dict, receipt: Path, work: Path, *, paged=True) -> bool:
+    """A completed Haiku turn in its retained session that reported only progress.
+
+    Mirrors `continuable` for Luna: the history holds no finding or uncertainty,
+    the answer is the session's own latest structured output, and it is either
+    unfinished or a pass while served coverage is still missing.
+    """
+    from . import security_audit as sa
+    from .audit_recovery import claude_finals, claude_safe_history
+
+    try:
+        if not paged or not claude_safe_history(work, batch, paged):
+            return False
+        session = sa.claude_thread(work)
+        events = [json.loads(line) for line in transcript.splitlines() if line.strip()]
+        if any(not isinstance(e, dict) or e.get("session_id", session) != session for e in events):
+            return False
+        value = sa.claude_result(transcript).get("structured_output")
+        finals = claude_finals(work)
+        if not finals or finals[-1] != value:
+            return False
+        if not isinstance(value, dict) or set(value) != {"verdict", "findings"} or value["findings"] != []:
+            return False
+        proof = coverage(batch, receipt, protocol=4)
+        return value["verdict"] == "unfinished" or (value["verdict"] == "pass" and bool(proof["missing"]))
+    except (Die, OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
