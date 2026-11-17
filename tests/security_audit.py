@@ -161,6 +161,7 @@ class WorkerBoundJudgments(unittest.TestCase):
             ),
             ("validate_history", {"side_effect": lambda *args: [c["sha"] for c in self.batch["commits"]]}),
             ("api", {"return_value": {"login": "admin"}}),
+            ("admin_login", {"return_value": "admin"}),
         ):
             mock = patch.object(sa, name, **kwargs)
             mock.start()
@@ -1536,34 +1537,47 @@ class Authority(unittest.TestCase):
             self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
             self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["blocked.json"])
 
-    def test_admin_must_be_literal_true(self):
-        for value in (False, None, "true", 1):
-            with self.subTest(value=value), patch.object(sa, "api", return_value={"permissions": {"admin": value}}):
+    def test_admin_must_be_literal_admin_permission(self):
+        def graphql(permission, login="admin"):
+            data = {"data": {"viewer": {"login": login}, "repository": {"viewerPermission": permission}}}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(data), stderr="")
+
+        for value in ("WRITE", "MAINTAIN", None, "admin", True):
+            with self.subTest(value=value), patch.object(sa, "execute", return_value=graphql(value)):
                 with self.assertRaises(Die):
                     sa.require_admin()
+        with patch.object(sa, "execute", return_value=graphql("ADMIN", "")), self.assertRaises(Die):
+            sa.admin_login()
+        with patch.object(sa, "execute", return_value=graphql("ADMIN")) as call:
+            self.assertEqual(sa.admin_login(), "admin")
+        self.assertIn("graphql", call.call_args.args[0])
 
     def test_permission_failure_does_not_authorize(self):
-        with patch.object(sa, "api", side_effect=NoProgress("unavailable")), self.assertRaises(NoProgress):
+        failed = SimpleNamespace(returncode=1, stdout="", stderr="unavailable")
+        with patch.object(sa, "execute", return_value=failed), self.assertRaises(NoProgress):
             sa.require_admin()
+        with patch.object(sa, "execute", return_value=SimpleNamespace(returncode=0, stdout="{}", stderr="")):
+            with self.assertRaises(NoProgress):
+                sa.require_admin()
 
     def test_concurrent_update_never_writes(self):
         with (
             patch.object(sa, "require_admin"),
             patch.object(sa, "remote_sha", return_value="b" * 40),
-            patch.object(sa, "api") as api,
+            patch.object(sa, "push_cursor") as push,
             self.assertRaises(NoProgress),
         ):
             sa.advance(Path("unused"), {"from_sha": "a" * 40})
-        api.assert_not_called()
+        push.assert_not_called()
 
     def test_revoked_admin_never_writes(self):
         with (
             patch.object(sa, "require_admin", side_effect=Die("revoked")),
-            patch.object(sa, "api") as api,
+            patch.object(sa, "push_cursor") as push,
             self.assertRaises(Die),
         ):
             sa.advance(Path("unused"), {})
-        api.assert_not_called()
+        push.assert_not_called()
 
     def test_no_force_update_and_confirmed_sha(self):
         target, old, main = "c" * 40, "a" * 40, "b" * 40
@@ -1573,11 +1587,63 @@ class Authority(unittest.TestCase):
             patch.object(sa, "remote_sha", side_effect=[old, main, target]),
             patch.object(sa, "refresh"),
             patch.object(sa, "validate_history") as history,
-            patch.object(sa, "api", return_value={"object": {"sha": target}}) as api,
+            patch.object(sa, "push_cursor") as push,
         ):
             self.assertEqual(sa.advance(Path("unused"), batch), target)
         history.assert_called_once_with(Path("unused"), old, main, target)
-        self.assertEqual(api.call_args.kwargs["body"], {"sha": target, "force": False})
+        push.assert_called_once_with(Path("unused"), old, target)
+
+    def test_unconfirmed_push_does_not_report_advancement(self):
+        target, old, main = "c" * 40, "a" * 40, "b" * 40
+        batch = {"from_sha": old, "commits": [{"sha": target}]}
+        with (
+            patch.object(sa, "require_admin"),
+            patch.object(sa, "remote_sha", side_effect=[old, main, old]),
+            patch.object(sa, "refresh"),
+            patch.object(sa, "validate_history"),
+            patch.object(sa, "push_cursor"),
+            self.assertRaises(NoProgress),
+        ):
+            sa.advance(Path("unused"), batch)
+
+    def test_cursor_push_is_a_leased_fast_forward_with_env_token(self):
+        old, target = "a" * 40, "c" * 40
+        with (
+            patch.dict(sa.os.environ, {"GH_TOKEN": "ghp-fixture-secret"}),
+            patch.object(sa.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as run,
+        ):
+            sa.push_cursor(Path("repo"), old, target)
+        argv, env = run.call_args.args[0], run.call_args.kwargs["env"]
+        self.assertIn(f"--force-with-lease=refs/heads/{sa.CURSOR}:{old}", argv)
+        self.assertIn(f"{target}:refs/heads/{sa.CURSOR}", argv)
+        self.assertFalse(any(a.startswith("+") or a in ("--force", "-f") for a in argv))
+        self.assertNotIn("ghp-fixture-secret", " ".join(argv))
+        self.assertEqual(env["TAUCETI_AUDIT_PUSH_TOKEN"], "ghp-fixture-secret")
+        with (
+            patch.dict(sa.os.environ, {"GH_TOKEN": "x"}),
+            patch.object(sa.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="", stderr="stale")),
+            self.assertRaises(NoProgress),
+        ):
+            sa.push_cursor(Path("repo"), old, target)
+
+    def test_remote_sha_reads_exactly_one_ref_over_git(self):
+        sha = "d" * 40
+        ok = SimpleNamespace(returncode=0, stdout=f"{sha}\trefs/heads/main\n", stderr="")
+        with patch.object(sa.subprocess, "run", return_value=ok) as run:
+            self.assertEqual(sa.remote_sha("main"), sha)
+        self.assertEqual(run.call_args.args[0][:2], ["git", "ls-remote"])
+        for out in (
+            "",
+            f"{sha}\trefs/heads/mainx\n",
+            f"{sha}\trefs/heads/main\n{sha}\trefs/heads/main\n",
+            "zz\trefs/heads/main\n",
+        ):
+            with (
+                self.subTest(out=out),
+                patch.object(sa.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=out, stderr="")),
+            ):
+                with self.assertRaises(NoProgress):
+                    sa.remote_sha("main")
 
     def test_protection_bypass_is_separate(self):
         rules = sa.protections()
@@ -2320,6 +2386,7 @@ class Run(unittest.TestCase):
             ("validate_history", {"return_value": [self.target]}),
             ("plan_batch", {"return_value": self.batch}),
             ("api", {"return_value": {"login": "admin"}}),
+            ("admin_login", {"return_value": "admin"}),
         ):
             mock = patch.object(sa, name, **kwargs)
             mock.start()
@@ -2383,7 +2450,7 @@ class Run(unittest.TestCase):
 
     def test_identity_failure_cannot_lose_a_model_finding(self):
         with (
-            patch.object(sa, "api", side_effect=NoProgress("GitHub unavailable")),
+            patch.object(sa, "admin_login", side_effect=NoProgress("GitHub unavailable")),
             patch.object(sa, "inspect") as inspect,
         ):
             with self.assertRaises(NoProgress):

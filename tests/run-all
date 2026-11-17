@@ -243,6 +243,7 @@ RUN_STDLIB=(
   scoreboard_trust.py
   security_audit.py
   security_audit_served.py
+  security_audit_pool.py
   shared_build_caches.py
   shared_repositories.py
   source_argument.py

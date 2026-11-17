@@ -413,7 +413,7 @@ def recover(cfg, opts, previous: dict) -> bool:
     if completed is not None:
         check_current_batch(work, batch)
         evidence = {
-            "actor": sa.api("user")["login"],
+            "actor": sa.admin_login(),
             "batch": batch["input_digest"],
             "from_sha": batch["from_sha"],
             "to_sha": batch["commits"][-1]["sha"],
@@ -464,7 +464,7 @@ def recover(cfg, opts, previous: dict) -> bool:
     save(state_path, state)  # Reserve the budget before launch; a restart cannot reset it.
     check_current_batch(work, batch)
     target = batch["commits"][-1]["sha"]
-    actor = sa.api("user")["login"]
+    actor = sa.admin_login()
     attempt = work / f"attempt-{time.time_ns()}"
     attempt.mkdir()
     (attempt / "input.json").write_text(sa.serialize(batch))

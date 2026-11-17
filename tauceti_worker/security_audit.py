@@ -225,21 +225,48 @@ def api(path: str, *, method: str = "GET", body=None):
         raise NoProgress("security-audit: invalid GitHub response") from exc
 
 
-def require_admin() -> None:
-    if api(f"repos/{TAUCETI}").get("permissions", {}).get("admin") is not True:
+# The audit reads refs and advances its cursor over Git, and checks authority with
+# GraphQL. Neither draws on the REST quota that other tools on the same account
+# exhaust; only the non-fatal readiness dispatch still uses REST.
+REMOTE = f"https://github.com/{TAUCETI}.git"
+
+
+def admin_login() -> str:
+    """Return the authenticated login after confirming repository-admin permission."""
+    owner, name = TAUCETI.split("/")
+    argv = [
+        "gh",
+        "api",
+        "graphql",
+        "--hostname",
+        "github.com",
+        "-f",
+        "query=query($owner:String!,$name:String!){viewer{login} repository(owner:$owner,name:$name){viewerPermission}}",
+        "-F",
+        f"owner={owner}",
+        "-F",
+        f"name={name}",
+    ]
+    p = execute(argv, env={**os.environ, "TAUCETI_OUTBOX_REPLAY": "1"})
+    if p.returncode:
+        raise NoProgress(f"security-audit: GitHub request failed: {p.stderr.strip()}")
+    try:
+        data = json.loads(p.stdout)["data"]
+        login, permission = data["viewer"]["login"], data["repository"]["viewerPermission"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise NoProgress("security-audit: invalid GitHub response") from exc
+    if permission != "ADMIN" or not isinstance(login, str) or not login:
         raise Die(f"security-audit requires repository-admin permission on {TAUCETI}")
+    return login
 
 
-def remote_sha(branch: str) -> str:
-    value = api(f"repos/{TAUCETI}/git/ref/heads/{branch}").get("object", {})
-    sha = value.get("sha", "")
-    if value.get("type") != "commit" or not SHA.fullmatch(sha):
-        raise NoProgress(f"security-audit: {branch} is not a commit reference")
-    return sha
+def require_admin() -> None:
+    admin_login()
 
 
-def git(repo: Path, *args: str) -> bytes:
-    # Bare, private object store. Never inherit Git config injection or replace refs.
+def git_env(*, credential: bool = False) -> dict:
+    # Never inherit Git config injection or replace refs. Pushes authenticate
+    # with the selected account's token from the environment, never argv.
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "SYSTEMROOT", "SSL_CERT_FILE")}
     env.update(
         GIT_CONFIG_NOSYSTEM="1",
@@ -248,9 +275,66 @@ def git(repo: Path, *args: str) -> bytes:
         GIT_LITERAL_PATHSPECS="1",
         GIT_TERMINAL_PROMPT="0",
     )
+    if credential:
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        if not token:
+            # gh's stored credential for its active account; a local read, not an API call.
+            p = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=30)
+            token = p.stdout.strip() if not p.returncode else ""
+        if not token:
+            # NoProgress, not Die: a passing verdict stays reusable and nothing is blocked.
+            raise NoProgress("security-audit: no GitHub token available to advance the cursor")
+        env["TAUCETI_AUDIT_PUSH_TOKEN"] = token
+    return env
+
+
+def remote_sha(branch: str) -> str:
+    ref = f"refs/heads/{branch}"
+    p = subprocess.run(
+        ["git", "ls-remote", "--", REMOTE, ref], env=git_env(), capture_output=True, text=True, timeout=120
+    )
+    if p.returncode:
+        raise NoProgress(f"security-audit: git ls-remote failed: {p.stderr.strip()}")
+    rows = [line.split("\t") for line in p.stdout.splitlines() if line.strip()]
+    if len(rows) != 1 or len(rows[0]) != 2 or rows[0][1] != ref or not SHA.fullmatch(rows[0][0]):
+        raise NoProgress(f"security-audit: {branch} is not a commit reference")
+    return rows[0][0]
+
+
+def push_cursor(repo: Path, old: str, target: str) -> None:
+    """Fast-forward the cursor only if it still equals old (server-side compare-and-swap)."""
+    ref = f"refs/heads/{CURSOR}"
+    helper = '!f() { test "$1" = get || exit 0; echo username=x-access-token; echo "password=$TAUCETI_AUDIT_PUSH_TOKEN"; }; f'
+    p = subprocess.run(
+        [
+            "git",
+            "--git-dir",
+            str(repo),
+            "-c",
+            "credential.helper=",
+            "-c",
+            f"credential.helper={helper}",
+            "push",
+            "--porcelain",
+            "--no-verify",
+            f"--force-with-lease={ref}:{old}",
+            REMOTE,
+            f"{target}:{ref}",
+        ],
+        env=git_env(credential=True),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if p.returncode:
+        raise NoProgress(f"security-audit: cursor push rejected: {(p.stderr or p.stdout).strip()}")
+
+
+def git(repo: Path, *args: str) -> bytes:
+    # Bare, private object store.
     p = subprocess.run(
         ["git", "--git-dir", str(repo), *args],
-        env=env,
+        env=git_env(),
         capture_output=True,
         timeout=180,
     )
@@ -1386,8 +1470,16 @@ def inspect(
     allowed_history=(),
     continue_reading: bool = False,
     protocol: int | None = None,
+    claude_credential: str | None = None,
 ) -> dict:
+    """Run one isolated reviewer launch.
+
+    `claude_credential` selects Haiku's billing: "subscription" never uses a configured
+    API key, "api-key" requires one, and None prefers a configured key."""
     from .audit_clients import selected_protocol
+
+    if claude_credential not in (None, "subscription", "api-key"):
+        raise Die("security-audit: unknown Claude credential kind")
 
     if resume_from is not None:
         retained_protocol = attempt_protocol(resume_from)
@@ -1437,7 +1529,9 @@ def inspect(
         )
         dest = home / (".codex/auth.json" if provider == "codex" else ".claude/.credentials.json")
         dest.parent.mkdir(parents=True)
-        api_key = anthropic_api_key() if provider == "claude" else None
+        api_key = anthropic_api_key() if provider == "claude" and claude_credential != "subscription" else None
+        if provider == "claude" and claude_credential == "api-key" and not api_key:
+            raise Die(f"security-audit: API-key Haiku review requires {API_KEY_FILE_ENV}")
         if api_key:
             # API billing, independent of subscription pacing. The key reaches only
             # the isolated client process; the reviewer has no tool to read it.
@@ -1647,9 +1741,11 @@ def advance(repo: Path, batch: dict) -> str:
     refresh(repo, main)
     target = batch["commits"][-1]["sha"]
     validate_history(repo, old, main, target)
-    # No force. GitHub's separate no-bypass rule also rejects rewinds/deletions.
-    updated = api(f"repos/{TAUCETI}/git/refs/heads/{CURSOR}", method="PATCH", body={"sha": target, "force": False})
-    if updated.get("object", {}).get("sha") != target or remote_sha(CURSOR) != target:
+    # target descends from old on main's first-parent history, so this is a
+    # fast-forward; the lease makes it conditional on the cursor still being old.
+    # GitHub's separate no-bypass rule also rejects rewinds/deletions.
+    push_cursor(repo, old, target)
+    if remote_sha(CURSOR) != target:
         raise NoProgress("security-audit: cursor update could not be confirmed")
     return target
 
@@ -1671,11 +1767,70 @@ def dispatch_advanced(work: Path, landed: str) -> None:
         log("security-audit: advanced, but readiness-report dispatch failed; dispatch toolchain-tags manually")
 
 
+def reviewer_model(provider: str) -> str:
+    return "gpt-6-luna" if provider == "codex" else "haiku"
+
+
+def credential_kind(provider: str) -> str:
+    """The billing credential an unpinned inspect() uses: a configured key wins for Haiku."""
+    return "api-key" if provider == "claude" and anthropic_api_key() else "subscription"
+
+
+def review_record(
+    actor: str, provider: str, protocol: int, batch: dict, attempt: Path, verdict: dict, credential: str
+) -> dict:
+    """The ledger entry for one isolated reviewer verdict on one exact batch. Never includes a key."""
+    return {
+        "actor": actor,
+        "provider": provider,
+        "model": reviewer_model(provider),
+        "credential": credential,
+        "batch": batch["input_digest"],
+        "prompt_digest": hashlib.sha256(
+            (
+                (SERVED_MODEL_PROMPT if provider == "codex" else SERVED_CLAUDE_PROMPT)
+                if protocol == 4
+                else MODEL_PROMPT
+            ).encode()
+        ).hexdigest(),
+        "protocol_version": protocol,
+        "launcher_profile": reviewer_argv(provider, protocol=protocol),
+        "execution_record": str(attempt / "execution.json"),
+        "catalog_digest": hashlib.sha256(serialize(inspection_catalog(protocol)).encode()).hexdigest()
+        if provider == "codex"
+        else None,
+        "reader_digest": hashlib.sha256(reader_path(protocol).read_bytes()).hexdigest(),
+        "input_policy": "compacting-session-v1",
+        "output_repairs": len((attempt / "output-repairs.jsonl").read_text().splitlines())
+        if (attempt / "output-repairs.jsonl").exists()
+        else 0,
+        "from_sha": batch["from_sha"],
+        "to_sha": batch["commits"][-1]["sha"],
+        "verdict": verdict,
+    }
+
+
+def pool_active(work: Path) -> bool:
+    """True while a parallel pool holds this audit state's exclusive cursor lock."""
+    path = work / "pool.lock"
+    if not path.exists():
+        return False
+    with path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    return False
+
+
 def run(cfg, opts, *, min_commits: int = 1) -> int:
     if type(min_commits) is not int or min_commits < 1:
         raise Die("security-audit: minimum pending commits must be a positive integer")
-    require_admin()
     work = cfg.state / CURSOR
+    if pool_active(work):
+        raise AuditNotDue("security-audit: a parallel audit pool owns this cursor")
+    require_admin()
     repo = work / "objects.git"
     cursor, main = remote_sha(CURSOR), remote_sha(os.environ.get("TAUCETI_BASE_BRANCH", "main"))
     refresh(repo, cursor, main)
@@ -1740,12 +1895,12 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
     attempt = work / f"attempt-{time.time_ns()}"
     attempt.mkdir()
     (attempt / "input.json").write_text(serialize(batch))
-    actor = api("user")["login"]  # Resolve identity before a model verdict can exist.
+    actor = admin_login()  # Resolve identity before a model verdict can exist.
     provider = opts.work_model
     from .audit_clients import selected_protocol
 
     protocol = selected_protocol(provider, work)
-    model = "gpt-6-luna" if provider == "codex" else "haiku"
+    model = reviewer_model(provider)
     log(f"security-audit: isolated reviewer {provider}/{model}, protocol {protocol}")
     try:
         if any(c["files"] for c in batch["commits"]):
@@ -1759,33 +1914,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
             }
         record(
             work / "ledger.jsonl",
-            {
-                "actor": actor,
-                "provider": provider,
-                "model": model,
-                "batch": batch["input_digest"],
-                "prompt_digest": hashlib.sha256(
-                    (
-                        (SERVED_MODEL_PROMPT if provider == "codex" else SERVED_CLAUDE_PROMPT)
-                        if protocol == 4
-                        else MODEL_PROMPT
-                    ).encode()
-                ).hexdigest(),
-                "protocol_version": protocol,
-                "launcher_profile": reviewer_argv(provider, protocol=protocol),
-                "execution_record": str(attempt / "execution.json"),
-                "catalog_digest": hashlib.sha256(serialize(inspection_catalog(protocol)).encode()).hexdigest()
-                if provider == "codex"
-                else None,
-                "reader_digest": hashlib.sha256(reader_path(protocol).read_bytes()).hexdigest(),
-                "input_policy": "compacting-session-v1",
-                "output_repairs": len((attempt / "output-repairs.jsonl").read_text().splitlines())
-                if (attempt / "output-repairs.jsonl").exists()
-                else 0,
-                "from_sha": cursor,
-                "to_sha": target,
-                "verdict": verdict,
-            },
+            review_record(actor, provider, protocol, batch, attempt, verdict, credential_kind(provider)),
         )
         if verdict["verdict"] != "pass":
             raise Die("security-audit: " + "; ".join(verdict["findings"]))
@@ -1984,7 +2113,7 @@ def resume_incomplete(
     from .loop import resolve_work_model
 
     resolve_work_model(cfg, "codex", dry=False, ignore_quota=ignore_quota, fresh=True)
-    actor = api("user")["login"]
+    actor = admin_login()
     attempt = work / f"attempt-{time.time_ns()}"
     attempt.mkdir()
     (attempt / "input.json").write_text(serialize(batch), encoding="utf-8")
@@ -2077,7 +2206,7 @@ def attest(state: Path, through: str, reason: str) -> None:
     refresh(repo, cursor, main)
     remaining = validate_history(repo, cursor, main, through)
     commits = remaining[: remaining.index(through) + 1]
-    actor = api("user")["login"]
+    actor = admin_login()
     record(
         state / "ledger.jsonl",
         {
@@ -2173,14 +2302,32 @@ def setup(state: Path) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["setup", "attest", "resume", "retry-service", "repair-output"])
+    parser.add_argument("command", choices=["setup", "attest", "resume", "retry-service", "repair-output", "pool"])
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--through", help="full main commit SHA reviewed by the human administrator")
     parser.add_argument("--reason", help="human review evidence; never a model re-roll")
     parser.add_argument("--ignore-quota", action="store_true", help="ignore pacing, retaining hard quota limits")
+    parser.add_argument("--parallel", type=int, default=4, help="pool: concurrent isolated reviewers")
+    parser.add_argument(
+        "--agent", choices=["codex", "claude"], help="pool: pin one provider (default: codex, then haiku)"
+    )
     args = parser.parse_args()
     if args.command == "setup":
         setup(args.state)
+    elif args.command == "pool":
+        from .audit_pool import Chooser, Pool
+        from .config import Config
+
+        cfg = Config.resolve(args.state.parent.name)
+        if (cfg.state / CURSOR).resolve() != args.state.resolve():
+            parser.error("pool --state must identify this checkout's existing worker audit state")
+        min_commits = int(os.environ.get("TAUCETI_SECURITY_AUDIT_MIN_COMMITS") or 1)
+        Pool(
+            args.state,
+            parallel=args.parallel,
+            chooser=Chooser(cfg, pin=args.agent, ignore_quota=args.ignore_quota),
+            min_commits=min_commits,
+        ).serve()
     elif args.command in ("resume", "retry-service", "repair-output"):
         from .config import Config
         from .round import RoundContext
