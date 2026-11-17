@@ -1043,33 +1043,6 @@ def release(pool, name, guard, *, dry=False):
     return freed
 
 
-def supersede(pool, name, fresh, refused, guard):
-    """Replace `name`'s pool-owned names that hold rejected bytes with `fresh`, verified bytes.
-
-    Expansion's re-extraction is the only repair for a rejected canonical object or legacy alias:
-    adopting either would put the rejected inode back into every entry it publishes. Under the
-    exclusive object lock and through `guard`; a deferred replacement leaves the name in place,
-    and `reconcile` and expansion refuse to adopt it.
-    """
-    if not refused:
-        return
-    directory = store(pool)
-    fresh_info = fresh.lstat()
-    if fingerprint(fresh_info) in refused:
-        return  # Never spread rejected bytes, even over other rejected bytes.
-    with object_lock(directory, name, exclusive=True):
-        for path in (directory / "objects" / name, legacy(pool, name)):
-            try:
-                info = path.lstat()
-            except FileNotFoundError:
-                continue
-            if not stat.S_ISREG(info.st_mode) or fingerprint(info) not in refused:
-                continue
-            if guard.replace(fresh, fresh_info, path, info, recent_ok=True) and path.parent.name == "objects":
-                sidecar(directory, name).unlink(missing_ok=True)  # Our metadata; `expected` heals it.
-                log(f"canonical store: replaced rejected object {name} with re-expanded bytes")
-
-
 def reconcile(pool, name, path, *, blocking=True, guard=None, refused=None):
     """Make a pool alias of `name` (an entry file, `artifacts/`) the canonical inode, if identical.
 

@@ -6,6 +6,7 @@ import json
 import os
 import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -517,29 +518,58 @@ class Canonical(unittest.TestCase):
         cache.hydrate(entry, private, "d" * 16)
         self.assertTrue((private / "outputs/TauCeti" / ("d" * 16 + ".json")).exists())
 
+    def expander(self, checkout):
+        """`(expand, archive)`: `expand()` runs one CI expansion of an archive of `checkout`'s build."""
+        payload = b"archive of " + checkout.name.encode()
+        archive = lake_hash(payload) + ".ltar"
+        download = self.root / "download"
+        (download / "artifacts").mkdir(parents=True)
+        (download / "artifacts" / archive).write_bytes(payload)
+        cache.atomic_json(download / "outputs/TauCeti" / ("d" * 16 + ".json"), dict(data=archive))
+        build = checkout / ".lake/build"
+
+        def run(args, *, input, **kwargs):  # leantar: fresh inodes of the archived outputs
+            for job in json.loads(input):
+                shutil.copytree(build / "lib/lean", job["base"][0], dirs_exist_ok=True)
+                shutil.copytree(build / "ir", job["base"][1], dirs_exist_ok=True)
+
+        tools = SimpleNamespace(check_output=lambda *a, **k: str(self.root / "toolchain"), run=run)
+
+        def expand():
+            report = dict(hits=0, expanded=0)
+            with patch.object(cache, "subprocess", tools):
+                cache.expand(download, self.root / "private", self.root, {}, self.pool, report)
+            return report["hits"], report["expanded"]
+
+        return expand, archive
+
     def test_restored_outputs_beside_a_stale_trace_are_removed_not_rejected(self):
-        # CI's build of TauCeti.A is published; a local build of the same input differs in one
-        # output. Lake restores CI's outputs over it but keeps the local trace's names.
-        ci = self.checkout("ci", "TauCeti.A", seed="ci")
-        self.relink(ci)
-        checkout = self.checkout("w", "TauCeti.A", seed="local")
-        objects = canonical.store(self.pool) / "objects"
-        restored = {}
-        for (path, name), (_, theirs) in zip(paths(checkout), paths(ci), strict=True):
-            self.assertNotEqual(name, theirs)
+        # CI's and a local build of one Lake input differ only in `.olean.private`.
+        builds = {}
+        for seed in ("ci", "w"):
+            checkout = self.checkout(seed, "TauCeti.A", seed="same")
+            lib = checkout / ".lake/build/lib/lean/TauCeti"
+            data = seed.encode() * 64
+            (lib / "A.olean.private").write_bytes(data)
+            trace = json.loads((lib / "A.trace").read_text())
+            trace["outputs"]["o"].append(lake_hash(data) + ".olean.private")
+            (lib / "A.trace").write_text(json.dumps(trace))
+            builds[seed] = checkout
+        checkout = builds["w"]
+        self.relink(checkout)  # The local build was published first.
+        expand, _ = self.expander(builds["ci"])
+        self.assertEqual(expand(), (0, 1))
+        # Lake restores CI's outputs from the hydrated store but keeps the stale local trace.
+        private = self.root / "private"
+        for (path, _), (_, theirs) in zip(paths(checkout), paths(builds["ci"]), strict=True):
             path.unlink()
-            if path.name == "A.olean.server":
-                os.link(objects / theirs, path)  # shared with the CI canonical object
-            else:
-                shutil.copyfile(objects / theirs, path)  # a private copy of CI's bytes
-            restored[theirs] = path.lstat()
-        report = self.relink(checkout)
-        self.assertEqual(report["invalidated_outputs"], len(restored))
-        self.assertFalse(any(path.exists() for path, _ in paths(checkout)))  # Lake rebuilds the module.
+            os.link(private / "artifacts" / theirs, path)
+        report = canonical.relink(checkout, private, self.pool)  # the round-end relink
+        self.assertEqual(report["invalidated_outputs"], 1)
+        self.assertFalse((checkout / ".lake/build/lib/lean/TauCeti/A.olean.private").exists())  # Lake rebuilds A.
         self.assertEqual(canonical.rejected(self.pool), set())
-        entry = self.entry_for(ci)
-        cache.hydrate(entry, self.root / "other-store", "d" * 16)  # CI's objects stay usable.
-        self.assertTrue(all((objects / theirs).exists() for theirs in restored))
+        self.assertEqual(expand(), (1, 0))  # The next round hydrates CI's entry.
+        self.assertEqual(canonical.rejected(self.pool), set())
 
     def test_rejected_bytes_are_never_rehydrated_or_kept_privately(self):
         checkout = self.checkout("w", "TauCeti.A")
@@ -572,12 +602,7 @@ class Canonical(unittest.TestCase):
         """
         checkout = self.checkout("w", "TauCeti.A")
         olean, name = next((p, n) for p, n in paths(checkout) if p.name == "A.olean")
-        payload = b"archive of TauCeti.A"
-        archive = lake_hash(payload) + ".ltar"
-        download = self.root / "download"
-        (download / "artifacts").mkdir(parents=True)
-        (download / "artifacts" / archive).write_bytes(payload)
-        cache.atomic_json(download / "outputs/TauCeti" / ("d" * 16 + ".json"), dict(data=archive))
+        expand, archive = self.expander(checkout)
         shared = self.pool / "artifacts" / name
         shared.parent.mkdir(parents=True)
         shutil.copyfile(olean, shared)
@@ -595,50 +620,34 @@ class Canonical(unittest.TestCase):
                 os.link(shared, entry / descriptor)
             else:
                 shutil.copyfile(path, entry / descriptor)
-        os.link(download / "artifacts" / archive, entry / archive)
+        os.link(self.root / "download/artifacts" / archive, entry / archive)
         cache.atomic_json(entry / "entry.json", dict(data=dict(outputs, l=archive)))
-        build = checkout / ".lake/build"
-
-        def run(args, *, input, **kwargs):  # leantar: fresh inodes of the archived outputs
-            for job in json.loads(input):
-                shutil.copytree(build / "lib/lean", job["base"][0], dirs_exist_ok=True)
-                shutil.copytree(build / "ir", job["base"][1], dirs_exist_ok=True)
-
-        tools = SimpleNamespace(check_output=lambda *a, **k: str(self.root / "toolchain"), run=run)
-
-        def expand():
-            report = dict(hits=0, expanded=0)
-            with patch.object(cache, "subprocess", tools):
-                cache.expand(download, self.root / "private", self.root, {}, self.pool, report)
-            return report["hits"], report["expanded"]
-
         return expand, name, bad
 
-    def test_reexpansion_replaces_a_rejected_shared_alias_and_canonical_object(self):
-        expand, name, bad = self.rejected_pool_alias()
-        self.assertEqual(expand(), (0, 1))
+    def assert_fresh_publication(self, name, bad):
         entry = next((self.pool / "entries").iterdir()) / name
         fresh = entry.lstat()
         self.assertNotEqual(fresh.st_ino, bad.st_ino)
-        objects = canonical.store(self.pool) / "objects"
-        for alias in (self.pool / "artifacts" / name, objects / name, self.root / "private/artifacts" / name):
-            self.assertEqual(alias.lstat().st_ino, fresh.st_ino, alias)
-        self.assertEqual(canonical.expected(canonical.store(self.pool), name)[2], True)
-        # The rejected inode is gone from the pool, so the next round simply hydrates.
-        self.assertEqual(expand(), (1, 0))
+        self.assertEqual(stat.S_IMODE(fresh.st_mode), 0o444)
+        self.assertEqual((self.root / "private/artifacts" / name).lstat().st_ino, fresh.st_ino)
+        # The rejected pool names linger, but no entry or store adopts them.
+        self.assertEqual((self.pool / "artifacts" / name).lstat().st_ino, bad.st_ino)
+        self.assertEqual((canonical.store(self.pool) / "objects" / name).lstat().st_ino, bad.st_ino)
 
-    def test_reexpansion_never_adopts_a_rejected_alias_it_cannot_replace(self):
+    def test_reexpansion_never_adopts_a_rejected_shared_alias_or_canonical_object(self):
+        expand, name, bad = self.rejected_pool_alias()
+        self.assertEqual(expand(), (0, 1))
+        self.assertEqual(expand(), (1, 0))  # The next round simply hydrates.
+        self.assert_fresh_publication(name, bad)
+
+    def test_reexpansion_publishes_read_only_bytes_beside_a_busy_rejected_alias(self):
         expand, name, bad = self.rejected_pool_alias()
         shared = self.pool / "artifacts" / name
         os.chmod(shared, 0o644)
-        with open(shared, "r+b"):  # Busy: neither name may be replaced, nor adopted.
+        with open(shared, "r+b"):  # Busy as well as rejected.
             self.assertEqual(expand(), (0, 1))
             self.assertEqual(expand(), (1, 0))
-        entry = next((self.pool / "entries").iterdir()) / name
-        self.assertNotEqual(entry.lstat().st_ino, bad.st_ino)
-        self.assertEqual((self.root / "private/artifacts" / name).lstat().st_ino, entry.lstat().st_ino)
-        self.assertEqual(shared.lstat().st_ino, bad.st_ino)
-        self.assertEqual((canonical.store(self.pool) / "objects" / name).lstat().st_ino, bad.st_ino)
+        self.assert_fresh_publication(name, bad)
 
     def test_private_alias_is_dropped_only_while_it_is_the_rejected_snapshot(self):
         checkout = self.checkout("w", "TauCeti.A")

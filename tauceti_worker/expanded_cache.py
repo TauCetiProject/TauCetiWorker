@@ -344,7 +344,7 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
     deadline = math.inf if deadline is None else deadline
     program = None
     completed = 0
-    from .canonical_store import Guard, fingerprint, reconcile, rejected, supersede
+    from .canonical_store import Guard, fingerprint, reconcile, rejected
 
     guard = Guard()  # One lazy /proc scan for every alias this expansion may replace.
     refused = rejected(pool)  # read once per expansion, not once per entry
@@ -473,19 +473,17 @@ def expand(download, private, cwd, env, pool, report, *, manifest=None, private_
                     for name in names:
                         # Deduplicate identical outputs across archive bundles as well as workers.
                         shared = pool / ("archives" if name.endswith(".ltar") else "artifacts") / name
-                        # Pool names holding rejected bytes take these verified ones instead:
-                        # adopting them would republish the rejected inode on every expansion.
-                        supersede(pool, name, artifacts[name], refused, guard)
                         # An identical canonical object (a local build published first) wins.
                         reconcile(pool, name, artifacts[name], guard=guard, refused=refused)
                         # Create a publication link FIRST, so a newly published canonical
                         # artifact never appears to GC as an unreferenced single link.
+                        artifacts[name].chmod(0o444)  # Read-only even if `shared` keeps other bytes.
                         link(artifacts[name], publication / name, guard)
                         link(publication / name, shared, guard)
                         shared.chmod(0o444)  # Only ever removes write permission.
                         reconcile(pool, name, shared, guard=guard, refused=refused)
                         if shared.stat().st_ino != (publication / name).stat().st_ino and (
-                            fingerprint(shared.lstat()) not in refused  # A deferred supersede.
+                            fingerprint(shared.lstat()) not in refused  # Never adopt rejected bytes.
                         ):
                             (publication / name).unlink()  # Our staging name.
                             link(shared, publication / name, guard)
