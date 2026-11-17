@@ -485,7 +485,7 @@ def project(
         )
         inputs = rows(
             "SELECT id,repository,number,head_sha,title,author,state,approved_at,batch_id,"
-            "landed_at,landed_sha,no_repair FROM inputs ORDER BY CASE WHEN state IN ('waiting','reserved') THEN 0 ELSE 1 END,id DESC LIMIT ?",
+            "landed_at,landed_sha,no_repair,reason FROM inputs ORDER BY CASE WHEN state IN ('waiting','reserved') THEN 0 ELSE 1 END,id DESC LIMIT ?",
             (LIMIT + 1,),
         )
         # The exporter can start before the queue migrates an older ledger.
@@ -603,6 +603,9 @@ def project(
             and not row["removed"]
         ):
             disposition = "rejected_empty"
+        elif row["withdrawn"] and item.get("state") == "cancelled" and item.get("reason") == "empty-commit":
+            # Emptied by an adopted repair and sent back to its author at once (`_withdraw_member`).
+            disposition = "withdrawn_empty"
         member_records.append(
             {
                 "id": str(row["id"]),

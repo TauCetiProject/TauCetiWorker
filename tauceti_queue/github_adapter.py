@@ -51,7 +51,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 
-from . import chain, declaration_names, diagnostics, github_app, ports
+from . import chain, declaration_names, diagnostics, diff_guard, github_app, ports
 from .ports import CandidatePhase, CandidateRun, FastForwardResult, Status
 
 API = github_app.API
@@ -1172,6 +1172,8 @@ class GitHubAdapter:
             local = eligible(
                 raw, repo, paths=paths, read=lambda path: self.client.get_json(path)[1], member_read=gh_read
             )
+        # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here.
+        guard = diff_guard.violations(self.clone_dir, merge_base, pull.head_sha) if local else ()
         fresh, statuses = self._admission_fence(repo, number, pull, labels_progress=progress.setdefault("labels", {}))
         if (
             fresh.head_sha,
@@ -1205,6 +1207,7 @@ class GitHubAdapter:
             statuses,
             self._diff_version(pull.base_sha, pull.head_sha),
             self_tested=local,
+            diff_guard=guard,
         )
 
     def _admission_fence(self, repo, number, pull, *, labels_progress=None):

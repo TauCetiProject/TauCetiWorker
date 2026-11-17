@@ -1,5 +1,19 @@
 # Reject PRs whose final staging commits are empty
 
+An adopted repair that reduces an ordinary member to an empty commit withdraws that member at once
+(setting `withdraw_emptied_at_adoption`, default on): the member is marked `withdrawn` and keeps its
+empty commit in the chain, its input is cancelled as `empty-commit`, its approval is withdrawn, its
+staging label is removed, and its author gets one comment through the outbox (key
+`withdrawn-comment:<input>`) saying what failed (the repair task's CI run and findings), the accepted
+revision, the agent's explanation and what to do next (rebase, fix, approve again). The PR stays open.
+A withdrawn member cannot be given content again by a later repair (`no-repair-edited`); one whose PR
+lands on `main` by other means before its batch lands is landed with the batch as any externally
+merged member is. This is journaled as `member-withdrawn-empty` and counted in `prs_withdrawn_empty`.
+
+The landing-time rejection below remains the backstop for empty final commits that adoption did not
+withdraw (the setting off, or a member emptied by a path other than an adopted repair). Its comment
+carries the same failure lines and what to do next.
+
 When a staging batch lands, a PR whose final commit is empty should be reported as rejected rather than merged. Use the explanation the repair agent already appended to its commit message. Do not add another explanation channel, repair marker, or agent protocol.
 
 ## Implementation

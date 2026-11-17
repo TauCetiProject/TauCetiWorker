@@ -225,21 +225,48 @@ def api(path: str, *, method: str = "GET", body=None):
         raise NoProgress("security-audit: invalid GitHub response") from exc
 
 
-def require_admin() -> None:
-    if api(f"repos/{TAUCETI}").get("permissions", {}).get("admin") is not True:
+# The audit reads refs and advances its cursor over Git, and checks authority with
+# GraphQL. Neither draws on the REST quota that other tools on the same account
+# exhaust; only the non-fatal readiness dispatch still uses REST.
+REMOTE = f"https://github.com/{TAUCETI}.git"
+
+
+def admin_login() -> str:
+    """Return the authenticated login after confirming repository-admin permission."""
+    owner, name = TAUCETI.split("/")
+    argv = [
+        "gh",
+        "api",
+        "graphql",
+        "--hostname",
+        "github.com",
+        "-f",
+        "query=query($owner:String!,$name:String!){viewer{login} repository(owner:$owner,name:$name){viewerPermission}}",
+        "-F",
+        f"owner={owner}",
+        "-F",
+        f"name={name}",
+    ]
+    p = execute(argv, env={**os.environ, "TAUCETI_OUTBOX_REPLAY": "1"})
+    if p.returncode:
+        raise NoProgress(f"security-audit: GitHub request failed: {p.stderr.strip()}")
+    try:
+        data = json.loads(p.stdout)["data"]
+        login, permission = data["viewer"]["login"], data["repository"]["viewerPermission"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise NoProgress("security-audit: invalid GitHub response") from exc
+    if permission != "ADMIN" or not isinstance(login, str) or not login:
         raise Die(f"security-audit requires repository-admin permission on {TAUCETI}")
+    return login
 
 
-def remote_sha(branch: str) -> str:
-    value = api(f"repos/{TAUCETI}/git/ref/heads/{branch}").get("object", {})
-    sha = value.get("sha", "")
-    if value.get("type") != "commit" or not SHA.fullmatch(sha):
-        raise NoProgress(f"security-audit: {branch} is not a commit reference")
-    return sha
+def require_admin() -> None:
+    admin_login()
 
 
-def git(repo: Path, *args: str) -> bytes:
-    # Bare, private object store. Never inherit Git config injection or replace refs.
+def git_env(*, credential: bool = False) -> dict:
+    # Never inherit Git config injection or replace refs. Pushes authenticate
+    # with the selected account's token from the environment, never argv.
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "SYSTEMROOT", "SSL_CERT_FILE")}
     env.update(
         GIT_CONFIG_NOSYSTEM="1",
@@ -248,9 +275,66 @@ def git(repo: Path, *args: str) -> bytes:
         GIT_LITERAL_PATHSPECS="1",
         GIT_TERMINAL_PROMPT="0",
     )
+    if credential:
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        if not token:
+            # gh's stored credential for its active account; a local read, not an API call.
+            p = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=30)
+            token = p.stdout.strip() if not p.returncode else ""
+        if not token:
+            # NoProgress, not Die: a passing verdict stays reusable and nothing is blocked.
+            raise NoProgress("security-audit: no GitHub token available to advance the cursor")
+        env["TAUCETI_AUDIT_PUSH_TOKEN"] = token
+    return env
+
+
+def remote_sha(branch: str) -> str:
+    ref = f"refs/heads/{branch}"
+    p = subprocess.run(
+        ["git", "ls-remote", "--", REMOTE, ref], env=git_env(), capture_output=True, text=True, timeout=120
+    )
+    if p.returncode:
+        raise NoProgress(f"security-audit: git ls-remote failed: {p.stderr.strip()}")
+    rows = [line.split("\t") for line in p.stdout.splitlines() if line.strip()]
+    if len(rows) != 1 or len(rows[0]) != 2 or rows[0][1] != ref or not SHA.fullmatch(rows[0][0]):
+        raise NoProgress(f"security-audit: {branch} is not a commit reference")
+    return rows[0][0]
+
+
+def push_cursor(repo: Path, old: str, target: str) -> None:
+    """Fast-forward the cursor only if it still equals old (server-side compare-and-swap)."""
+    ref = f"refs/heads/{CURSOR}"
+    helper = '!f() { test "$1" = get || exit 0; echo username=x-access-token; echo "password=$TAUCETI_AUDIT_PUSH_TOKEN"; }; f'
+    p = subprocess.run(
+        [
+            "git",
+            "--git-dir",
+            str(repo),
+            "-c",
+            "credential.helper=",
+            "-c",
+            f"credential.helper={helper}",
+            "push",
+            "--porcelain",
+            "--no-verify",
+            f"--force-with-lease={ref}:{old}",
+            REMOTE,
+            f"{target}:{ref}",
+        ],
+        env=git_env(credential=True),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if p.returncode:
+        raise NoProgress(f"security-audit: cursor push rejected: {(p.stderr or p.stdout).strip()}")
+
+
+def git(repo: Path, *args: str) -> bytes:
+    # Bare, private object store.
     p = subprocess.run(
         ["git", "--git-dir", str(repo), *args],
-        env=env,
+        env=git_env(),
         capture_output=True,
         timeout=180,
     )
@@ -1713,9 +1797,11 @@ def advance(repo: Path, batch: dict) -> str:
     refresh(repo, main)
     target = batch["commits"][-1]["sha"]
     validate_history(repo, old, main, target)
-    # No force. GitHub's separate no-bypass rule also rejects rewinds/deletions.
-    updated = api(f"repos/{TAUCETI}/git/refs/heads/{CURSOR}", method="PATCH", body={"sha": target, "force": False})
-    if updated.get("object", {}).get("sha") != target or remote_sha(CURSOR) != target:
+    # target descends from old on main's first-parent history, so this is a
+    # fast-forward; the lease makes it conditional on the cursor still being old.
+    # GitHub's separate no-bypass rule also rejects rewinds/deletions.
+    push_cursor(repo, old, target)
+    if remote_sha(CURSOR) != target:
         raise NoProgress("security-audit: cursor update could not be confirmed")
     return target
 
@@ -1865,7 +1951,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
     attempt = work / f"attempt-{time.time_ns()}"
     attempt.mkdir()
     (attempt / "input.json").write_text(serialize(batch))
-    actor = api("user")["login"]  # Resolve identity before a model verdict can exist.
+    actor = admin_login()  # Resolve identity before a model verdict can exist.
     provider = opts.work_model
     from .audit_clients import selected_protocol
 
@@ -2083,7 +2169,7 @@ def resume_incomplete(
     from .loop import resolve_work_model
 
     resolve_work_model(cfg, "codex", dry=False, ignore_quota=ignore_quota, fresh=True)
-    actor = api("user")["login"]
+    actor = admin_login()
     attempt = work / f"attempt-{time.time_ns()}"
     attempt.mkdir()
     (attempt / "input.json").write_text(serialize(batch), encoding="utf-8")
@@ -2176,7 +2262,7 @@ def attest(state: Path, through: str, reason: str) -> None:
     refresh(repo, cursor, main)
     remaining = validate_history(repo, cursor, main, through)
     commits = remaining[: remaining.index(through) + 1]
-    actor = api("user")["login"]
+    actor = admin_login()
     record(
         state / "ledger.jsonl",
         {

@@ -807,6 +807,7 @@ class NativeSource(unittest.TestCase):
         with (
             patch.object(self.source, "_merge_base", return_value="b" * 40),
             patch.object(self.source, "_git", return_value=subprocess.CompletedProcess([], 0, b"Math/A.lean\0", b"")),
+            patch("tauceti_queue.diff_guard.violations", return_value=()),
         ):
             snapshot = self.source.admission_snapshot("team/Math", 1)
             self.assertEqual(snapshot.statuses["_native_review"], "damaged")
@@ -1032,12 +1033,28 @@ class NativeSource(unittest.TestCase):
         self.status_rows.append(old)
         self.assertEqual(self.read()[2], "clear")
 
+    def test_every_native_head_is_held_to_the_pr_level_diff_guards(self):
+        pull = NativePullRequest(1, "a" * 40, "main", "Proof", "", "writer", "open", base_sha="b" * 40)
+        self.source.fetch_pr.side_effect = [pull, pull]
+        with (
+            patch.object(self.source, "_merge_base", return_value="b" * 40),
+            patch.object(self.source, "_git", return_value=subprocess.CompletedProcess([], 0, b"Math/A.lean\0", b"")),
+            patch("tauceti_queue.diff_guard.violations", return_value=("too large to review",)) as measure,
+        ):
+            snapshot = self.source.admission_snapshot("team/Math", 1)
+        measure.assert_called_once_with(self.source.clone_dir, "b" * 40, "a" * 40)
+        self.assertEqual(snapshot.diff_guard, ("too large to review",))
+        result = self.source.admission_policy.evaluate(snapshot)[0]
+        self.assertFalse(result["merge"])
+        self.assertIn("too large to review", result["reason"])
+
     def test_unrelated_discussion_does_not_starve_a_source_snapshot_but_changed_heads_still_do(self):
         pull = NativePullRequest(1, "a" * 40, "main", "Proof", "", "writer", "open", base_sha="b" * 40)
         discussion = replace(pull, title="A new title", comments_count=1, updated_at="2026-11-08T14:00:00Z")
         with (
             patch.object(self.source, "_merge_base", return_value="b" * 40),
             patch.object(self.source, "_git", return_value=subprocess.CompletedProcess([], 0, b"Math/A.lean\0", b"")),
+            patch("tauceti_queue.diff_guard.violations", return_value=()),
         ):
             self.source.fetch_pr.side_effect = [pull, discussion]
             snapshot = self.source.admission_snapshot("team/Math", 1)

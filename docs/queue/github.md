@@ -192,9 +192,15 @@ fenced `diff` block. A diff longer than 400 lines shows the first 400 and a note
 line count and a link to the commit. Then the earlier edited revisions, the PRs the explanation
 mentions and the retained ref, as before. Each summary is journaled as `edit-summary` (number,
 commit, accepted head, `diff_lines`, `truncated`) and counted in `edit_summaries`. A clean member's
-comment is unchanged. A final empty contribution instead receives a rejection notice quoting the
-same accumulated explanations, has its staging label removed, and is closed without the merged
-title prefix. Existing externally merged placeholders and opt-out withdrawals retain their handling.
+comment is unchanged. A contribution an adopted repair reduces to an empty commit is withdrawn at
+adoption (`withdraw_emptied_at_adoption`): one comment, keyed `withdrawn-comment:<input>`, says that
+the queue withdrew it from the batch, what failed (the repair task's CI run and up to eight
+findings, or its rebase conflict), the accepted revision, the agent's explanation quoted, and what to
+do next (rebase, fix, approve again); its staging label is removed, its approval withdrawn, and the
+PR stays open. A final empty contribution not withdrawn at adoption instead receives a rejection
+notice at landing quoting the same accumulated explanations and failure lines, has its staging label
+removed, and is closed without the merged title prefix. Existing externally merged placeholders and
+opt-out withdrawals retain their handling.
 
 **The `repaired-in-queue` label.** Beside `dont-repair-in-queue` (the author's opt-out) and
 `needs-rebase` (the author must act), the queue marks the PRs it changed: every landed member that
