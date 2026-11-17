@@ -58,6 +58,8 @@ class Slot:
     provider: str | None = None
     credential: str | None = None
     resume: dict | None = None  # Codex: the stopped attempt to continue in the same session.
+    # Inherited from the Worker's sequential audit, which already ran it without soft pacing.
+    inherited: bool = False
 
     @property
     def digest(self) -> str:
@@ -112,6 +114,7 @@ class Pool:
         self.started = time.time()
         self.advanced_commits = 0
         self.planning_blocked: str | None = None
+        self.inherited: tuple[dict, dict] | None = None  # (block, retained batch) of a Worker Codex attempt.
         self.fetched: tuple[str, str] | None = None
 
     # Persistence -----------------------------------------------------------
@@ -254,6 +257,15 @@ class Pool:
             return
         if not self.slots and len(sa.validate_history(self.repo, cursor, main)) < self.min_commits:
             return
+        if not self.slots and self.inherited is not None:
+            previous, batch = self.inherited
+            self.inherited = None
+            commits = [c["sha"] for c in batch["commits"]]
+            if batch["from_sha"] == cursor and sa.validate_history(self.repo, cursor, main)[: len(commits)] == commits:
+                slot = Slot(batch, provider="codex", credential="subscription", resume=previous, inherited=True)
+                self.slots.append(slot)
+                frm = slot.target
+                log(f"security-audit pool: continuing the Worker's Codex inspection {cursor[:12]}..{frm[:12]}")
         while len(self.slots) < self.parallel:
             try:
                 batch = sa.plan_batch(self.repo, frm, main)
@@ -510,6 +522,15 @@ class Pool:
         for key in ("attempt", "continuation_of"):
             if previous.get(key) and not clean_history(Path(previous[key])):
                 return False
+        try:
+            from .audit_recovery import retained
+
+            _, batch, execution, _ = retained(self.work, previous)
+            if execution.get("argv", [""])[0] == "codex":
+                # A batch keeps its reviewer for life: continue this Codex session in the pool.
+                self.inherited = (previous, batch)
+        except (Die, OSError, ValueError, KeyError, TypeError, IndexError, AttributeError):
+            self.inherited = None  # Nothing valid to continue; a fresh inspection is allowed.
         archived = self.work / f"superseded-by-pool-block-{time.time_ns()}.json"
         (self.work / "blocked.json").rename(archived)
         sa.record(ledger, {"superseded_operational_block": previous, "archived": str(archived)})
@@ -643,5 +664,5 @@ class Chooser:
     def retry(self, slot: Slot):
         """Same provider for life; Claude may move from subscription to the API key."""
         if slot.provider == "codex":
-            return ("codex", "subscription") if self.under_pace("codex") else None
+            return ("codex", "subscription") if slot.inherited or self.under_pace("codex") else None
         return self.claude(prefer=slot.credential)

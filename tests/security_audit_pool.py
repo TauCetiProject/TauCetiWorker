@@ -370,5 +370,38 @@ class Ownership(PoolFixture):
         self.assertTrue(list(self.state.glob("superseded-by-pool-block-*.json")))
 
 
+    def test_worker_codex_block_continues_in_its_session_even_over_pace(self):
+        # The Worker's batch was planned against an older main, so its input differs
+        # from what the pool would plan now; it must still be continued, on Codex.
+        batch = sa.plan_batch(self.repo, self.shas[0], self.shas[-2])
+        attempt = self.state / "attempt-1"
+        attempt.mkdir()
+        (attempt / "input.json").write_text(sa.serialize(batch))
+        block = {
+            "from_sha": self.shas[0],
+            "to_sha": batch["commits"][-1]["sha"],
+            "reason": "security-audit: inspection unfinished; retained for same-session continuation",
+            "attempt": str(attempt),
+        }
+        (self.state / "blocked.json").write_text(sa.serialize(block))
+        self.pace["codex"] = False
+        self.key = "sk-ant-fixture-secret"
+        retained = []
+
+        def fake_retained(work, previous):
+            retained.append(previous["attempt"])
+            return Path(previous["attempt"]), batch, {"argv": ["codex", "exec"], "paged": True}, False
+
+        with (
+            patch("tauceti_worker.audit_recovery.retained", side_effect=fake_retained),
+            patch("tauceti_worker.audit_progress.continuable", return_value=True),
+        ):
+            self.serve(lambda b, a: self.verdict(b))
+        self.assertIn(str(attempt), retained)
+        head = [(p, resumed) for i, p, _, resumed in self.launches if i == 0]
+        self.assertEqual(head, [("codex", True)])
+        self.assertTrue(all(p == "claude" for i, p, _, _ in self.launches if i != 0))
+        self.assertEqual(len(self.advanced), 3)
+
 if __name__ == "__main__":
     unittest.main()
