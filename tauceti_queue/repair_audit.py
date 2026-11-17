@@ -34,7 +34,7 @@ from tauceti_queue import diagnostics, repair_sandbox, repair_tools
 WORK_DIR = Path(".lake") / "tauceti-repair-audit"
 SETTINGS_FILE = "audit.json"  # in .tauceti-repair: what the agent's build script needs to run the checks
 ERRORS_FILE = "errors.jsonl"  # repair_stream's error list, in .tauceti-repair
-TOOLS_DIR = "tauceti-tools"  # under the worker's root: one TauCetiTools checkout per pinned ref
+TOOLS_DIR = "tauceti-tools"  # under the worker's root: one TauCetiTools checkout per commit
 URL_VARIABLE = "TAUCETI_QUEUE_TOOLS_URL"  # a ``{repo}`` template; tests point it at a local repository
 DEFAULT_URL = "https://github.com/{repo}.git"
 ENABLE_VARIABLE = "TAUCETI_QUEUE_WORKER_AUDITS"
@@ -156,8 +156,10 @@ def parse_tools_pin(text: str) -> tuple[str, str]:
     if not isinstance(tools, dict):
         raise Unavailable("tauceti.toml: missing [tools.tools]")
     repo, ref = str(tools.get("repo") or ""), str(tools.get("ref") or "")
-    if not REPO.match(repo) or not SHA.match(ref):
-        raise Unavailable(f"tauceti.toml: [tools.tools] needs repo and a 40-hex ref, found {repo!r} {ref!r}")
+    if not REPO.match(repo) or not (ref == "main" or SHA.match(ref)):
+        raise Unavailable(
+            f"tauceti.toml: [tools.tools] needs repo and ref main or a 40-hex SHA, found {repo!r} {ref!r}"
+        )
     return repo, ref
 
 
@@ -170,13 +172,24 @@ def _tail(text: str) -> str:
 
 
 def tools_checkout(tools_root: Path, repo: str, ref: str) -> Path:
-    """``tools_root/<ref>``, a checkout of TauCetiTools at ``ref``, fetched on first use."""
+    """``tools_root/<sha>``, a checkout of TauCetiTools at ``ref``, fetched on first use.
+
+    ``main`` is resolved to its current commit on every call, so its name is the commit audited."""
+    url = os.environ.get(URL_VARIABLE, DEFAULT_URL).format(repo=repo)
+    if not SHA.match(ref):
+        try:
+            proc = _run(["git", "ls-remote", url, f"refs/heads/{ref}"], timeout=60)
+        except subprocess.TimeoutExpired as error:
+            raise Unavailable(f"resolving {repo}@{ref}: {error}") from error
+        resolved = proc.stdout.split()[:1] if proc.returncode == 0 else []
+        if not resolved or not SHA.match(resolved[0]):
+            raise Unavailable(f"resolving {repo}@{ref}: {_tail(proc.stderr or proc.stdout) or 'no such branch'}")
+        ref = resolved[0]
     dest = tools_root / ref
     if (dest / "tauceti_tools").is_dir():
         return dest
     tools_root.mkdir(parents=True, exist_ok=True)
     scratch = Path(tempfile.mkdtemp(prefix=f".{ref[:12]}-", dir=tools_root))
-    url = os.environ.get(URL_VARIABLE, DEFAULT_URL).format(repo=repo)
     try:
         for argv in (
             ["git", "init", "--quiet", scratch],
@@ -454,6 +467,7 @@ def check(
         repo, ref = tools_pin(worktree)
         record["tools"] = f"{repo}@{ref}"
         checkout = tools_checkout(tools_root, repo, ref)
+        ref = checkout.name  # the exact commit, which keys the compiled drivers
         record["tools_seconds"] = round(time.monotonic() - setup_started, 3)
         if should_defer():
             return dict(record, status="deferred", seconds=round(time.monotonic() - started, 1))

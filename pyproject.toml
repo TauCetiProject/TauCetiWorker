@@ -9,12 +9,16 @@ description = "Autonomous worker for the TauCetiProject/TauCeti Lean library"
 requires-python = ">=3.11"
 dependencies = [
     "tauceti-review @ git+https://github.com/TauCetiProject/TauCetiReview@a85a2bbcd59a8177ee375d01dfd3394e0858c459",
-    "tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@3efe7c2dac753c6acaec93b9398cd2260493735d",
+    "tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@main",
     "rich>=13",
     "textual>=8,<9",
     "psutil>=7; sys_platform == 'darwin'",
     "cryptography>=42",
 ]
+
+[tool.uv]
+# TauCetiReview may name another TauCetiTools ref; the worker always runs TauCetiTools main.
+override-dependencies = ["tauceti-tools @ git+https://github.com/TauCetiProject/TauCetiTools@main"]
 
 [project.scripts]
 tauceti = "tauceti_worker.cli:cli_main"
