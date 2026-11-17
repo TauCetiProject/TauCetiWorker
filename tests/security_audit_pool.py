@@ -283,6 +283,28 @@ class Providers(PoolFixture):
         first = [(p, resumed) for i, p, _, resumed in self.launches if i == 0]
         self.assertEqual(first, [("codex", False), ("codex", True)])
 
+    def test_haiku_retry_is_refused_when_the_stopped_transcript_holds_a_finding(self):
+        self.pace["codex"] = False
+
+        def inspect(batch, attempt):
+            if self.index(batch) == 0:
+                (attempt / "execution.json").write_text(sa.serialize({"argv": ["claude", "-p"]}))
+                use = {
+                    "type": "tool_use",
+                    "name": "StructuredOutput",
+                    "input": {"verdict": "finding", "findings": ["x"]},
+                }
+                (attempt / "model-transcript.jsonl").write_text(
+                    sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
+                )
+                raise Die("security-audit: reviewer failed")
+            return self.verdict(batch)
+
+        self.serve(inspect, stop=lambda p: not p.running and any(s.status == "blocked" for s in p.slots))
+        self.assertEqual([p for i, p, _, _ in self.launches if i == 0], ["claude"])
+        self.assertEqual(self.advanced, [])
+        self.assertTrue((self.state / "blocked.json").exists())
+
     def test_pinned_codex_waits_rather_than_using_haiku(self):
         self.pace["codex"] = False
         self.key = "sk-ant-fixture-secret"

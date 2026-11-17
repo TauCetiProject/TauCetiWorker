@@ -57,7 +57,7 @@ class Slot:
     # A batch keeps its reviewer for life; retries never switch provider.
     provider: str | None = None
     credential: str | None = None
-    resume: dict | None = None  # Codex: the stopped attempt to continue in the same session.
+    resume: dict | None = None  # The stopped attempt to continue in the same session.
     # Inherited from the Worker's sequential audit, which already ran it without soft pacing.
     inherited: bool = False
 
@@ -80,12 +80,30 @@ def operational(exc: BaseException, attempt: Path, provider: str) -> bool:
     return clean and clean_history(attempt)
 
 
-def clean_history(attempt: Path) -> bool:
-    if not attempt.is_dir() or not sa.native_rollouts(attempt):
+def claude_attempt(attempt: Path) -> bool:
+    if (attempt / sa.CLAUDE_SESSIONS).exists():
         return True
-    # A fresh attempt must never discard a judgment already in the native history.
-    from .audit_recovery import native_finals
+    if (attempt / "native-sessions").exists() or any(attempt.glob("model-rollout-*.jsonl")):
+        return False  # A Codex attempt: its native rollout is checked as before.
+    try:
+        return json.loads((attempt / "execution.json").read_text())["argv"][0] == "claude"
+    except FileNotFoundError:
+        return False  # Never launched: no reviewer output exists.
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        return True  # Unreadable launch record: check it as Haiku output, which fails closed.
 
+
+def clean_history(attempt: Path) -> bool:
+    if not attempt.is_dir():
+        return True
+    # A fresh attempt must never discard a judgment already in the reviewer's history:
+    # Luna's native rollout, or Haiku's retained session and captured stream-json output.
+    from .audit_recovery import claude_clean, native_finals
+
+    if claude_attempt(attempt) and not claude_clean(attempt):
+        return False
+    if not sa.native_rollouts(attempt):
+        return True
     try:
         finals = native_finals(attempt)
     except (Die, OSError, ValueError, TypeError, AttributeError):
@@ -114,7 +132,8 @@ class Pool:
         self.started = time.time()
         self.advanced_commits = 0
         self.planning_blocked: str | None = None
-        self.inherited: tuple[dict, dict] | None = None  # (block, retained batch) of a Worker Codex attempt.
+        # (block, retained batch, provider, credential) of a stopped Worker attempt to continue.
+        self.inherited: tuple[dict, dict, str, str] | None = None
         self.fetched: tuple[str, str] | None = None
 
     # Persistence -----------------------------------------------------------
@@ -258,14 +277,17 @@ class Pool:
         if not self.slots and len(sa.validate_history(self.repo, cursor, main)) < self.min_commits:
             return
         if not self.slots and self.inherited is not None:
-            previous, batch = self.inherited
+            previous, batch, provider, credential = self.inherited
             self.inherited = None
             commits = [c["sha"] for c in batch["commits"]]
             if batch["from_sha"] == cursor and sa.validate_history(self.repo, cursor, main)[: len(commits)] == commits:
-                slot = Slot(batch, provider="codex", credential="subscription", resume=previous, inherited=True)
+                slot = Slot(batch, provider=provider, credential=credential, resume=previous, inherited=True)
                 self.slots.append(slot)
                 frm = slot.target
-                log(f"security-audit pool: continuing the Worker's Codex inspection {cursor[:12]}..{frm[:12]}")
+                log(
+                    f"security-audit pool: continuing the Worker's {sa.reviewer_model(provider)} inspection"
+                    f" {cursor[:12]}..{frm[:12]}"
+                )
         while len(self.slots) < self.parallel:
             try:
                 batch = sa.plan_batch(self.repo, frm, main)
@@ -352,6 +374,10 @@ class Pool:
             continued = self.continue_codex(batch, attempt, protocol, resume)
             if continued is not None:
                 return continued
+        if provider == "claude" and resume is not None:
+            continued = self.continue_claude(batch, attempt, protocol, credential, resume)
+            if continued is not None:
+                return continued
         if provider == "claude":
             return sa.inspect(batch, provider, attempt, protocol=protocol, claude_credential=credential)
         return sa.inspect(batch, provider, attempt, protocol=protocol)
@@ -390,6 +416,45 @@ class Pool:
             protocol=protocol,
         )
 
+    def continue_claude(self, batch, attempt, protocol, credential, resume) -> dict | None:
+        """Continue a stopped Haiku attempt in its own retained Claude session.
+
+        Without a valid retained session, a fresh attempt is allowed only when the
+        stopped attempt's session and captured output show no finding or uncertainty."""
+        from .audit_progress import claude_continuable
+        from .audit_recovery import retained_claude
+
+        try:
+            original, retained_batch, execution = retained_claude(self.work, resume)
+        except (Die, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            stopped = Path(resume["attempt"])
+            if not clean_history(stopped):
+                raise Die(
+                    "security-audit: the stopped Haiku attempt holds a judgment that a fresh attempt would discard"
+                ) from exc
+            return None
+        if retained_batch != batch:
+            raise Die("security-audit: retained pool attempt belongs to another batch")
+        # Lineage: a later pass in this attempt cannot discard the stopped attempt's output.
+        (attempt / "previous-block.json").write_text(sa.serialize(resume))
+        transcript = original / "model-transcript.jsonl"
+        progress = claude_continuable(
+            transcript.read_text() if transcript.exists() else "",
+            batch,
+            original / "read-receipt.json",
+            original,
+            paged=execution["paged"],
+        )
+        return sa.inspect(
+            batch,
+            "claude",
+            attempt,
+            resume_from=original,
+            continue_reading=progress,
+            protocol=protocol,
+            claude_credential=credential,
+        )
+
     def finished(self, future, cursor: str) -> None:
         slot, attempt = self.running.pop(future)
         span = f"{slot.batch['from_sha'][:12]}..{slot.target[:12]}"
@@ -409,8 +474,8 @@ class Pool:
             if operational(exc, attempt, slot.provider) and slot.failures < MAX_RETRIES:
                 slot.failures += 1
                 slot.status = "planned"
-                # Codex continues the same native session; Claude retries in a fresh one.
-                slot.resume = failure if slot.provider == "codex" else None
+                # Both reviewers continue the same retained session when it is valid.
+                slot.resume = failure
                 slot.retry_at = time.time() + RETRY_SECONDS * 2 ** (slot.failures - 1)
                 self.persist(slot)
                 log(
@@ -523,12 +588,18 @@ class Pool:
             if previous.get(key) and not clean_history(Path(previous[key])):
                 return False
         try:
-            from .audit_recovery import retained
+            from .audit_recovery import retained, retained_claude
 
-            _, batch, execution, _ = retained(self.work, previous)
-            if execution.get("argv", [""])[0] == "codex":
-                # A batch keeps its reviewer for life: continue this Codex session in the pool.
-                self.inherited = (previous, batch)
+            if claude_attempt(Path(previous["attempt"])):
+                _, batch, execution = retained_claude(self.work, previous)
+                credential = "api-key" if "ANTHROPIC_API_KEY" in execution.get("environment", {}) else "subscription"
+                # A batch keeps its reviewer for life: continue this Haiku session in the pool.
+                self.inherited = (previous, batch, "claude", credential)
+            else:
+                _, batch, execution, _ = retained(self.work, previous)
+                if execution.get("argv", [""])[0] == "codex":
+                    # A batch keeps its reviewer for life: continue this Codex session in the pool.
+                    self.inherited = (previous, batch, "codex", "subscription")
         except (Die, OSError, ValueError, KeyError, TypeError, IndexError, AttributeError):
             self.inherited = None  # Nothing valid to continue; a fresh inspection is allowed.
         archived = self.work / f"superseded-by-pool-block-{time.time_ns()}.json"
