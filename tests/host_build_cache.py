@@ -62,17 +62,22 @@ if mode == 'invalid-toolchain':
  print("error: could not download nonexistent lean version 'leanprover-lean4-v0.bad'"); sys.exit(1)
 if mode == 'workspace-error':
  print('error: lakefile.toml: expected string'); sys.exit(1)
-if mode == 'rebase' and '--rev' in a and a[a.index('--rev')+1] == 'b'*40:
+if mode in ('rebase', 'stale-main') and '--rev' in a and a[a.index('--rev')+1] == 'b'*40:
  print('error: TauCetiProject/TauCeti: outputs not found for revision ' + 'b'*40); sys.exit(1)
 print('cache ready')
 """)
     shim.chmod(0o755)
     git = root / "git"
     git.write_text("""#!/usr/bin/env python3
-import os, sys
+import json, os, sys
 args=sys.argv[1:]
+mode=os.environ.get('CACHE_TEST_MODE')
 if args[0]=='rev-parse':
- print(('b' if os.environ.get('CACHE_TEST_MODE')=='rebase' and args[-1]=='origin/main' else 'a')*40)
+ print(('b' if mode in ('rebase', 'stale-main') and args[-1]=='origin/main' else 'a')*40)
+elif args[0]=='show' and args[-1].endswith(':lake-manifest.json'):
+ # In 'stale-main', the older main revision predates a Mathlib bump.
+ pin = 'o'*40 if mode=='stale-main' and args[-1].startswith('c'*40) else 'm'*40
+ print(json.dumps({'packages': [{'name': 'mathlib', 'rev': pin}]}))
 elif args[0]=='show': print('leanprover/lean4:v4.35.0-rc3')
 elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
 """)
@@ -174,6 +179,15 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert rc == 0 and len(launched) == 1 and len(records) == 3
     assert records[1]["args"][-4:] == ["--rev", "b" * 40, "--toolchain", "leanprover/lean4:v4.35.0-rc3"]
     assert records[2]["args"][-4:] == ["--rev", "c" * 40, "--toolchain", "leanprover/lean4:v4.35.0-rc3"]
+    print("[OK] a rebase falls back to the newest cached main at main's Mathlib pin")
+
+    # Current main (b) is uncached and the newest cached main (c) predates a Mathlib bump: its outputs
+    # match almost nothing, so taking them means compiling the whole library. Stop as for a miss.
+    rc, records, text = run("stale-main")
+    assert rc == 75 and not launched, text
+    assert len(records) == 2 and records[1]["args"][-4:-2] == ["--rev", "b" * 40], records
+    assert "1 older revisions pin a different Mathlib" in text, text
+    print("[OK] a cached main at an older Mathlib pin stops instead of recompiling the entire library")
     rc, records, text = run("workspace-error")
     assert rc == 0 and len(launched) == 1 and len(records) == 1
     for mode in ("dependency-error", "invalid-toolchain"):

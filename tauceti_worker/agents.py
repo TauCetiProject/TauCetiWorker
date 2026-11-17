@@ -1907,7 +1907,16 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
         # An explicit toolchain fetch also primes the store for a rebase that changes Lean versions.
         toolchain = git("show", base_ref + ":lean-toolchain")
         revisions = git("rev-list", *([] if max_revs == "0" else [f"--max-count={max_revs}"]), base_ref)
+        # An older main that pins a different Mathlib shares almost no artifacts with current main:
+        # every module's inputs changed. Accepting its outputs starts a round that recompiles the
+        # whole library locally, which is exactly what stopping on a miss exists to prevent. Right
+        # after a Mathlib bump lands, the newest cached main is usually such a pre-bump revision.
+        main_pin = shared_mathlib._manifest_pin(git("show", base_ref + ":lake-manifest.json"))
+        stale = 0
         for revision in revisions.splitlines():
+            if shared_mathlib._manifest_pin(git("show", revision + ":lake-manifest.json")) != main_pin:
+                stale += 1
+                continue
             status = fetch(
                 "TauCeti main", [*base, "--rev", revision, *(["--toolchain", toolchain] if toolchain else [])]
             )
@@ -1919,6 +1928,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
             origin = git("config", "--get", "remote.origin.url")
             unavailable(
                 "TauCeti main cache has no published outputs in the requested history"
+                + (f" at main's Mathlib pin ({stale} older revisions pin a different Mathlib)" if stale else "")
                 + (
                     ""
                     if _same_repository(origin, checkout_url())
