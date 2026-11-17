@@ -6,7 +6,8 @@ build job's log with bors-ng's `priv/failure_diagnostics.py` patterns, mapped to
 Covered: compiler errors in both the Lean and Lake forms with timestamps and ANSI stripped,
 duplicate declarations from the audit driver and the axioms script, environment linter locations
 (ranged, module-only, unknown), the failed-targets fallback used only without located findings,
-deduplication, a lost runner, and cancellation, timeouts and a failed finalizer as infrastructure.
+deduplication, a lost runner, the member review-size policy's per-member rejection records, and
+cancellation, timeouts and a failed finalizer as infrastructure.
 """
 
 import json
@@ -133,6 +134,36 @@ class ParseLog(unittest.TestCase):
         self.assertEqual(findings[1]["reason"], "runner_lost")
         self.assertEqual(d.parse_log([]), [])
         self.assertEqual(d.parse_log(["info: all good", "error: something else entirely"]), [])
+
+    def test_member_policy_rejections_name_the_member(self):
+        head = "a" * 40
+        record = {
+            "source_pr": 812,
+            "source": {"forge": {"kind": "forgejo", "url": "https://forge.invalid"}, "name": "o/r", "id": 9},
+            "source_forge": "forgejo:https://forge.invalid",
+            "head": head,
+            "reasons": ["+2400 added lines (cap 2000)"],
+            "additions": 2400,
+            "deletions": 3,
+            "files": 12,
+        }
+        lines = [
+            "2026-11-16T05:16:00.0000000Z MEMBER-POLICY-REJECTED " + json.dumps(record, sort_keys=True),
+            "MEMBER-POLICY-REJECTED " + json.dumps(record, sort_keys=True),
+            "MEMBER-POLICY-REJECTED {not json",
+            "MEMBER-POLICY-REJECTED " + json.dumps(dict(record, head="not-a-sha")),
+            "MEMBER-POLICY-REJECTED " + json.dumps(dict(record, source_pr="812")),
+            "::error::source member review-size policy rejected this candidate; inspect source-member-policy.json",
+        ]
+        [finding] = d.parse_log(lines)
+        self.assertEqual((finding["kind"], finding["module"]), ("policy", ""))
+        self.assertEqual((finding["source_pr"], finding["member_head"]), (812, head))
+        self.assertEqual(finding["source"]["forge"]["kind"], "forgejo")
+        self.assertEqual((finding["additions"], finding["files"]), (2400, 12))
+        self.assertIn("#812", finding["message"])
+        self.assertIn("+2400 added lines", finding["message"])
+        # Without the record (older TauCetiTools) nothing is invented.
+        self.assertEqual(d.parse_log(lines[-1:]), [])
 
     def test_message_bound(self):
         finding = d.parse_log(["TauCeti/A/B.lean:1:1: error: " + "x" * 5000])[0]

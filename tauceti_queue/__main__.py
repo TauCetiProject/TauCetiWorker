@@ -192,6 +192,7 @@ class Service:
                 wired.http,
             )
             self.native_http.prebound_socket = listener
+            self.controller.public_url = self.config.public_url
             self.loop_module = _optional("loop")
             return
         module = _optional("controller")
@@ -218,6 +219,7 @@ class Service:
             canonical_branch=self.config.canonical_branch or None,
             mixed=mixed,
         )
+        self.controller.public_url = self.config.public_url
         self.loop_module = _optional("loop")
         poll_module = _optional("approval_poll")
         if poll_module is not None and hasattr(self.github, "list_open_pull_requests"):

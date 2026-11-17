@@ -11,15 +11,30 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from tauceti_queue import admission_planning, chain, feeds, monitoring  # noqa: E402
+from tauceti_queue import (  # noqa: E402
+    admission_planning,
+    attribution,
+    chain,
+    diagnostics,
+    escalation,
+    feeds,
+    monitoring,
+)
 from tauceti_queue.approval_poll import ApprovalPoller  # noqa: E402
-from tauceti_queue.controller import LOG_GRACE_SECONDS, MERGED_TITLE_PREFIX, ControllerError, TaskError  # noqa: E402
+from tauceti_queue.controller import (  # noqa: E402
+    LOG_GRACE_SECONDS,
+    MERGED_TITLE_PREFIX,
+    Controller,
+    ControllerError,
+    TaskError,
+)
 from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller  # noqa: E402
 from tauceti_queue.loop import ReconciliationLoop  # noqa: E402
 
@@ -416,29 +431,33 @@ class Repair(QueueFixture):
         self.assertIsNone(self.repo.file_at("main", "Hopeless.lean"))
         self.assertIn("Dropped Hopeless.lean", self.github.comments_for(102)[0]["body"])
         self.assertEqual(self.controller.status()["counters"]["shrink_to_empty"], 1)
-        rejected = self.controller.inputs()[1]
-        self.assertEqual((rejected["state"], rejected["reason"]), ("cancelled", "empty-commit"))
-        self.assertIsNone(rejected["landed_at"])
-        self.assertIsNone(rejected["landed_sha"])
+        withdrawn = self.controller.inputs()[1]
+        self.assertEqual((withdrawn["state"], withdrawn["reason"]), ("cancelled", "empty-commit"))
+        self.assertIsNone(withdrawn["landed_at"])
+        self.assertIsNone(withdrawn["landed_sha"])
         self.assertEqual(self.controller.status()["counters"]["prs_landed"], 1)
         self.assertEqual(self.controller.status()["counters"]["prs_edited_landed"], 0)
-        self.assertEqual(self.controller.status()["counters"]["prs_rejected"], 1)
-        self.assertEqual(self.github.closed[102], "Change 102")
+        self.assertEqual(self.controller.status()["counters"]["prs_withdrawn_empty"], 1)
+        self.assertNotIn("prs_rejected", self.controller.status()["counters"])
+        # Sent back to its author at adoption: the PR stays open and is not closed at landing.
+        self.assertNotIn(102, self.github.closed)
         self.assertEqual(self.github.closed[101], MERGED_TITLE_PREFIX + "Change 101")
         [comment] = self.github.comments_for(102)
-        self.assertIn("rejected during staging repair", comment["body"])
+        self.assertIn("withdrew this PR from batch", comment["body"])
+        self.assertIn("What to do next", comment["body"])
         self.assertNotIn("successfully merged", comment["body"])
         self.assertNotIn("bors-staging", self.github.labels[102])
         self.assertNotIn("repaired-in-queue", self.github.labels[102])
         outcomes = feeds.ControllerFeedSource(self.controller).outcomes(PROJECT, "main")
         self.assertEqual({o.pr: o.state for o in outcomes}, {101: "ok", 102: "canceled"})
         landed = self.controller.store.journal_entries("landed")[0]["detail"]
-        self.assertEqual((landed["members"], landed["rejected"]), ([101], [102]))
+        self.assertEqual((landed["members"], landed["withdrawn"]), ([101], [102]))
+        self.assertNotIn("rejected", landed)
         exported = monitoring.project(
             self.controller.store.path, clock=self.clock, facts=monitoring.CommitFacts(self.repo.clone)
         )
         item = next(m for m in exported["members"] if m["pr"] == "102")
-        self.assertEqual(item["disposition"], "rejected_empty")
+        self.assertEqual(item["disposition"], "withdrawn_empty")
         self.assertIsNone(item["landed_at"])
 
     def test_s17_two_source_failures_land_with_three_full_runs_and_no_singletons(self):
@@ -496,7 +515,734 @@ class Repair(QueueFixture):
         self.assertTrue(adoption.accepted, adoption)
 
 
+class RecordingNotifier:
+    """A Zulip stand-in: records each delivered message; `lose` replies are lost after delivery."""
+
+    def __init__(self, lose=0):
+        self.messages = []
+        self.calls = []
+        self.lose = lose
+
+    def send(self, marker, content, *, reconcile):
+        self.calls.append((marker, reconcile))
+        if reconcile and any(marker in message for message in self.messages):
+            return "zulip reconciled"
+        self.messages.append(content)
+        if self.lose:
+            self.lose -= 1
+            raise RuntimeError("lost Zulip reply")
+        return f"zulip {len(self.messages)}"
+
+
+class FailureFingerprints(unittest.TestCase):
+    def test_line_numbers_shas_and_urls_do_not_change_a_fingerprint(self):
+        first = [
+            {"kind": "compiler", "module": "TauCeti/A.lean", "message": "TauCeti/A.lean:12:3: error: boom at 0123abcd"}
+        ]
+        moved = [
+            {"kind": "compiler", "module": "TauCeti/A.lean", "message": "TauCeti/A.lean:40:7: error: boom at 99aa00ff"}
+        ]
+        other = [{"kind": "compiler", "module": "TauCeti/A.lean", "message": "TauCeti/A.lean:12:3: error: other"}]
+        identity = [
+            escalation.fingerprint("build", [], escalation.finding_lines(d))["fingerprint"]
+            for d in (first, moved, other)
+        ]
+        self.assertEqual(identity[0], identity[1])
+        self.assertNotEqual(identity[0], identity[2])
+        infrastructure = first + [{"kind": "infrastructure", "message": "runner lost"}]
+        self.assertEqual(escalation.finding_lines(first), escalation.finding_lines(infrastructure))
+
+    def test_verdict_class_names_the_classification_and_failed_contexts(self):
+        verdicts = {"build": {"state": "success"}, "scope": {"state": "failure"}, "bump-guard": {"state": "success"}}
+        self.assertEqual(
+            escalation.verdict_class("verified source CI: policy_failure", verdicts), "policy_failure:scope"
+        )
+        self.assertEqual(escalation.verdict_class("Build failed", {"build": {"state": "failure"}}), "build")
+        self.assertEqual(
+            escalation.named_members([{"kind": "status", "source_pr": "o/r#4"}, {"kind": "compiler", "pr": 7}]),
+            ["o/r#4", 7],
+        )
+
+    def test_zulip_notifier_reconciles_a_retry_by_its_marker(self):
+        notifier = escalation.ZulipNotifier(
+            {"site": "https://zulip.invalid", "email": "bot@x", "api_key": "k", "recipient_id": 5}
+        )
+        calls = []
+
+        def request(method, params):
+            calls.append((method, params))
+            if method == "GET":
+                return {"messages": [{"id": 77, "content": "earlier text with marker-1"}]}
+            return {"id": 78}
+
+        with patch.object(notifier, "_request", side_effect=request):
+            self.assertEqual(notifier.send("marker-1", "body marker-1", reconcile=True), "zulip 77 (reconciled)")
+            self.assertEqual([method for method, _ in calls], ["GET"])
+            self.assertEqual(notifier.send("marker-2", "body marker-2", reconcile=True), "zulip 78")
+            self.assertEqual(notifier.send("marker-3", "body marker-3", reconcile=False), "zulip 78")
+        self.assertEqual([method for method, _ in calls], ["GET", "GET", "POST", "POST"])
+        self.assertEqual(json.loads(calls[-1][1]["to"]), [5])
+
+    def test_notifier_configuration_comes_from_the_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "zulip.json"
+            path.write_text(json.dumps({"site": "https://z.invalid", "email": "b", "api_key": "k", "recipient_id": 3}))
+            notifier = escalation.notifier_from_environment({escalation.ZULIP_CONFIG_ENV: str(path)})
+            self.assertEqual(notifier.config["recipient_id"], 3)
+            self.assertIsNone(escalation.notifier_from_environment({}))
+            path.write_text("{}")
+            with self.assertRaises(ValueError):
+                escalation.notifier_from_environment({escalation.ZULIP_CONFIG_ENV: str(path)})
+
+
+class FailureAttribution(unittest.TestCase):
+    """`attribution.attribute`: which members a failure's findings implicate, before any bisection."""
+
+    def error(self, module, kind="compiler"):
+        return {"kind": kind, "module": module, "path": module.replace(".", "/") + ".lean", "message": "boom"}
+
+    def attribute(self, findings, changes, imports=None, **kwargs):
+        graph = imports or {}
+        return attribution.attribute(findings, list(changes), changes, lambda p: graph.get(p, ()), **kwargs)
+
+    def test_a_module_one_member_changed_names_that_member(self):
+        found = self.attribute(
+            [self.error("TauCeti.B")], {"a": {"TauCeti/A.lean"}, "b": {"TauCeti/B.lean"}, "c": {"TauCeti/C.lean"}}
+        )
+        self.assertEqual(found.members, ["b"])
+        self.assertIn("changed TauCeti/B.lean", found.reasons["b"])
+
+    def test_an_untouched_module_names_the_nearest_imported_change(self):
+        imports = {
+            "TauCeti/User.lean": {"TauCeti/Mid.lean"},
+            "TauCeti/Mid.lean": {"TauCeti/Lib.lean", "TauCeti/Far.lean"},
+            "TauCeti/Lib.lean": {"TauCeti/Deep.lean"},
+        }
+        changes = {"lib": {"TauCeti/Lib.lean"}, "deep": {"TauCeti/Deep.lean"}, "other": {"TauCeti/Other.lean"}}
+        found = self.attribute([self.error("TauCeti.User")], changes, imports)
+        self.assertEqual(found.members, ["lib"], "the nearer change, not the deeper one")
+        self.assertIn("which TauCeti/User.lean imports", found.reasons["lib"])
+
+    def test_the_smallest_set_covering_every_finding(self):
+        changes = {"x": {"TauCeti/S.lean"}, "y": {"TauCeti/S.lean", "TauCeti/T.lean"}, "z": {"TauCeti/U.lean"}}
+        # S is ambiguous between x and y, T is y's alone: y explains both.
+        found = self.attribute([self.error("TauCeti.S"), self.error("TauCeti.T")], changes)
+        self.assertEqual(found.members, ["y"])
+        # S alone stays ambiguous: both plausible members are named.
+        found = self.attribute([self.error("TauCeti.S")], changes)
+        self.assertEqual(found.members, ["x", "y"])
+        self.assertIn("one of 2", found.reasons["x"])
+
+    def test_unlocated_findings_are_not_attributed_and_too_many_members_are_refused(self):
+        changes = {f"m{i}": {f"TauCeti/M{i}.lean"} for i in range(5)}
+        found = self.attribute([{"kind": "status", "module": "", "message": "scope failed"}], changes)
+        self.assertEqual((found.members, len(found.unattributed)), ([], 1))
+        self.assertIn("no finding", found.summary())
+        many = [self.error(f"TauCeti.M{i}") for i in range(5)]
+        self.assertEqual(len(self.attribute(many, changes).members), 5)
+        refused = self.attribute(many, changes, max_members=4)
+        self.assertEqual(refused.members, [])
+        self.assertIn("attribution_max_members", refused.summary())
+
+    def test_a_build_configuration_change_explains_errors_in_untouched_modules(self):
+        changes = {"bump": {"lake-manifest.json"}, "other": {"TauCeti/Other.lean"}}
+        found = self.attribute([self.error("TauCeti.Untouched")], changes)
+        self.assertEqual(found.members, ["bump"])
+        self.assertIn("build configuration", found.reasons["bump"])
+
+    def test_policy_records_resolve_by_accepted_head_and_source_across_forges(self):
+        forgejo = {"forge": {"kind": "forgejo", "url": "https://forge.invalid"}, "name": "o/r", "id": 9}
+        github = {"forge": {"kind": "github", "url": "https://github.com"}, "name": "o/r", "id": 1}
+        members = [
+            {"id": 1, "number": 7, "accepted_head": "a" * 40, "source_identity": ""},
+            {
+                "id": 2,
+                "number": 7,
+                "accepted_head": "b" * 40,
+                "source_identity": json.dumps(forgejo, sort_keys=True, separators=(",", ":")),
+            },
+        ]
+        by_head = {"head": "b" * 40, "number": 7, "source": github}
+        self.assertEqual(Controller._policy_member(by_head, members)["id"], 2, "the accepted head decides")
+        self.assertEqual(
+            Controller._policy_member({"head": "c" * 40, "number": 7, "source": forgejo}, members)["id"], 2
+        )
+        self.assertEqual(Controller._policy_member({"head": "c" * 40, "number": 7, "source": github}, members)["id"], 1)
+        self.assertIsNone(Controller._policy_member({"head": "c" * 40, "number": 7}, members))
+        self.assertEqual(
+            attribution.policy_references([{"kind": "policy", "member_head": "b" * 40, "source_pr": 7}]),
+            [{"head": "b" * 40, "number": 7, "source": None}],
+        )
+        self.assertEqual(escalation.named_members([{"kind": "policy", "member_head": "b" * 40, "source_pr": 7}]), [])
+
+
+class LoopTermination(QueueFixture):
+    """The queue never re-dispatches an unchanged candidate after the same failure: every failure is
+    followed by an adopted repair, a withdrawal, a split or an alert (docs/queue/escalation.md)."""
+
+    def setUp(self):
+        super().setUp()
+        self.notifier = self.controller.notifier = RecordingNotifier()
+
+    def fails_on(self, path, verdict="fail", attributed=None):
+        """A CI policy failing any candidate whose tree holds `path`: a property of the content, as real CI's is."""
+
+        def policy(head, _base, _members):
+            if self.repo.file_at(head, path) is None:
+                return "pass", []
+            if verdict != "fail":
+                return verdict, []
+            finding = {"kind": "compiler", "module": f"TauCeti/{path}", "message": f"TauCeti/{path}:3:1: error: boom"}
+            if attributed is not None:
+                finding["source_pr"] = f"{PROJECT}#{attributed}"
+            return "fail", [finding]
+
+        return policy
+
+    def give_up(self, times):
+        """Workers claim the head's task and give it back without a submission."""
+        for _ in range(times):
+            task = self.controller.claim_task("flaky-worker", "admin-worker")
+            self.assertIsNotNone(task)
+            self.controller.release_task(task.task_id, task.claim_token, "agent_failed", "no result")
+
+    def unhelpful_repair(self, number, path):
+        """An agent that changes content without fixing the failure."""
+        agent = self.agent(
+            name=f"unhelpful-{number}-{len(self.github.dispatches)}",
+            script=lambda task: {
+                f"{PROJECT}#{number}": Resolution(
+                    {path: f"tweak {len(self.github.dispatches)}\n"}, explanation="Tweaked."
+                )
+            },
+        )
+        adoption = agent.run(self.controller)
+        self.assertTrue(adoption.accepted, adoption)
+
+    def test_a_recurring_failure_naming_a_member_withdraws_it_and_the_rest_lands(self):
+        self.github.ci_policy = self.fails_on("Bad.lean", attributed=102)
+        self.approve(101, {"A.lean": "a\n"})
+        self.approve(102, {"Bad.lean": "bad\n"})
+        self.approve(103, {"C.lean": "c\n"})
+        self.tick()
+        head = self.head()
+        self.run_ci()
+        self.tick()
+        self.assertEqual(self.controller.status()["head"]["stage"], "repair")
+        self.unhelpful_repair(101, "A.lean")
+        self.tick()
+        self.run_ci()
+        self.tick()
+        # The same failure again: no second repair, the named member is withdrawn.
+        failures = self.controller.store.rows("failures", {"batch_id": head["id"]}, order="id")
+        self.assertEqual(len({f["fingerprint"] for f in failures}), 1)
+        self.assertEqual([f["action"] for f in failures], ["repair", "withdraw"])
+        self.assertEqual(json.loads(failures[0]["members"]), [f"{PROJECT}#102"])
+        row = self.controller.input_for(PROJECT, 102)
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "queue-withdrawn"))
+        member = next(m for m in self.members(self.head()) if m["number"] == 102)
+        self.assertEqual(member["withdrawn"], 1)
+        self.assertTrue(self.controller._commit_empty(member["commit_sha"]))
+        self.assertIn("Withdrawn by the merge queue", member["explanation"])
+        status = self.controller.status()
+        self.assertTrue(any("escalation (withdraw)" in alert for alert in status["alerts"]), status["alerts"])
+        self.assertEqual(status["escalations"][-1]["action"], "withdraw")
+        self.tick()
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.assertIn("withdraw on head batch", self.notifier.messages[0])
+        self.assertIn("withdrew #102", self.notifier.messages[0])
+        [comment] = self.github.comments_for(102)
+        self.assertIn("The merge queue withdrew this PR from batch", comment["body"])
+        self.assertIn("What to do next", comment["body"])
+        self.assertIn("boom", comment["body"])
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.head())
+        self.assertEqual(self.repo.file_at("main", "C.lean"), "c\n")
+        self.assertIsNone(self.repo.file_at("main", "Bad.lean"))
+        self.assertNotIn(102, self.github.closed)
+        self.assertEqual(len(self.github.comments_for(102)), 1)
+        self.assertEqual(len(self.github.dispatches), 3)
+        self.assertEqual(len(self.notifier.messages), 1, "one message per escalation")
+
+    def test_an_unattributed_policy_failure_with_fruitless_repairs_is_bisected_until_isolated(self):
+        # The 2026-11-16 incident: a policy verdict names no member and no worker can submit a repair.
+        self.github.ci_policy = self.fails_on("Huge.lean", verdict="scope-fail")
+        for number in range(101, 107):
+            self.approve(number, {f"F{number}.lean": f"{number}\n", **({"Huge.lean": "x\n"} if number == 104 else {})})
+        self.tick()
+        head = self.head()
+        order = [m["number"] for m in self.members(head)]
+        self.assertEqual(sorted(order), list(range(101, 107)))
+        self.run_ci()
+        self.tick()
+        self.give_up(2)
+        self.tick()
+        self.assertEqual(self.controller.status()["head"]["stage"], "repair", "two fruitless claims are not enough")
+        self.give_up(1)
+        self.tick()
+        # Three fruitless claims: the head keeps its first half; the rest wait again at their age.
+        self.assertEqual([m["number"] for m in self.members(self.head())], order[:3])
+        self.assertEqual(self.controller.store.journal_entries("bisected")[0]["detail"]["moved"], order[3:])
+        self.assertTrue(all(self.controller.input_for(PROJECT, n)["state"] == "waiting" for n in order[3:]))
+        for _ in range(40):
+            self.tick()
+            if all(self.controller.input_for(PROJECT, n)["state"] in ("landed", "cancelled") for n in range(101, 107)):
+                break
+            stage = self.controller.status()["head"]["stage"] if self.head() else None
+            if stage == "ci":
+                self.run_ci()
+            elif stage == "repair":
+                task = self.controller.status()["head"]["task"]
+                if self.controller._fruitless_claims({"id": task["task_id"]}) == 0:
+                    self.unhelpful_repair(self.members(self.head())[0]["number"], "Tweak.lean")
+                else:
+                    self.give_up(1)
+            self.clock.advance(60)
+        states = {n: self.controller.input_for(PROJECT, n) for n in range(101, 107)}
+        self.assertEqual(
+            {n: r["state"] for n, r in states.items() if n != 104}, {n: "landed" for n in (101, 102, 103, 105, 106)}
+        )
+        self.assertEqual((states[104]["state"], states[104]["reason"]), ("cancelled", "queue-withdrawn"))
+        self.assertIsNone(self.repo.file_at("main", "Huge.lean"))
+        actions = [e["action"] for e in self.controller.status()["escalations"]]
+        self.assertIn("bisect", actions)
+        visible = self.controller.status()["loop_termination"]
+        self.assertEqual(visible["bisections"], actions.count("bisect"))
+        self.assertEqual(visible["bisections_last_7_days"], actions.count("bisect"))
+        self.assertIn(
+            "attribution: no finding could be attributed", self.controller.status()["escalations"][0]["cause"]
+        )
+        self.assertEqual(actions[-1], "withdraw")
+        self.tick()
+        self.assertEqual(len(self.notifier.messages), len(actions))
+        [comment] = self.github.comments_for(104)
+        self.assertIn("withdrew this PR", comment["body"])
+        self.assertIn("verdict: `scope`", comment["body"])
+        self.assertIn("restricted paths changed", comment["body"])
+        self.assertIn("the only member left", comment["body"])
+        # No candidate was ever dispatched twice with the same content after the same failure.
+        trees = [
+            (d["client_payload"]["batch_id"], chain.tree_of(self.repo.origin, d["client_payload"]["head_sha"]))
+            for d in self.github.dispatches
+        ]
+        self.assertEqual(len(trees), len(set(trees)))
+
+    def test_a_repair_that_leaves_the_content_unchanged_is_not_dispatched(self):
+        self.github.ci_policy = self.fails_on("Bad.lean")
+        self.approve(101, {"Bad.lean": "bad\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        task = self.controller.claim_task("w", "admin-worker")
+        adoption = self.controller.submit_task(task.task_id, task.claim_token, task.tip)
+        self.assertTrue(adoption.accepted, adoption)
+        self.tick()
+        self.assertEqual(len(self.github.dispatches), 1, "the unchanged content is not built again")
+        self.assertEqual(self.controller.status()["escalations"][-1]["action"], "bisect")
+        self.assertIn("unchanged", self.controller.status()["escalations"][-1]["cause"])
+
+    def test_a_policy_rejection_withdraws_the_named_member_at_its_first_failure(self):
+        heads = {}
+
+        def policy(head, _base, _members):
+            if self.repo.file_at(head, "Huge.lean") is None:
+                return "pass", []
+            record = {
+                "source_pr": 102,
+                "source": {"forge": {"kind": "github", "url": "https://github.com"}, "name": PROJECT, "id": 1},
+                "source_forge": "github",
+                "head": heads[102],
+                "reasons": ["+2400 added lines (cap 2000)"],
+                "additions": 2400,
+            }
+            return "fail", diagnostics.parse_log(["MEMBER-POLICY-REJECTED " + json.dumps(record)])
+
+        self.github.ci_policy = policy
+        self.approve(101, {"A.lean": "a\n"})
+        heads[102] = self.approve(102, {"Huge.lean": "x\n"})
+        self.approve(103, {"C.lean": "c\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        # No repair task: no repair can change the accepted head the policy measured.
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "repair"}), 0)
+        row = self.controller.input_for(PROJECT, 102)
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "queue-withdrawn"))
+        [failure] = self.controller.store.rows("failures", {})
+        self.assertEqual((failure["action"], json.loads(failure["members"])), ("withdraw", [f"{PROJECT}#102"]))
+        self.assertIn("review-size policy", self.controller.status()["escalations"][-1]["cause"])
+        self.tick()
+        self.assertIn("+2400 added lines", self.github.comments_for(102)[0]["body"])
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.head())
+        self.assertEqual((self.repo.file_at("main", "A.lean"), self.repo.file_at("main", "C.lean")), ("a\n", "c\n"))
+        self.assertEqual(self.controller.status()["loop_termination"]["bisections"], 0)
+
+    def failing_module(self, path, content, module):
+        """CI that fails while `path` holds `content`, reporting the error in `module` and naming no member."""
+
+        def policy(head, _base, _members):
+            if self.repo.file_at(head, path) != content:
+                return "pass", []
+            location = module.replace(".", "/") + ".lean"
+            return "fail", [
+                {"kind": "compiler", "module": module, "path": location, "message": f"{location}:3:1: error: boom"}
+            ]
+
+        return policy
+
+    def test_a_recurring_error_is_attributed_to_the_member_that_changed_its_module(self):
+        self.github.ci_policy = self.failing_module("TauCeti/B.lean", "bad\n", "TauCeti.B")
+        self.approve(101, {"TauCeti/A.lean": "a\n"})
+        self.approve(102, {"TauCeti/B.lean": "bad\n"})
+        self.approve(103, {"TauCeti/C.lean": "c\n"})
+        self.approve(104, {"TauCeti/D.lean": "d\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.give_up(3)
+        self.tick()
+        escalated = self.controller.status()["escalations"][-1]
+        self.assertEqual(escalated["action"], "withdraw")
+        self.assertIn("attributed by #102: changed TauCeti/B.lean", escalated["cause"])
+        row = self.controller.input_for(PROJECT, 102)
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "queue-withdrawn"))
+        self.assertEqual(len(self.members(self.head())), 4, "nobody else was sent back")
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.head())
+        counters = self.controller.status()["counters"]
+        self.assertEqual((counters.get("bisections", 0), counters["attributed_withdrawals"]), (0, 1))
+        self.assertEqual(self.controller.status()["loop_termination"]["attributed_withdrawals"], 1)
+
+    def test_an_error_in_an_untouched_module_is_attributed_through_its_imports(self):
+        self.repo.advance_main(
+            {"TauCeti/Lib.lean": "def lib := 1\n", "TauCeti/User.lean": "import TauCeti.Lib\n\ndef user := lib\n"}
+        )
+        self.github.ci_policy = self.failing_module("TauCeti/Lib.lean", "broken\n", "TauCeti.User")
+        self.tick()
+        self.approve(101, {"TauCeti/Other.lean": "o\n"})
+        self.approve(102, {"TauCeti/Lib.lean": "broken\n"})
+        self.approve(103, {"TauCeti/Third.lean": "t\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.give_up(3)
+        self.tick()
+        escalated = self.controller.status()["escalations"][-1]
+        self.assertEqual(escalated["action"], "withdraw", escalated)
+        self.assertIn("which TauCeti/User.lean imports", escalated["cause"])
+        self.assertEqual(self.controller.input_for(PROJECT, 102)["reason"], "queue-withdrawn")
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
+
+    def test_a_head_with_no_active_member_left_is_dissolved(self):
+        self.github.ci_policy = lambda *_: ("scope-fail", [])
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        head = self.head()
+        self.run_ci()
+        self.tick()
+        self.give_up(3)
+        self.tick()
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "queue-withdrawn")
+        # The same failure with nothing left to withdraw: the head is dissolved, not held for an operator.
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "removed")
+        self.assertEqual(self.controller.status()["escalations"][-1]["action"], "dissolve")
+        self.github.ci_policy = lambda *_: ("pass", [])
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.repo.file_at("main", "B.lean"), "b\n")
+        self.assertIsNone(self.repo.file_at("main", "A.lean"))
+
+    def test_repeated_infrastructure_failures_back_off_automatically_and_recover(self):
+        self.controller.set_setting("infrastructure_failure_limit", 2, "test")
+        self.github.ci_policy = lambda *_: ("infrastructure", [])
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        for _ in range(3):
+            self.run_ci()
+            self.clock.advance(600)
+            self.tick()
+        # Two failures reach the limit: no operator is needed, the queue backs off on its own.
+        self.assertEqual(len(self.github.dispatches), 2)
+        status = self.controller.status()
+        self.assertTrue(any("infrastructure backoff" in alert for alert in status["alerts"]), status["alerts"])
+        self.assertTrue(any("re-dispatch at" in reason for reason in status["reasons"]), status["reasons"])
+        self.assertEqual(status["loop_termination"]["infrastructure_backoff"]["retries"], 0)
+        self.tick()
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.assertIn("infrastructure-backoff", self.notifier.messages[0])
+        # 30 minutes, then 60, then 120, then 240, then 240: each wait is honoured, none needs `retry-ci`.
+        delays = []
+        for _ in range(5):
+            dispatched = len(self.github.dispatches)
+            waited = 0
+            while len(self.github.dispatches) == dispatched:
+                self.clock.advance(600)
+                waited += 600
+                self.tick()
+                self.assertLess(waited, 5 * 3600)
+            delays.append(waited)
+            self.run_ci()
+            self.tick()
+        self.assertEqual([round(d / 1800) for d in delays], [1, 2, 4, 8, 8])
+        self.assertEqual(len(self.notifier.messages), 1, "no message per retry")
+        self.github.ci_policy = lambda *_: ("pass", [])
+        while len(self.github.dispatches) == 7:
+            self.clock.advance(600)
+            self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.head())
+        self.assertEqual(self.repo.file_at("main", "A.lean"), "a\n")
+        self.assertIsNone(self.controller.status()["loop_termination"]["infrastructure_backoff"])
+        self.assertEqual(len(self.notifier.messages), 2)
+        self.assertIn("infrastructure-recovered", self.notifier.messages[1])
+        self.assertFalse(any("CI infrastructure backoff since" in a for a in self.controller.status()["alerts"]))
+        self.assertFalse(any("infrastructure-recovered" in a for a in self.controller.status()["alerts"]))
+
+    def test_an_infrastructure_backoff_spans_head_versions_with_one_message(self):
+        self.controller.set_setting("infrastructure_failure_limit", 1, "test")
+        self.github.ci_policy = lambda *_: ("infrastructure", [])
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.assertIsNotNone(self.controller.status()["loop_termination"]["infrastructure_backoff"])
+        # The base moves: a new head version dispatches at once, and its failure keeps backing off.
+        self.repo.advance_main({"Other.lean": "o\n"})
+        self.tick()
+        self.assertEqual(len(self.github.dispatches), 2)
+        self.run_ci()
+        self.clock.advance(1200)
+        self.tick()
+        self.assertEqual(len(self.github.dispatches), 2, "still backing off on the new version")
+        self.tick()
+        self.assertEqual(len(self.notifier.messages), 1)
+
+    def test_a_rebase_conflict_nobody_resolves_withdraws_the_conflicting_member(self):
+        self.approve(101, {"Shared.lean": "one\ntwo by 101\nthree\n"})
+        self.tick()
+        self.approve(102, {"Shared.lean": "one\ntwo by 102\nthree\n"})
+        self.approve(103, {"C.lean": "c\n"})
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.controller.status()["head"]["stage"], "rebase_conflict")
+        self.give_up(3)
+        self.tick()
+        row = self.controller.input_for(PROJECT, 102)
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "queue-withdrawn"))
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.head())
+        self.assertEqual(self.repo.file_at("main", "C.lean"), "c\n")
+        self.assertEqual(self.repo.file_at("main", "Shared.lean"), "one\ntwo by 101\nthree\n")
+        self.assertIn("rebase conflict task", self.github.comments_for(102)[0]["body"])
+
+    def test_notification_delivery_retries_without_a_second_message(self):
+        self.notifier.lose = 1
+        self.github.ci_policy = self.fails_on("Bad.lean", attributed=101)
+        self.approve(101, {"Bad.lean": "bad\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.give_up(3)
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.clock.advance(self.controller.setting("outbox_retry_max_seconds"))
+        self.tick()
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.assertEqual([reconcile for _, reconcile in self.notifier.calls], [False, True])
+        self.assertEqual(self.controller.store.count("outbox", {"kind": "notify", "state": "done"}), 1)
+
+    def test_an_escalation_that_cannot_act_holds_the_head_with_an_alert(self):
+        self.github.ci_policy = self.fails_on("Bad.lean", attributed=101)
+        self.approve(101, {"Bad.lean": "bad\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.give_up(3)
+        with patch.object(chain, "replay", side_effect=chain.ChainError("object store unavailable")):
+            self.tick()
+        head = self.head()
+        self.assertEqual(self.controller.status()["escalations"][-1]["action"], "hold")
+        alerts = self.controller.status()["alerts"]
+        self.assertTrue(any("holds after escalation" in a and "object store unavailable" in a for a in alerts), alerts)
+        self.tick(3)
+        self.assertEqual(self.head()["version"], head["version"])
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.assertIn("hold on head batch", self.notifier.messages[0])
+        self.assertIn("retried automatically in 30 minutes", self.notifier.messages[0])
+        # It fails again on retry: the hold doubles, with no second message.
+        self.clock.advance(1800)
+        with patch.object(chain, "replay", side_effect=chain.ChainError("object store unavailable")):
+            self.tick()
+        hold = self.controller.status()["loop_termination"]["escalation_hold"]
+        self.assertEqual(hold["retries"], 1)
+        self.assertEqual(hold["retry_at"] - self.clock(), 3600)
+        self.tick()
+        self.assertEqual(len(self.notifier.messages), 1)
+        # Once the cause clears, the automatic retry withdraws the member without an operator.
+        self.clock.advance(3600)
+        self.tick()
+        row = self.controller.input_for(PROJECT, 101)
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "queue-withdrawn"))
+        self.assertIsNone(self.controller.status()["loop_termination"]["escalation_hold"])
+        self.assertGreater(self.head()["version"], head["version"])
+
+    def test_without_a_notifier_the_alert_remains_and_the_outbox_settles(self):
+        self.controller.notifier = None
+        self.github.ci_policy = self.fails_on("Bad.lean", attributed=101)
+        self.approve(101, {"Bad.lean": "bad\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.give_up(3)
+        self.tick(2)
+        entry = self.controller.store.row("outbox", {"kind": "notify"})
+        self.assertEqual((entry["state"], entry["result"]), ("done", "notifier-unconfigured"))
+        self.assertTrue(any("escalation (withdraw)" in a for a in self.controller.status()["alerts"]))
+
+
+class WithdrawnAtAdoption(QueueFixture):
+    """An adopted repair that empties an ordinary member sends it back to its author at once."""
+
+    def emptied(self, numbers=(102,), explanation="Dropped {file}: it cannot compile against #101."):
+        self.github.ci_policy = fail_members(*numbers)
+        self.approve(101, {"A.lean": "a\n"})
+        for number in numbers:
+            self.approve(number, {f"F{number}.lean": "broken\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        agent = self.agent(
+            script=lambda task: {
+                f"{PROJECT}#{number}": Resolution(empty=True, explanation=explanation.format(file=f"F{number}.lean"))
+                for number in numbers
+            }
+        )
+        self.github.ci_policy = verdicts()
+        adoption = agent.run(self.controller)
+        self.assertTrue(adoption.accepted, adoption)
+        return adoption
+
+    def test_the_author_gets_one_explanatory_comment_at_adoption_and_the_pr_stays_open(self):
+        admission = self.controller.admission = unittest.mock.Mock()
+        adoption = self.emptied()
+        self.assertEqual(adoption.provenance[f"{PROJECT}#102"], "withdrawn")
+        row = self.controller.input_for(PROJECT, 102)
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "empty-commit"))
+        admission.withdraw.assert_called_once_with(102, row["head_sha"])
+        self.controller.admission = None  # the stand-in only records the approval withdrawal
+        member = next(m for m in self.members(self.head()) if m["number"] == 102)
+        self.assertEqual(member["withdrawn"], 1)
+        self.tick()  # drains the outbox
+        [comment] = self.github.comments_for(102)
+        body = comment["body"]
+        self.assertIn("withdrew this PR from batch", body)
+        self.assertIn("What failed (repair task", body)
+        self.assertIn("TauCeti/Pr102.lean", body)
+        self.assertIn("error in PR 102", body)
+        self.assertIn("https://github.invalid/actions/runs/", body)
+        self.assertIn(f"Accepted revision: `{row['head_sha']}`", body)
+        self.assertIn("> Dropped F102.lean: it cannot compile against #101.", body)
+        self.assertIn("What to do next: rebase onto `main`", body)
+        self.assertNotIn("bors-staging", self.github.labels[102])
+        self.assertEqual(self.controller.store.journal_entries("member-withdrawn-empty")[0]["detail"]["number"], 102)
+        # The batch lands without it: no second comment, no close, not counted as landed or rejected.
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.head())
+        self.assertEqual(len(self.github.comments_for(102)), 1)
+        self.assertNotIn(102, self.github.closed)
+        self.assertEqual(self.github.prs[102]["state"], "open")
+        counters = self.controller.status()["counters"]
+        self.assertEqual((counters["prs_landed"], counters.get("prs_rejected", 0)), (1, 0))
+        self.assertEqual(self.controller.input_for(PROJECT, 102)["reason"], "empty-commit")
+
+    def test_a_later_repair_cannot_restore_a_withdrawn_member(self):
+        self.emptied()
+        self.github.ci_policy = verdicts("fail")
+        self.tick()
+        self.run_ci()
+        self.tick()
+        restorer = self.agent(
+            name="restorer",
+            script=lambda task: {
+                f"{PROJECT}#102": Resolution({"F102.lean": "fixed\n"}, explanation="Restored a working contribution.")
+            },
+        )
+        rejection = restorer.run(self.controller)
+        self.assertFalse(rejection.accepted)
+        self.assertEqual(rejection.reason, "no-repair-edited")
+
+    def test_comment_delivery_survives_a_lost_response_and_restart_without_duplicates(self):
+        post = self.github.post_comment
+
+        def post_then_fail(*args):
+            post(*args)
+            raise RuntimeError("lost comment response")
+
+        with patch.object(self.github, "post_comment", side_effect=post_then_fail):
+            self.emptied()
+            self.tick()
+        self.assertEqual(len(self.github.comments_for(102)), 1)
+        restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(restarted.store.close)
+        restarted.recover()
+        self.clock.advance(restarted.setting("outbox_retry_max_seconds"))
+        restarted.tick()
+        self.assertEqual(restarted.store.count("outbox", {"key": "withdrawn-comment:2", "state": "done"}), 1)
+        self.assertEqual(len(self.github.comments_for(102)), 1)
+
+    def test_a_withdrawn_member_merged_outside_the_queue_lands_with_its_batch(self):
+        self.emptied()
+        self.repo.advance_main({"F102.lean": "fixed elsewhere\n"}, message="Change 102 (#102)")
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.head())
+        self.assertEqual(self.controller.input_for(PROJECT, 102)["state"], "landed")
+        self.assertEqual(self.controller.status()["counters"]["prs_landed"], 2)
+
+    def test_disabled_setting_defers_the_decision_to_landing(self):
+        self.controller.set_setting("withdraw_emptied_at_adoption", False, "test")
+        self.emptied()
+        self.assertEqual(self.controller.input_for(PROJECT, 102)["state"], "inserted")
+        self.tick()
+        self.assertEqual(self.github.comments_for(102), [])
+        self.run_ci()
+        self.tick(2)
+        [comment] = self.github.comments_for(102)
+        self.assertIn("rejected during staging repair", comment["body"])
+        self.assertIn("What failed (repair task", comment["body"])
+        self.assertIn("What to do next", comment["body"])
+        self.assertEqual(self.github.closed[102], "Change 102")
+
+
 class EmptyContributions(QueueFixture):
+    """The landing-time backstop: an empty final commit not withdrawn at adoption is rejected when its batch lands."""
+
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("withdraw_emptied_at_adoption", False, "test")
+
     def assert_unrelated_history_still_rejects(self, message, *, empty=False):
         self.repaired_empty()
         self.repo.advance_main({} if empty else {"Other.lean": "other\n"}, message=message)
@@ -601,6 +1347,8 @@ class EmptyContributions(QueueFixture):
         self.assertEqual({o.state for o in outcomes}, {"canceled"})
 
     def test_a_later_repair_restoring_content_is_merged(self):
+        # The scripted failure repeats verbatim; allow it a second repair instead of escalating.
+        self.controller.set_setting("failure_repeat_limit", 3, "test")
         self.repaired_empty()
         self.github.ci_policy = verdicts("fail")
         self.tick()
