@@ -62,6 +62,7 @@ for key in ("TAUCETI_RUNTIME_STATUS", "TAUCETI_FLEET_ADMISSION_FILE", "CLAUDE_CO
     os.environ.pop(key, None)
 
 from tauceti_queue import chain as chain_tool  # noqa: E402
+from tauceti_queue import diagnostics as queue_diagnostics  # noqa: E402
 from tauceti_queue import (  # noqa: E402
     repair,
     repair_audit,
@@ -4755,6 +4756,80 @@ class Records(unittest.TestCase):
         short = repair.chain_report(seed, content.base, content.tip, tip, [m["source_pr"] for m in content.members[:2]])
         self.assertFalse(short["ok"])
         self.assertTrue(any("unknown-member" in p for p in short["problems"]))
+
+    def test_the_review_size_policy_measures_each_commit_against_its_parent_and_accepts_a_split(self):
+        root = Path(tempfile.mkdtemp(prefix="review-size-", dir=TMP))
+        content = Content(root)
+        seed = root / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", content.base)
+        chain = repair.read_chain(seed, content.base, content.tip)
+        long_file = "".join(f"theorem t{i} : True := trivial\n" for i in range(1001))
+        for commit_ in chain:
+            sh(seed, "cherry-pick", "--allow-empty", "--keep-redundant-commits", commit_.sha)
+            if commit_.pr == 2:
+                (seed / "TauCeti" / "Long.lean").write_text(long_file)
+                sh(seed, "add", "-A")
+                sh(seed, "commit", "--quiet", "--amend", "--no-edit")
+        tip = sh(seed, "rev-parse", "HEAD")
+        members = [m["source_pr"] for m in content.members]
+        report = repair.chain_report(seed, content.base, content.tip, tip, members)
+        self.assertFalse(report["ok"])
+        [entry] = report["review_size"]
+        self.assertEqual(entry["pr"], 2)
+        self.assertIn(
+            "TauCeti/Long.lean: new Lean files must be at most 1000 lines (found 1001)", entry["violations"][0]
+        )
+        self.assertTrue(any(p.startswith("review-size: #2 (commit ") for p in report["problems"]))
+
+        # The agent's check script reports the same rejection, and `--size` measures one commit.
+        record = {
+            "source_pr": 2,
+            "head": content.members[1]["accepted_head"],
+            "reasons": ["long"],
+            "measured": "batch-commit",
+            "batch_commit": tip,
+            "parent": content.base,
+        }
+        raw = {**content.task(1), "diagnostics": [queue_diagnostics.member_policy_finding(json.dumps(record))]}
+        task = repair_task.Task.from_json({**raw, "claim_token": "x", "expires_at": time.time() + 60})
+        listings = repair.listings_path(seed)
+        prompt = repair.compose_prompt(
+            repair_task.prompt_context(task, None, listings=listings),
+            repair_task.task_findings(task),
+            repair.read_chain(seed, content.base, tip),
+            seed,
+        )
+        self.assertIn("## The review-size policy", prompt)
+        self.assertIn("Splitting the change inside the batch is a valid repair", prompt)
+        self.assertIn("python3 .tauceti-repair/check --size <commit>", prompt)
+        check = listings.parent / "check"
+
+        def run(*args: str) -> tuple[int, str]:
+            result = subprocess.run([sys.executable, str(check), *args], cwd=seed, text=True, capture_output=True)
+            return result.returncode, result.stdout.strip()
+
+        rc, problem = run()
+        self.assertEqual(rc, 1)
+        self.assertIn("(#2): the staging review-size policy measures this commit against its parent", problem)
+        second = sh(seed, "rev-list", "--reverse", f"{content.base}..HEAD").split()[1]
+        rc, measured = run("--size", second)
+        self.assertEqual((rc, json.loads(measured)["new_files_too_long"]), (1, [["TauCeti/Long.lean", 1001]]))
+
+        # Splitting the long file inside member 2's own commit satisfies the policy.
+        sh(seed, "checkout", "--quiet", "--detach", content.base)
+        for commit_ in chain:
+            sh(seed, "cherry-pick", "--allow-empty", "--keep-redundant-commits", commit_.sha)
+            if commit_.pr == 2:
+                lines = long_file.splitlines(keepends=True)
+                (seed / "TauCeti" / "Long.lean").write_text("".join(lines[:600]))
+                (seed / "TauCeti" / "Long2.lean").write_text("".join(lines[600:]))
+                sh(seed, "add", "-A")
+                sh(seed, "commit", "--quiet", "--amend", "--no-edit")
+        split = sh(seed, "rev-parse", "HEAD")
+        report = repair.chain_report(seed, content.base, content.tip, split, members)
+        self.assertEqual(report["review_size"], [])
+        self.assertTrue(report["ok"], report["problems"])
+        self.assertEqual(run(), (0, "ok"))
 
 
 TOOLS_REPOSITORY, TOOLS_REF = make_tools_repository(TMP / "tools")

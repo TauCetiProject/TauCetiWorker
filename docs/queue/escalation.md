@@ -34,9 +34,15 @@ repairs, rebases or bisections happened between them.
    ([`reject-empty-commits.md`](reject-empty-commits.md)). An adopted repair that leaves the head's
    tree on the same base as it was when CI failed is not dispatched: the controller escalates that
    failure at once, since the same content would fail the same way.
-   A failure the member review-size policy attributes to named members skips this step
-   (`policy_rejection_withdraw`): the policy measures each member's accepted head, which no repair can
-   change, so those members are withdrawn at once.
+   A member review-size policy rejection is repairable when the policy measured the member's own
+   commit in the batch chain against its parent (the record's `measured` is `batch-commit`), which
+   TauCetiTools does since it maps chain commits to members by their trailers: it goes to repair
+   like any other failure, with the exact numbers, and splitting the member's change inside the batch
+   (for example a too-long new file into smaller files) is a valid repair, which the repair worker
+   checks locally before it submits. If the repair does not satisfy the policy, the thresholds below
+   withdraw the member. A rejection measured on the member's accepted head (`accepted-head`, or a
+   record without `measured` from an older TauCetiTools) skips this step
+   (`policy_rejection_withdraw`): no repair can change that head, so the member is withdrawn at once.
 2. **Escalate** when any of these holds:
    - the same fingerprint has now occurred `failure_repeat_limit` times on the batch (default 2,
      that is at the first repeat);
@@ -90,7 +96,8 @@ bisects, the controller attributes the failure from evidence it already holds
 1. **Named by the policy.** The member review-size policy (TauCetiTools
    `ci_candidate_workflow.member_size_policy`) prints one `MEMBER-POLICY-REJECTED {json}` line per
    rejected member in the `sandboxed-build` job log, with its PR number, repository identity, forge,
-   accepted head, measured sizes and reasons. The log parser (`diagnostics.py`) turns each into a
+   accepted head, measured sizes and reasons, and where it measured the member (`measured`; for
+   `batch-commit` also the `batch_commit` and its `parent`). The log parser (`diagnostics.py`) turns each into a
    `policy` finding; the controller resolves it by accepted head, else by number and repository
    identity, so a Forgejo pull is never confused with a GitHub PR of the same number. A log without
    these lines (an older TauCetiTools) simply attributes nothing this way.
@@ -167,7 +174,7 @@ read is itself reported as an alert.
 | `failure_repeat_limit` | `2` | occurrences of one fingerprint on a batch that trigger escalation; 0 disables |
 | `repair_fruitless_claim_limit` | `3` | fruitless claims of a head's repair or rebase-conflict task that trigger escalation; 0 disables |
 | `source_failure_round_limit` | `6` | source failures of a batch since its last escalation that trigger escalation; 0 disables |
-| `policy_rejection_withdraw` | `true` | withdraw members the review-size policy rejects at their first failure, without a repair |
+| `policy_rejection_withdraw` | `true` | withdraw members the review-size policy rejects on their accepted head at their first failure, without a repair; rejections measured on the batch commit always go to repair first |
 | `attribution_max_members` | `10` | the most members an attribution may name before the head is bisected instead; 0: no bound |
 | `infrastructure_failure_limit` | `5` | counted infrastructure failures of a head version before the automatic backoff; 0: short backoff forever |
 | `automatic_retry_seconds` | `1800` | first delay of the infrastructure backoff and of a held escalation's retry |
