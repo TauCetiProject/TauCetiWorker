@@ -334,7 +334,9 @@ cannot discard an earlier source finding or explained code uncertainty, includin
 one retained only in native history.
 
 Coverage continuations, recognized provider failures and mechanical output repairs
-share at most three launches per invocation, with 5- and 10-second delays. Failed
+share at most three charged launches per invocation, with 5- and 10-second delays.
+A protocol-4 coverage turn that serves new pages is not charged, so reading continues
+in the same invocation, up to 60 launches in total. Failed
 launches and partial turns are archived under `service-error-N/`, `output-error-N/`
 or `coverage-turn-N/`. Native history, reader receipts and goal bookkeeping are
 durable while the subprocess runs, so a restart retains evidence written before

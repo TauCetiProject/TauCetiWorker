@@ -706,6 +706,46 @@ class ServedJudgments(unittest.TestCase):
             advance.assert_called_once()
         self.assertFalse((self.work / "blocked.json").exists())
 
+    def test_coverage_turns_serving_new_pages_continue_in_one_invocation(self):
+        (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture","refresh_token":"fixture"}}')
+        calls = 0
+        pages = len(ar.Reader(self.batch, self.original / "read-receipt.json").pages)
+        # Two turns that only reread page 0 use two of the three charged launches;
+        # the remaining pages are then read one per turn in the same invocation.
+
+        def model(argv, **kwargs):
+            nonlocal calls
+            calls += 1
+            args = json.loads(next(v.split("=", 1)[1] for v in argv if v.startswith("mcp_servers.audit.args=")))
+            r = ar.Reader(self.batch, Path(args[3]))
+            start = len(r.coverage()["served"])
+            read = ([start] if start < len(r.pages) else []) if calls > 2 else [0]
+            for page in read:
+                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            done = len(r.coverage()["served"]) == len(r.pages)
+            value = {"verdict": "pass" if done else "unfinished", "findings": []}
+            append_native_reads(kwargs["cwd"], read, self.thread, self.batch)
+            historical.append_native(kwargs["cwd"], value, self.thread)
+            events = [
+                {"type": "thread.started", "thread_id": self.thread},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(value)}},
+                {"type": "turn.completed"},
+            ]
+            events = read_events("codex", read) + events
+            return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
+
+        with (
+            patch.object(sa, "codex_dir", return_value=self.work),
+            patch.object(sa, "run_process", side_effect=model),
+            patch.object(sa.time, "sleep"),
+            patch.object(sa, "advance", return_value="b" * 40) as advance,
+            patch.object(recovery.time, "time", return_value=1000),
+        ):
+            self.assertTrue(recovery.recover(self.cfg, self.opts, self.block))
+        self.assertEqual(calls, 2 + pages - 1)
+        advance.assert_called_once()
+        self.assertFalse((self.work / "blocked.json").exists())
+
     def test_worker_killed_between_coverage_turns_resumes_the_retained_attempt(self):
         (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture","refresh_token":"fixture"}}')
         calls = 0

@@ -47,6 +47,8 @@ BOOTSTRAP = "8eecb48e9b51da99ca119f190a64ca43c100795b"
 # Legacy token-failure recovery credits only this unchanged page-layout version.
 LEGACY_READER_DIGEST = "3b7c68055c792d0ea3243220cff9a73f282c1e1c1f71d9646f1739a2fd3757c4"
 MAX_COMMITS = 20
+# Upper bound on launches in one invocation when coverage turns keep serving new pages.
+MAX_INVOCATION_LAUNCHES = 60
 MAX_BYTES = 2 * 1024 * 1024  # Session workload target, not a context-window limit.
 MAX_BLOB_BYTES = 4 * 1024 * 1024
 INLINE_BYTES = 32 * 1024
@@ -1018,7 +1020,8 @@ def run_client(
         base_prompt = base_prompt[
             len(OUTPUT_REPAIR_PROMPT) if base_prompt.startswith(OUTPUT_REPAIR_PROMPT) else len(CONTINUE_PROMPT) :
         ]
-    for number in range(3):
+    spent = 0  # Launches charged to the shared three-launch budget.
+    for number in range(MAX_INVOCATION_LAUNCHES):
         if protocol == 4 and number:
             from .audit_clients import selected_protocol
 
@@ -1127,7 +1130,17 @@ def run_client(
                 protocol=protocol,
             )
         )
-        if (error is None and not repair and not progress) or number == 2:
+        # A protocol-4 coverage turn that served new pages of the same immutable
+        # input is not charged: keep reading in this invocation instead of
+        # waiting a full Worker round. Failures and stalled turns stay limited.
+        grew = (
+            protocol == 4
+            and paged
+            and progress
+            and len(Reader(batch, receipt).coverage()["served"]) > len(checkpoint["before"]["served"])
+        )
+        spent += 0 if grew else 1
+        if (error is None and not repair and not progress) or spent == 3 or number == MAX_INVOCATION_LAUNCHES - 1:
             return result
         thread = retained_thread(work)
         # Retain every failed launch before replacing the top-level evidence
@@ -1164,9 +1177,9 @@ def run_client(
             # instructions from the subsequently advanced live receipt.
             prompt = (snapshot(batch, receipt, work, protocol=protocol) if paged else INLINE_CONTINUE_PROMPT) + prompt
         log(
-            f"security-audit: {'unfinished inspection' if progress else 'output repair' if repair else 'service error'}; retry {number + 1}/2 in the same conversation after {5 * (number + 1)}s"
+            f"security-audit: {'unfinished inspection' if progress else 'output repair' if repair else 'service error'}; launch {number + 2} ({spent}/2 charged retries) in the same conversation after {5 * max(1, spent)}s"
         )
-        time.sleep(5 * (number + 1))
+        time.sleep(5 * max(1, spent))
     raise AssertionError("unreachable")
 
 
