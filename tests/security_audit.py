@@ -1614,8 +1614,16 @@ class Authority(unittest.TestCase):
         with patch.object(sa.subprocess, "run", return_value=ok) as run:
             self.assertEqual(sa.remote_sha("main"), sha)
         self.assertEqual(run.call_args.args[0][:2], ["git", "ls-remote"])
-        for out in ("", f"{sha}\trefs/heads/mainx\n", f"{sha}\trefs/heads/main\n{sha}\trefs/heads/main\n", "zz\trefs/heads/main\n"):
-            with self.subTest(out=out), patch.object(sa.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=out, stderr="")):
+        for out in (
+            "",
+            f"{sha}\trefs/heads/mainx\n",
+            f"{sha}\trefs/heads/main\n{sha}\trefs/heads/main\n",
+            "zz\trefs/heads/main\n",
+        ):
+            with (
+                self.subTest(out=out),
+                patch.object(sa.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=out, stderr="")),
+            ):
                 with self.assertRaises(NoProgress):
                     sa.remote_sha("main")
 
