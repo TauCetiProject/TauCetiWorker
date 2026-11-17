@@ -369,7 +369,6 @@ class Ownership(PoolFixture):
         self.assertEqual(len(self.advanced), 3)
         self.assertTrue(list(self.state.glob("superseded-by-pool-block-*.json")))
 
-
     def test_worker_codex_block_continues_in_its_session_even_over_pace(self):
         # The Worker's batch was planned against an older main, so its input differs
         # from what the pool would plan now; it must still be continued, on Codex.
@@ -402,6 +401,7 @@ class Ownership(PoolFixture):
         self.assertEqual(head, [("codex", True)])
         self.assertTrue(all(p == "claude" for i, p, _, _ in self.launches if i != 0))
         self.assertEqual(len(self.advanced), 3)
+
 
 if __name__ == "__main__":
     unittest.main()
