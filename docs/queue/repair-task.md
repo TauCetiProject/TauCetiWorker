@@ -282,8 +282,13 @@ has a time budget holds because the service re-exposes the task.
    and beside it `.tauceti-repair/check`, the agent's one validation command: a standalone Python
    script that verifies the chain is linear on the target, has exactly one commit per member in the
    recorded order with the trailers and ` (#N)` subjects kept and every original message preserved as
-   a prefix, that no rebase is in progress and that the working tree is clean, and prints the first
-   problem or `ok`. A rebase conflict also gets `.tauceti-repair/step`, a short shell script that
+   a prefix, that no rebase is in progress and that the working tree is clean, then runs staging's
+   member review-size policy on each member's commit against its parent (the shared
+   `ci_git.pr_guards`, copied beside it as `.tauceti-repair/ci_git.py` from the worker's TauCetiTools),
+   and prints the first problem or `ok`; `check --size <commit>` prints one commit's measured sizes
+   and violations as JSON. When the task's findings include a `policy` finding, the prompt explains
+   the policy and its caps and says that splitting the member's change inside the batch (for example
+   a too-long new file into smaller files, in that member's own commit) is a valid repair. A rebase conflict also gets `.tauceti-repair/step`, a short shell script that
    starts the rebase (or continues it), commits each stop whose member is already on `main` with
    `main`'s version of the conflicted files as an empty commit, stops at the first real conflict
    naming the commit and the files, and refuses to start when HEAD already sits on the target. The
@@ -349,7 +354,9 @@ has a time budget holds because the service re-exposes the task.
 5. **Checks.** `repair.chain_report`, the controller's own checks in its order: `chain.validate`
    against the recorded members on `onto` (identity by `Source-PR`, single-parent history, both
    trailers, count) and `chain.compare` of the input chain `base..tip` against the result on `onto`
-   (append-only messages, provenance per member). A chain that validates but changed a member's
+   (append-only messages, provenance per member), and then staging's member review-size policy on
+   each non-empty commit of the result against its parent (`repair.review_size_violations`, the same
+   `ci_git.pr_guards` as admission and staging), each rejection a problem. A chain that validates but changed a member's
    content without an appended explanation gets one short follow-up turn in the same session
    (`--resume`, `repair.explanation_prompt`) asking only for the explanation, as the plan requires of
    the same attempt. A chain that fails validation, a dirty worktree, or a HEAD still at the input

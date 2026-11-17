@@ -48,8 +48,13 @@ DUPLICATE = re.compile(
 ENV_LOCATIONS = "LINT-ENV-LOCATIONS "
 # One line per member the source member review-size policy rejects (TauCetiTools
 # `ci_candidate_workflow.member_size_policy`): `source_pr` (the PR number), `source` (the repository
-# identity record), `source_forge`, `head` (the accepted head), `reasons` and the measured sizes.
+# identity record), `source_forge`, `head` (the accepted head), `reasons`, the measured sizes and,
+# from a TauCetiTools that measures the batch chain, `measured`, `batch_commit` and `parent`.
 MEMBER_POLICY_REJECTED = "MEMBER-POLICY-REJECTED "
+# A record's `measured`: `batch-commit` (the member's own commit in the batch chain against its
+# `parent`, which a repair in the batch can change) or `accepted-head` (against its merge base).
+MEASURED_BATCH_COMMIT = "batch-commit"
+MEASURED_ACCEPTED_HEAD = "accepted-head"
 SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 ENV_PATH = re.compile(r"TauCeti(?:/[A-Za-z_][A-Za-z0-9_']*)+\.lean")
 IMPORT_HEADER = re.compile(
@@ -175,16 +180,27 @@ def member_policy_finding(payload: str) -> dict | None:
     reasons = [str(r)[:200] for r in data.get("reasons") or [] if isinstance(r, str)][:8]
     sizes = {k: data[k] for k in ("additions", "deletions", "files") if type(data.get(k)) is int}
     forge = data.get("source_forge") if isinstance(data.get("source_forge"), str) else ""
-    measured = ", ".join(f"{k} {v}" for k, v in sizes.items())
-    message = f"member review-size policy rejected #{number} at {head[:12]}: " + ("; ".join(reasons) or "rejected")
+    # Where the policy measured the member: its own commit in the batch chain against that commit's
+    # parent (repairable in the batch), or its accepted head against its merge base (a record without
+    # the field comes from a TauCetiTools that measured only that, which no repair can change).
+    chained = {
+        k: data[k] for k in ("batch_commit", "parent") if isinstance(data.get(k), str) and SHA.fullmatch(data[k])
+    }
+    repairable = data.get("measured") == MEASURED_BATCH_COMMIT and len(chained) == 2
+    measured = MEASURED_BATCH_COMMIT if repairable else MEASURED_ACCEPTED_HEAD
+    sizes_text = ", ".join(f"{k} {v}" for k, v in sizes.items())
+    where = f"its batch commit {chained['batch_commit'][:12]}" if repairable else head[:12]
+    message = f"member review-size policy rejected #{number} at {where}: " + ("; ".join(reasons) or "rejected")
     finding = _finding(
         "policy",
         "",
-        message + (f" ({measured})" if measured else ""),
+        message + (f" ({sizes_text})" if sizes_text else ""),
         source_pr=number,
         member_head=head,
         source_forge=forge[:512],
         reasons=reasons,
+        measured=measured,
+        **(chained if repairable else {}),
         **sizes,
     )
     if isinstance(data.get("source"), dict):

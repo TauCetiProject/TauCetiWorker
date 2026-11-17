@@ -844,6 +844,7 @@ class LoopTermination(QueueFixture):
         self.assertIn("unchanged", self.controller.status()["escalations"][-1]["cause"])
 
     def test_a_policy_rejection_withdraws_the_named_member_at_its_first_failure(self):
+        # A record without `measured` (a TauCetiTools that measured only the accepted head).
         heads = {}
 
         def policy(head, _base, _members):
@@ -880,6 +881,81 @@ class LoopTermination(QueueFixture):
         self.assertIsNone(self.head())
         self.assertEqual((self.repo.file_at("main", "A.lean"), self.repo.file_at("main", "C.lean")), ("a\n", "c\n"))
         self.assertEqual(self.controller.status()["loop_termination"]["bisections"], 0)
+
+    def batch_commit_policy(self, heads):
+        """CI whose member review-size policy rejects #102 while the candidate holds Huge.lean, measured on
+        #102's own commit in the batch chain (the record TauCetiTools writes since it measures the chain)."""
+
+        def policy(head, base, _members):
+            if self.repo.file_at(head, "Huge.lean") is None:
+                return "pass", []
+            [commit] = [c for c in self.first_parent_chain(base, head) if c.source_pr == f"{PROJECT}#102"]
+            record = {
+                "source_pr": 102,
+                "source": {"forge": {"kind": "github", "url": "https://github.com"}, "name": PROJECT, "id": 1},
+                "source_forge": "github",
+                "head": heads[102],
+                "measured": "batch-commit",
+                "batch_commit": commit.sha,
+                "parent": commit.parents[0],
+                "reasons": ["Huge.lean: new Lean files must be at most 1000 lines (found 1001)."],
+                "additions": 1001,
+            }
+            return "fail", diagnostics.parse_log(["MEMBER-POLICY-REJECTED " + json.dumps(record)])
+
+        return policy
+
+    def test_a_policy_rejection_measured_in_the_batch_goes_to_repair_and_a_split_lands(self):
+        heads = {}
+        self.github.ci_policy = self.batch_commit_policy(heads)
+        self.approve(101, {"A.lean": "a\n"})
+        heads[102] = self.approve(102, {"Huge.lean": "x\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        # The first failure is a repair task with the exact numbers, not a withdrawal.
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "repair"}), 1)
+        self.assertEqual(self.controller.input_for(PROJECT, 102)["state"], "inserted")
+        [failure] = self.controller.store.rows("failures", {})
+        self.assertEqual(failure["action"], "repair")
+        claimed = self.controller.claim_task("w", "admin-worker")
+        [finding] = [d for d in claimed.diagnostics if d.get("kind") == "policy"]
+        self.assertEqual((finding["measured"], finding["additions"]), ("batch-commit", 1001))
+        self.controller.release_task(claimed.task_id, claimed.claim_token, "agent_failed", "handing to the agent")
+        split = self.agent(
+            script=lambda task: {
+                f"{PROJECT}#102": Resolution(
+                    {"Huge.lean": None, "Huge/A.lean": "x\n", "Huge/B.lean": "y\n"}, explanation="Split Huge.lean."
+                )
+            }
+        )
+        self.assertTrue(split.run(self.controller).accepted)
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.head())
+        self.assertEqual(self.controller.input_for(PROJECT, 102)["state"], "landed")
+        self.assertEqual(self.repo.file_at("main", "Huge/B.lean"), "y\n")
+        self.assertEqual(self.controller.status()["escalations"], [])
+
+    def test_a_policy_rejection_measured_in_the_batch_withdraws_only_after_escalation(self):
+        heads = {}
+        self.github.ci_policy = self.batch_commit_policy(heads)
+        self.approve(101, {"A.lean": "a\n"})
+        heads[102] = self.approve(102, {"Huge.lean": "x\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "repair"}), 1)
+        self.give_up(3)
+        self.tick()
+        escalated = self.controller.status()["escalations"][-1]
+        self.assertEqual(escalated["action"], "withdraw")
+        row = self.controller.input_for(PROJECT, 102)
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "queue-withdrawn"))
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
+        self.tick()
+        self.assertIn("new Lean files must be at most 1000 lines", self.github.comments_for(102)[0]["body"])
 
     def failing_module(self, path, content, module):
         """CI that fails while `path` holds `content`, reporting the error in `module` and naming no member."""
