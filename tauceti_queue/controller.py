@@ -4043,6 +4043,14 @@ class Controller:
             return False
         assert result is not None
         row = fresh
+        if isinstance(row["number"], SourceNumber) and not self.setting("forgejo_placement_enabled"):
+            # Forgejo placement was paused while the probe ran: the input waits with the others.
+            with self.store.transaction():
+                self.store.update(
+                    "inputs", {"id": row["id"]}, state=INPUT_WAITING, batch_id=None, last_probe="placement-paused"
+                )
+                self._release_claim(claim, "placement-paused", now)
+            return False
         current = self.store.row("batches", {"id": batch["id"]})
         prepared = any(c["operation"] == f"task:{TASK_PREPARE}" for c in self._active_claims(batch["id"]))
         if (
@@ -4577,6 +4585,8 @@ class Controller:
                     self._clear_emergency_request(row)
                     self.store.journal(now, "emergency-refused", number=row["number"], reason="forgejo-inert")
                 continue
+            if isinstance(row["number"], SourceNumber) and not self.setting("forgejo_placement_enabled"):
+                continue  # held with every Forgejo input while placement is paused; the request is kept
             if row["state"] == INPUT_WAITING:
                 return self._build_emergency(row, now)
             owner = self.store.row("batches", {"id": row["batch_id"]}) if row["batch_id"] is not None else None
@@ -6322,9 +6332,12 @@ class Controller:
                 )
             ]
             returned = 0
-            for batch in affected:
-                members = self._members(batch["id"])
-                with self.store.transaction():
+            # One transaction, with the lock held throughout: every affected batch is removed, its
+            # members wait again and the named PRs are cancelled before anything lets the lock go, so
+            # no insertion can place a returned input into a batch being removed or re-place a named PR.
+            with self.store.transaction():
+                for batch in affected:
+                    members = self._members(batch["id"])
                     for stale in self.store.rows("tasks", {"batch_id": batch["id"], "state": TASK_OPEN}):
                         self.store.update(
                             "tasks",
@@ -6341,11 +6354,15 @@ class Controller:
                     self.store.journal(
                         now, "native-evicted", batch["id"], actor=actor, state=batch["state"], members=len(members)
                     )
-                self._discard_pre_rebase("native-evicted", now, batch)
-                self._remove_batch(batch, "native-evicted", now)
-            withdrawn = {
-                number: self._withdraw(repo, number, "cancelled", actor)["withdrawn"] for number in sorted(named)
-            }
+                    self._discard_pre_rebase("native-evicted", now, batch)
+                    self.store.update("batches", {"id": batch["id"]}, state=BATCH_REMOVED)
+                    self.store.journal(now, "batch-removed", batch["id"], reason="native-evicted")
+                    self._clear_admission_state(batch["id"])
+                withdrawn = {
+                    number: self._withdraw(repo, number, "cancelled", actor)["withdrawn"] for number in sorted(named)
+                }
+            for batch in affected:
+                self._cancel_superseded_runs(batch["id"], now, reason="batch removed (native-evicted)")
             self._wake.set()
             self._refresh_snapshot()
             return {
