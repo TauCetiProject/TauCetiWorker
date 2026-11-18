@@ -541,9 +541,11 @@ def self_tested_guidance(policy: str) -> str:
         + fallback
         + "Keep the label in place through fix/rebase pushes after local verification succeeds. "
         "The label is a persistent author declaration, not a per-commit receipt. "
-        "If verification fails or is incomplete, remove it with `gh pr edit <number> "
+        "Remove it only when local verification of the current head actually fails, with `gh pr edit <number> "
         "--repo TauCetiProject/TauCeti --remove-label self-tested`" + remove_fallback + ". Do not leave it on work you "
-        "cannot stand behind. Do not apply it for infrastructure or pin changes, or full-lint/lint-repair requests. "
+        "cannot stand behind. Never remove `self-tested` (or post `-self-tested`) to request or re-trigger PR CI, "
+        "or because of `awaiting-CI` or `ci-failed` labels; those concern PR CI, not your local verification. "
+        "Do not apply it for infrastructure or pin changes, or full-lint/lint-repair requests. "
         "After the round, the worker also applies the label to pushed heads with a successful complete "
         "matching verification receipt. Admission checks trusted-author and source-scope eligibility directly; reviews and all staging tests still run.\n\n"
     )
