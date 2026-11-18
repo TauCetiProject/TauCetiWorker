@@ -204,8 +204,7 @@ The queue does not read the caller's harness literals and asks no broker before
 dispatch. The restricted runner groups admit exactly
 `TauCetiProject/TauCetiTools/.github/workflows/<file>@refs/heads/main`, and the
 queue accepts a result only from a run whose referenced `pr-build.yml` is that
-harness at `refs/heads/main` (TauCetiTools `ci_candidate`). A policy that still
-names an exact `harness_revision` is held to that revision instead.
+harness at `refs/heads/main` (TauCetiTools `ci_candidate`).
 
 Ordinary reviewed changes to `.github`, `.tauceti`, `scripts` and `tauceti.toml`
 on protected execution `main` are available to the next request without a

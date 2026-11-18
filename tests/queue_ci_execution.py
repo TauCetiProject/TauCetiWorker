@@ -71,8 +71,9 @@ class Reader:
             repository={"id": 42, "full_name": "team/Execution"},
             referenced_workflows=[
                 {
-                    "path": "team/Tools/.github/workflows/pr-build.yml@" + config.harness_revision,
-                    "sha": config.harness_revision,
+                    "path": "team/Tools/.github/workflows/pr-build.yml@main",
+                    "sha": "a" * 40,
+                    "ref": "refs/heads/main",
                 }
             ],
             display_title="source request=" + req.request_id,
@@ -108,7 +109,6 @@ class Execution(unittest.TestCase):
             config.source,
             config.execution,
             "b" * 40,
-            config.harness_revision,
             config.config_digest,
             5,
             7,
@@ -157,7 +157,7 @@ class Execution(unittest.TestCase):
         files = {
             ".tauceti/ci-source.toml": configuration,
             ".tauceti/ci-source.json": cc.canonical(selected.record(with_config=False)),
-            selected.workflow: caller_text(selected.harness_revision or "main").encode(),
+            selected.workflow: caller_text("main").encode(),
         }
         reads = []
 
@@ -182,9 +182,9 @@ class Execution(unittest.TestCase):
         self.assertTrue(all("?ref=" + revision in path for path in reads[1:]))
         self.assertEqual(self.posts, [])
 
-    def test_caller_adopts_reviewed_harness_and_configuration_changes(self):
+    def test_caller_adopts_reviewed_configuration_changes(self):
         configuration = CONFIG + b"\n# protected main config update\n"
-        selected = dataclasses.replace(policy(configuration), harness_revision="f" * 40)
+        selected = policy(configuration)
         self.caller_reader(revision="c" * 40, configuration=configuration, configured=selected)
         self.assertEqual(self.adapter.caller(policy()), ("c" * 40, selected, configuration))
 

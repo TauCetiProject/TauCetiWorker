@@ -67,7 +67,6 @@ class LaunchFiles(unittest.TestCase):
             forge,
             ".github/workflows/pr-build.yml",
             harness,
-            "c" * 40,
             "main",
             "main",
             True,

@@ -267,7 +267,6 @@ class WorkflowCredentials(unittest.TestCase):
             config.source,
             config.execution,
             "b" * 40,
-            config.harness_revision,
             config.config_digest,
             5,
             7,

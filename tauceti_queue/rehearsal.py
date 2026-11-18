@@ -124,8 +124,8 @@ end Scratch
 
 PR_BUILD_YML = r"""name: pr-build
 # Adapted from TauCetiProject/TauCeti's .github/workflows/pr-build.yml for the queue cutover
-# rehearsal; the staging path is TauCeti's (read against it on 2026-11-04, TauCetiTools pinned at
-# 8bad7a00af97c00c90a9777c195618c857dbf91c in `uses:` lines and tauceti.toml, as in TauCeti):
+# rehearsal; the staging path is TauCeti's (read against it on 2026-11-04). TauCetiTools runs from
+# `main` in `uses:` lines and tauceti.toml, as in TauCeti:
 #
 # - the `repository_dispatch` event `tauceti-bors-staging` with the same `client_payload`
 #   (head_sha, base_sha, batch_id, members, base_ref), the same `run-name` the service finds the
@@ -195,14 +195,13 @@ jobs:
           fetch-depth: 1
 
       - name: Prepare pinned shared tools
-        uses: TauCetiProject/TauCetiTools/.github/actions/setup@8bad7a00af97c00c90a9777c195618c857dbf91c
+        uses: TauCetiProject/TauCetiTools/.github/actions/setup@main
         with:
           tools-repository: TauCetiProject/TauCetiTools
-          tools-ref: 8bad7a00af97c00c90a9777c195618c857dbf91c
           project-directory: gate
       - name: Select CI API credentials
         id: ci-api
-        uses: TauCetiProject/TauCetiTools/.github/actions/ci-credentials@8bad7a00af97c00c90a9777c195618c857dbf91c
+        uses: TauCetiProject/TauCetiTools/.github/actions/ci-credentials@main
         with:
           owner: ${{ github.repository_owner }}
           repository: ${{ github.event.repository.name }}
@@ -396,14 +395,13 @@ jobs:
           persist-credentials: false
 
       - name: Prepare pinned shared tools
-        uses: TauCetiProject/TauCetiTools/.github/actions/setup@8bad7a00af97c00c90a9777c195618c857dbf91c
+        uses: TauCetiProject/TauCetiTools/.github/actions/setup@main
         with:
           tools-repository: TauCetiProject/TauCetiTools
-          tools-ref: 8bad7a00af97c00c90a9777c195618c857dbf91c
           project-directory: .
       - name: Select CI API credentials
         id: ci-api
-        uses: TauCetiProject/TauCetiTools/.github/actions/ci-credentials@8bad7a00af97c00c90a9777c195618c857dbf91c
+        uses: TauCetiProject/TauCetiTools/.github/actions/ci-credentials@main
         with:
           owner: ${{ github.repository_owner }}
           repository: ${{ github.event.repository.name }}
@@ -494,7 +492,7 @@ deployment = "cloudflare"
 
 [tools.tools]
 repo = "TauCetiProject/TauCetiTools"
-ref = "8bad7a00af97c00c90a9777c195618c857dbf91c"
+ref = "main"
 """
 
 # TauCeti's scripts/*.py are these eleven lines; the finalizer sparse-checks-out three of them.
