@@ -468,6 +468,11 @@ class Adapter(unittest.TestCase):
         self.assertEqual(len(t.calls), 2)
         a, _ = setup(jobs=[{"id": 55, "name": "sandboxed-build"}, {"id": 56, "name": "sandboxed-build"}])
         self.assertEqual(a.declaration_names(TAUCETI, HEAD)["reason"], "build_job_ambiguous")
+        # A stub caller of the reusable pr-build prefixes its job names.
+        a, _ = setup(
+            jobs=[{"id": 55, "name": "pr-build / sandboxed-build", "status": "completed", "conclusion": "success"}]
+        )
+        self.assertEqual(a.declaration_names(TAUCETI, HEAD)["added"], {"TauCeti.A": ["Ns.shared", "Ns.α"]})
         self.assertEqual(dn.parse_log("DECLARATION-NAMES " + json.dumps(raw), BASE)["reason"], "head_mismatch")
         for invalid in [
             dict(raw, complete=False, added={}),

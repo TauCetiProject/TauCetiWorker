@@ -1090,7 +1090,9 @@ class GitHubAdapter:
         )
         jobs = result.get("jobs") if isinstance(result, dict) else None
         matching = (
-            [j for j in jobs if isinstance(j, dict) and j.get("name") == BUILD_JOB] if isinstance(jobs, list) else []
+            [j for j in jobs if isinstance(j, dict) and str(j.get("name") or "").rsplit(" / ", 1)[-1] == BUILD_JOB]
+            if isinstance(jobs, list)
+            else []
         )
         if len(matching) != 1 or (result.get("total_count") or len(jobs or [])) > 100:
             return declaration_names.unknown("build_job_ambiguous")

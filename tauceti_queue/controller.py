@@ -7281,7 +7281,10 @@ class Controller:
                 d.get("kind") == "infrastructure"
                 and (
                     d.get("reason") == "finalizer_failed"
-                    or (d.get("job") == "finalize-merge-group-build" and d.get("reason") in ("cancelled", "timed_out"))
+                    or (
+                        str(d.get("job") or "").rsplit(" / ", 1)[-1] == "finalize-merge-group-build"
+                        and d.get("reason") in ("cancelled", "timed_out")
+                    )
                 )
                 for d in run.diagnostics
             )

@@ -179,6 +179,12 @@ class Infrastructure(unittest.TestCase):
         ]
         findings = d.infrastructure_findings(run, jobs)
         self.assertEqual([f["reason"] for f in findings], ["cancelled", "cancelled", "finalizer_failed"])
+        # A stub caller of the reusable pr-build prefixes its job names.
+        prefixed = [{"name": "pr-build / finalize-merge-group-build", "conclusion": "failure"}]
+        self.assertEqual(
+            [f["reason"] for f in d.infrastructure_findings({"id": 7, "conclusion": "failure"}, prefixed)],
+            ["finalizer_failed"],
+        )
         self.assertTrue(all(f["kind"] == "infrastructure" for f in findings))
         self.assertEqual(
             d.infrastructure_findings(

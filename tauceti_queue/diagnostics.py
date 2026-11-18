@@ -268,7 +268,8 @@ def infrastructure_findings(run: dict, jobs: Iterable[dict], *, build_status_pos
                     job=name,
                 )
             )
-        elif job.get("conclusion") == "failure" and name == "finalize-merge-group-build":
+        # A stub caller of a reusable pr-build prefixes job names with `<caller job> / `.
+        elif job.get("conclusion") == "failure" and name.rsplit(" / ", 1)[-1] == "finalize-merge-group-build":
             findings.append(
                 _finding(
                     "infrastructure",
