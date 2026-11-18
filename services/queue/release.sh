@@ -22,6 +22,9 @@
 # ~/TauCetiQueue-releases (hand-made worktrees) are never touched.
 # shellcheck disable=SC2034  # variables used by the scripts that source this file
 
+# Failures inside $(...) (fetch, worktree add) must stop the installer, not be swallowed.
+shopt -s inherit_errexit
+
 RELEASES_DIR="$HOME/TauCetiQueue-releases"
 RELEASE_MARKER=".tauceti-queue-release"
 RELEASE_KEEP="${TAUCETI_QUEUE_RELEASE_KEEP:-5}"
@@ -34,9 +37,18 @@ _release_die() { _release_log "$*"; exit 1; }
 # The physical path of a directory (symlinks resolved), or nothing.
 _release_real() { (cd "$1" 2>/dev/null && pwd -P); }
 
+# release_lock: hold a shared lock on the releases directory for the rest of the install (fd 9,
+# inherited across the handoff), from choosing or creating a release until its units name it, so
+# that a concurrent garbage collection, which takes the lock exclusively, cannot remove it.
+release_lock() {
+  mkdir -p "$RELEASES_DIR"
+  if ! { true >&9; } 2>/dev/null; then exec 9>>"$RELEASES_DIR/.lock"; fi
+  flock -s 9 || _release_die "cannot lock $RELEASES_DIR/.lock"
+}
+
 # release_sha DIR: the revision a release directory was built from (its marker), or nothing.
 release_sha() {
-  sed -n 's/^sha=//p' "$1/$RELEASE_MARKER" 2>/dev/null | head -n 1
+  { sed -n 's/^sha=//p' "$1/$RELEASE_MARKER" 2>/dev/null || true; } | head -n 1
 }
 
 # release_unit_dir UNIT: the directory the installed unit file runs from (WorkingDirectory, with
@@ -55,8 +67,8 @@ release_unit_dir() {
 release_dir_revision() {
   local dir="$1" sha
   sha="$(release_sha "$dir")"
-  [ -n "$sha" ] || sha="$(sed -n 's/^SHA = "\([0-9a-f]\{40\}\)"$/\1/p' "$dir/tauceti_queue/_revision.py" 2>/dev/null)"
-  [ -n "$sha" ] || sha="$(git -C "$dir" rev-parse --verify --quiet HEAD 2>/dev/null)"
+  [ -n "$sha" ] || sha="$(sed -n 's/^SHA = "\([0-9a-f]\{40\}\)"$/\1/p' "$dir/tauceti_queue/_revision.py" 2>/dev/null || true)"
+  [ -n "$sha" ] || sha="$(git -C "$dir" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
   echo "$sha"
 }
 
@@ -66,10 +78,10 @@ release_fetch() {
   local checkout="$1" revision="$2" url="$3"
   if [ ! -d "$checkout/.git" ]; then
     _release_log "cloning $url into $checkout"
-    git clone --quiet "$url" "$checkout"
+    git clone --quiet "$url" "$checkout" || _release_die "cannot clone $url"
   fi
   _release_log "fetching origin into $checkout"
-  git -C "$checkout" fetch --quiet --prune origin
+  git -C "$checkout" fetch --quiet --prune origin || _release_die "cannot fetch origin into $checkout"
   git -C "$checkout" rev-parse --verify --quiet "${revision}^{commit}" || _release_die "unknown revision $revision"
 }
 
@@ -77,13 +89,14 @@ release_fetch() {
 release_create() {
   local checkout="$1" sha="$2" dir
   mkdir -p "$RELEASES_DIR"
+  # mkdir reserves the name atomically; `git worktree add` accepts the empty directory.
   while :; do
     dir="$RELEASES_DIR/$sha-$(date -u +%Y%m%dT%H%M%SZ)"
-    [ -e "$dir" ] || break
+    mkdir "$dir" 2>/dev/null && break
     sleep 1
   done
   _release_log "creating release $dir"
-  git -C "$checkout" worktree add --quiet --detach "$dir" "$sha" >&2
+  git -C "$checkout" worktree add --quiet --detach "$dir" "$sha" >&2 || _release_die "cannot create the worktree $dir"
   echo "$dir"
 }
 
@@ -100,7 +113,7 @@ release_build() {
     export UV_NO_SYNC=1
     return 0
   fi
-  [ "$(git -C "$dir" rev-parse HEAD 2>/dev/null)" = "$sha" ] || _release_die "$dir is not a checkout of $sha"
+  [ "$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)" = "$sha" ] || _release_die "$dir is not a checkout of $sha"
   _release_log "syncing the uv environment in $dir"
   (cd "$dir" && uv sync --quiet "$@")
   # /status and the workers report the revision the process was started from; tauceti_queue/runtime.py
@@ -119,6 +132,7 @@ release_build() {
 release_handoff() {
   local checkout="$1" revision="$2" release="$3" script="$4" sha
   shift 4
+  release_lock
   if [ -n "$release" ]; then
     release="$(_release_real "$release")" || _release_die "no release directory $3"
     sha="$(release_sha "$release")"
@@ -146,6 +160,7 @@ release_enter() {
   [[ "$RELEASE" =~ ^[A-Za-z0-9/._@+-]+$ ]] || _release_die "unsupported characters in $RELEASE"
   target="$TAUCETI_QUEUE_RELEASE_SHA"
   [[ "$target" =~ ^[0-9a-f]{40}$ ]] || _release_die "bad release revision $target"
+  release_lock
   cd "$RELEASE"
 }
 
@@ -179,7 +194,7 @@ release_render_unit() {
 # release_unit_cwd UNIT: the working directory of the unit's running main process, or nothing.
 release_unit_cwd() {
   local pid
-  pid="$(systemctl --user show -p MainPID --value "$1" 2>/dev/null)"
+  pid="$(systemctl --user show -p MainPID --value "$1" 2>/dev/null || true)"
   [ -n "$pid" ] && [ "$pid" != 0 ] || return 0
   readlink -f "/proc/$pid/cwd" 2>/dev/null || true
 }
@@ -193,6 +208,15 @@ release_verify_running() {
 release_gc() {
   [ -d "$RELEASES_DIR" ] || return 0
   case "$RELEASE_KEEP" in ''|*[!0-9]*) _release_die "TAUCETI_QUEUE_RELEASE_KEEP takes a non-negative integer" ;; esac
+  # Exclusive against every install between choosing a release and naming it in a unit (release_lock);
+  # an install of our own has already named its release, so it gives up its shared lock first.
+  flock -u 9 2>/dev/null || true
+  exec 8>>"$RELEASES_DIR/.lock"
+  if ! flock -x -n 8; then
+    _release_log "another install holds $RELEASES_DIR/.lock; not collecting releases now"
+    exec 8>&-
+    return 0
+  fi
   local used name dir kept=0
   # Every visible process's working directory (unreadable ones are other users').
   used="$(find /proc -mindepth 2 -maxdepth 2 -name cwd -printf '%l/\n' 2>/dev/null || true)"
@@ -219,6 +243,7 @@ release_gc() {
       rm -rf -- "$dir"
     fi
   done
+  exec 8>&-
 }
 
 # release_status: each installed or running queue unit, the revision and directory its unit file

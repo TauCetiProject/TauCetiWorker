@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -85,7 +86,7 @@ def stop(unit):
     (state / f"{unit}.pid").unlink(missing_ok=True)
 
 command, rest = args[0], args[1:]
-if command in ("daemon-reload", "enable"):
+if command in ("daemon-reload", "enable", "reenable"):
     sys.exit(0)
 if command == "start":
     for unit in rest:
@@ -348,6 +349,36 @@ class Releases(unittest.TestCase):
         self.assertIn("drop-in", log)
         self.assertFalse(self.releases.exists())
 
+    def test_failed_fetch_stops_the_install_rather_than_using_the_cached_origin(self):
+        self.origin.rename(self.root / "origin-gone")
+        log = self.run_script("install-monitoring.sh", "--wait", "0", expect=1)
+        self.assertIn("cannot fetch origin", log)
+        self.assertEqual(self.release_dirs(), [])
+
+    def test_gc_waits_for_an_install_that_holds_the_lock(self):
+        self.releases.mkdir()
+        old = self.releases / f"{'c' * 40}-20260101T000000Z"
+        old.mkdir()
+        if True:
+            holder = subprocess.Popen(
+                ["flock", "-s", str(self.releases / ".lock"), "sleep", "30"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.addCleanup(holder.wait)
+            self.addCleanup(holder.kill)
+            time.sleep(0.5)
+            env = dict(self.env, TAUCETI_QUEUE_RELEASE_KEEP="0")
+            result = subprocess.run(
+                ["bash", str(REPO / "services/queue/release.sh"), "gc"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        self.assertIn("not collecting", result.stderr)
+        self.assertTrue(old.exists())
+
     def test_gc_keeps_referenced_running_and_newest_releases(self):
         self.releases.mkdir()
         names = [f"{'a' * 40}-2026010{day}T000000Z" for day in range(1, 9)]
@@ -366,7 +397,7 @@ class Releases(unittest.TestCase):
         subprocess.run(
             ["bash", str(REPO / "services/queue/release.sh"), "gc"], env=env, check=True, capture_output=True
         )
-        left = sorted(p.name for p in self.releases.iterdir())
+        left = sorted(p.name for p in self.releases.iterdir() if p.name != ".lock")
         self.assertEqual(left, sorted([names[0], names[1], names[6], names[7], handmade.name]))
 
     def test_gc_removes_worktrees_from_the_shared_clone(self):

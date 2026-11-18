@@ -264,9 +264,11 @@ its scripts are the release-aware ones; from then on any copy can start an insta
 off to the target release's installer. The old `tauceti-queue-repair@.service` template stays
 installed and still names `~/TauCetiQueue`, but no instance with its own unit file uses it. Other
 host units outside this repository that use `~/TauCetiQueue/.venv` keep working; that environment
-is no longer updated by the installers. To undo the migration for a unit, install the old unit file
-(`git -C ~/TauCetiQueue show <old sha>:services/queue/<unit>`) into `~/.config/systemd/user/`, remove
-an instance's own `tauceti-queue-repair@NAME.service`, `daemon-reload` and restart that unit.
+is no longer updated by the installers. Until that fast-forward, a migrated unit can be moved back
+to the shared checkout, which still holds the old code and environment: install the old unit file
+(`git -C ~/TauCetiQueue show HEAD:services/queue/<unit>`) into `~/.config/systemd/user/`, remove an
+instance's own `tauceti-queue-repair@NAME.service`, `daemon-reload` and restart that unit. After it,
+roll back with `--release` instead.
 
 `--no-restart` installs without restarting (the running service keeps its revision; verification then
 reports the mismatch deliberately). The unit has `Restart=always`, `TimeoutStopSec=120` and

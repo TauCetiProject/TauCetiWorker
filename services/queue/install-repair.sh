@@ -169,7 +169,8 @@ release_render_unit "$UNIT_SOURCE" "$UNIT"
 systemctl --user daemon-reload
 fragment="$(systemctl --user show -p FragmentPath --value "$UNIT")"
 [ "$fragment" = "$UNIT_DIR/$UNIT" ] || die "systemd loads $UNIT from ${fragment:-nothing}, not $UNIT_DIR/$UNIT"
-systemctl --user enable --quiet "$UNIT"
+# reenable: an instance enabled through the template has a wants link to the template file.
+systemctl --user reenable --quiet "$UNIT"
 
 if [ "$RESTART" = 1 ]; then
   log "restarting $UNIT"

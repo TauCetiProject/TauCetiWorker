@@ -32,6 +32,11 @@ override_warning() {
   log "WARNING: $1. Running repair cleanup at anything other than origin/main HEAD requires explicit"
   log "WARNING: permission from a human operator, and must be undone as soon as the change lands on main."
 }
+for dropin in "$HOME"/.config/systemd/user/tauceti-queue-repair-cleanup.{service,timer}.d/*.conf; do
+  if [ -e "$dropin" ]; then
+    die "systemd drop-in $dropin overrides the installed unit; queue units must not use drop-ins. Move it out of $(dirname "$dropin"), then rerun"
+  fi
+done
 if [ -z "${TAUCETI_QUEUE_RELEASE:-}" ]; then
   if [ -n "$RELEASE_ARG" ] && [ "$REVISION" != "origin/main" ]; then die "--release and --revision are exclusive"; fi
   if [ "$REVISION" != "origin/main" ]; then override_warning "installing --revision $REVISION, not origin/main"; fi
