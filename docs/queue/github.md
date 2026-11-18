@@ -142,7 +142,8 @@ and approval-poll thread own pending work and missed policy observations; see
 [Primary admission](operations.md#primary-admission).
 
 **Comment commands.** `bors r+`, `bors merge`, `bors r=login`, `bors p=N`, `bors r-`, `bors cancel`
-in issue comments and review bodies, from collaborators with push access, parsed below.
+in issue comments and review bodies, from collaborators with push access, parsed below; `bors emergency`
+and `bors emergency-` from repository admins only.
 
 **Legacy eligibility checks (explicit pre-cutover mode only).** TauCetiReview's reusable
 `merge-only.yml` and `merge-sweep.yml` run `runner/backend.py eligibility`, which publishes an
@@ -267,6 +268,8 @@ nothing (`bors merged this`, `bors cancelled it`, `bors single-handedly`).
 | `bors cancel` | `controller.cancel(repo, pr, commenter)` |
 | `bors single on\|off` | accepted without effect |
 | `bors ping` | `:pong: pong` |
+| `bors emergency` | repository admins only (`adapter.repository_admin`; anyone else gets one `:lock: Permission denied` reply): `controller.request_emergency(repo, pr, commenter, surface="comment", reason=<comment URL>, live_head=<live head>)`; the reply says the request was accepted (and behind which PR it is queued) or why it was refused (`disabled`, `not-approved`, `head-moved`, ...) |
+| `bors emergency-` | repository admins only: `controller.cancel_emergency(repo, pr, commenter, surface="comment")`; refused once the emergency batch is landing |
 | `bors try`, `try-`, `retry`, `delegate`/`d` forms, `link`, `stack`, `unlink` | refused with a reply saying the merge queue does not run them |
 
 Anything after a complete command refuses the whole line with Bors's reply shape (`:-1: bors did not
@@ -426,6 +429,8 @@ status plus `revision` and `started_at`.
 | `POST /tasks/inference` | bearer; body `{worker, ok, error}`; `report_inference(...)`; 204 |
 | `POST /admin/settings` | bearer and repository admin; `set_setting(key, value, login)` per key; `{settings, actor}` |
 | `POST /admin/urgent` | bearer and repository admin; body `{repo, pr}`; `mark_urgent(repo, pr, login)` |
+| `POST /admin/emergency` | bearer and repository admin; body `{repo, pr, reason}`; `request_emergency(repo, pr, login, surface="endpoint", reason=)`; `repo` goes to the controller unchecked, so a qualified Forgejo key is accepted where the controller's source checks accept it |
+| `POST /admin/emergency-cancel` | bearer and repository admin; body `{repo, pr}`; `cancel_emergency(repo, pr, login, surface="endpoint")` |
 | `POST /admin/retry-ci` | bearer and repository admin; `retry_ci(repo, login)` |
 
 Bearer tokens are GitHub tokens resolved to a login through `GET /user` (cached by token digest for

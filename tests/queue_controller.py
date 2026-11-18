@@ -2754,6 +2754,7 @@ class StatusShape(ControllerCase):
                 "open_batches",
                 "sealed_successor",
                 "head",
+                "emergency",
                 "external_head",
                 "approvals",
                 "admission",
@@ -2772,6 +2773,7 @@ class StatusShape(ControllerCase):
         )
         self.assertIsNone(status["head"])
         self.assertIsNone(status["external_head"])
+        self.assertEqual(status["emergency"], {"enabled": False, "batch": None, "queued": [], "cancel_intents": []})
         self.assertEqual(status["approvals"], {"webhook": 0, "polled": 0, "revoked_by_poll": 0, "last_poll": None})
         self.assertEqual(status["waiting"]["count"], 0)
         self.approve(101, {"A.lean": "a\n"})

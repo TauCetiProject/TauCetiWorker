@@ -435,7 +435,69 @@ hour.
 
 Urgent lane: `mark_urgent` flags the input (drawn next, ahead of the random draw) or, if it is
 already a member of the open batch, the batch. The open batch seals as soon as the head lands and
-its active claims finish; the running head is never cancelled.
+its active claims finish; the running head is never cancelled. It never lowers an emergency
+(`urgent = 2`) input or batch.
+
+Emergency lane (slice 1, `emergency_enabled`, off by default): a repository admin's request
+(`request_emergency(repo, pr, actor, surface=, reason=, live_head=)`, from `bors emergency`,
+`POST /admin/emergency` or `tauceti-queue emergency`) makes an approved PR the next head as a batch
+of its own. The flag is never an approval: the PR needs a live input (`waiting`, `reserved` or
+`inserted`) whose head is the live PR head, else the request is refused `not-approved` or
+`head-moved` (also `disabled`, `forgejo-inert`, `already-requested`); every request and refusal is
+journaled (`emergency-requested`, `emergency-refused`). The input gets `urgent = 2` and
+`evidence.emergency` (`actor`, `requested_at`, `surface`, `reason`, then the `batch_id` and, for a
+displaced PR, `displaced`), and leaves the ordinary draw (`_waiting`). An ordinary insertion never
+makes an emergency batch: it copies at most urgency 1 into its batch.
+
+The tick's `_emergency` step (after `_supersede_stale_pre_rebase`, before `_seal`) settles cancel
+intents, ends a dead emergency batch E (`empty-allocation`: no member after a crash or a transient
+probe failure, retried; `emptied`: no active member; `inert`: a member from a disabled source), and,
+when no E is live, builds one for the oldest request: a waiting input is probed (`_probe`) into a
+new open batch on `main` with `batches.urgent = 2` (`conflicts-with-main`, `missing-source`,
+`missing-source-in-flight` and `source-ci-scope` refuse the request; `probe-error`, `batch-moved` and
+`admission-pending` keep it for the next pass); an input inserted in an open batch B is replayed onto
+`main` without the lock with the same checks and then, in one transaction, inserted into a new E
+whose ownership of the input (`inputs.batch_id`) replaces B's (the prospective singleton; a refusal
+leaves it in B). A request whose PR is in the running head waits for that head to land. One E is
+live at a time; later requests queue behind it, first in first out. E is never evicted, and slice 1
+never evicts the running head: E waits for it to land (`emergency-waits`).
+
+E is left out of the scheduling selectors only (`_staging_batches`: insertion, `open_batch_limit`,
+idle removal, the first open batch for pre-rebase and preparation, successor sealing); retained-ref
+republication, sources in flight and status still see it. `_seal` selects `_emergency_ready()` (an
+open E with an active member, not inert) before the first open batch and makes it head through the
+same checks (`_seal_blocked`: inference hold, external head, claims) and transition (`_make_head`).
+As E becomes head, the claimed `pre_rebase` tasks and claimed pre-rebased `prepare` tasks of ordinary
+open batches are recorded (`state:emergency_preserved`): while claimed they stay current on their
+recorded `onto` and their batch's pre-rebase is not rewritten, so they submit as usual and the next
+`_pre_rebase` carries the result onto E's tip. E dispatches on an unpublished base (published base
+cache, above) and lands only on a pass of its own run through the normal promotion.
+
+A displaced slot in B never acts for the input (`_displaced`): its withdrawal, anticipation or
+return only marks the slot, and B's landing skips it. Every way E's member leaves E goes through
+`_emergency_exit` (escalation, adoption emptying or anticipation, return, cancellation, and a
+rejection when E lands with `withdraw_emptied_at_adoption` off): when B's slot is still live the
+input is `inserted` in B again with one comment to the author; otherwise the caller's own behaviour
+applies (withdrawal cancels, return waits at the original age). Every way E ends without landing goes
+through `_end_emergency`, one transaction that returns its member (or a reservation its own probe
+holds), clears the request (except a transient `empty-allocation`), supersedes its tasks, releases
+its claims, discards pre-rebases onto its tips, removes it (`emergency-ended` with the cause:
+`cancelled`, `dissolved`, `emptied`, `inert`, `empty-allocation`) and writes `cancel_intent:<attempt>`
+for every unsettled attempt of E at any version. `_reconcile_head` ends an E emptied between tick
+steps before anything can dispatch it. `cancel_emergency(repo, pr, actor, surface=)` refuses
+`promotion-pending` once a `promote` entry is pending or the current attempt passed; a promotion
+entry for a batch no longer `head` returns `not-head`. `_settle_cancel_intents` (after each such
+transaction and first in every `_emergency` pass) looks up the run of an attempt without one whose
+dispatch may have been sent, cancels a live run and deletes the intent only once the cancel is
+accepted, the run is observed completed, or the attempt provably has no run (`prepared`, `rejected`,
+or an `accepted` dispatch with no run found once older than `dispatch_timeout_seconds`; a `sending`
+or `uncertain` dispatch is never retired by age). Failures are retried each pass; intents block
+nothing.
+
+`approve` of a live input's own accepted head by a repository admin (admin evidence with `actor_id`
+and `merge_base_sha`) records `evidence.admin_reapproval` beside the original evidence and journals
+`admin-reapproved`; the original evidence, `approved_at`, state and batch are untouched. The feeds'
+scope approvals read it when the original evidence has no admin scope.
 
 Bors's state at the cutover (`import_bors_state(observation, candidates, now=, dry_run=,
 release_head=)`, implemented in `tauceti_queue/bors_import.py`): every member of a non-running batch
@@ -510,6 +572,7 @@ and reported in status:
 | `base_cache_endpoint` | `https://cache.taucetiproject.org/revisions` | public Lake revision endpoint a head's base must be published at before staging is dispatched (CI section above); empty disables the requirement |
 | `base_cache_recheck_seconds` | 120 | how long a base found unpublished is remembered before it is probed again |
 | `base_cache_alert_seconds` | 7200 | a wait for a published base this long raises a status alert and one direct message; 0 never |
+| `emergency_enabled` | false | accept emergency requests (`bors emergency`, `POST /admin/emergency`); off refuses them `disabled`, and a request already accepted keeps running |
 | `no_repair_labels` | `["dont-repair-in-queue"]` | labels (case-insensitive) by which an author opts a PR out of agent edits; such a member is only ever emptied and withdrawn as `problem-anticipated` |
 
 ## Ports
@@ -527,7 +590,8 @@ squash-landed member with a title change, which no other method expresses. `Cand
 only `kind == "infrastructure"` for classification.
 
 Commands arrive from the adapter as `approve(repo, pr, head_sha, reviewer, priority, evidence,
-approved_at=None, pull=None)`, `unapprove`, `cancel`, `set_priority`, `mark_urgent(repo, pr, actor)`;
+approved_at=None, pull=None)`, `unapprove`, `cancel`, `set_priority`, `mark_urgent(repo, pr, actor)`,
+`request_emergency` and `cancel_emergency`;
 `approved_at` lets the cutover import keep an input's original age and `pull` a PR already read.
 `validate_pull(repo, pr, head_sha)` and `input_for(repo, pr)` serve the import and the poll. Events arrive as
 `handle_event(kind, payload)` with the raw webhook payload; they refresh what they describe
@@ -633,7 +697,11 @@ claim collisions, chain validation failures, inference holds, promotion refusals
 repair-or-reject decision: `no_repair_opt_outs`, `edit_summaries` and `prs_edited_landed` (the
 repairs), `no_repair_withdrawals`, `problem_anticipated_needs_rebase`,
 `problem_anticipated_readmitted`); the recent
-`head_cycle_seconds` (first dispatch to landing); `insertion_passes`; `max_passes_waited`.
+`head_cycle_seconds` (first dispatch to landing); `insertion_passes`; `max_passes_waited`;
+`emergency` (`enabled`; `batch`, null or the live emergency batch: `batch_id`, `stage` (`waiting` or
+`head`), `waiting_for`, and the request's `number`, `state`, `actor`, `requested_at`, `surface`,
+`reason`; `queued`, the requests behind it; `cancel_intents`, the open intents with `attempt_id`,
+`batch_id`, `reason`, `at`). Every batch summary carries `emergency` (`urgent == 2`).
 
 `status()` waits at most two seconds for the controller lock (`wait=` overrides; `/healthz` passes
 half a second). When a pass holds it longer, the snapshot taken at the end of the last pass or
@@ -666,6 +734,7 @@ Tests are `tests/queue_fixture.py` (F), `tests/queue_controller.py` (C) and `tes
 | 18 no PR waits more than the window in passes | F `test_s18_no_pr_waits_more_than_the_window_in_passes`; C `Draw` |
 | 19 PR events and pushes neither cancel nor verdict; cancelled runs change nothing | F `test_s19_pr_events_and_branch_pushes_never_cancel_a_candidate_or_post_its_verdict`, `test_s10_s19_stale_status_...` |
 | 20 urgent lane | F `test_s20_urgent_pr_is_in_the_next_head_without_cancelling_the_running_one` |
+| 20b emergency lane | F `EmergencyLane` (every test of the class) |
 | 21 closing or relabelling a member changes nothing | F `test_s16_s21_...`; C `test_waiting_inputs_react_to_events_and_members_do_not` |
 | 22 status names runner, host, phases, stall, revision | F `test_s22_status_names_runner_host_phase_progress_stall_and_revision`; C `StatusShape` |
 | 25 a removal that strands an importer is refused at insertion | F `MissingSource` (`test_s25_removal_that_strands_an_importer_is_refused_at_insertion`, `test_s25_bad_import_is_refused_and_a_batch_mates_module_is_a_source`, `test_s25_gap_already_on_main_and_unavailable_scan_do_not_refuse`); `tests/queue_admission_planning.py` `ImportGaps` |

@@ -7,7 +7,7 @@ their repository-id mapping and `batch_id` query, webhook signature verification
 deduplication, routing of comments to command execution and of every event to the controller,
 bearer authentication of the worker and admin endpoints with its login cache (persisted across
 restarts, revalidated in the background, revocable), the controller
-error mapping (403, 404, 400, 500) and the urgent-lane request validation.
+error mapping (403, 404, 400, 500), the urgent-lane request validation and the emergency endpoints.
 """
 
 import http.client
@@ -123,6 +123,14 @@ class FakeController(FakeSource):
         if pr == 404:
             raise LookupError("no such approved PR")
         return {"urgent": pr}
+
+    def request_emergency(self, repo, pr, actor, *, surface, reason=""):
+        self.calls.append(("request_emergency", repo, pr, actor, surface, reason))
+        return {"accepted": True, "reason": "accepted", "behind": None}
+
+    def cancel_emergency(self, repo, pr, actor, *, surface):
+        self.calls.append(("cancel_emergency", repo, pr, actor, surface))
+        return {"cancelled": True, "reason": "cancelled"}
 
     def import_bors_state(self, observation, candidates=None, *, dry_run=False, release_head=False):
         self.calls.append(("import_bors_state", observation.get("schema"), candidates, dry_run, release_head))
@@ -571,6 +579,27 @@ class ServerTest(unittest.TestCase):
         status, body = self.request("POST", "/admin/rebuild-head", {}, self.bearer("ghp_kim"))
         self.assertEqual(status, 200, body)
         self.assertEqual(self.controller.calls[-1], ("rebuild_head", TAUCETI, "kim-em"))
+
+    def test_emergency_endpoints_need_an_admin_and_pass_qualified_keys_to_the_controller(self):
+        body = {"repo": TAUCETI, "pr": 42, "reason": "harness bump"}
+        self.assertEqual(self.request("POST", "/admin/emergency", body, self.bearer("ghp_worker"))[0], 403)
+        self.assertEqual(self.request("POST", "/admin/emergency", dict(body, pr="42"), self.bearer("ghp_kim"))[0], 400)
+        self.assertEqual(self.request("POST", "/admin/emergency", dict(body, pr=True), self.bearer("ghp_kim"))[0], 400)
+        status, reply = self.request("POST", "/admin/emergency", body, self.bearer("ghp_kim"))
+        self.assertEqual((status, reply["accepted"]), (200, True))
+        self.assertEqual(
+            self.controller.calls[-1], ("request_emergency", TAUCETI, 42, "kim-em", "endpoint", "harness bump")
+        )
+        # A qualified Forgejo key is not refused by the endpoint: the controller's source checks decide.
+        forgejo = "forgejo:forge.example/TauCeti"
+        status, _ = self.request("POST", "/admin/emergency", {"repo": forgejo, "pr": 5}, self.bearer("ghp_kim"))
+        self.assertEqual(status, 200)
+        self.assertEqual(self.controller.calls[-1], ("request_emergency", forgejo, 5, "kim-em", "endpoint", ""))
+        status, reply = self.request(
+            "POST", "/admin/emergency-cancel", {"repo": TAUCETI, "pr": 42}, self.bearer("ghp_kim")
+        )
+        self.assertEqual((status, reply["cancelled"]), (200, True))
+        self.assertEqual(self.controller.calls[-1], ("cancel_emergency", TAUCETI, 42, "kim-em", "endpoint"))
 
     def test_import_bors_and_reconcile_approvals_endpoints(self):
         feed = {"schema": "tauceti-bors.observation/v1", "repo": TAUCETI, "batches": []}

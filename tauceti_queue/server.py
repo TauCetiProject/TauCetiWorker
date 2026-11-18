@@ -17,6 +17,8 @@ same process. Routes:
     POST /tasks/<id>/result                           resolved to a login through `GET /user`
     POST /admin/settings                              same bearer scheme; the controller checks the
     POST /admin/urgent                                caller's repository-admin permission
+    POST /admin/emergency                             `{"repo", "pr", "reason"}`: an emergency request
+    POST /admin/emergency-cancel                      `{"repo", "pr"}`: its withdrawal
     POST /admin/revoke-identity                       `{"login": ...}`: forget the cached identity
                                                       and admin answers for a login
 
@@ -26,7 +28,8 @@ controller's `DEFAULT_SETTINGS`, each value of the type of that setting's initia
 The controller methods behind them: `status()`, `handle_event`, `claim_task(worker_identity,
 github_login)`, `renew_task(task_id, worker_identity, github_login, body)`, `submit_task(task_id,
 worker_identity, github_login, body)`, `update_settings(github_login, settings)`, `mark_urgent(repo,
-pr, actor)`, and the `feeds.FeedSource` reads. A controller may raise `PermissionError` (403),
+pr, actor)`, `request_emergency(repo, pr, actor, surface=, reason=)`, `cancel_emergency(repo, pr,
+actor, surface=)`, and the `feeds.FeedSource` reads. A controller may raise `PermissionError` (403),
 `LookupError` (404) or `ValueError` (400); anything else is a 500 with the traceback logged.
 """
 
@@ -588,6 +591,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin/urgent":
             self._admin_urgent()
             return
+        if path in ("/admin/emergency", "/admin/emergency-cancel"):
+            self._admin_emergency(cancel=path.endswith("-cancel"))
+            return
         if path == "/admin/primary":
             self._admin_primary()
             return
@@ -979,6 +985,26 @@ class Handler(BaseHTTPRequestHandler):
         if not self._admin(identity[0]):
             return
         self._call(lambda: self.server.controller.mark_urgent(repo, pr, identity[0]))
+
+    def _admin_emergency(self, *, cancel: bool) -> None:
+        """`POST /admin/emergency {repo, pr, reason}` and `/admin/emergency-cancel {repo, pr}`. `repo` is
+        passed to the controller, whose source checks accept a qualified native key too."""
+        identity, body = self._authenticated_json()
+        if identity is None or body is None:
+            return
+        repo = str(body.get("repo") or next(iter(self.server.config.repositories.values()), ""))
+        pr = body.get("pr")
+        reason = body.get("reason", "")
+        if not repo or not isinstance(pr, int) or isinstance(pr, bool) or pr <= 0 or not isinstance(reason, str):
+            self._error(400, "`repo` must name a repository, `pr` be a positive integer and `reason` text")
+            return
+        if not self._admin(identity[0]):
+            return
+        controller = self.server.controller
+        if cancel:
+            self._call(lambda: controller.cancel_emergency(repo, pr, identity[0], surface="endpoint"))
+        else:
+            self._call(lambda: controller.request_emergency(repo, pr, identity[0], surface="endpoint", reason=reason))
 
     def _admin_import_bors(self) -> None:
         """Bors's state at the cutover: `{"observation": feed, "candidates": journal | [journals], "dry_run", "release_head"}`."""
