@@ -23,6 +23,7 @@ from tauceti_tools import ci_candidate as cc
 from tauceti_tools.ci_candidate_evidence import EvidenceUnavailable
 
 from tauceti_queue.ci_execution import ExecutionEvidence, GitHubSourceExecution
+from tauceti_queue.github_adapter import GitHubError
 from tauceti_queue.github_app import AppCredentials, CredentialsError, InstallationToken, InstallationTokenSource
 from tauceti_queue.ports import DispatchNotAccepted
 
@@ -151,6 +152,15 @@ class Execution(unittest.TestCase):
         with self.assertRaises(OSError):
             self.adapter.dispatch(self.frozen)
         self.assertEqual(len(self.posts), 2)  # exactly one POST per explicit call
+
+    def test_deleted_reads_run_and_reports_only_404(self):
+        self.status = 404
+        self.assertTrue(self.adapter.deleted(self.frozen, "101"))
+        method, url, _headers, _body = self.posts[-1]
+        self.assertEqual((method, url), ("GET", "https://api.github.com/repos/team/Execution/actions/runs/101"))
+        self.status = 422
+        with self.assertRaises(GitHubError):
+            self.adapter.deleted(self.frozen, "101")
 
     def caller_reader(self, *, revision="b" * 40, protected=True, configuration=CONFIG, configured=None):
         selected = configured or policy(configuration)

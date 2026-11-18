@@ -50,6 +50,7 @@ from .ports import (
     TaskMember,
 )
 from .source_authority import NativeQueueAuthority, SourceAuthorityUnavailable, principal_key
+from .source_ci import NoOwner, RunDeleted
 from .stale_cache import StaleCache
 from .store import Store, dumps, loads
 from .task_identity import NATIVE_GIT_REFS, TaskBinding, native_retained_ref, native_submission_ref
@@ -6902,12 +6903,7 @@ class Controller:
                 self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
                 return
         if run is None:
-            if attempt.get("dispatch_state") in {"sending", "uncertain"}:
-                self._reasons.append(
-                    f"head {head['id']}: dispatch outcome is unknown; reconciling without a second send"
-                )
-                self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
-                return
+            # An unknown (`sending`/`uncertain`) dispatch with no run is resent after the same timeout.
             if now - (attempt["sent_at"] or attempt["dispatched_at"]) >= int(self.setting("dispatch_timeout_seconds")):
                 values.update(outcome=OUTCOME_INFRASTRUCTURE, outcome_detail="no-run: the dispatch produced no run")
                 self.store.journal(
@@ -7102,10 +7098,11 @@ class Controller:
         self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
 
     def _observe_source_attempt(self, head, attempt, now, *, strict=False):
-        """Only the artifact verifier may decide a source candidate's outcome.
+        """Only the artifact verifier may decide a source candidate's pass or source failure.
 
-        Absence, expiry and unavailable APIs preserve the single-send intent.
-        They never become an infrastructure verdict that authorizes a new send.
+        Unavailable APIs keep the request pending. A complete listing with no owner after
+        `dispatch_timeout_seconds`, a deleted owned run, and a completed owned run with no
+        verified result after publication grace are infrastructure outcomes, which resend.
         """
         candidate_ci = self._candidate_coordinator(attempt_id=attempt["id"])
         values = {"last_observed_at": now, "needs_observation": 0}
@@ -7133,8 +7130,22 @@ class Controller:
             owned = request_row is not None and request_row["owner_run_id"] is not None
             since = failed["since"] if owned else (attempt["sent_at"] or attempt["dispatched_at"])
             overdue = now - since >= int(self.setting("dispatch_timeout_seconds"))
+            resend = None
+            if isinstance(error, RunDeleted):
+                resend = f"lost-run: {error}; resending"
+            elif isinstance(error, NoOwner) and overdue:
+                resend = "unowned-run: no ownership proof after dispatch timeout; resending"
+            if resend is not None:
+                values.update(outcome=OUTCOME_INFRASTRUCTURE, outcome_detail=resend)
+                with self.store.transaction():
+                    self.store.journal(
+                        now, "source-ci-infrastructure", head["id"], attempt_id=attempt["id"], detail=resend
+                    )
+                    self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
+                    self.store.execute("DELETE FROM settings WHERE key=?", (key,))
+                return
             detail = (
-                "reconciliation-required: source CI ownership or evidence unavailable; no automatic resend"
+                "reconciliation-required: source CI ownership or evidence unavailable"
                 if overdue
                 else "waiting for verified source CI ownership and evidence"
             )
@@ -7189,28 +7200,21 @@ class Controller:
             result = observation.result
             if result is None:
                 if now - completed["at"] >= LOG_GRACE_SECONDS:
-                    if observation.result_absent and run.conclusion in {
-                        "cancelled",
-                        "timed_out",
-                        "startup_failure",
-                        "failure",
-                    }:
-                        values.update(
-                            outcome=OUTCOME_INFRASTRUCTURE,
-                            outcome_detail=f"owned-run-{run.conclusion}: no verified result after publication grace",
-                        )
-                        self.store.journal(
-                            now,
-                            "source-ci-infrastructure",
-                            head["id"],
-                            attempt_id=attempt["id"],
-                            run_id=run.run_id,
-                            run_attempt=run.attempt,
-                        )
-                    else:
-                        values["outcome_detail"] = (
-                            "reconciliation-required: completed source CI has no verified current result; no automatic resend"
-                        )
+                    # Absent, expired, unreadable or invalid: a completed run that has not
+                    # published a verified result by now is resent rather than left waiting.
+                    values.update(
+                        outcome=OUTCOME_INFRASTRUCTURE,
+                        outcome_detail=f"owned-run-{run.conclusion or 'unknown'}: "
+                        "no verified result after publication grace; resending",
+                    )
+                    self.store.journal(
+                        now,
+                        "source-ci-infrastructure",
+                        head["id"],
+                        attempt_id=attempt["id"],
+                        run_id=run.run_id,
+                        run_attempt=run.attempt,
+                    )
             else:
                 # GitHubEvidence binds this to the immutable request, repository,
                 # current run attempt and trusted isolated publisher.

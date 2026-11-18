@@ -506,10 +506,10 @@ The GitHub dispatch transport does not automatically retransmit on server errors
 
 Unknown sends retain their attempt ID and candidate branch for reconciliation.
 If the run becomes visible, the existing title/time lookup associates it with the
-attempt; this is not a producer-verified request binding. A missing run
-alone does not prove rejection, so normal ticks do not retransmit uncertain sends
-after a timeout. An explicit operator `retry_ci` can supersede one after the same
-live-run check and observation of any completed run. Ordinary source preparation
+attempt; this is not a producer-verified request binding. An uncertain send with
+no run after `dispatch_timeout_seconds` becomes an infrastructure outcome and is
+resent with a fresh request; an explicit operator `retry_ci` can supersede one
+sooner after the same live-run check and observation of any completed run. Ordinary source preparation
 failures and dispatch rejections retry with capped exponential backoff,
 respecting a persisted server retry deadline. Permanent HTTP rejections also
 raise an operator alert so configuration can be repaired while retries continue.
@@ -632,18 +632,19 @@ cannot make a source candidate pass. Promotion rechecks current membership, curr
 passing evidence and fresh source approval before its source compare and set; an already
 visible promotion is reconciled without another write.
 
-Absent, expired, malformed or unavailable evidence keeps the request pending at the
-normal polling interval. A single transient observation failure on an already owned run
+Unavailable evidence keeps the request pending at the normal polling interval. A single transient observation failure on an already owned run
 does not trigger the request-age alert. Liveness checks read current run metadata
 without downloading expired artifacts. Automatic retries skip repeated repository-wide
 discovery for already owned completed attempts; explicit operator retries additionally
 check for newly discovered duplicates. Discovery uses closed creation-time windows and
 splits ranges before the [filtered 1,000-run cap](https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-workflow). Limits on requests, records, pages and
-time precision yield an explicit unavailable result; exceeding them never proves a
-dispatch did not happen. An acknowledged or ambiguous send is never automatically
-repeated because no run is found. After its evidence deadline the status includes
-`reconciliation_required` and the exact request nonce. `retry_ci` refuses when ownership
-cannot be verified. For an owned completed run, an operator must name the exact current
+time precision yield an explicit unavailable result, which keeps the request pending.
+When a complete listing finds no live, unreadable or owned run for an acknowledged or
+ambiguous send after `dispatch_timeout_seconds`, the attempt becomes an infrastructure
+outcome (`unowned-run`) and is resent with a fresh request; a completed unowned attempt
+does not block that resend. An owned run that GitHub reports deleted (404) is likewise an
+infrastructure outcome (`lost-run`). While listings or reads fail, the status includes
+`reconciliation_required` and the exact request nonce after the evidence deadline. For an owned completed run, an operator must name the exact current
 request nonce shown in status to retire missing evidence and authorize a fresh dispatch;
 all discovered verified duplicates must also have finished. Fresh promotion reads
 release the controller lock and recheck local bindings on return. Source CI observation
@@ -655,18 +656,16 @@ outcome, hold, promotion generation and journal update share one transaction so 
 cannot strand the head behind a finished outbox key. The existing admin retry endpoint
 accepts the exact `request_id` nonce; native HTTP authentication still requires its
 separate qualified authority integration. After publication grace, a verified owned
-completed run with a failure, cancellation, timeout or startup failure enters the
-bounded infrastructure retry policy only after a complete authenticated artifact
-listing and fresh run metadata confirm the result is absent. Read failures and
-present-but-unreadable artifacts stay pending. Grace starts at the controller's
+completed run without a verified current result (absent, expired, unreadable or invalid,
+whatever its conclusion) enters the infrastructure retry policy and is resent; it never
+passes. Grace starts at the controller's
 first completed observation, tracked separately from GitHub's completion time so
-status and feed timestamps retain their original meaning. A successful run without a usable result
-still requires reconciliation. Repeated preparation/freeze failures raise alerts, and an
+status and feed timestamps retain their original meaning. Repeated preparation/freeze failures raise alerts, and an
 exact-nonce operator retry can retire a request that remains prepared. Re-observing a
 deferred passing result does not count the same CI run twice; transient per-attempt
 settings are removed after landing.
 
-Permanently missing ownership, automatic late and duplicate run cleanup, richer repair
+Automatic late and duplicate run cleanup, richer repair
 diagnostics, the native source port, qualified task/reporting metadata, native HTTP
 actor/approval authority, protected ref publication and Git transport identity binding
 remain activation gates.
