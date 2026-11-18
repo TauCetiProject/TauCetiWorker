@@ -165,7 +165,31 @@ def main():
         check("the stray tree is gone", not (one.checkout / "stray").exists() and legacy_absent(one))
         rw.release(one)
 
-        # 6. Turning the flag off again returns to an ordinary checkout, keeping .lake.
+        # 6. A source checkout is prepared while its source is active, from that source's host clone,
+        # and the round ends after the source is no longer active. It is still removed: a leftover
+        # one is swept by another worker's round, holding this worker's round lock as it starts.
+        other = root / "other.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(seed), str(other)], check=True)
+        source = SimpleNamespace(
+            wid=one.wid,
+            state=one.state / "sources/abc",
+            checkout=one.state / "sources/abc/checkout",
+            data_home=one.data_home,
+        )
+        agents.CHECKOUT_URL = str(other)
+        check("a source checkout prepares", agents.prepare_checkout(source, work="fix", pr=3))
+        source_clone = rw.host_clone()
+        agents.CHECKOUT_URL = str(origin)
+        check("the source checkout belongs to another host clone", source_clone != rw.host_clone())
+        check("it is not a worktree of the default clone", not rw.owns(source.checkout))
+        rw.release(one)
+        check("round end removed the source worktree", not source.checkout.exists())
+        listed = subprocess.run(
+            ["git", f"--git-dir={source_clone}", "worktree", "list", "--porcelain"], capture_output=True, text=True
+        ).stdout
+        check("its host clone no longer lists it", str(source.checkout) not in listed)
+
+        # 7. Turning the flag off again returns to an ordinary checkout, keeping .lake.
         check("prepare again", agents.prepare_checkout(one, work="fix", pr=1))
         os.environ["TAUCETI_ROUND_WORKTREES"] = "0"
         check("flag off prepares", agents.prepare_checkout(one, work="fix", pr=1))

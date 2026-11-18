@@ -406,6 +406,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_POLL` | `300` | Seconds between quota checks while the loop waits. |
 | `TAUCETI_ROUND_TIMEOUT` | `21600` | Hard safety cap per round (seconds), against a hung agent or tool: the loop kills the round's process group and abandons the round. Work, including verification, finishes inside the round; nothing is checkpointed or continued. |
 | `TAUCETI_INTERROUND` | `20` | Minimum gap after a productive round (seconds). |
+| `TAUCETI_ROUND_LOCK_WAIT` | `120` | How long a loop's round waits for its worker's `round.lock` (seconds), held briefly by another worker removing this worker's leftover worktree or by a round still finishing after a loop restart. A round that still finds it held exits as a claim collision, without failure backoff. |
 | `TAUCETI_BACKOFF_BASE` / `TAUCETI_BACKOFF_MAX` | `30` / `900` | The escalating no-progress back-off (seconds). |
 | `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress prose attempts (seconds; eight hours by default). Mechanical documentation retries do not spend this window. |
 | `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. A loop dedicated to `overlap-scan` requires only REST core. |
