@@ -1053,7 +1053,7 @@ class MixedExecution(MixedFixture, unittest.TestCase):
             with self.assertRaises(ValueError):
                 WorkerTask.from_json(damaged)
         original_binding = loads(self.controller.store.row("tasks", {"id": task_id})["task_binding"])
-        self.ledger.policy = dataclasses.replace(self.ledger.policy, harness_revision="e" * 40)
+        self.ledger.policy = dataclasses.replace(self.ledger.policy, require_publication=False)
         self.assertGreater(self.controller.renew_task(task_id, task.claim_token), self.clock())
         self.profile.raw["authority_generation"] = "2" * 32
         self.assertGreater(self.controller.renew_task(task_id, task.claim_token), self.clock())
@@ -1083,7 +1083,7 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         frozen = self.start_mixed()
         configuration = self.ledger.configuration + b"\n# reviewed control update\n"
         policy = dataclasses.replace(
-            self.ledger.policy, harness_revision="e" * 40, config_digest=hashlib.sha256(configuration).hexdigest()
+            self.ledger.policy, require_publication=False, config_digest=hashlib.sha256(configuration).hexdigest()
         )
         self.execution.caller_snapshot = ("f" * 40, policy, configuration)
         head = self.controller._head()

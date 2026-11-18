@@ -115,7 +115,8 @@ fi
 
 # --- environment ----------------------------------------------------------------------------------
 log "syncing the uv environment"
-uv sync --quiet
+# TauCetiTools follows its main branch; take its current commit on every install.
+uv sync --quiet --upgrade-package tauceti-tools
 
 # --- configuration --------------------------------------------------------------------------------
 mkdir -p "$CONFIG_DIR" && chmod 0700 "$CONFIG_DIR"

@@ -6215,5 +6215,33 @@ class EarlyPublication(Fixture):
         self.assertEqual(list((cfg.root / "worktrees").glob("task-1-publish-*")), [])
 
 
+class ToolsMainPin(unittest.TestCase):
+    """``ref = "main"`` follows TauCetiTools main; each audit checks out its current commit."""
+
+    def test_main_resolves_to_the_branch_tip_and_moves_with_it(self):
+        self.assertEqual(
+            repair_audit.parse_tools_pin('[tools.tools]\nrepo = "TauCetiProject/TauCetiTools"\nref = "main"\n'),
+            ("TauCetiProject/TauCetiTools", "main"),
+        )
+        with self.assertRaises(repair_audit.Unavailable):
+            repair_audit.parse_tools_pin('[tools.tools]\nrepo = "TauCetiProject/TauCetiTools"\nref = "develop"\n')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, first = make_tools_repository(root / "tools")
+            sh(repo, "branch", "-M", "main")
+            os.environ[repair_audit.URL_VARIABLE] = str(repo)
+            self.addCleanup(os.environ.pop, repair_audit.URL_VARIABLE, None)
+            checkout = repair_audit.tools_checkout(root / "checkouts", "TauCetiProject/TauCetiTools", "main")
+            self.assertEqual(checkout.name, first)
+            (repo / "tauceti_tools" / "moved.py").write_text("")
+            sh(repo, "add", "-A")
+            sh(repo, "-c", "user.name=T", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "move")
+            moved = repair_audit.tools_checkout(root / "checkouts", "TauCetiProject/TauCetiTools", "main")
+            self.assertEqual(moved.name, sh(repo, "rev-parse", "HEAD"))
+            self.assertNotEqual(moved.name, first)
+            with self.assertRaises(repair_audit.Unavailable):
+                repair_audit.tools_checkout(root / "checkouts", "TauCetiProject/TauCetiTools", "absent")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

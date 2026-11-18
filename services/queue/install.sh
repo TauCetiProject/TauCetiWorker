@@ -94,7 +94,8 @@ fi
 
 # --- environment ----------------------------------------------------------------------------------
 log "syncing the uv environment"
-uv sync --quiet
+# TauCetiTools follows its main branch; take its current commit on every install.
+uv sync --quiet --upgrade-package tauceti-tools
 # Bake the revision so /status reports the installed checkout even if git becomes unavailable
 # to the service's environment; tauceti_queue/runtime.py prefers this file over `git rev-parse`.
 printf 'SHA = "%s"\nDIRTY = False\n' "$target" > tauceti_queue/_revision.py.tmp

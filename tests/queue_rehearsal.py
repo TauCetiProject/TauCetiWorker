@@ -123,10 +123,10 @@ class Scaffold(unittest.TestCase):
         self.assertNotIn("__PUBLIC_URL__", config)
         default = rehearsal.scaffold_files()["tauceti.toml"]
         self.assertIn(f'url = "{rehearsal.DEFAULT_PUBLIC_URL}"', default)
-        # The pinned TauCetiTools revision is the same in the workflow's `uses:` lines and the configuration.
-        pins = set(re.findall(r"TauCetiTools/\.github/actions/[a-z-]+@([0-9a-f]{40})", rehearsal.PR_BUILD_YML))
-        self.assertEqual(len(pins), 1)
-        self.assertIn(f'ref = "{pins.pop()}"', config)
+        # The workflow's `uses:` lines and the configuration both follow TauCetiTools main.
+        refs = set(re.findall(r"TauCetiTools/\.github/actions/[a-z-]+@(\S+)", rehearsal.PR_BUILD_YML))
+        self.assertEqual(refs, {"main"})
+        self.assertIn('ref = "main"', config)
 
     def test_public_url_must_be_an_https_origin(self):
         self.assertEqual(rehearsal.public_url_argument("https://host.example/"), "https://host.example")

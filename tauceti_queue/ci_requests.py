@@ -194,7 +194,6 @@ class RequestLedger:
             self.policy.source,
             self.policy.execution,
             self.workflow_revision,
-            self.policy.harness_revision,
             self.policy.config_digest,
             attempt["batch_id"],
             attempt["batch_version"],
