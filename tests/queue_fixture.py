@@ -10,6 +10,7 @@ import json
 import sys
 import tempfile
 import time
+import types
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -3904,6 +3905,84 @@ class EmergencyLane(QueueFixture):
         carried = self.controller.store.row("batches", {"id": successor["id"]})
         self.assertEqual((carried["pre_rebase_state"], carried["pre_rebase_onto"]), ("adopted", self.head()["tip"]))
         self.assertIn(f"{PROJECT}#102", json.loads(carried["pre_rebase_edits"]))
+
+    def test_a_github_singleton_is_not_held_to_the_source_candidate_scope(self):
+        head, successor = self.running_head_with_successor()
+        self.emergency(103)
+        owner = self.controller.store.row("batches", {"id": successor["id"]})
+        mixed = types.SimpleNamespace(mode="admit", primary="github", supports_candidate=lambda base, tip: False)
+
+        def singleton():
+            nonlocal row
+            row = self.controller.store.row("inputs", {"id": row["id"]})
+            with self.controller._lock:
+                return self.controller._emergency_singleton(row, owner, self.clock())
+
+        row = self.controller.input_for(PROJECT, 103)
+        with patch.object(self.controller, "mixed", mixed), patch.object(self.controller, "mixed_ci", object()):
+            mixed.primary = "forgejo"  # source-candidate CI would run it: the scope applies
+            self.assertIsNone(singleton())
+        self.assertEqual(self.journal("emergency-refused")[-1]["reason"], "source-ci-scope")
+        self.emergency(103)
+        row = self.controller.input_for(PROJECT, 103)
+        mixed.primary = "github"  # GitHub CI runs it: no source-candidate scope, as for an ordinary probe
+        with patch.object(self.controller, "mixed", mixed), patch.object(self.controller, "mixed_ci", object()):
+            batch = singleton()
+        self.assertEqual([m["number"] for m in self.members(batch)], [103])
+
+    def test_an_empty_allocation_leaves_successor_work_onto_main_alone(self):
+        self.controller.set_setting("repair_concurrency", 2, "t")
+        self.approve(101, {"Shared.lean": "line one\nline two changed by 101\nline three\n"})
+        self.tick()
+        self.approve(102, {"Shared.lean": "line one\nline two changed by 102\nline three\n"})
+        self.tick()
+        task = self.agent().claim(self.controller)
+        self.assertEqual(task.kind, "pre_rebase")
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.head(), "the claimed successor waits")
+        self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["onto"], self.repo.main_sha())
+        self.approve(104, {"D.lean": "d\n"})
+        self.emergency(104)
+        with patch.object(self.controller, "_fetch_head", return_value=False):
+            self.tick()
+        self.assertEqual(self.journal("emergency-ended")[-1]["cause"], "empty-allocation")
+        self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["state"], "open")
+        self.assertEqual(self.controller.store.count("claims", {"task_id": task.task_id, "released_at": None}), 1)
+
+    def test_an_emergency_landing_cancels_its_other_attempts_durably(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.emergency(101)
+        self.github.ci_policy = fail_members(101)
+        self.tick()
+        [batch] = self.emergency_batches()
+        [first] = self.controller.store.rows("ci_attempts", {"batch_id": batch["id"]})
+        stray = self.github.runs[-1]
+        self.run_ci()
+        self.tick()
+        agent = self.agent(
+            script=lambda task: {f"{PROJECT}#101": Resolution({"A.lean": "fixed\n"}, explanation="Fixed.")}
+        )
+        self.assertTrue(agent.run(self.controller).accepted)
+        self.github.ci_policy = verdicts()
+        self.controller.store.update(
+            "ci_attempts",
+            {"id": first["id"]},
+            outcome="superseded",
+            run_id=None,
+            run_status="",
+            dispatch_state="uncertain",
+        )
+        self.tick()
+        second = self.controller.store.rows("ci_attempts", {"batch_id": batch["id"]}, order="id")[-1]
+        self.assertNotEqual(second["id"], first["id"])
+        self.run_ci()
+        stray.status, stray.conclusion = "in_progress", None  # the superseded dispatch's run is still live
+        self.tick(2)
+        self.assertEqual(self.controller.store.row("batches", {"id": batch["id"]})["state"], "landed")
+        self.assertEqual((stray.status, stray.conclusion), ("completed", "cancelled"), "found and cancelled")
+        self.assertEqual(self.controller.status()["emergency"]["cancel_intents"], [])
+        self.assertEqual(self.controller.store.row("ci_attempts", {"id": second["id"]})["cancel_result"], "")
 
     def test_cancel_intents_survive_lookup_failures_and_uncertain_dispatches(self):
         self.approve(101, {"A.lean": "a\n"})

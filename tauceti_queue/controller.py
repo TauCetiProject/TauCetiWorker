@@ -3807,11 +3807,7 @@ class Controller:
                 if not self._fetch_head(row["number"], row["head_sha"]):
                     raise chain.ChainError(f"accepted head {row['head_sha']} is not available")
                 result = chain.build(self.clone, batch["tip"], [member], chain_id=chain_id)
-                gaps, scan_unavailable = (
-                    self._new_import_gaps(batch["tip"], result) if result.status == chain.CLEAN else ([], None)
-                )
-                if result.status == chain.CLEAN and self.mixed is not None and self.mixed.mode == "admit":
-                    scope_supported = self.mixed.supports_candidate(batch["base"], result.tip)
+                gaps, scan_unavailable, scope_supported = self._replay_preflight(batch["base"], batch["tip"], result)
         except chain.ChainError as error:
             failure = error
         finally:
@@ -3919,14 +3915,7 @@ class Controller:
                 )
             return False
         record = result.commits[0]
-        source_ci_required = (
-            self.mixed is not None
-            and self.mixed.mode == "admit"
-            and (
-                isinstance(row["number"], SourceNumber) or self._candidate_coordinator(batch_id=batch["id"]) is not None
-            )
-        )
-        if source_ci_required and not scope_supported:
+        if self._source_ci_required(row["number"], batch) and not scope_supported:
             reason = (
                 "source-ci-scope: native candidate needs a compatible batch or changes within the native path policy"
                 if isinstance(row["number"], SourceNumber)
@@ -4071,6 +4060,31 @@ class Controller:
             )
         self._admission_context(self.store.row("batches", {"id": batch["id"]}) or batch, now)
         return True
+
+    def _replay_preflight(
+        self, base: str, tip: str, result: chain.ChainResult
+    ) -> tuple[list[tuple[str, str]], str | None, bool]:
+        """The checks a clean replay onto `tip` (on `base`) gets before insertion, run without the lock:
+        the new import gaps, why the import scan was unavailable, and whether the source-candidate scope
+        supports the candidate (`_source_ci_required` says whether that applies)."""
+        if result.status != chain.CLEAN:
+            return [], None, True
+        gaps, scan_unavailable = self._new_import_gaps(tip, result)
+        scope_supported = True
+        if self.mixed is not None and self.mixed.mode == "admit":
+            scope_supported = self.mixed.supports_candidate(base, result.tip)
+        return gaps, scan_unavailable, scope_supported
+
+    def _source_ci_required(self, number: Any, batch: dict[str, Any] | None) -> bool:
+        """Whether inserting `number` into `batch` routes the batch's CI through source-candidate CI,
+        whose scope then restricts it; `batch` None is a new batch of that member alone."""
+        if self.mixed is None or self.mixed.mode != "admit":
+            return False
+        if isinstance(number, SourceNumber):
+            return True
+        if batch is not None:
+            return self._candidate_coordinator(batch_id=batch["id"]) is not None
+        return self.candidate_ci is not None or (self.mixed_ci is not None and self.mixed.primary == "forgejo")
 
     def _planner(self) -> admission_planning.Planner:
         if not hasattr(self, "_admission_planner"):
@@ -4427,10 +4441,7 @@ class Controller:
                 if not self._fetch_head(row["number"], row["head_sha"]):
                     raise chain.ChainError(f"accepted head {row['head_sha']} is not available")
                 result = chain.build(self.clone, canonical, [member], chain_id=chain_id)
-                if result.status == chain.CLEAN:
-                    gaps, _ = self._new_import_gaps(canonical, result)
-                    if self.mixed is not None and self.mixed.mode == "admit":
-                        scope_supported = self.mixed.supports_candidate(canonical, result.tip)
+                gaps, _, scope_supported = self._replay_preflight(canonical, canonical, result)
         except chain.ChainError as error:
             failure = error
         finally:
@@ -4446,7 +4457,7 @@ class Controller:
             else "missing-source"
             if gaps
             else "source-ci-scope"
-            if not scope_supported
+            if not scope_supported and self._source_ci_required(row["number"], None)
             else None
         )
         fresh = self.store.row("inputs", {"id": row["id"]})
@@ -4553,7 +4564,10 @@ class Controller:
             for claim in self._active_claims(batch["id"]):
                 self._release_claim(claim, "superseded", now)
             self._set_pre_rebase(batch, "", now)
-            self._discard_pre_rebase("emergency-ended", now, batch)
+            current = self.store.row("batches", {"id": batch["id"]}) or batch
+            if current["version"] > 0:
+                # A version-0 allocation's only tip is `main`, which successor work may rightly be onto.
+                self._discard_pre_rebase("emergency-ended", now, current)
             self.store.update("batches", {"id": batch["id"]}, state=BATCH_REMOVED)
             self.store.journal(now, "batch-removed", batch["id"], reason=f"emergency-{cause}")
             self.store.journal(
@@ -8057,9 +8071,14 @@ class Controller:
                 for member in rejected:
                     self._enqueue_rejection_effects(batch, member)
             self._interacting_landed({m["number"] for m in members}, now)
+            if batch["urgent"] == URGENT_EMERGENCY:
+                self._write_cancel_intents(batch, "emergency batch landed", now)
         if self.mixed is not None and self.mixed.mode == "admit" and self.setting("publication_enabled"):
             self._enqueue("mixed-sync", f"mixed-sync:{self.mixed.generation}:{batch['id']}:{batch['tip']}", {})
-        self._cancel_superseded_runs(batch["id"], now, reason="batch landed")
+        if batch["urgent"] == URGENT_EMERGENCY:
+            self._settle_cancel_intents(now)
+        else:
+            self._cancel_superseded_runs(batch["id"], now, reason="batch landed")
         self._wake.set()
 
     def _enqueue_rejection_effects(self, batch: dict[str, Any], member: dict[str, Any]) -> None:
