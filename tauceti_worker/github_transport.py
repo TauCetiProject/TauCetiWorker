@@ -27,6 +27,7 @@ _advisory = contextvars.ContextVar("source_advisory", default=False)
 _retry_reads = contextvars.ContextVar("github_retry_reads", default=True)
 _revision = contextvars.ContextVar("github_revision", default="")
 _cache_hit = contextvars.ContextVar("github_cache_hit", default=False)
+_cache_only = contextvars.ContextVar("source_cache_only", default=False)
 _request_context = contextvars.ContextVar("github_request_context", default=None)
 
 
@@ -76,9 +77,19 @@ def register_principal(user_id: int, login: str, env=None):
             continue
 
 
+class CacheOnlyMiss(Exception):
+    """A cache-only read found no current observation; nothing was fetched."""
+
+
 @contextlib.contextmanager
 def read_context(
-    *, fresh: bool = False, revision: str = "", direct: bool = False, retry: bool = True, advisory: bool | None = None
+    *,
+    fresh: bool = False,
+    revision: str = "",
+    direct: bool = False,
+    retry: bool = True,
+    advisory: bool | None = None,
+    cache_only: bool = False,
 ):
     a = _fresh.set(_fresh.get() or fresh)
     b = _revision.set(revision or _revision.get())
@@ -86,6 +97,7 @@ def read_context(
     d = _direct.set(_direct.get() or direct)
     e = _retry_reads.set(_retry_reads.get() and retry)
     f = _advisory.set(_advisory.get() if advisory is None else advisory)
+    g = _cache_only.set(_cache_only.get() or cache_only)
     try:
         yield
     finally:
@@ -95,6 +107,12 @@ def read_context(
         _direct.reset(d)
         _retry_reads.reset(e)
         _advisory.reset(f)
+        _cache_only.reset(g)
+
+
+def cache_only():
+    """Answer source reads only from current cached observations, raising CacheOnlyMiss otherwise."""
+    return _cache_only.get()
 
 
 def advisory_reads():
@@ -285,10 +303,35 @@ def prune_shared_cache():
         with locked(cache / ".prune.lock", timeout=0.05):
             if recent():
                 return
-            prune_read_cache(cache, max_files=1024, max_bytes=64 * 1024 * 1024)
+            # Above the live set: two review observations per open PR plus listings and other reads.
+            prune_read_cache(cache, max_files=8192, max_bytes=256 * 1024 * 1024)
             atomic(marker, {"time": time.time()})
     except OSError:
         pass  # Cache cleanup never gates a source read.
+
+
+def _shared_path(key, identity):
+    digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
+    return root() / "cache" / identity / (digest + ".json")
+
+
+def update_shared(key, mutate, *, identity, generation_scope, lock_timeout: float = 5) -> bool:
+    """Replace one current cached value in place, keeping its age and revision.
+
+    The lock excludes an in-flight leader, whose result could predate the correction. False means
+    nothing current was updated (no entry, another generation, a held lock or storage failure); the
+    caller then decides whether to invalidate instead.
+    """
+    path = _shared_path(key, identity)
+    try:
+        with locked(path.with_suffix(".lock"), timeout=lock_timeout):
+            cached = json.loads(path.read_text())
+            if cached["generation"] != shared_generation(generation_scope):
+                return False
+            atomic(path, {**cached, "value": mutate(cached["value"])})
+            return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 def shared_read(
@@ -311,15 +354,32 @@ def shared_read(
     The default invokes each caller's fetch after failures, preserving fetch side effects.
     """
     identity = identity or scope()
-    if not identity or _fresh.get() or os.environ.get("TAUCETI_GITHUB_CACHE_BYPASS") == "1":
+    bypass = not identity or _fresh.get() or os.environ.get("TAUCETI_GITHUB_CACHE_BYPASS") == "1"
+    if bypass and _cache_only.get():
+        raise CacheOnlyMiss("shared cache bypassed")
+    if bypass:
         return fetch()
     requested_at = time.time()
-    digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
-    path = root() / "cache" / identity / (digest + ".json")
+    path = _shared_path(key, identity)
     attempt = path.with_suffix(".attempt")
 
     def current_generation():
         return generation(key) if generation_scope is None else shared_generation(generation_scope)
+
+    if _cache_only.get():
+        # Atomic replacement makes an unlocked read safe; waiting on a leader would be a fetch.
+        try:
+            cached = json.loads(path.read_text())
+            if (
+                (immutable or cached["generation"] == current_generation())
+                and cached.get("revision", "") == _revision.get()
+                and 0 <= time.time() - cached["time"] < ttl
+            ):
+                _cache_hit.set(True)
+                return cached["value"]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        raise CacheOnlyMiss("no current shared observation")
 
     def finished(outcome):
         if not coalesce_failures:

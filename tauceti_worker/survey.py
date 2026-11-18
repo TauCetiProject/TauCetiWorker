@@ -405,6 +405,10 @@ class Survey:
     dependency_wait: dict | None = None
     discovery_gaps: int = 0  # diagnostic only; partial history never stops work selection
     discovery_gap_prs: list[int] = field(default_factory=list)
+    # A native source survey's per-PR review-history reads (at most SURVEY_DETAIL_READS), and the PRs
+    # it left unclassified because no cached observation describes their current state. Diagnostic.
+    detail_reads: int = 0
+    detail_deferred: int = 0
     errors: list[str] = field(default_factory=list)
     # PRs whose review keeps ERRORING (engine can't post a verdict) past MAX_REVIEW_ERRORS: the worker
     # can't review them and CI's round cap can't catch them (rounds never advance), so each round
@@ -1135,6 +1139,8 @@ def classify_survey(
                 (sv.reviewable.suppressed if c.attempts >= c.budget else sv.reviewable.actionable).append(c)
             continue
         m = rs.gh_meta(p.number)
+        if m.provenance == "deferred":
+            continue  # unread this survey (detail budget spent); a later survey reads it
         if m.provenance in {"stale", "fetch_failed"}:
             gaps.add(p.number)
             continue
@@ -1227,6 +1233,9 @@ def classify_survey(
                     ).append(c)
                 continue
             meta = rs.gh_meta(p.number)
+            if meta.provenance == "deferred":
+                sv.fix_waiting.append((p.number, "review state not read this survey"))
+                continue
             blocking = rs.ledger_blocking(p.number, p.head_oid)
             per_head = counters.read(f"fix-{p.number}-{p.head_oid[:12]}")
             pending_contest = False

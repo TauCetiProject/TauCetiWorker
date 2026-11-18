@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
 from . import github_transport as transport
+from .constants import SOURCE_FACTS_TTL
 from .read_cache import prune_read_cache as prune_state_cache  # noqa: F401
 
 
@@ -174,6 +175,21 @@ class BoundedReadCache:
                 if not slot.users:
                     del self._active[key]
 
+    def peek(self, key, *, ttl, scope=None):
+        """A current entry, or CacheOnlyMiss. Never fetches, coalesces or publishes."""
+        self._validate_scope(scope)
+        key = (
+            scope,
+            json.dumps(key, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(),
+        )
+        now = self.clock()
+        with self._lock:
+            item = self._entries.get(key)
+            if item is None or ttl <= 0 or not 0 <= now - item[1] < ttl or now >= item[2]:
+                raise transport.CacheOnlyMiss("no current local observation")
+            self._entries.move_to_end(key)
+            return json.loads(item[0])
+
     def _publish(self, key, encoded, ttl, started):
         # Caller owns _lock. A slow request cannot extend the observation's TTL
         # or overwrite the result of a later-started fetch.
@@ -268,6 +284,41 @@ class _ProjectionAPI:
                 ):
                     raise Incomplete("source head repository belongs to another origin")
         return rows
+
+
+LISTING_PAGE_ATTEMPTS = 3
+
+
+def _page_retrying(api, *, attempts=LISTING_PAGE_ATTEMPTS, sleep=time.sleep):
+    """A view of a native client whose GET requests retry transient failures, page by page.
+
+    A listing spans many pages; one 5xx or dropped connection should cost that page another
+    request, not the whole listing (and every survey waiting on it). Malformed responses, client
+    errors and every non-GET request keep their single attempt. Other clients are returned as is.
+    """
+    import copy
+
+    from tauceti_tools.forge import ForgeError, Forgejo, Incomplete
+
+    if not isinstance(api, Forgejo):
+        return api
+    view = copy.copy(api)
+    request = api.request
+
+    def retrying(method, path, *args, **kwargs):
+        for attempt in range(attempts):
+            try:
+                return request(method, path, *args, **kwargs)
+            except Incomplete:
+                raise
+            except ForgeError as error:
+                transient = error.status in (0, 408, 429) or error.status >= 500
+                if method.upper() != "GET" or not transient or attempt == attempts - 1:
+                    raise
+                sleep(2**attempt)
+
+    view.request = retrying
+    return view
 
 
 class ForgejoReadSource:
@@ -379,6 +430,9 @@ class ForgejoReadSource:
                 return value
 
             key = (self.cache_namespace, operation, json.dumps(args, sort_keys=True), revision)
+            cache_only = transport.cache_only()
+            if cache_only and (fresh or force or not cacheable):
+                raise transport.CacheOnlyMiss("uncached source read")
             shared = (
                 getattr(self, "shared_inventory", False) is True
                 and transport.advisory_reads()
@@ -404,7 +458,10 @@ class ForgejoReadSource:
                 value = transport.shared_read(
                     [*shared_scope, operation, args, policy, global_epoch],
                     fresh_fetch,
-                    ttl=self.ttl,
+                    # A survey read names the PR's (updatedAt, head) as its revision, and
+                    # shared_read serves only that revision, so the observation answers until
+                    # the PR changes, a write invalidates it, or the edit/deletion backstop ends.
+                    ttl=SOURCE_FACTS_TTL if revision else self.ttl,
                     identity=self.cache_namespace,
                     lock_timeout=300,
                     generation_scope=shared_scope,
@@ -415,6 +472,8 @@ class ForgejoReadSource:
                 self._bound()
                 if advisory_policy(self) != policy:
                     raise ReadInvalidated("publication policy changed during advisory read")
+            elif cache_only:
+                value, hit = self.cache.peek(key, ttl=self.ttl, scope=(self.repository.key, number)), True
             elif cacheable:
                 value, hit = self.cache.read(
                     key, bounded_fetch, ttl=self.ttl, fresh=fresh or force, scope=(self.repository.key, number)
@@ -454,13 +513,45 @@ class ForgejoReadSource:
         )
 
     def refresh_pr_state(self, number, expected, observed=""):
-        """Correct a selected observation using only this bound source."""
-        self.invalidate_discovery()
+        """Correct a selected observation using only this bound source.
+
+        The fresh row replaces this PR's row in the shared listing (or removes a closed PR) instead
+        of expiring the whole listing, which every surveying worker would then have to refetch.
+        A row that cannot be placed falls back to expiring the listing.
+        """
         self.invalidate(number)
-        data = self.pr_view(number, ["headRefOid"], fresh=True)
+        data = self.pr_view(number, [*self.inventory_fields, "state"], fresh=True)
+        if data is not None and self._correct_discovery(number, data):
+            return dict(status="ok", outcome="refreshed", data=data)
+        self.invalidate_discovery()
+        if data is None:
+            data = self.pr_view(number, ["headRefOid"], fresh=True)
         if data is None:
             return dict(status="unavailable", reason="refresh_unavailable")
         return dict(status="ok", outcome="refreshed", data=data)
+
+    def _correct_discovery(self, number, data):
+        if getattr(self, "shared_inventory", False) is not True:
+            return True  # No shared listing; this adapter's own entries were invalidated above.
+        row = {key: data[key] for key in self.inventory_fields if key in data}
+        if set(row) != set(self.inventory_fields) or data.get("state") not in {"OPEN", "CLOSED", "MERGED"}:
+            return False
+        from .source_identity import discovery_scope
+        from .source_survey import discovery_key
+
+        def mutate(rows):
+            if not isinstance(rows, list):
+                raise ValueError("cached listing is not a list")
+            kept = [item for item in rows if not (isinstance(item, dict) and item.get("number") == number)]
+            if data["state"] == "OPEN":
+                # Native listings are creation-descending, which PR numbers follow.
+                index = next((i for i, item in enumerate(kept) if item.get("number", 0) < number), len(kept))
+                kept.insert(index, row)
+            return kept
+
+        return transport.update_shared(
+            discovery_key(self), mutate, identity=self.cache_namespace, generation_scope=discovery_scope(self)
+        )
 
     def open_prs(self, *, fresh=False):
         """Complete bounded open inventory, excluding unverified CI observations.
@@ -470,7 +561,17 @@ class ForgejoReadSource:
         short-lived discovery observation, not a source snapshot or merge proof.
         """
         fields = list(self.inventory_fields)
-        return self._read("open_prs", [], lambda: self.reader.pulls(self.repository, fields, state="open"), fresh=fresh)
+
+        def fetch():
+            reader = self.reader
+            retrying = _page_retrying(self.api)
+            if retrying is not self.api:
+                from tauceti_tools.forge_read import ForgejoReader
+
+                reader = ForgejoReader(_ProjectionAPI(retrying))
+            return reader.pulls(self.repository, fields, state="open")
+
+        return self._read("open_prs", [], fetch, fresh=fresh)
 
     def authenticated_actor(self):
         """Fresh native actor identity; never infer it from a login or GitHub."""

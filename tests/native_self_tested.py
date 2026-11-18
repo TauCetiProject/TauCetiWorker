@@ -61,18 +61,43 @@ class NativeSelfTested(unittest.TestCase):
         self.assertIsNone(self.source.pull_for_head("team", "roadmap/x"))
         self.assertEqual(self.source.reader.pulls.call_count, 5)
 
-    def test_selected_state_refresh_expires_shared_inventory(self):
+    def inventory_row(self, number, head="a" * 40):
+        return {field: None for field in self.source.inventory_fields} | dict(number=number, headRefOid=head)
+
+    def test_selected_state_refresh_replaces_one_shared_inventory_row(self):
+        from tauceti_worker.source_survey import discovery_inventory
+
+        self.source.shared_inventory = True
+        listing = [self.inventory_row(3), self.inventory_row(1), self.inventory_row(2)]
+        self.source.open_prs = Mock(side_effect=[listing, AssertionError("listing refetched")])
+        fresh = self.inventory_row(1, "b" * 40) | dict(state="OPEN")
+        self.source.pr_view = Mock(return_value=fresh)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.fixture.clone / "shared-reads")):
+            self.assertEqual(discovery_inventory(self.source), listing)
+            result = self.source.refresh_pr_state(1, "a" * 40)
+            self.assertEqual((result["status"], result["data"]["headRefOid"]), ("ok", "b" * 40))
+            self.source.pr_view.assert_called_once_with(1, [*self.source.inventory_fields, "state"], fresh=True)
+            corrected = discovery_inventory(self.source)
+            self.assertEqual([row["number"] for row in corrected], [3, 2, 1])
+            self.assertEqual(corrected[2], self.inventory_row(1, "b" * 40))
+            # A closed PR leaves the listing; still no listing refetch.
+            self.source.pr_view.return_value = self.inventory_row(3) | dict(state="MERGED")
+            self.source.refresh_pr_state(3, "a" * 40)
+            self.assertEqual([row["number"] for row in discovery_inventory(self.source)], [2, 1])
+        self.assertEqual(self.source.open_prs.call_count, 1)
+
+    def test_selected_state_refresh_expires_shared_inventory_when_the_row_is_incomplete(self):
         from tauceti_worker.source_survey import discovery_inventory
 
         self.source.shared_inventory = True
         self.source.open_prs = Mock(side_effect=[[dict(number=1)], [dict(number=2)]])
-        self.source.pr_view = Mock(return_value=dict(headRefOid="b" * 40))
+        self.source.pr_view = Mock(side_effect=[None, dict(headRefOid="b" * 40)])
         with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.fixture.clone / "shared-reads")):
             self.assertEqual(discovery_inventory(self.source), [dict(number=1)])
             self.assertEqual(discovery_inventory(self.source), [dict(number=1)])
             result = self.source.refresh_pr_state(1, "a" * 40)
             self.assertEqual(result["status"], "ok")
-            self.source.pr_view.assert_called_once_with(1, ["headRefOid"], fresh=True)
+            self.source.pr_view.assert_called_with(1, ["headRefOid"], fresh=True)
             self.assertEqual(discovery_inventory(self.source), [dict(number=2)])
 
     def test_shared_refill_bypasses_adapter_local_inventory(self):
