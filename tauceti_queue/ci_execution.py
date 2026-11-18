@@ -343,6 +343,25 @@ class GitHubSourceExecution:
                 pass  # Optional context cannot erase a verified failure or create a pass.
         return CandidateObservation(run, ownership, result, absent)
 
+    def progress(self, frozen, run):
+        """`run` with the job and step phases and placement GitHub reports for its attempt.
+
+        One jobs listing, no logs. The phases are observational context for status and the
+        stall report; they are never ownership or verdict evidence.
+        """
+        name = frozen.policy.execution.repository.name
+        adapter = GitHubAdapter(GitHubClient(self.tokens, self.transport), name)
+        details = adapter.candidate_run(
+            name, {"id": run.run_id, "run_attempt": run.attempt}, with_jobs=True, with_diagnostics=False
+        )
+        return replace(
+            run,
+            phases=details.phases,
+            runner_name=details.runner_name,
+            runner_labels=details.runner_labels,
+            host=details.host,
+        )
+
     def _result_absent(self, reader, frozen, run):
         """A failed artifact download is not evidence of an absent verdict.
 
