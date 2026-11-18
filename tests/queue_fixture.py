@@ -4399,6 +4399,42 @@ class EmergencyEviction(QueueFixture):
         self.land_all()
         self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "landed")
 
+    def test_an_old_intent_without_a_run_never_cancels_the_returning_heads_new_run(self):
+        head, _ = self.running_head()
+        self.approve(104, {"D.lean": "d\n"})
+        self.emergency(104)
+        with patch.object(self.controller, "_settle_cancel_intents"):
+            self.tick()
+            [attempt] = self.attempts(head["id"])
+            self.controller.store.update(
+                "ci_attempts", {"id": attempt["id"]}, run_id=None, run_status="", dispatch_state="uncertain"
+            )
+            self.controller.cancel_emergency(PROJECT, 104, "admin-worker", surface="test")
+            self.tick()
+        self.assertEqual(len(self.attempts(head["id"])), 2)
+        self.controller.store.update("ci_attempts", {"id": self.attempts(head["id"])[-1]["id"]}, run_id=None)
+        self.tick()
+        self.assertNotEqual(self.run_of(head["id"]).conclusion, "cancelled", "the new run is not taken")
+        self.assertIsNone(self.controller._state(f"cancel_intent:{attempt['id']}"))
+
+    def test_displacing_a_head_member_respects_the_sealing_barriers(self):
+        head, _ = self.running_head(101, 102)
+        self.controller._set_state("inference_hold", {"since": self.clock(), "last_error": "t"})
+        self.emergency(102)
+        self.tick()
+        self.assertEqual(self.head()["id"], head["id"])
+        self.assertIsNone(self.controller._emergency_batch())
+        self.assertIn("inference hold", self.journal("emergency-waits")[-1]["why"])
+
+    def test_zero_repair_concurrency_still_refuses_every_claim(self):
+        self.controller.set_setting("repair_concurrency", 0, "t")
+        self.github.ci_policy = fail_members(101)
+        self.running_head()
+        self.run_ci()
+        self.tick()
+        self.assertTrue(self.controller.store.rows("tasks", {"kind": "repair", "state": "open"}))
+        self.assertIsNone(self.agent().claim(self.controller))
+
     def test_successor_claimed_pre_rebase_survives_eviction_and_is_carried_onto_the_returning_head(self):
         self.controller.set_setting("repair_concurrency", 2, "t")
         self.approve(101, {"Shared.lean": "line one\nline two changed by 101\nline three\n"})

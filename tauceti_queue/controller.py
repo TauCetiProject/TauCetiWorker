@@ -1830,7 +1830,7 @@ class Controller:
                 ]
             active = self._active_task_claims()
             if len(active) >= concurrency:
-                head = self._head()
+                head = self._head() if concurrency > 0 else None
                 head_work = [pair for pair in claimable if head is not None and pair[1]["id"] == head["id"]]
                 if not head_work or any(claim["batch_id"] == head["id"] for claim in active):
                     if head_work:
@@ -4870,6 +4870,15 @@ class Controller:
             self._emergency_waits(target, f"{prefix}head {head['id']} ({why})", now)
             return False
 
+        barrier = (
+            self._seal_blocked(batch)
+            if batch is not None
+            else ("inference hold: not sealing", False)
+            if self._state("inference_hold")
+            else ((self._external_head_blocks_sealing(), False) if self._external_head_blocks_sealing() else None)
+        )
+        if barrier is not None:
+            return wait(barrier[0])
         attempt = self._current_attempt(head)
         why = self._protection(head, attempt, observed=False)
         if why is not None:
@@ -4912,7 +4921,11 @@ class Controller:
             and self._protection(current, current_attempt, observed=observe) is None
         )
         if valid and built is not None:
-            valid = self._singleton_current(row, head, built) is not None
+            valid = (
+                self._singleton_current(row, head, built) is not None
+                and not self._state("inference_hold")
+                and not self._external_head_blocks_sealing()
+            )
         elif valid:
             fresh = self.store.row("batches", {"id": target})
             valid = (
@@ -5243,6 +5256,18 @@ class Controller:
                 continue
             if not attempt["run_id"]:
                 if attempt["dispatch_state"] not in {"sending", "uncertain", "accepted", "legacy"}:
+                    continue
+                if any(
+                    later["id"] > attempt_id
+                    and later["head_sha"] == attempt["head_sha"]
+                    and later["base_sha"] == attempt["base_sha"]
+                    and later["dispatch_state"] in {"sending", "uncertain", "accepted", "legacy"}
+                    for later in self.store.rows("ci_attempts", {"batch_id": attempt["batch_id"]})
+                ):
+                    # A later dispatch of the same candidate was sent (a head that returned after an
+                    # eviction): a lookup now finds that newer run, which this intent must never take,
+                    # and pr-build.yml's concurrency group cancels the earlier run when the later starts.
+                    self._drop_cancel_intent(attempt_id)
                     continue
                 try:
                     if candidate_ci is not None:
