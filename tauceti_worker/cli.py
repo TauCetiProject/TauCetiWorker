@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 from .agents import (
@@ -62,6 +63,7 @@ from .config import (
     extra_roadmap_prompt,
     is_git_url,
     log,
+    one_line,
     roadmap_only,
     sanitize_wid,
     security_audit_problem,
@@ -1906,6 +1908,15 @@ def cli_main() -> int:
         return 2
     except KeyboardInterrupt:
         return 130
+    except Exception as e:  # noqa: BLE001 - an unexpected crash still leaves a one-line reason
+        # The traceback is for debugging; the log line and the published failure are what the loop
+        # and status views show, so a crashed round never reads as a bare "exited with status 1".
+        traceback.print_exc()
+        what = "round" if sys.argv[1:2] == ["_round"] else "tauceti"
+        reason = f"{what} crashed: {type(e).__name__}: {one_line(str(e))}"
+        log(reason)
+        report_failure(reason, code=1)
+        return 1
 
 
 def _ensure_scripts_executable() -> None:

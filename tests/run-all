@@ -235,6 +235,7 @@ RUN_STDLIB=(
   review_throttles.py
   roadmap_backpressure.py
   roadmap_claims.py
+  round_crash_reasons.py
   round_file_changes.py
   round_group_sweep.py
   resources.py
