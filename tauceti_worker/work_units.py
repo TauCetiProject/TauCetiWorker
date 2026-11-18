@@ -19,6 +19,7 @@ from pathlib import Path
 from .agents import (
     AuthoringProfile,
     BuildCacheUnavailable,
+    BuildCacheWait,
     _claude_review_model,
     _codex_review_model_override,
     _kiro_review_model,
@@ -1347,6 +1348,22 @@ BUBBLE_WORK_REFUSED = (
 )
 
 
+# Host agent rounds whose preparation can end in BuildCacheWait, by the commit they prepare.
+CACHE_WAIT_PR_STAGES = {"fix", "fix-ci", "rebase", "bump", "lint-repair"}
+CACHE_WAIT_MAIN_STAGES = {"roadmap", "overlap-fix"}
+
+
+def _build_cache_deferral(stage: str, c: Candidate) -> dict | None:
+    """A host-wide wait another round recorded for this candidate's commit (build_cache_wait)."""
+    from . import build_cache_wait
+
+    if stage in CACHE_WAIT_PR_STAGES and c.pr and c.head:
+        return build_cache_wait.deferral(c.head, stage=stage)
+    if stage in CACHE_WAIT_MAIN_STAGES:
+        return build_cache_wait.deferral(scope="main")
+    return None
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
     """Perform one stage. Return its rc, or None to decline this candidate and try another.
 
@@ -1366,6 +1383,19 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         # private copy per round. Until Bubble rounds see the host's read-only shared views,
         # they do not run. Review only greps a shared, read-only Mathlib source.
         raise NoProgress(BUBBLE_WORK_REFUSED)
+    if (waiting := _build_cache_deferral(stage, c)) is not None:
+        commit = str(waiting.get("commit", ""))[:12]
+        if stage != "roadmap":
+            target = f" #{c.pr}" if c.pr else ""
+            log(f"  {stage}{target}: waiting for a build cache for {commit}; selecting other work")
+            return None
+        # Roadmap is the last candidate: wait visibly rather than report that nothing was eligible.
+        raise BuildCacheWait(
+            f"waiting-build-cache: main {commit} has no published TauCeti cache with its dependencies yet "
+            "(another round on this host is waiting on it); roadmap deferred",
+            retry_at=waiting.get("retry_at"),
+            commit=str(waiting.get("commit", "")),
+        )
     from .github_outbox import pending_for
 
     if (

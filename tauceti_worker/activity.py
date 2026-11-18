@@ -151,6 +151,7 @@ class Round:
             "AdmissionUnavailable",
             "DocumentationUnavailable",
             "ProgressPreparationUnavailable",
+            "BuildCacheWait",
             "GitHubUnavailable",
             "SharedStateUnavailable",
         ):

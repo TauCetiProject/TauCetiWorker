@@ -415,6 +415,50 @@ restores CI's outputs by hard link. Modules CI has not published are the agent's
 are left alone. The receipt counts `ci_disagreeing_traces`, `ci_disagreeing_removed` and
 `ci_disagreeing_skipped` (deferred because a file was busy).
 
+#### Waiting for a matching TauCeti cache
+
+`lake cache get --max-revs=N` installs the newest published revision in the last N commits.
+When CI has not yet published a commit that changed dependencies (a Mathlib bump, say), that
+revision predates the change, none of its outputs apply, and the round would compile all of
+TauCeti, which cannot finish within the round limit. Host agent rounds (roadmap, overlap-fix,
+and the PR rounds fix, fix-ci, rebase, bump and lint-repair) therefore check the cache before
+the agent starts. The revision Lake installed is the first commit in `git rev-list HEAD -n N`
+whose revision map is in the round's download directory, which is the same rule Lake follows
+(maps seeded from the pool included). Its `lake-manifest.json` package revisions and
+`lean-toolchain` are compared with the checkout's dependency files as prepared. A rebase round
+prepares with main's files, so main's cache is the one it needs. For a PR round, the main
+revision fetched alongside also counts. If either matches, the round proceeds. A fallback with
+the same dependencies is logged as a same-dependency fallback and only the commits in between
+rebuild.
+
+Otherwise the round ends as `waiting-build-cache` (exit 79): no failure, no attempt charged,
+downloaded and hydrated outputs kept, and the worker selects other work after 5 seconds.
+`tauceti workers status` shows the state, the commit and the recheck time. The round writes
+`<pool>/cache-waits/<commit>-<dependencies>.json`, keyed by the head and the dependency files it
+prepared, with a retry time five minutes ahead. It records the stage and the revision whose map
+would serve those dependencies: the head for its own, main for main's (a rebase round). Until the
+retry time, other workers on the host skip the same stage on that head, and skip roadmap and
+overlap-fix while a wait on main is recorded (roadmap reports `waiting-build-cache` itself, since
+it is the last candidate). A fix of a head whose rebase is waiting is not held. At most every
+30 seconds per host, a selecting worker sends an anonymous `HEAD` request for that revision's
+map, `<TAUCETI_CACHE_REVISION_URL>/TauCetiProject/TauCeti/tc/<toolchain>/<revision>.jsonl`, with
+the prepared toolchain mangled as Lake does (`leanprover--lean4---v4.36.0`); a 200 removes the
+wait. When the retry time passes, the next round to select that work claims the check for two
+minutes, together with its own later candidates, and goes through. Only cache preparation
+re-arms the retry time, so a round that claims and then declines lets the claim lapse for the
+next one. A successful check on main clears every wait on main. Any error reading or writing
+markers, or probing, lets work proceed, including the round that could not record its wait. A marker
+that exists but cannot be read is left alone rather than restarted. At most once an hour per
+host, selection deletes every marker whose first wait is more than seven days old, whatever its
+head or stage; released PR waits are kept until then, so a spent grace is not granted again.
+
+A wait older than an hour logs one warning per host and commit, naming the URL CI should have
+published. Rounds on main wait without limit: main always gets a cache, and building anyway
+only occupies the host. A PR whose own head changes dependencies relative to main only gets a
+cache once CI builds that PR, which may never succeed, so after two hours of waiting its rounds
+proceed on the fallback cache as before, letting the repair agent work on the PR. Bubble rounds,
+bump attestation and the queue's repair service do not wait.
+
 The existing pool status receipt also records mapping/seed/install counts and per-phase
 elapsed and CPU seconds for seeding, fetching, transfer, expansion/hydration, and Mathlib
 view preparation. CPU includes the preparator and reaped children. Phases can be nested,

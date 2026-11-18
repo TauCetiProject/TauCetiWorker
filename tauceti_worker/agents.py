@@ -1070,7 +1070,9 @@ def run_agent_host(
     _LAST_AGENT_FAILURE = None
     from . import round_storage
 
-    with host_build_cache_context(cwd, env, logdir, **({"queue_mathlib": True} if queue_mathlib else {})) as prefix:
+    # Worker rounds wait for a cache with their dependencies; the queue's repair service builds its own.
+    cache_options = {"queue_mathlib": True} if queue_mathlib else {"cache_wait": True}
+    with host_build_cache_context(cwd, env, logdir, **cache_options) as prefix:
         if not cache_note:
             env.pop("TAUCETI_PR_CACHE_MISS", None)  # the convention belongs to the appendix left out
         rc = run_agent_proc(
@@ -1540,6 +1542,22 @@ class AgentLaunchUnavailable(BuildCacheUnavailable):
     """A process creation failure before the agent existed."""
 
 
+class BuildCacheWait(BuildCacheUnavailable):
+    """The published TauCeti cache does not match this round's dependencies yet (build_cache_wait).
+
+    A deferral, like ProgressPreparationUnavailable: no failure, no attempt, other work next.
+    """
+
+    state = "waiting-build-cache"
+
+    def __init__(self, message: str, *, retry_at: float | None = None, commit: str = ""):
+        super().__init__(message)
+        self.retry_at = retry_at
+        self.commit = commit
+        # Activity records the round as waiting on this dependency (activity.Round.finish).
+        self.failure = dict(dependency="build-cache", reason=commit[:12] or "unpublished")
+
+
 _LAKE_FALSE = {"0", "false", "no", "off", "n", "f"}
 
 
@@ -1551,8 +1569,13 @@ def lake_cache_max_revs(env: dict) -> str:
 
 
 @contextlib.contextmanager
-def host_build_cache_context(cwd: Path, env: dict, logdir: Path, *, queue_mathlib: bool = False):
-    """Keep the public service available through repairs, merges and dependency changes."""
+def host_build_cache_context(
+    cwd: Path, env: dict, logdir: Path, *, queue_mathlib: bool = False, cache_wait: bool = False
+):
+    """Keep the public service available through repairs, merges and dependency changes.
+
+    ``cache_wait=True`` (worker agent rounds) raises BuildCacheWait instead of starting on a
+    cache whose dependencies differ from the checkout's (see build_cache_wait)."""
     from .build_resources import defaults
 
     defaults(env)
@@ -1568,13 +1591,18 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path, *, queue_mathli
             return contextlib.nullcontext([])
         return shared_mathlib.view(cwd, env, logdir, _cache_fetch)
 
+    from .build_cache_wait import ENABLE
+
     if queue_mathlib:
         env["TAUCETI_QUEUE_MATHLIB"] = "1"
+    if cache_wait:
+        env[ENABLE] = "1"
     try:
         with _host_build_cache_context(cwd, env, logdir, mathlib_view) as prefix:
             yield prefix
     finally:
         env.pop("TAUCETI_QUEUE_MATHLIB", None)
+        env.pop(ENABLE, None)
 
 
 @contextlib.contextmanager
@@ -1627,6 +1655,10 @@ def _host_build_cache_context(cwd: Path, env: dict, logdir: Path, mathlib_view):
                 try:
                     try:
                         prepare_host_build_caches(cwd, env, logdir, report=report)
+                    except BuildCacheWait:
+                        if prefix:
+                            shared_mathlib.preparation_status(env)  # Mathlib itself is ready
+                        raise
                     except expanded_cache.Unavailable as error:
                         if prefix:
                             shared_mathlib.preparation_status(env, error=error)
@@ -1674,6 +1706,7 @@ def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None
     from . import expanded_cache
 
     prefix = json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]"))
+    wait = None
     with expanded_cache.preparation(
         cwd,
         env,
@@ -1696,7 +1729,12 @@ def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None
             30,
         ),
     ) as warm_env:
-        warm_host_build_caches(cwd, warm_env, logdir, report=report)
+        try:
+            warm_host_build_caches(cwd, warm_env, logdir, report=report)
+        except BuildCacheWait as error:
+            wait = error  # finish preparation first: a later round keeps what was downloaded and hydrated
+    if wait is not None:
+        raise wait
 
 
 def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float | None) -> int:
@@ -1891,10 +1929,20 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
         return
     if not TAUCETI_CACHE_SERVICE:
         return
+    from . import build_cache_wait
+
     base = ["lake", "cache", "get", "--service", TAUCETI_CACHE_SERVICE, "--repo", TAUCETI]
     result = fetch("TauCeti", [*base, f"--max-revs={max_revs}"])
     if result == "workspace-error":
         return
+    waits = env.get(build_cache_wait.ENABLE) == "1"
+    # Before the main fetch adds its own map: which revision this fetch actually installed.
+    installed = (
+        build_cache_wait.installed_revision(cwd, env.get("LAKE_CACHE_DIR"), max_revs)
+        if waits and result == "ready"
+        else None
+    )
+    main_hit = None
 
     def git(*args: str) -> str:
         p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
@@ -1914,6 +1962,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
             if status != "miss":
                 if status == "workspace-error":
                     return
+                main_hit = revision
                 break
         else:
             origin = git("config", "--get", "remote.origin.url")
@@ -1927,6 +1976,8 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
             )
     elif result == "miss":
         unavailable("TauCeti main cache has no published outputs in the requested history")
+    if waits:
+        build_cache_wait.check(cwd, env, head=head, main=main, installed=installed, main_hit=main_hit)
     if result == "miss":
         env["TAUCETI_PR_CACHE_MISS"] = "1"
         log("warning: PR history is uncached; current main artifacts are ready for the rebase")

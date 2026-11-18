@@ -1747,6 +1747,7 @@ def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, w
             "checking-quota": "checking quota",
             "waiting-github": "waiting for GitHub",
             "waiting-quota": "waiting for quota",
+            "waiting-build-cache": "waiting for a build cache",
         }.get(state, state)
         heading = f"{item['id']} — {display_state}"
         if item["desired"] == "stopped" or state in {"missing", "restarting", "stale", "stopped", "stopping"}:
@@ -1782,7 +1783,12 @@ def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, w
             if item.get("wait_detail"):
                 cause += f" ({item['wait_detail']})"
             lines.extend(_status_field("waiting", [f"{item['wait_dependency']}: {cause}"], width))
-        if item.get("next_action_at") and state in {"backoff", "waiting-github", "waiting-quota"}:
+        if item.get("next_action_at") and state in {
+            "backoff",
+            "waiting-github",
+            "waiting-quota",
+            "waiting-build-cache",
+        }:
             label = "retry" if state == "backoff" else "recheck"
             lines.extend(_status_field(label, [_format_until(item["next_action_at"])], width))
         if budget := item.get("budget"):
