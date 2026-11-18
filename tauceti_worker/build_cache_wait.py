@@ -7,8 +7,8 @@ therefore checks which revision Lake installed and compares its `lake-manifest.j
 revisions and `lean-toolchain` with the checkout's. When they differ the round ends as a wait
 (`waiting-build-cache`) before the agent starts.
 
-A small marker per blocked commit in the host's build-cache pool lets the other workers on the host
-skip that commit for a few minutes. Expiry and an anonymous HTTP check of the revision map are the
+A small marker per blocked commit and prepared dependency set in the host's build-cache pool lets
+the other workers on the host skip that work for a few minutes. Expiry and an anonymous HTTP check of the revision map are the
 only releases besides a successful preparation. Every error reading, writing or probing fails open:
 this mechanism may never block work by itself breaking.
 """
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -33,6 +34,7 @@ RETRY_SECONDS = 300  # how long a recorded wait keeps the host's other workers o
 WARN_SECONDS = 3600  # a wait this old logs one warning per host and commit
 PR_GRACE_SECONDS = 7200  # a PR whose own head changes dependencies stops waiting after this
 PROBE_SECONDS = 30  # at most one published-map probe per marker and host in this interval
+CLAIM_SECONDS = 120  # an expired wait's real check belongs to one round for this long
 FORGET_SECONDS = 7 * 86400  # stale markers are removed by readers
 SCOPE = "TauCeti"  # Lake's local revision-map scope: <cache>/revisions/TauCeti/<rev>.jsonl
 ENABLE = "TAUCETI_BUILD_CACHE_WAIT"  # set by worker agent rounds; other cache users never wait
@@ -153,75 +155,120 @@ def _write(path: Path, value: dict) -> None:
     os.replace(temporary, path)
 
 
-def record(commit: str, *, scope: str, toolchain: str, installed: str | None, env=None, now=None) -> dict:
-    """Record (or extend) a wait on `commit`; returns the marker, with `first_wait_at` preserved."""
+def key(head: str, target) -> str:
+    """A wait is on what a round prepared: its head, and the dependencies it needs a cache for.
+
+    A rebase of head X prepares main's dependency files, a fix of head X its own, so the two wait
+    for different caches and must not share a marker.
+    """
+    digest = hashlib.sha256(json.dumps(target).encode()).hexdigest()[:12]
+    return f"{head}-{digest}"
+
+
+def _claimant() -> str:
+    return f"{os.uname().nodename}:{os.getpid()}"
+
+
+def record(
+    name: str,
+    *,
+    commit: str,
+    scope: str,
+    stage: str,
+    need: str | None,
+    toolchain: str,
+    installed: str | None,
+    env=None,
+    now=None,
+) -> dict:
+    """Record (or extend) the wait `name`; returns the marker, with `first_wait_at` preserved.
+
+    `need` is the revision whose published map would satisfy the prepared dependencies (probed with
+    `toolchain`, theirs). Raises OSError when the marker cannot be persisted: the caller proceeds.
+    """
     now = time.time() if now is None else now
-    try:
-        with _locked(env) as folder:
-            path = folder / f"{commit}.json"
-            marker = _read(path)
-            if scope == "main":
-                # Main has one current commit: an older main commit's wait is superseded by this one.
-                for other in folder.glob("*.json"):
-                    if other != path and _read(other).get("scope") == "main":
-                        other.unlink(missing_ok=True)
-            marker.setdefault("first_wait_at", now)
-            marker.update(
-                commit=commit, scope=scope, toolchain=toolchain, installed=installed, retry_at=now + RETRY_SECONDS
+    with _locked(env) as folder:
+        path = folder / f"{name}.json"
+        marker = _read(path)
+        if scope == "main":
+            # Main has one current commit: an older main commit's wait is superseded by this one.
+            for other in folder.glob("*.json"):
+                if other != path and _read(other).get("scope") == "main":
+                    other.unlink(missing_ok=True)
+        marker.setdefault("first_wait_at", now)
+        stages = set(marker.get("stages") or ()) | {stage or "*"}
+        marker.update(
+            commit=commit,
+            scope=scope,
+            stages=sorted(stages),
+            need=need,
+            toolchain=toolchain,
+            installed=installed,
+            retry_at=now + RETRY_SECONDS,
+        )
+        for field in ("released", "claimant", "claimed_until"):
+            marker.pop(field, None)
+        if now - marker["first_wait_at"] >= WARN_SECONDS and not marker.get("warned_at"):
+            marker["warned_at"] = now
+            hours = (now - marker["first_wait_at"]) / 3600
+            where = revision_url(need, toolchain) if need else "a revision with these dependencies"
+            log(
+                f"warning: {scope} commit {commit[:12]} has waited {hours:.1f}h for a TauCeti build cache "
+                f"matching its dependencies; check that CI published {where}"
             )
-            marker.pop("released", None)
-            if now - marker["first_wait_at"] >= WARN_SECONDS and not marker.get("warned_at"):
-                marker["warned_at"] = now
-                hours = (now - marker["first_wait_at"]) / 3600
-                log(
-                    f"warning: {scope} commit {commit[:12]} has waited {hours:.1f}h for a TauCeti build cache "
-                    f"matching its dependencies; check that CI published {revision_url(commit, toolchain)}"
-                )
-            _write(path, marker)
-            return marker
-    except OSError as error:
-        log(f"build-cache wait marker for {commit[:12]} could not be written: {error}")
-        return dict(commit=commit, scope=scope, first_wait_at=now, retry_at=now + RETRY_SECONDS)
+        _write(path, marker)
+        return marker
 
 
-def release(commit: str, env=None) -> None:
+def release(name: str, env=None) -> None:
     """Stop the host waiting on this commit while keeping its first-wait time (the PR grace is spent)."""
     with contextlib.suppress(OSError), _locked(env) as folder:
-        path = folder / f"{commit}.json"
+        path = folder / f"{name}.json"
         marker = _read(path)
         if marker:
             marker["released"] = True
             _write(path, marker)
 
 
-def clear(commit: str, *, scope: str, env=None) -> None:
-    """A usable cache was found: drop this commit's wait, and for main every main wait."""
+def clear(name: str, *, scope: str, env=None) -> None:
+    """A usable cache was found: drop this wait, and for main every main wait."""
     with contextlib.suppress(OSError), _locked(env) as folder:
-        (folder / f"{commit}.json").unlink(missing_ok=True)
+        (folder / f"{name}.json").unlink(missing_ok=True)
         if scope == "main":
             for other in folder.glob("*.json"):
                 if _read(other).get("scope") == "main":
                     other.unlink(missing_ok=True)
 
 
-def deferral(commit: str | None = None, *, scope: str = "pr", env=None, now=None, probe=None) -> dict | None:
-    """The fresh marker that should keep this worker off `commit` (or off main), else None.
+def deferral(
+    commit: str | None = None, *, scope: str = "pr", stage: str = "", env=None, now=None, probe=None
+) -> dict | None:
+    """The fresh marker that should keep this round off `commit` (or off main), else None.
 
-    An expired marker lets exactly one worker through for a real check: that worker re-arms it
-    for everyone else. A fresh marker is cleared as soon as CI's map for its commit is published.
+    PR waits apply to the stages that recorded them. After a wait's retry time, one round gets a
+    short claim and goes through, together with its own later candidates; a claimant that only
+    declines lets the claim lapse, and the next round goes through. Only the real check in cache
+    preparation re-arms the retry time. A fresh wait clears once CI publishes the map it needs.
     """
     now = time.time() if now is None else now
     probe = probe or published
+    me = _claimant()
     try:
         folder = directory(env)
-        if scope == "main":
-            paths = [p for p in folder.glob("*.json") if _read(p).get("scope") == "main"] if folder.is_dir() else []
-        else:
-            paths = [folder / f"{commit}.json"] if commit and (folder / f"{commit}.json").is_file() else []
-        for path in paths:
+        found = []
+        for path in folder.glob("*.json") if folder.is_dir() else ():
             marker = _read(path)
             if not marker or marker.get("released"):
                 continue
+            if scope == "main":
+                if marker.get("scope") != "main":
+                    continue
+            elif marker.get("commit") != commit or not (
+                stage in marker.get("stages", ()) or "*" in marker.get("stages", ())
+            ):
+                continue
+            found.append(path)
+        for path in found:
             probe_due = False
             with _locked(env):
                 marker = _read(path)
@@ -231,15 +278,17 @@ def deferral(commit: str | None = None, *, scope: str = "pr", env=None, now=None
                     path.unlink(missing_ok=True)
                     continue
                 if now >= float(marker.get("retry_at", 0)):
-                    marker["retry_at"] = now + RETRY_SECONDS  # this worker takes the real check
+                    if now < float(marker.get("claimed_until", 0)) and marker.get("claimant") != me:
+                        return marker  # another round is taking the real check
+                    marker.update(claimant=me, claimed_until=now + CLAIM_SECONDS)
                     _write(path, marker)
                     continue
-                if now - float(marker.get("probed_at", 0)) >= PROBE_SECONDS:
+                if marker.get("need") and now - float(marker.get("probed_at", 0)) >= PROBE_SECONDS:
                     marker["probed_at"] = now
                     _write(path, marker)
                     probe_due = True
-            if probe_due and probe(str(marker.get("commit", "")), str(marker.get("toolchain") or "")):
-                log(f"build cache for {marker.get('commit', '')[:12]} is now published; its wait is over")
+            if probe_due and probe(str(marker["need"]), str(marker.get("toolchain") or "")):
+                log(f"build cache for {str(marker['need'])[:12]} is now published; the wait on it is over")
                 with contextlib.suppress(OSError), _locked(env):
                     path.unlink(missing_ok=True)
                 continue
@@ -253,7 +302,8 @@ def check(cwd: Path, env: dict, *, head: str, main: str, installed: str | None, 
     """Raise BuildCacheWait when no installed cache has the checkout's dependencies.
 
     `installed` is the revision the HEAD-history fetch used; `main_hit` the revision the main fetch
-    used in a PR round. Either matching the checkout is enough. Unknown facts proceed.
+    used in a PR round. Either matching the checkout is enough. Unknown facts, and any failure to
+    persist the wait, proceed.
     """
     from .agents import BuildCacheWait
 
@@ -264,6 +314,7 @@ def check(cwd: Path, env: dict, *, head: str, main: str, installed: str | None, 
         target = working(cwd)
         if target is None:
             return
+        name = key(head, target)
         candidates = [rev for rev in dict.fromkeys((installed, main_hit)) if rev]
         if not candidates:
             return  # no identifiable install; today's behaviour
@@ -277,15 +328,28 @@ def check(cwd: Path, env: dict, *, head: str, main: str, installed: str | None, 
                         f"host build caches: TauCeti cache is a same-dependency fallback from {rev[:12]} "
                         f"for {head[:12]}; only the commits between them rebuild"
                     )
-                clear(head, scope=scope, env=env)
+                clear(name, scope=scope, env=env)
                 return
-        toolchain = (_git(cwd, "show", f"{head}:lean-toolchain") or "").strip()
-        marker = record(head, scope=scope, toolchain=toolchain, installed=candidates[0], env=env)
-        waited = time.time() - float(marker.get("first_wait_at", time.time()))
-        if scope == "pr" and committed(cwd, main) != target and waited >= PR_GRACE_SECONDS:
+        main_deps = committed(cwd, main) if main else None
+        # The revision whose map would serve these dependencies: HEAD for its own, main for main's
+        # (a rebase round). Its toolchain is the target's.
+        need = head if committed(cwd, head) == target else main if main and main_deps == target else None
+        stage = env.get("TAUCETI_GITHUB_PHASE") or os.environ.get("TAUCETI_GITHUB_PHASE", "")
+        marker = record(
+            name,
+            commit=head,
+            scope=scope,
+            stage=stage,
+            need=need,
+            toolchain=target[0],
+            installed=candidates[0],
+            env=env,
+        )
+        waited = time.time() - float(marker["first_wait_at"])
+        if scope == "pr" and main_deps != target and waited >= PR_GRACE_SECONDS:
             # A PR that changes dependencies itself has a cache only once CI builds it; CI may
             # never manage to. After the grace, build as before so its repair can proceed.
-            release(head, env=env)
+            release(name, env=env)
             log(
                 f"warning: PR head {head[:12]} changes dependencies and has waited {waited / 3600:.1f}h "
                 "for its own build cache; building against the fallback cache"
@@ -295,9 +359,10 @@ def check(cwd: Path, env: dict, *, head: str, main: str, installed: str | None, 
         log(f"build-cache dependency check skipped ({type(error).__name__}: {error})")
         return
     label = "main" if scope == "main" else "PR head"
+    needs = f"; needs {need[:12]}'s cache" if need and need != head else ""
     message = (
         f"waiting-build-cache: {label} {head[:12]} has no published TauCeti cache with its dependencies "
         f"(the cache found, from {' and '.join(rev[:12] for rev in candidates)}, has a different "
-        f"lake-manifest.json or lean-toolchain); agent not started, waiting {waited / 60:.0f}m so far"
+        f"lake-manifest.json or lean-toolchain{needs}); agent not started, waiting {waited / 60:.0f}m so far"
     )
     raise BuildCacheWait(message, retry_at=marker.get("retry_at"), commit=head)

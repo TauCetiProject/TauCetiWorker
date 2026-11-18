@@ -434,16 +434,20 @@ rebuild.
 Otherwise the round ends as `waiting-build-cache` (exit 79): no failure, no attempt charged,
 downloaded and hydrated outputs kept, and the worker selects other work after 5 seconds.
 `tauceti workers status` shows the state, the commit and the recheck time. The round writes
-`<pool>/cache-waits/<commit>.json` with a retry time five minutes ahead. Until then, other
-workers on the host skip PR work on that head, and skip roadmap and overlap-fix while a wait on
-main is recorded (roadmap reports `waiting-build-cache` itself, since it is the last candidate).
-At most every 30 seconds per host, a selecting worker sends an anonymous `HEAD` request for the
-commit's revision map,
-`<TAUCETI_CACHE_REVISION_URL>/TauCetiProject/TauCeti/tc/<toolchain>/<commit>.jsonl`, with
-the toolchain mangled as Lake does (`leanprover--lean4---v4.36.0`); a 200 removes the wait. When
-the retry time passes, the next worker to select that work takes one real check and re-arms the
-marker for everyone else. A successful check on main clears every wait on main. Any error
-reading or writing markers, or probing, lets work proceed.
+`<pool>/cache-waits/<commit>-<dependencies>.json`, keyed by the head and the dependency files it
+prepared, with a retry time five minutes ahead. It records the stage and the revision whose map
+would serve those dependencies: the head for its own, main for main's (a rebase round). Until the
+retry time, other workers on the host skip the same stage on that head, and skip roadmap and
+overlap-fix while a wait on main is recorded (roadmap reports `waiting-build-cache` itself, since
+it is the last candidate). A fix of a head whose rebase is waiting is not held. At most every
+30 seconds per host, a selecting worker sends an anonymous `HEAD` request for that revision's
+map, `<TAUCETI_CACHE_REVISION_URL>/TauCetiProject/TauCeti/tc/<toolchain>/<revision>.jsonl`, with
+the prepared toolchain mangled as Lake does (`leanprover--lean4---v4.36.0`); a 200 removes the
+wait. When the retry time passes, the next round to select that work claims the check for two
+minutes, together with its own later candidates, and goes through. Only cache preparation
+re-arms the retry time, so a round that claims and then declines lets the claim lapse for the
+next one. A successful check on main clears every wait on main. Any error reading or writing
+markers, or probing, lets work proceed, including the round that could not record its wait.
 
 A wait older than an hour logs one warning per host and commit, naming the URL CI should have
 published. Rounds on main wait without limit: main always gets a cache, and building anyway

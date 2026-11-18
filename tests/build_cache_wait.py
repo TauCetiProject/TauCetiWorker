@@ -127,9 +127,15 @@ class BuildCacheWait(unittest.TestCase):
         with patch.dict(self.env, FAKE_PUBLISHED=" ".join(published)):
             agents.warm_host_build_caches(self.repo, self.env, self.root / "logs")
 
+    def markers(self, commit):
+        folder = self.pool / "cache-waits"
+        found = [json.loads(path.read_text()) for path in sorted(folder.glob("*.json"))] if folder.is_dir() else []
+        return [marker for marker in found if marker.get("commit") == commit]
+
     def marker(self, commit):
-        path = self.pool / "cache-waits" / f"{commit}.json"
-        return json.loads(path.read_text()) if path.is_file() else None
+        found = self.markers(commit)
+        self.assertLessEqual(len(found), 1)
+        return found[0] if found else None
 
     def pr_head(self, base, content="pr"):
         self.git("checkout", "-q", "-b", "pr", base)
@@ -250,13 +256,22 @@ class BuildCacheWait(unittest.TestCase):
 
     # -- host-wide marker and selection --------------------------------------------------------
 
-    def write_marker(self, commit, **fields):
+    def write_marker(self, commit, name=None, **fields):
+        """A wait as `check` would record it for the checkout as it stands (unless `name` says)."""
         folder = self.pool / "cache-waits"
         folder.mkdir(parents=True, exist_ok=True)
         now = time.time()
-        marker = dict(commit=commit, scope="main", toolchain="leanprover/lean4:v4.36.0", first_wait_at=now)
+        marker = dict(
+            commit=commit,
+            scope="main",
+            stages=["*"],
+            need=commit,
+            toolchain="leanprover/lean4:v4.36.0",
+            first_wait_at=now,
+        )
         marker.update({"retry_at": now + 300, **fields})
-        (folder / f"{commit}.json").write_text(json.dumps(marker))
+        name = name or build_cache_wait.key(commit, build_cache_wait.working(self.repo))
+        (folder / f"{name}.json").write_text(json.dumps(marker))
 
     def test_fresh_marker_makes_selection_skip(self):
         self.write_marker(self.c4)
@@ -279,9 +294,51 @@ class BuildCacheWait(unittest.TestCase):
     def test_expired_marker_allows_one_real_check(self):
         self.write_marker(self.c4, retry_at=time.time() - 1)
         probe = []
-        self.assertIsNone(build_cache_wait.deferral(scope="main", probe=probe.append))
-        self.assertIsNotNone(build_cache_wait.deferral(scope="main", probe=lambda *a: False))
+        with patch.object(build_cache_wait, "_claimant", return_value="round-a"):
+            self.assertIsNone(build_cache_wait.deferral(scope="main", probe=probe.append))
+        with patch.object(build_cache_wait, "_claimant", return_value="round-b"):
+            self.assertIsNotNone(build_cache_wait.deferral(scope="main", probe=lambda *a: False))
         self.assertEqual(probe, [])
+
+    def test_a_declined_claim_never_consumes_the_real_check(self):
+        """Selection claims an expired wait briefly; only cache preparation re-arms it."""
+        retry_at = time.time() - 1
+        self.write_marker(self.c4, retry_at=retry_at)
+        overlap = SimpleNamespace(pr=0, head="", reason="")
+        opts = SimpleNamespace(dry_run=False, sandbox_host=True)
+        for expiry in range(3):
+            now = time.time() + expiry * (build_cache_wait.CLAIM_SECONDS + 1)
+            with (
+                patch.object(build_cache_wait.time, "time", return_value=now),
+                patch.object(build_cache_wait, "_claimant", return_value=f"decliner-{expiry}"),
+            ):
+                # overlap-fix takes the claim, then declines later in dispatch.
+                self.assertIsNone(wu._build_cache_deferral("overlap-fix", overlap))
+                self.assertEqual(self.marker(self.c4)["retry_at"], retry_at)
+                # The same round's roadmap still goes through to the real check.
+                self.assertIsNone(wu._build_cache_deferral("roadmap", overlap))
+            with (
+                patch.object(build_cache_wait.time, "time", return_value=now),
+                patch.object(build_cache_wait, "_claimant", return_value="other"),
+                patch.object(build_cache_wait, "published", return_value=False),
+                self.assertRaises(agents.BuildCacheWait),
+            ):
+                wu.dispatch("roadmap", None, None, overlap, opts)  # claimed elsewhere: waits
+        # After the decliners' claims lapse, another round's roadmap gets the real check...
+        later = time.time() + 3 * (build_cache_wait.CLAIM_SECONDS + 1)
+        with (
+            patch.object(build_cache_wait.time, "time", return_value=later),
+            patch.object(build_cache_wait, "_claimant", return_value="roadmap-round"),
+        ):
+            self.assertIsNone(wu._build_cache_deferral("roadmap", overlap))
+        self.assertEqual(self.marker(self.c4)["retry_at"], retry_at)
+        # ...which preparation re-arms when the cache still does not match.
+        with patch.object(build_cache_wait, "_claimant", return_value="roadmap-round"):
+            with self.assertRaises(agents.BuildCacheWait):
+                self.warm(self.c2)
+        marker = self.marker(self.c4)
+        self.assertGreater(marker["retry_at"], time.time())
+        self.assertNotIn("claimant", marker)
 
     def test_published_map_clears_the_marker(self):
         self.write_marker(self.c4)
@@ -300,14 +357,69 @@ class BuildCacheWait(unittest.TestCase):
         self.assertIsNotNone(build_cache_wait.deferral(scope="main", probe=probe))
         self.assertEqual(probes, [(self.c4, "leanprover/lean4:v4.36.0")])
 
+    def test_rebase_waits_for_mains_cache_not_the_heads(self):
+        head = self.pr_head(self.c2)  # old dependencies; its own cache is published
+        for name in ("lake-manifest.json", "lean-toolchain"):  # as shared_mathlib.rebase_target does
+            (self.repo / name).write_text(self.git("show", f"{self.c4}:{name}") + "\n")
+        start = time.time() - build_cache_wait.WARN_SECONDS - 60
+        with (
+            patch.dict(os.environ, TAUCETI_GITHUB_PHASE="rebase"),
+            patch.object(build_cache_wait.time, "time", return_value=start),
+            self.assertRaises(agents.BuildCacheWait) as raised,
+        ):
+            self.warm(head, self.c1)
+        self.assertIn(f"needs {self.c4[:12]}", str(raised.exception))
+        marker = self.marker(head)
+        self.assertEqual((marker["need"], marker["toolchain"]), (self.c4, "leanprover/lean4:v4.36.0"))
+        self.assertEqual(marker["stages"], ["rebase"])
+        # The head's own published map does not end the wait: the probe asks for main's.
+        probes = []
+
+        def probe(rev, toolchain):
+            probes.append((rev, toolchain))
+            return rev == head
+
+        rebase = SimpleNamespace(pr=7, head=head)
+        self.assertIsNotNone(build_cache_wait.deferral(head, stage="rebase", now=start + 10, probe=probe))
+        self.assertEqual(probes, [(self.c4, "leanprover/lean4:v4.36.0")])
+        self.assertIsNotNone(self.marker(head))
+        # A fix of the same head prepares its own dependencies and is not held by the rebase's wait.
+        with (
+            patch.object(build_cache_wait, "published", return_value=False),
+            patch.object(build_cache_wait.time, "time", return_value=start + 20),
+        ):
+            self.assertIsNone(wu._build_cache_deferral("fix", rebase))
+            self.assertIsNotNone(wu._build_cache_deferral("rebase", rebase))
+        # The next rebase round keeps the first wait time, so the one-hour warning fires.
+        with patch.dict(os.environ, TAUCETI_GITHUB_PHASE="rebase"), self.assertRaises(agents.BuildCacheWait):
+            self.warm(head, self.c1)
+        self.assertEqual(self.marker(head)["first_wait_at"], start)
+        warnings = [line for line in self.logs if line.startswith("warning:") and head[:12] in line]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(self.c4, warnings[0])  # names the map CI should publish: main's
+
+    def test_unwritable_markers_let_the_round_proceed(self):
+        # A PR whose head changes dependencies: with no persisted wait the 2h grace could never run out.
+        self.git("update-ref", "refs/remotes/origin/main", self.c2)
+        self.pr_head(self.c2, "base")
+        self.commit("v4.36.0", "newer", "own bump")
+        with patch.object(build_cache_wait, "_locked", side_effect=OSError("read-only")):
+            for hours in (0, 1, 3):
+                with patch.object(build_cache_wait.time, "time", return_value=time.time() + hours * 3600):
+                    self.warm(self.c1)
+            self.git("checkout", "-q", "main")
+            self.warm(self.c2)  # a main-scope wait proceeds too
+        self.assertFalse((self.pool / "cache-waits").exists() and list((self.pool / "cache-waits").glob("*.json")))
+        self.assertTrue(any("dependency check skipped" in line for line in self.logs))
+
     def test_unreadable_marker_fails_open(self):
         folder = self.pool / "cache-waits"
         folder.mkdir(parents=True)
-        (folder / f"{self.c4}.json").write_text("{not json")
-        self.assertIsNone(build_cache_wait.deferral(self.c4))
+        (folder / f"{self.c4}-x.json").write_text("{not json")
+        self.assertIsNone(build_cache_wait.deferral(self.c4, stage="fix"))
         with patch.object(build_cache_wait, "_locked", side_effect=OSError("read-only")):
             self.write_marker(self.c3, scope="pr")
-            self.assertIsNone(build_cache_wait.deferral(self.c3))
+            self.assertIsNone(build_cache_wait.deferral(self.c3, stage="fix"))
 
     def test_revision_url_and_http_probe(self):
         self.assertEqual(

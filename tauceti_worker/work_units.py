@@ -1358,7 +1358,7 @@ def _build_cache_deferral(stage: str, c: Candidate) -> dict | None:
     from . import build_cache_wait
 
     if stage in CACHE_WAIT_PR_STAGES and c.pr and c.head:
-        return build_cache_wait.deferral(c.head)
+        return build_cache_wait.deferral(c.head, stage=stage)
     if stage in CACHE_WAIT_MAIN_STAGES:
         return build_cache_wait.deferral(scope="main")
     return None
