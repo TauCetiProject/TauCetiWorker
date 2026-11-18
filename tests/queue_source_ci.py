@@ -15,11 +15,12 @@ from queue_ci_requests import CONFIG, policy
 from tauceti_tools.ci_candidate_evidence import EvidenceUnavailable
 
 from tauceti_queue import monitoring
+from tauceti_queue import runtime as rt
 from tauceti_queue.ci_execution import CandidateObservation
 from tauceti_queue.ci_requests import RequestLedger
-from tauceti_queue.controller import LOG_GRACE_SECONDS, Controller
+from tauceti_queue.controller import LOG_GRACE_SECONDS, SOURCE_PHASES_INTERVAL_SECONDS, Controller
 from tauceti_queue.fakes import make_controller, run_git
-from tauceti_queue.ports import CandidateRun, DispatchNotAccepted, PromotionRefused
+from tauceti_queue.ports import CandidatePhase, CandidateRun, DispatchNotAccepted, PromotionRefused
 from tauceti_queue.source_ci import SourceCandidateCI
 from tauceti_queue.store import Store
 
@@ -212,6 +213,112 @@ class SourceController(unittest.TestCase):
         self.controller.tick()
         self.assertEqual(len(self.execution.dispatches), 2)
         self.assertEqual(self.store.rows("batches")[0]["state"], "landed")
+
+    def running_phases(self, step):
+        """GitHub's jobs listing for a run in its build job, at the 1-based `step` of three."""
+        names = ["Set up job", "Build exact candidate under bwrap", "Complete job"]
+        phases = [CandidatePhase("build / Build", 101, None, "in_progress")]
+        for index, name in enumerate(names, 1):
+            status = "completed" if index < step else ("in_progress" if index == step else "queued")
+            started = 100 + index if index <= step else None
+            phases.append(CandidatePhase(f"build / Build: {name}", started, started if index < step else None, status))
+        return tuple(phases)
+
+    def test_source_attempt_records_github_phases_for_status_and_stall(self):
+        attempt = self.start()
+        frozen = self.ledger.load(attempt["id"])
+        self.execution.add(frozen)
+        reads = []
+        self.step = 2
+
+        def progress(frozen_request, run):
+            self.assertEqual(frozen_request, frozen)
+            reads.append(run.run_id)
+            return replace(run, phases=self.running_phases(self.step), runner_name="staging-1", host="staging-1")
+
+        self.execution.progress = progress
+        self.clock.advance(60)
+        self.controller.tick()
+        current = self.store.row("ci_attempts", {"id": attempt["id"]})
+        self.assertEqual(reads, ["101"])
+        self.assertEqual(current["runner_name"], "staging-1")
+        status = self.controller.status()
+        ci = status["head"]["ci"]
+        self.assertEqual(len(ci["phases"]), 4)
+        self.assertEqual(
+            ci["current_step"],
+            {
+                "job": "build / Build",
+                "name": "Build exact candidate under bwrap",
+                "index": 2,
+                "total": 3,
+                "started_at": 102,
+            },
+        )
+        self.assertIn("step 2/3 Build exact candidate under bwrap (build / Build), running", rt.summarize(status))
+        # Observation continues every polling interval; the jobs listing is read only every
+        # SOURCE_PHASES_INTERVAL_SECONDS while the run is in progress.
+        observations = self.execution.observations
+        self.clock.advance(60)
+        self.controller.tick()
+        self.assertGreater(self.execution.observations, observations)
+        self.assertEqual(reads, ["101"])
+        # Unchanged phases are silence: the stall report names the recorded phase, not None.
+        interval = int(self.controller.setting("stall_interval_seconds"))
+        self.clock.advance(interval)
+        self.controller.tick()
+        self.assertEqual(len(reads), 2)
+        stall = self.controller.status()["head"]["stall"]
+        self.assertIsNotNone(stall)
+        self.assertEqual(stall["phase"], "build / Build: Complete job")
+        # A step completing is progress and clears the stall.
+        self.step = 3
+        self.clock.advance(SOURCE_PHASES_INTERVAL_SECONDS)
+        self.controller.tick()
+        self.assertEqual(len(reads), 3)
+        self.assertIsNone(self.controller.status()["head"]["stall"])
+        self.assertEqual(self.controller.status()["head"]["ci"]["current_step"]["index"], 3)
+        self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "pending")
+
+    def test_source_phases_are_read_once_at_completion_and_never_decide(self):
+        attempt = self.start()
+        frozen = self.ledger.load(attempt["id"])
+        self.execution.add(frozen)
+        reads = []
+
+        def progress(_frozen, run):
+            reads.append(run.status)
+            if run.status == "completed":
+                raise OSError("jobs listing unavailable")
+            return replace(run, phases=self.running_phases(2))
+
+        self.execution.progress = progress
+        self.clock.advance(60)
+        self.controller.tick()
+        self.execution.add(frozen, classification="passed")
+        self.clock.advance(60)
+        self.controller.tick()
+        self.assertEqual(reads, ["in_progress", "completed"])
+        # A failed phase read leaves the verified result as the only authority.
+        self.assertEqual(self.store.rows("batches")[0]["state"], "landed")
+
+    def test_failed_phase_read_keeps_observing(self):
+        attempt = self.start()
+        frozen = self.ledger.load(attempt["id"])
+        self.execution.add(frozen)
+
+        def progress(_frozen, _run):
+            raise OSError("rate limited")
+
+        self.execution.progress = progress
+        self.clock.advance(60)
+        reasons = self.controller.tick()
+        current = self.store.row("ci_attempts", {"id": attempt["id"]})
+        self.assertEqual(current["run_id"], "101")
+        self.assertEqual(current["outcome"], "pending")
+        self.assertEqual(current["phases"], "[]")
+        self.assertTrue(any("source CI phases unavailable" in reason for reason in reasons), reasons)
+        self.assertIsNone(self.controller.status()["head"]["ci"]["current_step"])
 
     def test_acknowledged_dispatch_without_evidence_resends_once_after_timeout(self):
         self.check_unknown_dispatch_recovery(lost=False)

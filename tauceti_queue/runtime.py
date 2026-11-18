@@ -298,6 +298,12 @@ def summarize(document: Mapping[str, Any], now: datetime | None = None) -> str:
                 f"{outcome}{(': ' + ci['outcome_detail']) if ci.get('outcome_detail') else ''}  "
                 f"started {_when(ci.get('started_at'))} ({_age(ci.get('started_at'), now)} ago)"
             )
+            step = ci.get("current_step")
+            if isinstance(step, Mapping):
+                lines.append(
+                    f"  step {step.get('index', '?')}/{step.get('total', '?')} {step.get('name', '?')} "
+                    f"({step.get('job', '?')}), running {_age(step.get('started_at'), now)}"
+                )
             phases = list(ci.get("phases") or [])
             if len(phases) > 6:
                 lines.append(f"    ({len(phases) - 6} earlier phases)")

@@ -102,6 +102,16 @@ class SourceCandidateCI:
                 raise RunDeleted(f"owned run {owner} is no longer on GitHub") from None
             raise
 
+    def progress(self, attempt_id, run):
+        """`run` with its GitHub job and step phases, or `None` when the execution cannot read them.
+
+        Only the ledger's owned run is read. Phases are display and stall context only.
+        """
+        progress = getattr(self.execution, "progress", None)
+        if progress is None or self.ledger.owner_run(attempt_id) != run.run_id:
+            return None
+        return progress(self.ledger.load(attempt_id), run)
+
     def _deleted(self, frozen, run_id):
         deleted = getattr(self.execution, "deleted", None)
         return deleted is not None and deleted(frozen, run_id)

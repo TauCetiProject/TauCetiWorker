@@ -318,6 +318,40 @@ class Execution(unittest.TestCase):
             observation = self.adapter.observe(self.frozen, "101", owned=True)
         self.assertEqual(observation.result["classification"], "source_failure")
 
+    def test_progress_reads_one_jobs_listing_for_the_run_attempt(self):
+        self.reader.add(attempt=2, status="in_progress")
+        run = self.adapter._run(self.reader.runs["101"])
+        job = {
+            "name": "build / Build",
+            "runner_name": "staging-1",
+            "labels": ["tauceti-staging"],
+            "status": "in_progress",
+            "started_at": "2026-11-17T13:00:00Z",
+            "steps": [
+                {"name": "Set up job", "status": "completed", "conclusion": "success"},
+                {"name": "Build exact candidate under bwrap", "status": "in_progress"},
+            ],
+        }
+        calls = []
+
+        def paginate(_client, path, **kwargs):
+            calls.append((path, kwargs))
+            return [job]
+
+        with patch("tauceti_queue.github_adapter.GitHubClient.paginate", paginate):
+            progressed = self.adapter.progress(self.frozen, run)
+        self.assertEqual(calls, [("repos/team/Execution/actions/runs/101/attempts/2/jobs", {"key": "jobs"})])
+        self.assertEqual(
+            [(p.name, p.status) for p in progressed.phases],
+            [
+                ("build / Build", "in_progress"),
+                ("build / Build: Set up job", "completed"),
+                ("build / Build: Build exact candidate under bwrap", "in_progress"),
+            ],
+        )
+        self.assertEqual((progressed.runner_name, progressed.host), ("staging-1", "staging-1"))
+        self.assertEqual(replace(progressed, phases=(), runner_name=None, runner_labels=(), host=None), run)
+
     def test_owned_rerun_needs_current_result(self):
         self.reader.add(attempt=2, status="completed")
         self.reader.receipts.clear()  # recorded ownership survives receipt expiry

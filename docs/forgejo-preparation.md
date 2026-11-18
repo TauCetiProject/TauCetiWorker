@@ -632,6 +632,13 @@ cannot make a source candidate pass. Promotion rechecks current membership, curr
 passing evidence and fresh source approval before its source compare and set; an already
 visible promotion is reconciled without another write.
 
+For an owned run that is in progress, the controller also reads GitHub's jobs listing for
+its attempt at most once every five minutes (`SOURCE_PHASES_INTERVAL_SECONDS`), and once
+more when it completes. It records the job and step phases, runner and host as on the
+ordinary GitHub path, so status shows the current step and the stall report sees step
+changes. The phases are observational only: a failed read is a reason line, and they
+never establish ownership or a verdict.
+
 Unavailable evidence keeps the request pending at the normal polling interval. A single transient observation failure on an already owned run
 does not trigger the request-age alert. Liveness checks read current run metadata
 without downloading expired artifacts. Automatic retries skip repeated repository-wide
