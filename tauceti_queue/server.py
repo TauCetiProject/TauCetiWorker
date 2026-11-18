@@ -603,6 +603,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin/rebuild-head":
             self._admin_rebuild_head()
             return
+        if path == "/admin/evict-native":
+            self._admin_evict_native()
+            return
         if path == "/admin/import-bors":
             self._admin_import_bors()
             return
@@ -894,6 +897,24 @@ class Handler(BaseHTTPRequestHandler):
         self._call(
             lambda: self.server.controller.rebuild_head(repo, identity[0], **self._source_task_kwargs(refresh=True))
         )
+
+    def _admin_evict_native(self) -> None:
+        identity, body = self._authenticated_json()
+        if identity is None or body is None or not self._admin(identity[0]):
+            return
+        if self.server.source_authority is not None:
+            self._error(400, "native-member eviction is for the GitHub-primary controller")
+            return
+        withdraw = body.get("withdraw", [])
+        if (
+            set(body) - {"repo", "withdraw"}
+            or not isinstance(withdraw, list)
+            or not all(isinstance(number, int) and not isinstance(number, bool) and number > 0 for number in withdraw)
+        ):
+            self._error(400, 'body must be {"withdraw": [GitHub PR numbers]} (optional `repo`)')
+            return
+        repo = str(body.get("repo") or next(iter(self.server.config.repositories.values()), ""))
+        self._call(lambda: self.server.controller.evict_native(repo, identity[0], withdraw=withdraw))
 
     def _admin_primary(self) -> None:
         identity, body = self._authenticated_json()

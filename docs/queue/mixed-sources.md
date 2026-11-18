@@ -325,3 +325,23 @@ integration, not an operational intake pause. Without native access, retained
 native batches wait for source recovery; a native-primary ledger requires its
 active mixed configuration. Production enablement, hosted mixed CI/landing
 evidence and production primary changes remain separate rollout actions.
+
+### Landing GitHub work while Forgejo is unavailable
+
+Under GitHub primary, a batch with no Forgejo member and no earlier
+source-candidate attempt dispatches and lands through GitHub alone; a batch with
+a Forgejo member needs Forgejo for both. When Forgejo cannot be used, hold
+Forgejo inputs out of insertion, then break apart the batches that hold them:
+
+```sh
+tauceti-queue settings set forgejo_placement_enabled false
+# POST /admin/evict-native (repository admin), body {} or {"withdraw": [<GitHub PR>, ...]}
+```
+
+`/admin/evict-native` removes every live batch (head and open) with an active
+Forgejo member or a named GitHub PR; all their members wait again at their
+original age with their approvals, and their repair edits are discarded. GitHub
+inputs are inserted into new GitHub-only batches; batches already GitHub-only
+are kept. A named PR is cancelled as `bors r-` would. It is refused while
+`forgejo_placement_enabled` is true. Once Forgejo works again, set it to `true`
+and the waiting Forgejo inputs are inserted as usual.
