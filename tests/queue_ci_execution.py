@@ -2,6 +2,7 @@
 """GitHub execution adapter boundaries, single sends and ownership evidence."""
 
 import base64
+import copy
 import dataclasses
 import json
 import socket
@@ -23,7 +24,7 @@ from tauceti_tools import ci_candidate as cc
 from tauceti_tools.ci_candidate_evidence import EvidenceUnavailable
 
 from tauceti_queue.ci_execution import ExecutionEvidence, GitHubSourceExecution
-from tauceti_queue.github_adapter import GitHubError
+from tauceti_queue.github_adapter import GitHubError, RateLimited
 from tauceti_queue.github_app import AppCredentials, CredentialsError, InstallationToken, InstallationTokenSource
 from tauceti_queue.ports import DispatchNotAccepted
 
@@ -351,24 +352,131 @@ class Execution(unittest.TestCase):
         self.assertEqual((progressed.runner_name, progressed.host), ("staging-1", "staging-1"))
         self.assertEqual(replace(progressed, phases=(), runner_name=None, runner_labels=(), host=None), run)
 
-    def test_owned_rerun_needs_current_result_and_cancel_rechecks_live_metadata(self):
-        proof = self.reader.add(attempt=2, status="completed")
+    def test_owned_rerun_needs_current_result(self):
+        self.reader.add(attempt=2, status="completed")
         self.reader.receipts.clear()  # recorded ownership survives receipt expiry
         observation = self.adapter.observe(self.frozen, "101", owned=True)
         self.assertIsNone(observation.result)
         self.assertEqual(observation.run.attempt, 2)
-        self.assertEqual(self.adapter.cancel(self.frozen, "101", proof=proof), "already-completed")
-        self.assertEqual(self.posts, [])
-        self.reader.runs["101"]["status"] = "in_progress"
-        self.reader.runs["101"]["conclusion"] = None
+
+    def cancel_adapter(self, runs):
+        """An adapter whose GitHub run reads come from `runs`; no frozen-request reader is available."""
+
+        def transport(method, url, headers, body):
+            self.posts.append((method, url, headers, body))
+            if method == "GET":
+                run = runs.get(url.rsplit("/", 1)[1])
+                return (404, {}, b"{}") if run is None else (200, {}, json.dumps(run).encode())
+            if isinstance(self.status, Exception):
+                raise self.status
+            return self.status, {}, b""
+
+        return GitHubSourceExecution(
+            self.tokens, transport=transport, reader_factory=lambda *_: self.fail("cancel reads no frozen policy")
+        )
+
+    def test_cancel_uses_the_stored_ownership_proof_and_rechecks_the_live_run(self):
+        proof = self.reader.add(status="completed")
+        adapter = self.cancel_adapter(self.reader.runs)
+        execution, digest = self.frozen.policy.execution, self.frozen.request.digest
+
+        def cancel(run_id="101", **overrides):
+            arguments = {"execution": execution, "request_digest": digest, "proof": proof, **overrides}
+            return adapter.cancel(arguments.pop("execution"), run_id, **arguments)
+
+        def cancels():
+            return [post for post in self.posts if post[0] == "POST"]
+
+        self.assertEqual(cancel(), "already-completed")
+        self.assertEqual(cancels(), [])
+        self.reader.runs["101"].update(status="in_progress", conclusion=None)
         self.status = 202
-        self.assertEqual(self.adapter.cancel(self.frozen, "101", proof=proof), "cancelled")
-        self.reader.runs["101"]["head_sha"] = "c" * 40
-        with self.assertRaises(ValueError):
-            self.adapter.cancel(self.frozen, "101", proof=proof)
-        with self.assertRaises(ValueError):
-            self.adapter.cancel(self.frozen, "101", proof=dict(proof, request_digest="0" * 64))
-        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(cancel(), "cancelled")
+        self.assertEqual(cancels()[0][1], "https://api.github.com/repos/team/Execution/actions/runs/101/cancel")
+        self.assertEqual(cancels()[0][2]["Authorization"], "Bearer fixture-only")
+        self.status = 409
+        self.assertEqual(cancel(), "already-completed")
+        self.status = 500
+        with self.assertRaises(OSError):
+            cancel()
+        posted = len(cancels())
+        for overrides in (
+            dict(proof=dict(proof, request_digest="0" * 64)),
+            dict(request_digest="0" * 64),
+            dict(proof=dict(proof, run_id=102)),
+            dict(proof=dict(proof, kind="claim")),
+            dict(proof=None),
+            dict(run_id="0101"),
+            dict(execution=cc.RepositoryIdentity(execution.repository, 43)),
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                cancel(**overrides)
+        for field, value in (
+            ("repository", {"id": 43, "full_name": "team/Execution"}),
+            ("repository", {"id": 42, "full_name": "team/Other"}),
+            ("event", "workflow_dispatch"),
+            ("id", 102),
+        ):
+            original = copy.deepcopy(self.reader.runs["101"])
+            self.reader.runs["101"][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                cancel()
+            self.reader.runs["101"] = original
+        self.assertEqual(len(cancels()), posted, "nothing unproven was cancelled")
+        del self.reader.runs["101"]
+        self.assertEqual(cancel(), "already-completed", "GitHub deleted the run")
+        self.assertEqual(len(cancels()), posted)
+
+    def test_cancel_rate_limits_never_sleep_and_carry_githubs_deadline(self):
+        proof = self.reader.add(status="in_progress")
+        execution, digest = self.frozen.policy.execution, self.frozen.request.digest
+        now = [1_000_000.0]
+        responses = []
+
+        def transport(method, url, headers, body):
+            self.posts.append((method, url))
+            return responses.pop(0)
+
+        adapter = GitHubSourceExecution(
+            self.tokens,
+            transport=transport,
+            reader_factory=lambda *_: self.fail("cancel reads no frozen policy"),
+            clock=lambda: now[0],
+        )
+
+        def cancel():
+            return adapter.cancel(execution, "101", request_digest=digest, proof=proof)
+
+        live = (200, {}, json.dumps(self.reader.runs["101"]).encode())
+        with patch("time.sleep", side_effect=AssertionError("a cancellation never sleeps")):
+            # A rate-limited read is one request, and its deadline is GitHub's Retry-After.
+            responses[:] = [(429, {"Retry-After": "180"}, b"")]
+            with self.assertRaises(RateLimited) as caught:
+                cancel()
+            self.assertEqual((len(self.posts), caught.exception.retry_at), (1, now[0] + 180))
+            # The shared client remembers it: the next cancellation sends nothing until then.
+            with self.assertRaises(RateLimited) as caught:
+                cancel()
+            self.assertEqual((len(self.posts), caught.exception.retry_at), (1, now[0] + 180))
+            now[0] += 181
+            # The cancel POST's own rate-limit headers are recorded and honoured.
+            reset = now[0] + 600
+            limited = {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(reset), "x-ratelimit-limit": "5000"}
+            responses[:] = [live, (403, limited, b'{"message": "API rate limit exceeded"}')]
+            with self.assertRaises(RateLimited) as caught:
+                cancel()
+            self.assertEqual(caught.exception.retry_at, reset + 1)
+            self.assertEqual(adapter.cancel_client.rate_limit(), (0, reset))
+            with self.assertRaises(RateLimited):
+                cancel()
+            self.assertEqual(len(self.posts), 3)
+            now[0] = reset + 2
+            responses[:] = [
+                live,
+                (202, {"x-ratelimit-remaining": "4999", "x-ratelimit-reset": str(now[0] + 3600)}, b""),
+            ]
+            self.assertEqual(cancel(), "cancelled")
+            self.assertEqual(adapter.cancel_client.rate_limit()[0], 4999)
 
     def test_repository_reader_rejects_name_reuse_and_malformed_api_metadata(self):
         # Exercise the real bounded metadata validator, independent of our reader fake.

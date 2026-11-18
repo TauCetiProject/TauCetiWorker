@@ -139,7 +139,11 @@ class SourceCandidateCI:
             self.ledger.record_owned_run(frozen.attempt_id, observation.run, observation.ownership, now=self.clock())
         return unavailable
 
-    def _owned(self, run_id):
+    def _ownership(self, run_id):
+        """The stored ownership row, its request snapshot row and its receipt for `run_id`.
+
+        Only `record_owned_run` writes these rows, after the trusted artifact reader verified the
+        proof, so they establish ownership without parsing the frozen request or its policy again."""
         binding = self.ledger.store.get_setting(self.ledger.binding_key)
         row = self.ledger.store.row("ci_request_runs", {"execution_id": binding["execution"]["id"], "run_id": run_id})
         if row is None:
@@ -147,15 +151,22 @@ class SourceCandidateCI:
         request = self.ledger.store.row("ci_requests", {"request_digest": row["request_digest"]})
         if request is None:
             raise ValueError("owned execution request snapshot is unavailable")
-        return self.ledger.load(request["attempt_id"]), loads(row["receipt_json"])
+        return binding, request, loads(row["receipt_json"])
+
+    def _owned(self, run_id):
+        _binding, request, proof = self._ownership(run_id)
+        return self.ledger.load(request["attempt_id"]), proof
 
     def read_run(self, run_id):
         frozen, _proof = self._owned(run_id)
         return self.execution.status(frozen, run_id)
 
     def cancel_run(self, run_id):
-        frozen, proof = self._owned(run_id)
-        return self.execution.cancel(frozen, run_id, proof=proof)
+        # A superseded attempt may have been frozen under a policy schema this service no longer
+        # parses; cancelling its run must not depend on reloading it (`_ownership`).
+        binding, request, proof = self._ownership(run_id)
+        execution = cc.RepositoryIdentity.parse(binding["execution"])
+        return self.execution.cancel(execution, run_id, request_digest=request["request_digest"], proof=proof)
 
     def live_attempt(self, attempts, *, discover_completed=False):
         for attempt in reversed(attempts):

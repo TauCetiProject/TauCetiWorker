@@ -4005,7 +4005,10 @@ class EmergencyLane(QueueFixture):
         run.vanished = False
         self.github.fail_next["find_candidate_run"] = 1
         self.tick()
-        self.assertEqual(run.status, "queued", "a failed lookup is retried next pass")
+        self.assertEqual(run.status, "queued", "a failed lookup is retried after its backoff")
+        self.tick()
+        self.assertEqual(run.status, "queued", "the retry waits out its backoff")
+        self.clock.advance(self.controller.setting("outbox_retry_seconds"))
         restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
         self.addCleanup(restarted.store.close)
         restarted.recover()

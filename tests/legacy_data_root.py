@@ -422,13 +422,23 @@ class LegacyDataRoot(unittest.TestCase):
                 self.addCleanup(selector.wait)
                 self.addCleanup(selector.kill)
                 time.sleep(0.2)
-                with self.assertRaisesRegex(config.Die, "selects"):
-                    purge.cmd_purge(SimpleNamespace(yes=True, config=False))
-                selector.kill()
-                selector.wait()
-                purge.stop_services.return_value = ["tauceti-workers.service is still active"]
-                with self.assertRaisesRegex(config.Die, "could not stop"):
-                    purge.cmd_purge(SimpleNamespace(yes=True, config=False))
+                # Scan only the selector and this test's own lineage: a concurrently running test
+                # module's sandboxed processes (`bwrap --unshare-pid`) refuse inspection, which
+                # purge rightly reports instead of the selection this test is about.
+                inspect = retention._linux_process
+
+                def only_ours(process, uid):
+                    pid = int(process.name)
+                    return inspect(process, uid) if pid == selector.pid or pid in purge._lineage() else None
+
+                with patch.object(retention, "_linux_process", only_ours):
+                    with self.assertRaisesRegex(config.Die, "selects"):
+                        purge.cmd_purge(SimpleNamespace(yes=True, config=False))
+                    selector.kill()
+                    selector.wait()
+                    purge.stop_services.return_value = ["tauceti-workers.service is still active"]
+                    with self.assertRaisesRegex(config.Die, "could not stop"):
+                        purge.cmd_purge(SimpleNamespace(yes=True, config=False))
             self.assertTrue((data / "state/w/recovery/saved/patch.diff").exists())
             self.assertTrue((base / "elsewhere/tauceti").exists())
 
