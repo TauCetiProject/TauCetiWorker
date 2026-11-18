@@ -4634,23 +4634,43 @@ class Controller:
             and now - (attempt["sent_at"] or attempt["dispatched_at"]) >= int(self.setting("dispatch_timeout_seconds"))
         )
 
-    def _write_cancel_intent(self, attempt: dict[str, Any], reason: str, now: float, *, failed: bool = False) -> None:
+    def _write_cancel_intent(
+        self, attempt: dict[str, Any], reason: str, now: float, *, failed: BaseException | None = None
+    ) -> None:
         """Record a cancel intent for `attempt` unless one is open; `_settle_cancel_intents` pursues it.
-        `failed`: a lookup or cancel of it just failed, so the first retry waits out a backoff."""
+        `failed`: the error of a lookup or cancel of it that just failed, so the first retry waits out
+        a backoff (`_defer_cancel_intent`)."""
         key = f"cancel_intent:{attempt['id']}"
         if self._state(key) is None:
             self._set_state(key, {"batch_id": attempt["batch_id"], "reason": reason, "at": now})
-            if failed:
-                self._defer_cancel_intent(attempt["id"], self._state(key), now)
+            if failed is not None:
+                self._defer_cancel_intent(attempt["id"], self._state(key), now, failed)
 
-    def _defer_cancel_intent(self, attempt_id: int, intent: dict[str, Any], now: float) -> None:
-        """Back off a cancel intent whose lookup or cancel failed, as the outbox does (`_outbox_failed`)."""
+    @staticmethod
+    def _error_retry_at(error: BaseException | None) -> float:
+        """GitHub's own deadline carried by `error` or the error it was raised from, else 0."""
+        seen = 0
+        while error is not None and seen < 8:
+            retry_at = getattr(error, "retry_at", None)
+            if isinstance(retry_at, int | float) and not isinstance(retry_at, bool):
+                return float(retry_at)
+            error, seen = error.__cause__ or error.__context__, seen + 1
+        return 0.0
+
+    def _defer_cancel_intent(
+        self, attempt_id: int, intent: dict[str, Any], now: float, error: BaseException | None = None
+    ) -> None:
+        """Back off a cancel intent whose lookup or cancel failed, as the outbox does (`_outbox_failed`).
+
+        The backoff is measured from the clock after the failure (a slow request must not leave the
+        retry already overdue), and never ends before a rate-limit deadline GitHub gave `error`."""
         tries = int(intent.get("tries", 0)) + 1
         backoff = min(
             int(self.setting("outbox_retry_seconds")) * (2 ** min(20, tries - 1)),
             int(self.setting("outbox_retry_max_seconds")),
         )
-        self._set_state(f"cancel_intent:{attempt_id}", dict(intent, tries=tries, retry_at=now + backoff))
+        retry_at = max(max(now, self.clock()) + backoff, self._error_retry_at(error))
+        self._set_state(f"cancel_intent:{attempt_id}", dict(intent, tries=tries, retry_at=retry_at))
 
     def _write_cancel_intents(self, batch: dict[str, Any], reason: str, now: float) -> None:
         """Record a cancel intent for every unsettled attempt of `batch`, at any version; a pending one
@@ -4715,10 +4735,15 @@ class Controller:
                             base_sha=attempt["base_sha"],
                             since=attempt["sent_at"] or attempt["dispatched_at"],
                         )
+                    empty = None
+                except NoOwner as error:
+                    # A complete listing found no run: a successful empty lookup, settled by the
+                    # rules below. It grants no ownership, so nothing is cancelled for it.
+                    run, empty = None, error
                 except Exception as error:  # noqa: BLE001 - retried next pass
                     self.log.warning("cancel intent %s: run lookup failed: %s", attempt_id, error)
                     self._note_reason(f"cancel intent for CI attempt {attempt_id}: run lookup failed")
-                    self._defer_cancel_intent(attempt_id, intent, now)
+                    self._defer_cancel_intent(attempt_id, intent, now, error)
                     continue
                 others = {
                     str(a["run_id"])
@@ -4732,11 +4757,16 @@ class Controller:
                     self._drop_cancel_intent(attempt_id)
                     continue
                 else:
+                    if empty is not None:
+                        # A `sending`/`uncertain` dispatch, or one still inside its timeout, is kept;
+                        # its next complete discovery waits out a backoff.
+                        self._defer_cancel_intent(attempt_id, intent, now, empty)
                     continue
             if attempt["run_status"] == "completed":
                 self._drop_cancel_intent(attempt_id)
                 continue
             run_id = str(attempt["run_id"])
+            failure = None
             try:
                 if candidate_ci is not None:
                     with self._lock.unlocked():
@@ -4744,7 +4774,7 @@ class Controller:
                 else:
                     result = cancel(self.repository, run_id)
             except Exception as error:  # noqa: BLE001 - retried next pass
-                result = f"failed: {str(error)[:200]}"
+                result, failure = f"failed: {str(error)[:200]}", error
             with self.store.transaction():
                 self.store.update(
                     "ci_attempts",
@@ -4767,7 +4797,7 @@ class Controller:
                     self._count("ci_runs_cancelled")
                     self._drop_cancel_intent(attempt_id)
                 else:
-                    self._defer_cancel_intent(attempt_id, intent, now)
+                    self._defer_cancel_intent(attempt_id, intent, now, failure)
             if result not in ("cancelled", "already-completed"):
                 self.log.warning("cancel intent %s: cancelling CI run %s %s", attempt_id, run_id, result)
 
@@ -6428,9 +6458,14 @@ class Controller:
                                 "ci_attempts", {"id": attempt["id"]}, run_id=run.run_id, run_status=run.status
                             )
                             attempt = dict(attempt, run_id=run.run_id, run_status=run.status)
+                    except NoOwner as error:
+                        # A complete listing found no run. Unless that settles it (an accepted
+                        # dispatch past its timeout), its cancel intent looks again after a backoff.
+                        if not self._cancel_settled(attempt, now, looked_up=True):
+                            self._write_cancel_intent(attempt, reason, now, failed=error)
                     except Exception as error:  # noqa: BLE001 - supersession must not block the queue
                         self.log.warning("superseded dispatch %s lookup failed: %s", attempt["id"], error)
-                        self._write_cancel_intent(attempt, reason, now, failed=True)
+                        self._write_cancel_intent(attempt, reason, now, failed=error)
             if protected_run and attempt["run_id"] == protected_run:
                 continue
             if not attempt["run_id"] or attempt["run_status"] == "completed":
@@ -6467,7 +6502,7 @@ class Controller:
                     result=values["cancel_result"],
                 )
                 if error is not None:
-                    self._write_cancel_intent(attempt, reason, now, failed=True)
+                    self._write_cancel_intent(attempt, reason, now, failed=error)
             if error is not None:
                 self.log.warning(
                     "head %s: cancelling superseded CI run %s failed, retrying through its cancel intent: %s",
@@ -9266,7 +9301,7 @@ class Controller:
                 if attempt is None or str(attempt["run_id"]) != str(payload["run_id"]):
                     self.log.warning("retry of cancelling CI run %s failed, giving up: %s", payload["run_id"], error)
                     return f"gave-up: {str(error)[:200]}"
-                self._write_cancel_intent(attempt, attempt["cancel_reason"] or "superseded", now, failed=True)
+                self._write_cancel_intent(attempt, attempt["cancel_reason"] or "superseded", now, failed=error)
                 self.log.warning("cancelling CI run %s failed, its cancel intent retries: %s", payload["run_id"], error)
                 return f"cancel-intent: {str(error)[:200]}"
         raise ControllerError("unknown-outbox-kind", kind)

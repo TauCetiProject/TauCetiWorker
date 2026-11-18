@@ -498,8 +498,12 @@ transaction and first in every `_emergency` pass) looks up the run of an attempt
 dispatch may have been sent, cancels a live run and deletes the intent only once the cancel is
 accepted, the run is observed completed, or the attempt provably has no run (`prepared`, `rejected`,
 or an `accepted` dispatch with no run found once older than `dispatch_timeout_seconds`; a `sending`
-or `uncertain` dispatch is never retired by age). A failure backs the intent off (`tries`,
-`retry_at`, as for the outbox); there is no cap, and intents block nothing.
+or `uncertain` dispatch is never retired by age). A source-CI lookup that ends in `NoOwner` (a
+complete listing with no live, unreadable or owned run) is such an empty lookup, not a failure. A
+failure backs the intent off (`tries`, `retry_at`, as for the outbox), measured from the clock after
+the failure and never earlier than a rate-limit deadline GitHub gave it; there is no cap, and
+intents block nothing. Source-CI cancellations share one GitHub client in deferred mode: they never
+sleep or retry in a pass, and the cancel POST's rate-limit headers feed the same counters.
 
 `approve` of a live input's own accepted head by a repository admin (admin evidence with `actor_id`
 and `merge_base_sha`) records `evidence.admin_reapproval` beside the original evidence and journals

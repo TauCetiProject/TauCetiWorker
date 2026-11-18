@@ -448,6 +448,25 @@ class GitHubClient:
             self._fail(f"HTTP {status} on {method} {path}")
             raise GitHubError(f"HTTP {status} on {method} {path}", status, data)
 
+    def record_response(self, method: str, path: str, status: int, headers: dict[str, str], body: bytes = b"") -> None:
+        """Account for a response this client did not send itself (a raw, never-retried POST).
+
+        Its rate-limit headers update the shared counters, and a primary or secondary limit blocks
+        the bucket and raises `RateLimited` with GitHub's deadline, exactly as `request` would."""
+        headers = {k.lower(): v for k, v in headers.items()}
+        with self._lock:
+            self.requests += 1
+        self._record(headers, headers.get("x-ratelimit-resource") or "core")
+        wait = self._limit_wait(status, headers, body)
+        if wait is None:
+            return
+        blocked_resource = "core" if headers.get("x-ratelimit-remaining") == "0" else "secondary"
+        deadline = self._clock() + wait
+        with self._lock:
+            self._blocked_until[blocked_resource] = max(self._blocked_until.get(blocked_resource, 0), deadline)
+        self._fail(f"rate limited for {wait:.0f}s on {method} {path}")
+        raise RateLimited(f"rate limited for {wait:.0f}s", status, body, retry_at=deadline, resource=blocked_resource)
+
     def _retry(self) -> None:
         with self._lock:
             self.retries += 1

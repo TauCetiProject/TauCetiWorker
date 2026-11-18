@@ -24,7 +24,7 @@ from tauceti_tools import ci_candidate as cc
 from tauceti_tools.ci_candidate_evidence import EvidenceUnavailable
 
 from tauceti_queue.ci_execution import ExecutionEvidence, GitHubSourceExecution
-from tauceti_queue.github_adapter import GitHubError
+from tauceti_queue.github_adapter import GitHubError, RateLimited
 from tauceti_queue.github_app import AppCredentials, CredentialsError, InstallationToken, InstallationTokenSource
 from tauceti_queue.ports import DispatchNotAccepted
 
@@ -426,6 +426,57 @@ class Execution(unittest.TestCase):
         del self.reader.runs["101"]
         self.assertEqual(cancel(), "already-completed", "GitHub deleted the run")
         self.assertEqual(len(cancels()), posted)
+
+    def test_cancel_rate_limits_never_sleep_and_carry_githubs_deadline(self):
+        proof = self.reader.add(status="in_progress")
+        execution, digest = self.frozen.policy.execution, self.frozen.request.digest
+        now = [1_000_000.0]
+        responses = []
+
+        def transport(method, url, headers, body):
+            self.posts.append((method, url))
+            return responses.pop(0)
+
+        adapter = GitHubSourceExecution(
+            self.tokens,
+            transport=transport,
+            reader_factory=lambda *_: self.fail("cancel reads no frozen policy"),
+            clock=lambda: now[0],
+        )
+
+        def cancel():
+            return adapter.cancel(execution, "101", request_digest=digest, proof=proof)
+
+        live = (200, {}, json.dumps(self.reader.runs["101"]).encode())
+        with patch("time.sleep", side_effect=AssertionError("a cancellation never sleeps")):
+            # A rate-limited read is one request, and its deadline is GitHub's Retry-After.
+            responses[:] = [(429, {"Retry-After": "180"}, b"")]
+            with self.assertRaises(RateLimited) as caught:
+                cancel()
+            self.assertEqual((len(self.posts), caught.exception.retry_at), (1, now[0] + 180))
+            # The shared client remembers it: the next cancellation sends nothing until then.
+            with self.assertRaises(RateLimited) as caught:
+                cancel()
+            self.assertEqual((len(self.posts), caught.exception.retry_at), (1, now[0] + 180))
+            now[0] += 181
+            # The cancel POST's own rate-limit headers are recorded and honoured.
+            reset = now[0] + 600
+            limited = {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(reset), "x-ratelimit-limit": "5000"}
+            responses[:] = [live, (403, limited, b'{"message": "API rate limit exceeded"}')]
+            with self.assertRaises(RateLimited) as caught:
+                cancel()
+            self.assertEqual(caught.exception.retry_at, reset + 1)
+            self.assertEqual(adapter.cancel_client.rate_limit(), (0, reset))
+            with self.assertRaises(RateLimited):
+                cancel()
+            self.assertEqual(len(self.posts), 3)
+            now[0] = reset + 2
+            responses[:] = [
+                live,
+                (202, {"x-ratelimit-remaining": "4999", "x-ratelimit-reset": str(now[0] + 3600)}, b""),
+            ]
+            self.assertEqual(cancel(), "cancelled")
+            self.assertEqual(adapter.cancel_client.rate_limit()[0], 4999)
 
     def test_repository_reader_rejects_name_reuse_and_malformed_api_metadata(self):
         # Exercise the real bounded metadata validator, independent of our reader fake.

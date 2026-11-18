@@ -82,6 +82,9 @@ class GitHubSourceExecution:
             raise ValueError("invalid execution discovery page bound")
         self.tokens, self.clock, self.max_pages = tokens, clock, max_pages
         self.transport = transport or UrllibTransport()
+        # One client for every cancellation, so a rate limit GitHub reports to one cancel is
+        # honoured by the next instead of each cancel rediscovering it with fresh requests.
+        self.cancel_client = GitHubClient(self.tokens, self.transport, clock=clock)
         opener = (
             None
             if reader_factory is not None
@@ -510,7 +513,11 @@ class GitHubSourceExecution:
         `execution` is the ledger's bound execution repository and `proof` the stored receipt that
         established ownership of `run_id` for `request_digest`. Neither the frozen request nor its
         execution policy is parsed again, so an attempt frozen under an older policy schema stays
-        cancellable. The native repository is rechecked before the idempotent cancellation."""
+        cancellable. The native repository is rechecked before the idempotent cancellation.
+
+        Requests go through the shared `cancel_client` in deferred mode: nothing sleeps or retries
+        here. A rate limit (on the read or the cancel POST, whose headers are recorded too) raises
+        `RateLimited` carrying GitHub's deadline, which the caller persists on its cancel intent."""
         if not isinstance(run_id, str) or not run_id.isascii() or not run_id.isdecimal() or run_id.startswith("0"):
             raise ValueError("invalid execution run ID")
         if (
@@ -529,9 +536,9 @@ class GitHubSourceExecution:
         ):
             raise ValueError("execution credential belongs to another repository ID")
         name = execution.repository.name
-        status, raw = GitHubClient(self.tokens, self.transport).get_json(
-            f"repos/{name}/actions/runs/{run_id}", tolerate=(404,)
-        )
+        client = self.cancel_client
+        with client.deferred_requests(urgent=True):
+            status, raw = client.get_json(f"repos/{name}/actions/runs/{run_id}", tolerate=(404,))
         if status == 404:
             return "already-completed"  # GitHub deleted the run: it can never run again.
         repository = raw.get("repository") if isinstance(raw, dict) else None
@@ -545,7 +552,9 @@ class GitHubSourceExecution:
             raise ValueError("owned execution run belongs to another repository or event")
         if raw.get("status") == "completed":
             return "already-completed"
-        status, _headers, _body = self._send(name, "/actions/runs/" + run_id + "/cancel")
+        path = "/actions/runs/" + run_id + "/cancel"
+        status, headers, body = self._send(name, path)
+        client.record_response("POST", "repos/" + name + path, status, headers or {}, body or b"")
         if status == 202:
             return "cancelled"
         if status == 409:

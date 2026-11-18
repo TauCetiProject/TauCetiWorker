@@ -20,6 +20,7 @@ from tauceti_queue.ci_execution import CandidateObservation
 from tauceti_queue.ci_requests import RequestLedger
 from tauceti_queue.controller import LOG_GRACE_SECONDS, SOURCE_PHASES_INTERVAL_SECONDS, Controller
 from tauceti_queue.fakes import make_controller, run_git
+from tauceti_queue.github_adapter import RateLimited
 from tauceti_queue.ports import CandidatePhase, CandidateRun, DispatchNotAccepted, PromotionRefused
 from tauceti_queue.source_ci import SourceCandidateCI
 from tauceti_queue.store import Store
@@ -39,6 +40,7 @@ class VerifiedExecution:
         self.discoveries = 0
         self.deleted_runs = set()
         self.cancel_failures = 0
+        self.cancel_error = None
 
     def preflight(self, frozen):
         return "fixture-only"
@@ -114,6 +116,8 @@ class VerifiedExecution:
     def cancel(self, execution, run_id, *, request_digest, proof):
         if proof.get("request_digest") != request_digest or str(proof.get("run_id")) != run_id:
             raise ValueError("cancellation requires the stored request ownership proof")
+        if self.cancel_error is not None:
+            raise self.cancel_error()
         if self.cancel_failures:
             self.cancel_failures -= 1
             raise OSError("owned execution cancellation is unconfirmed")
@@ -467,6 +471,64 @@ class SourceController(unittest.TestCase):
         self.assertEqual(self.execution.cancelled, ["101"])
         self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["cancel_result"], "cancelled")
         self.assertEqual(self.controller._cancel_intents(), {})
+
+    def test_a_rate_limited_cancel_waits_for_githubs_deadline_measured_after_the_failure(self):
+        attempt = self.owned_live_attempt_with_retired_policy_field()
+        retry = self.controller.setting("outbox_retry_seconds")
+
+        def limited(slow, deadline):
+            start = self.clock()
+
+            def error():
+                self.clock.advance(slow)  # the failing request itself took this long
+                return RateLimited("rate limited", 429, retry_at=start + deadline, resource="core")
+
+            return start, error
+
+        # GitHub's deadline is later than the backoff: the intent waits for GitHub.
+        start, self.execution.cancel_error = limited(0, 3 * retry)
+        self.controller._cancel_superseded_runs(attempt["batch_id"], start, reason="head rebuilt")
+        self.assertEqual(self.controller._cancel_intents()[attempt["id"]]["retry_at"], start + 3 * retry)
+        self.clock.advance(3 * retry - 1)
+        self.controller._settle_cancel_intents(self.clock())
+        self.assertEqual(self.controller._cancel_intents()[attempt["id"]]["tries"], 1, "not retried early")
+        # A slow failure: the backoff is measured from after it, not from the start of the pass.
+        self.clock.advance(1)
+        start, self.execution.cancel_error = limited(4 * retry, 1)
+        self.controller._settle_cancel_intents(start)
+        intent = self.controller._cancel_intents()[attempt["id"]]
+        self.assertEqual((intent["tries"], intent["retry_at"]), (2, self.clock() + 2 * retry))
+        self.execution.cancel_error = None
+        self.clock.advance(2 * retry)
+        self.controller._settle_cancel_intents(self.clock())
+        self.assertEqual(self.execution.cancelled, ["101"])
+        self.assertEqual(self.controller._cancel_intents(), {})
+
+    def test_an_empty_complete_discovery_settles_an_accepted_dispatch_past_its_timeout(self):
+        attempt = self.start()  # dispatched, and no run ever appears
+        self.assertEqual((attempt["dispatch_state"], attempt["run_id"]), ("accepted", None))
+        self.controller._cancel_superseded_runs(attempt["batch_id"], self.clock(), reason="head rebuilt")
+        self.assertIn(attempt["id"], self.controller._cancel_intents(), "inside its timeout the run may yet appear")
+        self.clock.advance(self.controller.setting("dispatch_timeout_seconds"))
+        discoveries = self.execution.discoveries
+        self.controller._settle_cancel_intents(self.clock())
+        self.assertEqual(self.execution.discoveries, discoveries + 1)
+        self.assertEqual(self.controller._cancel_intents(), {}, "NoOwner is an empty lookup, not a failure")
+        self.assertEqual(self.execution.cancelled, [])
+        # A send that may or may not have reached GitHub is never settled by age.
+        self.store.update("ci_attempts", {"id": attempt["id"]}, dispatch_state="uncertain")
+        self.controller._write_cancel_intent(self.store.row("ci_attempts", {"id": attempt["id"]}), "head rebuilt", 0)
+        self.clock.advance(10 * self.controller.setting("dispatch_timeout_seconds"))
+        self.controller._settle_cancel_intents(self.clock())
+        self.assertIn(attempt["id"], self.controller._cancel_intents())
+        self.assertEqual(self.execution.cancelled, [])
+
+    def test_a_superseded_accepted_dispatch_without_any_run_past_its_timeout_writes_no_intent(self):
+        attempt = self.start()
+        self.clock.advance(self.controller.setting("dispatch_timeout_seconds"))
+        self.controller._cancel_superseded_runs(attempt["batch_id"], self.clock(), reason="head rebuilt")
+        self.assertEqual(self.controller._cancel_intents(), {})
+        self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "superseded")
 
     def test_revoked_approval_blocks_cached_pass_and_unowned_cancel(self):
         attempt = self.start()
