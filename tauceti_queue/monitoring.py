@@ -30,7 +30,6 @@ from pathlib import Path
 
 from . import task_progress
 from .monitoring_protocol import PublicationRejected, PublisherIdentity, ResyncRequired, SnapshotPublisher, encode
-from .task_identity import TaskBinding
 
 SCHEMA = "tauceti.operations.queue/v1"
 LIMIT = 20_000
@@ -337,7 +336,7 @@ def task_binding_fields(task):
     """Project SQL identity metadata independently of optional worker progress."""
     try:
         row = json.loads(task.get("task_binding", "{}"))
-        return {} if row == {} else {"task_binding": TaskBinding.parse(row).record()}
+        return {} if row == {} else {"task_binding": task_progress.binding_record(row)}
     except (ValueError, TypeError):
         return {"task_binding": None, "identity_coverage": "invalid"}
 
@@ -355,7 +354,7 @@ class TaskObservations:
         for task in sorted(tasks, key=lambda t: (t["state"] != "open", -t["id"]))[:100]:
             try:
                 raw_binding = json.loads(task.get("task_binding", "{}"))
-                expected_binding = None if raw_binding == {} else TaskBinding.parse(raw_binding).record()
+                expected_binding = None if raw_binding == {} else task_progress.binding_record(raw_binding)
             except (ValueError, TypeError):
                 continue
             candidates = []
@@ -431,7 +430,9 @@ class TaskObservations:
                     if task["state"] == "open"
                     else None
                 )
-                result[task["id"]] = observation | ({"build": build} if build else {})
+                # The binding only matches a checkpoint to its task; the task record publishes it.
+                public = {key: value for key, value in observation.items() if key != "task_binding"}
+                result[task["id"]] = public | ({"build": build} if build else {})
                 if task["state"] == "open" and token in live_tokens:
                     from . import task_activity
 

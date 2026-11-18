@@ -216,6 +216,48 @@ url = "https://private.invalid"
         self.assertEqual(progress["state"], "agent_running")
         self.assertNotIn(sentinel, json.dumps(value))
 
+    def test_mixed_task_binding_is_published_and_its_checkpoint_progress_matched(self):
+        github = {"forge": {"kind": "github", "url": "https://github.com"}, "id": 7, "name": PROJECT}
+        forgejo = {"forge": {"kind": "forgejo", "url": "https://git.example"}, "id": 1, "name": PROJECT}
+        binding = {
+            "schema": "tauceti-queue.mixed-task/v1",
+            "github": github,
+            "forgejo": forgejo,
+            "policy_digest": "8" * 64,
+            "epoch": "d" * 32,
+        }
+        head = self.controller._head()
+        self.controller._create_task(head, "repair", head["base"], [], self.clock())
+        task_id = self.controller.store.rows("tasks")[-1]["id"]
+        self.controller.store.execute("UPDATE tasks SET task_binding=? WHERE id=?", (json.dumps(binding), task_id))
+        directory = self.root / "worker" / "tasks" / str(task_id)
+        directory.mkdir(parents=True)
+        task = {
+            "task_id": str(task_id),
+            "claim_token": "c" * 32,
+            "schema": "tauceti-queue.mixed-task/v1",
+            "mixed_binding": binding,
+            "repository": PROJECT,
+        }
+        (directory / "task.json").write_text(
+            json.dumps({"task": task, "state": "agent_running", "updated_at": self.clock()})
+        )
+        value = self.export(worker_roots=[self.root / "worker"], task_observations=monitoring.TaskObservations())
+        record = next(t for t in value["tasks"] if t["id"] == str(task_id))
+        self.assertEqual(record["task_binding"], binding)
+        self.assertNotIn("identity_coverage", record)
+        self.assertEqual(record["progress"]["coverage"], "observed")
+        self.assertEqual(record["progress"]["state"], "agent_running")
+        self.assertNotIn("task_binding", record["progress"])
+        # A checkpoint bound to another queue generation is never attributed to this task.
+        task["mixed_binding"] = dict(binding, epoch="e" * 32)
+        (directory / "task.json").write_text(
+            json.dumps({"task": task, "state": "agent_running", "updated_at": self.clock() + 1})
+        )
+        value = self.export(worker_roots=[self.root / "worker"], task_observations=monitoring.TaskObservations())
+        record = next(t for t in value["tasks"] if t["id"] == str(task_id))
+        self.assertEqual(record["progress"]["coverage"], "unavailable")
+
     def test_export_does_not_write_the_database(self):
         before = {
             table: self.controller.store.rows(table) for table in ("inputs", "members", "batches", "claims", "settings")
