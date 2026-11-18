@@ -309,6 +309,53 @@ class StatusCommand(Base):
         self.assertIn("no status from http://q/status", err.getvalue())
 
 
+class EmergencyCommand(Base):
+    def test_request_and_cancel_post_to_the_admin_endpoints(self):
+        requests = []
+
+        def fetch(url, method="GET", body=None, token=None, **_kwargs):
+            requests.append((url, method, body, token))
+            return {"accepted": True} if url.endswith("/admin/emergency") else {"cancelled": False}
+
+        parser = cli.build_parser()
+        with captured():
+            args = parser.parse_args(
+                [
+                    "emergency",
+                    "TauCetiProject/TauCeti",
+                    "42",
+                    "--reason",
+                    "harness",
+                    "--url",
+                    "http://q",
+                    "--token",
+                    "t",
+                ]
+            )
+            self.assertEqual(cli.cmd_emergency(args, fetch=fetch), 0)
+        self.assertEqual(
+            requests[-1],
+            (
+                "http://q/admin/emergency",
+                "POST",
+                {"repo": "TauCetiProject/TauCeti", "pr": 42, "reason": "harness"},
+                "t",
+            ),
+        )
+        with captured():
+            args = parser.parse_args(
+                ["emergency", "cancel", "TauCetiProject/TauCeti", "42", "--url", "http://q", "--token", "t"]
+            )
+            self.assertEqual(cli.cmd_emergency(args, fetch=fetch), 1, "a refusal exits 1")
+        self.assertEqual(
+            requests[-1], ("http://q/admin/emergency-cancel", "POST", {"repo": "TauCetiProject/TauCeti", "pr": 42}, "t")
+        )
+        with captured() as (_out, err):
+            args = parser.parse_args(["emergency", "TauCetiProject/TauCeti", "x", "--url", "http://q", "--token", "t"])
+            self.assertEqual(cli.cmd_emergency(args, fetch=fetch), 2)
+        self.assertIn("positive integer", err.getvalue())
+
+
 class SettingsCommand(Base):
     def test_show_and_set(self):
         requests = []

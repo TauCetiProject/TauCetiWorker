@@ -790,6 +790,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `automatic_retry_seconds` | `1800` | integer, at least 0; below 60 counts as 60 |
 | `automatic_retry_max_seconds` | `14400` | integer, at least 0 |
 | `escalation_alert_seconds` | `86400` | integer, at least 0 |
+| `emergency_enabled` | `false` | `true` or `false`; accept `bors emergency` requests (below, after Rebuilding the head) |
 
 Escalations (withdrawals, bisections, the start and end of an infrastructure backoff) are sent as Zulip direct messages when
 `TAUCETI_QUEUE_ZULIP_CONFIG` in `~/.config/tauceti-queue/environment` names a mode-0600 bot
@@ -1001,6 +1002,20 @@ without a source change, for example after a chain tool fix changed the commit m
 head's CI failed on a consequence of the old format; it is refused while the head is claimed and when a
 member carries agent edits, which a rebuild would discard. `POST /admin/retry-ci` stays the action for
 persistent infrastructure failures; automatic retries continue with capped backoff.
+
+### Landing a PR urgently: `bors emergency`, not an admin merge
+
+To land an approved PR ahead of the queue (a harness or staging fix, a broken `main`), a repository
+admin comments `bors emergency` on it (withdraw with `bors emergency-`), or runs
+`uv run tauceti-queue emergency TauCetiProject/TauCeti <pr> --reason "<why>"` (`emergency cancel ...`
+to withdraw; `POST /admin/emergency` and `/admin/emergency-cancel` underneath). Use this, not an admin
+merge: an admin merge supersedes the running head's CI and leaves `main` on a revision only `ci.yml`
+publishes, while the emergency lane lands the PR through the queue, as the next head in a batch of
+its own, on a pass of its own staging run, with its Lake cache published. The running head is not
+evicted: the emergency batch waits for it to land. The PR must be approved at its live head first.
+The lane is disabled until `uv run tauceti-queue settings set emergency_enabled true`; until then
+every request is refused `disabled`. `status.emergency` shows the request, what it waits for and any
+CI run still being cancelled.
 
 ## Monitoring
 

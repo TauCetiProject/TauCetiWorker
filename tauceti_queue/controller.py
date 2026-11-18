@@ -176,6 +176,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "base_cache_endpoint": "https://cache.taucetiproject.org/revisions",
     "base_cache_recheck_seconds": 120,
     "base_cache_alert_seconds": 7200,
+    # The emergency lane (`bors emergency`, `POST /admin/emergency`): a repository admin's request that
+    # an approved PR become the next head as a single-member batch (`_emergency`). Off: every request
+    # is refused `disabled`; a request already accepted keeps running.
+    "emergency_enabled": False,
 }
 
 # The actor of the values `seed_setting` writes from the configuration file's `[settings]`.
@@ -994,6 +998,7 @@ class Controller:
             now = self.clock()
             existing = self._input_for(pr)
             if existing is not None:
+                self._admin_reapproval(existing, head_sha, evidence, now)
                 if existing["head_sha"] == head_sha and existing["state"] in (INPUT_WAITING, INPUT_RESERVED):
                     changed = {}
                     if priority != existing["priority"]:
@@ -1274,13 +1279,165 @@ class Controller:
             if current is None or current["state"] in (INPUT_LANDED, INPUT_CANCELLED):
                 return {"urgent": False, "reason": "not-queued"}
             with self.store.transaction():
-                self.store.update("inputs", {"id": current["id"]}, urgent=1)
+                # Never lowers an emergency (`URGENT_EMERGENCY`) request or batch.
+                self.store.update("inputs", {"id": current["id"]}, urgent=max(current["urgent"], 1))
                 if current["state"] == INPUT_INSERTED and current["batch_id"] is not None:
-                    self.store.update("batches", {"id": current["batch_id"]}, urgent=1)
+                    batch = self.store.row("batches", {"id": current["batch_id"]}) or {"urgent": 0}
+                    self.store.update("batches", {"id": current["batch_id"]}, urgent=max(batch["urgent"], 1))
                 self.store.journal(now, "urgent", number=pr, actor=actor, state=current["state"])
             self._wake.set()
             self._refresh_snapshot()
             return {"urgent": True, "state": current["state"]}
+
+    def _admin_reapproval(
+        self, existing: dict[str, Any], head_sha: str, evidence: dict[str, Any] | None, now: float
+    ) -> None:
+        """An admin's approval of the live input's own accepted head, recorded beside the original evidence.
+
+        `approve` does not replace a live input's evidence (the PR keeps its admission age, and an inserted
+        member is never re-approved), so an admin's `r+` of a PR first approved by someone else would
+        otherwise leave no admin scope. The new authorization is stored as its own record,
+        `evidence.admin_reapproval`; the original evidence, `approved_at`, state and batch are untouched.
+        """
+        evidence = evidence or {}
+        if (
+            existing["state"] not in (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED)
+            or existing["head_sha"] != head_sha
+            or not evidence.get("admin")
+            or not evidence.get("actor_id")
+            or not evidence.get("merge_base_sha")
+        ):
+            return
+        stored = loads(existing["evidence"], {})
+        record = {
+            key: evidence.get(key)
+            for key in (
+                "actor_login",
+                "actor_id",
+                "comment_id",
+                "comment_url",
+                "created_at",
+                "head_sha",
+                "merge_base_sha",
+                "command",
+            )
+        }
+        same_as_original = all(stored.get(key) == record[key] for key in ("actor_id", "comment_id", "created_at"))
+        if stored.get("admin_reapproval") == record or same_as_original:
+            return  # the same approval seen again (a poll, a redelivery)
+        stored["admin_reapproval"] = record
+        with self.store.transaction():
+            self.store.update("inputs", {"id": existing["id"]}, evidence=dumps(stored))
+            self.store.journal(
+                now,
+                "admin-reapproved",
+                existing["batch_id"] if existing["state"] == INPUT_INSERTED else None,
+                number=existing["number"],
+                head=head_sha,
+                actor=evidence.get("actor_login"),
+                state=existing["state"],
+            )
+
+    def request_emergency(
+        self, repo: str, pr: int, actor: str, *, surface: str, reason: str = "", live_head: str | None = None
+    ) -> dict[str, Any]:
+        """A repository admin's request that the PR land next through the emergency lane (`_emergency`).
+
+        The caller has checked that `actor` is a repository admin. The flag is never an approval: the PR
+        needs a live input (waiting, reserved or inserted) whose head is the live PR head, read from the
+        source unless `live_head` is given. Returns `{"accepted": bool, "reason": ..., "behind": PR | None}`;
+        refusals are `disabled`, `not-approved`, `head-moved`, `fetch-failed: ...`, `forgejo-inert` and
+        `already-requested`. Every request and refusal is journaled.
+        """
+        self._check_repo(repo)
+        number = self._source_number(repo, pr)
+        if live_head is None and self.setting("emergency_enabled"):
+            try:
+                live_head = self.source.fetch_pr(repo, number).head_sha
+            except Exception as error:  # noqa: BLE001 - the refusal names the failure
+                return self._refuse_emergency(number, actor, surface, f"fetch-failed: {error}"[:200])
+        with self._lock:
+            now = self.clock()
+            if not self.setting("emergency_enabled"):
+                return self._refuse_emergency(number, actor, surface, "disabled")
+            current = self._input_for(number)
+            if current is None or current["state"] not in (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED):
+                return self._refuse_emergency(number, actor, surface, "not-approved")
+            if current["head_sha"] != live_head:
+                return self._refuse_emergency(number, actor, surface, "head-moved")
+            if isinstance(number, SourceNumber) and (self.mixed is None or self.mixed.mode != "admit"):
+                return self._refuse_emergency(number, actor, surface, "forgejo-inert")
+            if self._emergency_requested(current):
+                return {"accepted": False, "reason": "already-requested", "behind": self._emergency_behind(current)}
+            evidence = loads(current["evidence"], {})
+            evidence["emergency"] = {"actor": actor, "requested_at": now, "surface": surface, "reason": reason}
+            with self.store.transaction():
+                # Only the input is flagged: an ordinary batch never becomes an emergency batch.
+                self.store.update("inputs", {"id": current["id"]}, urgent=URGENT_EMERGENCY, evidence=dumps(evidence))
+                self.store.journal(
+                    now,
+                    "emergency-requested",
+                    number=number,
+                    head=current["head_sha"],
+                    actor=actor,
+                    surface=surface,
+                    reason=reason,
+                    state=current["state"],
+                )
+            behind = self._emergency_behind(self.store.row("inputs", {"id": current["id"]}) or current)
+            self._wake.set()
+            self._refresh_snapshot()
+            return {"accepted": True, "reason": "accepted", "behind": behind, "state": current["state"]}
+
+    def _refuse_emergency(self, number: Any, actor: str, surface: str, reason: str) -> dict[str, Any]:
+        with self._lock:
+            self.store.journal(
+                self.clock(), "emergency-refused", number=number, actor=actor, surface=surface, reason=reason
+            )
+        return {"accepted": False, "reason": reason, "behind": None}
+
+    def cancel_emergency(self, repo: str, pr: int, actor: str, *, surface: str) -> dict[str, Any]:
+        """Withdraw an emergency request (`bors emergency-`, `POST /admin/emergency-cancel`).
+
+        A built emergency batch ends through `_end_emergency` (its member back where it was, its tasks,
+        claims and runs retired), unless it is about to land: a pending `promote` outbox entry or a passed
+        current attempt refuses the cancellation `promotion-pending`. A request with no batch yet is just
+        cleared. The PR's approval is never withdrawn."""
+        self._check_repo(repo)
+        number = self._source_number(repo, pr)
+        with self._lock:
+            now = self.clock()
+            current = self._input_for(number)
+            batch = self._emergency_batch()
+            if batch is not None and current is not None and self._emergency_input(batch) == current["id"]:
+                attempt = self._current_attempt(batch)
+                promoting = self.store.query(
+                    "SELECT 1 FROM outbox WHERE kind='promote' AND state='pending' AND key LIKE ? LIMIT 1",
+                    (f"promote:{batch['id']}:%",),
+                )
+                if promoting or (attempt is not None and attempt["outcome"] == OUTCOME_PASS):
+                    self.store.journal(
+                        now,
+                        "emergency-cancel-refused",
+                        batch["id"],
+                        number=number,
+                        actor=actor,
+                        reason="promotion-pending",
+                    )
+                    return {"cancelled": False, "reason": "promotion-pending", "batch_id": batch["id"]}
+                self._end_emergency(batch, "cancelled", now, actor=actor)
+                self._refresh_snapshot()
+                return {"cancelled": True, "reason": "cancelled", "batch_id": batch["id"]}
+            if current is None or not self._emergency_requested(current):
+                return {"cancelled": False, "reason": "not-requested", "batch_id": None}
+            with self.store.transaction():
+                self._clear_emergency_request(current)
+                self.store.journal(
+                    now, "emergency-ended", number=number, cause="cancelled", actor=actor, surface=surface
+                )
+            self._wake.set()
+            self._refresh_snapshot()
+            return {"cancelled": True, "reason": "cancelled", "batch_id": None}
 
     def _input_for(self, pr: int) -> dict[str, Any] | None:
         """The PR's newest live input, otherwise its newest terminal input."""
@@ -2276,7 +2433,7 @@ class Controller:
                 )
             )
             if shrunk:
-                self._discard_pre_rebase("head-shrunk", now)
+                self._discard_pre_rebase("head-shrunk", now, batch)
             self.store.journal(
                 now, "adopted", batch["id"], task_id=task["id"], version=version, tip=tip_sha, provenance=provenance
             )
@@ -2760,13 +2917,28 @@ class Controller:
         barrier = None if include_inert else self._inert_barrier()
         return [batch for batch in batches if barrier is None or batch["id"] < barrier]
 
+    def _staging_batches(self) -> list[dict[str, Any]]:
+        """The open batches ordinary scheduling works on: `_open_batches` without the emergency batch.
+
+        Insertion, background tasks and sealing order use this; enumeration that must see every live
+        batch (retained refs, sources in flight, status) keeps `_open_batches`."""
+        return [batch for batch in self._open_batches() if batch["urgent"] != URGENT_EMERGENCY]
+
     def _unsealed_batches(self) -> list[dict[str, Any]]:
         """Batches still accepting insertions; only these count against `open_batch_limit`."""
-        return [batch for batch in self._open_batches() if not batch["sealed"]]
+        return [batch for batch in self._staging_batches() if not batch["sealed"]]
 
     def _open_batch(self) -> dict[str, Any] | None:
-        batches = self._open_batches()
+        batches = self._staging_batches()
         return batches[0] if batches else None
+
+    def _emergency_batch(self) -> dict[str, Any] | None:
+        """The live (open or head) emergency batch; there is at most one."""
+        return self.store.row(
+            "batches",
+            {"repository": self.repository, "state": [BATCH_OPEN, BATCH_HEAD], "urgent": URGENT_EMERGENCY},
+            order="id",
+        )
 
     def _head(self) -> dict[str, Any] | None:
         return self.store.row("batches", {"repository": self.repository, "state": BATCH_HEAD}, order="id DESC")
@@ -3134,6 +3306,7 @@ class Controller:
         self._insertion_passes(now)
         for step in (
             self._supersede_stale_pre_rebase,
+            self._emergency,
             self._seal,
             self._reconcile_head,
             self._pre_rebase,
@@ -3447,7 +3620,9 @@ class Controller:
         rows = [
             row
             for row in rows
-            if not isinstance(row["number"], SourceNumber) or self.mixed is not None and self.mixed.mode == "admit"
+            if (not isinstance(row["number"], SourceNumber) or self.mixed is not None and self.mixed.mode == "admit")
+            # An emergency request is drawn only into its own batch (`_emergency`).
+            and row["urgent"] != URGENT_EMERGENCY
         ]
         rows.sort(key=lambda row: (-row["urgent"], -row["priority"], row["approved_at"], row["id"]))
         return rows
@@ -3632,11 +3807,7 @@ class Controller:
                 if not self._fetch_head(row["number"], row["head_sha"]):
                     raise chain.ChainError(f"accepted head {row['head_sha']} is not available")
                 result = chain.build(self.clone, batch["tip"], [member], chain_id=chain_id)
-                gaps, scan_unavailable = (
-                    self._new_import_gaps(batch["tip"], result) if result.status == chain.CLEAN else ([], None)
-                )
-                if result.status == chain.CLEAN and self.mixed is not None and self.mixed.mode == "admit":
-                    scope_supported = self.mixed.supports_candidate(batch["base"], result.tip)
+                gaps, scan_unavailable, scope_supported = self._replay_preflight(batch["base"], batch["tip"], result)
         except chain.ChainError as error:
             failure = error
         finally:
@@ -3744,14 +3915,7 @@ class Controller:
                 )
             return False
         record = result.commits[0]
-        source_ci_required = (
-            self.mixed is not None
-            and self.mixed.mode == "admit"
-            and (
-                isinstance(row["number"], SourceNumber) or self._candidate_coordinator(batch_id=batch["id"]) is not None
-            )
-        )
-        if source_ci_required and not scope_supported:
+        if self._source_ci_required(row["number"], batch) and not scope_supported:
             reason = (
                 "source-ci-scope: native candidate needs a compatible batch or changes within the native path policy"
                 if isinstance(row["number"], SourceNumber)
@@ -3867,9 +4031,12 @@ class Controller:
                 added_at=now,
                 no_repair=row["no_repair"],
             )
-            self.store.update(
-                "batches", {"id": batch["id"]}, version=version, tip=result.tip, urgent=batch["urgent"] or row["urgent"]
+            # An ordinary insertion never makes an emergency batch: a request that flagged the input
+            # while this probe ran makes the batch urgent at most; the lane takes the input from here.
+            urgent = (
+                batch["urgent"] if batch["urgent"] == URGENT_EMERGENCY else max(batch["urgent"], min(row["urgent"], 1))
             )
+            self.store.update("batches", {"id": batch["id"]}, version=version, tip=result.tip, urgent=urgent)
             self._record_tip(batch["id"], version, result.tip, now)
             self.store.update(
                 "inputs", {"id": row["id"]}, state=INPUT_INSERTED, batch_id=batch["id"], last_probe="inserted"
@@ -3893,6 +4060,31 @@ class Controller:
             )
         self._admission_context(self.store.row("batches", {"id": batch["id"]}) or batch, now)
         return True
+
+    def _replay_preflight(
+        self, base: str, tip: str, result: chain.ChainResult
+    ) -> tuple[list[tuple[str, str]], str | None, bool]:
+        """The checks a clean replay onto `tip` (on `base`) gets before insertion, run without the lock:
+        the new import gaps, why the import scan was unavailable, and whether the source-candidate scope
+        supports the candidate (`_source_ci_required` says whether that applies)."""
+        if result.status != chain.CLEAN:
+            return [], None, True
+        gaps, scan_unavailable = self._new_import_gaps(tip, result)
+        scope_supported = True
+        if self.mixed is not None and self.mixed.mode == "admit":
+            scope_supported = self.mixed.supports_candidate(base, result.tip)
+        return gaps, scan_unavailable, scope_supported
+
+    def _source_ci_required(self, number: Any, batch: dict[str, Any] | None) -> bool:
+        """Whether inserting `number` into `batch` routes the batch's CI through source-candidate CI,
+        whose scope then restricts it; `batch` None is a new batch of that member alone."""
+        if self.mixed is None or self.mixed.mode != "admit":
+            return False
+        if isinstance(number, SourceNumber):
+            return True
+        if batch is not None:
+            return self._candidate_coordinator(batch_id=batch["id"]) is not None
+        return self.candidate_ci is not None or (self.mixed_ci is not None and self.mixed.primary == "forgejo")
 
     def _planner(self) -> admission_planning.Planner:
         if not hasattr(self, "_admission_planner"):
@@ -4001,29 +4193,654 @@ class Controller:
             {"number": row["number"], "body": body, "marker": f"<!-- {COMMENT_MARKER} conflict:{row['head_sha']} -->"},
         )
 
+    # --- the emergency lane ------------------------------------------------------------------------
+    #
+    # An admin's request (`request_emergency`) flags a live input with `urgent = URGENT_EMERGENCY` and
+    # `evidence.emergency`. `_emergency` builds one single-member batch E for the oldest request
+    # (`batches.urgent = URGENT_EMERGENCY`), which ordinary scheduling does not see (`_staging_batches`)
+    # and `_seal` makes the next head ahead of every open batch. E never evicts a running head. A PR
+    # already inserted in an open batch B is built into E as well; B keeps its slot, which no longer
+    # acts for the input (`_displaced`). Every way E's member leaves E goes through `_emergency_exit`,
+    # every way E ends (landing aside) through `_end_emergency`, and E's runs are cancelled through
+    # durable intents (`_settle_cancel_intents`).
+
+    def _active_members(self, batch: dict[str, Any]) -> list[dict[str, Any]]:
+        return [m for m in self._members(batch["id"]) if not m["withdrawn"]]
+
+    @staticmethod
+    def _emergency_requested(row: dict[str, Any]) -> bool:
+        return row["urgent"] == URGENT_EMERGENCY and "emergency" in loads(row["evidence"], {})
+
+    def _flagged_inputs(self) -> list[dict[str, Any]]:
+        """The live inputs with an emergency request, oldest request first."""
+        rows = self.store.rows(
+            "inputs",
+            {
+                "repository": self.repository,
+                "state": [INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED],
+                "urgent": URGENT_EMERGENCY,
+            },
+        )
+        rows = [row for row in rows if self._emergency_requested(row)]
+        rows.sort(key=lambda row: (loads(row["evidence"], {})["emergency"].get("requested_at") or 0, row["id"]))
+        return rows
+
+    def _emergency_input(self, batch: dict[str, Any]) -> int | None:
+        """The id of the input emergency batch `batch` was built for."""
+        members = self.store.rows("members", {"batch_id": batch["id"]}, order="id", limit=1)
+        if members:
+            return members[0]["input_id"]
+        for row in self._flagged_inputs():
+            if loads(row["evidence"], {})["emergency"].get("batch_id") == batch["id"]:
+                return row["id"]
+        return None
+
+    def _emergency_behind(self, row: dict[str, Any]) -> Any:
+        """The PR whose emergency request is served before `row`'s, or None when it is served next."""
+        order: list[dict[str, Any]] = []
+        batch = self._emergency_batch()
+        if batch is not None and (input_id := self._emergency_input(batch)) is not None:
+            order.append(self.store.row("inputs", {"id": input_id}) or {})
+        order += [r for r in self._flagged_inputs() if r["id"] not in {o.get("id") for o in order}]
+        ids = [o.get("id") for o in order]
+        position = ids.index(row["id"]) if row["id"] in ids else len(order)
+        return order[position - 1]["number"] if position > 0 else None
+
+    def _clear_emergency_request(self, row: dict[str, Any]) -> None:
+        """Forget the input's emergency request: no `evidence.emergency`, ordinary urgency."""
+        evidence = loads(row["evidence"], {})
+        evidence.pop("emergency", None)
+        values: dict[str, Any] = {"evidence": dumps(evidence)}
+        if row["urgent"] == URGENT_EMERGENCY:
+            values["urgent"] = 1
+        self.store.update("inputs", {"id": row["id"]}, **values)
+
+    def _displaced(self, batch: dict[str, Any], member: dict[str, Any]) -> bool:
+        """The member's input now belongs to an emergency batch other than `batch`: the slot never acts
+        for the input (no input write, approval withdrawal or PR effect, and it does not land)."""
+        row = self.store.row("inputs", {"id": member["input_id"]})
+        if row is None or row["batch_id"] in (None, batch["id"]):
+            return False
+        owner = self.store.row("batches", {"id": row["batch_id"]})
+        return owner is not None and owner["urgent"] == URGENT_EMERGENCY
+
+    def _emergency_exit(self, batch: dict[str, Any], member: dict[str, Any], now: float) -> bool:
+        """The one path by which a member leaves the emergency batch that owns its input; True when the
+        input went back to its live displaced slot (the caller then leaves input, approval and PR alone).
+
+        Called inside the caller's transaction. The request is over either way (ordinary urgency, no
+        `evidence.emergency`). When the slot in batch B the PR was displaced from is still live, the input
+        is `inserted` in B again, E's member is withdrawn and the author is told once; otherwise the
+        caller's own behaviour applies (a withdrawal cancels, a return waits at the original age)."""
+        if batch["urgent"] != URGENT_EMERGENCY:
+            return False
+        row = self.store.row("inputs", {"id": member["input_id"]})
+        if row is None or row["batch_id"] != batch["id"]:
+            return False
+        record = loads(row["evidence"], {}).get("emergency") or {}
+        displaced = record.get("displaced") or {}
+        slot = self.store.row("members", {"id": displaced["member_id"]}) if displaced.get("member_id") else None
+        owner = self.store.row("batches", {"id": displaced["batch_id"]}) if displaced.get("batch_id") else None
+        live = (
+            slot is not None
+            and owner is not None
+            and owner["state"] in (BATCH_OPEN, BATCH_HEAD)
+            and slot["batch_id"] == owner["id"]
+            and slot["input_id"] == row["id"]
+            and not slot["removed"]
+            and not slot["withdrawn"]
+        )
+        self._clear_emergency_request(row)
+        self.store.journal(
+            now, "emergency-exit", batch["id"], number=member["number"], returned_to=owner["id"] if live else None
+        )
+        if not live:
+            return False
+        assert owner is not None
+        self.store.update("inputs", {"id": row["id"]}, state=INPUT_INSERTED, batch_id=owner["id"])
+        self.store.update("members", {"id": member["id"]}, withdrawn=1)
+        if self.setting("publication_enabled"):
+            marker = f"<!-- {COMMENT_MARKER} emergency-returned:{self._source_pr(member['number'])}:{batch['id']} -->"
+            body = (
+                f"The emergency lane did not land this PR (batch {batch['id']}); it stays in batch {owner['id']} "
+                "and lands with it as usual."
+            )
+            self._enqueue(
+                "comment",
+                f"emergency-returned:{row['id']}:{batch['id']}",
+                {"number": member["number"], "body": body + "\n\n" + marker, "marker": marker},
+            )
+        return True
+
+    def _emergency_ready(self) -> dict[str, Any] | None:
+        """The open emergency batch when `_seal` may make it the head: it has an active member and is not
+        retained for a disabled source. It is staged ahead of every open batch, so the only barriers that
+        can apply to it are its own and an inert head, which stops the tick before sealing."""
+        batch = self._emergency_batch()
+        if (
+            batch is None
+            or batch["state"] != BATCH_OPEN
+            or not self._active_members(batch)
+            or self._mixed_inert_batch(batch)
+            or self._inert_ci_batch(batch)
+        ):
+            return None
+        return batch
+
+    def _emergency(self, now: float) -> None:
+        """The tick's emergency step: settle cancel intents, end a dead emergency batch, build one for
+        the oldest request when none is live, and report what an open one waits for."""
+        self._settle_cancel_intents(now)
+        self._prune_preserved()
+        batch = self._emergency_batch()
+        if batch is not None:
+            if batch["state"] == BATCH_OPEN and not self._members(batch["id"]):
+                # A crash after allocation, or a probe that did not insert: the request is retried.
+                self._end_emergency(batch, "empty-allocation", now, keep_request=True)
+                batch = None
+            elif not self._active_members(batch):
+                self._end_emergency(batch, "emptied", now)
+                batch = None
+            elif batch["state"] == BATCH_OPEN and (self._mixed_inert_batch(batch) or self._inert_ci_batch(batch)):
+                self._end_emergency(batch, "inert", now)
+                batch = None
+        if batch is None:
+            batch = self._pick_emergency(now)
+        if batch is None or batch["state"] != BATCH_OPEN:
+            return
+        head = self._head()
+        if head is not None:
+            self._emergency_waits(batch["id"], f"head {head['id']}", now)
+
+    def _emergency_waits(self, batch_id: int | None, why: str, now: float) -> None:
+        self._reasons.append(f"emergency batch {batch_id} waits for {why} to land" if batch_id else why)
+        key = f"{batch_id}:{why}"
+        if self._state("emergency_waits") != key:
+            self._set_state("emergency_waits", key)
+            self.store.journal(now, "emergency-waits", batch_id, why=why)
+
+    def _pick_emergency(self, now: float) -> dict[str, Any] | None:
+        """Build the emergency batch for the oldest request, first in first out."""
+        for row in self._flagged_inputs():
+            if row["state"] == INPUT_RESERVED:
+                return None  # its ordinary probe is running; it is waiting or inserted afterwards
+            if isinstance(row["number"], SourceNumber) and (self.mixed is None or self.mixed.mode != "admit"):
+                with self.store.transaction():
+                    self._clear_emergency_request(row)
+                    self.store.journal(now, "emergency-refused", number=row["number"], reason="forgejo-inert")
+                continue
+            if row["state"] == INPUT_WAITING:
+                return self._build_emergency(row, now)
+            owner = self.store.row("batches", {"id": row["batch_id"]}) if row["batch_id"] is not None else None
+            if owner is None or owner["state"] not in (BATCH_OPEN, BATCH_HEAD):
+                continue
+            if owner["state"] == BATCH_HEAD:
+                # The running head carries the PR: it lands with the head, which is never evicted.
+                self._emergency_waits(None, f"emergency request #{row['number']} lands with head {owner['id']}", now)
+                return None
+            return self._emergency_singleton(row, owner, now)
+        return None
+
+    def _build_emergency(self, row: dict[str, Any], now: float) -> dict[str, Any] | None:
+        """Allocate the emergency batch on `main` for a waiting input and probe the input into it.
+
+        `_probe` runs unlocked; no transaction is held across it. Its refusals refuse the request
+        (`conflicts-with-main` and `missing-source` also cancel the input, as for any probe); a
+        transient failure (`probe-error`, `batch-moved`, `admission-pending`) ends the allocation and
+        keeps the request for the next pass."""
+        canonical = self._canonical
+        if canonical is None:
+            return None
+        with self.store.transaction():
+            batch = self._create_open_batch(canonical, now)
+            self.store.update("batches", {"id": batch["id"]}, urgent=URGENT_EMERGENCY)
+            evidence = loads(row["evidence"], {})
+            evidence["emergency"]["batch_id"] = batch["id"]
+            self.store.update("inputs", {"id": row["id"]}, evidence=dumps(evidence))
+            self.store.journal(now, "emergency-batch", batch["id"], number=row["number"], state=row["state"])
+        batch = self.store.row("batches", {"id": batch["id"]}) or batch
+        inserted = self._probe(self.store.row("inputs", {"id": row["id"]}) or row, batch, now)
+        current = self.store.row("batches", {"id": batch["id"]})
+        if current is None or current["state"] not in (BATCH_OPEN, BATCH_HEAD):
+            return None  # cancelled while the probe ran
+        if inserted:
+            return current
+        fresh = self.store.row("inputs", {"id": row["id"]}) or row
+        refused = None
+        if fresh["state"] == INPUT_CANCELLED:
+            refused = fresh["reason"]
+        elif fresh["state"] == INPUT_WAITING and (
+            fresh["last_probe"] == MISSING_SOURCE_IN_FLIGHT or fresh["last_probe"].startswith("source-ci-scope:")
+        ):
+            refused = fresh["last_probe"].split(":", 1)[0]
+        if refused is not None:
+            self._end_emergency(current, "empty-allocation", now, refused=refused)
+        else:
+            self._end_emergency(current, "empty-allocation", now, keep_request=True)
+        return None
+
+    def _emergency_singleton(self, row: dict[str, Any], owner: dict[str, Any], now: float) -> dict[str, Any] | None:
+        """Build the emergency batch for a PR inserted in open batch `owner` (the prospective singleton).
+
+        The PR's accepted head is replayed onto `main` without the lock, with the checks a probe makes
+        (conflict, new import gaps, source CI scope); nothing is written before that succeeds, so a
+        refusal leaves the input in `owner`. Then one transaction allocates E with its member and moves
+        the input's ownership to it, recording the displaced slot in `evidence.emergency.displaced`."""
+        slot = self.store.row("members", {"batch_id": owner["id"], "input_id": row["id"], "removed": 0})
+        canonical = self._canonical
+        if slot is None or slot["withdrawn"] or canonical is None:
+            return None
+        member = self._chain_member(slot)
+        chain_id = f"emergency-{row['id']}-{secrets.token_hex(4)}"
+        failure: chain.ChainError | None = None
+        result: chain.ChainResult | None = None
+        gaps: list[tuple[str, str]] = []
+        scope_supported = True
+        try:
+            with self._lock.unlocked():
+                if not self._fetch_head(row["number"], row["head_sha"]):
+                    raise chain.ChainError(f"accepted head {row['head_sha']} is not available")
+                result = chain.build(self.clone, canonical, [member], chain_id=chain_id)
+                gaps, _, scope_supported = self._replay_preflight(canonical, canonical, result)
+        except chain.ChainError as error:
+            failure = error
+        finally:
+            chain.delete_chain_ref(self.clone, chain_id)
+        if failure is not None:
+            self.store.journal(now, "emergency-build-error", owner["id"], number=row["number"], error=str(failure))
+            self._reasons.append(f"emergency batch for #{row['number']} could not be built: {failure}")
+            return None
+        assert result is not None
+        refused = (
+            "conflicts-with-main"
+            if result.status != chain.CLEAN
+            else "missing-source"
+            if gaps
+            else "source-ci-scope"
+            if not scope_supported and self._source_ci_required(row["number"], None)
+            else None
+        )
+        fresh = self.store.row("inputs", {"id": row["id"]})
+        if refused is not None:
+            if fresh is not None and self._emergency_requested(fresh):
+                with self.store.transaction():
+                    self._clear_emergency_request(fresh)
+                    self.store.journal(
+                        now, "emergency-refused", owner["id"], number=row["number"], reason=refused, kept_in=owner["id"]
+                    )
+            return None
+        current = self.store.row("batches", {"id": owner["id"]})
+        slot = self.store.row("members", {"id": slot["id"]})
+        if (
+            fresh is None
+            or not self._emergency_requested(fresh)
+            or fresh["state"] != INPUT_INSERTED
+            or fresh["batch_id"] != owner["id"]
+            or fresh["head_sha"] != row["head_sha"]
+            or current is None
+            or current["state"] != BATCH_OPEN
+            or slot is None
+            or slot["removed"]
+            or slot["withdrawn"]
+            or self._canonical != canonical
+            or self._emergency_batch() is not None
+        ):
+            return None  # something moved while the replay ran; the next pass tries again
+        record = result.commits[0]
+        with self.store.transaction():
+            batch = self._create_open_batch(canonical, now)
+            self.store.insert(
+                "members",
+                batch_id=batch["id"],
+                input_id=row["id"],
+                source_pr=member.source_pr,
+                number=row["number"],
+                accepted_head=row["head_sha"],
+                position=0,
+                commit_sha=record.sha,
+                provenance="clean",
+                added_at=now,
+                no_repair=row["no_repair"],
+            )
+            self.store.update("batches", {"id": batch["id"]}, version=1, tip=result.tip, urgent=URGENT_EMERGENCY)
+            self._record_tip(batch["id"], 1, result.tip, now)
+            self._retain(self.batch_ref(batch["id"], 1), result.tip)
+            evidence = loads(fresh["evidence"], {})
+            evidence["emergency"].update(
+                batch_id=batch["id"], displaced={"batch_id": owner["id"], "member_id": slot["id"]}
+            )
+            self.store.update("inputs", {"id": row["id"]}, batch_id=batch["id"], evidence=dumps(evidence))
+            self.store.journal(
+                now,
+                "emergency-batch",
+                batch["id"],
+                number=row["number"],
+                state=INPUT_INSERTED,
+                displaced_from=owner["id"],
+            )
+            self.store.journal(
+                now, "inserted", batch["id"], number=row["number"], version=1, commit=record.sha, empty=record.empty
+            )
+        return self.store.row("batches", {"id": batch["id"]})
+
+    def _end_emergency(
+        self,
+        batch: dict[str, Any],
+        cause: str,
+        now: float,
+        *,
+        keep_request: bool = False,
+        refused: str | None = None,
+        actor: str | None = None,
+    ) -> None:
+        """End emergency batch `batch` without landing it; the one request-scoped cleanup path.
+
+        In one transaction: its members leave it (`_return_members`, so `_emergency_exit`: back to a
+        live displaced slot, else waiting at the original age); an input its own probe holds reserved
+        waits again; the request is cleared unless `keep_request` (a transient `empty-allocation`, retried
+        next pass); its open tasks are superseded and its claims released; pre-rebases onto its tips are
+        discarded; it is removed; and a durable cancel intent is written for every unsettled attempt of
+        it at any version (`_write_cancel_intents`). The intents are then settled at once."""
+        input_id = self._emergency_input(batch)
+        number = None
+        with self.store.transaction():
+            for member in self._members(batch["id"]):
+                if not member["withdrawn"]:
+                    self._return_members(batch, [member], f"emergency-{cause}", now)
+            row = self.store.row("inputs", {"id": input_id}) if input_id is not None else None
+            if row is not None:
+                number = row["number"]
+                if row["state"] == INPUT_RESERVED and row["batch_id"] == batch["id"]:
+                    # Its own probe runs unlocked: the input waits again and the returning probe finds
+                    # it no longer reserved.
+                    self.store.update("inputs", {"id": row["id"]}, state=INPUT_WAITING, batch_id=None)
+                    row = self.store.row("inputs", {"id": row["id"]}) or row
+                if not keep_request and self._emergency_requested(row):
+                    self._clear_emergency_request(row)
+            for stale in self.store.rows("tasks", {"batch_id": batch["id"], "state": TASK_OPEN}):
+                self.store.update(
+                    "tasks", {"id": stale["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="emergency-ended"
+                )
+            for claim in self._active_claims(batch["id"]):
+                self._release_claim(claim, "superseded", now)
+            self._set_pre_rebase(batch, "", now)
+            current = self.store.row("batches", {"id": batch["id"]}) or batch
+            if current["version"] > 0:
+                # A version-0 allocation's only tip is `main`, which successor work may rightly be onto.
+                self._discard_pre_rebase("emergency-ended", now, current)
+            self.store.update("batches", {"id": batch["id"]}, state=BATCH_REMOVED)
+            self.store.journal(now, "batch-removed", batch["id"], reason=f"emergency-{cause}")
+            self.store.journal(
+                now,
+                "emergency-ended",
+                batch["id"],
+                number=number,
+                cause=cause,
+                retried=keep_request,
+                **({"refused": refused} if refused else {}),
+                **({"actor": actor} if actor else {}),
+            )
+            if refused:
+                self.store.journal(now, "emergency-refused", batch["id"], number=number, reason=refused)
+            self._clear_admission_state(batch["id"])
+            self._write_cancel_intents(batch, f"emergency batch ended ({cause})", now)
+            self._set_state("emergency_waits", None)
+        self._settle_cancel_intents(now)
+        self._wake.set()
+
+    # Durable run cancellation: `cancel_intent:<attempt>` (under `state:`) until the run is settled.
+
+    def _cancel_settled(self, attempt: dict[str, Any], now: float, *, looked_up: bool) -> bool:
+        """Nothing is left to cancel for the attempt: its cancel was accepted, its run completed, it never
+        had a run (`prepared`, `rejected`), or (after a lookup found none) an accepted dispatch is older
+        than `dispatch_timeout_seconds`. A `sending`/`uncertain` dispatch is never settled by age."""
+        if attempt["cancel_result"] in ("cancelled", "already-completed") or attempt["run_status"] == "completed":
+            return True
+        if attempt["dispatch_state"] in ("prepared", "rejected"):
+            return True
+        return bool(
+            looked_up
+            and not attempt["run_id"]
+            and attempt["dispatch_state"] in ("accepted", "legacy")
+            and now - (attempt["sent_at"] or attempt["dispatched_at"]) >= int(self.setting("dispatch_timeout_seconds"))
+        )
+
+    def _write_cancel_intents(self, batch: dict[str, Any], reason: str, now: float) -> None:
+        """Record a cancel intent for every unsettled attempt of `batch`, at any version; a pending one
+        becomes `superseded`. Called inside the caller's transaction."""
+        for attempt in self.store.rows("ci_attempts", {"batch_id": batch["id"]}, order="id"):
+            if self._cancel_settled(attempt, now, looked_up=False):
+                continue
+            key = f"cancel_intent:{attempt['id']}"
+            if self._state(key) is None:
+                self._set_state(key, {"batch_id": batch["id"], "reason": reason, "at": now})
+            if attempt["outcome"] == OUTCOME_PENDING:
+                self.store.update(
+                    "ci_attempts",
+                    {"id": attempt["id"], "outcome": OUTCOME_PENDING},
+                    outcome=OUTCOME_SUPERSEDED,
+                    outcome_detail=f"ci-superseded: {reason}",
+                )
+
+    def _cancel_intents(self) -> dict[int, dict[str, Any]]:
+        rows = self.store.query("SELECT key, value FROM settings WHERE key LIKE 'state:cancel_intent:%' ORDER BY key")
+        return {int(row["key"].rsplit(":", 1)[1]): loads(row["value"], {}) for row in rows}
+
+    def _drop_cancel_intent(self, attempt_id: int) -> None:
+        self.store.execute("DELETE FROM settings WHERE key=?", (f"state:cancel_intent:{attempt_id}",))
+
+    def _settle_cancel_intents(self, now: float) -> None:
+        """Pursue every cancel intent until its run is positively settled.
+
+        An attempt without a run whose dispatch may have been sent has its run looked up first, whatever
+        its outcome; a live run is cancelled. The intent is deleted only when the cancel was accepted,
+        the run is observed completed, or the attempt provably has no run (`_cancel_settled`). A failed
+        lookup or cancel keeps the intent for the next pass; there is no cap. Intents block nothing."""
+        for attempt_id, intent in self._cancel_intents().items():
+            attempt = self.store.row("ci_attempts", {"id": attempt_id})
+            if attempt is None or self._cancel_settled(attempt, now, looked_up=False):
+                self._drop_cancel_intent(attempt_id)
+                continue
+            try:
+                candidate_ci = self._candidate_coordinator(attempt_id=attempt_id)
+            except ControllerError:
+                continue  # retained for its disabled source's coordinator
+            if candidate_ci is None and self.store.row("ci_requests", {"attempt_id": attempt_id}) is not None:
+                continue
+            cancel = (
+                candidate_ci.cancel_run if candidate_ci is not None else getattr(self.execution, "cancel_run", None)
+            )
+            if cancel is None:
+                continue
+            if not attempt["run_id"]:
+                if attempt["dispatch_state"] not in {"sending", "uncertain", "accepted", "legacy"}:
+                    continue
+                try:
+                    if candidate_ci is not None:
+                        with self._lock.unlocked():
+                            run = candidate_ci.observe(attempt_id).run
+                    else:
+                        run = self.execution.find_candidate_run(
+                            self.repository,
+                            batch_id=str(attempt["batch_id"]),
+                            head_sha=attempt["head_sha"],
+                            base_sha=attempt["base_sha"],
+                            since=attempt["sent_at"] or attempt["dispatched_at"],
+                        )
+                except Exception as error:  # noqa: BLE001 - retried next pass
+                    self.log.warning("cancel intent %s: run lookup failed: %s", attempt_id, error)
+                    self._note_reason(f"cancel intent for CI attempt {attempt_id}: run lookup failed")
+                    continue
+                others = {
+                    str(a["run_id"])
+                    for a in self.store.rows("ci_attempts", {"batch_id": attempt["batch_id"]})
+                    if a["id"] != attempt_id and a["run_id"]
+                }
+                if run is not None and str(run.run_id) not in others:
+                    self.store.update("ci_attempts", {"id": attempt_id}, run_id=run.run_id, run_status=run.status)
+                    attempt = self.store.row("ci_attempts", {"id": attempt_id}) or attempt
+                elif self._cancel_settled(attempt, now, looked_up=True):
+                    self._drop_cancel_intent(attempt_id)
+                    continue
+                else:
+                    continue
+            if attempt["run_status"] == "completed":
+                self._drop_cancel_intent(attempt_id)
+                continue
+            run_id = str(attempt["run_id"])
+            try:
+                if candidate_ci is not None:
+                    with self._lock.unlocked():
+                        result = cancel(run_id)
+                else:
+                    result = cancel(self.repository, run_id)
+            except Exception as error:  # noqa: BLE001 - retried next pass
+                result = f"failed: {str(error)[:200]}"
+            with self.store.transaction():
+                self.store.update(
+                    "ci_attempts",
+                    {"id": attempt_id},
+                    cancelled_at=attempt["cancelled_at"] or now,
+                    cancel_reason=intent.get("reason", ""),
+                    cancel_result=result,
+                )
+                self.store.journal(
+                    now,
+                    "ci-cancelled",
+                    attempt["batch_id"],
+                    attempt_id=attempt_id,
+                    run_id=run_id,
+                    reason=intent.get("reason", ""),
+                    result=result,
+                    intent=True,
+                )
+                if result in ("cancelled", "already-completed"):
+                    self._count("ci_runs_cancelled")
+                    self._drop_cancel_intent(attempt_id)
+
+    # Claimed successor work across the emergency batch becoming the head.
+
+    def _preserve_successor_tasks(self, now: float) -> None:
+        """Record `{task: onto}` for every claimed `pre_rebase` task and claimed pre-rebased `prepare`
+        task of an ordinary open batch, as the emergency batch becomes the head: their intended parent
+        (the previous head's tip) is no longer `_pre_rebase_target`, but their owner may still submit
+        onto it (`_preserved_onto`); the next `_pre_rebase` then carries the result onto the new head."""
+        preserved = {}
+        for batch in self._staging_batches():
+            for claim in self._active_claims(batch["id"]):
+                task = self.store.row("tasks", {"id": claim["task_id"]}) if claim["task_id"] is not None else None
+                if task is not None and task["state"] == TASK_OPEN:
+                    if task["kind"] == TASK_PRE_REBASE or self._pre_rebased_prepare(task):
+                        preserved[str(task["id"])] = task["onto"]
+        self._set_state("emergency_preserved", preserved)
+        if preserved:
+            self.store.journal(now, "emergency-preserved", tasks=sorted(int(task_id) for task_id in preserved))
+
+    def _preserved_onto(self, task: dict[str, Any]) -> str | None:
+        """The parent a preserved task may still submit onto, while it is open and claimed."""
+        onto = (self._state("emergency_preserved") or {}).get(str(task["id"]))
+        if onto is None or task["state"] != TASK_OPEN or not self._active_claims(task["batch_id"], task_id=task["id"]):
+            return None
+        return onto
+
+    def _preserved_tasks(self, batch: dict[str, Any]) -> list[dict[str, Any]]:
+        """The batch's preserved tasks still claimed: its stored pre-rebase is not rewritten under them."""
+        if not self._state("emergency_preserved"):
+            return []
+        return [
+            task
+            for task in self.store.rows("tasks", {"batch_id": batch["id"], "state": TASK_OPEN})
+            if self._preserved_onto(task) is not None
+        ]
+
+    def _prune_preserved(self) -> None:
+        preserved = self._state("emergency_preserved") or {}
+        kept = {
+            task_id: onto
+            for task_id, onto in preserved.items()
+            if (task := self.store.row("tasks", {"id": int(task_id)})) is not None and self._preserved_onto(task)
+        }
+        if kept != preserved:
+            self._set_state("emergency_preserved", kept)
+
+    def _emergency_status(self) -> dict[str, Any]:
+        """`/status`'s `emergency`: the live emergency batch, the queued requests and the open cancel intents."""
+
+        def request(row: dict[str, Any]) -> dict[str, Any]:
+            record = loads(row["evidence"], {}).get("emergency") or {}
+            return {
+                "number": int(row["number"]),
+                **self._public_pull_identity(row["number"]),
+                "state": row["state"],
+                **{key: record.get(key) for key in ("actor", "requested_at", "surface", "reason")},
+            }
+
+        batch = self._emergency_batch()
+        active = None
+        if batch is not None:
+            input_id = self._emergency_input(batch)
+            row = self.store.row("inputs", {"id": input_id}) if input_id is not None else None
+            head = self._head()
+            waiting_for = None
+            if batch["state"] == BATCH_OPEN:
+                waiting_for = (
+                    f"head {head['id']} to land"
+                    if head is not None
+                    else "a member"
+                    if not self._active_members(batch)
+                    else "sealing"
+                )
+            active = {
+                "batch_id": batch["id"],
+                "stage": "head" if batch["state"] == BATCH_HEAD else "waiting",
+                "waiting_for": waiting_for,
+                **(request(row) if row is not None else {}),
+            }
+        served = {self._emergency_input(batch)} if batch is not None else set()
+        return {
+            "enabled": bool(self.setting("emergency_enabled")),
+            "batch": active,
+            "queued": [request(row) for row in self._flagged_inputs() if row["id"] not in served],
+            "cancel_intents": [
+                {"attempt_id": attempt_id, **intent} for attempt_id, intent in self._cancel_intents().items()
+            ],
+        }
+
     # --- sealing -----------------------------------------------------------------------------------
 
     def _seal(self, now: float) -> None:
         if self._head() is not None:
             self._seal_successor(now)
             return
-        batch = self._open_batch()
+        # The emergency batch is staged ahead of every open batch (`_emergency_ready`).
+        batch = self._emergency_ready() or self._open_batch()
         if batch is None or not self._members(batch["id"]):
             return
-        if self._state("inference_hold"):
-            self._reasons.append("inference hold: not sealing")
+        blocked = self._seal_blocked(batch)
+        if blocked is not None:
+            reason, claimed = blocked
+            if claimed:
+                self._seal_successor(now)
+            self._reasons.append(reason)
             return
+        self._make_head(batch, now)
+        self._seal_successor(now)
+
+    def _seal_blocked(self, batch: dict[str, Any]) -> tuple[str, bool] | None:
+        """Why `batch` cannot become the head now, and whether that is a claim on it; None when it can."""
+        if self._state("inference_hold"):
+            return "inference hold: not sealing", False
         blocked = self._external_head_blocks_sealing()
         if blocked:
-            self._reasons.append(blocked)
-            return
-        claims = self._active_claims(batch["id"])
-        if claims:
+            return blocked, False
+        if self._active_claims(batch["id"]):
             # Keep the batch open while its owner prepares or pre-rebases it. Adoption uses the
             # ordinary open-batch validation, and the next head keeps the completed work.
-            self._seal_successor(now)
-            self._reasons.append(f"open batch {batch['id']} is claimed; sealing waits for the release")
-            return
+            return f"open batch {batch['id']} is claimed; sealing waits for the release", True
+        return None
+
+    def _make_head(self, batch: dict[str, Any], now: float) -> None:
+        """Seal `batch` as the head, which `_seal_blocked` allowed."""
         with self.store.transaction():
             # Unclaimed background offers give way to the new head's own work.
             self._supersede_prepare(batch["id"], "sealed", now)
@@ -4049,9 +4866,11 @@ class Controller:
                 size=len(self._members(batch["id"])),
                 urgent=batch["urgent"],
             )
+            if batch["urgent"] == URGENT_EMERGENCY:
+                self._preserve_successor_tasks(now)
+                self.store.journal(now, "emergency-head", batch["id"], version=batch["version"])
             if self._canonical is not None and not self._unsealed_batches():
                 self._create_open_batch(self._canonical, now)
-        self._seal_successor(now)
 
     def _seal_successor(self, now: float) -> None:
         """Freeze oldest unsealed batches at the threshold until two active batches are sealed.
@@ -4063,7 +4882,7 @@ class Controller:
         minimum = int(self.setting("sealed_successor_min_members"))
         if minimum == 0 or self._state("inference_hold") or self._external_head_blocks_sealing():
             return
-        sealed = int(self._head() is not None) + sum(bool(batch["sealed"]) for batch in self._open_batches())
+        sealed = int(self._head() is not None) + sum(bool(batch["sealed"]) for batch in self._staging_batches())
         # Promotion may be waiting for the oldest preparation owner even after the previous
         # head landed. That still leaves capacity for a second sealed batch; do not wait for
         # the first to become head before freezing the next one's membership.
@@ -4096,6 +4915,10 @@ class Controller:
     def _reconcile_head(self, now: float) -> None:
         head = self._head()
         if head is None:
+            return
+        if head["urgent"] == URGENT_EMERGENCY and not self._active_members(head):
+            # Emptied between tick steps (a submission withdrew its member): never dispatched.
+            self._end_emergency(head, "emptied", now)
             return
         canonical = self._canonical
         assert canonical is not None
@@ -4258,7 +5081,7 @@ class Controller:
                 self._supersede_prepare(task["batch_id"], "batch-changed", now, own_base_only=True)
         if not self.setting("prepare_open_batches") or self._state("inference_hold"):
             return
-        for batch in self._open_batches():
+        for batch in self._staging_batches():
             successor = self._open_batch()
             if (
                 self.setting("prepare_pre_rebased")
@@ -4454,7 +5277,7 @@ class Controller:
             task["state"] == TASK_OPEN
             and batch["state"] == BATCH_OPEN
             and chain.is_ancestor(self.clone, task["tip"], batch["tip"])
-            and task["onto"] == self._pre_rebase_target()
+            and task["onto"] in (self._pre_rebase_target(), self._preserved_onto(task))
         )
 
     def _set_pre_rebase(
@@ -4509,11 +5332,18 @@ class Controller:
             superseded += 1
         return superseded
 
-    def _discard_pre_rebase(self, reason: str, now: float) -> None:
-        """The head was reshaped (rebuilt, or a member shrunk to nothing): forget every open batch's
-        pre-rebase, edits included, and supersede its task; the next pass replays from scratch."""
+    def _discard_pre_rebase(self, reason: str, now: float, reshaped: dict[str, Any]) -> None:
+        """`reshaped` was reshaped (rebuilt, emptied, removed, or a member shrunk to nothing): forget the
+        open batches' pre-rebases onto any of its recorded tips, edits included, and supersede their
+        tasks; the next pass replays from scratch. In normal operation only the first open batch has a
+        pre-rebase, onto the head; a pre-rebase onto another batch's tip (the emergency lane) is kept."""
+        tips = {row["tip"] for row in self.store.rows("batch_tips", {"batch_id": reshaped["id"]})} | {reshaped["tip"]}
         for batch in self._open_batches():
             if not batch["pre_rebase_state"] and self._open_pre_rebase_task(batch) is None:
+                continue
+            task = self._open_pre_rebase_task(batch)
+            onto = batch["pre_rebase_onto"] if batch["pre_rebase_state"] else (task or {}).get("onto")
+            if batch["id"] != reshaped["id"] and onto not in tips:
                 continue
             with self.store.transaction():
                 self._set_pre_rebase(batch, "", now)
@@ -4546,6 +5376,9 @@ class Controller:
         self._supersede_stale_pre_rebase(now)
         batch = self._open_batch()
         if batch is None or not self._members(batch["id"]):
+            return
+        if self._preserved_tasks(batch):
+            self._note_reason(f"open batch {batch['id']} waits for claimed pre-rebase work")
             return
         head = self._head()
         if self._pre_rebase_blocked(head) is not None:
@@ -4694,7 +5527,7 @@ class Controller:
             and batch["pre_rebase_state"] in PRE_REBASE_USABLE
             and bool(batch["pre_rebase_tip"])
             and batch["pre_rebase_onto"] == task["onto"]
-            and task["onto"] == self._pre_rebase_target()
+            and task["onto"] in (self._pre_rebase_target(), self._preserved_onto(task))
             and chain.is_ancestor(self.clone, task["tip"], batch["pre_rebase_tip"])
         )
 
@@ -4731,6 +5564,8 @@ class Controller:
         preparation of the same chain that was adopted, released clean or failed is not repeated."""
         if not self.setting("prepare_pre_rebased") or not self.setting("prepare_open_batches"):
             return "prepare_pre_rebased is off"
+        if self._preserved_tasks(batch):
+            return "waits for claimed pre-rebase work"
         if not batch["sealed"] and len(self._members(batch["id"])) < max(1, int(self.setting("prepare_min_members"))):
             return "below prepare_min_members"
         if batch["pre_rebase_state"] not in PRE_REBASE_USABLE or not batch["pre_rebase_tip"]:
@@ -5144,7 +5979,7 @@ class Controller:
                     superseded += 1
                 self._retain(self.batch_ref(head["id"], version), result.tip)
                 self._count("head_rebuilds")
-                self._discard_pre_rebase("head-rebuilt", now)
+                self._discard_pre_rebase("head-rebuilt", now, head)
                 self.store.journal(
                     now,
                     "rebuilt",
@@ -6729,6 +7564,9 @@ class Controller:
             elif active:
                 cause += "; this PR is the only member left on the batch, so the failure is its own"
                 action, detail = "withdraw", self._withdraw_from_head(head, active, failure, cause, now)
+            elif head["urgent"] == URGENT_EMERGENCY:
+                self._end_emergency(head, "dissolved", now)
+                action, detail = "dissolve", "no active member was left; the emergency batch ended"
             else:
                 action, detail = "dissolve", self._dissolve_head(head, cause, now)
         except Exception as error:  # noqa: BLE001 - a failed escalation must hold with an alert, not stall silently
@@ -6829,7 +7667,7 @@ class Controller:
             for claim in self._active_claims(head["id"]):
                 self._release_claim(claim, "escalated", now)
             self._set_pre_rebase(head, "", now)
-            self._discard_pre_rebase("head-dissolved", now)
+            self._discard_pre_rebase("head-dissolved", now, head)
             self.store.journal(now, "head-dissolved", head["id"], version=head["version"], cause=cause)
         self._remove_batch(head, "dissolved", now)
         self._wake.set()
@@ -6927,6 +7765,8 @@ class Controller:
         """Take members out of the head (`removed`); an input still inserted waits again at its original age.
         Called inside the caller's transaction."""
         for member in members:
+            # The emergency batch's member returns to the slot it was displaced from, when that is live.
+            self._emergency_exit(head, member, now)
             self.store.update("members", {"id": member["id"]}, removed=1, removed_reason=reason)
             row = self.store.row("inputs", {"id": member["input_id"]})
             if row is not None and row["state"] == INPUT_INSERTED and row["batch_id"] == head["id"]:
@@ -6957,7 +7797,7 @@ class Controller:
         for claim in self._active_claims(head["id"]):
             self._release_claim(claim, "escalated", now)
         self._set_pre_rebase(head, "", now)
-        self._discard_pre_rebase("head-shrunk", now)
+        self._discard_pre_rebase("head-shrunk", now, head)
         self._cancel_superseded_runs(head["id"], now, reason=f"head {resolution}")
         self._wake.set()
 
@@ -7136,6 +7976,8 @@ class Controller:
         external_members: set[int] = set()
         landed_ranges: dict[str, dict[str, str]] = {}
         for member in everyone:
+            if self._displaced(batch, member):
+                continue  # its input is the emergency batch's, which lands or returns it
             if member["withdrawn"]:
                 source = self.store.row("inputs", {"id": member["input_id"]}) or {}
                 if source.get("reason") != EMPTY_COMMIT or source.get("state") != INPUT_CANCELLED:
@@ -7158,7 +8000,13 @@ class Controller:
             else:
                 members.append(member)
         with self.store.transaction():
+            # An emptied emergency member returns to its live displaced slot instead of being rejected.
+            rejected = [member for member in rejected if not self._emergency_exit(batch, member, now)]
             self.store.update("batches", {"id": batch["id"]}, state=BATCH_LANDED, landed_at=now, landed_how=how)
+            if batch["urgent"] == URGENT_EMERGENCY:
+                self.store.journal(
+                    now, "emergency-landed", batch["id"], tip=batch["tip"], members=[m["number"] for m in members]
+                )
             if candidate_ci is not None:
                 self.store.execute("DELETE FROM settings WHERE key=?", (f"source-ci:freeze-error:{batch['id']}",))
                 for recorded_attempt in self.store.rows("ci_attempts", {"batch_id": batch["id"]}):
@@ -7223,9 +8071,14 @@ class Controller:
                 for member in rejected:
                     self._enqueue_rejection_effects(batch, member)
             self._interacting_landed({m["number"] for m in members}, now)
+            if batch["urgent"] == URGENT_EMERGENCY:
+                self._write_cancel_intents(batch, "emergency batch landed", now)
         if self.mixed is not None and self.mixed.mode == "admit" and self.setting("publication_enabled"):
             self._enqueue("mixed-sync", f"mixed-sync:{self.mixed.generation}:{batch['id']}:{batch['tip']}", {})
-        self._cancel_superseded_runs(batch["id"], now, reason="batch landed")
+        if batch["urgent"] == URGENT_EMERGENCY:
+            self._settle_cancel_intents(now)
+        else:
+            self._cancel_superseded_runs(batch["id"], now, reason="batch landed")
         self._wake.set()
 
     def _enqueue_rejection_effects(self, batch: dict[str, Any], member: dict[str, Any]) -> None:
@@ -7287,7 +8140,22 @@ class Controller:
         (`_no_repair_edits`). Its input is cancelled with `reason`, its approval is withdrawn (a new
         approval brings it back), and the author gets `comment` once through the outbox, keyed by the
         input, with the membership label removed. Called inside the caller's transaction.
+
+        A displaced slot (`_displaced`) and an emergency member whose displaced slot is still live
+        (`_emergency_exit`) are only marked withdrawn: the input, its approval and the PR are left alone.
         """
+        if self._displaced(batch, member) or self._emergency_exit(batch, member, now):
+            self.store.update("members", {"id": member["id"]}, withdrawn=1)
+            self.store.journal(
+                now,
+                journal_kind,
+                batch["id"],
+                number=member["number"],
+                member_id=member["id"],
+                reason=reason,
+                slot_only=True,
+            )
+            return
         self.store.update("members", {"id": member["id"]}, withdrawn=1)
         self.store.update(
             "inputs",
@@ -7655,7 +8523,12 @@ class Controller:
         author is told the problem is not yet reproducible on their branch. The approval is not reused:
         the PR comes back through `needs-rebase` and re-approval once the other side lands, or is
         re-admitted at its original age if the other side leaves the queue without landing (`_follow_anticipated`).
+        A displaced slot, or an emergency member returned to its live displaced slot, is only marked withdrawn.
         """
+        if self._displaced(batch, member) or self._emergency_exit(batch, member, now):
+            self.store.update("members", {"id": member["id"]}, withdrawn=1)
+            self.store.journal(now, PROBLEM_ANTICIPATED, batch["id"], number=member["number"], slot_only=True)
+            return
         attribution = self._attribution(
             explanation,
             member["number"],
@@ -8334,6 +9207,8 @@ class Controller:
             self._promotion_send_state(payload, "settled")
             self._landed(batch, "promoted", now)
             return "already-visible"
+        if batch["state"] != BATCH_HEAD:
+            return "not-head"  # removed (an emergency batch cancelled before its promotion was sent)
         if candidate_ci is not None:
             attempt = self.store.row("ci_attempts", {"id": payload["attempt_id"]})
             if (
@@ -8592,6 +9467,7 @@ class Controller:
                     (self._open_batch_summary(batch, now) for batch in open_batches if batch["sealed"]), None
                 ),
                 "head": head_status,
+                "emergency": self._emergency_status(),
                 "external_head": self._external_head_status(),
                 "approvals": {
                     "webhook": counters.get("approvals_webhook", 0),
@@ -8680,6 +9556,7 @@ class Controller:
             "tip": batch["tip"],
             "size": len(members),
             "urgent": bool(batch["urgent"]),
+            "emergency": batch["urgent"] == URGENT_EMERGENCY,
             "oldest_member_age_seconds": (now - min(m["added_at"] for m in members)) if members else None,
             **self._preparation_status(batch, members, now),
             "pre_rebase": self._pre_rebase_status(batch),
@@ -8781,6 +9658,7 @@ class Controller:
             "tip": batch["tip"],
             "size": len(members),
             "urgent": bool(batch["urgent"]),
+            "emergency": batch["urgent"] == URGENT_EMERGENCY,
             "oldest_member_age_seconds": (now - min(m["added_at"] for m in members)) if members else None,
             "members": [
                 {

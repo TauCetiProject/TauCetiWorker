@@ -397,6 +397,16 @@ class Generated(unittest.TestCase):
         self.assertIn("null", derived["keys"]["requested_batch"]["types"])
 
 
+class AdminScope(unittest.TestCase):
+    def test_an_admin_reapproval_counts_only_at_its_own_head_and_never_replaces_admin_evidence(self):
+        original = {"admin": True, "actor_id": 1, "merge_base_sha": MERGE_BASE}
+        again = {"actor_id": 2, "merge_base_sha": BASE, "head_sha": HEAD}
+        self.assertEqual(feeds._admin_scope(dict(original, admin_reapproval=again), HEAD)["actor_id"], 1)
+        self.assertEqual(feeds._admin_scope({"admin": False, "admin_reapproval": again}, HEAD)["actor_id"], 2)
+        self.assertIsNone(feeds._admin_scope({"admin": False, "admin_reapproval": again}, TIP))
+        self.assertIsNone(feeds._admin_scope({"admin": False}, HEAD))
+
+
 if __name__ == "__main__":
     unittest.main()
 
