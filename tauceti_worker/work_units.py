@@ -1583,9 +1583,10 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         except Exception as error:  # noqa: BLE001 - an attestation problem must not fail the round
             log(f"  {stage} #{c.pr}: self-tested attestation failed ({one_line(str(error))}); ordinary CI continues")
     if stage in SELF_TESTED_STAGES and not bubble and not opts.dry_run:
-        # The review bot clears `self-tested` on every push, so the worker labels each head the
-        # round published once it has checked the live head, this round's verification receipt
-        # for exactly that commit, and the change's eligibility (self_tested_label).
+        # `self-tested` persists across pushes; the worker also labels each head the round
+        # published, in case the agent did not, once it has checked the live head, this round's
+        # verification receipt for exactly that commit, and the change's eligibility
+        # (self_tested_label).
         try:
             from .self_tested_label import label_round_pushes
 

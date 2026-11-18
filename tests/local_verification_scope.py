@@ -332,6 +332,13 @@ def main():
                 and "--remove-label self-tested" in text
                 and "A push clears" not in text,
             )
+            check(
+                f"self-tested helper={helper}: remove only on failed local verification, never for PR CI",
+                "Remove it only when local verification of the current head actually fails" in text
+                and "verification fails or is incomplete" not in text
+                and "Never remove `self-tested` (or post `-self-tested`) to request or re-trigger PR CI" in text
+                and "`awaiting-CI` or `ci-failed` labels" in text,
+            )
             for policy in ("bump", "full-lint", "lint-repair"):
                 check(
                     f"self-tested helper={helper}: excludes {policy}",
