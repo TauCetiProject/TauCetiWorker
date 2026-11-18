@@ -709,6 +709,79 @@ ci="one/project"
         self.assertEqual(execute.call_count, 2)
         self.assertEqual(execute.call_args.args[1].only, ["review"])
 
+    def outage_round(self, *, github=None, forgejo=None, new_pr_forge="github"):
+        """Run one multi-source round over fake observations; return the executed (source, stage)."""
+        import contextlib
+
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import RoundOpts
+
+        observations = []
+        if github is not None:
+            observations.append(
+                ("github", SimpleNamespace(cfg=self.cfg, gh=SimpleNamespace(repo="one/project")), github)
+            )
+        if forgejo is not None:
+            observations.append(("forgejo", SimpleNamespace(cfg=self.cfg, gh=self.source), forgejo))
+        executed = []
+
+        def execute(worker, opts, prepared_survey):
+            executed.append((next(name for name, w, _ in observations if w is worker), opts.only))
+            return 0
+
+        options = RoundOpts(
+            only=["fix", "review", "roadmap"], agent="auto", work_model="auto", sandbox_host=True, dry_run=True
+        )
+        with (
+            patch.dict(os.environ, {"TAUCETI_NEW_PR_FORGE": new_pr_forge}),
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.multi_source.activate", return_value=contextlib.nullcontext()),
+            patch("tauceti_worker.work_units.run_round", side_effect=execute),
+        ):
+            return run_round(None, options, use_fleet_focus=False), executed
+
+    def forgejo_without_refs(self):
+        # The observed outage: the native inventory lists PRs whose head SHA is empty.
+        return self.native_survey([self.row(head="")])
+
+    def github_with_fix(self):
+        survey = Survey(worker_id="test")
+        survey.kind("fix").actionable.append(Candidate(1, "a" * 40))
+        return survey
+
+    def test_mixed_worker_continues_github_work_through_a_forgejo_outage(self):
+        down = self.forgejo_without_refs()
+        self.assertTrue(down.github_failed)
+        self.assertEqual(down.dependency_wait["dependency"], "source-forge")
+        self.assertEqual(self.outage_round(github=self.github_with_fix(), forgejo=down), (0, [("github", ["fix"])]))
+
+    def test_mixed_worker_continues_forgejo_work_through_a_github_outage(self):
+        down = Survey(worker_id="test", github_failed=True)
+        down.errors.append("GitHub discovery unavailable (Die)")
+        native = Survey(worker_id="test")
+        native.reviewable.actionable.append(Candidate(2, "b" * 40))
+        result = self.outage_round(github=down, forgejo=native, new_pr_forge="forgejo")
+        self.assertEqual(result, (0, [("forgejo", ["review"])]))
+
+    def test_partial_inventory_waits_instead_of_authoring(self):
+        # Open Forgejo PRs' targets are unknown, so new GitHub authoring could duplicate them.
+        from tauceti_worker.config import SharedStateUnavailable
+
+        with self.assertRaises(SharedStateUnavailable) as raised:
+            self.outage_round(github=Survey(worker_id="test"), forgejo=self.forgejo_without_refs())
+        self.assertEqual(raised.exception.dependency, "source-forge")
+
+    def test_single_source_outage_still_waits(self):
+        from tauceti_worker.config import NoProgress, SharedStateUnavailable
+
+        with self.assertRaises(SharedStateUnavailable) as raised:
+            self.outage_round(forgejo=self.forgejo_without_refs(), new_pr_forge="forgejo")
+        self.assertEqual(raised.exception.dependency, "source-forge")
+        self.assertIn("inventory_projection", str(raised.exception))
+        down = Survey(worker_id="test", github_failed=True)
+        with self.assertRaisesRegex(NoProgress, "all selected source surveys are unavailable"):
+            self.outage_round(github=down)
+
     def test_shared_github_intentions_use_the_github_identity(self):
         from tauceti_worker.intentions import own_identities
 

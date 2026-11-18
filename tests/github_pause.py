@@ -202,7 +202,7 @@ class GitHubPauseTests(unittest.TestCase):
             admit.assert_called_once()
             status.assert_called_once_with(publication_pending_count=1)
 
-    def drive(self, codes, retry_at):
+    def drive(self, codes, retry_at, **snapshot):
         args = cli.build_parser().parse_args(["work", "--agent", "claude", "--claude-billing", "api", "--loop"])
         waits, statuses = [], []
 
@@ -216,7 +216,11 @@ class GitHubPauseTests(unittest.TestCase):
             patch.object(loop, "api_mode", return_value=True),
             patch.object(loop, "github_budget", return_value={}),
             patch.object(loop, "run_round_subprocess", side_effect=codes),
-            patch.object(loop, "runtime_snapshot", return_value={"next_action_at": retry_at, "detail": "quota reset"}),
+            patch.object(
+                loop,
+                "runtime_snapshot",
+                return_value={"next_action_at": retry_at, "detail": "quota reset", **snapshot},
+            ),
             patch.object(loop, "report_runtime", side_effect=lambda state=None, **kw: statuses.append((state, kw))),
             patch.object(loop.time, "time", return_value=1000),
             patch.object(loop.time, "sleep", side_effect=sleep),
@@ -233,6 +237,14 @@ class GitHubPauseTests(unittest.TestCase):
     def test_expired_reset_and_unknown_acknowledgement_recheck_promptly(self):
         self.assertEqual(self.drive([EX_GITHUB_WAIT], 999)[0], [1])
         self.assertEqual(self.drive([EX_GITHUB_WAIT, EX_GITHUB_WAIT], None)[0], [5, 5])
+
+    def test_wait_names_the_forge_it_waits_on(self):
+        for dependency, forge in (("source-forge", "forgejo"), ("github-state", "github"), (None, "github")):
+            with patch.object(loop, "log") as log:
+                self.drive([EX_GITHUB_WAIT], None, wait_dependency=dependency)
+            self.assertIn(
+                f"{forge}: quota reset — rechecking after", " ".join(str(call) for call in log.call_args_list)
+            )
 
     def test_infrastructure_wait_resets_unrelated_no_progress_streak(self):
         self.assertEqual(self.drive([EX_NOPROGRESS, EX_GITHUB_WAIT, EX_NOPROGRESS], 1002)[0], [60, 3, 60])

@@ -362,7 +362,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     max(1, retry_at - now + 1) if isinstance(retry_at, (int, float)) and math.isfinite(retry_at) else 5
                 )
                 reason = paused.get("detail") or "GitHub publication recovery pending"
-                log(f"github: {reason} — rechecking after {nap:.1f}s")
+                # A native source survey waits through the same exit status; name the forge it waits on.
+                forge = "forgejo" if paused.get("wait_dependency") == "source-forge" else "github"
+                log(f"{forge}: {reason} — rechecking after {nap:.1f}s")
                 report_runtime(
                     "waiting-github",
                     detail=reason,
