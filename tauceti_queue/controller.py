@@ -67,6 +67,13 @@ DISPATCH_EVENT = "tauceti-bors-staging"
 REPAIR_OUTPUTS_PREVIOUS_TIPS = 4
 # How many of the most recently landed heads lend their published tips as fetch candidates.
 REPAIR_OUTPUTS_LANDED_HEADS = 2
+# Staging is dispatched only on a base with a published Lake cache (`Controller._base_cache_ready`).
+# The base is covered by the revision map of itself or of a first-parent ancestor at most this many
+# commits back whose difference from the base touches no Lake build input (`lake_build_input`).
+BASE_CACHE_ANCESTORS = 20
+# `batches.urgent` of an emergency batch, which dispatches without waiting for a published base: it
+# is the means of publishing `main` again after an out-of-queue push.
+URGENT_EMERGENCY = 2
 MERGED_TITLE_PREFIX = "[Merged by Bors] - "  # what bors-ng writes when it closes a squash-landed member
 COMMENT_MARKER = "tauceti-queue"
 
@@ -161,6 +168,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "automatic_retry_max_seconds": 14400,
     # How long an escalation stays among the status page's alerts.
     "escalation_alert_seconds": 86400,
+    # Staging is dispatched only on a base whose exact Lake revision map (or that of an ancestor with
+    # the same build inputs) is published at this public endpoint, the one `pr-build.yml` reads
+    # (`LAKE_CACHE_REVISION_ENDPOINT_PUBLIC`). Empty disables the requirement. A base found
+    # unpublished is probed again after `base_cache_recheck_seconds`; a wait of
+    # `base_cache_alert_seconds` raises a status alert and one direct message (0: never).
+    "base_cache_endpoint": "https://cache.taucetiproject.org/revisions",
+    "base_cache_recheck_seconds": 120,
+    "base_cache_alert_seconds": 7200,
 }
 
 # The actor of the values `seed_setting` writes from the configuration file's `[settings]`.
@@ -272,6 +287,38 @@ _FINDING_RE = re.compile(r"^\s*Finding:\s*(?P<finding>\S.*?)\s*$", re.M | re.I)
 EXTERNAL_HEAD_RUNNING = "running"
 EXTERNAL_HEAD_LANDED = "landed"
 EXTERNAL_HEAD_RELEASED = "released"
+
+
+def lake_build_input(path: str) -> bool:
+    """Whether a change to `path` can change a Lake input hash of the root package's published outputs.
+
+    Lake hashes each module's source and imports, the toolchain, the package configuration (whose
+    `leanOptions` reach every module) and, through the manifest, the dependencies' revisions. The
+    root package's modules are `TauCeti.lean`, `TauCeti/**.lean` and the `lean_exe` roots under
+    `scripts/`; every `.lean` file counts, which also covers nested packages, conservatively."""
+    return path.endswith(".lean") or path in ("lakefile.toml", "lakefile.lean", "lake-manifest.json", "lean-toolchain")
+
+
+def revision_map_published(url: str, *, timeout: float = 30.0) -> bool:
+    """Whether `url` serves a Lake revision map: an anonymous GET, validated like `lake_cache_probe.probe`.
+    A 404 is False; any other failure raises, which the caller treats as unpublished."""
+    import urllib.error
+    import urllib.request
+
+    from tauceti_tools.assets.scripts.lake_cache_probe import parse_map
+
+    from .github_app import ssl_context
+
+    request = urllib.request.Request(url, headers={"User-Agent": "tauceti-queue"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout, context=ssl_context()) as response:
+            raw = response.read()
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return False
+        raise
+    parse_map(raw)
+    return True
 
 
 class ControllerError(Exception):
@@ -438,6 +485,7 @@ class Controller:
         rng: random.Random | None = None,
         logger: logging.Logger | None = None,
         notifier: escalation.Notifier | None = None,
+        revision_map_probe: Callable[[str], bool] | None = None,
     ) -> None:
         with store.transaction():
             if store.get_setting("queue:operating-mode") not in {None, "controller"}:
@@ -564,6 +612,11 @@ class Controller:
         self.notifier = notifier
         # The service's public URL (configuration `public_url`), linked from notifications when set.
         self.public_url = ""
+        # Reads a Lake revision-map URL for the published-base requirement (`_base_cache_ready`). None
+        # (the fixtures, native sources) leaves the requirement off; the service passes
+        # `revision_map_published`. Per base: (covering revision or None, checked at, detail).
+        self.revision_map_probe = revision_map_probe
+        self._base_cache: dict[str, tuple[str | None, float, str]] = {}
 
     # --- settings ----------------------------------------------------------------------------------
 
@@ -5533,6 +5586,112 @@ class Controller:
                     error,
                 )
 
+    def _covering_revision(self, base: str, endpoint: str) -> tuple[str | None, str]:
+        """The revision whose published Lake map serves `base`, or None, with what was found.
+
+        Git and HTTP only, called without the controller lock. The candidates are `base` and then its
+        first-parent ancestors (at most `BASE_CACHE_ANCESTORS`), newest first, as far as their trees
+        differ from the base's only outside the Lake build inputs; staging's cache lookup asks for the
+        base exactly and then walks those ancestors, and for such an ancestor every input hash matches."""
+        from tauceti_tools.assets.scripts.lake_cache_probe import exact_map_url
+
+        assert self.revision_map_probe is not None
+        shown = chain._git(self.clone, "show", f"{base}:lean-toolchain")
+        if shown.returncode != 0:
+            return None, "the base has no lean-toolchain"
+        toolchain = shown.stdout.strip()
+        listed = chain._git(self.clone, "rev-list", "--first-parent", f"--max-count={BASE_CACHE_ANCESTORS + 1}", base)
+        revisions = listed.stdout.split() if listed.returncode == 0 else [base]
+        last_error = ""
+        probed = 0
+        for revision in revisions:
+            if revision != base:
+                diff = chain._git(self.clone, "diff", "--name-only", "--no-renames", "-z", revision, base)
+                if diff.returncode != 0 or any(lake_build_input(path) for path in diff.stdout.split("\0") if path):
+                    break
+            probed += 1
+            try:
+                url = exact_map_url(endpoint, toolchain, revision, self.repository)
+                if self.revision_map_probe(url):
+                    return revision, url
+            except Exception as error:  # noqa: BLE001 - an inconclusive probe is a miss, as in lake_cache_probe
+                last_error = f"; last probe failed: {type(error).__name__}: {str(error)[:200]}"
+        searched = (
+            "itself" if probed <= 1 else f"itself or its {probed - 1} first-parent ancestors with the same build inputs"
+        )
+        return None, f"no published Lake map for the base {searched}{last_error}"
+
+    def _base_cache_ready(self, head: dict[str, Any], now: float) -> bool:
+        """Whether the head may be dispatched on its base: the staging build must never start from a
+        `main` revision whose Lake cache is not published. False records the wait (a reason, one
+        `base-cache-wait` journal entry per base and, after `base_cache_alert_seconds`, one alert)."""
+        endpoint = self.setting("base_cache_endpoint")
+        if self.revision_map_probe is None or not endpoint:
+            return True
+        if self._candidate_coordinator(batch_id=head["id"]) is not None:
+            return True  # source-candidate CI reads its own cache scope
+        base = head["base"]
+        known = self._base_cache.get(base)
+        recheck = int(self.setting("base_cache_recheck_seconds"))
+        if known is None or (known[0] is None and now - known[1] >= recheck):
+            with self._lock.unlocked():
+                covering, detail = self._covering_revision(base, endpoint)
+            if len(self._base_cache) > 256:
+                self._base_cache.clear()
+            known = self._base_cache[base] = (covering, now, detail)
+            current = self.store.row("batches", {"id": head["id"]})
+            if current is None or any(current[key] != head[key] for key in ("state", "version", "tip", "base")):
+                return False  # the head moved during the probe; the next pass decides
+        covering, _, detail = known
+        wait = self._state("base_cache_wait")
+        if covering is not None:
+            if wait:
+                with self.store.transaction():
+                    self._set_state("base_cache_wait", None)
+                    if wait["base"] == base:
+                        self.store.journal(
+                            now,
+                            "base-cache-published",
+                            head["id"],
+                            base=base,
+                            revision=covering,
+                            waited_seconds=now - wait["since"],
+                        )
+            return True
+        if head["urgent"] == URGENT_EMERGENCY:
+            with self.store.transaction():
+                self.store.journal(
+                    now, "dispatch-unpublished-base", head["id"], version=head["version"], base=base, detail=detail
+                )
+            return True
+        if not wait or wait["base"] != base or wait["batch_id"] != head["id"]:
+            wait = {"batch_id": head["id"], "base": base, "since": now, "detail": detail, "alerted_at": None}
+            with self.store.transaction():
+                self._set_state("base_cache_wait", wait)
+                self.store.journal(
+                    now, "base-cache-wait", head["id"], version=head["version"], base=base, detail=detail
+                )
+        elif wait["detail"] != detail:
+            wait["detail"] = detail
+            with self.store.transaction():
+                self._set_state("base_cache_wait", wait)
+        alert_after = int(self.setting("base_cache_alert_seconds"))
+        if alert_after and wait["alerted_at"] is None and now - wait["since"] >= alert_after:
+            wait["alerted_at"] = now
+            record = {
+                "action": "waiting for a published base cache",
+                "batch_id": head["id"],
+                "version": head["version"],
+                "cause": f"no Lake cache is published for base {base} after {now - wait['since']:.0f}s: {detail}",
+                "detail": "staging is not dispatched until it is; publish the base's cache (main push CI or by hand)",
+            }
+            with self.store.transaction():
+                self._set_state("base_cache_wait", wait)
+                self.store.journal(now, "base-cache-alert", head["id"], base=base, waited_seconds=now - wait["since"])
+                self._notify(f"base-cache-wait:{head['id']}:{base}", record)
+        self._reasons.append(f"head {head['id']} waiting for base {base} cache to be published ({detail})")
+        return False
+
     def _dispatch(self, head: dict[str, Any], now: float, retry: int) -> None:
         candidate_ci = self._candidate_coordinator(batch_id=head["id"])
         if self._mixed_inert_batch(head):
@@ -5550,6 +5709,8 @@ class Controller:
             self._reasons.append(f"head {head['id']}: source CI preparation retry at {failed['retry_at']:.0f}")
             return
         if self._readopt_live_run(head, now):
+            return
+        if not self._base_cache_ready(head, now):
             return
         # A head from before `batch_tips` existed has its current tip recorded here, so that the
         # dispatch after its next rebase names it.
@@ -8685,6 +8846,16 @@ class Controller:
         else:
             stage = attempt["outcome"]
         info["stage"] = stage
+        wait = self._state("base_cache_wait")
+        info["base_cache_wait"] = None
+        if wait and wait["batch_id"] == head["id"] and wait["base"] == head["base"]:
+            info["base_cache_wait"] = wait
+            alert_after = int(settings["base_cache_alert_seconds"])
+            if alert_after and now - wait["since"] >= alert_after:
+                alerts.append(
+                    f"head {head['id']} has waited {now - wait['since']:.0f}s for base {head['base']} cache to be "
+                    f"published: {wait['detail']}"
+                )
         if candidate_ci is not None:
             failure = self.store.get_setting(f"source-ci:freeze-error:{head['id']}")
             if failure and failure["binding"] == [head["version"], head["tip"], head["base"]] and failure["count"] >= 3:

@@ -3339,5 +3339,137 @@ class PreRebase(QueueFixture):
         self.assertEqual([e["detail"]["onto"] for e in self.journal("pre-rebase-conflict")][-1], tip)
 
 
+class PublishedBaseCache(QueueFixture):
+    """Staging is dispatched only on a base whose Lake cache is published (`_base_cache_ready`)."""
+
+    TOOLCHAIN = "leanprover/lean4:v4.36.0-rc2"
+    MAPS = "https://cache.taucetiproject.org/revisions/TauCetiProject/TauCeti/tc/leanprover--lean4---v4.36.0-rc2/"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        files = {"README.md": "readme\n", "Shared.lean": "line one\n", "lean-toolchain": self.TOOLCHAIN + "\n"}
+        self.controller, self.github, self.repo, self.clock = make_controller(self.root, files=files)
+        self.addCleanup(self.controller.store.close)
+        self.github.admins.add("admin-worker")
+        self.published = set()
+        self.probed = []
+        self.controller.revision_map_probe = self.probe
+        self.notifier = self.controller.notifier = RecordingNotifier()
+
+    def probe(self, url):
+        self.probed.append(url)
+        self.assertTrue(url.startswith(self.MAPS) and url.endswith(".jsonl"), url)
+        return url[len(self.MAPS) : -len(".jsonl")] in self.published
+
+    def journal(self, kind):
+        return self.controller.store.journal_entries(kind)
+
+    def test_published_base_dispatches(self):
+        base = self.repo.main_sha()
+        self.published.add(base)
+        self.approve(101, {"TauCeti/A.lean": "a\n"})
+        self.tick()
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(self.probed, [self.MAPS + base + ".jsonl"])
+        self.assertEqual(self.journal("base-cache-wait"), [])
+        self.assertIsNone(self.controller.status()["head"]["base_cache_wait"])
+
+    def test_unpublished_base_waits_then_dispatches_once_published(self):
+        base = self.repo.main_sha()
+        self.approve(101, {"TauCeti/A.lean": "a\n"})
+        reasons = self.tick()
+        self.assertEqual(self.github.dispatches, [])
+        self.assertIn(f"head 1 waiting for base {base} cache to be published", " ".join(reasons))
+        status = self.controller.status()
+        self.assertEqual(status["head"]["stage"], "dispatch")
+        self.assertEqual(status["head"]["base_cache_wait"]["base"], base)
+        # A miss is remembered for `base_cache_recheck_seconds`: further passes neither probe nor journal.
+        self.clock.advance(60)
+        self.tick(3)
+        self.assertEqual(len(self.probed), 1)
+        self.assertEqual(self.github.dispatches, [])
+        self.assertEqual([e["detail"]["base"] for e in self.journal("base-cache-wait")], [base])
+        self.published.add(base)
+        self.clock.advance(60)
+        self.tick()
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(self.github.dispatches[0]["client_payload"]["base_sha"], base)
+        [published] = self.journal("base-cache-published")
+        self.assertEqual(published["detail"]["revision"], base)
+        self.assertEqual(published["detail"]["waited_seconds"], 120)
+        self.assertIsNone(self.controller.status()["head"]["base_cache_wait"])
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.repo.main_sha(), self.controller.store.row("batches", {"id": 1})["tip"])
+
+    def test_base_differing_from_a_published_ancestor_outside_build_inputs_is_covered(self):
+        published = self.repo.main_sha()
+        self.published.add(published)
+        self.repo.advance_main({".github/workflows/ci.yml": "jobs: {}\n"}, "harness change")
+        harness = self.repo.advance_main({"scripts/check.sh": "true\n", "README.md": "new\n"}, "another")
+        self.approve(101, {"TauCeti/A.lean": "a\n"})
+        self.tick()
+        self.assertEqual(self.head()["base"], harness)
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(self.probed[-1], self.MAPS + published + ".jsonl")
+        self.assertEqual(len(self.probed), 3)
+
+    def test_build_input_change_after_the_published_ancestor_waits(self):
+        published = self.repo.main_sha()
+        self.published.add(published)
+        lakefile = self.repo.advance_main({"lakefile.toml": 'name = "TauCeti"\n'}, "lakefile change")
+        base = self.repo.advance_main({"README.md": "new\n"}, "harness change")
+        self.approve(101, {"TauCeti/A.lean": "a\n"})
+        reasons = self.tick()
+        self.assertEqual(self.github.dispatches, [])
+        # The lakefile commit has the base's build inputs; the walk stops before the published commit.
+        self.assertEqual(self.probed, [self.MAPS + base + ".jsonl", self.MAPS + lakefile + ".jsonl"])
+        self.assertIn("itself or its 1 first-parent ancestors with the same build inputs", " ".join(reasons))
+
+    def test_lake_build_inputs(self):
+        from tauceti_queue.controller import lake_build_input
+
+        for path in ("TauCeti.lean", "TauCeti/A/B.lean", "scripts/Axioms.lean", "lakefile.toml", "lakefile.lean"):
+            self.assertTrue(lake_build_input(path), path)
+        for path in ("lake-manifest.json", "lean-toolchain"):
+            self.assertTrue(lake_build_input(path), path)
+        for path in (".github/workflows/ci.yml", "scripts/lint.sh", "docs/x.md", "web/lean-toolchain", "tauceti.toml"):
+            self.assertFalse(lake_build_input(path), path)
+
+    def test_emergency_batch_dispatches_on_an_unpublished_base(self):
+        base = self.repo.main_sha()
+        self.approve(101, {"TauCeti/A.lean": "a\n"})
+        self.tick()
+        self.assertEqual(self.github.dispatches, [])
+        self.controller.store.update("batches", {"id": self.head()["id"]}, urgent=2)
+        self.tick()
+        self.assertEqual(len(self.github.dispatches), 1)
+        [exempt] = self.journal("dispatch-unpublished-base")
+        self.assertEqual(exempt["detail"]["base"], base)
+
+    def test_long_wait_alerts_once_and_a_new_base_is_journaled_again(self):
+        base = self.repo.main_sha()
+        self.approve(101, {"TauCeti/A.lean": "a\n"})
+        self.tick()
+        self.clock.advance(7200)
+        self.tick()
+        alerts = self.controller.status()["alerts"]
+        self.assertTrue(any(f"for base {base} cache to be published" in alert for alert in alerts), alerts)
+        self.clock.advance(600)
+        self.tick(2)
+        self.assertEqual(len(self.journal("base-cache-alert")), 1)
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.assertIn(base, self.notifier.messages[0])
+        # Main advances while the head waits: the head is rebased and waits for the new base, journaled once.
+        moved = self.repo.advance_main({"TauCeti/Other.lean": "o\n"})
+        self.tick(2)
+        self.assertEqual(self.head()["base"], moved)
+        self.assertEqual([e["detail"]["base"] for e in self.journal("base-cache-wait")], [base, moved])
+        self.assertEqual(self.github.dispatches, [])
+        self.assertEqual(self.controller.status()["head"]["base_cache_wait"]["base"], moved)
+
+
 if __name__ == "__main__":
     unittest.main()

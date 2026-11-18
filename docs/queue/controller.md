@@ -329,6 +329,25 @@ batch's tips newest first, at most four per batch (`Controller._landed_tips`), w
 Every task's `warm_revs` (`Controller._warm_revs`) names the same tips after the batch tips it lists
 and before the base.
 
+Staging never builds on a `main` revision whose Lake cache is not published. Before any dispatch
+(after a live run is re-adopted, which needs none) the controller asks the public revision endpoint
+(`base_cache_endpoint`) for the map `pr-build.yml`'s cache lookup reads: the URL is TauCetiTools'
+`lake_cache_probe.exact_map_url` for the toolchain in `lean-toolchain` at the base. The base is
+covered by its own map, or by that of a first-parent ancestor at most `BASE_CACHE_ANCESTORS` (20)
+commits back whose tree differs from the base's only outside the Lake build inputs (every `.lean`
+file, `lakefile.toml`, `lakefile.lean`, `lake-manifest.json`, `lean-toolchain`; `lake_build_input`),
+since the walk of staging's lookup finds that map and every input hash matches. The probe runs
+without the controller lock, and the head is re-read after it. A covering revision is remembered
+for the process; a miss is remembered for `base_cache_recheck_seconds`. While no map covers the
+base the head is not dispatched: the reason line says `head N waiting for base SHA cache to be
+published`, the head's status carries `base_cache_wait` (`batch_id`, `base`, `since`, `detail`,
+`alerted_at`), `base-cache-wait` is journaled once per base, and after `base_cache_alert_seconds`
+the status raises an alert and one direct message is sent (`base-cache-alert`). The dispatch that
+follows journals `base-cache-published`. An emergency batch (`batches.urgent == 2`) is exempt, being
+how `main` is published again after an out-of-queue push, and journals `dispatch-unpublished-base`.
+Source-candidate CI, which reads its own cache scope, and a controller built without
+`revision_map_probe` (the fixtures, native sources) skip the requirement.
+
 A run GitHub reports `queued` or `in_progress` is never re-dispatched over. It is lost only when it
 can no longer be found (neither in the listing nor by a direct read of the run), or when it is
 `in_progress`, nothing in its jobs moved for `lost_run_seconds` (progress is any phase or step
@@ -488,6 +507,9 @@ and reported in status:
 | `prepare_quiet_seconds` | 600 | time since the last insertion before an open batch is prepared |
 | `pre_rebase_enabled` | true | replay the oldest open batch onto the head's tip once the head's chain is submitted |
 | `prepare_pre_rebased` | true | create a `prepare` task for the oldest open batch's usable pre-rebase on the head's tip (with `prepare_open_batches`, for the batches it applies to) |
+| `base_cache_endpoint` | `https://cache.taucetiproject.org/revisions` | public Lake revision endpoint a head's base must be published at before staging is dispatched (CI section above); empty disables the requirement |
+| `base_cache_recheck_seconds` | 120 | how long a base found unpublished is remembered before it is probed again |
+| `base_cache_alert_seconds` | 7200 | a wait for a published base this long raises a status alert and one direct message; 0 never |
 | `no_repair_labels` | `["dont-repair-in-queue"]` | labels (case-insensitive) by which an author opts a PR out of agent edits; such a member is only ever emptied and withdrawn as `problem-anticipated` |
 
 ## Ports
@@ -592,7 +614,8 @@ prepares, `own_base` or `pre_rebased`) and `waiting` (null, or the other `kind` 
 and `sealed_at`, and retain the successor for compatibility); `sealed_successor` (null or the first sealed
 non-head batch summary; `open_batches` includes every sealed non-head batch); `head` (the same plus `sealed_at`,
 `expected_parent`, `based_on_canonical`, `stage` in `rebase`, `rebase_conflict`, `dispatch`, `ci`,
-`repair`, `infrastructure`, `promote`, the open `task`, and `ci` with dispatch id, run id and
+`repair`, `infrastructure`, `promote`, the open `task`, `base_cache_wait` (null, or the wait for a
+published base described in the CI section), and `ci` with dispatch id, run id and
 attempt, status, conclusion, timestamps, runner, labels, host, phases with timestamps, last progress,
 outcome and detail, plus `stall` with `since`, `silence_seconds` and the phase when the build has
 been silent for `stall_interval_seconds`, and `cancelled_runs`, the batch's attempts whose runs the
