@@ -1,0 +1,7 @@
+# ~/.config/tauceti-queue/monitoring-environment: host-specific settings for
+# tauceti-queue-monitoring.service and tauceti-queue-monitoring-history.service.
+#
+# Extra arguments appended to both commands, split on whitespace. The units already pass the three
+# standard repair task roots; list here any others whose history should stay visible, such as the
+# task roots of workers retired from another host.
+#TAUCETI_QUEUE_MONITORING_ARGS=--worker-root /home/kim/TauCetiQueue-data/legacy-chungus2/repair

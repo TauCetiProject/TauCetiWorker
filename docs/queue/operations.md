@@ -181,12 +181,13 @@ git clone https://github.com/TauCetiProject/TauCetiWorker.git ~/TauCetiQueue
 ~/TauCetiQueue/services/queue/install.sh --revision <sha>    # a pinned revision
 ```
 
-**The controller and the repair workers run origin/main HEAD from `~/TauCetiQueue`.** Never use
-systemd drop-ins (`~/.config/systemd/user/tauceti-queue*.service.d/*.conf`) for queue units: they
-silently override the installed unit and each other, so `~/TauCetiQueue`, `git log` and the
-installers stop describing what runs. `install.sh` and `install-repair.sh` refuse to run while one
-exists for the unit they install. Settings belong in `~/.config/tauceti-queue/environment` (or
-`repair-environment*`) or in the unit files in this repository.
+**The controller, the repair workers and the monitoring units run origin/main HEAD from
+`~/TauCetiQueue`.** Never use systemd drop-ins (`~/.config/systemd/user/tauceti-queue*.service.d/*.conf`)
+for queue units: they silently override the installed unit and each other, so `~/TauCetiQueue`,
+`git log` and the installers stop describing what runs. `install.sh`, `install-repair.sh` and
+`install-monitoring.sh` ([monitoring.md](monitoring.md)) refuse to run while one exists for a unit
+they install. Settings belong in `~/.config/tauceti-queue/environment` (or `repair-environment*`,
+`monitoring-environment`) or in the unit files in this repository.
 
 Running any revision other than origin/main HEAD (`--revision`, `--checkout` or
 `TAUCETI_QUEUE_CHECKOUT`) requires explicit permission from a human operator, and the installers
