@@ -28,7 +28,7 @@ Tables:
 | --- | --- |
 | `settings` | runtime settings and controller state (`state:*` keys: canonical SHA, inference hold, counters, Bors's external head, the last approval poll) as JSON, with actor and time |
 | `inputs` | approved inputs: repository, PR, accepted head, title, description, author, evidence, reviewer, priority, urgent flag, state, age (`approved_at`), retained ref, probe history (`probes`, `last_probe`, `last_probe_tip`, `passes_waited`), the `no_repair` opt-out and, for a `problem-anticipated` withdrawal, `anticipated` (JSON: batch, member, commit, `interacting`, `file`, `finding`, the agent's `explanation`, `stage`, times) |
-| `batches` | identity, version, base, tip, sealed flag, state (`open`, `head`, `landed`, `removed`), expected parent for promotion, urgent flag, first dispatch time |
+| `batches` | identity, version, base, tip, sealed flag, state (`open`, `head`, `landed`, `removed`), expected parent for promotion, urgent flag, first dispatch time, `lane` (`control` for the control-file lane batch, else empty) |
 | `members` | per batch and position: input, `Source-PR`, accepted head, current commit, provenance (`clean` or `edited`), the task that edited it, the accumulated explanation, every edited commit SHA, the `no_repair` opt-out, `withdrawn` (a member the queue sent back: an emptied `no_repair` member, or one an adopted repair emptied; its empty commit stays in the chain, the PR does not land) |
 | `claims` | batch identity and version, operation (`insert`, `rebase`, `task:repair`, `task:rebase_conflict`), worker identity and GitHub login, token, starting tip, expiry, renewal, release and its reason |
 | `tasks` | repair and rebase-conflict tasks: batch and version, base, tip, `onto`, diagnostics, state (`open`, `submitted`, `superseded`), counts of claims and submissions |
@@ -584,6 +584,7 @@ and reported in status:
 | `base_cache_recheck_seconds` | 120 | how long a base found unpublished is remembered before it is probed again |
 | `base_cache_alert_seconds` | 7200 | a wait for a published base this long raises a status alert and one direct message; 0 never |
 | `emergency_enabled` | false | accept emergency requests (`bors emergency`, `POST /admin/emergency`); off refuses them `disabled`, and a request already accepted keeps running |
+| `control_lane_enabled` | false | with mixed sources admitted under GitHub primary, stage GitHub PRs whose own diff leaves the native path policy in the control-file lane batch, sealed next after the emergency batch and never repaired ([mixed-sources.md](mixed-sources.md), "The control-file lane"); off stages a live lane batch as an ordinary one |
 | `no_repair_labels` | `["dont-repair-in-queue"]` | labels (case-insensitive) by which an author opts a PR out of agent edits; such a member is only ever emptied and withdrawn as `problem-anticipated` |
 
 ## Ports
@@ -712,7 +713,10 @@ repairs), `no_repair_withdrawals`, `problem_anticipated_needs_rebase`,
 `emergency` (`enabled`; `batch`, null or the live emergency batch: `batch_id`, `stage` (`waiting` or
 `head`), `waiting_for`, and the request's `number`, `state`, `actor`, `requested_at`, `surface`,
 `reason`; `queued`, the requests behind it; `cancel_intents`, the open intents with `attempt_id`,
-`batch_id`, `reason`, `at`, and after a failure `tries` and `retry_at`). Every batch summary carries `emergency` (`urgent == 2`).
+`batch_id`, `reason`, `at`, and after a failure `tries` and `retry_at`). Every batch summary
+carries `emergency` (`urgent == 2`) and `lane` (`control` for the control-file lane batch, else
+empty); `waiting.control` counts the waiting control-file inputs, and each waiting input carries
+`control`.
 
 `status()` waits at most two seconds for the controller lock (`wait=` overrides; `/healthz` passes
 half a second). When a pass holds it longer, the snapshot taken at the end of the last pass or

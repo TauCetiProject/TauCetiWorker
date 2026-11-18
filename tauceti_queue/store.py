@@ -144,7 +144,8 @@ CREATE TABLE IF NOT EXISTS batches (
     pre_rebase_source TEXT,
     pre_rebase_edits TEXT NOT NULL DEFAULT '{}',
     pre_rebase_at REAL,
-    pre_rebase_prepared TEXT
+    pre_rebase_prepared TEXT,
+    lane TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS members (
     id INTEGER PRIMARY KEY,

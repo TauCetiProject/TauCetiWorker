@@ -842,6 +842,428 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         self.controller.tick()
         self.assertEqual(self.controller.input_for(self.controller.repository, 17)["state"], "inserted")
 
+    # --- the control-file lane (`control_lane_enabled`) ---------------------------------------------
+
+    def enable_lane(self):
+        self.native.admission_policy.prefix = "Math/"
+        self.native.admission_policy.allow_files = ("Shared.lean",)
+        self.controller.set_setting("control_lane_enabled", True, "fixture")
+
+    def lane(self):
+        return self.controller.store.row("batches", {"lane": "control", "state": ["open", "head"]}, order="id DESC")
+
+    def sources(self, batch):
+        return [
+            ("forgejo" if isinstance(m["number"], SourceNumber) else "github", int(m["number"]))
+            for m in self.controller._members(batch["id"])
+        ]
+
+    def pass_native_head(self):
+        head = self.controller._head()
+        frozen = self.ledger.load(self.controller._current_attempt(head)["id"])
+        self.execution.add(frozen, classification="passed")
+        self.clock.advance(60)
+        self.controller.tick()
+        self.controller.tick()
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+        return head
+
+    def pass_github_head(self):
+        from tauceti_queue.fakes import run_git
+
+        head = self.controller._head()
+        # The fixture's Forgejo mirror has only the objects pushed to it: give it the landing tip.
+        run_git(self.repo.clone, "push", "-q", str(self.native_repo.origin), f"{head['tip']}:refs/fixture/{head['id']}")
+        self.github.start_runs()
+        self.github.complete_runs()
+        self.clock.advance(60)
+        self.controller.tick()
+        self.controller.tick()
+        self.assertEqual(
+            self.controller.store.row("batches", {"id": head["id"]})["state"], "landed", self.controller._reasons
+        )
+        return head
+
+    def native_head(self, number=17, path="Math/Head.lean"):
+        native = self.native.create_pr(number, {path: "head\n"})
+        self.controller.approve(self.native_id.repository.key, number, native, "fixture")
+        self.controller.tick()
+        head = self.controller._head()
+        self.assertEqual(self.sources(head), [("forgejo", number)])
+        return head
+
+    def approve_github(self, number, files):
+        head = self.github.create_pr(number, files)
+        self.assertTrue(self.controller.approve(self.controller.repository, number, head, "fixture")["accepted"])
+        return head
+
+    def approve_native(self, number, files):
+        head = self.native.create_pr(number, files)
+        self.assertTrue(self.controller.approve(self.native_id.repository.key, number, head, "fixture")["accepted"])
+        return head
+
+    def test_control_lane_takes_the_control_pr_alone_and_native_prs_share_an_ordinary_batch(self):
+        self.enable_lane()
+        self.approve_github(17, {"scripts/control.py": "control\n"})
+        self.approve_native(17, {"Math/Native.lean": "native\n"})
+        self.approve_native(18, {"Math/Other.lean": "other\n"})
+        self.controller.tick()
+        lane = self.lane()
+        self.assertEqual((lane["state"], self.sources(lane)), ("head", [("github", 17)]), self.controller._reasons)
+        [ordinary] = self.controller.store.rows("batches", {"state": "open"})
+        self.assertEqual(ordinary["lane"], "")
+        self.assertEqual(sorted(self.sources(ordinary)), [("forgejo", 17), ("forgejo", 18)])
+        row = self.controller.input_for(self.controller.repository, 17)
+        self.assertEqual((row["no_repair"], loads(row["evidence"])["control_files"]), (1, True))
+        self.assertEqual([m["no_repair"] for m in self.controller._members(lane["id"])], [1])
+        # The lane head runs GitHub-native CI; nothing went to source-candidate CI.
+        self.assertIsNone(self.controller._candidate_coordinator(batch_id=lane["id"]))
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(self.execution.dispatches, [])
+        from tauceti_queue.controller import ControllerError
+
+        with self.assertRaisesRegex(ControllerError, "human control-file"):
+            self.controller.change_primary("forgejo", "fixture")
+        status = self.controller.status()
+        self.assertEqual(status["head"]["id"], lane["id"])
+        self.assertEqual([b["lane"] for b in status["open_batches"]], [""])
+        self.pass_github_head()
+        head = self.controller._head()
+        self.assertEqual(head["id"], ordinary["id"])
+        self.assertTrue(self.execution.dispatches)
+        for request in self.execution.dispatches:
+            self.assertTrue(self.registry_value.supports_candidate(request.request.base, request.request.head))
+            self.assertTrue(all(member.source == self.native_id for member in request.request.accepted_members))
+
+    def test_control_lane_goes_ahead_of_an_older_open_batch_but_never_preempts_the_head(self):
+        self.enable_lane()
+        first = self.native_head()
+        self.approve_native(18, {"Math/Next.lean": "next\n"})
+        self.controller.tick()
+        [older] = self.controller.store.rows("batches", {"state": "open"})
+        self.approve_github(19, {".github/workflows/x.yml": "on: push\n"})
+        reasons = self.controller.tick()
+        lane = self.lane()
+        self.assertGreater(lane["id"], older["id"])
+        self.assertEqual((lane["state"], self.sources(lane)), ("open", [("github", 19)]))
+        self.assertEqual(self.controller._head()["id"], first["id"], "the lane never evicts the running head")
+        self.assertIn(f"control-file lane batch {lane['id']} waits for head {first['id']} to land", reasons)
+        status = self.controller.status()
+        self.assertEqual(sorted(b["lane"] for b in status["open_batches"]), ["", "control"])
+        self.assertEqual(self.controller.status()["waiting"]["control"], 0)
+        self.pass_native_head()
+        head = self.controller._head()
+        self.assertEqual(head["id"], lane["id"], "the lane batch seals ahead of the older open batch")
+        self.assertEqual(self.controller.store.row("batches", {"id": older["id"]})["state"], "open")
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(len(self.execution.dispatches), 1)
+        self.assertEqual(len(self.controller.store.journal_entries("control-lane-head")), 1)
+
+    def test_control_lane_opens_outside_the_open_batch_limit(self):
+        self.enable_lane()
+        self.native_head()
+        self.approve_native(18, {"Math/Same.lean": "eighteen\n"})
+        self.approve_native(19, {"Math/Same.lean": "nineteen\n"})
+        self.controller.tick()
+        self.controller.tick()
+        self.assertEqual(len(self.controller._unsealed_batches()), 2)
+        self.assertEqual(int(self.controller.setting("open_batch_limit")), 2)
+        self.approve_github(20, {"scripts/control.sh": "echo\n"})
+        self.controller.tick()
+        lane = self.lane()
+        self.assertEqual(self.sources(lane), [("github", 20)])
+        self.assertEqual(len(self.controller._unsealed_batches()), 2)
+        self.assertNotIn(lane["id"], [b["id"] for b in self.controller._staging_batches()])
+
+    def test_a_control_pr_left_waiting_is_never_probed_into_an_ordinary_batch(self):
+        self.enable_lane()
+        first = self.native_head()
+        self.approve_github(18, {"scripts/control.py": "eighteen\n"})
+        self.controller.tick()
+        # #19 conflicts with #18 in the lane: it waits for the lane's base to move, never for an ordinary batch.
+        self.approve_github(19, {"scripts/control.py": "nineteen\n"})
+        before = self.controller.store.count("batches")
+        for _ in range(3):
+            self.clock.advance(60)
+            self.controller.tick()
+        self.assertEqual(self.controller.store.count("batches"), before)
+        row = self.controller.input_for(self.controller.repository, 19)
+        self.assertEqual((row["state"], row["probes"]), ("waiting", 1))
+        self.assertEqual(self.sources(self.lane()), [("github", 18)])
+        self.assertEqual(self.controller.store.journal_entries("probe-source-ci-scope"), [])
+        self.assertEqual(self.controller._head()["id"], first["id"])
+        self.assertEqual(self.controller.status()["waiting"]["control"], 1)
+
+    def test_an_unclassified_github_pr_waits_out_of_ordinary_batches(self):
+        self.enable_lane()
+        self.native_head()
+        head = self.approve_github(18, {"Math/Github.lean": "github\n"})
+        fetch = self.controller._fetch_head
+        with patch.object(self.controller, "_fetch_head", side_effect=lambda n, sha: sha != head and fetch(n, sha)):
+            self.controller.tick()
+        row = self.controller.input_for(self.controller.repository, 18)
+        self.assertEqual((row["state"], row["probes"]), ("waiting", 0))
+        self.assertEqual(row["last_probe"], "control-lane: waits for its head to be classified")
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(self.controller.repository, 18)["state"], "inserted")
+        self.assertIsNone(self.lane())
+
+    def test_a_pr_with_native_and_control_changes_goes_to_the_lane_whole(self):
+        self.enable_lane()
+        self.native_head()
+        self.approve_github(18, {"Math/Both.lean": "both\n", "scripts/both.py": "both\n"})
+        self.approve_native(19, {"Math/Native.lean": "native\n"})
+        self.controller.tick()
+        self.assertEqual(self.sources(self.lane()), [("github", 18)])
+        ordinary = [b for b in self.controller.store.rows("batches", {"state": "open"}) if not b["lane"]]
+        self.assertEqual([self.sources(b) for b in ordinary], [[("forgejo", 19)]])
+
+    def test_an_ordinary_github_pr_and_allow_listed_files_stay_out_of_the_lane(self):
+        self.enable_lane()
+        self.native_head()
+        self.approve_github(18, {"Math/Github.lean": "github\n", "Shared.lean": "allowed\n"})
+        self.controller.tick()
+        self.assertIsNone(self.lane())
+        row = self.controller.input_for(self.controller.repository, 18)
+        self.assertEqual(
+            (row["state"], row["no_repair"], loads(row["evidence"])["control_files"]), ("inserted", 0, False)
+        )
+
+    def test_native_control_changes_are_refused_and_never_enter_the_lane(self):
+        self.enable_lane()
+        self.native_head()
+        self.approve_native(18, {"scripts/native.py": "native\n"})
+        self.controller.tick()
+        row = self.controller.input_for(self.native_id.repository.key, 18)
+        self.assertEqual(row["state"], "waiting")
+        self.assertIn("native candidate needs a compatible batch", row["last_probe"])
+        self.assertNotIn("control_files", loads(row["evidence"]))
+        self.assertIsNone(self.lane())
+        self.assertEqual(self.controller.store.count("batches", {"lane": "control"}), 0)
+
+    def test_control_lane_is_off_under_native_primary(self):
+        self.enable_lane()
+        self.registry_value.primary = "forgejo"
+        self.approve_github(17, {"scripts/control.py": "control\n"})
+        self.controller.tick()
+        row = self.controller.input_for(self.controller.repository, 17)
+        self.assertEqual(row["state"], "waiting")
+        self.assertIn("require GitHub primary", row["last_probe"])
+        self.assertNotIn("control_files", loads(row["evidence"]))
+        self.assertEqual(self.controller.store.count("batches", {"lane": "control"}), 0)
+        self.assertEqual(self.execution.dispatches, [])
+        self.assertTrue(self.controller.change_primary("github", "fixture")["changed"])
+        self.controller.tick()
+        self.assertEqual(self.sources(self.lane()), [("github", 17)])
+
+    def test_a_control_pr_refused_on_the_canonical_tip_is_still_probed_into_a_lane_on_that_tip(self):
+        self.native.admission_policy.prefix = "Math/"
+        self.native.admission_policy.allow_files = ()
+        self.approve_github(17, {"scripts/control.py": "control\n"})
+        canonical = self.repo.main_sha()
+        # A source-candidate scope refusal recorded against an empty batch on the canonical commit.
+        row = self.controller.input_for(self.controller.repository, 17)
+        self.controller.store.update(
+            "inputs",
+            {"id": row["id"]},
+            last_probe="source-ci-scope: human control-file changes require GitHub primary and a GitHub-only batch",
+            last_probe_tip=canonical,
+            last_probe_base=canonical,
+        )
+        self.controller.set_setting("control_lane_enabled", True, "fixture")
+        self.controller.tick()
+        lane = self.lane()
+        self.assertEqual((lane["base"], self.sources(lane)), (canonical, [("github", 17)]), self.controller._reasons)
+
+    def test_an_emergency_request_for_a_control_pr_takes_it_out_of_the_lane(self):
+        self.enable_lane()
+        self.controller.set_setting("emergency_enabled", True, "fixture")
+        first = self.native_head()
+        self.approve_github(18, {"scripts/control.py": "control\n"})
+        self.controller.tick()
+        lane = self.lane()
+        self.assertEqual(self.sources(lane), [("github", 18)])
+        request = self.controller.request_emergency(self.controller.repository, 18, "admin", surface="test")
+        self.assertTrue(request["accepted"], request)
+        self.controller.tick()
+        emergency = self.controller._emergency_batch()
+        self.assertEqual(self.sources(emergency), [("github", 18)])
+        self.assertEqual([m["no_repair"] for m in self.controller._members(emergency["id"])], [1])
+        self.assertEqual(self.controller.store.journal_entries("emergency-refused"), [])
+        self.assertEqual(self.controller._head()["id"], first["id"])
+        self.pass_native_head()
+        self.assertEqual(self.controller._head()["id"], emergency["id"], "the emergency batch goes before the lane")
+        self.pass_github_head()
+        self.controller.tick()
+        # The lane batch keeps only the displaced slot, which never makes it a head of its own.
+        self.assertIsNone(self.controller._head())
+        self.assertIsNone(self.controller._lane_ready())
+
+    def test_a_label_added_and_removed_never_clears_the_control_opt_out(self):
+        self.enable_lane()
+        self.native_head()
+        self.approve_github(18, {"scripts/control.py": "control\n"})
+        self.controller.tick()
+        for action, labels in (("labeled", ["dont-repair-in-queue"]), ("unlabeled", [])):
+            self.controller.handle_event(
+                "pull_request",
+                {
+                    "action": action,
+                    "number": 18,
+                    "label": {"name": "dont-repair-in-queue"},
+                    "pull_request": {"number": 18, "labels": [{"name": label} for label in labels]},
+                },
+            )
+        row = self.controller.input_for(self.controller.repository, 18)
+        self.assertEqual((row["state"], row["no_repair"]), ("inserted", 1))
+        self.assertEqual([m["no_repair"] for m in self.controller._members(self.lane()["id"])], [1])
+
+    def test_a_failing_lane_head_withdraws_the_culprit_without_editing_it(self):
+        from tauceti_queue.fakes import Resolution, ScriptedAgent
+
+        self.enable_lane()
+        self.github.ci_policy = lambda head, base, members: (
+            ("fail", [{"kind": "compiler", "module": "scripts/bad.py", "message": "boom"}])
+            if self.repo.file_at(head, "scripts/bad.py") is not None
+            else ("pass", [])
+        )
+        self.approve_github(17, {"scripts/good.py": "good\n"})
+        self.approve_github(18, {"scripts/bad.py": "bad\n"})
+        self.controller.tick()
+        lane = self.lane()
+        self.assertEqual((lane["state"], sorted(self.sources(lane))), ("head", [("github", 17), ("github", 18)]))
+        self.github.start_runs()
+        self.github.complete_runs()
+        self.clock.advance(60)
+        self.controller.tick()
+        self.github.admins.add("reviewer")
+        [bad] = [m for m in self.controller._members(lane["id"]) if int(m["number"]) == 18]
+        edit = ScriptedAgent(
+            "editor",
+            "reviewer",
+            self.repo,
+            self.root / "editor",
+            lambda task: {bad["source_pr"]: Resolution({"scripts/bad.py": "edited\n"}, explanation="Edited.")},
+        )
+        result = edit.run(self.controller)
+        self.assertIsNotNone(result, self.controller._reasons)
+        self.assertFalse(result.accepted, "a control member is never edited")
+        self.assertEqual(result.reason, "no-repair-edited")
+        self.assertTrue(all(m.no_repair for m in edit.tasks[0].members))
+        # The same worker empties the member instead, which is all a repair may do to it.
+        edit.script = lambda task: {bad["source_pr"]: Resolution(empty=True, explanation="It does not build.")}
+        task = edit.tasks[0]
+        result = self.controller.submit_task(task.task_id, task.claim_token, edit.produce(task))
+        self.assertTrue(result.accepted, result)
+        row = self.controller.input_for(self.controller.repository, 18)
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "problem-anticipated"))
+        self.controller.tick()
+        body = self.github.comments_for(18)[0]["body"]
+        self.assertIn("changes control files outside the native path policy", body)
+        self.assertNotIn("dont-repair-in-queue", body)
+        self.pass_github_head()
+        self.assertEqual(self.repo.file_at("main", "scripts/good.py"), "good\n")
+        self.assertIsNone(self.repo.file_at("main", "scripts/bad.py"))
+        self.assertEqual(
+            {m["number"]: m["provenance"] for m in self.controller._members(lane["id"])}, {17: "clean", 18: "edited"}
+        )
+
+    def test_turning_the_lane_off_stages_a_live_lane_batch_as_an_ordinary_one(self):
+        self.enable_lane()
+        self.native_head()
+        self.approve_native(18, {"Math/Next.lean": "next\n"})
+        self.controller.tick()
+        [older] = self.controller.store.rows("batches", {"state": "open"})
+        self.approve_github(19, {"scripts/control.py": "control\n"})
+        self.controller.tick()
+        lane = self.lane()
+        self.controller.set_setting("control_lane_enabled", False, "operator")
+        reasons = self.controller.tick()
+        self.assertFalse(any("control-file lane" in reason for reason in reasons), reasons)
+        self.assertEqual([b["id"] for b in self.controller._staging_batches()], [older["id"], lane["id"]])
+        self.pass_native_head()
+        self.assertEqual(self.controller._head()["id"], older["id"], "with the lane off, oldest first")
+        self.assertEqual(self.controller.store.journal_entries("control-lane-head"), [])
+        self.assertEqual(self.controller.store.row("batches", {"id": lane["id"]})["state"], "open")
+
+    def lane_with_claimed_successor_pre_rebase(self):
+        """Head H (#101) runs, ordinary open batch B (#102) conflicts with it on `Shared.lean` and a
+        worker holds B's `pre_rebase` task onto H's tip; then a control PR (#103) opens the lane."""
+        from tauceti_queue.fakes import Resolution, ScriptedAgent
+
+        self.enable_lane()
+        self.controller.set_setting("repair_concurrency", 2, "fixture")
+        self.github.admins.add("reviewer")
+        self.approve_github(101, {"Shared.lean": "line one\nline two changed by 101\nline three\n"})
+        self.controller.tick()
+        head = self.controller._head()
+        self.approve_github(102, {"Shared.lean": "line one\nline two changed by 102\nline three\n"})
+        self.controller.tick()
+        successor = next(b for b in self.controller.store.rows("batches", {"state": "open"}) if not b["lane"])
+        source_pr = self.controller._members(successor["id"])[0]["source_pr"]
+        agent = ScriptedAgent(
+            "agent",
+            "reviewer",
+            self.repo,
+            self.root / "agent",
+            lambda task: {
+                source_pr: Resolution(
+                    {"Shared.lean": "line one\nline two changed by 101 and 102\nline three\n"}, explanation="Merged."
+                )
+            },
+        )
+        task = agent.claim(self.controller)
+        self.assertIsNotNone(task, self.controller._reasons)
+        self.assertEqual((task.kind, task.onto), ("pre_rebase", head["tip"]))
+        self.approve_github(103, {"scripts/control.py": "control\n"})
+        self.controller.tick()
+        self.assertEqual(self.lane()["state"], "open")
+        self.pass_github_head()
+        lane = self.controller._head()
+        self.assertEqual(lane["lane"], "control")
+        self.assertEqual(
+            [e["detail"] for e in self.controller.store.journal_entries("emergency-preserved")],
+            [{"tasks": [task.task_id]}],
+        )
+        self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["state"], "open")
+        return successor, agent, task, source_pr
+
+    def test_claimed_successor_pre_rebase_survives_the_lane_head_and_is_carried_onto_it(self):
+        successor, agent, task, source_pr = self.lane_with_claimed_successor_pre_rebase()
+        adoption = self.controller.submit_task(task.task_id, task.claim_token, agent.produce(task))
+        self.assertTrue(adoption.accepted, adoption)
+        self.controller.tick()
+        carried = self.controller.store.row("batches", {"id": successor["id"]})
+        self.assertEqual(
+            (carried["pre_rebase_state"], carried["pre_rebase_onto"]), ("adopted", self.controller._head()["tip"])
+        )
+        self.assertIn(source_pr, loads(carried["pre_rebase_edits"]))
+        self.pass_github_head()
+        sealed = self.controller._head()
+        self.assertEqual(sealed["id"], successor["id"])
+        self.assertTrue(self.controller.store.journal_entries("rebased")[-1]["detail"]["pre_rebased"])
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 0)
+        self.assertEqual([m["provenance"] for m in self.controller._members(sealed["id"])], ["edited"])
+
+    def test_a_preserved_pre_rebase_submitted_after_the_lane_lands_is_carried_onto_main(self):
+        successor, agent, task, source_pr = self.lane_with_claimed_successor_pre_rebase()
+        self.pass_github_head()  # the lane lands while the worker still holds the task
+        self.assertIsNone(self.controller._head(), "the claimed successor waits for its worker")
+        adoption = self.controller.submit_task(task.task_id, task.claim_token, agent.produce(task))
+        self.assertTrue(adoption.accepted, adoption)
+        self.controller.tick()
+        sealed = self.controller._head()
+        self.assertEqual(sealed["id"], successor["id"])
+        self.assertEqual(sealed["base"], self.repo.main_sha())
+        self.assertTrue(self.controller.store.journal_entries("rebased")[-1]["detail"]["pre_rebased"])
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 0)
+        self.assertEqual([m["provenance"] for m in self.controller._members(sealed["id"])], ["edited"])
+        self.pass_github_head()
+        self.assertEqual(
+            self.repo.file_at("main", "Shared.lean"), "line one\nline two changed by 101 and 102\nline three\n"
+        )
+        self.assertEqual(self.repo.file_at("main", "scripts/control.py"), "control\n")
+
     def test_old_uncertain_lease_is_settled_when_main_has_moved_off_its_expected_parent(self):
         from tauceti_queue.controller import ControllerError
         from tauceti_queue.fakes import run_git

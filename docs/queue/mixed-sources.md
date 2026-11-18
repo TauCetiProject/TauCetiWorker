@@ -186,11 +186,82 @@ existing per-member scope/dependency gates; landing rechecks original heads,
 targets, holds and current review authority.
 
 Human-approved GitHub control-file changes keep their existing GitHub-only CI
-path. Admission separates them from native batches before dispatch. Under
-Forgejo primary, changes outside the configured native path policy wait with an
-explicit reason; switch temporarily to GitHub primary to land them. A primary
-change to Forgejo refuses pending batches containing these changes. This keeps
-the current CI scope checks intact without spending a build on a known refusal.
+path. Source-candidate CI refuses any batch whose diff leaves the native path
+policy (paths under the policy's prefix plus its allow list), so such a PR can
+never share a batch with a Forgejo PR. Under Forgejo primary every batch goes
+through source-candidate CI, and these changes wait with an explicit reason
+(`require GitHub primary and a GitHub-only batch`); switch temporarily to GitHub
+primary to land them. A primary change to Forgejo refuses pending batches
+containing these changes.
+
+### The control-file lane
+
+Without help, a control-file PR blocks Forgejo PRs in both directions: probed
+into a batch with Forgejo members it is refused, and once it is in a GitHub-only
+batch every Forgejo PR probed there is refused (`native candidate needs a
+compatible batch or changes within the native path policy`) until that batch
+lands. The `control_lane_enabled` setting (off by default) gives these PRs a lane
+of their own. It applies only while mixed sources are admitted under GitHub
+primary; otherwise every rule below is off.
+
+- **Eligibility.** Each waiting GitHub input is classified once, before routing:
+  it is a control-file change when its own diff, from its merge base with `main`
+  to its accepted head, leaves the native path policy (exactly what
+  source-candidate CI refuses). This covers `.github/`, `scripts/`, lakefiles,
+  docs and any other path outside the policy. A PR that also touches native paths
+  goes to the lane whole. The classification is stored in the input's
+  `evidence.control_files`; a push makes a new input, which is classified again.
+  Forgejo PRs are never lane members: one outside the policy keeps today's wait.
+- **The lane batch.** At most one open lane batch (`batches.lane = 'control'`)
+  exists. It is created on `main` when a control-file input waits, takes every
+  waiting control-file input first in first out, and is removed when it is empty
+  and stale or nothing waits for it. Ordinary insertion never probes a
+  control-file input, so ordinary batches never carry paths outside the policy.
+  The lane batch does not count against `open_batch_limit` and gets no
+  preparation, pre-rebase or successor sealing.
+- **Priority.** When the head lands, the next head is the emergency batch if any,
+  then the lane batch, then the oldest ordinary open batch. The lane never evicts
+  a running head (status reason: `control-file lane batch N waits for head M to
+  land`) and has no fairness guard: lane heads may run back to back. Claimed
+  `pre_rebase` and pre-rebased `prepare` work on the ordinary successor survives
+  a lane head as it does an emergency head, and a pre-rebase made on the previous
+  head's tip is carried onto `main` by replay when the successor seals.
+- **CI.** A lane head has only GitHub members, so it is dispatched through
+  GitHub-native `pr-build.yml`, whose `scope` status checks the admin approval
+  for every restricted path. A lane head that changes `lakefile.*` or Lean files
+  under `scripts/` changes Lake build inputs: it gets no cache hit and the next
+  head waits for its base cache to be published.
+- **No repair.** A control-file input gets `no_repair`, which no label event
+  clears. Repair agents never edit it: a failing lane head is handled by the
+  ordinary escalation (attribution, withdrawal, bisection), and a repair may only
+  empty a member, which the queue then withdraws as `problem-anticipated`. The
+  withdrawal comment says the queue does not edit control files.
+
+Status shows `lane` on every open batch and on the head, `control` on each
+waiting input, and the number of waiting control-file inputs in
+`waiting.control`. The journal records `control-classified`,
+`control-lane-opened` and `control-lane-head`.
+
+**Enabling.** Deploy with the setting off, then run
+`uv run tauceti-queue settings set control_lane_enabled true` (or post
+`{"control_lane_enabled": true}` to `/admin/settings`). The next tick classifies
+the waiting GitHub inputs and opens the lane batch.
+
+**Disabling.** Set it to `false`. A live lane batch is then staged as an ordinary
+open batch, oldest first, and nothing else needs cleaning up. Inputs already
+classified keep `no_repair`.
+
+**A batch that already carries a control-file PR.** Enabling the lane does not
+move members inserted before it: membership of a batch is fixed, and the queue
+has no command that removes a member from an open batch. Such a batch keeps
+refusing Forgejo PRs until it seals, and it drains naturally when it lands. The
+Forgejo PRs it refused are not lost: their conflict marker names only that
+batch's base, so they enter the next ordinary open batch as soon as one exists.
+To confirm that a batch is in this state, list its paths outside the policy in
+the queue clone on the host: `git diff --name-only <base> <tip>`, filtered by the
+policy prefix and its allow list. A `grep -v '^TauCeti/'` alone also flags
+allowed files such as `TauCeti.lean`, `lake-manifest.json`, `lean-toolchain` and
+`docbuild/docs/references.bib`.
 
 Each new mixed/source-candidate request captures the configured execution
 repository's protected `main` SHA, `.tauceti/ci-source.json`, matching

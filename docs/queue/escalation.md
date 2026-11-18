@@ -34,6 +34,9 @@ repairs, rebases or bisections happened between them.
    ([`reject-empty-commits.md`](reject-empty-commits.md)). An adopted repair that leaves the head's
    tree on the same base as it was when CI failed is not dispatched: the controller escalates that
    failure at once, since the same content would fail the same way.
+   Every member of a control-file lane head is `no_repair` ([mixed-sources.md](mixed-sources.md),
+   "The control-file lane"), so a repair there can only empty the culprit, and otherwise the
+   failure goes on to escalation.
    A member review-size policy rejection is repairable when the policy measured the member's own
    commit in the batch chain against its parent (the record's `measured` is `batch-commit`), which
    TauCetiTools does since it maps chain commits to members by their trailers: it goes to repair

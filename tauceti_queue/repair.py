@@ -1775,7 +1775,8 @@ def _no_repair_section(context: PromptContext, chain: list[ChainCommit]) -> list
     lines = [
         "## Do not edit",
         "",
-        "The authors of these PRs opted out of repair (`dont-repair-in-queue`). Do not change their content or their messages:",
+        "These PRs must not be edited: their authors opted out of repair (`dont-repair-in-queue`), or they change "
+        "control files outside the native path policy. Do not change their content or their messages:",
         "",
     ]
     for number in guarded:

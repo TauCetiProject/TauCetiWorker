@@ -791,6 +791,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `automatic_retry_max_seconds` | `14400` | integer, at least 0 |
 | `escalation_alert_seconds` | `86400` | integer, at least 0 |
 | `emergency_enabled` | `false` | `true` or `false`; accept `bors emergency` requests (below, after Rebuilding the head) |
+| `control_lane_enabled` | `false` | `true` or `false`; stage GitHub control-file PRs in their own lane batch ([mixed-sources.md](mixed-sources.md), "The control-file lane") |
 
 Escalations (withdrawals, bisections, the start and end of an infrastructure backoff) are sent as Zulip direct messages when
 `TAUCETI_QUEUE_ZULIP_CONFIG` in `~/.config/tauceti-queue/environment` names a mode-0600 bot
