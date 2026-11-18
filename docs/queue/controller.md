@@ -353,7 +353,11 @@ can no longer be found (neither in the listing nor by a direct read of the run),
 `in_progress`, nothing in its jobs moved for `lost_run_seconds` (progress is any phase or step
 appearing, starting or completing, or the run's `updated_at` moving), and a direct read
 (`GET /repos/{repo}/actions/runs/{id}`) still says `in_progress` with an `updated_at` at least that
-old; a silence short of that is a `stall:` reason line, never a verdict. A second dispatch for a tip
+old; a silence short of that is a `stall:` reason line, never a verdict. A run publishing its final
+oleans (`publishing`: the `sandboxed-build` step `Build exact candidate under bwrap` concluded
+`success`, and the handoff step or the `publish-merge-group-cache` job has started with no phase of
+them concluded unsuccessfully) is never lost, however long it is silent: a publisher that really died
+ends when GitHub fails or times out its job, and the completed run is classified as usual. A second dispatch for a tip
 whose run is live is never issued, because pr-build.yml's concurrency group would cancel the live run:
 before any re-dispatch of a tip dispatched before, the controller asks `find_candidate_run` for the
 newest run for it since its first attempt, and when that run is still `queued` or `in_progress` it
@@ -445,7 +449,7 @@ already a member of the open batch, the batch. The open batch seals as soon as t
 its active claims finish; the running head is never cancelled. It never lowers an emergency
 (`urgent = 2`) input or batch.
 
-Emergency lane (slice 1, `emergency_enabled`, off by default): a repository admin's request
+Emergency lane (`emergency_enabled`, off by default): a repository admin's request
 (`request_emergency(repo, pr, actor, surface=, reason=, live_head=)`, from `bors emergency`,
 `POST /admin/emergency` or `tauceti-queue emergency`) makes an approved PR the next head as a batch
 of its own. The flag is never an approval: the PR needs a live input (`waiting`, `reserved` or
@@ -465,9 +469,47 @@ new open batch on `main` with `batches.urgent = 2` (`conflicts-with-main`, `miss
 `admission-pending` keep it for the next pass); an input inserted in an open batch B is replayed onto
 `main` without the lock with the same checks and then, in one transaction, inserted into a new E
 whose ownership of the input (`inputs.batch_id`) replaces B's (the prospective singleton; a refusal
-leaves it in B). A request whose PR is in the running head waits for that head to land. One E is
-live at a time; later requests queue behind it, first in first out. E is never evicted, and slice 1
-never evicts the running head: E waits for it to land (`emergency-waits`).
+leaves it in B). A request whose PR is in the running head waits for that head to land, unless
+eviction (below) displaces it. One E is live at a time; later requests queue behind it, first in
+first out. E is never evicted. With `emergency_evict` off E waits for the running head to land
+(`emergency-waits`).
+
+Eviction (`emergency_evict`, off by default; `_evict`): E takes the head from a running ordinary head
+H unless H is protected, decided on H's current attempt in this order (`_protection`): a
+promotion-refusal hold is never protection; a pending `promote:<H>:...` outbox entry (P1) or a pass
+(P2) is; then, on a fresh strict observation of a pending attempt that may have a run
+(`_eviction_observation`: `needs_observation` set, `_observe_attempt(strict=True)`, reloaded; a
+source-candidate run in progress also has its phases read afresh, and a failed read means no
+eviction this pass), P2 again, a completed run with conclusion `success` whose verdicts are being
+bound (P3), and a run publishing its final oleans (P4, `publishing`). Everything else is evicted: a
+building or queued run, a publisher still waiting for a runner, a pending or uncertain dispatch, an
+infrastructure backoff, a source failure waiting for or under repair, a rebase conflict, an
+escalation hold. An observation that fails means no eviction this pass; a head found protected by an
+observation within `polling_interval_seconds` is not read again until that interval passes. After
+the observation everything read is revalidated (same head, version, tip and attempt, no controller
+claim on H, still not protected, E still sealable or the prospective singleton still current), then
+one transaction: for a PR in H with other active members, E is allocated from the prospective
+singleton built beforehand (ownership moves only here); H becomes `open` again, sealed, with its
+version and tip, `expected_parent` cleared and `prepared_version = version`; a durable
+`cancel_intent` is written for every unsettled attempt of H (a pending one superseded), except an
+attempt under a promotion-refusal hold, which H returns to; `state:emergency_evicted:<H>` records
+H's version, tip and open tasks; `_make_head(E)`; journal `evicted` (the last observed phases and why
+H was not protected). What no transaction prevents: the run can start publishing between the
+observation and the cancel.
+
+While H waits, its retained tasks (open at the evicted version) stay submittable and claimable
+(`_evicted_task_current`), and nothing else is created for H (`_pre_rebase`, `_prepare_open_batches`,
+`_prepare_pre_rebased`); an adoption on H, like a preparation's, records `prepared_version`. Tasks
+are offered by the role of their batch, not their kind (`claim_task`, `_choose_task`): the head's
+task first, then open batches' work, H's retained repair ahead of pre-rebases and preparations, with
+claims on open batches bounded by `repair_concurrency - 1`; while no claim on the head is live, the
+head's task is offered even when the claims already number `repair_concurrency`, so live claims can
+exceed it by one while H keeps a retained claim. In normal operation role and kind coincide. Once E
+is dispatched, H (now the first open batch) is pre-rebased onto E's tip as usual and seals from that
+pre-rebase when E lands; the batch behind H keeps its pre-rebase onto H's tip and gets no own-base
+preparation while that pre-rebase is usable. If E ends without landing, H is sealed again at once on
+its unchanged base. A run with an open cancel intent is never re-adopted (`_readopt_live_run`), so a
+returning H dispatches a new attempt. The marker goes when H is head again, lands or is removed.
 
 E is left out of the scheduling selectors only (`_staging_batches`: insertion, `open_batch_limit`,
 idle removal, the first open batch for pre-rebase and preparation, successor sealing); retained-ref
@@ -584,6 +626,7 @@ and reported in status:
 | `base_cache_recheck_seconds` | 120 | how long a base found unpublished is remembered before it is probed again |
 | `base_cache_alert_seconds` | 7200 | a wait for a published base this long raises a status alert and one direct message; 0 never |
 | `emergency_enabled` | false | accept emergency requests (`bors emergency`, `POST /admin/emergency`); off refuses them `disabled`, and a request already accepted keeps running |
+| `emergency_evict` | false | the emergency batch takes the head from a running ordinary head unless it is about to land or publishing its final oleans (`_evict`); off, it waits for the running head to land |
 | `control_lane_enabled` | false | with mixed sources admitted under GitHub primary, stage GitHub PRs whose own diff leaves the native path policy in the control-file lane batch, sealed next after the emergency batch and never repaired ([mixed-sources.md](mixed-sources.md), "The control-file lane"); off stages a live lane batch as an ordinary one |
 | `no_repair_labels` | `["dont-repair-in-queue"]` | labels (case-insensitive) by which an author opts a PR out of agent edits; such a member is only ever emptied and withdrawn as `problem-anticipated` |
 
