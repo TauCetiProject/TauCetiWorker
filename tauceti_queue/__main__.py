@@ -218,6 +218,7 @@ class Service:
             revision=self.runtime.revision.sha,
             canonical_branch=self.config.canonical_branch or None,
             mixed=mixed,
+            revision_map_probe=module.revision_map_published,
         )
         self.controller.public_url = self.config.public_url
         self.loop_module = _optional("loop")
