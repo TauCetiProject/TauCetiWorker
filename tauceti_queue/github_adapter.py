@@ -66,6 +66,8 @@ COMMENT_MARKER = "<!-- tauceti-queue {marker} -->"
 # Bors treats collaborators with push access as reviewers (`auto_reviewer_required_perm: :push`).
 REVIEWER_PERMISSIONS = frozenset({"admin", "maintain", "write"})
 MAX_LOG_BYTES = 64 * 1024 * 1024
+# A bump guard reads about twenty resources; this bounds one PR head's kept responses.
+MAX_SELF_TESTED_READS = 64
 
 Transport = github_app.Transport
 Phase = CandidatePhase
@@ -1129,6 +1131,28 @@ class GitHubAdapter:
         # ambiguous: retain the target identity and let the compare API resolve a fresh decision.
         return bases[0] if len(bases) == 1 else ",".join([*bases, base])
 
+    def _self_tested_read(self, reads: dict, path: str):
+        """One self-tested eligibility read, kept for this head's admission attempts.
+
+        A bump guard makes about twenty background reads, and pacing defers most of them. The
+        attempt that follows the wait resumes from the kept responses instead of starting again
+        from the first read. A 404 is an answer the guard uses, so it is kept too. Past the bound
+        the evaluation fails visibly rather than repeating its last uncached read forever.
+        """
+        if path not in reads:
+            if len(reads) >= MAX_SELF_TESTED_READS:
+                raise GitHubError(f"self-tested evidence needs more than {MAX_SELF_TESTED_READS} reads")
+            try:
+                reads[path] = (200, self.client.get_json(path)[1])
+            except GitHubError as error:
+                if isinstance(error, RequestDeferred) or error.status != 404:
+                    raise
+                reads[path] = (404, str(error))
+        status, data = reads[path]
+        if status == 404:
+            raise GitHubError(data, 404)  # fresh each time, so replays do not grow one traceback
+        return data
+
     def admission_snapshot(self, repo: str, number: int, *, generation=0) -> ports.AdmissionSnapshot:
         """Read complete current inputs and the exact reviewed diff; never run a PR's code."""
         progress = self._admission_reads.get((repo, number))
@@ -1182,6 +1206,7 @@ class GitHubAdapter:
 
         local = False
         if requested(pull.labels):
+            reads = progress.setdefault("self_tested", {})
             raw = {
                 "number": number,
                 "state": pull.state,
@@ -1190,9 +1215,20 @@ class GitHubAdapter:
                 "head": {"sha": pull.head_sha, "ref": pull.head_ref, "repo": {"full_name": pull.head_repo}},
                 "user": {"login": pull.author_login},
             }
-            local = eligible(
-                raw, repo, paths=paths, read=lambda path: self.client.get_json(path)[1], member_read=gh_read
-            )
+            try:
+                local = eligible(
+                    raw,
+                    repo,
+                    paths=paths,
+                    read=lambda path: self._self_tested_read(reads, path),
+                    member_read=gh_read,
+                )
+            except Exception as error:
+                # Kept reads span only one run of resource waits. Any other failure reads fresh
+                # evidence next time, including mutable upstream answers the PR fence cannot see.
+                if not isinstance(error, RequestDeferred):
+                    progress.pop("self_tested", None)
+                raise
         # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here.
         guard = diff_guard.violations(self.clone_dir, merge_base, pull.head_sha) if local else ()
         fresh, statuses = self._admission_fence(repo, number, pull, labels_progress=progress.setdefault("labels", {}))
