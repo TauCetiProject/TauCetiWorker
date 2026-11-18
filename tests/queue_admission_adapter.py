@@ -246,6 +246,45 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(len(transport.calls), 4)
             self.assertEqual(clock.slept, [])
 
+    def test_paced_self_tested_reads_resume_instead_of_restarting_the_bump_guard(self):
+        transport = FakeTransport()
+        limit = {"x-ratelimit-remaining": "3", "x-ratelimit-reset": "1800000030"}
+        url = f"https://api.github.com/repos/{TAUCETI}"
+        transport.add("GET", url + "/branches/main", 200, {"commit": {"sha": BASE}}, limit)
+        transport.add("GET", url + "/contents/lakefile.lean", 404, {"message": "Not Found"}, limit)
+        transport.add("GET", url + "/contents/lean-toolchain", 200, {"type": "file"}, limit)
+        c, clock = client(transport)
+        adapter = ga.GitHubAdapter(c, repo=TAUCETI, clone_dir=None)
+        reads = {}
+
+        def guard():
+            read = lambda path: adapter._self_tested_read(reads, f"repos/{TAUCETI}/{path}")  # noqa: E731
+            main = read("branches/main")["commit"]["sha"]
+            try:
+                read("contents/lakefile.lean")
+            except ga.RequestDeferred:
+                raise
+            except ga.GitHubError as missing:
+                self.assertEqual(missing.status, 404)
+            return main, read("contents/lean-toolchain")["type"]
+
+        attempts = 0
+        with c.deferred_requests():
+            while True:
+                attempts += 1
+                try:
+                    result = guard()
+                    break
+                except ga.RequestDeferred as pending:
+                    clock.now = pending.retry_at
+        self.assertEqual(result, (BASE, "file"))
+        self.assertEqual(attempts, 3, "each paced attempt must make one new read")
+        self.assertEqual(len(transport.calls), 3, "kept responses, including the 404, are not read again")
+        full = {str(n): (n, None) for n in range(ga.MAX_SELF_TESTED_READS)}
+        clock.now += 60
+        adapter._self_tested_read(full, f"repos/{TAUCETI}/branches/main")
+        self.assertEqual(len(full), ga.MAX_SELF_TESTED_READS, "kept responses stay bounded")
+
     def test_essential_requests_take_priority_without_serializing_other_buckets(self):
         essential_started, release = threading.Event(), threading.Event()
         background_started, core_entered = threading.Event(), threading.Event()

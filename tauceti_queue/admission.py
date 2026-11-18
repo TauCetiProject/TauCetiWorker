@@ -244,6 +244,7 @@ class AdmissionPoller:
         self._lock = threading.Lock()
         self._discovery_lock = threading.Lock()
         self._discovery_serial = 0
+        self._failures = {}  # admission_work id -> (generation, consecutive failed attempts)
         self.wake = lambda: None
         self.last_summary = None
         self.stopping = threading.Event()
@@ -461,11 +462,12 @@ class AdmissionPoller:
                 self.clock(),
             )
 
-    def _retry_at(self, error):
-        return (
-            error.retry_at
-            if isinstance(error, RequestDeferred)
-            else self.clock() + self.controller.setting("outbox_retry_seconds")
+    def _retry_at(self, error, failures=1):
+        if isinstance(error, RequestDeferred):
+            return error.retry_at
+        return self.clock() + min(
+            int(self.controller.setting("outbox_retry_seconds")) * 2 ** min(20, failures - 1),
+            int(self.controller.setting("outbox_retry_max_seconds")),
         )
 
     def _process_one(self, summary, *, prefer_urgent=True, urgent_only=False):
@@ -484,6 +486,7 @@ class AdmissionPoller:
             deferred = getattr(client, "deferred_requests", None)
             with deferred(urgent=revocation) if deferred is not None else nullcontext():
                 self._evaluate(work, summary)
+            self._failures.pop(work["id"], None)
         except Exception as error:
             if (
                 getattr(error, "publication_kind", None) == "recovery"
@@ -492,9 +495,15 @@ class AdmissionPoller:
                 reconcile = getattr(self.controller, "reconcile_source_recovery", None)
                 if reconcile is not None:
                     reconcile(work["number"], getattr(error, "head", None), getattr(error, "nonce", None))
+            # Consecutive failures of one generation back off; a resource wait is not a failure.
+            failures = 1
+            if not isinstance(error, RequestDeferred):
+                generation, count = self._failures.get(work["id"], (None, 0))
+                failures = count + 1 if generation == work["generation"] else 1
+                self._failures[work["id"]] = (work["generation"], failures)
             self.state.defer(
                 work,
-                self._retry_at(error),
+                self._retry_at(error, failures),
                 str(error),
                 error.resource if isinstance(error, RequestDeferred) else "source",
             )

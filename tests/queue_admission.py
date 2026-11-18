@@ -438,6 +438,33 @@ class AdmissionTests(unittest.TestCase):
         self.clock.advance(7200)
         self.assertEqual(self.intake.run_once()["approved"], 1)
 
+    def test_repeated_source_errors_back_off_and_a_resource_wait_keeps_the_count(self):
+        self.ready()
+        original = self.github.admission_snapshot
+        errors = []
+
+        def failing(*args, **kwargs):
+            error = errors.pop(0)
+            raise error() if callable(error) else error
+
+        self.github.admission_snapshot = failing
+        failure = RuntimeError("evidence unavailable")
+        delays = []
+        for error in (
+            failure,
+            failure,
+            lambda: RequestDeferred("quota wait", retry_at=self.clock() + 5, resource="core"),
+            *[failure] * 4,
+        ):
+            errors.append(error)
+            self.intake.run_once()
+            delays.append(self.intake.state.get(1)["next_attempt_at"] - self.clock())
+            self.clock.advance(delays[-1])
+        self.assertEqual(delays, [30, 60, 5, 120, 240, 480, 900], "a resource wait is not a failure; capped")
+        self.github.admission_snapshot = original
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.assertEqual(self.intake._failures, {})
+
     def test_discovery_server_cooldown_protects_new_dirty_work_after_restart(self):
         self.ready()
         until = self.clock() + 7200
