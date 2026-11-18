@@ -1189,27 +1189,48 @@ class SupersededRuns(ControllerCase):
         self.assertEqual(self.controller._active_claims(self.head["id"])[0]["task_id"], task.task_id)
         self.assertEqual(self.attempts()[0]["cancel_reason"], "canonical advanced; rebase waits for worker")
 
-    def test_a_failed_cancel_never_blocks_the_dispatch_and_is_retried_once(self):
-        self.github.fail_next["cancel_run"] = 5
+    def test_a_failed_cancel_never_blocks_the_dispatch_and_is_retried_until_settled(self):
+        self.github.fail_next["cancel_run"] = 3
         first, second = self.replay()
         self.assertEqual(len(self.github.dispatches), 2, "the new attempt was dispatched")
         self.assertEqual(second["dispatch_id"], "dispatch-2")
         self.assertEqual(first["outcome"], "superseded")
         self.assertTrue(first["cancel_result"].startswith("failed:"), first["cancel_result"])
+        intent = self.controller._cancel_intents()[first["id"]]
+        self.assertEqual(intent["tries"], 1)
+        self.assertGreater(intent["retry_at"], self.clock())
         for _ in range(4):
             self.observe(self.controller.setting("outbox_retry_max_seconds") + 1)
-        self.assertEqual(len(self.cancel_calls()), 2, "one inline call and one retry from the outbox")
-        entry = self.controller.store.row("outbox", {"kind": "cancel_run"})
-        self.assertEqual(entry["state"], "done")
-        self.assertTrue(entry["result"].startswith("gave-up:"), entry["result"])
+        self.assertEqual(len(self.cancel_calls()), 4, "one inline call, two failed retries and the one that settles")
+        self.assertEqual(self.github.runs[0].conclusion, "cancelled")
+        self.assertEqual(self.attempts()[0]["cancel_result"], "cancelled")
+        self.assertEqual(self.controller._cancel_intents(), {})
+        self.assertIsNone(self.controller.store.row("outbox", {"kind": "cancel_run"}))
         self.assertEqual(self.attempts()[1]["outcome"], "pending")
 
-    def test_a_failed_cancel_succeeds_on_its_outbox_retry(self):
+    def test_a_failed_cancel_backs_off_before_its_retry(self):
         self.github.fail_next["cancel_run"] = 1
         self.replay()
+        self.controller._settle_cancel_intents(self.clock())
+        self.assertEqual(len(self.cancel_calls()), 1, "the retry waits out its backoff")
+        self.observe()
+        self.assertEqual(len(self.cancel_calls()), 2)
+        self.assertEqual(self.github.runs[0].conclusion, "cancelled")
+        self.assertEqual(self.attempts()[0]["cancel_result"], "cancelled")
+        self.assertEqual(self.controller._cancel_intents(), {})
+
+    def test_a_queued_outbox_cancel_that_fails_hands_over_to_a_cancel_intent(self):
+        # An entry enqueued by an earlier controller, which retried a failed cancel once through the outbox.
+        self.github.cancel_run = None
+        first, _second = self.replay()
+        del self.github.cancel_run
+        self.github.fail_next["cancel_run"] = 1
+        payload = {"run_id": first["run_id"], "attempt_id": first["id"]}
+        self.assertTrue(self.controller._perform("cancel_run", payload, self.clock()).startswith("cancel-intent:"))
+        self.assertIn(first["id"], self.controller._cancel_intents())
         self.observe()
         self.assertEqual(self.github.runs[0].conclusion, "cancelled")
-        self.assertEqual(self.controller.store.row("outbox", {"kind": "cancel_run"})["result"], "cancelled")
+        self.assertEqual(self.controller._cancel_intents(), {})
 
     def test_a_landed_batch_cancels_a_straggler(self):
         # A controller unable to cancel at dispatch (as before this was added) leaves the old run going.

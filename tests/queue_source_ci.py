@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Controller source-candidate dispatch, restart and fresh promotion evidence."""
 
+import json
 import sys
 import tempfile
 import unittest
@@ -36,6 +37,7 @@ class VerifiedExecution:
         self.observations = 0
         self.discoveries = 0
         self.deleted_runs = set()
+        self.cancel_failures = 0
 
     def preflight(self, frozen):
         return "fixture-only"
@@ -108,7 +110,12 @@ class VerifiedExecution:
     def deleted(self, frozen, run_id):
         return run_id in self.deleted_runs
 
-    def cancel(self, frozen, run_id, *, proof):
+    def cancel(self, execution, run_id, *, request_digest, proof):
+        if proof.get("request_digest") != request_digest or str(proof.get("run_id")) != run_id:
+            raise ValueError("cancellation requires the stored request ownership proof")
+        if self.cancel_failures:
+            self.cancel_failures -= 1
+            raise OSError("owned execution cancellation is unconfirmed")
         self.cancelled.append(run_id)
         return "cancelled"
 
@@ -282,6 +289,77 @@ class SourceController(unittest.TestCase):
         self.assertEqual(self.approvals, [])
         self.assertEqual(len(self.execution.dispatches), 1)
         self.assertEqual(self.store.count("ci_request_runs"), 1)
+
+    def owned_live_attempt_with_retired_policy_field(self):
+        """An owned live run whose attempt was frozen with a policy field this service no longer parses."""
+        attempt = self.start()
+        frozen = self.ledger.load(attempt["id"])
+        self.execution.add(frozen)
+        self.clock.advance(60)
+        self.controller.tick()
+        attempt = self.store.row("ci_attempts", {"id": attempt["id"]})
+        self.assertEqual((attempt["run_id"], self.store.count("ci_request_runs")), ("101", 1))
+        row = self.store.row("ci_requests", {"attempt_id": attempt["id"]})
+        stored = json.loads(row["policy_json"])
+        self.store.update(
+            "ci_requests",
+            {"attempt_id": attempt["id"]},
+            policy_json=json.dumps(dict(stored, harness_revision="a" * 40)),
+        )
+        with self.assertRaisesRegex(ValueError, "invalid execution policy fields"):
+            self.ledger.load(attempt["id"])
+        return attempt
+
+    def test_a_run_frozen_under_a_retired_policy_field_can_still_be_cancelled(self):
+        attempt = self.owned_live_attempt_with_retired_policy_field()
+        self.assertEqual(self.ci.cancel_run("101"), "cancelled")
+        self.controller._cancel_superseded_runs(attempt["batch_id"], self.clock(), reason="head rebuilt")
+        self.assertEqual(self.execution.cancelled, ["101", "101"])
+        current = self.store.row("ci_attempts", {"id": attempt["id"]})
+        self.assertEqual((current["outcome"], current["cancel_result"]), ("superseded", "cancelled"))
+        self.assertEqual(self.controller._cancel_intents(), {})
+
+    def test_cancellation_still_requires_a_stored_ownership_row(self):
+        attempt = self.owned_live_attempt_with_retired_policy_field()
+        for run_id in ("999", "0101"):
+            with self.assertRaisesRegex(ValueError, "not owned"):
+                self.ci.cancel_run(run_id)
+        self.store.update("ci_request_runs", {"run_id": "101"}, receipt_json=json.dumps({"kind": "request"}))
+        with self.assertRaisesRegex(ValueError, "ownership proof"):
+            self.ci.cancel_run("101")
+        self.store.execute("DELETE FROM ci_request_runs")
+        with self.assertRaisesRegex(ValueError, "not owned"):
+            self.ci.cancel_run("101")
+        self.controller._cancel_superseded_runs(attempt["batch_id"], self.clock(), reason="head rebuilt")
+        self.clock.advance(3600)
+        self.controller._settle_cancel_intents(self.clock())
+        self.assertEqual(self.execution.cancelled, [])
+        self.assertIn(attempt["id"], self.controller._cancel_intents(), "an unproven run is never cancelled")
+
+    def test_a_failed_superseded_cancel_is_retried_with_backoff_until_settled(self):
+        attempt = self.owned_live_attempt_with_retired_policy_field()
+        self.execution.cancel_failures = 2
+        self.controller._cancel_superseded_runs(attempt["batch_id"], self.clock(), reason="head rebuilt")
+        current = self.store.row("ci_attempts", {"id": attempt["id"]})
+        self.assertTrue(current["cancel_result"].startswith("failed:"), current["cancel_result"])
+        self.assertEqual(self.controller._cancel_intents()[attempt["id"]]["reason"], "head rebuilt")
+        self.assertEqual(self.store.count("outbox", {"kind": "cancel_run"}), 0)
+        retry = self.controller.setting("outbox_retry_seconds")
+        self.assertEqual(self.controller._cancel_intents()[attempt["id"]]["retry_at"], self.clock() + retry)
+        self.controller._settle_cancel_intents(self.clock())  # the first retry waits out its backoff
+        self.clock.advance(retry)
+        self.controller._settle_cancel_intents(self.clock())  # fails again and backs off further
+        intent = self.controller._cancel_intents()[attempt["id"]]
+        self.assertEqual(intent["tries"], 2)
+        self.assertEqual(intent["retry_at"], self.clock() + 2 * retry)
+        self.clock.advance(2 * retry - 1)
+        self.controller._settle_cancel_intents(self.clock())
+        self.assertEqual(self.execution.cancelled, [])
+        self.clock.advance(1)
+        self.controller._settle_cancel_intents(self.clock())
+        self.assertEqual(self.execution.cancelled, ["101"])
+        self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["cancel_result"], "cancelled")
+        self.assertEqual(self.controller._cancel_intents(), {})
 
     def test_revoked_approval_blocks_cached_pass_and_unowned_cancel(self):
         attempt = self.start()

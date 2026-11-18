@@ -371,9 +371,16 @@ its head rebuilt, every other attempt of the batch whose run is known and not la
 `cancel_result` (`cancelled`, `already-completed` for a 409, or the failure), a pending attempt
 becomes `superseded` with detail `ci-cancelled: <reason>` (an attempt already classified keeps its
 outcome, so infrastructure retries still count), and `ci-cancelled` is journaled with the attempt,
-run, `superseded_by` and reason. A failed request (403, 404, 5xx) is logged and retried once through
-the outbox (`cancel_run`, key `cancel-run:<run id>`); the second failure is recorded as `gave-up:`
-and dropped, and neither holds back the dispatch or the landing. A cancelled run is never treated as
+run, `superseded_by` and reason. A failed request (403, 404, 5xx), or a failed lookup of a
+superseded attempt's run, is logged and leaves a durable `cancel_intent:<attempt>`, which
+`_settle_cancel_intents` retries with the outbox's backoff (`outbox_retry_seconds` doubling up to
+`outbox_retry_max_seconds`) until the run is settled; neither holds back the dispatch or the landing.
+A `cancel_run` outbox entry left by an earlier controller gets one more try and then hands a failure
+to the same intent. A source-CI cancellation (`SourceCandidateCI.cancel_run`) is authorised by the
+stored `ci_request_runs` row and its receipt alone, checked against the bound execution repository
+and the live run; it never reparses the frozen request or its execution policy, so an attempt frozen
+under an older policy schema stays cancellable, and a run with no stored ownership is never
+cancelled. A cancelled run is never treated as
 lost or as an infrastructure failure: its attempt is no longer observed, the re-adoption of live
 runs skips it, and observation of a newer attempt never binds to it.
 
@@ -491,8 +498,8 @@ transaction and first in every `_emergency` pass) looks up the run of an attempt
 dispatch may have been sent, cancels a live run and deletes the intent only once the cancel is
 accepted, the run is observed completed, or the attempt provably has no run (`prepared`, `rejected`,
 or an `accepted` dispatch with no run found once older than `dispatch_timeout_seconds`; a `sending`
-or `uncertain` dispatch is never retired by age). Failures are retried each pass; intents block
-nothing.
+or `uncertain` dispatch is never retired by age). A failure backs the intent off (`tries`,
+`retry_at`, as for the outbox); there is no cap, and intents block nothing.
 
 `approve` of a live input's own accepted head by a repository admin (admin evidence with `actor_id`
 and `merge_base_sha`) records `evidence.admin_reapproval` beside the original evidence and journals
@@ -701,7 +708,7 @@ repairs), `no_repair_withdrawals`, `problem_anticipated_needs_rebase`,
 `emergency` (`enabled`; `batch`, null or the live emergency batch: `batch_id`, `stage` (`waiting` or
 `head`), `waiting_for`, and the request's `number`, `state`, `actor`, `requested_at`, `surface`,
 `reason`; `queued`, the requests behind it; `cancel_intents`, the open intents with `attempt_id`,
-`batch_id`, `reason`, `at`). Every batch summary carries `emergency` (`urgent == 2`).
+`batch_id`, `reason`, `at`, and after a failure `tries` and `retry_at`). Every batch summary carries `emergency` (`urgent == 2`).
 
 `status()` waits at most two seconds for the controller lock (`wait=` overrides; `/healthz` passes
 half a second). When a pass holds it longer, the snapshot taken at the end of the last pass or
