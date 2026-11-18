@@ -34,8 +34,9 @@ RETRY_SECONDS = 300  # how long a recorded wait keeps the host's other workers o
 WARN_SECONDS = 3600  # a wait this old logs one warning per host and commit
 PR_GRACE_SECONDS = 7200  # a PR whose own head changes dependencies stops waiting after this
 PROBE_SECONDS = 30  # at most one published-map probe per marker and host in this interval
+SWEEP_SECONDS = 3600  # the host-wide age sweep of wait markers runs at most this often
 CLAIM_SECONDS = 120  # an expired wait's real check belongs to one round for this long
-FORGET_SECONDS = 7 * 86400  # stale markers are removed by readers
+FORGET_SECONDS = 7 * 86400  # waits (released ones too) this old are deleted by the sweep
 SCOPE = "TauCeti"  # Lake's local revision-map scope: <cache>/revisions/TauCeti/<rev>.jsonl
 ENABLE = "TAUCETI_BUILD_CACHE_WAIT"  # set by worker agent rounds; other cache users never wait
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -149,6 +150,19 @@ def _read(path: Path) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _load(path: Path) -> dict:
+    """An existing wait, or {} when there is none. Raises OSError or ValueError when a marker exists
+    but cannot be read: treating it as absent would restart its wait (and a PR's grace) for good."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return {}
+    value = json.loads(text)
+    if not isinstance(value, dict):
+        raise ValueError(f"{path.name} is not a build-cache wait")
+    return value
+
+
 def _write(path: Path, value: dict) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(value, sort_keys=True))
@@ -184,12 +198,13 @@ def record(
     """Record (or extend) the wait `name`; returns the marker, with `first_wait_at` preserved.
 
     `need` is the revision whose published map would satisfy the prepared dependencies (probed with
-    `toolchain`, theirs). Raises OSError when the marker cannot be persisted: the caller proceeds.
+    `toolchain`, theirs). Raises OSError or ValueError when the marker cannot be read back or
+    persisted: the caller proceeds.
     """
     now = time.time() if now is None else now
     with _locked(env) as folder:
         path = folder / f"{name}.json"
-        marker = _read(path)
+        marker = _load(path)
         if scope == "main":
             # Main has one current commit: an older main commit's wait is superseded by this one.
             for other in folder.glob("*.json"):
@@ -240,6 +255,46 @@ def clear(name: str, *, scope: str, env=None) -> None:
                     other.unlink(missing_ok=True)
 
 
+def sweep(env=None, *, now=None) -> int:
+    """Delete waits older than FORGET_SECONDS, whatever their head, stage or release; at most hourly.
+
+    Markers for closed PRs and replaced heads are never selected again, so selection alone would
+    never collect them. Released waits stay until the same bound, so a spent PR grace is not granted
+    again while its head is still in use. Unreadable markers age by modification time. Returns the
+    number deleted; every failure is ignored.
+    """
+    now = time.time() if now is None else now
+    removed = 0
+    with contextlib.suppress(OSError, ValueError):
+        folder = directory(env)
+        if not folder.is_dir():
+            return 0
+        stamp = folder / ".swept"
+
+        def swept() -> float:
+            try:
+                return float(stamp.read_text())
+            except (OSError, ValueError):
+                return 0  # never swept, or a damaged stamp: sweep now
+
+        if now - swept() < SWEEP_SECONDS:
+            return 0
+        with _locked(env):
+            if now - swept() < SWEEP_SECONDS:
+                return 0  # another round swept while this one waited for the lock
+            stamp.write_text(str(now))
+            for path in folder.glob("*.json"):
+                with contextlib.suppress(OSError):
+                    try:
+                        since = float(_load(path).get("first_wait_at", path.stat().st_mtime))
+                    except (ValueError, TypeError):
+                        since = path.stat().st_mtime
+                    if now - since > FORGET_SECONDS:
+                        path.unlink(missing_ok=True)
+                        removed += 1
+    return removed
+
+
 def deferral(
     commit: str | None = None, *, scope: str = "pr", stage: str = "", env=None, now=None, probe=None
 ) -> dict | None:
@@ -253,6 +308,7 @@ def deferral(
     now = time.time() if now is None else now
     probe = probe or published
     me = _claimant()
+    sweep(env, now=now)
     try:
         folder = directory(env)
         found = []

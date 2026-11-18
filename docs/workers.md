@@ -447,7 +447,10 @@ wait. When the retry time passes, the next round to select that work claims the 
 minutes, together with its own later candidates, and goes through. Only cache preparation
 re-arms the retry time, so a round that claims and then declines lets the claim lapse for the
 next one. A successful check on main clears every wait on main. Any error reading or writing
-markers, or probing, lets work proceed, including the round that could not record its wait.
+markers, or probing, lets work proceed, including the round that could not record its wait. A marker
+that exists but cannot be read is left alone rather than restarted. At most once an hour per
+host, selection deletes every marker whose first wait is more than seven days old, whatever its
+head or stage; released PR waits are kept until then, so a spent grace is not granted again.
 
 A wait older than an hour logs one warning per host and commit, naming the URL CI should have
 published. Rounds on main wait without limit: main always gets a cache, and building anyway

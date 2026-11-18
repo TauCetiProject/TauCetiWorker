@@ -421,6 +421,73 @@ class BuildCacheWait(unittest.TestCase):
             self.write_marker(self.c3, scope="pr")
             self.assertIsNone(build_cache_wait.deferral(self.c3, stage="fix"))
 
+    def own_bump_pr(self):
+        """A PR whose head changes dependencies past main's: the case with a 2h grace."""
+        self.git("update-ref", "refs/remotes/origin/main", self.c2)
+        self.pr_head(self.c2, "base")
+        return self.commit("v4.36.0", "newer", "own bump")
+
+    def test_unreadable_existing_marker_never_restarts_the_wait(self):
+        head = self.own_bump_pr()
+        name = build_cache_wait.key(head, build_cache_wait.working(self.repo))
+        path = self.pool / "cache-waits" / f"{name}.json"
+        start = time.time() - 600
+        self.write_marker(head, scope="pr", first_wait_at=start)
+        real_read = Path.read_text
+
+        def failing_read(self_path, *args, **kwargs):
+            if self_path == path:
+                raise PermissionError("unreadable")
+            return real_read(self_path, *args, **kwargs)
+
+        # Reading fails while writing would succeed: every round proceeds, even past 2h.
+        for hours in (0, 1, 3):
+            with (
+                patch.object(build_cache_wait.time, "time", return_value=time.time() + hours * 3600),
+                patch.object(Path, "read_text", failing_read),
+            ):
+                self.warm(self.c1)
+        self.assertEqual(json.loads(path.read_text())["first_wait_at"], start)
+        # A corrupt marker is left alone the same way, and does not block selection either.
+        path.write_text("{not json")
+        for hours in (0, 3):
+            with patch.object(build_cache_wait.time, "time", return_value=time.time() + hours * 3600):
+                self.warm(self.c1)
+        self.assertEqual(path.read_text(), "{not json")
+        self.assertIsNone(build_cache_wait.deferral(head, stage="fix"))
+        self.assertTrue(any("dependency check skipped" in line for line in self.logs))
+
+    def test_sweep_collects_old_waits_whatever_their_head_or_release(self):
+        folder = self.pool / "cache-waits"
+        now = time.time()
+        old = now - build_cache_wait.FORGET_SECONDS - 60
+        self.write_marker(self.c1, name="closed-pr", scope="pr", first_wait_at=old)
+        self.write_marker(self.c2, name="released-old", scope="pr", first_wait_at=old, released=True)
+        self.write_marker(self.c3, name="released-recent", scope="pr", first_wait_at=now - 86400, released=True)
+        self.write_marker(self.c4, name="fresh-main", first_wait_at=now)
+        (folder / "corrupt-old.json").write_text("{not json")
+        os.utime(folder / "corrupt-old.json", (old, old))
+        (folder / "corrupt-recent.json").write_text("{not json")
+        # A selection for an unrelated head still sweeps the whole folder.
+        with patch.object(build_cache_wait, "published", return_value=False):
+            build_cache_wait.deferral("f" * 40, stage="fix", now=now)
+        self.assertEqual(
+            sorted(path.stem for path in folder.glob("*.json")),
+            ["corrupt-recent", "fresh-main", "released-recent"],
+        )
+        # At most once per interval per host: a new stale marker waits for the next sweep.
+        self.write_marker(self.c1, name="closed-later", scope="pr", first_wait_at=old)
+        self.assertEqual(build_cache_wait.sweep(now=now + 60), 0)
+        self.assertTrue((folder / "closed-later.json").exists())
+        self.assertEqual(build_cache_wait.sweep(now=now + build_cache_wait.SWEEP_SECONDS + 1), 1)
+        self.assertFalse((folder / "closed-later.json").exists())
+        # A damaged stamp means sweep now; a folder that cannot be locked is ignored.
+        (folder / ".swept").write_text("garbage")
+        self.write_marker(self.c1, name="closed-again", scope="pr", first_wait_at=old)
+        self.assertEqual(build_cache_wait.sweep(now=now + 2 * build_cache_wait.SWEEP_SECONDS), 1)
+        with patch.object(build_cache_wait, "_locked", side_effect=OSError("read-only")):
+            self.assertEqual(build_cache_wait.sweep(now=now + 9 * build_cache_wait.SWEEP_SECONDS), 0)
+
     def test_revision_url_and_http_probe(self):
         self.assertEqual(
             build_cache_wait.revision_url(self.c4, "leanprover/lean4:v4.36.0-rc2\n"),
