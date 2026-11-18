@@ -1134,21 +1134,22 @@ class GitHubAdapter:
 
         A bump guard makes about twenty background reads, and pacing defers most of them. The
         attempt that follows the wait resumes from the kept responses instead of starting again
-        from the first read. A 404 is an answer the guard uses, so it is kept too.
+        from the first read. A 404 is an answer the guard uses, so it is kept too. Past the bound
+        the evaluation fails visibly rather than repeating its last uncached read forever.
         """
-        answer = reads.get(path)
-        if answer is None:
+        if path not in reads:
+            if len(reads) >= MAX_SELF_TESTED_READS:
+                raise GitHubError(f"self-tested evidence needs more than {MAX_SELF_TESTED_READS} reads")
             try:
-                answer = (self.client.get_json(path)[1], None)
+                reads[path] = (200, self.client.get_json(path)[1])
             except GitHubError as error:
                 if isinstance(error, RequestDeferred) or error.status != 404:
                     raise
-                answer = (None, error)
-            if len(reads) < MAX_SELF_TESTED_READS:
-                reads[path] = answer
-        if answer[1] is not None:
-            raise answer[1]
-        return answer[0]
+                reads[path] = (404, str(error))
+        status, data = reads[path]
+        if status == 404:
+            raise GitHubError(data, 404)  # fresh each time, so replays do not grow one traceback
+        return data
 
     def admission_snapshot(self, repo: str, number: int, *, generation=0) -> ports.AdmissionSnapshot:
         """Read complete current inputs and the exact reviewed diff; never run a PR's code."""
@@ -1212,13 +1213,20 @@ class GitHubAdapter:
                 "head": {"sha": pull.head_sha, "ref": pull.head_ref, "repo": {"full_name": pull.head_repo}},
                 "user": {"login": pull.author_login},
             }
-            local = eligible(
-                raw,
-                repo,
-                paths=paths,
-                read=lambda path: self._self_tested_read(reads, path),
-                member_read=gh_read,
-            )
+            try:
+                local = eligible(
+                    raw,
+                    repo,
+                    paths=paths,
+                    read=lambda path: self._self_tested_read(reads, path),
+                    member_read=gh_read,
+                )
+            except Exception as error:
+                # Kept reads span only one run of resource waits. Any other failure reads fresh
+                # evidence next time, including mutable upstream answers the PR fence cannot see.
+                if not isinstance(error, RequestDeferred):
+                    progress.pop("self_tested", None)
+                raise
         # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here.
         guard = diff_guard.violations(self.clone_dir, merge_base, pull.head_sha) if local else ()
         fresh, statuses = self._admission_fence(repo, number, pull, labels_progress=progress.setdefault("labels", {}))

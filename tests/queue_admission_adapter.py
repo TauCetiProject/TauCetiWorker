@@ -280,10 +280,10 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(result, (BASE, "file"))
         self.assertEqual(attempts, 3, "each paced attempt must make one new read")
         self.assertEqual(len(transport.calls), 3, "kept responses, including the 404, are not read again")
-        full = {str(n): (n, None) for n in range(ga.MAX_SELF_TESTED_READS)}
-        clock.now += 60
-        adapter._self_tested_read(full, f"repos/{TAUCETI}/branches/main")
-        self.assertEqual(len(full), ga.MAX_SELF_TESTED_READS, "kept responses stay bounded")
+        full = {str(n): (200, n) for n in range(ga.MAX_SELF_TESTED_READS)}
+        with self.assertRaisesRegex(ga.GitHubError, "more than"):
+            adapter._self_tested_read(full, f"repos/{TAUCETI}/branches/main")
+        self.assertEqual(len(transport.calls), 3, "past the bound nothing new is read")
 
     def test_essential_requests_take_priority_without_serializing_other_buckets(self):
         essential_started, release = threading.Event(), threading.Event()
