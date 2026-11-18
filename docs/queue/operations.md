@@ -113,7 +113,8 @@ build and how long each phase took, and makes placement decisions from those mea
 
 | Path | Content |
 | --- | --- |
-| `~/TauCetiQueue` | checkout of `TauCetiProject/TauCetiWorker` at the installed revision; the unit runs `uv run tauceti-queue serve` from here |
+| `~/TauCetiQueue` | the shared clone of `TauCetiProject/TauCetiWorker` that releases are made from; the installers fetch into it and never change its working tree |
+| `~/TauCetiQueue-releases/<sha>-<time>/` | one release per install: a detached worktree of the shared clone with its own `.venv`, baked `tauceti_queue/_revision.py` and `.tauceti-queue-release` marker; each installed unit names its own release, and the controller runs `uv run tauceti-queue serve` from its release |
 | `~/.config/tauceti-queue/config.toml` | the configuration (below); created from `services/queue/config.toml.example` on first install |
 | `~/.config/tauceti-queue/environment` | optional `TAUCETI_QUEUE_*` overrides read by the unit (`EnvironmentFile`); never secrets |
 | `~/.config/tauceti-queue/github-app.json`, `github-private-key.pem`, `github-webhook-secret` | the App credentials (GitHub App section) |
@@ -175,34 +176,97 @@ Normal source discovery recovers missed policy observations. GitHub does not aut
 failed webhooks; inspect failed deliveries after a restart and redeliver missed operator commands.
 
 ```sh
-# first time: get the installer, then let it manage the checkout
+# first time: get the installer; it clones ~/TauCetiQueue when absent
 git clone https://github.com/TauCetiProject/TauCetiWorker.git ~/TauCetiQueue
 ~/TauCetiQueue/services/queue/install.sh                     # origin/main
 ~/TauCetiQueue/services/queue/install.sh --revision <sha>    # a pinned revision
+services/queue/release.sh status                             # what each unit names and runs
 ```
 
-**The controller, the repair workers and the monitoring units run origin/main HEAD from
-`~/TauCetiQueue`.** Never use systemd drop-ins (`~/.config/systemd/user/tauceti-queue*.service.d/*.conf`)
-for queue units: they silently override the installed unit and each other, so `~/TauCetiQueue`,
-`git log` and the installers stop describing what runs. `install.sh`, `install-repair.sh` and
-`install-monitoring.sh` ([monitoring.md](monitoring.md)) refuse to run while one exists for a unit
-they install. Settings belong in `~/.config/tauceti-queue/environment` (or `repair-environment*`,
-`monitoring-environment`) or in the unit files in this repository.
+**One release directory per install.** Each install materialises the requested revision as its own
+directory, `~/TauCetiQueue-releases/<sha>-<UTC time>/`: a detached `git worktree` of the shared
+clone `~/TauCetiQueue` with its own uv environment and baked revision. The installer then hands off
+to that release's copy of itself (so the installer logic is always the target revision's, whichever
+copy was started), renders only the units it installs so that every code path in them names the
+release, and restarts only those units. Other units keep their own release untouched: nothing
+changes under a running process, a crash restarts the same code, and each process reports the
+revision it was started from (`/status` for the controller, `revision` in a repair worker's
+`worker.json`, the first journal line of the monitoring units). A repair instance gets its own unit
+file, `tauceti-queue-repair@NAME.service`, rendered from the template, which takes precedence over
+`tauceti-queue-repair@.service`, so installing one worker never changes what another (re)starts
+from. A release is built once and never resynced, so its TauCetiTools commit is the one current at
+its creation. Data and configuration (`~/TauCetiQueue-data`, `~/.config/tauceti-queue`) stay where
+they are.
 
-Running any revision other than origin/main HEAD (`--revision`, `--checkout` or
+`services/queue/release.sh status` lists each queue unit with the revision its unit file names and
+the revision its running process runs (marked `*` when the process still runs another directory,
+for example after `--no-restart`). After a successful install the installer removes release
+directories that no file under `~/.config/systemd/user` names and that no running process uses as
+its working directory (background publications included), keeping the newest 5 of those for
+rollback (`TAUCETI_QUEUE_RELEASE_KEEP`); `services/queue/release.sh gc` does the same by hand. Only
+names of the form `<sha>-<time>` are collected; hand-made worktrees in that directory are left alone.
+
+**The controller, the repair workers and the monitoring units run origin/main HEAD, each from its
+own release directory.** Never use systemd drop-ins (`~/.config/systemd/user/tauceti-queue*.service.d/*.conf`)
+for queue units: they silently override the installed unit and each other, so the release
+directories, `release.sh status` and the installers stop describing what runs. `install.sh`,
+`install-repair.sh` and `install-monitoring.sh` ([monitoring.md](monitoring.md)) refuse to run while
+one exists for a unit they install. Settings belong in `~/.config/tauceti-queue/environment` (or
+`repair-environment*`, `monitoring-environment`) or in the unit files in this repository.
+
+Running any revision other than origin/main HEAD (`--revision`, `--release`, `--checkout` or
 `TAUCETI_QUEUE_CHECKOUT`) requires explicit permission from a human operator, and the installers
 print a warning when it happens. Whoever does it must rerun the installer with no arguments as soon
 as their change lands on main. `/status` reports the running revision, so such a deployment stays
 visible.
 
-`services/queue/install.sh` is idempotent. It fetches, fast-forwards the checkout to the requested
-revision (refusing local modifications or a non-fast-forward target rather than forcing), runs `uv
-sync`, bakes the revision into `tauceti_queue/_revision.py`, writes `config.toml` and `environment` from
-the examples when absent, runs `check-config`, installs the units, `systemctl --user daemon-reload`,
-enables and restarts `tauceti-queue.service` and the backup timer, and then verifies the deployment by
-reading `/status` until the service answers and comparing the reported `service.revision` with the
-checkout. Exit 0 means the running service is the installed revision; exit 2 means it answered with a
-different revision or not at all, and the next step is `journalctl --user -u tauceti-queue -n 50`.
+`services/queue/install.sh` is idempotent. It fetches into the shared clone, refuses a target that
+does not descend from the revision the service runs now (rather than forcing it), creates the
+release, runs `uv sync` there, bakes the revision into the release's `tauceti_queue/_revision.py`,
+writes `config.toml` and `environment` from the examples when absent, runs `check-config`, installs
+`tauceti-queue.service` and the backup service and timer pointing at the release, `systemctl --user
+daemon-reload`, enables and restarts `tauceti-queue.service` and the backup timer, and then verifies
+the deployment by reading `/status` until the service answers, comparing the reported
+`service.revision` with the release and checking that the service's main process runs from the
+release. Exit 0 means the running service is the installed release; exit 2 means it answered with a
+different revision, from another directory, or not at all, and the next step is `journalctl --user
+-u tauceti-queue -n 50`.
+
+**Rollback** points a unit back at a previous release directory and restarts only it, without
+rebuilding anything: list the candidates with `ls ~/TauCetiQueue-releases` (or `release.sh status`
+for the ones in use), then run the matching installer with `--release`, for example
+`~/TauCetiQueue/services/queue/install.sh --release ~/TauCetiQueue-releases/<sha>-<time>` or
+`install-repair.sh --instance 2 --release ...`. It warns like `--revision`, runs that release's own
+installer and verifies as usual. The installers refuse to move a unit backwards with `--revision`;
+`--release` is the explicit way.
+
+**Migration from the shared checkout.** Before this layout every unit ran from `~/TauCetiQueue`
+itself. The first install with the new installers works from that layout live, one unit at a time,
+with no drain: start the release-aware installer from a fresh clone so that `~/TauCetiQueue`'s
+working tree, which the not yet migrated units still run, is not changed:
+
+```sh
+git clone -q https://github.com/TauCetiProject/TauCetiWorker.git /tmp/tcq-bootstrap
+~/TauCetiQueue/services/queue/backup.sh               # as before any controller install
+/tmp/tcq-bootstrap/services/queue/install.sh
+/tmp/tcq-bootstrap/services/queue/install-repair.sh                # each right after its worker.json reports idle
+/tmp/tcq-bootstrap/services/queue/install-repair.sh --instance 2
+/tmp/tcq-bootstrap/services/queue/install-repair.sh --instance 3
+/tmp/tcq-bootstrap/services/queue/install-monitoring.sh
+/tmp/tcq-bootstrap/services/queue/install-repair-cleanup.sh --database ... --clone ... --root ...   # the arguments in "Terminal repair worktree cleanup"
+/tmp/tcq-bootstrap/services/queue/release.sh status
+```
+
+Each command moves only its own units to a new release; the others keep running from
+`~/TauCetiQueue` until their turn. When `release.sh status` shows no queue unit left on
+`~/TauCetiQueue`, fast-forward it once (`git -C ~/TauCetiQueue merge --ff-only origin/main`) so that
+its scripts are the release-aware ones; from then on any copy can start an install, because it hands
+off to the target release's installer. The old `tauceti-queue-repair@.service` template stays
+installed and still names `~/TauCetiQueue`, but no instance with its own unit file uses it. Other
+host units outside this repository that use `~/TauCetiQueue/.venv` keep working; that environment
+is no longer updated by the installers. To undo the migration for a unit, install the old unit file
+(`git -C ~/TauCetiQueue show <old sha>:services/queue/<unit>`) into `~/.config/systemd/user/`, remove
+an instance's own `tauceti-queue-repair@NAME.service`, `daemon-reload` and restart that unit.
 
 `--no-restart` installs without restarting (the running service keeps its revision; verification then
 reports the mismatch deliberately). The unit has `Restart=always`, `TimeoutStopSec=120` and
@@ -289,7 +353,8 @@ Paths on tauchonki2, where they differ from the default layout:
 
 | Path | Content |
 | --- | --- |
-| `~/TauCetiQueue` | shared code checkout for controller and repair workers at the installed revision |
+| `~/TauCetiQueue` | shared clone that releases are made from |
+| `~/TauCetiQueue-releases/<sha>-<time>/` | one release per install; each queue unit names its own (`services/queue/release.sh status`) |
 | `~/.config/tauceti-queue/config.toml` | `host = "tauchonki2"`, existing App/review/admission configuration and data paths |
 | `~/.config/tauceti-queue/environment` | controller overrides, including `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` for NixOS TLS trust |
 | `~/TauCetiQueue-data/clone` | controller content clone, including retained private source refs |
@@ -320,22 +385,19 @@ of scheduling. The publisher reads local worker roots directly. During the Novem
 retained source observations are mirrored under `legacy-chungus2/`; remote PID liveness
 is unverified. The finite handoff service refreshes those observations until each old worker stops.
 
-Before an update, take an online backup with `services/queue/backup.sh`, verify the target revision
-and fast-forward the checkout. Use the service installer for controller deployment or explicitly
-bake `_revision.py` and restart `tauceti-queue.service`. Since the checkout is shared, an update
-that changes repair code also needs each repair worker restarted through its unit; a running task
-is abandoned and its claim released, so restart a worker right after `worker.json` reports `idle`
-to avoid losing its task. Keep ordinary admissions enabled. Verify public revision, accepted
+Before an update, take an online backup with `services/queue/backup.sh` and verify the target
+revision. Use the service installer for controller deployment; it creates the controller's own
+release and restarts only `tauceti-queue.service`. The repair workers and monitoring keep their
+releases until their own installers run, so an update that changes repair code needs
+`install-repair.sh` for each worker (and `release.sh status` shows which units still run older
+code); a running task is abandoned and its claim released, so install a worker right after
+`worker.json` reports `idle` to avoid losing its task. Keep ordinary admissions enabled. Verify public revision, accepted
 members, claims, CI identity and useful progress after the update; do not use the retired shell
 helpers on chungus.
 
-A plain `git pull` does not refresh the baked revision. Before a manual service restart:
-
-```sh
-cd ~/TauCetiQueue
-printf 'SHA = "%s"\nDIRTY = False\n' "$(git rev-parse HEAD)" > tauceti_queue/_revision.py
-systemctl --user restart tauceti-queue
-```
+Never edit or `git pull` inside a release directory: units may run from it, and its baked
+revision would stop describing the code. A manual `systemctl --user restart` of a unit restarts the
+same release.
 
 Stop a service through its unit rather than killing arbitrary process patterns. On a host without
 lingering, the units/timers may need starting after a reboot/user-manager restart. Confirm public
@@ -492,8 +554,7 @@ On the colocated controller/repair host, install the lifecycle collector after d
 worker/publisher ownership leases:
 
 ```sh
-cd ~/TauCetiQueue
-services/queue/install-repair-cleanup.sh \
+~/TauCetiQueue/services/queue/install-repair-cleanup.sh \
   --database ~/TauCetiQueue-data/queue.sqlite3 \
   --clone ~/TauCetiQueue-data/repair-clone \
   --root ~/TauCetiQueue-data/repair \
@@ -590,8 +651,7 @@ had 0.154.0, which failed this way; 0.166.0 answers normally on the same Pro acc
 ### Install and update
 
 ```sh
-git clone https://github.com/TauCetiProject/TauCetiWorker.git ~/TauCetiQueue   # if not already present
-~/TauCetiQueue/services/queue/install-repair.sh                   # origin/main
+~/TauCetiQueue/services/queue/install-repair.sh                   # origin/main (clones ~/TauCetiQueue when absent)
 ~/TauCetiQueue/services/queue/install-repair.sh --revision <sha>  # a pinned revision
 ~/TauCetiQueue/services/queue/install-repair.sh --instance 2      # another worker
 ```
@@ -599,15 +659,18 @@ git clone https://github.com/TauCetiProject/TauCetiWorker.git ~/TauCetiQueue   #
 The rules in [Install and update](#install-and-update) apply here too: no drop-ins, and origin/main HEAD
 unless a human operator has given permission for another revision.
 
-`install-repair.sh` is idempotent and live. It fast-forwards the checkout, runs `uv sync`, writes
+`install-repair.sh` is idempotent and live. It creates the worker's own release (as above), runs
+`uv sync` there, writes
 `~/.config/tauceti-queue/repair-environment` from `services/queue/repair-environment.example` when
 absent (then review it: service URL, worker name, clone, task root, credential locations), clones the
-content repository when absent, runs the worker's host checks, installs the unit, enables and
-restarts it, and verifies that the unit is active and that the restarted process (the unit's
-`MainPID`) reports itself serving in `<task root>/worker.json`. Exit 0 means the worker is serving;
+content repository when absent, runs the worker's host checks, installs only this worker's unit
+pointing at the release, enables and restarts it, and verifies that the unit is active, that its
+main process runs from the release, and that the restarted process (the unit's `MainPID`) reports
+itself serving at the release's revision in `<task root>/worker.json`. Exit 0 means the worker is serving;
 1 a setup or host-check failure; 2 an inactive or silent unit, and the next step is
 `journalctl --user -u tauceti-queue-repair -n 50`. `--no-restart` installs without interrupting a
-running task. The queue service, its backup timer and the fleet units are not touched.
+running task. The queue service, its backup timer, the other workers and the fleet units are not
+touched.
 
 An instance uses `tauceti-queue-repair@NAME.service` and `repair-environment-NAME`. When that file
 is absent, the installer copies the singleton's provider/cache configuration and supplies a distinct
@@ -623,7 +686,7 @@ beyond that leaves the claim to expire (`claim_ttl_seconds`, 900) and the task i
 ### Verify, logs, stop
 
 ```sh
-cd ~/TauCetiQueue && uv run python -m tauceti_queue.repair_task --check   # tools, token, admin, service, clone, credentials, disk
+cd "$(systemctl --user show -p WorkingDirectory --value tauceti-queue-repair)" && UV_NO_SYNC=1 uv run python -m tauceti_queue.repair_task --check   # tools, token, admin, service, clone, credentials, disk
 systemctl --user status tauceti-queue-repair
 journalctl --user -u tauceti-queue-repair -f
 jq . "$(. ~/.config/tauceti-queue/repair-environment; echo "$TAUCETI_QUEUE_TASK_ROOT")/worker.json"
@@ -631,7 +694,7 @@ jq . "$(. ~/.config/tauceti-queue/repair-environment; echo "$TAUCETI_QUEUE_TASK_
 
 `--check` prints one line per host requirement and exits 1 when any fails, naming the token's source
 and the login, never the token, and whether the api key is set, never the key. `worker.json` is the
-worker's heartbeat: `pid`, `state` (`starting`, `claiming`, `running`, `idle`, `stopping`, `stopped`),
+worker's heartbeat: `pid`, `revision` (read once at startup from the release), `state` (`starting`, `claiming`, `running`, `idle`, `stopping`, `stopped`),
 `tasks`, `outcomes` by status, `providers` (per provider: `ran`, `skipped`, `failed` counts), `errors`
 and `last_error`, `last_outcome` (with the task's `provider` and `provider_attempts`), `started_at` and
 `updated_at`. The service side of the same facts is
@@ -710,7 +773,8 @@ that is older than GitHub reconciles on restart, which is the same path as recov
 
 After every `install.sh` (and after any restart), in this order:
 
-1. **Revision.** `uv run tauceti-queue status --expect-revision $(git -C ~/TauCetiQueue rev-parse HEAD)`
+1. **Revision.** `uv run tauceti-queue status --expect-revision <installed sha>` (the installer does
+   this; `services/queue/release.sh status` shows the sha each unit names and runs)
    exits 0; `service.started_at` is after the restart; `service.controller` is `running` (`unavailable`
    with a reason means a component is missing from this revision).
 2. **The two feeds answer.** `curl -s https://queue.taucetiproject.org/api/observation | jq .schema`
