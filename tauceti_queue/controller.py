@@ -63,6 +63,9 @@ BUILD_CONTEXT = "build"
 # lands only when all three are bound to its run and `success`.
 VERDICT_CONTEXTS = (BUILD_CONTEXT, "bump-guard", "scope")
 LOG_GRACE_SECONDS = 600  # publication grace for a completed run's bound verdicts and failed-build log
+# A source-candidate run's GitHub job and step phases are read at most this often while it runs, and
+# once more when it completes; observation itself stays on `polling_interval_seconds`.
+SOURCE_PHASES_INTERVAL_SECONDS = 300
 DISPATCH_EVENT = "tauceti-bors-staging"
 # How many of a batch's previous tips a CI dispatch names in `repair_outputs_revs`.
 REPAIR_OUTPUTS_PREVIOUS_TIPS = 4
@@ -326,6 +329,29 @@ def revision_map_published(url: str, *, timeout: float = 30.0) -> bool:
     return True
 
 
+def current_step(phases: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The last running step of the recorded GitHub phases: its job, name, 1-based position among
+    that job's steps and start time. Phases list each job followed by its `"<job>: <step>"` steps."""
+    jobs: list[tuple[str, list[dict[str, Any]]]] = []
+    for phase in phases:
+        name = str(phase.get("name") or "")
+        if jobs and name.startswith(jobs[-1][0] + ": "):
+            jobs[-1][1].append(phase)
+        else:
+            jobs.append((name, []))
+    for job, steps in reversed(jobs):
+        for index in range(len(steps) - 1, -1, -1):
+            if steps[index].get("status") == "in_progress":
+                return {
+                    "job": job,
+                    "name": str(steps[index].get("name"))[len(job) + 2 :],
+                    "index": index + 1,
+                    "total": len(steps),
+                    "started_at": steps[index].get("started_at"),
+                }
+    return None
+
+
 class ControllerError(Exception):
     """A caller error (unknown repository, unknown setting, bad value); carries a stable `code`."""
 
@@ -505,6 +531,8 @@ class Controller:
         self.mixed_ci = None
         self.execution = execution if execution is not None else github
         self.candidate_ci = candidate_ci
+        # (attempt id, run id, run attempt) -> (time, run status) of the last phase read of a source run.
+        self._source_phases_read: dict[tuple[Any, str, int], tuple[float, str]] = {}
         self.source_authority = source_authority
         if source_authority is not None and (
             not isinstance(source_authority, NativeQueueAuthority)
@@ -7116,6 +7144,7 @@ class Controller:
         try:
             with self._lock.unlocked():
                 observation = candidate_ci.observe(attempt["id"])
+                progress = self._source_progress(candidate_ci, attempt, observation.run, now)
         except Exception as error:  # noqa: BLE001 - keep pending, including malformed evidence
             if not self._source_head_current(head, attempt):
                 if strict:
@@ -7191,6 +7220,21 @@ class Controller:
         )
         if run.updated_at != attempt["run_updated_at"]:
             values["last_progress_at"] = now
+        same_run = attempt["run_id"] == run.run_id and attempt["run_attempt"] == run.attempt
+        if progress is not None:
+            # Observational only, as on the ordinary path: a phase or step appearing, starting or
+            # completing is progress for the stall report. The verdict below never reads them.
+            phases = [vars(phase) for phase in progress.phases]
+            if phases != (loads(attempt["phases"], []) if same_run else []):
+                values["last_progress_at"] = now
+            values.update(
+                phases=dumps(phases),
+                runner_name=progress.runner_name,
+                runner_labels=dumps(list(progress.runner_labels)),
+                host=progress.host,
+            )
+        elif not same_run:
+            values.update(phases=dumps([]), runner_name=None, runner_labels=dumps([]), host=None)
         if run.status == "completed":
             completion_key = f"source-ci:completion-seen:{attempt['id']}"
             completed = self.store.get_setting(completion_key)
@@ -7284,6 +7328,34 @@ class Controller:
             and self.store.get_setting(f"source-ci:promotion-hold:{attempt['id']}") is None
         ):
             self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
+
+    def _source_progress(self, candidate_ci, attempt, run, now):
+        """`run` with its GitHub job and step phases when a read is due, else `None`.
+
+        Due once every `SOURCE_PHASES_INTERVAL_SECONDS` while the run is in progress and once when
+        it completes, so the extra jobs call stays bounded. A failed read is display context only:
+        it is reported as a reason and never changes the observation.
+        """
+        if run.phases:
+            return run  # the execution already read them (a verified source failure's diagnostics)
+        if run.status not in ("in_progress", "completed"):
+            return None
+        key = (attempt["id"], run.run_id, run.attempt)
+        last = self._source_phases_read.get(key)
+        if last is not None and (
+            last[1] == "completed" or (run.status == "in_progress" and now - last[0] < SOURCE_PHASES_INTERVAL_SECONDS)
+        ):
+            return None
+        if len(self._source_phases_read) >= 64:
+            self._source_phases_read.clear()
+        self._source_phases_read[key] = (now, run.status)
+        try:
+            return candidate_ci.progress(attempt["id"], run)
+        except Exception as error:  # noqa: BLE001 - phases are optional context
+            self._reasons.append(
+                f"head {attempt['batch_id']}: source CI phases unavailable for run {run.run_id}: {error}"
+            )
+            return None
 
     # --- loop termination: failure fingerprints and escalation ---------------------------------------
 
@@ -9768,6 +9840,7 @@ class Controller:
                 "runner_labels": loads(attempt["runner_labels"], []),
                 "host": attempt["host"],
                 "phases": loads(attempt["phases"], []),
+                "current_step": current_step(loads(attempt["phases"], [])),
                 "last_progress_at": attempt["last_progress_at"],
                 "last_observed_at": attempt["last_observed_at"],
                 "outcome": attempt["outcome"],
