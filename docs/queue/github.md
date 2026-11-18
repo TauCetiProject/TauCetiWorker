@@ -226,6 +226,11 @@ reduces it to an empty commit and appends three lines naming the cause, `Interac
 error>: <sentence>`. A submission that changes such a member other than by emptying it (or by the
 queue's own empty commit for a PR already on `main`) is rejected as `no-repair-edited`.
 
+A control-file change in the control-file lane ([mixed-sources.md](mixed-sources.md), "The
+control-file lane") has `no_repair` as well, whatever its labels: no label event clears it, and a
+readmitted input keeps it. Its withdrawal comment says it changes control files outside the native
+path policy, which the queue never edits, instead of naming the label.
+
 **The withdrawal comment.** When an adopted chain (a repair, a rebase conflict, a preparation, or
 a pre-rebase the seal uses) has emptied a `no_repair` member, the PR is withdrawn as
 `problem-anticipated` and gets one comment (marker `anticipated:<input id>`): it carries the label,

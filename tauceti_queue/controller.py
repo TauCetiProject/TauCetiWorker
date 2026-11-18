@@ -78,6 +78,13 @@ BASE_CACHE_ANCESTORS = 20
 # `batches.urgent` of an emergency batch, which dispatches without waiting for a published base: it
 # is the means of publishing `main` again after an out-of-queue push.
 URGENT_EMERGENCY = 2
+# `batches.lane` of the control-file lane batch (`_lane_batch`): GitHub PRs whose own diff leaves the
+# native path policy, staged ahead of the ordinary open batches while `control_lane_enabled` is on.
+LANE_CONTROL = "control"
+# The key of an input's `evidence` that records its control-file classification (`_classify_control_inputs`).
+CONTROL_EVIDENCE = "control_files"
+# `inputs.last_probe` of a GitHub input the lane could not classify yet (its head is unavailable).
+CONTROL_UNCLASSIFIED = "control-lane: waits for its head to be classified"
 MERGED_TITLE_PREFIX = "[Merged by Bors] - "  # what bors-ng writes when it closes a squash-landed member
 COMMENT_MARKER = "tauceti-queue"
 
@@ -184,6 +191,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # an approved PR become the next head as a single-member batch (`_emergency`). Off: every request
     # is refused `disabled`; a request already accepted keeps running.
     "emergency_enabled": False,
+    # The control-file lane (`_control_lane_active`, docs/queue/mixed-sources.md): with mixed sources
+    # admitted under GitHub primary, a GitHub PR whose own diff leaves the native path policy is staged
+    # in its own batch, which becomes the head ahead of every ordinary open batch, and is never repaired.
+    # Off: every lane rule is off and a live lane batch is staged as an ordinary open batch.
+    "control_lane_enabled": False,
 }
 
 # The actor of the values `seed_setting` writes from the configuration file's `[settings]`.
@@ -1551,6 +1563,8 @@ class Controller:
             no_repair = self._carries_no_repair(labels)
         else:
             no_repair = payload.get("action") == "labeled"
+        if not no_repair and self._control_input(current):
+            return True  # a control-file change is never repaired, whatever its labels say
         if no_repair == bool(current["no_repair"]):
             return True
         with self.store.transaction():
@@ -2177,7 +2191,8 @@ class Controller:
                 violations = [
                     chain.Violation(
                         "no-repair-edited",
-                        f"{m.source_pr} opted out of repair: leave its content alone, or reduce it to an empty commit "
+                        f"{m.source_pr} is never edited (it opted out of repair or changes control files): leave its "
+                        "content alone, or reduce it to an empty commit "
                         "naming the interacting PR, file and finding",
                         commit=m.new_sha,
                         source_pr=m.source_pr,
@@ -2947,11 +2962,164 @@ class Controller:
         return [batch for batch in batches if barrier is None or batch["id"] < barrier]
 
     def _staging_batches(self) -> list[dict[str, Any]]:
-        """The open batches ordinary scheduling works on: `_open_batches` without the emergency batch.
+        """The open batches ordinary scheduling works on: `_open_batches` without the emergency batch
+        and, while the lane is active, the control-file lane batch.
 
         Insertion, background tasks and sealing order use this; enumeration that must see every live
-        batch (retained refs, sources in flight, status) keeps `_open_batches`."""
-        return [batch for batch in self._open_batches() if batch["urgent"] != URGENT_EMERGENCY]
+        batch (retained refs, sources in flight, status) keeps `_open_batches`. With the lane off, a
+        live lane batch is staged here as an ordinary open batch, so turning it off needs no cleanup."""
+        lane = self._control_lane_active()
+        return [
+            batch
+            for batch in self._open_batches()
+            if batch["urgent"] != URGENT_EMERGENCY and not (lane and batch["lane"] == LANE_CONTROL)
+        ]
+
+    # --- the control-file lane ---------------------------------------------------------------------
+
+    def _control_lane_active(self) -> bool:
+        """Whether the control-file lane applies: on, with mixed sources admitted under GitHub primary
+        and no source-candidate CI for GitHub batches. Under Forgejo primary every batch goes through
+        source-candidate CI, which cannot authorize control files, so such a PR keeps waiting there."""
+        return bool(
+            self.setting("control_lane_enabled")
+            and self.mixed is not None
+            and self.mixed.mode == "admit"
+            and self.mixed.primary == "github"
+            and self.candidate_ci is None
+        )
+
+    @staticmethod
+    def _control_input(row: dict[str, Any]) -> bool:
+        """The input was classified as a control-file change (`_classify_control_inputs`)."""
+        return bool(loads(row.get("evidence"), {}).get(CONTROL_EVIDENCE))
+
+    def _lane_batch(self) -> dict[str, Any] | None:
+        """The open control-file lane batch, if any; through `_open_batches`, so an inert barrier hides it
+        like any later batch."""
+        return next((batch for batch in self._open_batches() if batch["lane"] == LANE_CONTROL), None)
+
+    def _lane_members(self, batch: dict[str, Any]) -> list[dict[str, Any]]:
+        """The lane batch's members that act for their input: not withdrawn, and not a slot an emergency
+        request took its PR from (`_displaced`)."""
+        return [m for m in self._active_members(batch) if not self._displaced(batch, m)]
+
+    def _lane_ready(self) -> dict[str, Any] | None:
+        """The open lane batch when `_seal` may make it the head: the lane is active and the batch has a
+        member that acts for its input and is not retained for a disabled source."""
+        if not self._control_lane_active():
+            return None
+        batch = self._lane_batch()
+        if (
+            batch is None
+            or not self._lane_members(batch)
+            or self._mixed_inert_batch(batch)
+            or self._inert_ci_batch(batch)
+        ):
+            return None
+        return batch
+
+    def _ordinary_waiting(self) -> list[dict[str, Any]]:
+        """`_waiting` without the inputs the active lane takes, which ordinary insertion never probes: a
+        GitHub input enters an ordinary batch only once it is classified as not a control-file change
+        (one approved while the tick ran is classified in the next)."""
+        rows = self._waiting()
+        if not self._control_lane_active():
+            return rows
+        return [
+            row
+            for row in rows
+            if isinstance(row["number"], SourceNumber) or loads(row["evidence"], {}).get(CONTROL_EVIDENCE) is False
+        ]
+
+    def _control_change(self, number: Any, head: str, canonical: str) -> bool | None:
+        """Whether a GitHub PR's own diff (its head against its merge base with `canonical`) leaves the
+        native path policy, the paths source-candidate CI refuses; None when that cannot be read now.
+        Run without the lock: it may fetch the head."""
+        if not self._fetch_head(number, head):
+            return None
+        try:
+            base = chain.git(self.clone, "merge-base", canonical, head).strip()
+        except chain.ChainError:
+            base = canonical  # no merge base: the whole difference from `main` counts
+        try:
+            return not self.mixed.supports_candidate(base, head)
+        except chain.ChainError as error:
+            self.log.warning("control-file classification of #%s failed: %s", number, error)
+            return None
+
+    def _classify_control_inputs(self, now: float) -> None:
+        """Classify each waiting GitHub input once, before routing: a control-file change goes to the lane
+        and is never repaired (`inputs.no_repair`, durable, see `_no_repair_event`). An input row is one
+        accepted head (a push makes a new row), so the classification never needs to change."""
+        canonical = self._canonical
+        if canonical is None or not self._control_lane_active():
+            return
+        for row in self._waiting():
+            if isinstance(row["number"], SourceNumber) or CONTROL_EVIDENCE in loads(row["evidence"], {}):
+                continue
+            with self._lock.unlocked():
+                control = self._control_change(row["number"], row["head_sha"], canonical)
+            fresh = self.store.row("inputs", {"id": row["id"]})
+            if fresh is None or fresh["state"] not in (INPUT_WAITING, INPUT_RESERVED):
+                continue
+            if control is None:
+                if fresh["last_probe"] != CONTROL_UNCLASSIFIED:
+                    self.store.update("inputs", {"id": row["id"]}, last_probe=CONTROL_UNCLASSIFIED)
+                continue
+            evidence = loads(fresh["evidence"], {})
+            evidence[CONTROL_EVIDENCE] = control
+            with self.store.transaction():
+                self.store.update(
+                    "inputs", {"id": row["id"]}, evidence=dumps(evidence), **({"no_repair": 1} if control else {})
+                )
+                if control:
+                    self.store.journal(now, "control-classified", number=row["number"], head=row["head_sha"])
+
+    def _lane_probe_eligible(self, row: dict[str, Any], batch: dict[str, Any]) -> bool:
+        """`_probe_eligible` for the lane batch. A `source-ci-scope` refusal says nothing about this
+        batch's tip (it was about the batch-mates), so its recorded tip does not stop the probe."""
+        if row["last_probe"].startswith("source-ci-scope:"):
+            row = dict(row, last_probe_tip="")
+        return self._probe_eligible(row, batch)
+
+    def _control_lane_insertion(self, now: float, probed: set[tuple[int, int]], started: float, budget: float) -> None:
+        """Probe the waiting control-file inputs into the lane batch, first in first out, creating it on
+        the canonical commit when none is open. Shares the tick's probe budget and `probed` set."""
+        if not self._control_lane_active():
+            return
+        self._classify_control_inputs(now)
+        canonical = self._canonical
+        rows = [row for row in self._waiting() if self._control_input(row)]
+        if canonical is None or not rows:
+            return
+        lane = self._lane_batch()
+        if lane is not None and not self._members(lane["id"]) and lane["base"] != canonical:
+            self._remove_batch(lane, "stale-empty", now)
+            lane = None
+        if lane is None:
+            with self.store.transaction():
+                lane = self._create_open_batch(canonical, now)
+                self.store.update("batches", {"id": lane["id"]}, lane=LANE_CONTROL)
+                self.store.journal(now, "control-lane-opened", lane["id"], base=canonical)
+        for row in rows:
+            if probed and time.monotonic() - started >= budget:
+                self._reasons.append(f"insertion paused after {len(probed)} probes (budget)")
+                self._wake.set()
+                return
+            fresh = self.store.row("inputs", {"id": row["id"]})
+            lane = self.store.row("batches", {"id": lane["id"]}) or lane
+            if lane["state"] != BATCH_OPEN:
+                return
+            if (
+                fresh is None
+                or fresh["state"] != INPUT_WAITING
+                or (fresh["id"], lane["id"]) in probed
+                or not self._lane_probe_eligible(fresh, lane)
+            ):
+                continue
+            probed.add((fresh["id"], lane["id"]))
+            self._probe(fresh, lane, now)
 
     def _unsealed_batches(self) -> list[dict[str, Any]]:
         """Batches still accepting insertions; only these count against `open_batch_limit`."""
@@ -3678,7 +3846,9 @@ class Controller:
         probed: set[tuple[int, int]] = set()  # (input, batch) pairs probed in this tick
         started = time.monotonic()
         budget = float(self.setting("insertion_probe_budget_seconds"))
-        while self._waiting():
+        # Control-file inputs go to the lane first and are never probed into an ordinary batch.
+        self._control_lane_insertion(now, probed, started, budget)
+        while self._ordinary_waiting():
             if probed and time.monotonic() - started >= budget:
                 self._reasons.append(f"insertion paused after {len(probed)} probes (budget)")
                 self._wake.set()
@@ -3686,7 +3856,7 @@ class Controller:
             batches = self._ensure_open_batches(now)
             if batches is None:
                 break
-            remaining = self._waiting()
+            remaining = self._ordinary_waiting()
             target: dict[str, Any] | None = None
             eligible: list[dict[str, Any]] = []
             for batch in batches:
@@ -3781,14 +3951,18 @@ class Controller:
     def _remove_idle_open_batches(self, now: float) -> None:
         """Remove empty open batches: a later one as soon as the pass leaves it empty (it is created on
         demand for an input that conflicts with the batches before it), the first only when nothing waits
-        and its base is stale."""
+        and its base is stale. An empty lane batch goes when its base is stale or no control input waits."""
         for position, batch in enumerate(self._unsealed_batches()):
             if self._members(batch["id"]):
                 continue
             if position > 0:
                 self._remove_batch(batch, "idle", now)
-            elif not self._waiting() and self._canonical is not None and batch["base"] != self._canonical:
+            elif not self._ordinary_waiting() and self._canonical is not None and batch["base"] != self._canonical:
                 self._remove_batch(batch, "idle", now)
+        lane = self._lane_batch() if self._control_lane_active() else None
+        if lane is not None and not self._members(lane["id"]):
+            if lane["base"] != self._canonical or not any(self._control_input(row) for row in self._waiting()):
+                self._remove_batch(lane, "idle", now)
 
     def _remove_batch(self, batch: dict[str, Any], reason: str, now: float) -> None:
         with self.store.transaction():
@@ -4892,11 +5066,16 @@ class Controller:
     # --- sealing -----------------------------------------------------------------------------------
 
     def _seal(self, now: float) -> None:
-        if self._head() is not None:
+        head = self._head()
+        if head is not None:
+            lane = self._lane_ready()
+            if lane is not None:
+                self._reasons.append(f"control-file lane batch {lane['id']} waits for head {head['id']} to land")
             self._seal_successor(now)
             return
-        # The emergency batch is staged ahead of every open batch (`_emergency_ready`).
-        batch = self._emergency_ready() or self._open_batch()
+        # The emergency batch is staged ahead of every open batch (`_emergency_ready`), and the
+        # control-file lane batch next (`_lane_ready`): it never waits behind an ordinary batch.
+        batch = self._emergency_ready() or self._lane_ready() or self._open_batch()
         if batch is None or not self._members(batch["id"]):
             return
         blocked = self._seal_blocked(batch)
@@ -4952,6 +5131,11 @@ class Controller:
             if batch["urgent"] == URGENT_EMERGENCY:
                 self._preserve_successor_tasks(now)
                 self.store.journal(now, "emergency-head", batch["id"], version=batch["version"])
+            elif batch["lane"] == LANE_CONTROL and self._control_lane_active():
+                # Like the emergency batch, the lane head goes ahead of the batch pre-rebased onto the
+                # previous head: claimed successor work may still submit onto that tip.
+                self._preserve_successor_tasks(now)
+                self.store.journal(now, "control-lane-head", batch["id"], version=batch["version"])
             if self._canonical is not None and not self._unsealed_batches():
                 self._create_open_batch(self._canonical, now)
 
@@ -5842,17 +6026,36 @@ class Controller:
         """Base a newly sealed head on `canonical` from its pre-rebase, without replaying it again.
 
         Applies when the head ahead of it landed as the tip the pre-rebase was made on (`main` equals
-        `pre_rebase_onto`); members inserted after the pre-rebase are replayed onto it first. The
+        `pre_rebase_onto`, or descends from it, and the pre-rebase is first carried onto `main` by a
+        clean replay); members inserted after the pre-rebase are replayed onto it first. The
         members take their commits from the pre-rebased chain, and those an agent edited in a
         `pre_rebase` task are recorded as edited with its explanation. False (nothing changed) when
         there is no such pre-rebase, an extension conflicts or the chain's members do not match.
         """
-        if head["pre_rebase_state"] not in PRE_REBASE_USABLE or head["pre_rebase_onto"] != canonical:
+        onto = head["pre_rebase_onto"]
+        if head["pre_rebase_state"] not in PRE_REBASE_USABLE or not onto:
             return False
         tip = head["pre_rebase_tip"]
         source = head["pre_rebase_source"]
         if not tip or not source or not chain.is_ancestor(self.clone, source, head["tip"]):
             return False
+        if onto != canonical:
+            # A batch landed after the pre-rebase was made (a lane or emergency head went ahead of
+            # this one while its pre-rebase work was claimed): carry the pre-rebase, with its edits,
+            # onto `main` by replay, as `_carry_pre_rebase` does while a head runs.
+            if not chain.is_ancestor(self.clone, onto, canonical):
+                return False
+            chain_id = f"pre-rebase-carry-{head['id']}-{secrets.token_hex(4)}"
+            try:
+                moved = chain.replay(self.clone, onto, tip, canonical, chain_id=chain_id)
+            except chain.ChainError as error:
+                self.store.journal(now, "pre-rebase-error", head["id"], onto=canonical, error=str(error))
+                return False
+            finally:
+                chain.delete_chain_ref(self.clone, chain_id)
+            if moved.status != chain.CLEAN:
+                return False
+            tip = moved.tip
         landed_on_base: list[dict[str, str]] = []
         if source != head["tip"]:
             chain_id = f"pre-rebase-seal-{head['id']}-{secrets.token_hex(4)}"
@@ -8731,8 +8934,14 @@ class Controller:
     ) -> str:
         labels = ", ".join(f"`{label}`" for label in self.setting("no_repair_labels")) or "`dont-repair-in-queue`"
         interacting = record.get("interacting")
+        row = self.store.row("inputs", {"id": member["input_id"]}) or {}
+        why = (
+            "This PR changes control files outside the native path policy, which the merge queue never edits"
+            if self._control_input(row)
+            else f"This PR carries {labels}, so the merge queue does not edit it"
+        )
         lines = [
-            f"This PR carries {labels}, so the merge queue does not edit it. Integrating it in batch {batch['id']} "
+            f"{why}. Integrating it in batch {batch['id']} "
             "needed a change to it, so the queue withdrew it from the batch instead: its commit there is empty and "
             "the PR will not be closed as merged.",
             "",
@@ -8844,7 +9053,7 @@ class Controller:
                 reason="",
                 batch_id=None,
                 anticipated=dumps(record),
-                no_repair=int(self._carries_no_repair(getattr(pull, "labels", None))),
+                no_repair=int(self._carries_no_repair(getattr(pull, "labels", None)) or self._control_input(row)),
                 passes_waited=0,
                 last_probe="readmitted",
                 last_probe_tip="",
@@ -9601,6 +9810,7 @@ class Controller:
                 "waiting": {
                     "count": len(waiting),
                     "urgent": sum(1 for row in waiting if row["urgent"]),
+                    "control": sum(1 for row in waiting if self._control_input(row)),
                     "oldest_approved_at": min(row["approved_at"] for row in waiting) if waiting else None,
                     "oldest_age_seconds": (now - min(row["approved_at"] for row in waiting)) if waiting else None,
                     "max_passes_waited": max((row["passes_waited"] for row in waiting), default=0),
@@ -9690,6 +9900,7 @@ class Controller:
             "passes_waited": row["passes_waited"],
             "probes": row["probes"],
             "last_probe": row["last_probe"],
+            "control": self._control_input(row),
         }
 
     def _open_batch_summary(self, batch: dict[str, Any], now: float) -> dict[str, Any]:
@@ -9704,6 +9915,7 @@ class Controller:
             "size": len(members),
             "urgent": bool(batch["urgent"]),
             "emergency": batch["urgent"] == URGENT_EMERGENCY,
+            "lane": batch["lane"],
             "oldest_member_age_seconds": (now - min(m["added_at"] for m in members)) if members else None,
             **self._preparation_status(batch, members, now),
             "pre_rebase": self._pre_rebase_status(batch),
@@ -9806,6 +10018,7 @@ class Controller:
             "size": len(members),
             "urgent": bool(batch["urgent"]),
             "emergency": batch["urgent"] == URGENT_EMERGENCY,
+            "lane": batch["lane"],
             "oldest_member_age_seconds": (now - min(m["added_at"] for m in members)) if members else None,
             "members": [
                 {
