@@ -5151,15 +5151,17 @@ class Controller:
             return False
         finally:
             chain.delete_chain_ref(self.clone, chain_id)
-        members = self._members(batch["id"])
-        clean = {record.source_pr for record in result.commits if record.sha is not None}
-        cut = next((i for i, member in enumerate(members) if member["source_pr"] not in clean), len(members))
-        kept, left = members[:cut], members[cut:]
+        # The chain's own order decides the prefix (an adopted preparation may reorder commits).
+        commits = chain.chain_commits(self.clone, batch["base"], batch["tip"])
+        by_pr = {member["source_pr"]: member for member in self._members(batch["id"])}
+        order = [commit.source_pr or commit.sha for commit in commits]
+        if sorted(order) != sorted(by_pr) or [record.source_pr for record in result.commits] != order:
+            return False
+        cut = next((i for i, record in enumerate(result.commits) if record.sha is None), len(order))
+        kept, left = [by_pr[pr] for pr in order[:cut]], [by_pr[pr] for pr in order[cut:]]
         if not kept:
             return False
-        tip = kept[-1]["commit_sha"]
-        if len(chain.chain_commits(self.clone, batch["base"], tip)) != len(kept):
-            return False
+        tip = commits[cut - 1].sha
         conflict = result.conflict
         with self.store.transaction():
             superseded = self._supersede_pre_rebase_tasks(batch["id"], "clean-prefix", now)
@@ -5180,9 +5182,12 @@ class Controller:
                 )
                 self._record_tip(head_id, 0, tip, now)
                 self._retain(self.batch_ref(head_id, 0), tip)
-                for member in kept:
-                    self.store.update("members", {"id": member["id"]}, batch_id=head_id)
+                for position, member in enumerate(kept):
+                    self.store.update("members", {"id": member["id"]}, batch_id=head_id, position=position)
                     self.store.update("inputs", {"id": member["input_id"], "batch_id": batch["id"]}, batch_id=head_id)
+                for position, member in enumerate(left):
+                    # Insertion appends at `len(members)`: keep the positions dense, in chain order.
+                    self.store.update("members", {"id": member["id"]}, position=position)
                 version = batch["version"] + 1
                 self.store.update("batches", {"id": batch["id"]}, version=version, base=tip, expected_parent=None)
                 self._record_tip(batch["id"], version, batch["tip"], now)

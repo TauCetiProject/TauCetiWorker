@@ -1447,7 +1447,9 @@ class PreRebase(ControllerCase):
         left = self.controller._open_batch()
         self.assertEqual(left["id"], batch["id"])
         self.assertEqual((left["tip"], left["version"]), (batch["tip"], batch["version"] + 1))
-        self.assertEqual([m["number"] for m in self.controller.members(left["id"])], [102, 104])
+        self.assertEqual(
+            [(m["number"], m["position"]) for m in self.controller.members(left["id"])], [(102, 0), (104, 1)]
+        )
         self.assertEqual(len(chain.chain_commits(self.repo.clone, left["base"], left["tip"])), 2)
         for number in (102, 104):
             row = self.controller.input_for(PROJECT, number)
