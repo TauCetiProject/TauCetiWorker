@@ -10,6 +10,7 @@ from pathlib import Path
 from tauceti_worker.cost_model import (
     _api_cost,
     _category,
+    _model_family,
     _mutates,
     _parse_claude,
     _parse_codex,
@@ -523,6 +524,9 @@ assert (
     == 0.25
 )
 assert _api_cost("claude", "claude-opus-5-5", million_input, "2026-09-22") == 4
+# Astra is its own Codex family: an unclassified model is skipped as unpriced even with a price row.
+assert _model_family("codex", "gpt-6-astra") == "astra"
+assert _model_family("claude", "gpt-6-astra") is None
 
 assert distribution([1, 100])["median"] == 50.5
 assert distribution([1, 2, 10, 20])["median"] == 6
