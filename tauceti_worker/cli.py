@@ -32,6 +32,7 @@ from .agents import (
     BUBBLE_MIN_VERSION,
     BUBBLE_REPO,
     KIRO_BUBBLE_MIN_VERSION,
+    BuildCacheWait,
     bubble_cmd_is_disposable,
     bubble_supports_allow_push,
     bubble_supports_github_account,
@@ -1864,7 +1865,8 @@ def cli_main() -> int:
         log(str(e))
         report_failure(str(e), code=1)
         return 1
-    except ProgressPreparationUnavailable as e:
+    except (ProgressPreparationUnavailable, BuildCacheWait) as e:
+        # A deferral before any paid work: no failure, and the loop selects other work.
         log(str(e))
         report_runtime(
             e.state,

@@ -415,6 +415,43 @@ restores CI's outputs by hard link. Modules CI has not published are the agent's
 are left alone. The receipt counts `ci_disagreeing_traces`, `ci_disagreeing_removed` and
 `ci_disagreeing_skipped` (deferred because a file was busy).
 
+#### Waiting for a matching TauCeti cache
+
+`lake cache get --max-revs=N` installs the newest published revision in the last N commits.
+When CI has not yet published a commit that changed dependencies (a Mathlib bump, say), that
+revision predates the change, none of its outputs apply, and the round would compile all of
+TauCeti, which cannot finish within the round limit. Host agent rounds (roadmap, overlap-fix,
+and the PR rounds fix, fix-ci, rebase, bump and lint-repair) therefore check the cache before
+the agent starts. The revision Lake installed is the first commit in `git rev-list HEAD -n N`
+whose revision map is in the round's download directory, which is the same rule Lake follows
+(maps seeded from the pool included). Its `lake-manifest.json` package revisions and
+`lean-toolchain` are compared with the checkout's dependency files as prepared. A rebase round
+prepares with main's files, so main's cache is the one it needs. For a PR round, the main
+revision fetched alongside also counts. If either matches, the round proceeds. A fallback with
+the same dependencies is logged as a same-dependency fallback and only the commits in between
+rebuild.
+
+Otherwise the round ends as `waiting-build-cache` (exit 79): no failure, no attempt charged,
+downloaded and hydrated outputs kept, and the worker selects other work after 5 seconds.
+`tauceti workers status` shows the state, the commit and the recheck time. The round writes
+`<pool>/cache-waits/<commit>.json` with a retry time five minutes ahead. Until then, other
+workers on the host skip PR work on that head, and skip roadmap and overlap-fix while a wait on
+main is recorded (roadmap reports `waiting-build-cache` itself, since it is the last candidate).
+At most every 30 seconds per host, a selecting worker sends an anonymous `HEAD` request for the
+commit's revision map,
+`<TAUCETI_CACHE_REVISION_URL>/TauCetiProject/TauCeti/tc/<toolchain>/<commit>.jsonl`, with
+the toolchain mangled as Lake does (`leanprover--lean4---v4.36.0`); a 200 removes the wait. When
+the retry time passes, the next worker to select that work takes one real check and re-arms the
+marker for everyone else. A successful check on main clears every wait on main. Any error
+reading or writing markers, or probing, lets work proceed.
+
+A wait older than an hour logs one warning per host and commit, naming the URL CI should have
+published. Rounds on main wait without limit: main always gets a cache, and building anyway
+only occupies the host. A PR whose own head changes dependencies relative to main only gets a
+cache once CI builds that PR, which may never succeed, so after two hours of waiting its rounds
+proceed on the fallback cache as before, letting the repair agent work on the PR. Bubble rounds,
+bump attestation and the queue's repair service do not wait.
+
 The existing pool status receipt also records mapping/seed/install counts and per-phase
 elapsed and CPU seconds for seeding, fetching, transfer, expansion/hydration, and Mathlib
 view preparation. CPU includes the preparator and reaped children. Phases can be nested,
