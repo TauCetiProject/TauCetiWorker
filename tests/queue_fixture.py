@@ -1082,6 +1082,18 @@ class LoopTermination(QueueFixture):
         self.assertIsNone(self.controller.status()["loop_termination"]["escalation_hold"])
         self.assertEqual([self.controller.input_for(PROJECT, n)["state"] for n in (101, 102)], ["landed"] * 2)
 
+    def test_a_fix_pushed_after_the_hold_expires_rebases_before_retrying(self):
+        self.broken_base("failure")
+        escalated = self.escalate((101, {"TauCeti/Lib.lean": "def lib := 2\n"}), (102, {"TauCeti/Other.lean": "o\n"}))
+        self.assertEqual(escalated["action"], "hold", escalated)
+        self.clock.advance(1800)
+        self.github.fail_next["main_ci_run"] = 1  # a retry on the old base would now attribute and withdraw #101
+        self.repo.advance_main({"TauCeti/User.lean": "import TauCeti.Lib\n"})
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual([self.controller.input_for(PROJECT, n)["state"] for n in (101, 102)], ["landed"] * 2)
+
     def unknown_base(self, reason):
         escalated = self.escalate((101, {"TauCeti/Lib.lean": "def lib := 2\n"}), (102, {"TauCeti/Other.lean": "o\n"}))
         self.assertEqual(escalated["action"], "withdraw", escalated)

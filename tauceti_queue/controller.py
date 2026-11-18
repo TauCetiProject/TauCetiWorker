@@ -5208,7 +5208,8 @@ class Controller:
                     self._update_prediction_verdict(head, active, attempt, now)
             self._reasons.append(f"head {head['id']} is claimed by {', '.join(c['worker'] for c in task_claims)}")
             return
-        if self._retry_escalation(head, now):
+        # A moved base rebases first, which ends the hold, rather than retrying against the old base.
+        if head["base"] == canonical and self._retry_escalation(head, now):
             return  # escalated again: the head changed, or holds longer
         pending = self._open_task(head)
         if pending is not None and self._fruitless_task(head, pending, now):
