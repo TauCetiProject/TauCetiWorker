@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from queue_ci_requests import CONFIG, policy
+from tauceti_tools.ci_candidate_evidence import EvidenceUnavailable
 
 from tauceti_queue import monitoring
 from tauceti_queue.ci_execution import CandidateObservation
@@ -34,6 +35,7 @@ class VerifiedExecution:
         self.lost_response = False
         self.observations = 0
         self.discoveries = 0
+        self.deleted_runs = set()
 
     def preflight(self, frozen):
         return "fixture-only"
@@ -93,6 +95,8 @@ class VerifiedExecution:
 
     def observe(self, frozen, run_id, *, owned=False):
         self.observations += 1
+        if run_id in self.deleted_runs:
+            raise EvidenceUnavailable("execution evidence transport failed")
         digest, observation = self.runs[run_id]
         if digest != frozen.request.digest:
             raise ValueError("wrong request")
@@ -100,6 +104,9 @@ class VerifiedExecution:
 
     def status(self, frozen, run_id):
         return self.observe(frozen, run_id, owned=True).run
+
+    def deleted(self, frozen, run_id):
+        return run_id in self.deleted_runs
 
     def cancel(self, frozen, run_id, *, proof):
         self.cancelled.append(run_id)
@@ -176,29 +183,84 @@ class SourceController(unittest.TestCase):
 
     def check_unknown_dispatch_recovery(self, *, lost):
         attempt = self.start(lost=lost)
+        self.clock.advance(60)
+        self.controller.tick()
+        self.assertEqual(len(self.execution.dispatches), 1)
+        self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "pending")
         self.clock.advance(86400)
         self.restart()
         self.controller.tick()
+        current = self.store.row("ci_attempts", {"id": attempt["id"]})
+        self.assertEqual(current["outcome"], "infrastructure")
+        self.assertTrue(current["outcome_detail"].startswith("unowned-run:"))
+        self.clock.advance(3600)
+        self.controller.tick()
+        self.assertEqual(len(self.execution.dispatches), 2)
+        first, second = self.execution.dispatches
+        self.assertNotEqual(second.request.request_id, first.request.request_id)
+        self.controller.tick()
+        self.assertEqual(len(self.execution.dispatches), 2)
+        self.execution.add(second, classification="passed")
+        self.clock.advance(60)
+        self.controller.tick()
+        self.assertEqual(len(self.execution.dispatches), 2)
+        self.assertEqual(self.store.rows("batches")[0]["state"], "landed")
+
+    def test_acknowledged_dispatch_without_evidence_resends_once_after_timeout(self):
+        self.check_unknown_dispatch_recovery(lost=False)
+
+    def test_lost_dispatch_without_evidence_resends_once_after_timeout(self):
+        self.check_unknown_dispatch_recovery(lost=True)
+
+    def check_unavailable_listing_never_resends(self, discover):
+        attempt = self.start()
+        self.execution.discover = discover
+        for _ in range(3):
+            self.clock.advance(86400)
+            self.controller.tick()
         self.assertEqual(len(self.execution.dispatches), 1)
         current = self.store.row("ci_attempts", {"id": attempt["id"]})
         self.assertEqual(current["outcome"], "pending")
         self.assertIn("reconciliation-required:", current["outcome_detail"])
         self.assertTrue(self.controller.status()["head"]["ci"]["reconciliation_required"])
-        discovered = self.execution.discoveries
-        self.controller.tick()
-        self.assertEqual(self.execution.discoveries, discovered)
-        self.assertFalse(self.controller.retry_ci(PROJECT, "reviewer", request_id=attempt["request_id"])["retried"])
-        self.execution.add(self.execution.dispatches[0], classification="passed")
+
+    def test_incomplete_listing_does_not_resend(self):
+        self.check_unavailable_listing_never_resends(lambda *_args, **_kwargs: ([], True))
+
+    def test_listing_api_error_does_not_resend(self):
+        def outage(*_args, **_kwargs):
+            raise EvidenceUnavailable("execution run listing is incomplete")
+
+        self.check_unavailable_listing_never_resends(outage)
+
+    def test_deleted_owned_run_resends(self):
+        attempt = self.start()
+        frozen = self.ledger.load(attempt["id"])
+        self.execution.add(frozen)
+        self.ci.observe(attempt["id"])
+        self.execution.deleted_runs.add("101")
+        self.assertIsNone(self.ci.live_attempt([attempt], discover_completed=True))
         self.clock.advance(60)
         self.controller.tick()
+        current = self.store.row("ci_attempts", {"id": attempt["id"]})
+        self.assertEqual(current["outcome"], "infrastructure")
+        self.assertTrue(current["outcome_detail"].startswith("lost-run:"))
+        self.clock.advance(3600)
+        self.controller.tick()
+        self.assertEqual(len(self.execution.dispatches), 2)
+
+    def test_unreadable_owned_run_keeps_waiting(self):
+        attempt = self.start()
+        frozen = self.ledger.load(attempt["id"])
+        self.execution.add(frozen)
+        self.ci.observe(attempt["id"])
+        self.execution.deleted = lambda *_args: False
+        self.execution.deleted_runs.add("101")
+        for _ in range(3):
+            self.clock.advance(86400)
+            self.controller.tick()
+        self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "pending")
         self.assertEqual(len(self.execution.dispatches), 1)
-        self.assertEqual(self.store.rows("batches")[0]["state"], "landed")
-
-    def test_acknowledged_dispatch_never_resends_without_evidence(self):
-        self.check_unknown_dispatch_recovery(lost=False)
-
-    def test_lost_dispatch_never_resends_without_evidence(self):
-        self.check_unknown_dispatch_recovery(lost=True)
 
     def test_receipt_cannot_pass_partial_rerun_or_expired_result(self):
         attempt = self.start()
@@ -211,11 +273,12 @@ class SourceController(unittest.TestCase):
         self.execution.runs["101"] = (digest, replace(observation, result=None))
         self.clock.advance(60)
         self.controller.tick()
+        self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "pending")
         self.clock.advance(LOG_GRACE_SECONDS + 1)
         self.controller.tick()
         current = self.store.row("ci_attempts", {"id": attempt["id"]})
-        self.assertEqual(current["outcome"], "pending")
-        self.assertIn("reconciliation-required:", current["outcome_detail"])
+        self.assertEqual(current["outcome"], "infrastructure")
+        self.assertIn("no verified result after publication grace", current["outcome_detail"])
         self.assertEqual(self.approvals, [])
         self.assertEqual(len(self.execution.dispatches), 1)
         self.assertEqual(self.store.count("ci_request_runs"), 1)
@@ -533,7 +596,7 @@ class SourceController(unittest.TestCase):
             {"retried": True, "forgotten": 1},
         )
 
-    def _owned_missing_result_uses_bounded_recovery(self, conclusion):
+    def _owned_missing_result_uses_bounded_recovery(self, conclusion, *, absent=True):
         attempt = self.start()
         frozen = self.ledger.load(attempt["id"])
         self.execution.add(frozen)
@@ -544,7 +607,7 @@ class SourceController(unittest.TestCase):
             replace(
                 observation,
                 run=replace(observation.run, status="completed", conclusion=conclusion),
-                result_absent=True,
+                result_absent=absent,
             ),
         )
         self.clock.advance(60)
@@ -563,6 +626,12 @@ class SourceController(unittest.TestCase):
 
     def test_owned_failed_run_with_confirmed_absence_uses_bounded_infrastructure_recovery(self):
         self._owned_missing_result_uses_bounded_recovery("failure")
+
+    def test_owned_failed_run_with_unreadable_result_uses_bounded_infrastructure_recovery(self):
+        self._owned_missing_result_uses_bounded_recovery("failure", absent=False)
+
+    def test_owned_successful_run_without_result_uses_bounded_infrastructure_recovery(self):
+        self._owned_missing_result_uses_bounded_recovery("success", absent=False)
 
     def test_repeated_preparation_failure_alerts_and_exact_retry_can_retire_prepared_request(self):
         def unavailable(_frozen):
@@ -622,7 +691,7 @@ class SourceController(unittest.TestCase):
         self.assertIn(finding, json.loads(task["diagnostics"]))
         self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "source-failure")
 
-    def test_transient_result_outage_after_completion_grace_preserves_source_failure(self):
+    def test_result_outage_within_completion_grace_preserves_source_failure(self):
         attempt = self.start()
         frozen = self.ledger.load(attempt["id"])
         self.execution.add(frozen, classification="source_failure")
@@ -635,15 +704,11 @@ class SourceController(unittest.TestCase):
             self.store.row("ci_attempts", {"id": attempt["id"]})["run_completed_at"], original.run.completed_at
         )
         self.assertEqual(self.store.get_setting(f"source-ci:completion-seen:{attempt['id']}")["at"], self.clock())
-        self.clock.advance(LOG_GRACE_SECONDS + 1)
-        self.controller.tick()
         self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "pending")
-        self.assertEqual(len(self.execution.dispatches), 1)
         self.execution.runs["101"] = (digest, original)
         self.clock.advance(60)
         self.controller.tick()
         self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "source-failure")
-        self.assertEqual(self.store.count("tasks", {"kind": "repair"}), 1)
         self.assertEqual(len(self.execution.dispatches), 1)
 
     def test_source_ci_reads_release_lock_and_cannot_revive_changed_request(self):

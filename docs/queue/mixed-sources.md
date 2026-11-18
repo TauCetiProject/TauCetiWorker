@@ -212,8 +212,9 @@ private caller approval or service restart. Existing frozen requests retain thei
 original caller, policy and configuration across retries and process restarts.
 The run's caller, harness, configuration, candidate and attestation must match
 that original request. A caller that moves before dispatch is a proven non-send;
-the existing retry path prepares a fresh request. A lost dispatch reply is still
-reconciled without blindly resending it.
+the existing retry path prepares a fresh request. A lost dispatch reply is
+resent with a fresh request once a complete run listing still shows no run for it
+after `dispatch_timeout_seconds`.
 
 Forgejo-to-GitHub follower publication checks controls against the captured
 GitHub content `main` base, with the existing ancestry and expected-old checks.

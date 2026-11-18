@@ -289,6 +289,11 @@ class GitHubSourceExecution:
         """Fresh run identity/status only; old artifact expiry is irrelevant."""
         return self._metadata(frozen, run_id)[1]
 
+    def deleted(self, frozen, run_id):
+        """Whether GitHub answers 404 for the run. Other read failures raise."""
+        name = frozen.policy.execution.repository.name
+        return GitHubAdapter(GitHubClient(self.tokens, self.transport), name).read_run(name, run_id) is None
+
     def observe(self, frozen, run_id, *, owned=False):
         reader, run = self._metadata(frozen, run_id)
         ownership = result = None
