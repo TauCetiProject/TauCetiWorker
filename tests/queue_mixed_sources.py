@@ -56,14 +56,7 @@ class MixedFixture:
         )
         self.github_id = cc.RepositoryIdentity(RepositoryRef(GITHUB, self.controller.repository), 42)
         self.github.repository_identity = self.github_id
-        self.profile = MixedProfile(
-            self.github_id,
-            self.native_id,
-            frozenset({3}),
-            4,
-            self.root / "unused-token",
-            {"authority_generation": "1" * 32},
-        )
+        self.profile = MixedProfile(self.github_id, self.native_id, 4, self.root / "unused-token", {})
         self.native = NativeFake(self.repo, self.clock, self.native_id.repository.name)
         self.native.repository_identity = self.native_id
         self.native.admission_policy = Decision()
@@ -344,7 +337,7 @@ class Mixed(MixedFixture, unittest.TestCase):
         promotion = self.controller.store.rows("outbox", {"kind": "promote"})[0]
         self.assertEqual(loads(promotion["payload"])["primary_generation"], 2)
 
-    def test_native_discovery_skips_unchanged_snapshots_and_withdraws_recovery_holds(self):
+    def test_native_discovery_skips_unchanged_snapshots_and_withdraws_unsafe_reviews(self):
         registry = self.registry()
         head = self.native.create_pr(1, {"Native.lean": "native\n"})
         poller = NativePoller(registry, self.controller)
@@ -360,7 +353,7 @@ class Mixed(MixedFixture, unittest.TestCase):
 
         def revoked(snapshot):
             result, *rest = original(snapshot)
-            return ({**result, "merge": False, "recovery_authority_hold": True}, *rest)
+            return ({**result, "merge": False, "review_safe": False}, *rest)
 
         self.native.admission_policy.evaluate = revoked
         poller.invalidate(1, head=head, urgent=True)
@@ -408,50 +401,36 @@ class Mixed(MixedFixture, unittest.TestCase):
         self.assertEqual(self.native.calls, [])
         self.assertTrue(any(row["source_identity"] for row in self.controller.store.rows("members")))
 
-    def test_operational_profile_revert_does_not_reuse_retired_review_authority(self):
-        from types import SimpleNamespace
+    def test_profiles_load_with_or_without_retired_review_keys(self):
+        import json
+        import os
 
-        from tauceti_queue.mixed_native import MixedNativeSource
+        from tauceti_queue.config import ConfigError
 
+        raw = {
+            "schema": "tauceti-queue.mixed-sources/v1",
+            "github": self.github_id.record(),
+            "forgejo": self.native_id.record(),
+            "publisher_id": 4,
+            "source_token_file": str(self.root / "unused-token"),
+        }
         cfg = Config(repository=self.controller.repository, canonical_branch="main", forgejo_mode="observe")
+        path = self.root / "profile.json"
 
-        def configured(profile):
-            source = MixedNativeSource(
-                profile,
-                cfg,
-                self.repo.clone,
-                client=SimpleNamespace(forge=self.native_id.repository.forge),
-                token="fixture",
-                clock=self.clock,
-            )
-            source.configure_publisher_policy(self.controller.store)
+        def load(value):
+            path.unlink(missing_ok=True)
+            path.write_text(json.dumps(value))
+            os.chmod(path, 0o600)
+            return MixedProfile.load(path, cfg)
 
-        configured(self.profile)
-        old = dict(self.profile.raw)
-        self.profile.raw["execution"] = {"workflow_revision": "a" * 40}
-        configured(self.profile)
-        self.profile.raw.clear()
-        self.profile.raw.update(old)
-        configured(self.profile)
-        self.profile.raw["authority_generation"] = "2" * 32
-        configured(self.profile)
-        self.profile.raw.clear()
-        self.profile.raw.update(old)
-        with self.assertRaisesRegex(ValueError, "generation"):
-            configured(self.profile)
-
-    def test_operational_profile_edits_preserve_review_generation(self):
-        original = self.profile.publishers().generation
-        self.profile.raw.update(
-            execution={"workflow_revision": "a" * 40},
-            mirror={"approved_caller": "b" * 40},
-            source_token_file="/another/credential",
-        )
-        self.assertEqual(self.profile.publishers().generation, original)
-        self.profile.raw.pop("execution")
-        self.profile.raw.pop("mirror")
-        self.profile.raw.pop("source_token_file")
-        self.assertEqual(self.profile.publishers().generation, original)
+        # Production profiles still name the reviewer IDs and authority generation scoreboards no longer need.
+        for value in (raw, {**raw, "reviewer_ids": [3], "authority_generation": "1" * 32}):
+            profile = load(value)
+            self.assertEqual(profile.publisher, 4)
+            self.assertEqual(profile.publishers().record(), {"source": self.native_id.record(), "recoveries": [4]})
+        for value in ({**raw, "unknown": 1}, {k: v for k, v in raw.items() if k != "publisher_id"}):
+            with self.assertRaises(ConfigError):
+                load(value)
 
 
 class MixedExecution(MixedFixture, unittest.TestCase):
@@ -1590,8 +1569,6 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         self.ledger.policy = dataclasses.replace(self.ledger.policy, require_publication=False)
         self.assertGreater(self.controller.renew_task(task_id, task.claim_token), self.clock())
         self.profile.raw["authority_generation"] = "2" * 32
-        self.assertGreater(self.controller.renew_task(task_id, task.claim_token), self.clock())
-        self.registry_value.profile = dataclasses.replace(self.profile, reviewers=frozenset({3, 5}))
         self.assertGreater(self.controller.renew_task(task_id, task.claim_token), self.clock())
         self.ledger.policy = dataclasses.replace(self.ledger.policy, base_branch="other")
         with self.assertRaises(TaskError):

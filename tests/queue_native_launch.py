@@ -112,7 +112,7 @@ class LaunchFiles(unittest.TestCase):
             project_configuration_sha256=hashlib.sha256(CONFIG).hexdigest(),
             execution_policy=self.policy.record(with_config=False),
             workflow_revision="b" * 40,
-            publishers=dict(generation="1" * 32, reviews=[8], statuses=[7], recoveries=[7]),
+            publishers=dict(recoveries=[7]),
             control_policy_file=str(self.control),
             source_credentials=dict(
                 origin=dict(kind="forgejo", url=forge.url),
@@ -194,7 +194,7 @@ class LaunchFiles(unittest.TestCase):
         with self.assertRaises(NativeLaunchError):
             NativeLaunch.load(link)
         row = copy.deepcopy(self.row)
-        row["publishers"]["reviews"] = [8, 8]
+        row["publishers"]["recoveries"] = [7, 7]
         self.save(row)
         with self.assertRaises(NativeLaunchError):
             NativeLaunch.load(self.path)

@@ -156,7 +156,6 @@ class NativePoller:
             and work["head_sha"] == head
             and work["generation"] == work["evaluated_generation"]
             and decision.get("review_safe")
-            and not decision.get("recovery_authority_hold")
             and head not in decision.get("recovery_heads", ())
         )
 
@@ -309,7 +308,6 @@ class NativePoller:
                     disposition = "closed" if snapshot.pull.state != "open" else "draft"
                 elif (
                     not result["review_safe"]
-                    or result.get("recovery_authority_hold")
                     or snapshot.pull.head_sha in result.get("recovery_heads", ())
                     or snapshot.pull.base_ref != controller.canonical_branch
                 ):
@@ -457,9 +455,6 @@ class MixedSources:
     def connect(self, controller, github_poller):
         self.controller = controller
         self.check_github()
-        configure_publishers = getattr(self.native, "configure_publisher_policy", None)
-        if configure_publishers is not None:
-            configure_publishers(controller.store)
         self.poller = NativePoller(self, controller)
         if self.mode == "admit":
             from .mixed_ci import MixedCandidateCI

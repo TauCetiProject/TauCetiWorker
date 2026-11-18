@@ -7,7 +7,6 @@ neither needs another distribution/pin in the launcher's inline dependencies.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import subprocess
@@ -82,30 +81,6 @@ def resolve(cfg):
                 raise NoProgress("review engine could not be prepared")
     if not (directory / "runner/cli.py").is_file() or not (directory / "rubrics").is_dir():
         raise NoProgress("review engine checkout is incomplete")
-    if os.environ.get("TAUCETI_NATIVE_REVIEW_PUBLISHER"):
-        try:
-            probe = subprocess.run(
-                [sys.executable, str(directory / "runner/cli.py"), "--publication-protocol"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            supported = probe.returncode == 0 and json.loads(probe.stdout).get("native_publisher") == 2
-        except (OSError, ValueError, subprocess.TimeoutExpired):
-            supported = False
-        if not supported:
-            raise NoProgress("review engine does not support the configured native publication backend")
-        from types import SimpleNamespace
-
-        from .native_review_publisher import QueueReviewPublisher
-        from .worker_sources import current as selected_source
-
-        try:
-            QueueReviewPublisher(SimpleNamespace(source=selected_source())).preflight()
-        except (OSError, RuntimeError, ValueError) as error:
-            raise NoProgress(
-                f"native review publisher unavailable before inference ({type(error).__name__})"
-            ) from error
     current = subprocess.run(["git", "-C", str(directory), "rev-parse", "HEAD"], capture_output=True, text=True)
     return ReviewRuntime(directory, current.stdout.strip() if current.returncode == 0 else "")
 

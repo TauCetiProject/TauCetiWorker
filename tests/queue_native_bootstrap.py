@@ -62,14 +62,7 @@ class Bootstrap(unittest.TestCase):
         )
         api.forge = self.policy.source.repository.forge
         api._token = "controller-source-token"
-        actor = PrincipalRef(api.forge, "7")
-        publishers = NativePublishers(
-            self.policy.source,
-            frozenset({PrincipalRef(api.forge, "8")}),
-            frozenset({actor}),
-            frozenset({actor}),
-            generation="1" * 32,
-        )
+        publishers = NativePublishers(self.policy.source, frozenset({PrincipalRef(api.forge, "7")}))
         credentials = AppCredentials(1, "fixture", 2, b"test-only-private-key", b"test-only-app-secret")
         self.tokens = InstallationTokenSource(
             credentials,
@@ -232,25 +225,20 @@ class Bootstrap(unittest.TestCase):
         with self.assertRaisesRegex(SourceAccessDenied, "another actor"):
             self.service(bootstrap=replace(self.bootstrap, source_git_client_factory=alternate)).build_controller()
 
-    def test_controller_review_role_and_non_ascii_webhook_secrets_are_refused(self):
-        actor = next(iter(self.bootstrap.publishers.statuses))
-        changed = replace(self.bootstrap.publishers, reviews=frozenset({actor}))
-        with self.assertRaisesRegex(SourceAccessDenied, "separate"):
-            self.service(bootstrap=replace(self.bootstrap, publishers=changed)).build_controller()
+    def test_non_ascii_webhook_secrets_are_refused(self):
         with self.assertRaises(ValueError):
             self.service(bootstrap=replace(self.bootstrap, source_webhook_secret=b"\xff" * 32)).build_controller()
 
-    def test_another_token_for_a_publication_or_review_actor_cannot_be_a_control(self):
+    def test_another_token_for_the_publication_actor_cannot_be_a_control(self):
         service = self.service()
         service.build_controller()
         authority = service.controller.source_authority
         authority._client_factory = self.native.authority._client_factory
-        for actor in [{"id": 7, "login": "controller"}, {"id": 8, "login": "reviewer"}]:
-            self.native.actor = actor
-            with self.assertRaisesRegex(SourceAccessDenied, "cannot act"):
-                authority.authenticate("other-token")
+        self.native.actor = {"id": 7, "login": "controller"}
+        with self.assertRaisesRegex(SourceAccessDenied, "cannot act"):
+            authority.authenticate("other-token")
 
-    def test_a_busy_listen_port_cannot_commit_source_binding_or_publisher_rotation(self):
+    def test_a_busy_listen_port_cannot_commit_source_binding(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
             occupied.bind(("127.0.0.1", 0))
             occupied.listen()
