@@ -3380,6 +3380,46 @@ class PreRebase(QueueFixture):
             "line one\nline two changed by 101 and 102\nline three\n",
         )
 
+    def test_a_preserved_pre_rebase_submitted_after_the_repaired_head_lands_is_carried_onto_main(self):
+        self.controller.set_setting("repair_concurrency", 2, "kim")
+        self.controller.set_setting("claim_ttl_seconds", 86400, "kim")  # the resolver outlasts two head rounds
+        self.github.ci_policy = verdicts("fail", "pass")
+        self.approve(101, {"Shared.lean": "line one\nline two changed by 101\nline three\n"})
+        self.tick()
+        self.approve(102, {"Shared.lean": "line one\nline two changed by 102\nline three\n"})
+        self.tick()
+        resolver = self.agent(
+            "resolver",
+            script=lambda task: {
+                f"{PROJECT}#102": Resolution(
+                    {"Shared.lean": "line one\nline two changed by 101 and 102\nline three\n"},
+                    explanation="Merged the line two edits.",
+                )
+            },
+        )
+        task = resolver.claim(self.controller)
+        head = self.head()
+        self.run_ci()
+        self.tick()
+        repairer = self.agent(script=lambda task: {f"{PROJECT}#101": Resolution({"A.lean": "a\n"}, explanation="A.")})
+        self.assertTrue(repairer.run(self.controller).accepted)
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+        self.assertIsNone(self.head(), "sealing waits for the claimed resolution")
+        result = self.controller.submit_task(task.task_id, task.claim_token, resolver.produce(task))
+        self.assertTrue(result.accepted, result)
+        self.tick()
+        sealed = self.head()
+        self.assertEqual(sealed["base"], self.repo.main_sha())
+        self.assertTrue(self.journal("rebased")[-1]["detail"]["pre_rebased"])
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 0)
+        self.assertEqual(
+            chain.git(self.repo.clone, "show", f"{sealed['tip']}:Shared.lean"),
+            "line one\nline two changed by 101 and 102\nline three\n",
+        )
+
 
 class PublishedBaseCache(QueueFixture):
     """Staging is dispatched only on a base whose Lake cache is published (`_base_cache_ready`)."""

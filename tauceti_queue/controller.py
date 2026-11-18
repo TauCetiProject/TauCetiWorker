@@ -6064,11 +6064,11 @@ class Controller:
         """Base a newly sealed head on `canonical` from its pre-rebase, without replaying it again.
 
         Applies when the head ahead of it landed as the tip the pre-rebase was made on (`main` equals
-        `pre_rebase_onto`, or descends from it, and the pre-rebase is first carried onto `main` by a
-        clean replay); members inserted after the pre-rebase are replayed onto it first. The
-        members take their commits from the pre-rebased chain, and those an agent edited in a
-        `pre_rebase` task are recorded as edited with its explanation. False (nothing changed) when
-        there is no such pre-rebase, an extension conflicts or the chain's members do not match.
+        `pre_rebase_onto`), or otherwise when the pre-rebase carries onto `main` by a clean replay;
+        members inserted after the pre-rebase are replayed onto it first. The members take their
+        commits from the pre-rebased chain, and those an agent edited in a `pre_rebase` task are
+        recorded as edited with its explanation. False (nothing changed) when there is no such
+        pre-rebase, a carry or an extension conflicts, or the chain's members do not match.
         """
         onto = head["pre_rebase_onto"]
         if head["pre_rebase_state"] not in PRE_REBASE_USABLE or not onto:
@@ -6079,10 +6079,10 @@ class Controller:
             return False
         if onto != canonical:
             # A batch landed after the pre-rebase was made (a lane or emergency head went ahead of
-            # this one while its pre-rebase work was claimed): carry the pre-rebase, with its edits,
-            # onto `main` by replay, as `_carry_pre_rebase` does while a head runs.
-            if not chain.is_ancestor(self.clone, onto, canonical):
-                return False
+            # this one while its pre-rebase work was claimed), or the head landed at a later tip than
+            # the one a preserved task resolved onto (`_preserve_across_head_round`): carry the
+            # pre-rebase, with its edits, onto `main` by replay, as `_carry_pre_rebase` does while a
+            # head runs.
             chain_id = f"pre-rebase-carry-{head['id']}-{secrets.token_hex(4)}"
             try:
                 moved = chain.replay(self.clone, onto, tip, canonical, chain_id=chain_id)

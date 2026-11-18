@@ -261,7 +261,8 @@ recorded in `state:emergency_preserved` (`pre-rebase-preserved` in the journal) 
 successor work of an emergency head (below), its owner submits onto that tip, and the next
 `_pre_rebase` carries the adopted result onto the head's tip by replay. A
 rebuild of the head or a repair that empties a head member discards every pre-rebase. When the head
-lands and the canonical commit equals `pre_rebase_onto`, the sealed head takes the pre-rebased chain
+lands and the canonical commit equals `pre_rebase_onto`, or the pre-rebase carries onto it by a clean
+replay (a preserved task that resolved onto an earlier tip of the landed head), the sealed head takes the pre-rebased chain
 directly (the `rebased` journal entry carries `pre_rebased`), recording the members edited in the
 task as edited; otherwise it is replayed as before. The stacked pair is never built by the
 controller and nothing about the pre-rebase is a verdict.
