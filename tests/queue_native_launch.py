@@ -184,6 +184,17 @@ class LaunchFiles(unittest.TestCase):
                 NativeLaunch.load(self.path)
             read.assert_not_called()
 
+    def test_retired_publisher_fields_are_ignored(self):
+        row = copy.deepcopy(self.row)
+        row["publishers"].update(generation="1" * 32, reviews=[7], statuses=[8])
+        self.save(row)
+        publishers = NativeLaunch.load(self.path).bootstrap.publishers
+        self.assertEqual({int(p.native_id) for p in publishers.recoveries}, {7})
+        row["publishers"]["unexpected"] = []
+        self.save(row)
+        with self.assertRaises(NativeLaunchError):
+            NativeLaunch.load(self.path)
+
     def test_symlinks_public_files_and_duplicate_publishers_are_rejected(self):
         self.path.chmod(0o644)
         with self.assertRaises(NativeLaunchError):

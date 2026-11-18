@@ -82,7 +82,12 @@ def _token(path):
 
 
 def _publishers(value, source):
-    ids = _fields(value, {"recoveries"})["recoveries"]
+    # Older profiles also name a generation and review/status allowlists; scoreboards and
+    # statuses no longer use them, so they are ignored like MixedProfile's retired keys.
+    retired = {"generation", "reviews", "statuses"}
+    if not isinstance(value, dict) or not {"recoveries"} <= set(value) <= {"recoveries", *retired}:
+        raise ValueError("invalid launch fields")
+    ids = value["recoveries"]
     if (
         not isinstance(ids, list)
         or not 0 < len(ids) <= 256

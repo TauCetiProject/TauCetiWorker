@@ -38,7 +38,8 @@ The profile is one JSON object with exactly these fields:
 `publishers.recoveries` is a nonempty array of source-local numeric user IDs,
 with no duplicates: the controller's own source account, whose recovery holds
 count as the GitHub bot logins' do. Scoreboards and commit statuses need no
-enrollment; they count as on GitHub. `source_credentials.origin` has exactly `kind` and `url`; it must match
+enrollment; they count as on GitHub, and older profiles' `generation`, `reviews` and `statuses`
+keys are ignored. `source_credentials.origin` has exactly `kind` and `url`; it must match
 the independently approved policy before token files are read. Source API/Git
 tokens and webhook secrets are visible ASCII; the webhook secret has at least
 32 characters. Credentials never appear in command arguments or status.
