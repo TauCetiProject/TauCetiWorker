@@ -103,6 +103,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "stall_interval_seconds": 900,
     "publication_enabled": False,
     "forgejo_admission_enabled": True,
+    # False holds every waiting Forgejo input out of insertion (it keeps its approval and age) while the
+    # Forgejo source cannot be used; `evict_native` returns the ones already in batches. True resumes.
+    "forgejo_placement_enabled": True,
     "claim_ttl_seconds": 900,
     "dispatch_timeout_seconds": 600,
     # An in-progress run counts as lost only when neither its jobs nor GitHub's direct read of the run
@@ -3024,6 +3027,8 @@ class Controller:
         GitHub input enters an ordinary batch only once it is classified as not a control-file change
         (one approved while the tick ran is classified in the next)."""
         rows = self._waiting()
+        if not self.setting("forgejo_placement_enabled"):
+            rows = [row for row in rows if not isinstance(row["number"], SourceNumber)]
         if not self._control_lane_active():
             return rows
         return [
@@ -6284,6 +6289,70 @@ class Controller:
                 "tip": result.tip,
                 "tasks_superseded": superseded,
                 "landed_on_base": result.landed_on_base,
+            }
+
+    def evict_native(self, repo: str, actor: str, *, withdraw: Sequence[int] = ()) -> dict[str, Any]:
+        """Operator: break apart every live batch (the head and the open batches) that holds a Forgejo
+        member or a GitHub PR named in `withdraw`, for when the Forgejo source cannot be used.
+
+        Each such batch is removed (the head as `_dissolve_head` does: tasks superseded, claims released,
+        pre-rebases discarded, runs cancelled) and all its members go back to waiting at their original
+        age with their approvals kept (`_return_members`), so a Forgejo PR re-enters a batch by itself once
+        `forgejo_placement_enabled` is true again. GitHub-only batches are kept. A PR in `withdraw` then
+        has its input cancelled as `bors r-` would (a new approval brings it back). Refused while
+        `forgejo_placement_enabled` is true, since the returned Forgejo inputs would be placed again."""
+        with self._lock:
+            if self.source_authority is not None:
+                return {"evicted": False, "reason": "native-controller"}
+            self._check_repo(repo)
+            if self.setting("forgejo_placement_enabled"):
+                return {"evicted": False, "reason": "placement-enabled"}
+            named = {int(number) for number in withdraw}
+            now = self.clock()
+            batches = self.store.rows(
+                "batches", {"repository": self.repository, "state": [BATCH_OPEN, BATCH_HEAD]}, order="id"
+            )
+            affected = [
+                batch
+                for batch in batches
+                if any(
+                    not member["withdrawn"]
+                    and (isinstance(member["number"], SourceNumber) or member["number"] in named)
+                    for member in self._members(batch["id"])
+                )
+            ]
+            returned = 0
+            for batch in affected:
+                members = self._members(batch["id"])
+                with self.store.transaction():
+                    for stale in self.store.rows("tasks", {"batch_id": batch["id"], "state": TASK_OPEN}):
+                        self.store.update(
+                            "tasks",
+                            {"id": stale["id"]},
+                            state=TASK_SUPERSEDED,
+                            resolved_at=now,
+                            resolution="native-evicted",
+                        )
+                    for claim in self._active_claims(batch["id"]):
+                        self._release_claim(claim, "superseded", now)
+                    self._set_pre_rebase(batch, "", now)
+                    self._return_members(batch, members, "native-evicted", now)
+                    returned += sum(1 for member in members if not member["withdrawn"])
+                    self.store.journal(
+                        now, "native-evicted", batch["id"], actor=actor, state=batch["state"], members=len(members)
+                    )
+                self._discard_pre_rebase("native-evicted", now, batch)
+                self._remove_batch(batch, "native-evicted", now)
+            withdrawn = {
+                number: self._withdraw(repo, number, "cancelled", actor)["withdrawn"] for number in sorted(named)
+            }
+            self._wake.set()
+            self._refresh_snapshot()
+            return {
+                "evicted": True,
+                "batches": [batch["id"] for batch in affected],
+                "returned": returned,
+                "withdrawn": withdrawn,
             }
 
     def retry_ci(

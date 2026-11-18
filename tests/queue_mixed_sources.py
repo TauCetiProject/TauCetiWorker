@@ -599,6 +599,43 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         self.assertTrue(any(comment["number"] == 17 for comment in self.github.comments))
         self.assertTrue(any(comment["number"] == 17 for comment in self.native.comments))
 
+    def test_evict_native_returns_members_and_github_only_batch_dispatches_without_forgejo(self):
+        frozen = self.start_mixed()
+        head = self.controller._head()
+        other = self.github.create_pr(18, {"Other.lean": "other\n"})
+        self.controller.approve(self.controller.repository, 18, other, "fixture")
+        self.controller.tick()
+        self.assertEqual(
+            self.controller.evict_native(self.controller.repository, "operator")["reason"], "placement-enabled"
+        )
+        self.controller.set_setting("forgejo_placement_enabled", False, "operator")
+        result = self.controller.evict_native(self.controller.repository, "operator", withdraw=[18])
+        self.assertTrue(result["evicted"])
+        self.assertIn(head["id"], result["batches"])
+        self.assertEqual(result["withdrawn"], {18: True})
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "removed")
+        native = self.controller.input_for(self.native_id.repository.key, 17)
+        self.assertEqual(native["state"], "waiting")
+        self.assertEqual(self.controller.input_for(self.controller.repository, 18)["state"], "cancelled")
+        dispatches = len(self.execution.dispatches)
+        self.native.calls.clear()
+        self.controller.tick()
+        head = self.controller._head()
+        self.assertIsNotNone(head, self.controller._reasons)
+        self.assertEqual([m["number"] for m in self.controller._members(head["id"])], [17])
+        self.assertFalse(isinstance(self.controller._members(head["id"])[0]["number"], SourceNumber))
+        attempt = self.controller._current_attempt(head)
+        self.assertIsNotNone(attempt, self.controller._reasons)
+        self.assertIsNone(self.controller.store.row("ci_requests", {"attempt_id": attempt["id"]}))
+        self.assertEqual(attempt["dispatch_state"], "accepted")
+        self.assertEqual(len(self.execution.dispatches), dispatches)
+        self.assertFalse(any(name == "update_ref" for name, _ in self.native.calls))
+        self.assertEqual(self.controller.input_for(self.native_id.repository.key, 17)["state"], "waiting")
+        self.assertNotEqual(frozen.attempt_id, attempt["id"])
+        self.controller.set_setting("forgejo_placement_enabled", True, "operator")
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(self.native_id.repository.key, 17)["state"], "inserted")
+
     def test_admission_pause_keeps_accepted_waiting_inputs_and_lands_running_mixed_work(self):
         # Accept an input before pausing, including its pre-batch waiting state.
         native = self.native.create_pr(17, {"Native.lean": "native\n"})
