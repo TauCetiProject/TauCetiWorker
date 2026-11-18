@@ -68,6 +68,19 @@ Escalation acts on the head, in this order:
   author gets one comment with what failed, the verdict, the findings, the CI run, the accepted
   revision, the fingerprint and what to do next. The PR stays open. A later member whose replay then
   conflicts goes back to waiting with every member after it.
+- **Hold on a broken base.** Before attribution, bisection or withdrawing the last member, that is
+  when no finding names a member, the controller asks whether the head's base builds
+  (`_base_health`). A base that is the tip of a batch the queue promoted passed the same candidate
+  CI and is healthy without any API call. Any other base (an admin push, a direct merge) is judged
+  by the newest `ci.yml` push run for that SHA: one REST call, never retried or slept on. `success`
+  is healthy and the ladder goes on; `failure` holds the head version (below) with the detail "main
+  is broken at ...", naming the run, and withdraws and bisects nobody. Each automatic retry reads
+  the run again, so a re-run that turns main CI green releases the hold, and a fix pushed to main
+  rebases the head and ends it. Anything else (no run, since `ci.yml` coalesces bursts of pushes; a
+  run not yet concluded, cancelled or timed out; a failed lookup; a source other than GitHub) is
+  unknown and keeps the ladder as it is, with "base health unknown" and the reason added to the
+  escalation's cause. Members a finding names are withdrawn whatever the base: that verdict is
+  about the member.
 - **Bisect**, the last resort. If nothing names a member, attribution finds none and more than one is
   active, the head keeps the first half of
   its active members (its chain prefix up to the last kept member); the second half's members are
@@ -78,7 +91,8 @@ Escalation acts on the head, in this order:
 - **Dissolve.** If no active member is left (every one was withdrawn and the head still fails), the
   head's content is its base with nothing to land: the head batch is removed (`head-dissolved`) and
   the next sealed batch takes its place.
-- **Hold and retry.** If the escalation itself fails (a Git error replaying the chain, say), the head
+- **Hold and retry.** If the base is broken (above) or the escalation itself fails (a Git error
+  replaying the chain, say), the head
   version holds with an alert and one direct message, and the same escalation is tried again
   automatically after `automatic_retry_seconds` (default 30 minutes), doubling at each further failure
   up to `automatic_retry_max_seconds` (default 4 hours). A rebase onto a moved base or an operator's
@@ -195,6 +209,9 @@ is an interaction with another member; the next round then meets the remaining f
 fingerprint, so a wrong guess costs one round and one withdrawal, not a loop. Import attribution sees
 project imports only, so an error caused by a dependency bump is attributed through the build
 configuration rule, not the import closure. A base that is itself broken makes every batch fail in
-modules nobody changed; the import rule can then name members that changed upstream modules. The
-`attribution_max_members` bound limits the damage when many are implicated; a broken base implicating
-few members is not detected.
+modules nobody changed; the import rule can then name members that changed upstream modules. A base
+main CI reports failed holds instead, but a base whose health is unknown (no `ci.yml` run, a failed
+lookup) is attributed as before, where the `attribution_max_members` bound limits the damage when
+many are implicated. A base the queue landed is taken as healthy, so a landed base that later stops
+building (a candidate workflow change, a runner image, a cache outage surfacing as source errors) is
+not detected.

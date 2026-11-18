@@ -234,6 +234,8 @@ class FakeGitHub:
         self.closed: dict[int, str] = {}
         self.statuses: dict[tuple[str, str], Status] = {}
         self.declaration_records: dict[str, dict] = {}
+        # `ci.yml`'s conclusion per pushed SHA of main (`main_ci_run`); no entry means no run.
+        self.main_ci: dict[str, str] = {}
         self.runs: list[FakeRun] = []
         # pr-build.yml's concurrency group with cancel-in-progress: a new dispatch for a candidate
         # cancels any queued or in-progress run for the same batch and head.
@@ -590,6 +592,26 @@ class FakeGitHub:
         with self.lock:
             self._call("commit_status", sha, context)
             return self.statuses.get((sha, context))
+
+    def main_ci_run(self, repo: str, sha: str) -> CandidateRun | None:
+        with self.lock:
+            self._call("main_ci_run", sha)
+            if sha not in self.main_ci:
+                return None
+            conclusion = self.main_ci[sha]
+            return CandidateRun(
+                run_id=f"main-{sha[:12]}",
+                attempt=1,
+                status="in_progress" if conclusion == "in_progress" else "completed",
+                conclusion=None if conclusion == "in_progress" else conclusion,
+                created_at=None,
+                started_at=None,
+                completed_at=None,
+                runner_name=None,
+                runner_labels=(),
+                host=None,
+                html_url=f"https://github.invalid/actions/runs/main-{sha[:12]}",
+            )
 
     def fast_forward_leased(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult:
         return self.fast_forward(repo, branch, expected_parent, tip)
