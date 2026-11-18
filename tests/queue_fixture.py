@@ -3339,6 +3339,47 @@ class PreRebase(QueueFixture):
         self.assertEqual(second["onto"], tip)
         self.assertEqual([e["detail"]["onto"] for e in self.journal("pre-rebase-conflict")][-1], tip)
 
+    def test_a_claimed_pre_rebase_survives_a_head_repair_round_and_is_carried_onto_its_new_tip(self):
+        self.controller.set_setting("repair_concurrency", 2, "kim")
+        self.github.ci_policy = verdicts("fail")
+        self.approve(101, {"Shared.lean": "line one\nline two changed by 101\nline three\n"})
+        self.tick()
+        self.approve(102, {"Shared.lean": "line one\nline two changed by 102\nline three\n"})
+        self.tick()
+        resolver = self.agent(
+            "resolver",
+            script=lambda task: {
+                f"{PROJECT}#102": Resolution(
+                    {"Shared.lean": "line one\nline two changed by 101 and 102\nline three\n"},
+                    explanation="Merged the line two edits.",
+                )
+            },
+        )
+        task = resolver.claim(self.controller)
+        self.assertEqual(task.kind, "pre_rebase")
+        old_tip = self.head()["tip"]
+        self.run_ci()
+        self.tick()
+        repairer = self.agent(script=lambda task: {f"{PROJECT}#101": Resolution({"A.lean": "a\n"}, explanation="A.")})
+        self.assertTrue(repairer.run(self.controller).accepted)
+        self.tick()
+        new_tip = self.head()["tip"]
+        self.assertNotEqual(new_tip, old_tip)
+        row = self.controller.store.row("tasks", {"id": task.task_id})
+        self.assertEqual(row["state"], "open", "the claimed resolution is not restarted")
+        self.assertEqual(self.journal("pre-rebase-preserved")[-1]["detail"]["onto"], old_tip)
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "pre_rebase"}), 1)
+        result = self.controller.submit_task(task.task_id, task.claim_token, resolver.produce(task))
+        self.assertTrue(result.accepted, result)
+        self.tick()
+        batch = self.open_batch()
+        self.assertEqual((batch["pre_rebase_state"], batch["pre_rebase_onto"]), ("adopted", new_tip))
+        self.assertTrue(self.journal("pre-rebased")[-1]["detail"]["carried"])
+        self.assertEqual(
+            chain.git(self.repo.clone, "show", f"{batch['pre_rebase_tip']}:Shared.lean"),
+            "line one\nline two changed by 101 and 102\nline three\n",
+        )
+
 
 class PublishedBaseCache(QueueFixture):
     """Staging is dispatched only on a base whose Lake cache is published (`_base_cache_ready`)."""

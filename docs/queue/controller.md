@@ -254,7 +254,12 @@ told that the target is the next head's expected base rather than `main`. `claim
 after the unheld head tasks and before `prepare`, one claim per batch; insertion goes on during the claim, and the submission
 is validated against the members the task covers and adopted as the batch's pre-rebase (`adopted`)
 with base, tip, version and members unchanged. A task whose `onto` is no longer the head's tip, or
-whose batch's chain was rewritten (a preparation adopted), is superseded and its claims released. A
+whose batch's chain was rewritten (a preparation adopted), is superseded and its claims released,
+except a claimed task whose `onto` is an earlier tip of the current head (a repair round or a rebase
+moved it, `_preserve_across_head_round`): resolving a conflict outlasts a head round, so the task is
+recorded in `state:emergency_preserved` (`pre-rebase-preserved` in the journal) like the claimed
+successor work of an emergency head (below), its owner submits onto that tip, and the next
+`_pre_rebase` carries the adopted result onto the head's tip by replay. A
 rebuild of the head or a repair that empties a head member discards every pre-rebase. When the head
 lands and the canonical commit equals `pre_rebase_onto`, the sealed head takes the pre-rebased chain
 directly (the `rebased` journal entry carries `pre_rebased`), recording the members edited in the
