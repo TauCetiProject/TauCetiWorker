@@ -17,6 +17,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 from tauceti_worker import intentions as it  # noqa: E402
+from tauceti_worker.config import Die  # noqa: E402
 from tauceti_worker.github import GitHubError  # noqa: E402
 
 fails = 0
@@ -228,10 +229,10 @@ check("nothing to avoid renders as none", it.avoid_list(FakeGH([]), "PDE", True)
 
 try:
     it.avoid_list(FakeGH(board, error=GitHubError("HTTP 504")), "PDE", True)
-    raised = False
-except GitHubError:
-    raised = True
-check("a failed read stops authoring, since holds fail closed", raised)
+    raised = None
+except Die as e:
+    raised = str(e)
+check("a failed read stops authoring, since holds fail closed", raised is not None and "HTTP 504" in raised)
 
 
 def no_identity():

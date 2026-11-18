@@ -16,6 +16,8 @@ import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from tauceti_tools.forge import ForgeError
+
 from .agents import (
     AuthoringProfile,
     BuildCacheUnavailable,
@@ -818,14 +820,14 @@ def log_round_file_changes(cfg: Config, pre_head: str | None) -> None:
 def _open_pr_numbers(w: Worker) -> set[int] | None:
     try:
         return {p["number"] for p in w.gh.pr_list(["number"], state="open")}
-    except GitHubError:
+    except (GitHubError, ForgeError):
         return None
 
 
 def _progress_snapshot(w: Worker, c: Candidate) -> dict | None:
     try:
         return _progress_snapshot_direct(w, c)
-    except (GitHubError, GitHubUnavailable, OSError):
+    except (GitHubError, GitHubUnavailable, ForgeError, OSError):
         return None
 
 
@@ -920,7 +922,7 @@ def _progressed(w: Worker, c: Candidate, pre: dict | None) -> bool | None:
     try:
         with read_context(fresh=True, direct=True, retry=False):
             return _progressed_direct(w, c, pre)
-    except (GitHubError, GitHubUnavailable, OSError):
+    except (GitHubError, GitHubUnavailable, ForgeError, OSError):
         return None
 
 
@@ -1046,7 +1048,7 @@ def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate, *, explic
         # Fix selection must be current; unrelated discovery retains its existing mirror/cache policy.
         with read_context(fresh=True, direct=True, retry=False) if stage == "fix" else contextlib.nullcontext():
             return _still_actionable_direct(stage, w, sv, c, explicit=explicit)
-    except (GitHubError, GitHubUnavailable, OSError):
+    except (GitHubError, GitHubUnavailable, ForgeError, OSError):
         if stage != "fix":
             raise
         log(f"  fix #{c.pr}: current review read unavailable; retaining normal checkout and agent investigation")
@@ -2020,7 +2022,7 @@ def _do_fixlike(
             try:
                 with read_context(fresh=True, direct=True, retry=False):
                     live = w.gh.pr_view(pr, ["headRefOid", "isDraft", "state", "labels"])
-            except (GitHubError, GitHubUnavailable, OSError):
+            except (GitHubError, GitHubUnavailable, ForgeError, OSError):
                 pass
         # Unknown optional reads keep the checkout/agent path running. Known
         # changes release ownership immediately, before caches or model calls.
