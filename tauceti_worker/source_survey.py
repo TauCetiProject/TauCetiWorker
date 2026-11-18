@@ -269,6 +269,10 @@ def spend_detail_reads(cfg, source, rs, budget, order):
                 break
             continue
         meta = rs.gh_meta(p.number)
+        if "review" in stages and rs.ledger_clean_head(p.number) == p.head_oid:
+            # classify_survey asks for the contest thread after the budget closes, so a cached clean
+            # scoreboard whose thread is not cached (an earlier read failed) must spend its read here.
+            rs.newest_contest_reply(p.number)
         if p.number not in budget.read or meta.provenance in ("stale", "fetch_failed", "deferred"):
             continue  # answered from the cache, or unavailable: no new evidence of work
         if ("fix" in stages and rs.ledger_blocking(p.number, p.head_oid)) or (

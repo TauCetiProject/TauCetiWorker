@@ -487,6 +487,39 @@ class BudgetedSurveys(unittest.TestCase):
             self.assertEqual([c.pr for c in result.rebaseable.actionable], [9])
             self.assertEqual(checked[-1], 9, "the walk stops at the first conflict")
 
+    def test_a_failed_thread_read_is_retried_while_its_scoreboard_is_cached(self):
+        from tauceti_tools.forge import Incomplete
+
+        self.reviewed = {n: "a" * 40 for n in self.heads}
+        reviews = self.api.reviews.side_effect
+
+        def failing(repository, number):
+            self.detail.append(("reviews", number))
+            raise Incomplete("transient", status=502)
+
+        self.api.reviews.side_effect = failing
+        self.survey(seed=4)
+        failed = {number for endpoint, number in self.detail if endpoint == "reviews"}
+        self.assertTrue(failed)
+        self.api.reviews.side_effect = reviews
+        self.survey(seed=4)
+        # Same order, scoreboards now cached: the walk spends its reads on the missing threads.
+        self.assertLessEqual(failed, {number for endpoint, number in self.detail if endpoint == "reviews"})
+
+    def test_a_reused_thread_observation_keeps_its_age(self):
+        from tauceti_worker.review_state import ReviewState
+
+        self.reviewed = {n: "a" * 40 for n in self.heads}
+        self.survey(seed=0)
+        read = self.read_prs()
+        rs = ReviewState(self.cfg, self.source)
+        for number in read:
+            rs._contest_path(number).unlink()
+        self.survey(seed=0)
+        self.assertFalse(self.read_prs() & read, "answered from the shared cache")
+        # Rewriting the sidecar now would restart the clock on an observation the shared cache aged.
+        self.assertFalse(any(rs._contest_path(number).exists() for number in read))
+
     def test_explicit_targets_are_read_in_full(self):
         result = self.survey(numbers=(2, 4, 6, 8, 10, 12))
         self.assertEqual(self.read_prs(), {2, 4, 6, 8, 10, 12})

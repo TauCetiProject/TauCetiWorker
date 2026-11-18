@@ -488,18 +488,26 @@ class ReviewState:
         if sc is not None and "contest" in sc:
             return sc["contest"]
 
+        started = time.time()
+
         def read():
             with read_context(fresh=force, revision=self._observed.get(pr, "")):
-                return self.gh.review_comments(pr)
+                return self.gh.review_comments(pr), cache_hit()
 
         try:
-            rcs = self._budgeted(pr, read, force)
+            rcs, reused = self._budgeted(pr, read, force)
         except _Deferred:
             return None  # unread this survey; dispatch re-reads contests for the PR it selects
         if rcs is None:
             return None  # a fetch FAILURE answers nothing and must not be cached as "no contest"
         best = self._newest_contest(rcs)
-        self._write_sidecar(self._contest_path(pr), pr, {"status": "present" if best else "missing", "contest": best})
+        if not (self._direct_source and reused):  # as for scoreboards: do not reset a reused observation's age
+            self._write_sidecar(
+                self._contest_path(pr),
+                pr,
+                {"status": "present" if best else "missing", "contest": best},
+                observed_at=started if self._direct_source else None,
+            )
         return best
 
     @staticmethod
