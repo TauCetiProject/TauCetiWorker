@@ -293,7 +293,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         comments = self.client.comments(self.repository, number)
         if not isinstance(comments, list) or not all(isinstance(row, dict) for row in comments):
             raise Incomplete("native discussion is unavailable")
-        comments = tuple(row for row in comments if relevant_comment(row))
+        comments = tuple(row for row in comments if relevant_comment(row, native=True))
         statuses = self._statuses(pull.head_sha)
         fresh = self.fetch_pr(repo, number)
         # Ordinary discussion/title timestamps cannot invalidate a complete

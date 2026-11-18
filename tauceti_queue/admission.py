@@ -106,12 +106,14 @@ def recovery_heads(comments):
     return policy.rebase_request_heads(comments) | policy.rebase_request_heads(comments, stalled=True)
 
 
-def relevant_comment(comment):
+def relevant_comment(comment, *, native=False):
+    """Native recovery requests are author-checked when evaluated, not here."""
     body = comment.get("body") or ""
     return (
         policy.SCOREBOARD_MARKER in body
         or bool(recovery_heads([comment]))
-        or body.startswith("Merge-queue recovery for head `")
+        or native
+        and body.startswith("Merge-queue recovery for head `")
     )
 
 

@@ -135,8 +135,8 @@ class ForgejoWebhookReceiver:
                     previous = (changes.get("body") or {}).get("from") or ""
                     if (
                         action != "deleted"
-                        and not relevant_comment(comment)
-                        and not relevant_comment({"body": previous})
+                        and not relevant_comment(comment, native=True)
+                        and not relevant_comment({"body": previous}, native=True)
                     ):
                         self.ignored += 1
                         return "ignored"
