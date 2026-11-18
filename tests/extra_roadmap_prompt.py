@@ -83,7 +83,9 @@ try:
 
     def render(area):
         cap.clear()
-        tc.work_units.do_roadmap(w, None, types.SimpleNamespace(reason=area, pr=0, head=""), opts, bubble=False)
+        tc.work_units.do_roadmap(
+            w, None, types.SimpleNamespace(reason=area, pr=0, head="", progress=None), opts, bubble=False
+        )
         return cap.get("prompt", "")
 
     os.environ["TAUCETI_EXTRA_ROADMAP_PROMPT"] = GUIDANCE

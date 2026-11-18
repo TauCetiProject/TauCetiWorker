@@ -184,9 +184,16 @@ def test_roadmap():
     w = types.SimpleNamespace(
         cfg=types.SimpleNamespace(state=tmp, wid="worker3", checkout=tmp / "checkout", logdir=tmp / "logs"), gh=None
     )
-    c = types.SimpleNamespace(reason="Topology", pr=0, head="")
+    c = types.SimpleNamespace(reason="Topology", pr=0, head="", progress={"prs": set()})
     opts = types.SimpleNamespace(agent_name="Claude Code", work_model="claude", source=str(source))
     tc.work_units.do_roadmap(w, None, c, opts, bubble=True)
+    suffix = c.progress.get("authored_suffix", "")
+    check("roadmap: baseline records the fork owner", c.progress.get("authored_owner") == "alice")
+    check("roadmap: recorded suffix ends in the worker id", suffix.endswith("-worker3"))
+    check(
+        "roadmap: prompt branch uses the recorded suffix",
+        bool(suffix) and f"--head alice:roadmap/<short-slug>{suffix} " in cap.get("prompt", ""),
+    )
 
     check("roadmap: bubble target stays canonical", cap.get("target") == TAUCETI)
     check("roadmap: --allow-push is the fork", cap.get("allow_push") == FORK)
