@@ -150,6 +150,11 @@ POLL = int(os.environ.get("TAUCETI_POLL", "300"))  # seconds between quota check
 # expected to finish inside the round, so this is set far above any healthy round, not as a budget.
 ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "21600"))  # 6 h
 
+# How long a loop-spawned round waits for its worker's round.lock before giving up without failure.
+# Another worker's round briefly holds it while removing this worker's leftover worktree, and a round
+# of a restarted loop can still be finishing.
+ROUND_LOCK_WAIT = int(os.environ.get("TAUCETI_ROUND_LOCK_WAIT", "120"))
+
 INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
 
 # A managed worker's wrapper sends this to its loop driver (never to a round's process group) to
