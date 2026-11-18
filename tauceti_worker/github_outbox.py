@@ -42,6 +42,27 @@ def local_operation(args):
     return args[:2] in (["pr", "checkout"], ["repo", "clone"])
 
 
+def label_edit(args):
+    """A `gh pr|issue edit` that only adds or removes labels.
+
+    Label edits are idempotent, so they are never retained: a denied or lost one simply fails
+    to the caller, who may repeat it. A retained intent would block later rounds on the PR."""
+    if args[:2] not in (["pr", "edit"], ["issue", "edit"]) or len(args) < 3:
+        return False
+    labels, rest = False, iter(args[3:])
+    for arg in rest:
+        if arg in ("--add-label", "--remove-label"):
+            labels = True
+            next(rest, None)
+        elif arg.startswith(("--add-label=", "--remove-label=")):
+            labels = True
+        elif arg in ("--repo", "-R"):
+            next(rest, None)
+        elif not arg.startswith("--repo="):
+            return False
+    return labels
+
+
 def semantic_key(payload):
     args = list(payload["argv"])
     for index in payload.get("assets", {}):
@@ -139,6 +160,7 @@ def prepare(argv, env, cwd=None, input=None):
         or env.get("TAUCETI_OUTBOX_REPLAY") == "1"
         or tr.proxy_readonly(argv[1:])
         or local_operation(argv[1:])
+        or label_edit(argv[1:])
     ):
         return None
     args = list(argv[1:])
@@ -819,6 +841,10 @@ def drain(env=None):
             ):
                 remaining.append(path.stem)
                 continue  # Preserve malformed legacy evidence without blocking other repairs.
+            if label_edit(value["argv"]):
+                # Older proxies retained label edits, which nothing can reconcile.
+                archive(path, value, "Label edits are not retained publications")
+                continue
             destination = target(value)
             if value.get("retry_at", 0) > time.time():
                 remaining.append(path.stem)

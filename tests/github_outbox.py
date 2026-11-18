@@ -93,6 +93,34 @@ with (
         replay.assert_not_called()
     for local in (["gh", "pr", "checkout", "15467", "--force"], ["gh", "repo", "clone", "org/repo"]):
         assert outbox.prepare(local, env, tmp) is None
+    # A label edit is idempotent: a denied one fails to the agent instead of blocking the PR.
+    for labels in (
+        ["gh", "pr", "edit", "9", "--repo", "org/repo", "--add-label", "self-tested"],
+        ["gh", "pr", "edit", "9", "--remove-label=self-tested", "-R", "org/repo"],
+        ["gh", "issue", "edit", "9", "--add-label", "a", "--add-label", "b"],
+    ):
+        assert outbox.prepare(labels, env, tmp) is None, labels
+    for compound in (
+        ["gh", "pr", "edit", "9", "--add-label", "self-tested", "--title", "t"],
+        ["gh", "pr", "edit", "9", "--repo", "org/repo"],
+    ):
+        assert not outbox.label_edit(compound[1:]), compound
+    legacy_label = outbox.directory(env) / "legacy-label.json"
+    tr.atomic(
+        legacy_label,
+        {
+            "argv": ["pr", "edit", "9", "--repo", "org/repo", "--add-label", "self-tested"],
+            "cwd": tmp,
+            "status": "ambiguous",
+            "retry_at": time.time() + 3600,
+        },
+    )
+    assert outbox.pending_for("org/repo", 9, env)
+    with patch.object(tr, "execute") as replay:
+        assert outbox.drain(env) == []
+        assert not legacy_label.exists() and legacy_label.with_suffix(".failed").exists()
+        replay.assert_not_called()
+    assert not outbox.pending_for("org/repo", 9, env)
     legacy_checkout = outbox.directory(env) / "legacy-checkout.json"
     tr.atomic(legacy_checkout, {"argv": ["pr", "checkout", "15467", "--force"], "cwd": tmp, "status": "ambiguous"})
     with patch.object(tr, "execute") as replay:
