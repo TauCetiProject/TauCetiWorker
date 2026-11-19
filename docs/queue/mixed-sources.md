@@ -29,8 +29,11 @@ the existing queue. Native discovery errors appear in status without stopping
 GitHub discovery. The poller lists every open Forgejo PR at most once per
 `approval_poll_interval_seconds` (or at once when discovery is requested, for
 example by re-enabling Forgejo admission), and spends the passes in between,
-each bounded by `reconcile_interval_seconds`, on evaluations. Landing still
-re-reads every Forgejo member's source and review before it promotes. `admit` enables native inputs in that same queue, including
+each bounded by `reconcile_interval_seconds`, on evaluations. Because mixed
+landing freezes a contribution at admission, an approved Forgejo input is read
+once more just before it joins a batch: unless the PR still shows the listed
+facts admission evaluated (head, state, labels, body, update time, comment
+count), the insertion is held and the PR is evaluated again. `admit` enables native inputs in that same queue, including
 qualified repair tasks and exact candidate CI. Pause new native acceptance with
 the authenticated runtime setting, keeping `forgejo_mode = "admit"`:
 

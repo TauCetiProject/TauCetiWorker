@@ -96,9 +96,8 @@ class AdmissionInputs:
             return port.withdraw(int(number), head)
 
     def insertion_check(self, number, head):
-        if isinstance(number, SourceNumber):
-            return None  # Forgejo keeps its own checks until slice 7 of decision 38 step 4
-        check = getattr(self.github, "insertion_check", None)
+        port = self._for(number)
+        check = getattr(port, "insertion_check", None)
         return None if check is None else check(int(number), head)
 
     def invalidate(self, number, **kwargs):
@@ -208,6 +207,51 @@ class NativePoller:
         )
         self.wake()
 
+    def _listed_version(self, pull, discovery_version):
+        registry, controller = self.registry, self.controller
+        return dumps(
+            {
+                "discovery": discovery_version
+                or {
+                    "head": pull.head_sha,
+                    "base": pull.base_ref,
+                    "draft": pull.draft,
+                    "refresh": int(controller.clock() // controller.setting("approval_poll_interval_seconds")),
+                },
+                "policy": registry.native.admission_policy.revision,
+                "mode": registry.mode,
+            }
+        )
+
+    def insertion_check(self, number, head):
+        """None when the Forgejo PR still shows the listed facts admission evaluated, else why not.
+
+        The full listing runs only once per approval-poll interval, and mixed landing freezes the
+        contribution at admission, so this one read (outside the controller lock) is what keeps a
+        closed PR, a moved head, a new label or review activity between listings out of a batch.
+        A difference re-observes the PR so it is evaluated again; a failed read holds insertion.
+        """
+        if not self.is_current(number, head):
+            return "not evaluated at this head"
+        work = self.state.get(int(number))
+        version_of = getattr(self.registry.native, "_discovery_version", None)
+        if work is None or work["generation"] != work["evaluated_generation"] or version_of is None:
+            return None  # no evaluated listed facts to compare: the local check stands
+        try:
+            pull = self.registry.native.fetch_pr_or_none(self.registry.profile.forgejo.repository.name, int(number))
+        except Exception as error:  # noqa: BLE001 - an unreadable source never admits
+            return f"unavailable: {type(error).__name__}"
+        if pull is None:
+            self.state.observe(int(number), head, "absent:" + self.registry.mode, urgent=True)
+            self.wake()
+            return "closed"
+        version = self._listed_version(pull, version_of(pull))
+        if pull.head_sha != head or version != work["observed_version"]:
+            self.state.observe(int(number), pull.head_sha, version, urgent=True)
+            self.wake()
+            return "source changed since evaluation"
+        return None
+
     def run_once(self, *, reason="interval"):
         with self._lock:
             return self._run(reason=reason)
@@ -232,21 +276,7 @@ class NativePoller:
                 for pull in pulls:
                     seen.add(pull.number)
                     details = pull.admission or {}
-                    version = dumps(
-                        {
-                            "discovery": details.get("discovery_version")
-                            or {
-                                "head": pull.head_sha,
-                                "base": pull.base_ref,
-                                "draft": pull.draft,
-                                "refresh": int(
-                                    controller.clock() // controller.setting("approval_poll_interval_seconds")
-                                ),
-                            },
-                            "policy": registry.native.admission_policy.revision,
-                            "mode": registry.mode,
-                        }
-                    )
+                    version = self._listed_version(pull, details.get("discovery_version"))
                     self.state.observe(
                         pull.number, pull.head_sha, version, recheck_after=details.get("recheck_seconds", 0)
                     )
