@@ -59,6 +59,7 @@ API_VERSION = "2022-11-28"
 USER_AGENT = "tauceti-queue (https://github.com/TauCetiProject/TauCetiWorker)"
 STAGING_EVENT = "tauceti-bors-staging"
 STAGING_WORKFLOW = "pr-build.yml"
+MAIN_WORKFLOW = "ci.yml"
 BUILD_JOB = "sandboxed-build"
 SHA = re.compile(r"[0-9a-f]{40}")
 RUN_URL = re.compile(r"/actions/runs/(\d+)(?:/|$)")
@@ -926,6 +927,21 @@ class GitHubAdapter:
         if len(matches) > 1:
             raise AmbiguousCandidateRun(f"{len(matches)} runs titled {expected!r}")
         return self.candidate_run(repo, matches[0], with_jobs=with_jobs, with_diagnostics=with_diagnostics)
+
+    def main_ci_run(self, repo: str, sha: str) -> CandidateRun | None:
+        """`GET repos/{repo}/actions/workflows/ci.yml/runs?head_sha=<sha>&event=push`, newest first: one
+        call that raises instead of retrying or waiting, so the controller never sleeps on it."""
+        with self.client.deferred_requests(urgent=True):
+            response = self.client.request(
+                "GET",
+                f"repos/{repo}/actions/workflows/{MAIN_WORKFLOW}/runs",
+                params={"head_sha": sha, "event": "push", "per_page": 1},
+                single_attempt=True,
+            )
+        runs = (response.json() or {}).get("workflow_runs") or []
+        if not runs or not isinstance(runs[0], dict) or not runs[0].get("id"):
+            return None
+        return self.candidate_run(repo, runs[0], with_jobs=False, with_diagnostics=False)
 
     def read_run(self, repo: str, run_id: str, *, with_jobs: bool = False) -> CandidateRun | None:
         """`GET repos/{repo}/actions/runs/{run_id}`: the run as GitHub reports it now, `None` on 404."""

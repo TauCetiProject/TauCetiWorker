@@ -5223,7 +5223,8 @@ class Controller:
                     self._update_prediction_verdict(head, active, attempt, now)
             self._reasons.append(f"head {head['id']} is claimed by {', '.join(c['worker'] for c in task_claims)}")
             return
-        if self._retry_escalation(head, now):
+        # A moved base rebases first, which ends the hold, rather than retrying against the old base.
+        if head["base"] == canonical and self._retry_escalation(head, now):
             return  # escalated again: the head changed, or holds longer
         pending = self._open_task(head)
         if pending is not None and self._fruitless_task(head, pending, now):
@@ -7962,19 +7963,23 @@ class Controller:
         )
 
     def _escalate(self, head: dict[str, Any], failure: dict[str, Any], cause: str, now: float) -> None:
-        """Act on a failure that repair did not resolve: withdraw the active members it names, else the
-        members attribution finds (`_attribute`), else bisect the head, else withdraw its one active
-        member, else (no active member left) dissolve the head. An escalation that raises holds the head
-        version and is tried again after an automatic backoff. Every outcome is journaled, alerted on the
+        """Act on a failure that repair did not resolve: withdraw the active members it names, else hold
+        while the base is known broken (`_base_health`), else withdraw the members attribution finds
+        (`_attribute`), else bisect the head, else withdraw its one active member, else (no active member
+        left) dissolve the head. A hold, or an escalation that raises, holds the head version and is
+        tried again after an automatic backoff. Every outcome is journaled, alerted on the
         status page and sent to the operator."""
         members = self._members(head["id"])
         active = [m for m in members if not m["withdrawn"]]
         named = self._resolve_members(loads(failure["members"], []), active)
         lines = loads(failure["lines"], [])
         original_cause = cause
+        health, evidence = "healthy", ""
         try:
             found = None
-            if not named and len(active) > 1:
+            if not named and active:
+                health, evidence = self._base_health(head["base"])
+            if not named and len(active) > 1 and health != "broken":
                 try:
                     found = self._attribute(head, failure, active)
                 except Exception as error:  # noqa: BLE001 - attribution is advisory; bisection still terminates
@@ -7984,7 +7989,13 @@ class Controller:
                 if named:
                     cause += "; attributed by " + found.summary(lambda key: self._member_label(key, active))
                     self._count("attributed_withdrawals")
-            if named:
+            if health == "broken":
+                action = "hold"
+                detail = (
+                    f"main is broken at {head['base'][:12]}: {evidence}; not withdrawing or bisecting until main "
+                    "is fixed (fix main or re-run its CI; `rebuild-head` re-dispatches)"
+                )
+            elif named:
                 action, detail = "withdraw", self._withdraw_from_head(head, named, failure, cause, now)
             elif len(active) > 1:
                 assert found is not None
@@ -8001,6 +8012,8 @@ class Controller:
         except Exception as error:  # noqa: BLE001 - a failed escalation must hold with an alert, not stall silently
             self.log.exception("escalation of head %s failed", head["id"])
             action, detail = "hold", f"escalation failed ({type(error).__name__}: {str(error)[:200]})"
+        if health == "unknown":
+            cause += f"; base health unknown ({evidence})"
         retried = False
         if action == "hold":
             prior = self._state("escalation_hold") or {}
@@ -8040,6 +8053,36 @@ class Controller:
             verdict_class=failure.get("verdict_class", ""),
             lines=lines,
         )
+
+    def _base_health(self, base: str) -> tuple[str, str]:
+        """Whether `base` builds, before a failure no finding names is blamed on a member: `healthy` when
+        it is the tip of a batch the queue promoted (it passed the same candidate CI; no API call), else
+        `healthy` or `broken` by the conclusion of main's `ci.yml` run for it, else `unknown` (no run,
+        not concluded, the lookup failed, or main is not on GitHub). Only `broken` changes the escalation;
+        `unknown` keeps today's attribution. The second value is the evidence, for the cause or detail."""
+        promoted = {"repository": self.repository, "state": BATCH_LANDED, "tip": base, "landed_how": "promoted"}
+        if self.store.row("batches", promoted) is not None:
+            return "healthy", "the queue landed it"
+        reader = getattr(self.execution, "main_ci_run", None)
+        if (
+            reader is None
+            or self.candidate_ci is not None
+            or self.native_source
+            or self.store.get_setting("mixed:primary", "github") != "github"
+        ):
+            return "unknown", "main CI is not read for this source"
+        try:
+            run = reader(self.repository, base)
+        except Exception as error:  # noqa: BLE001 - an unreadable base keeps today's attribution
+            self.log.warning("main CI lookup for %s failed: %s", base[:12], error)
+            return "unknown", f"main CI lookup failed ({type(error).__name__})"
+        if run is None:
+            return "unknown", f"no main CI run for {base[:12]}"
+        if run.status != "completed" or run.conclusion not in ("success", "failure"):
+            return "unknown", f"main CI run {run.html_url or run.run_id} is {run.conclusion or run.status}"
+        if run.conclusion == "success":
+            return "healthy", f"main CI run {run.html_url or run.run_id} passed"
+        return "broken", f"main CI run {run.html_url or run.run_id} failed"
 
     @staticmethod
     def _member_label(key: str, members: list[dict[str, Any]]) -> str:

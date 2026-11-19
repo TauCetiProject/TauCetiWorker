@@ -1016,6 +1016,115 @@ class LoopTermination(QueueFixture):
         self.assertEqual(self.controller.input_for(PROJECT, 102)["reason"], "queue-withdrawn")
         self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
 
+    def broken_base(self, conclusion=None):
+        """An admin push breaks main in TauCeti/User.lean, which imports TauCeti/Lib.lean; `conclusion` is
+        main CI's for it. CI fails while User.lean is broken, naming no member."""
+        self.github.ci_policy = self.failing_module("TauCeti/User.lean", "import TauCeti.Lib\nbroken\n", "TauCeti.User")
+        base = self.repo.advance_main(
+            {"TauCeti/Lib.lean": "def lib := 1\n", "TauCeti/User.lean": "import TauCeti.Lib\nbroken\n"}
+        )
+        if conclusion is not None:
+            self.github.main_ci[base] = conclusion
+        self.tick()
+        return base
+
+    def escalate(self, *members):
+        for number, files in members:
+            self.approve(number, files)
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.give_up(3)
+        self.tick()
+        return self.controller.status()["escalations"][-1]
+
+    def test_a_base_the_queue_landed_is_healthy_without_reading_main_ci(self):
+        self.repo.advance_main({"TauCeti/Lib.lean": "def lib := 1\n", "TauCeti/User.lean": "import TauCeti.Lib\n"})
+        self.tick()
+        self.approve(100, {"TauCeti/First.lean": "f\n"})
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual(self.controller.input_for(PROJECT, 100)["state"], "landed")
+        self.github.ci_policy = self.failing_module("TauCeti/Lib.lean", "broken\n", "TauCeti.User")
+        escalated = self.escalate((101, {"TauCeti/Lib.lean": "broken\n"}), (102, {"TauCeti/Other.lean": "o\n"}))
+        self.assertEqual(escalated["action"], "withdraw", escalated)
+        self.assertNotIn("base health", escalated["cause"])
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "queue-withdrawn")
+        self.assertNotIn("main_ci_run", [name for name, _ in self.github.calls])
+
+    def test_a_broken_base_holds_instead_of_withdrawing_and_a_green_rerun_releases_it(self):
+        base = self.broken_base("failure")
+        escalated = self.escalate((101, {"TauCeti/Lib.lean": "def lib := 2\n"}), (102, {"TauCeti/Other.lean": "o\n"}))
+        self.assertEqual(escalated["action"], "hold", escalated)
+        self.assertIn(f"main is broken at {base[:12]}: main CI run", escalated["detail"])
+        self.assertEqual([self.controller.input_for(PROJECT, n)["state"] for n in (101, 102)], ["inserted"] * 2)
+        self.assertEqual(self.controller.status()["counters"].get("bisections", 0), 0)
+        self.assertTrue(any("main is broken" in a for a in self.controller.status()["alerts"]))
+        self.tick()
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.assertIn(f"main is broken at {base[:12]}", self.notifier.messages[0])
+        # Main CI re-run turns green: the next automatic retry attributes as before.
+        self.github.main_ci[base] = "success"
+        self.clock.advance(1800)
+        self.tick()
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "queue-withdrawn")
+        self.assertIsNone(self.controller.status()["loop_termination"]["escalation_hold"])
+
+    def test_a_fix_pushed_to_a_broken_main_ends_the_hold_without_a_withdrawal(self):
+        self.broken_base("failure")
+        escalated = self.escalate((101, {"TauCeti/Lib.lean": "def lib := 2\n"}), (102, {"TauCeti/Other.lean": "o\n"}))
+        self.assertEqual(escalated["action"], "hold", escalated)
+        self.repo.advance_main({"TauCeti/User.lean": "import TauCeti.Lib\n"})
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertIsNone(self.controller.status()["loop_termination"]["escalation_hold"])
+        self.assertEqual([self.controller.input_for(PROJECT, n)["state"] for n in (101, 102)], ["landed"] * 2)
+
+    def test_a_fix_pushed_after_the_hold_expires_rebases_before_retrying(self):
+        self.broken_base("failure")
+        escalated = self.escalate((101, {"TauCeti/Lib.lean": "def lib := 2\n"}), (102, {"TauCeti/Other.lean": "o\n"}))
+        self.assertEqual(escalated["action"], "hold", escalated)
+        self.clock.advance(1800)
+        self.github.fail_next["main_ci_run"] = 1  # a retry on the old base would now attribute and withdraw #101
+        self.repo.advance_main({"TauCeti/User.lean": "import TauCeti.Lib\n"})
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        self.assertEqual([self.controller.input_for(PROJECT, n)["state"] for n in (101, 102)], ["landed"] * 2)
+
+    def unknown_base(self, reason):
+        escalated = self.escalate((101, {"TauCeti/Lib.lean": "def lib := 2\n"}), (102, {"TauCeti/Other.lean": "o\n"}))
+        self.assertEqual(escalated["action"], "withdraw", escalated)
+        self.assertIn(f"base health unknown ({reason}", escalated["cause"])
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "queue-withdrawn")
+        self.tick()
+        self.assertNotIn("base health", self.github.comments_for(101)[0]["body"])
+
+    def test_a_base_without_a_main_ci_run_keeps_attribution(self):
+        self.broken_base()
+        self.unknown_base("no main CI run")
+
+    def test_a_failed_main_ci_lookup_keeps_attribution(self):
+        self.broken_base()
+        self.github.fail_next["main_ci_run"] = 1
+        self.unknown_base("main CI lookup failed")
+
+    def test_a_broken_base_still_withdraws_a_member_ci_names(self):
+        self.broken_base("failure")
+        self.github.ci_policy = self.fails_on("Bad.lean", attributed=101)
+        escalated = self.escalate((101, {"Bad.lean": "bad\n"}), (102, {"B.lean": "b\n"}))
+        self.assertEqual(escalated["action"], "withdraw", escalated)
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "queue-withdrawn")
+        self.assertNotIn("main_ci_run", [name for name, _ in self.github.calls])
+
+    def test_a_broken_base_holds_the_only_member_left(self):
+        self.broken_base("failure")
+        escalated = self.escalate((101, {"TauCeti/Lib.lean": "def lib := 2\n"}))
+        self.assertEqual(escalated["action"], "hold", escalated)
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
+
     def test_a_head_with_no_active_member_left_is_dissolved(self):
         self.github.ci_policy = lambda *_: ("scope-fail", [])
         self.approve(101, {"A.lean": "a\n"})
