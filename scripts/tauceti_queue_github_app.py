@@ -34,6 +34,8 @@ PERMISSIONS = {
     "actions": "write",
     "workflows": "write",
     "metadata": "read",
+    # Organization permission: admission reads the self-tested team's membership itself.
+    "members": "read",
 }
 EVENTS = [
     "pull_request",

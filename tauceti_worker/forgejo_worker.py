@@ -13,6 +13,7 @@ from .forgejo_reads import ForgejoReadSource
 
 class ForgejoWorkerSource(ForgejoReadSource):
     supports_contest_reactions = False
+    supports_label_requests = False
     worker_capable = True
     supports_review_sandbox = False
 
@@ -184,10 +185,33 @@ class ForgejoWorkerSource(ForgejoReadSource):
         self.validate_binding()
         ForgejoWriter(self.api).edit(self.repository, pr, pull=True, add_labels=[name])
         self.invalidate(pr)
+        self.invalidate_discovery()
         return True
 
+    def pull_for_head(self, owner, branch):
+        """Fresh, unambiguous PR lookup for a branch published by a roadmap round."""
+        if not owner or not branch:
+            return None
+        # Narrow discovery on the server; still verify its branch and owner below.
+        rows = self._read(
+            "pull_for_head",
+            [owner, branch],
+            lambda: self.reader.pulls(
+                self.repository, ["number", "headRefName", "headRepositoryOwner"], state="open", head=branch
+            ),
+            fresh=True,
+            cacheable=False,
+        )
+        matches = [
+            row["number"]
+            for row in rows or []
+            if row.get("headRefName") == branch
+            and (row.get("headRepositoryOwner") or {}).get("login", "").casefold() == owner.casefold()
+        ]
+        return matches[0] if len(matches) == 1 else None
+
     def commit_status(self, sha, context):
-        # Source statuses remain observations. Stage 1C supplies execution authority.
+        # Native source statuses do not grant execution authority.
         return ""
 
     def rebase_requested(self, pr, head):

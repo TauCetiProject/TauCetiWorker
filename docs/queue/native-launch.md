@@ -30,14 +30,16 @@ The profile is one JSON object with exactly these fields:
 | `project_configuration_sha256` | SHA-256 of those exact project bytes |
 | `execution_policy` | Approved `ExecutionPolicy.record(with_config=False)` object |
 | `workflow_revision` | Immutable GitHub execution caller commit, 40 hex characters |
-| `publishers` | Object with `generation`, `reviews`, `statuses`, and `recoveries` |
+| `publishers` | Object with `recoveries` |
 | `control_policy_file` | Absolute path to the existing source-bound control policy |
 | `source_credentials` | Object with `origin`, `api_token_file`, and `git_token_file` |
 | `source_webhook_secret_file` | Absolute path to the separate Forgejo webhook secret |
 
-`publishers.generation` is the approved fresh 32-hex authority generation. Its
-three roles are nonempty arrays of source-local numeric user IDs, with no
-duplicates. `source_credentials.origin` has exactly `kind` and `url`; it must match
+`publishers.recoveries` is a nonempty array of source-local numeric user IDs,
+with no duplicates: the controller's own source account, whose recovery holds
+count as the GitHub bot logins' do. Scoreboards and commit statuses need no
+enrollment; they count as on GitHub, and older profiles' `generation`, `reviews` and `statuses`
+keys are ignored. `source_credentials.origin` has exactly `kind` and `url`; it must match
 the independently approved policy before token files are read. Source API/Git
 tokens and webhook secrets are visible ASCII; the webhook secret has at least
 32 characters. Credentials never appear in command arguments or status.

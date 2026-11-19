@@ -63,7 +63,7 @@ class BudgetTests(unittest.TestCase):
         self.budget.settle("calibration", 10)
         self.budget.configure(set_grant=0)
         self.assertFalse(self.budget.admit("wait", "first", "opus", "fix")["allowed"])
-        self.budget.configure(set_grant=100)
+        self.budget.configure(set_grant=15)
         self.assertEqual(
             admission_pause(self.budget.snapshot(worker="w", model="opus"), worker="w", model="opus", now=self.now),
             "waiting behind another worker",
@@ -77,6 +77,21 @@ class BudgetTests(unittest.TestCase):
         self.assertIsNone(
             admission_pause(self.budget.snapshot(worker="w", model="opus"), worker="w", model="opus", now=self.now)
         )
+
+    def test_funded_waiters_do_not_serialize_the_fleet_behind_preparation(self):
+        self.budget.configure(grant=100)
+        self.budget.admit("seed", "seed", "opus", "fix")
+        self.budget.settle("seed", 10)
+        self.budget.configure(set_grant=0)
+        self.budget.admit("old-wait", "old", "opus", "fix")
+        self.now += 1
+        self.budget.admit("new-wait", "new", "opus", "fix")
+        self.budget.configure(set_grant=30)
+        snapshot = self.budget.snapshot(worker="new", model="opus")
+        self.assertIsNone(admission_pause(snapshot, worker="new", model="opus", now=self.now))
+        self.assertTrue(self.budget.admit("new-run", "new", "opus", "fix")["allowed"])
+        self.assertTrue(self.budget.admit("old-run", "old", "opus", "fix")["allowed"])
+        self.assertEqual(len(self.budget.snapshot()["active_sessions"]), 2)
 
     def test_preflight_ignores_orphaned_calibration_bridge_and_admission_recovers_it(self):
         self.budget.configure(grant=100)

@@ -3,6 +3,7 @@ behind a short-TTL cache, with the predicates the cascade gates on."""
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
@@ -19,9 +20,9 @@ if TYPE_CHECKING:  # annotation only; survey is a higher layer
     from .survey import Counters
 
 from .config import Config
-from .constants import COMMENTS_MEMO_S, SBCACHE_BACKSTOP_S, SBCACHE_TTL
+from .constants import COMMENTS_MEMO_S, SBCACHE_BACKSTOP_S, SBCACHE_TTL, SOURCE_FACTS_TTL
 from .github import GitHub
-from .github_transport import cache_hit, invalidate, read_context
+from .github_transport import CacheOnlyMiss, cache_hit, invalidate, read_context
 from .survey_facts import newest_contest, scoreboard
 
 # ============================================================================
@@ -42,10 +43,48 @@ class Meta:
     # "stale"       — a fetch failed and a prior value was served instead
     # "missing"     — a successful read found no scoreboard
     # "fetch_failed"— a fetch failed with nothing cached to fall back on
+    # "deferred"    — a budgeted survey had no cached observation and no detail read left: unknown
     # Only `fresh` may authorize a mutation. `assumed` is deliberately NOT `fresh`: the `updatedAt`
     # rule cannot see a DELETED comment, so a board that was deleted or forged could be served under
     # it for up to the backstop. Triage tolerates that; spending money on it does not.
     provenance: str
+
+
+class _Deferred(Exception):
+    """A budgeted survey may not spend a remote read on this PR."""
+
+
+class DetailBudget:
+    """The remote review-state reads one survey may spend, by PR.
+
+    Reads are admitted in the order PRs are asked about, so the caller asks in rank order and then
+    closes the budget. A PR already admitted may finish its reads (scoreboard, then contest thread);
+    every other PR answers from a current cached observation or is deferred. Forced reads, which
+    dispatch uses before acting, are never budgeted.
+    """
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.read: set[int] = set()
+        self.deferred: set[int] = set()
+        self.open = True
+        self.meta: dict[int, tuple[str, Meta]] = {}
+
+    def allow(self, pr: int) -> bool:
+        if pr in self.read:
+            return True
+        if self.open and len(self.read) < self.limit:
+            self.read.add(pr)
+            return True
+        self.deferred.add(pr)
+        return False
+
+    @property
+    def exhausted(self) -> bool:
+        return not self.open or len(self.read) >= self.limit
+
+    def close(self) -> None:
+        self.open = False
 
 
 class ReviewState:
@@ -63,6 +102,30 @@ class ReviewState:
         self._comments: dict[int, tuple[float, list[dict] | None, bool]] = {}
         self._observed: dict[int, str] = {}
         self._survey_facts: dict[int, dict] = {}
+        self._budget: DetailBudget | None = None
+
+    @contextlib.contextmanager
+    def detail_budget(self, limit: int):
+        """Bound this survey pass's remote per-PR reads; see DetailBudget."""
+        budget = DetailBudget(limit)
+        previous, self._budget = self._budget, budget
+        try:
+            yield budget
+        finally:
+            self._budget = previous
+
+    def _budgeted(self, pr: int, read, force: bool):
+        """Run `read` from cache only unless this PR may spend a remote read; _Deferred otherwise."""
+        budget = None if force else self._budget
+        if budget is None or pr in budget.read:
+            return read()
+        try:
+            with read_context(cache_only=True):
+                return read()
+        except CacheOnlyMiss:
+            if not budget.allow(pr):
+                raise _Deferred from None
+        return read()
 
     def seed_survey(self, rows=()):
         """Facts last only for this pass. Force reads and post-write busts bypass them."""
@@ -86,7 +149,13 @@ class ReviewState:
         left the open list must go back to being unobserved rather than keep an answer from a previous
         pass. An empty `updated_at` is not recorded — "no clock" has to read as "cannot tell", which
         falls back to the plain TTL, not as a key that might match another blank."""
-        seen = {p.number: p.updated_at for p in prs if getattr(p, "updated_at", "")}
+        # A native source also keys on the head: its clock is the only freshness evidence, and a
+        # push that left it unmoved must still not reuse the previous head's review state.
+        seen = {
+            p.number: f"{p.updated_at}|{getattr(p, 'head_oid', '')}" if self._direct_source else p.updated_at
+            for p in prs
+            if getattr(p, "updated_at", "")
+        }
         # Drop memoized comments for any PR whose clock moved. The memo exists to coalesce the two
         # readers inside ONE pass; carried across a change it would hand a stale response to the fetch
         # that a moved clock just forced, and that response would then be written under the NEW key and
@@ -132,7 +201,7 @@ class ReviewState:
         if not isinstance(sc, dict) or sc.get("updated_at") != key:
             return None
         fetched = sc.get("fetched_at")
-        backstop = min(SBCACHE_BACKSTOP_S, self.gh.ttl) if self._direct_source else SBCACHE_BACKSTOP_S
+        backstop = SOURCE_FACTS_TTL if self._direct_source else SBCACHE_BACKSTOP_S
         if not isinstance(fetched, (int, float)) or not 0 <= time.time() - fetched < backstop:
             return None  # also rejects a future timestamp: a clock we cannot place is not a fresh one
         return sc if not self._direct_source or self.gh.binding_current() else None
@@ -165,7 +234,8 @@ class ReviewState:
         if self._direct_source:
             from .forgejo_reads import prune_state_cache
 
-            prune_state_cache(self.sbcache.parent)
+            # Three small files per open PR; stay above the live set so a pass does not evict itself.
+            prune_state_cache(self.sbcache.parent, max_files=8192, max_bytes=64 * 1024 * 1024)
 
     def _write_source_cache(self, path, value, *, prune=True, observed_at=None):
         """Private atomic source cache writes, without following a target symlink."""
@@ -226,6 +296,22 @@ class ReviewState:
         return Meta(data, provenance)
 
     def gh_meta(self, pr: int, *, force: bool = False) -> Meta:
+        budget = self._budget
+        if budget is None:
+            return self._gh_meta(pr, force=force)
+        key = self._observed.get(pr, "")
+        if force:
+            budget.meta.pop(pr, None)
+            return self._gh_meta(pr, force=True)
+        # One answer per PR per budgeted pass: the clean-head and blocking predicates each re-ask.
+        memo = budget.meta.get(pr)
+        if memo is not None and memo[0] == key:
+            return memo[1]
+        meta = self._gh_meta(pr)
+        budget.meta[pr] = (key, meta)
+        return meta
+
+    def _gh_meta(self, pr: int, *, force: bool = False) -> Meta:
         """Newest scoreboard's <!--tauceti-meta:v1 {...}--> JSON, identified by the <!--tauceti-scoreboard-->
         marker, with TTL cache.
 
@@ -271,7 +357,10 @@ class ReviewState:
             if age < ttl and cached is not None and (not self._direct_source or age >= 0):
                 return self._meta(cached, "assumed")
 
-        comments, reused = self._issue_comments(pr, force=force)
+        try:
+            comments, reused = self._budgeted(pr, lambda: self._issue_comments(pr, force=force), force)
+        except _Deferred:
+            return self._meta({}, "deferred")
         fetch_failed = comments is None
         # Source timestamps are normalized to fixed-width UTC by the adapter.
         # Stable timestamp sorting in the reducer then breaks ties by native ID.
@@ -343,6 +432,8 @@ class ReviewState:
         self._contest_path(pr).unlink(missing_ok=True)
         self._comments.pop(pr, None)
         self._survey_facts.pop(pr, None)
+        if self._budget is not None:
+            self._budget.meta.pop(pr, None)
 
     # --- predicates over the meta (the cascade's clean-head / blocking rules) ---
     def ledger_clean_head(self, pr: int) -> str:
@@ -396,12 +487,27 @@ class ReviewState:
         sc = None if force else self._sidecar(self._contest_path(pr), pr)
         if sc is not None and "contest" in sc:
             return sc["contest"]
-        with read_context(fresh=force, revision=self._observed.get(pr, "")):
-            rcs = self.gh.review_comments(pr)
+
+        started = time.time()
+
+        def read():
+            with read_context(fresh=force, revision=self._observed.get(pr, "")):
+                return self.gh.review_comments(pr), cache_hit()
+
+        try:
+            rcs, reused = self._budgeted(pr, read, force)
+        except _Deferred:
+            return None  # unread this survey; dispatch re-reads contests for the PR it selects
         if rcs is None:
             return None  # a fetch FAILURE answers nothing and must not be cached as "no contest"
         best = self._newest_contest(rcs)
-        self._write_sidecar(self._contest_path(pr), pr, {"status": "present" if best else "missing", "contest": best})
+        if not (self._direct_source and reused):  # as for scoreboards: do not reset a reused observation's age
+            self._write_sidecar(
+                self._contest_path(pr),
+                pr,
+                {"status": "present" if best else "missing", "contest": best},
+                observed_at=started if self._direct_source else None,
+            )
         return best
 
     @staticmethod

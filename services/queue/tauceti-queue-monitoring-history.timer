@@ -1,0 +1,14 @@
+# Hourly run of tauceti-queue-monitoring-history.service (docs/queue/monitoring.md).
+
+[Unit]
+Description=Refresh the Tau Ceti queue public history report
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+RandomizedDelaySec=30
+Persistent=true
+Unit=tauceti-queue-monitoring-history.service
+
+[Install]
+WantedBy=timers.target

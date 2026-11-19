@@ -14,15 +14,18 @@ from urllib.parse import urlsplit
 from tauceti_tools.forge import ForgeError, Unsupported
 
 
-def execute(args, source):
+def execute(args, source, *, cwd=None):
     env = dict(
         os.environ,
         TAUCETI_SOURCE_BINDING=json.dumps(source.identity.record()),
         TAUCETI_FORGEJO_TOKEN_FILE=str(source.token_file),
         TAUCETI_FORGEJO_ORIGIN=source.repository.forge.url,
     )
+    # -P: the working directory may be an untrusted PR checkout, which must
+    # never shadow this runtime's own modules on sys.path.
     return subprocess.run(
-        [sys.executable, "-m", "tauceti_worker.source_cli", *args],
+        [sys.executable, "-P", "-m", "tauceti_worker.source_cli", *args],
+        cwd=cwd,
         env=env,
         capture_output=True,
         text=True,
@@ -33,8 +36,7 @@ def execute(args, source):
 def load_source():
     from tauceti_tools.ci_candidate import RepositoryIdentity
     from tauceti_tools.forge import Forgejo
-
-    from tauceti_queue.control_policy_file import read_control_policy
+    from tauceti_tools.git_credentials import read_private_token
 
     from .forgejo_worker import ForgejoWorkerSource
 
@@ -42,7 +44,7 @@ def load_source():
     if identity.repository.forge.url != os.environ["TAUCETI_FORGEJO_ORIGIN"]:
         raise ValueError("Forgejo credential origin differs from the selected source")
     path = Path(os.environ["TAUCETI_FORGEJO_TOKEN_FILE"])
-    token = read_control_policy(path).decode("ascii").strip()
+    token = read_private_token(path)
     source = ForgejoWorkerSource(identity, Forgejo(identity.repository.forge, token=token), token_file=path)
     source.validate_binding()
     expected = os.environ.get("TAUCETI_FORGEJO_USER_ID")
@@ -57,6 +59,7 @@ def checkout(args, source):
     parser = argparse.ArgumentParser(prog="gh pr checkout")
     parser.add_argument("number", type=int)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--branch", "-b")
     parser.add_argument("--repo", "-R")
     opts = parser.parse_args(args)
     if opts.repo and opts.repo not in (
@@ -70,12 +73,16 @@ def checkout(args, source):
     from tauceti_tools.forge import RepositoryRef
 
     repository = RepositoryRef(source.repository.forge, head["repo"]["full_name"])
-    sha, branch = head["sha"], head["ref"]
+    sha, remote_branch = head["sha"], head["ref"]
+
+    # Round worktrees share one repository, so each worker names its own local branch.
+    branch = opts.branch if opts.branch is not None else remote_branch
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise ValueError("PR checkout requires an exact commit")
-    subprocess.run(["git", "check-ref-format", "--branch", branch], check=True, capture_output=True)
+    for name in {remote_branch, branch}:
+        subprocess.run(["git", "check-ref-format", "--branch", name], check=True, capture_output=True)
     subprocess.run(
-        ["git", "fetch", "--no-tags", repository.clone_url, "refs/heads/" + branch],
+        ["git", "fetch", "--no-tags", repository.clone_url, "refs/heads/" + remote_branch],
         check=True,
         capture_output=True,
         timeout=60,
@@ -89,7 +96,7 @@ def checkout(args, source):
     subprocess.run(command, check=True, capture_output=True)
     # gh checkout normally establishes the PR branch's tracking destination.
     subprocess.run(["git", "config", "branch." + branch + ".remote", repository.clone_url], check=True)
-    subprocess.run(["git", "config", "branch." + branch + ".merge", "refs/heads/" + branch], check=True)
+    subprocess.run(["git", "config", "branch." + branch + ".merge", "refs/heads/" + remote_branch], check=True)
     return 0
 
 

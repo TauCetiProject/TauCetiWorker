@@ -114,6 +114,10 @@ class WebhookReceiver:
             self.ignored += 1
             return "ignored"
         admission = getattr(self.controller, "admission", None)
+        record = getattr(admission, "evidence_event", None)
+        if callable(record):
+            # Before the relevance filter: the cache counts every comment and keeps every label set.
+            record(delivery.event, payload)
         if admission is not None and self._irrelevant_primary(delivery):
             self.ignored += 1
             return "ignored"

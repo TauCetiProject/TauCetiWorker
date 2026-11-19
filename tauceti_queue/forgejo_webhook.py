@@ -102,7 +102,7 @@ class ForgejoWebhookReceiver:
                 own_output = controller_actor is not None and str(sender_id) == controller_actor.principal.native_id
                 comment_event = event in {"issue_comment", "pull_request_comment"} and "comment" in payload
                 action = payload.get("action")
-                # Native review votes/threads are not the authenticated scoreboard
+                # Native review votes/threads are not the scoreboard
                 # evidence consumed by this policy. Social metadata cannot change
                 # admission either, and must not cancel an in-flight evaluation.
                 if (
@@ -135,23 +135,12 @@ class ForgejoWebhookReceiver:
                     previous = (changes.get("body") or {}).get("from") or ""
                     if (
                         action != "deleted"
-                        and not relevant_comment(comment)
-                        and not relevant_comment({"body": previous})
+                        and not relevant_comment(comment, native=True)
+                        and not relevant_comment({"body": previous}, native=True)
                     ):
                         self.ignored += 1
                         return "ignored"
-                    config = getattr(getattr(self.controller.source, "admission_policy", None), "publishers", None)
-                    publishers = set() if config is None else config.reviews | config.recoveries
-                    author = comment.get("user") or {}
-                    if not isinstance(author, dict):
-                        raise ValueError("native comment author is malformed")
-                    author_id = author.get("id")
-                    published = type(author_id) is int and any(str(author_id) == p.native_id for p in publishers)
-                    if not published and type(author_id) is int and author_id > 0:
-                        self.ignored += 1
-                        return "ignored"
-                    # Moderation of a publisher's row is urgent irrespective of
-                    # who edited/deleted it. Unknown/deleted authors fail closed.
+                    # Any author's scoreboard counts, as on GitHub.
                     poller.invalidate(number, head=head, urgent=True)
                 else:
                     if action == "edited" and payload.get("changes") and set(payload["changes"]) <= {"title"}:

@@ -52,6 +52,16 @@ class History(unittest.TestCase):
             ["not_yet_observable", "requires_attribution_and_comment_audit"],
         )
 
+    def test_native_forge_landings_count_apart_from_the_same_github_number(self):
+        value = snapshot()
+        forgejo = {"kind": "forgejo", "url": "https://git.example"}
+        native = {"__tauceti_queue_pull__": {"forge": forgejo, "id": 1, "name": PROJECT}, "number": 9}
+        for event in value["tables"]["journal"]:
+            if event["kind"] == "landed":
+                event["detail"]["members"] = [9, 10, native]
+        report = prepare(value, {"landed_prs_per_hour": 1}, load_reporter())
+        self.assertEqual(report["windows"][0]["summary"]["landed_prs"], 3)
+
     def test_unattributed_legacy_snapshot_fails_closed(self):
         value = snapshot()
         del value["tables"]["batches"][0]["repository"]
