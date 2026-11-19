@@ -602,7 +602,7 @@ class AdmissionPoller:
         self.state.attempted(work)
         try:
             client = getattr(self.adapter, "client", None)
-            revocation = bool(
+            revocation = bool(work.get("emergency")) or bool(
                 work["urgent"]
                 and self.controller.store.row(
                     "inputs", {"repository": self.repo, "number": work["number"], "state": ["waiting", "reserved"]}

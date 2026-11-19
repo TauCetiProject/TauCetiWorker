@@ -301,11 +301,30 @@ class StorageAndAuthority(unittest.TestCase):
         credentials = github_app.AppCredentials(1, "app", 2, b"key", b"")
         with patch.object(github_app, "load_execution_credentials", return_value=credentials) as load:
             tokens = wb.app_tokens(Path("/credentials"), 12)
-        load.assert_called_once_with(Path("/credentials"))
+        load.assert_called_once_with(Path("/credentials"), systemd_credentials=False)
         self.assertEqual((tokens.repository_id, tokens.permissions), (12, wb.APP_PERMISSIONS))
         with patch.object(github_app, "load_execution_credentials", side_effect=FileNotFoundError("secret path")):
             with self.assertRaisesRegex(wb.ObservationError, "^GitHub App credentials unavailable: FileNotFoundError$"):
                 wb.app_tokens(Path("/credentials"), None)
+
+    def test_only_the_systemd_credentials_directory_skips_the_ancestor_walk(self):
+        from tauceti_queue import github_app
+
+        credentials = github_app.AppCredentials(1, "app", 2, b"key", b"")
+        for directory, expected in (("/run/credentials/unit", True), ("/home/user/.config/app", False)):
+            with (
+                self.subTest(directory=directory),
+                patch.dict(wb.os.environ, {"CREDENTIALS_DIRECTORY": "/run/credentials/unit"}),
+                patch.object(github_app, "load_execution_credentials", return_value=credentials) as load,
+            ):
+                wb.app_tokens(Path(directory), None)
+            load.assert_called_once_with(Path(directory), systemd_credentials=expected)
+        with (
+            patch.dict(wb.os.environ, {}, clear=True),
+            patch.object(github_app, "load_execution_credentials", return_value=credentials) as load,
+        ):
+            wb.app_tokens(Path("/run/credentials/unit"), None)
+        load.assert_called_once_with(Path("/run/credentials/unit"), systemd_credentials=False)
 
     def test_main_loads_app_credentials_after_state(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -101,7 +101,7 @@ from .runtime_status import report_failure, report_runtime
 from .survey import Counters, survey
 from .tui import cmd_tui, render_survey
 from .usage import kiro_data_dir, usage_snapshot
-from .work_units import RoundOpts, Worker, _bubble, raise_on_account_mismatch, run_round, want
+from .work_units import RoundOpts, Worker, _bubble, model_free_selection, raise_on_account_mismatch, run_round, want
 from .worker_manager import WorkersError, add_workers_parser, cmd_managed_runner, cmd_workers
 
 # ============================================================================
@@ -921,6 +921,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_workers_parser(sub)
     add_budget_parser(sub)
     sub.add_parser("_fleet-protocol", help=argparse.SUPPRESS)
+    target_info = sub.add_parser("_targets-inspect", help=argparse.SUPPRESS)
+    target_info.add_argument("--file", type=Path, required=True)
 
     # Hidden internal subcommands.
     r = sub.add_parser("_round", add_help=False)
@@ -974,6 +976,11 @@ def main(argv: list[str] | None = None) -> int:
     selected_conf, remaining = conf_argument(list(sys.argv[1:] if argv is None else argv))
     args = parser.parse_args(remaining)
     cmd = args.cmd
+    if cmd == "_targets-inspect":
+        from .targets import describe_targets, load_targets
+
+        print(json.dumps(describe_targets(load_targets(args.file)), ensure_ascii=False))
+        return 0
     if cmd in (None, "work", "_round", "status"):
         from .worker_sources import configure
 
@@ -1037,6 +1044,7 @@ def main(argv: list[str] | None = None) -> int:
                     "activity": 1,
                     "roadmap_focus": 1,
                     "roadmap_targets": 1,
+                    "targets_inspect": 1,
                     "self_tested": 1,
                     "source_selection": 1,
                     "graceful_restart": 1,
@@ -1319,6 +1327,24 @@ def cmd_status(args) -> int:
     return 1 if sv.github_failed else 0
 
 
+def round_work_model(cfg, only, agent, *, dry, ignore_quota, quota_cmd, fresh, already_paced) -> str:
+    """The provider a round's work runs with: `agent` itself when the selection starts no agent
+    (`model_free_selection`), Claude in API billing mode, otherwise the paced choice."""
+    if model_free_selection(only):
+        return agent
+    if api_mode():
+        return "claude"
+    return resolve_work_model(
+        cfg,
+        agent,
+        dry=dry,
+        ignore_quota=ignore_quota,
+        quota_cmd=quota_cmd,
+        fresh=fresh,
+        **({"already_paced": True} if already_paced else {}),
+    )
+
+
 def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[int, ...] = ()) -> int:
     if "security-audit" in only:
         from .security_audit import require_admin
@@ -1554,18 +1580,16 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         # A `_round` child is spawned by a loop driver that forced a usage read moments ago, so it may
         # use that. A one-shot `tauceti work` has nothing recent behind it and must look for itself,
         # rather than refuse the round on a cached verdict that may be an hour old.
-        if api_mode():
-            work_model = "claude"
-        else:
-            work_model = resolve_work_model(
-                cfg,
-                agent,
-                dry=dry,
-                ignore_quota=ignore_quota,
-                quota_cmd=quota_cmd,
-                fresh=not one_round,
-                **({"already_paced": True} if one_round and getattr(args, "loop_paced", False) else {}),
-            )
+        work_model = round_work_model(
+            cfg,
+            only,
+            agent,
+            dry=dry,
+            ignore_quota=ignore_quota,
+            quota_cmd=quota_cmd,
+            fresh=not one_round,
+            already_paced=one_round and getattr(args, "loop_paced", False),
+        )
         authoring_profile = None
         if work_model != "auto":
             authoring_profile = resolve_authoring_profile(
@@ -1869,6 +1893,17 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
 
 def cli_main() -> int:
     """Console-script entry point (also used by ./tauceti). Maps the worker's exceptions to exit codes."""
+    from tauceti_tools.project import conf_argument
+
+    _, arguments = conf_argument(sys.argv[1:])
+    if arguments[:1] == ["_targets-inspect"]:
+        # Fleet's offline parser must not repair installed scripts or write failure/runtime
+        # records merely because an operator is validating a proposed list.
+        try:
+            return main() or 0
+        except Die as error:
+            print(f"tauceti: {error}", file=sys.stderr)
+            return 2
     # A service has no login shell to provide NIX_SSL_CERT_FILE, and uv's standalone CPython may not
     # know the host's CA-bundle path. Repair the process environment before quota telemetry and child
     # launches; this also gives other TLS-using subprocesses the same host trust store.

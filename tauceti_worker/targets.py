@@ -48,11 +48,20 @@ _AREA_RE = re.compile(r"[A-Za-z0-9_-]+")
 _HEADING_RE = re.compile(r"^##\s+(.*?)\s*$")
 _ITEM_RE = re.compile(r"^\s*-\s*\[([ xX~])\]\s*(.*?)\s*$")
 _SLUG_RE = re.compile(r"`([^`]+)`")
+_VALID_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _META_RE = re.compile(r"\(([^()]*)\)\s*$")
 _STATUS = {" ": "open", "~": "inflight", "x": "done", "X": "done"}
 _BOX = {"open": "[ ]", "inflight": "[~]", "done": "[x]"}
 
 Key = tuple[str, str]  # (area, slug): what a pull request's target marker names
+
+
+class MergedPRs(list):
+    """A merged-PR listing with explicit coverage before merged-state filtering."""
+
+    def __init__(self, rows=(), *, complete=False):
+        super().__init__(rows)
+        self.complete = complete
 
 
 @dataclass(frozen=True)
@@ -86,6 +95,7 @@ def _parse_item(line: str, area: str) -> TargetItem | None:
     sep = re.match(r"\s*[—–-]\s+", text)
     text = text[sep.end() :] if sep else text.strip()
     needs: tuple[str, ...] = ()
+    saw_needs = False
     meta = []
     clauses = _META_RE.search(text)
     if clauses:
@@ -94,14 +104,23 @@ def _parse_item(line: str, area: str) -> TargetItem | None:
             key, _, value = clause.partition(":")
             if key.strip().lower() != "needs":
                 meta.append(clause)
-            elif value.strip().lower() != "none":
-                needs = tuple(s.strip().strip("`").strip() for s in value.split(",") if s.strip("` \t"))
+            else:
+                if saw_needs or not value.strip():
+                    return None
+                saw_needs = True
+                if value.strip().lower() != "none":
+                    needs = tuple(s.strip().strip("`").strip() for s in value.split(",") if s.strip("` \t"))
+                    if not needs:
+                        return None
     return TargetItem(area, slug.group(1).strip(), _STATUS[m.group(1)], text, needs, tuple(meta))
 
 
 def parse_targets(text: str) -> Targets:
-    """Parse a target list. Die when the `tauceti-targets:v1` marker is missing; an item line that
-    does not parse, or a `needs:` slug the file never defines, is logged and otherwise ignored."""
+    """Parse and validate a target list before any task can be selected.
+
+    IDs are unique across areas; unknown prerequisites and dependency cycles are errors rather
+    than permission to author work whose prerequisites cannot be established.
+    """
     if not MARKER_RE.search(text):
         raise Die("the file lacks the `<!-- tauceti-targets:v1 -->` marker, so it is not a target list")
     preamble: list[str] = []
@@ -127,10 +146,32 @@ def parse_targets(text: str) -> Targets:
                 areas[area].append(item)
     targets = Targets("\n".join(preamble).strip(), areas)
     if bad:
-        log(f"target list: ignoring {len(bad)} malformed item line(s), first at line {bad[0]}")
-    undefined = {s for it in targets.items() for s in it.needs} - {it.slug for it in targets.items()}
+        raise Die(f"target list: {len(bad)} malformed item line(s), first at line {bad[0]}")
+    by_slug = {}
+    for item in targets.items():
+        if not _VALID_SLUG_RE.fullmatch(item.slug) or ".." in item.slug or item.slug.endswith((".", ".lock")):
+            raise Die(f"target list: invalid slug {item.slug!r}")
+        if item.slug in by_slug:
+            raise Die(f"target list: duplicate slug {item.slug!r}; slugs must be unique across areas")
+        by_slug[item.slug] = item
+    undefined = {s for it in targets.items() for s in it.needs} - by_slug.keys()
     if undefined:
-        log(f"target list: `needs:` names undefined slug(s), which block nothing: {', '.join(sorted(undefined))}")
+        raise Die(f"target list: `needs:` names undefined slug(s): {', '.join(sorted(undefined))}")
+    # An iterative traversal also accepts large, valid lists without Python recursion limits.
+    remaining = {slug: len(set(it.needs)) for slug, it in by_slug.items()}
+    dependents: dict[str, list[str]] = {slug: [] for slug in by_slug}
+    for slug, item in by_slug.items():
+        for dep in set(item.needs):
+            dependents[dep].append(slug)
+    ready = [slug for slug, count in remaining.items() if count == 0]
+    for slug in ready:
+        for child in dependents[slug]:
+            remaining[child] -= 1
+            if remaining[child] == 0:
+                ready.append(child)
+    cyclic = [slug for slug, count in remaining.items() if count]
+    if cyclic:
+        raise Die(f"target list: dependency cycle blocks: {', '.join(cyclic)}")
     return targets
 
 
@@ -190,7 +231,7 @@ def inflight_ref(item: TargetItem) -> str | None:
     URL of a Forgejo one."""
     for clause in item.meta:
         key, _, value = clause.partition(":")
-        found = re.search(r"https?://[^\s,;]+|#\d+", value)
+        found = re.search(r"https?://[^\s,;]+|#\d+", value, re.I)
         if key.strip().lower() == "in flight" and found:
             return found.group(0)
     return None
@@ -240,6 +281,8 @@ def landed(items: Iterable[TargetItem], merged: Iterable[dict]) -> dict[Key, int
     done: dict[Key, int] = {}
     base = content_base()
     for d in merged:
+        if d.get("state") == "CLOSED":
+            continue  # An editable title alone is never evidence of completion.
         if d.get("baseRefName") != base:
             continue
         keys, partial = marker_keys(d.get("body"))
@@ -253,21 +296,58 @@ def landed(items: Iterable[TargetItem], merged: Iterable[dict]) -> dict[Key, int
     return done
 
 
+def verified_landings(items: Iterable[TargetItem], rows: Iterable[dict], source) -> dict[Key, int]:
+    """Verify queue closures only when they could complete one of these targets.
+
+    Recent history contains markers for unrelated roadmap work too. Fetching proof for every
+    row would turn one bounded listing into hundreds of unnecessary authenticated reads.
+    """
+    items = list(items)
+    by_key = {(it.area, it.slug): it for it in items if it.status != "done"}
+    verified = []
+    for row in rows:
+        if row.get("state") != "CLOSED":
+            verified.append(row)
+            continue
+        relevant = [by_key[key] for key in marker_keys(row.get("body"))[0] if key in by_key]
+        promoted = {**row, "state": "MERGED"}
+        if not relevant or not landed(relevant, [promoted]):
+            continue
+        verifier = getattr(source, "target_queue_landed", None)
+        if verifier is not None and verifier(row.get("number"), content_base()):
+            verified.append(promoted)
+    return landed(items, verified)
+
+
 def live_targets(targets: Targets, gh, others: Iterable = ()) -> Targets:
     """`overlay_live` from the pull requests of `gh` and of each source in `others` (GitHub or
     Forgejo): an open one whose marker names an item puts it in flight, a merged one that completes
-    it (`landed`) makes it done. The merged side sees each source's MERGED_LIMIT most recent closed
-    pull requests that carry a marker. Raises GitHubError or SourceUnavailable when a listing fails."""
+    it (`landed`) makes it done. Missing prerequisite completions are also searched by item, so an
+    old landing still unlocks its children after it leaves the recent listing. Raises GitHubError
+    or SourceUnavailable when a required source read fails."""
     inflight: set[Key] = set()
     done: set[Key] = set()
-    for source in (gh, *others):
+    sources = (gh, *others)
+    incomplete = []
+    for source in sources:
         rows = source.open_prs()
         if rows is None:
             raise SourceUnavailable("open pull requests are unavailable for the target list")
         for d in rows:
             inflight |= marker_keys(d.get("body"))[0]
         recent = source.merged_prs(f"{MERGED_SEARCH} base:{content_base()} sort:updated-desc", limit=MERGED_LIMIT)
-        done |= set(landed(targets.items(), recent))
+        done |= set(verified_landings(targets.items(), recent, source))
+        if not getattr(recent, "complete", False):
+            incomplete.append(source)
+    # Resolve dependencies BEFORE eligibility, rather than only searching already eligible
+    # candidates. Otherwise an old completed parent stays open and its children remain blocked.
+    live = overlay_live(targets, inflight, done)
+    needed = {slug for item in live.items() if item.status == "open" for slug in item.needs}
+    for item in targets.items():
+        key = (item.area, item.slug)
+        if item.slug in needed and item.status != "done" and key not in done:
+            if any(landed_pr(item, source) is not None for source in incomplete):
+                done.add(key)
     return overlay_live(targets, inflight, done)
 
 
@@ -355,7 +435,7 @@ class GitHubMarkerReads:
         self._rows: list[dict] | None = None
         self._items: dict[str, list[dict]] = {}
 
-    def _read(self, fetch) -> list[dict]:
+    def _read(self, fetch):
         from .config import GitHubUnavailable
         from .github import GitHubError
         from .worker_sources import shared_github_environment
@@ -381,21 +461,44 @@ class GitHubMarkerReads:
         term = '"' + _ID_TERM.format(ident) + ('" is:open' if state == "OPEN" else f'" base:{content_base()}')
         if term not in self._items:
             self._items[term] = self._read(lambda: self.gh.target_marker_prs(limit=30, search=term))
-        return [d for d in self._items[term] if d.get("state") == state and body_matches(d.get("body") or "", phrases)]
+        return [
+            d
+            for d in self._items[term]
+            if (
+                d.get("state") == state
+                or (
+                    state == "MERGED"
+                    and d.get("state") == "CLOSED"
+                    and str(d.get("title") or "").startswith("[Merged by Bors] - ")
+                )
+            )
+            and body_matches(d.get("body") or "", phrases)
+        ]
 
     def open_prs(self) -> list[dict]:
         return [d for d in self._listing() if d.get("state") == "OPEN"]
 
     def merged_prs(self, search: str, *, limit: int = MERGED_LIMIT) -> list[dict]:
         phrases = search_phrases(search)
-        rows = [d for d in self._listing() if d.get("state") == "MERGED"]
-        return [d for d in rows if body_matches(d.get("body") or "", phrases)][:limit]
+        rows = [
+            d
+            for d in self._listing()
+            if d.get("state") == "MERGED"
+            or (d.get("state") == "CLOSED" and str(d.get("title") or "").startswith("[Merged by Bors] - "))
+        ]
+        return MergedPRs(
+            [d for d in rows if body_matches(d.get("body") or "", phrases)][:limit],
+            complete=len(self._listing()) < MERGED_LIMIT,
+        )
 
     def merged_beyond_listing(self, search: str, *, limit: int) -> list[dict]:
         return self._beyond(search, "MERGED")[:limit]
 
     def open_beyond_listing(self, search: str) -> list[dict]:
         return self._beyond(search, "OPEN")
+
+    def target_queue_landed(self, number, branch):
+        return self._read(lambda: self.gh.target_queue_landed(number, branch))
 
 
 def _item_search(item: TargetItem) -> str:
@@ -407,10 +510,10 @@ def landed_pr(item: TargetItem, gh) -> int | None:
     among the closed pull requests that carry a marker, then, when that does not settle it and the
     source can look further (`merged_beyond_listing`), that. Raises GitHubError when it fails."""
     key, search = (item.area, item.slug), _item_search(item)
-    found = landed([item], gh.merged_prs(search, limit=30)).get(key)
+    found = verified_landings([item], gh.merged_prs(search, limit=30), gh).get(key)
     beyond = getattr(gh, "merged_beyond_listing", None)
     if found is None and beyond is not None:
-        found = landed([item], beyond(search, limit=30)).get(key)
+        found = verified_landings([item], beyond(search, limit=30), gh).get(key)
     return found
 
 
@@ -424,18 +527,46 @@ def open_pr(item: TargetItem, gh) -> int | None:
 
 
 def eligible_items(targets: Targets, area: str) -> list[TargetItem]:
-    """The area's open items whose every `needs` slug is done, in file order. A slug the file does
-    not define blocks nothing."""
+    """The area's open items whose every prerequisite is known and done, in file order."""
 
     def met(slug: str) -> bool:
         dep = targets.find(slug)
-        return dep is None or dep.status == "done"
+        return dep is not None and dep.status == "done"
 
     return [it for it in targets.areas.get(area, []) if it.status == "open" and all(map(met, it.needs))]
 
 
 def eligible_areas(targets: Targets) -> list[str]:
     return [a for a in targets.areas if eligible_items(targets, a)]
+
+
+def describe_targets(targets: Targets) -> dict:
+    """Offline, versioned parse/summary contract shared with Fleet; no forge or credential reads."""
+    items = list(targets.items())
+    eligible = {it.slug for area in targets.areas for it in eligible_items(targets, area)}
+    return {
+        "schema": "tauceti-target-list/v1",
+        "preamble": targets.preamble,
+        "areas": list(targets.areas),
+        "items": [
+            {
+                "area": it.area,
+                "slug": it.slug,
+                "status": it.status,
+                "text": it.text,
+                "needs": list(it.needs),
+                "meta": list(it.meta),
+            }
+            for it in items
+        ],
+        "summary": {
+            "total": len(items),
+            "done": sum(it.status == "done" for it in items),
+            "inflight": sum(it.status == "inflight" for it in items),
+            "eligible": len(eligible),
+            "blocked": sum(it.status == "open" and it.slug not in eligible for it in items),
+        },
+    }
 
 
 def candidates(targets: Targets, only: str, skip: Iterable[str]) -> list[TargetItem]:

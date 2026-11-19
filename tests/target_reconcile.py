@@ -273,6 +273,24 @@ class Publish(Tmp):
         self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", both)
         self.assertIn("- [x] `strong-law`", both)
 
+    def test_a_failed_commit_whose_hook_edited_the_same_line_is_retried(self):
+        first = self.clone("first")
+        hook = first.parent / ".git" / "hooks" / "pre-commit"
+        hook.write_text(
+            "#!/bin/sh\nsed 's/the strong law (/the strong law. (/' targets.md > t.tmp && mv t.tmp targets.md\nexit 1\n"
+        )
+        hook.chmod(0o755)
+        listed = t.parse_targets(EXAMPLE)
+        a = t.rewrite_item(EXAMPLE, listed.find("strong-law"), "done", add=("landed: #7",))
+        self.assertIsNone(reconcile.publish(first, EXAMPLE, a, ["n"]))
+        left = first.read_text()
+        self.assertIn("- [ ] `strong-law` — the strong law. (serves: G1; needs:", left)
+        self.assertNotIn("landed: #7", left)
+        hook.unlink()
+        again = t.rewrite_item(left, t.parse_targets(left).find("strong-law"), "done", add=("landed: #7",))
+        self.assertEqual(reconcile.publish(first, left, again, ["n"]), again)
+        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", again)
+
     def test_a_tracked_list_keeps_its_own_git_settings_inside_a_source_activation(self):
         from tauceti_worker.source_identity import SourceActor
         from tauceti_worker.worker_sources import activate
@@ -387,10 +405,26 @@ class Round(Tmp):
         self.assertEqual(self.reconcile(), (None, "the target list is current"))
         self.assertLessEqual(time.time() - self.w.counters.read(reconcile.ATTEMPT_KEY), 5)
 
-    def test_bors_landings_count_as_merged(self):
-        self.w.gh = self.github(states={1234: {"state": "CLOSED", "title": "[Merged by Bors] - Truncation bounds"}})
-        self.assertEqual(self.reconcile(), (0, ""))
-        self.assertIn("(needs: none; landed: #1234)", self.path.read_text())
+    def test_a_queue_title_counts_as_merged_only_with_the_sources_landing_proof(self):
+        queued = {"state": "CLOSED", "title": "[Merged by Bors] - Truncation bounds"}
+        claimed = [(8, marker("MeasureTheory", "kolmogorov-zero-one"))]
+        self.w.gh = self.github(states={1234: queued})
+        self.assertEqual(self.reconcile(), (None, "the target list is current"))
+        self.assertEqual(self.path.read_text(), EXAMPLE)
+        asked = []
+        for proof, item in ((False, "(needs: none; closed: #1234)"), (True, "(needs: none; landed: #1234)")):
+            self.path.write_text(EXAMPLE)
+            self.w.gh = self.github(states={1234: queued})
+            self.w.gh.merged_prs = lambda search, limit: [
+                {"number": n, "body": body, "baseRefName": "main", "state": "CLOSED", "title": queued["title"]}
+                for n, body in claimed
+            ]
+            self.w.gh.target_queue_landed = lambda number, branch, proof=proof: asked.append(number) or proof
+            self.assertEqual(self.reconcile(), (0, ""))
+            text = self.path.read_text()
+            self.assertIn(item, text)
+            self.assertEqual("landed: #8" in text, proof)
+        self.assertEqual(sorted(asked), [8, 8, 1234, 1234])
 
     def test_one_look_at_a_time_and_none_without_reads(self):
         lock = os.open(self.path.with_name(".targets.md.lock"), os.O_RDWR | os.O_CREAT)
@@ -567,10 +601,21 @@ class ForgejoLists(Tmp):
         url = self.repo.pull_url(12)
         self.path.write_text(EXAMPLE.replace("in flight: #1234", f"in flight: {url}"))
         self.states = {12: {"state": "CLOSED", "title": landed, "body": ""}}
-        self.assertEqual(self.reconcile(self.forgejo), (0, ""))
+        with patch.object(self.forgejo, "target_queue_landed", return_value=True, create=True) as proof:
+            self.assertEqual(self.reconcile(self.forgejo), (0, ""))
         text = self.path.read_text()
         self.assertIn(f"(needs: none; landed: {url})", text)
         self.assertIn(f"landed: {self.repo.pull_url(3)})", text)
+        self.assertEqual(sorted(call.args for call in proof.call_args_list), [(3, "main"), (12, "main")])
+
+    def test_an_in_flight_url_is_read_whatever_its_scheme_case_or_trailing_slash(self):
+        self.merged_rows = []
+        self.states = {12: {"state": "MERGED", "body": ""}}
+        url = self.repo.pull_url(12)
+        for written in ("HTTPS" + url[len("https") :], url + "/"):
+            self.path.write_text(EXAMPLE.replace("in flight: #1234", f"in flight: {written}"))
+            self.assertEqual(self.reconcile(self.forgejo)[0], 0, written)
+            self.assertIn(f"(needs: none; landed: {written})", self.path.read_text())
 
     def test_a_partial_url_with_an_uppercase_scheme_is_still_an_exclusion(self):
         self.merged_rows = []
@@ -732,6 +777,58 @@ class Wiring(Tmp):
             self.assertRaisesRegex(tc.Die, "needs a target list"),
         ):
             tc.cmd_work(args, only=["reconcile"], agent="claude", one_round=True)
+
+
+class ModelFree(Tmp):
+    """A reconciliation-only round needs no provider: none is chosen, paced or bridged."""
+
+    def test_dispatch_in_api_billing_mode_enters_no_model_bridge(self):
+        opts = work.RoundOpts(only=["reconcile"], agent="claude", work_model="claude", sandbox_host=True, dry_run=False)
+        cfg = SimpleNamespace(state=self.tmp, logdir=self.tmp / "logs", wid="worker3")
+        w = SimpleNamespace(cfg=cfg, counters=tc.Counters(cfg), gh=SimpleNamespace(repo="org/repo"))
+        with (
+            patch.dict(os.environ, {"TAUCETI_RUNTIME_STATUS": str(self.tmp / "status.json")}),
+            patch.object(work, "log"),
+            patch("tauceti_worker.claude_api.api_mode", return_value=True),
+            patch("tauceti_worker.claude_api.api_context", side_effect=AssertionError("no model bridge")),
+            patch.object(reconcile, "run", return_value=0) as run,
+        ):
+            self.assertEqual(
+                work.dispatch("reconcile", w, tc.Survey(worker_id="worker3"), tc.Candidate(0, "", ""), opts), 0
+            )
+        run.assert_called_once()
+
+    def test_a_one_shot_reconciliation_chooses_no_model(self):
+        cli = importlib.import_module("tauceti_worker.cli")
+        self.assertTrue(work.model_free_selection(["reconcile"]))
+        self.assertFalse(work.model_free_selection(["reconcile", "fix"]))
+        self.assertFalse(work.model_free_selection([]))
+        paced = dict(dry=False, ignore_quota=False, quota_cmd=None, fresh=True, already_paced=False)
+        with (
+            patch.object(cli, "resolve_work_model", side_effect=tc.NoProgress("no model under pace right now")),
+            patch.object(cli, "api_mode", return_value=False),
+        ):
+            self.assertEqual(cli.round_work_model(None, ["reconcile"], "claude", **paced), "claude")
+            with self.assertRaisesRegex(tc.NoProgress, "no model under pace"):
+                cli.round_work_model(None, ["reconcile", "fix"], "claude", **paced)
+
+    def test_a_reconciliation_loop_launches_without_a_model_under_pace(self):
+        loop = importlib.import_module("tauceti_worker.loop")
+        args = tc.build_parser().parse_args(["work", "--only", "reconcile", "--loop"])
+
+        def sleep(seconds):
+            raise KeyboardInterrupt
+
+        with (
+            patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://fixture.invalid"}),
+            patch.object(loop, "choose_model", side_effect=AssertionError("no provider is chosen")),
+            patch.object(loop, "github_budget", return_value={}),
+            patch.object(loop, "run_round_subprocess", return_value=0) as launched,
+            patch.object(loop, "report_runtime"),
+            patch.object(loop.time, "sleep", side_effect=sleep),
+        ):
+            loop.cmd_loop(args, SimpleNamespace(wid="fixture"), only=["reconcile"], agent="claude")
+        launched.assert_called()
 
 
 if __name__ == "__main__":

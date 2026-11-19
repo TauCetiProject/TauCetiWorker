@@ -45,7 +45,7 @@ from tauceti_tools.forge import GITHUB, RepositoryRef
 
 from .config import Die, SourceUnavailable, log, one_line, roadmap_targets
 from .constants import ROADMAP, ROADMAP_DIR, TAUCETI
-from .github import GitHubError, normalize_merged
+from .github import BORS_MERGED_PREFIX, GitHubError
 from .paths import HERE
 from .targets import (
     MERGED_SEARCH,
@@ -70,6 +70,7 @@ from .targets import (
     render_item,
     reopened,
     rewrite_item,
+    verified_landings,
 )
 
 GAP = int(os.environ.get("TAUCETI_RECONCILE_GAP", "21600"))
@@ -118,7 +119,7 @@ class Source:
         return self.repository.pull_url(number) if self.native else f"#{number}"
 
     def number(self, ref: str) -> int | None:
-        found = re.fullmatch(r"https?://\S*?(\d+)" if self.native else r"#(\d+)", ref)
+        found = re.fullmatch(r"https?://\S*?(\d+)/?" if self.native else r"#(\d+)", ref, re.I)
         if found is None or (self.native and ref_key(self.repository.pull_url(int(found.group(1)))) != ref_key(ref)):
             return None
         return int(found.group(1))
@@ -140,9 +141,23 @@ class Source:
     def merged_prs(self) -> list[dict]:
         return self._read("merged_prs", f"{MERGED_SEARCH} sort:updated-desc", limit=MERGED_LIMIT)
 
+    def target_queue_landed(self, number: int, branch: str) -> bool | None:
+        """The source's proof that the merge queue landed pull request `number` on `branch`; None
+        when the source has no such proof or could not read it."""
+        if getattr(self.reads, "target_queue_landed", None) is None:
+            return None
+        found = self._read("target_queue_landed", number, branch)
+        return found if isinstance(found, bool) else None
+
     def view(self, number: int) -> dict:
+        """The pull request's state, title, body and base. One closed under the queue's title is
+        MERGED only with the source's landing proof, CLOSED when the proof is refused, and unknown
+        (`{}`) when there is none."""
         row = self._read("pr_view", number, ["state", "title", "body", "baseRefName"]) or {}
-        return normalize_merged(row)
+        if row.get("state") == "CLOSED" and str(row.get("title") or "").startswith(BORS_MERGED_PREFIX):
+            proof = self.target_queue_landed(number, content_base())
+            return {} if proof is None else {**row, "state": "MERGED"} if proof else row
+        return row
 
 
 class _GitHubHistory(GitHubMarkerReads):
@@ -274,12 +289,19 @@ def apply(text: str, changes: Iterable[Change]) -> str:
 def observe(targets: Targets, read: list[Source], *, open_listing: bool = False) -> Seen:
     """Read what `settle` needs from each source: its merged pull requests that carry a marker, and
     one view per `in flight:` clause that names one of its pull requests; with `open_listing`, also
-    its open ones, which keep an item from inference. A clause naming a pull request of no source in
-    `read` is not looked at. Raises GitHubError or SourceUnavailable when a listing fails."""
+    its open ones, which keep an item from inference. A pull request closed under the queue's title
+    counts as merged only with its source's landing proof (`verified_landings`, `Source.view`). A
+    clause naming a pull request of no source in `read` is not looked at. Raises GitHubError or
+    SourceUnavailable when a listing fails."""
     merged: list[dict] = []
     open_keys: set[Key] = set()
+    pending = [it for it in targets.items() if it.status != "done"]
     for source in read:
-        merged += source.merged_prs()
+        for row in source.merged_prs():
+            if row.get("state") != "CLOSED":
+                merged.append(row)
+            elif verified_landings(pending, [row], source):
+                merged.append({**row, "state": "MERGED"})
         for d in source.open_prs() if open_listing else ():
             open_keys |= marker_keys(d.get("body"))[0]
     named = {inflight_ref(it) for it in targets.items() if it.status == "inflight"} - {None}
@@ -750,8 +772,11 @@ def publish(path: Path, base: str, ours: str, notes: list[str], *, still=None) -
             log(
                 f"reconcile: commit failed ({one_line(committed.stderr or committed.stdout)}); the edit waits for a later look"
             )
-            # Take back this look's edit alone, keeping one a hook or a hand made meanwhile.
-            undone = merge3(merged, path.read_text(), theirs)
+            # Take back this look's edit alone, keeping one a hook or a hand made meanwhile. When the
+            # hook touched the same lines, put each edited item back by its slug instead: a status
+            # left behind uncommitted would read as settled and never be published.
+            now = path.read_text()
+            undone = merge3(merged, now, theirs) or _taken_back(theirs, merged, "", now)
             if undone is None:
                 log(f"reconcile: {path.name} changed on the reconciled lines during the commit; left as it is")
             else:

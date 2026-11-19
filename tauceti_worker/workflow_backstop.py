@@ -57,15 +57,20 @@ APP_PERMISSIONS = {"actions": "write", "metadata": "read"}
 def app_tokens(directory: Path, repository_id: int | None):
     """Installation tokens from App credentials in ``directory``, restricted to the backstop's needs.
 
-    The directory holds ``github-app.json`` and ``github-private-key.pem``. A pinned repository ID
+    The directory holds ``github-app.json`` and ``github-private-key.pem``. It is either a private
+    directory whose ancestors are owned by this user or root, or ``$CREDENTIALS_DIRECTORY`` (``%d``
+    in a unit), where systemd's ``LoadCredential=`` places them for a sandboxed service. A pinned repository ID
     narrows each token to that repository; before the first execution pins it, the token is limited
     only by APP_PERMISSIONS and the installation's repository selection.
     """
     from tauceti_queue import github_app
     from tauceti_queue.github_adapter import UrllibTransport
 
+    # systemd creates $CREDENTIALS_DIRECTORY for LoadCredential=; its ancestors are trusted.
+    loaded = os.environ.get("CREDENTIALS_DIRECTORY")
+    systemd = bool(loaded) and Path(loaded) == Path(directory)
     try:
-        credentials = github_app.load_execution_credentials(directory)
+        credentials = github_app.load_execution_credentials(directory, systemd_credentials=systemd)
         return github_app.InstallationTokenSource(
             credentials, UrllibTransport(timeout=45), repository_id=repository_id, permissions=APP_PERMISSIONS
         )
