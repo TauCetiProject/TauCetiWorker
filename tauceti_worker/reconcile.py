@@ -110,11 +110,14 @@ class Source:
 
     def view(self, number: int) -> dict:
         """The pull request's state, title, body and base. One closed under the queue's title is
-        MERGED only with the source's landing proof, CLOSED when the proof is refused, and unknown
-        (`{}`) when there is none."""
+        MERGED only with the source's landing proof for its base, CLOSED when the proof is refused,
+        and unknown (`{}`) when there is none."""
         row = self._read("pr_view", number, ["state", "title", "body", "baseRefName"]) or {}
         if row.get("state") == "CLOSED" and str(row.get("title") or "").startswith(BORS_MERGED_PREFIX):
-            proof = self.target_queue_landed(number, content_base())
+            # Proof against the pull request's own base: one landed elsewhere is merged, not closed,
+            # and `_merged_into_base` then leaves its item alone.
+            base = row.get("baseRefName")
+            proof = self.target_queue_landed(number, base) if base else None
             return {} if proof is None else {**row, "state": "MERGED"} if proof else row
         return row
 

@@ -465,6 +465,13 @@ class Round(Tmp):
             self.assertEqual("landed: #8" in text, proof)
         self.assertEqual(sorted(asked), [8, 8, 1234, 1234])
 
+    def test_a_queue_landing_on_another_base_leaves_the_item_alone(self):
+        queued = {"state": "CLOSED", "title": "[Merged by Bors] - Truncation bounds", "baseRefName": "staging"}
+        self.w.gh = self.github(states={1234: queued})
+        self.w.gh.target_queue_landed = lambda number, branch: branch == "staging"
+        self.assertEqual(self.reconcile(), (None, "the target list is current"))
+        self.assertEqual(self.path.read_text(), EXAMPLE)
+
     def test_one_look_at_a_time_and_none_without_reads(self):
         lock = os.open(self.path.with_name(".targets.md.lock"), os.O_RDWR | os.O_CREAT)
         self.addCleanup(os.close, lock)
