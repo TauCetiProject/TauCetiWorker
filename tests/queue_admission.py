@@ -438,6 +438,25 @@ class AdmissionTests(unittest.TestCase):
         self.clock.advance(7200)
         self.assertEqual(self.intake.run_once()["approved"], 1)
 
+    def test_lowering_the_floor_releases_waits_recorded_under_the_old_one(self):
+        self.ready()
+        self.github.client = GitHubClient(None, lambda *args: (200, {}, b"{}"), clock=self.clock)
+        original = self.github.admission_snapshot
+        until = self.clock() + 3600
+
+        def floored(*args, **kwargs):
+            raise RequestDeferred("floor", retry_at=until, resource="core:background")
+
+        self.github.admission_snapshot = floored
+        self.intake.run_once()
+        self.assertEqual(self.intake.state.summary()["next_attempt_at"], until)
+        self.github.admission_snapshot = original
+        self.assertEqual(self.intake.run_once()["evaluated"], 0, "held until the reset under the old floor")
+        self.controller.set_setting("github_background_floor", 100, "operator")
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.assertEqual(self.github.client.background_floor, 100)
+        self.assertNotIn("core:background", self.controller.store.get_setting(self.intake.state.resource_key, {}))
+
     def test_discovery_server_cooldown_protects_new_dirty_work_after_restart(self):
         self.ready()
         until = self.clock() + 7200

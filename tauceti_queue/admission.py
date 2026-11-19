@@ -402,8 +402,15 @@ class AdmissionPoller:
 
     def _run(self, reason):
         client = getattr(self.adapter, "client", None)
-        if client is not None and hasattr(client, "background_floor"):
-            client.background_floor = int(self.controller.setting("github_background_floor"))
+        floor = int(self.controller.setting("github_background_floor"))
+        if client is not None and getattr(client, "background_floor", floor) != floor:
+            # Waits recorded under the old floor end at the next read, which checks the new one.
+            client.background_floor = floor
+            client.release_background_holds()
+            self.state.release_background_waits()
+            if self.controller.store.get_setting("state:admission_discovery", {}).get("retry_at"):
+                with self._discovery_lock:
+                    self._discovery_at = min(self._discovery_at, self.clock())
         configure_polling = getattr(self.adapter, "configure_admission_polling", None)
         if configure_polling is not None:
             configure_polling(

@@ -252,6 +252,11 @@ class GitHubClient:
                     target, key = self._blocked_until, resource
                 target[key] = max(target.get(key, 0), deadline)
 
+    def release_background_holds(self) -> None:
+        """Forget restored background waits; the live quota and current floor decide the next read."""
+        with self._lock:
+            self._background_at.clear()
+
     def stats(self) -> dict:
         with self._lock:
             return {
