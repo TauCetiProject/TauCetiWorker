@@ -791,6 +791,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `automatic_retry_max_seconds` | `14400` | integer, at least 0 |
 | `escalation_alert_seconds` | `86400` | integer, at least 0 |
 | `emergency_enabled` | `false` | `true` or `false`; accept `bors emergency` requests (below, after Rebuilding the head) |
+| `emergency_evict` | `false` | `true` or `false`; let the emergency batch take the head from a running head that is neither about to land nor publishing its final oleans |
 | `forgejo_placement_enabled` | `true` | `true` or `false`; `false` keeps waiting Forgejo inputs out of insertion while Forgejo is unavailable ([mixed-sources.md](mixed-sources.md), "Landing GitHub work while Forgejo is unavailable") |
 | `control_lane_enabled` | `false` | `true` or `false`; stage GitHub control-file PRs in their own lane batch ([mixed-sources.md](mixed-sources.md), "The control-file lane") |
 
@@ -1013,8 +1014,13 @@ admin comments `bors emergency` on it (withdraw with `bors emergency-`), or runs
 to withdraw; `POST /admin/emergency` and `/admin/emergency-cancel` underneath). Use this, not an admin
 merge: an admin merge supersedes the running head's CI and leaves `main` on a revision only `ci.yml`
 publishes, while the emergency lane lands the PR through the queue, as the next head in a batch of
-its own, on a pass of its own staging run, with its Lake cache published. The running head is not
-evicted: the emergency batch waits for it to land. The PR must be approved at its live head first.
+its own, on a pass of its own staging run, with its Lake cache published. With `emergency_evict` off
+the emergency batch waits for the running head to land. With it on (`uv run tauceti-queue settings
+set emergency_evict true`), the emergency batch takes the head at once unless the running head is about
+to land (a pending promotion, a pass, a successful run whose verdicts are being bound) or publishing its
+final oleans; the evicted head's run is cancelled, it keeps its chain and claimed repair work, and it
+becomes the head again when the emergency batch lands or ends. The journal's `evicted` entry says why
+it was not protected. The PR must be approved at its live head first.
 The lane is disabled until `uv run tauceti-queue settings set emergency_enabled true`; until then
 every request is refused `disabled`. `status.emergency` shows the request, what it waits for and any
 CI run still being cancelled.

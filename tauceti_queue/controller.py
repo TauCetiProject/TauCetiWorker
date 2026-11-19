@@ -194,6 +194,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # an approved PR become the next head as a single-member batch (`_emergency`). Off: every request
     # is refused `disabled`; a request already accepted keeps running.
     "emergency_enabled": False,
+    # With the emergency lane on, the emergency batch takes the head from a running ordinary head
+    # (`_evict`) unless that head is about to land or publishing its final oleans. Off: it waits for
+    # the running head to land.
+    "emergency_evict": False,
     # The control-file lane (`_control_lane_active`, docs/queue/mixed-sources.md): with mixed sources
     # admitted under GitHub primary, a GitHub PR whose own diff leaves the native path policy is staged
     # in its own batch, which becomes the head ahead of every ordinary open batch, and is never repaired.
@@ -365,6 +369,40 @@ def current_step(phases: list[dict[str, Any]]) -> dict[str, Any] | None:
                     "started_at": steps[index].get("started_at"),
                 }
     return None
+
+
+# The phases of pr-build.yml that say a candidate run is publishing its final oleans (`publishing`):
+# the `sandboxed-build` job's build step, then its handoff step or the `publish-merge-group-cache` job.
+CANDIDATE_BUILD_JOB = "sandboxed-build"
+CANDIDATE_BUILD_STEP = "Build exact candidate under bwrap"
+CANDIDATE_HANDOFF_STEP = "Hand the merge-group oleans to the isolated publisher"
+CANDIDATE_PUBLICATION_JOB = "publish-merge-group-cache"
+# A phase conclusion that does not end a publication (anything else, a failure or a cancellation, does).
+PUBLICATION_CONCLUSIONS = ("", "success", "skipped", "neutral")
+
+
+def publishing(phases: list[dict[str, Any]]) -> bool:
+    """The recorded GitHub phases of an unfinished run say it is publishing its final oleans: the build
+    step concluded `success`, a publication phase (the handoff step, or the publication job or one of
+    its steps) has started, and none of them concluded unsuccessfully. A publisher still waiting for a
+    runner has not started. Phases are `"<job>"` and `"<job>: <step>"`; a job of a called workflow is
+    named `"<caller> / <job>"`."""
+    built = False
+    started = False
+    for phase in phases:
+        name = str(phase.get("name") or "")
+        job, _, step = name.partition(": ")
+        jobs = job.split(" / ")
+        build_job = jobs[-1] == CANDIDATE_BUILD_JOB
+        if build_job and step.startswith(CANDIDATE_BUILD_STEP):
+            built = phase.get("status") == "completed" and phase.get("detail") == "success"
+            continue
+        if not (CANDIDATE_PUBLICATION_JOB in jobs or (build_job and step.startswith(CANDIDATE_HANDOFF_STEP))):
+            continue
+        if phase.get("status") == "completed" and phase.get("detail") not in PUBLICATION_CONCLUSIONS:
+            return False
+        started = started or phase.get("started_at") is not None
+    return built and started
 
 
 class ControllerError(Exception):
@@ -548,6 +586,8 @@ class Controller:
         self.candidate_ci = candidate_ci
         # (attempt id, run id, run attempt) -> (time, run status) of the last phase read of a source run.
         self._source_phases_read: dict[tuple[Any, str, int], tuple[float, str]] = {}
+        # The keys of `_source_phases_read` whose last read failed (`_eviction_observation` needs a fresh one).
+        self._source_phases_unavailable: set[tuple[Any, str, int]] = set()
         self.source_authority = source_authority
         if source_authority is not None and (
             not isinstance(source_authority, NativeQueueAuthority)
@@ -1738,7 +1778,7 @@ class Controller:
             task["state"] == TASK_OPEN
             and batch["version"] == task["batch_version"]
             and batch["state"] == (BATCH_OPEN if task["kind"] == TASK_PREPARE else BATCH_HEAD)
-        )
+        ) or (task["kind"] != TASK_PREPARE and self._evicted_task_current(task, batch))
 
     def claim_task(
         self, worker_identity: str, github_login: str, *, source_access=None, expected_binding=None, mixed_capable=False
@@ -1746,13 +1786,17 @@ class Controller:
         """Hand an open task to an authorized worker under a renewable claim, within `repair_concurrency`.
 
         `repair_concurrency` bounds the live task claims in total. Within it, tasks are offered in
-        two tiers, each by kind priority then age (`TASK_PRIORITY`): first a head task (`repair` or
-        `rebase_conflict`); then an open batch's background task (`pre_rebase`, then `prepare`).
-        Each batch has at most one live worker claim, including when its task changes. Background
-        claims number at most `repair_concurrency - 1`. Starting background work also requires
-        fewer than `background_start_limit` total live claims; only head work may increase the
-        active total beyond that limit. Head work never waits behind background work. With two workers
-        one repairs the head while the other prepares or pre-rebases the next batch; a worker waits when no distinct batch needs work.
+        two tiers by the role of their batch, each by kind priority then age (`TASK_PRIORITY`): first
+        the head's task (`repair` or `rebase_conflict`); then an open batch's background task (a
+        retained task of a batch the emergency batch took the head from, `pre_rebase`, then
+        `prepare`). Each batch has at most one live worker claim, including when its task changes.
+        Claims on open batches number at most `repair_concurrency - 1`. Starting background work also
+        requires fewer than `background_start_limit` total live claims; only head work may increase
+        the active total beyond that limit. Head work never waits behind background work: while no
+        claim on the head is live, the head's task is offered even when the claims already number
+        `repair_concurrency` (only an evicted batch's retained claim can make them so). With two
+        workers one repairs the head while the other prepares or pre-rebases the next batch; a worker
+        waits when no distinct batch needs work.
 
         The admin check (a cached GitHub read) runs before the lock is taken, and the claim takes the
         lock's priority lane, so a claim answers while a tick is running.
@@ -1784,17 +1828,22 @@ class Controller:
                     for pair in claimable
                     if loads(pair[0]["task_binding"], {}).get("schema") != "tauceti-queue.mixed-task/v1"
                 ]
-            if len(self._active_task_claims()) >= concurrency:
-                if claimable and claimable[0][0]["kind"] not in BACKGROUND_TASKS:
-                    self._count("claim_collisions")
-                    self.store.journal(
-                        now,
-                        "claim-refused",
-                        worker=worker_identity,
-                        reason="concurrency",
-                        task_id=claimable[0][0]["id"],
-                    )
-                return None
+            active = self._active_task_claims()
+            if len(active) >= concurrency:
+                head = self._head() if concurrency > 0 else None
+                head_work = [pair for pair in claimable if head is not None and pair[1]["id"] == head["id"]]
+                if not head_work or any(claim["batch_id"] == head["id"] for claim in active):
+                    if head_work:
+                        self._count("claim_collisions")
+                        self.store.journal(
+                            now,
+                            "claim-refused",
+                            worker=worker_identity,
+                            reason="concurrency",
+                            task_id=head_work[0][0]["id"],
+                        )
+                    return None
+                claimable = head_work
             chosen = self._choose_task(claimable, concurrency)
             if chosen is None:
                 return None
@@ -1830,22 +1879,26 @@ class Controller:
     def _choose_task(
         self, claimable: list[tuple[dict[str, Any], dict[str, Any]]], concurrency: int
     ) -> tuple[dict[str, Any], dict[str, Any]] | None:
-        """The next task on a batch without a live worker claim: a head task, else background while
-        total claims number fewer than `background_start_limit` and background claims number fewer
-        than `concurrency - 1` (one slot is always left for head work,
-        so with `repair_concurrency` 1 nothing runs in the background). Selection and insertion of
-        the claim share the controller lock; concurrent requests cannot select the same batch.
+        """The next task on a batch without a live worker claim: the head's task, else an open batch's
+        (background) while total claims number fewer than `background_start_limit` and claims on open
+        batches number fewer than `concurrency - 1` (one slot is always left for head work, so with
+        `repair_concurrency` 1 nothing runs in the background). The role is the batch's, not the
+        task kind's: an evicted batch's retained repair is background work, ahead of the other kinds
+        by priority. Selection and insertion of the claim share the controller lock; concurrent
+        requests cannot select the same batch.
         """
         active = self._active_task_claims()
         held_batches = {claim["batch_id"] for claim in active}
         unheld = [pair for pair in claimable if pair[1]["id"] not in held_batches]
+        head = self._head()
+        head_id = head["id"] if head is not None else None
         for pair in unheld:
-            if pair[0]["kind"] not in BACKGROUND_TASKS:
+            if pair[1]["id"] == head_id:
                 return pair
-        background = [claim for claim in active if claim["operation"] in BACKGROUND_OPERATIONS]
+        background = [claim for claim in active if claim["batch_id"] != head_id]
         if len(active) < int(self.setting("background_start_limit")) and len(background) < concurrency - 1:
             for task, batch in unheld:
-                if task["kind"] in BACKGROUND_TASKS:
+                if batch["id"] != head_id:
                     return task, batch
         return None
 
@@ -1875,6 +1928,9 @@ class Controller:
             if self._pre_rebased_prepare(task):
                 if self._pre_rebased_prepare_current(task, batch):
                     found.append((task, batch))
+                continue
+            if task["kind"] != TASK_PREPARE and self._evicted_task_current(task, batch):
+                found.append((task, batch))
                 continue
             if batch["version"] != task["batch_version"]:
                 continue
@@ -2432,7 +2488,11 @@ class Controller:
                 self.store.update("members", {"id": member["id"]}, **values)
                 provenance[member["source_pr"]] = values.get("provenance", member["provenance"])
             # An adopted preparation keeps its batch open: the repaired members are what it seals with.
-            prepared = {"prepared_version": version} if task["kind"] == TASK_PREPARE else {}
+            # So does a retained task of a batch the emergency batch took the head from (`_evict`):
+            # its chain was validated as the head, and own-base preparation is not repeated.
+            prepared = (
+                {"prepared_version": version} if task["kind"] == TASK_PREPARE or batch["state"] == BATCH_OPEN else {}
+            )
             self.store.update(
                 "batches",
                 {"id": batch["id"]},
@@ -2704,6 +2764,11 @@ class Controller:
                     ci_attempt_id=task["ci_attempt_id"],
                     pre_rebased=(task["tip"], task["pre_rebase_source"]) if self._pre_rebased_prepare(task) else None,
                 )
+                marker = self._eviction(batch)
+                if marker is not None and task["id"] in marker["task_ids"]:
+                    # The replacement of an evicted batch's retained task is retained too.
+                    marker = dict(marker, task_ids=[*marker["task_ids"], replacement])
+                    self._set_state(f"emergency_evicted:{batch['id']}", marker)
             self.store.journal(
                 now, "task-policy-changed", task["batch_id"], task_id=task["id"], replacement_task_id=replacement
             )
@@ -4548,6 +4613,7 @@ class Controller:
         the oldest request when none is live, and report what an open one waits for."""
         self._settle_cancel_intents(now)
         self._prune_preserved()
+        self._prune_evicted()
         batch = self._emergency_batch()
         if batch is not None:
             if batch["state"] == BATCH_OPEN and not self._members(batch["id"]):
@@ -4566,7 +4632,10 @@ class Controller:
             return
         head = self._head()
         if head is not None:
-            self._emergency_waits(batch["id"], f"head {head['id']}", now)
+            if self.setting("emergency_evict"):
+                self._evict(head, now, batch=batch)
+            else:
+                self._emergency_waits(batch["id"], f"head {head['id']}", now)
 
     def _emergency_waits(self, batch_id: int | None, why: str, now: float) -> None:
         self._reasons.append(f"emergency batch {batch_id} waits for {why} to land" if batch_id else why)
@@ -4593,7 +4662,12 @@ class Controller:
             if owner is None or owner["state"] not in (BATCH_OPEN, BATCH_HEAD):
                 continue
             if owner["state"] == BATCH_HEAD:
-                # The running head carries the PR: it lands with the head, which is never evicted.
+                others = [m for m in self._active_members(owner) if m["input_id"] != row["id"]]
+                if others and self.setting("emergency_evict"):
+                    # The PR leaves the running head for a batch of its own, which takes the head.
+                    self._evict(owner, now, row=row)
+                    return None
+                # The running head carries the PR (alone, or eviction is off): it lands with the head.
                 self._emergency_waits(None, f"emergency request #{row['number']} lands with head {owner['id']}", now)
                 return None
             return self._emergency_singleton(row, owner, now)
@@ -4640,10 +4714,20 @@ class Controller:
     def _emergency_singleton(self, row: dict[str, Any], owner: dict[str, Any], now: float) -> dict[str, Any] | None:
         """Build the emergency batch for a PR inserted in open batch `owner` (the prospective singleton).
 
-        The PR's accepted head is replayed onto `main` without the lock, with the checks a probe makes
-        (conflict, new import gaps, source CI scope); nothing is written before that succeeds, so a
-        refusal leaves the input in `owner`. Then one transaction allocates E with its member and moves
-        the input's ownership to it, recording the displaced slot in `evidence.emergency.displaced`."""
+        The PR's accepted head is replayed onto `main` without the lock (`_singleton_chain`); nothing is
+        written before that succeeds, so a refusal leaves the input in `owner`. Then one transaction
+        allocates E with its member and moves the input's ownership to it (`_insert_singleton`)."""
+        built = self._singleton_chain(row, owner, now)
+        if built is None or self._singleton_current(row, owner, built) is None:
+            return None  # refused, or something moved while the replay ran; the next pass tries again
+        with self.store.transaction():
+            batch = self._insert_singleton(row, owner, built, now)
+        return self.store.row("batches", {"id": batch["id"]})
+
+    def _singleton_chain(self, row: dict[str, Any], owner: dict[str, Any], now: float) -> dict[str, Any] | None:
+        """Replay the accepted head of a PR inserted in `owner` onto `main` without the lock, with the
+        checks a probe makes (conflict, new import gaps, source CI scope). A refusal clears the request
+        and leaves the input in `owner`; nothing else is written."""
         slot = self.store.row("members", {"batch_id": owner["id"], "input_id": row["id"], "removed": 0})
         canonical = self._canonical
         if slot is None or slot["withdrawn"] or canonical is None:
@@ -4678,8 +4762,8 @@ class Controller:
             if not scope_supported and self._source_ci_required(row["number"], None)
             else None
         )
-        fresh = self.store.row("inputs", {"id": row["id"]})
         if refused is not None:
+            fresh = self.store.row("inputs", {"id": row["id"]})
             if fresh is not None and self._emergency_requested(fresh):
                 with self.store.transaction():
                     self._clear_emergency_request(fresh)
@@ -4687,8 +4771,17 @@ class Controller:
                         now, "emergency-refused", owner["id"], number=row["number"], reason=refused, kept_in=owner["id"]
                     )
             return None
+        return {"slot": slot, "member": member, "result": result, "canonical": canonical}
+
+    def _singleton_current(
+        self, row: dict[str, Any], owner: dict[str, Any], built: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """The input, reloaded, when the prospective singleton `built` still applies: the request is
+        live, the input still `inserted` in `owner` at its accepted head through a live slot, `owner`
+        in the state it was built from, `main` unmoved and no emergency batch live; else None."""
+        fresh = self.store.row("inputs", {"id": row["id"]})
         current = self.store.row("batches", {"id": owner["id"]})
-        slot = self.store.row("members", {"id": slot["id"]})
+        slot = self.store.row("members", {"id": built["slot"]["id"]})
         if (
             fresh is None
             or not self._emergency_requested(fresh)
@@ -4696,50 +4789,302 @@ class Controller:
             or fresh["batch_id"] != owner["id"]
             or fresh["head_sha"] != row["head_sha"]
             or current is None
-            or current["state"] != BATCH_OPEN
+            or current["state"] != owner["state"]
             or slot is None
             or slot["removed"]
             or slot["withdrawn"]
-            or self._canonical != canonical
+            or self._canonical != built["canonical"]
             or self._emergency_batch() is not None
         ):
-            return None  # something moved while the replay ran; the next pass tries again
+            return None
+        return fresh
+
+    def _insert_singleton(
+        self, row: dict[str, Any], owner: dict[str, Any], built: dict[str, Any], now: float
+    ) -> dict[str, Any]:
+        """Allocate the emergency batch on `main` with the prospective singleton `built` as its member,
+        and move the input's ownership to it, recording the displaced slot in
+        `evidence.emergency.displaced`. Inside the caller's transaction, after `_singleton_current`."""
+        fresh = self.store.row("inputs", {"id": row["id"]}) or row
+        result, member, slot = built["result"], built["member"], built["slot"]
         record = result.commits[0]
+        batch = self._create_open_batch(built["canonical"], now)
+        self.store.insert(
+            "members",
+            batch_id=batch["id"],
+            input_id=row["id"],
+            source_pr=member.source_pr,
+            number=row["number"],
+            accepted_head=row["head_sha"],
+            position=0,
+            commit_sha=record.sha,
+            provenance="clean",
+            added_at=now,
+            no_repair=row["no_repair"],
+        )
+        self.store.update("batches", {"id": batch["id"]}, version=1, tip=result.tip, urgent=URGENT_EMERGENCY)
+        self._record_tip(batch["id"], 1, result.tip, now)
+        self._retain(self.batch_ref(batch["id"], 1), result.tip)
+        evidence = loads(fresh["evidence"], {})
+        evidence["emergency"].update(batch_id=batch["id"], displaced={"batch_id": owner["id"], "member_id": slot["id"]})
+        self.store.update("inputs", {"id": row["id"]}, batch_id=batch["id"], evidence=dumps(evidence))
+        self.store.journal(
+            now,
+            "emergency-batch",
+            batch["id"],
+            number=row["number"],
+            state=INPUT_INSERTED,
+            displaced_from=owner["id"],
+        )
+        self.store.journal(
+            now, "inserted", batch["id"], number=row["number"], version=1, commit=record.sha, empty=record.empty
+        )
+        return self.store.row("batches", {"id": batch["id"]}) or batch
+
+    # Eviction (`emergency_evict`): the emergency batch takes the head from a running ordinary head.
+
+    def _evict(
+        self,
+        head: dict[str, Any],
+        now: float,
+        *,
+        batch: dict[str, Any] | None = None,
+        row: dict[str, Any] | None = None,
+    ) -> bool:
+        """Make the emergency batch the head in place of the running ordinary head `head`, unless the
+        head is about to land or publishing its final oleans (`_protection`); True when it did.
+
+        `batch` is the open emergency batch E; with `row` instead, the PR is a member of `head` and E is
+        the prospective singleton built from it, allocated only in the eviction transaction. In order:
+        the stored checks; the prospective singleton's replay; a fresh strict observation of the head's
+        attempt; revalidation of everything read; then one transaction that moves the input's
+        ownership (prospective singleton), reopens the head with its chain, version and retained tasks
+        (`emergency_evicted:<head>`), supersedes its pending attempt with a durable cancel intent
+        (unless it is under a promotion-refusal hold, which it returns to) and makes E the head
+        (`_make_head`). If a check fails nothing is written and E keeps waiting. What no transaction
+        prevents: the run can start publishing between the observation and the cancel."""
+        target = batch["id"] if batch is not None else None
+        prefix = f"emergency request #{row['number']} waits for " if row is not None else ""
+
+        def wait(why: str) -> bool:
+            self._emergency_waits(target, f"{prefix}head {head['id']} ({why})", now)
+            return False
+
+        barrier = (
+            self._seal_blocked(batch)
+            if batch is not None
+            else ("inference hold: not sealing", False)
+            if self._state("inference_hold")
+            else ((self._external_head_blocks_sealing(), False) if self._external_head_blocks_sealing() else None)
+        )
+        if barrier is not None:
+            return wait(barrier[0])
+        attempt = self._current_attempt(head)
+        why = self._protection(head, attempt, observed=False)
+        if why is not None:
+            return wait(why)
+        held = attempt is not None and self.store.get_setting(f"source-ci:promotion-hold:{attempt['id']}") is not None
+        observe = attempt is not None and not held and self._needs_eviction_observation(attempt)
+        if observe:
+            assert attempt is not None
+            # A head found protected by an observation within the polling interval is not read again
+            # each pass: protection is decided on fresh data, and so is every eviction.
+            recent = attempt["last_observed_at"] is not None and now - attempt["last_observed_at"] < int(
+                self.setting("polling_interval_seconds")
+            )
+            why = self._protection(head, attempt, observed=True) if recent else None
+            if why is not None:
+                return wait(why)
+        built = None
+        if row is not None:
+            built = self._singleton_chain(row, head, now)
+            if built is None:
+                return False
+        observed = attempt
+        if observe:
+            assert attempt is not None
+            try:
+                observed = self._eviction_observation(head, attempt, now)
+            except Exception as error:  # noqa: BLE001 - no eviction this pass
+                self.log.warning("eviction of head %s: observation failed: %s", head["id"], error)
+                return wait("its CI run could not be read")
+            why = self._protection(head, observed, observed=True)
+            if why is not None:
+                return wait(why)
+        current = self._head()
+        current_attempt = self._current_attempt(current) if current is not None else None
+        valid = (
+            current is not None
+            and all(current[key] == head[key] for key in ("id", "version", "tip"))
+            and (current_attempt or {}).get("id") == (attempt or {}).get("id")
+            and not [c for c in self._active_claims(head["id"]) if c["task_id"] is None]
+            and self._protection(current, current_attempt, observed=observe) is None
+        )
+        if valid and built is not None:
+            valid = (
+                self._singleton_current(row, head, built) is not None
+                and not self._state("inference_hold")
+                and not self._external_head_blocks_sealing()
+            )
+        elif valid:
+            fresh = self.store.row("batches", {"id": target})
+            valid = (
+                fresh is not None
+                and fresh["state"] == BATCH_OPEN
+                and bool(self._active_members(fresh))
+                and self._seal_blocked(fresh) is None
+            )
+        if not valid:
+            blocked = self._seal_blocked(batch) if batch is not None else None
+            return wait(blocked[0] if blocked else "it moved")
+        assert current is not None
         with self.store.transaction():
-            batch = self._create_open_batch(canonical, now)
-            self.store.insert(
-                "members",
-                batch_id=batch["id"],
-                input_id=row["id"],
-                source_pr=member.source_pr,
-                number=row["number"],
-                accepted_head=row["head_sha"],
-                position=0,
-                commit_sha=record.sha,
-                provenance="clean",
-                added_at=now,
-                no_repair=row["no_repair"],
+            if built is not None:
+                assert row is not None
+                batch = self._insert_singleton(row, current, built, now)
+            assert batch is not None
+            self.store.update(
+                "batches",
+                {"id": current["id"]},
+                state=BATCH_OPEN,
+                expected_parent=None,
+                prepared_version=current["version"],
             )
-            self.store.update("batches", {"id": batch["id"]}, version=1, tip=result.tip, urgent=URGENT_EMERGENCY)
-            self._record_tip(batch["id"], 1, result.tip, now)
-            self._retain(self.batch_ref(batch["id"], 1), result.tip)
-            evidence = loads(fresh["evidence"], {})
-            evidence["emergency"].update(
-                batch_id=batch["id"], displaced={"batch_id": owner["id"], "member_id": slot["id"]}
+            self._write_cancel_intents(
+                current,
+                f"evicted by emergency batch {batch['id']}",
+                now,
+                keep=current_attempt["id"] if held and current_attempt is not None else None,
             )
-            self.store.update("inputs", {"id": row["id"]}, batch_id=batch["id"], evidence=dumps(evidence))
+            tasks = self.store.rows(
+                "tasks", {"batch_id": current["id"], "state": TASK_OPEN, "batch_version": current["version"]}
+            )
+            self._set_state(
+                f"emergency_evicted:{current['id']}",
+                {
+                    "version": current["version"],
+                    "tip": current["tip"],
+                    "by": batch["id"],
+                    "attempt_id": (current_attempt or {}).get("id"),
+                    "task_ids": [task["id"] for task in tasks],
+                    "at": now,
+                },
+            )
+            self._make_head(self.store.row("batches", {"id": batch["id"]}) or batch, now)
             self.store.journal(
                 now,
-                "emergency-batch",
-                batch["id"],
-                number=row["number"],
-                state=INPUT_INSERTED,
-                displaced_from=owner["id"],
+                "evicted",
+                current["id"],
+                version=current["version"],
+                tip=current["tip"],
+                attempt_id=(current_attempt or {}).get("id"),
+                run_id=(observed or {}).get("run_id"),
+                phases=loads((observed or {}).get("phases"), []),
+                by=batch["id"],
+                why=self._evictable(current_attempt, held),
+                held=held,
+                tasks=[task["id"] for task in tasks],
             )
-            self.store.journal(
-                now, "inserted", batch["id"], number=row["number"], version=1, commit=record.sha, empty=record.empty
-            )
-        return self.store.row("batches", {"id": batch["id"]})
+            self._set_state("emergency_waits", None)
+        self._count("heads_evicted")
+        self._settle_cancel_intents(now)
+        self._wake.set()
+        return True
+
+    @staticmethod
+    def _needs_eviction_observation(attempt: dict[str, Any]) -> bool:
+        """A pending attempt whose run may exist: only a fresh observation can say it is not publishing."""
+        return attempt["outcome"] == OUTCOME_PENDING and attempt["dispatch_state"] not in ("prepared", "rejected")
+
+    def _protection(self, head: dict[str, Any], attempt: dict[str, Any] | None, *, observed: bool) -> str | None:
+        """Why the head may not be evicted, or None. Decided in order on the head's current attempt:
+        a promotion-refusal hold is never protection; a pending `promote` entry (P1) or a pass (P2) is.
+        With `observed` (the attempt was just read with `_eviction_observation`), a pending attempt is
+        also protected when its run completed `success` and its verdicts are being bound (P3), or it is
+        publishing its final oleans (P4, `publishing`). Everything else is evictable."""
+        if self.store.query(
+            "SELECT 1 FROM outbox WHERE kind='promote' AND state='pending' AND key LIKE ? LIMIT 1",
+            (f"promote:{head['id']}:%",),
+        ):
+            hold = attempt is not None and self.store.get_setting(f"source-ci:promotion-hold:{attempt['id']}")
+            if not hold:
+                return "its promotion is pending"
+        if attempt is None or self.store.get_setting(f"source-ci:promotion-hold:{attempt['id']}") is not None:
+            return None
+        if attempt["outcome"] == OUTCOME_PASS:
+            return "it passed and is about to land"
+        if not observed or attempt["outcome"] != OUTCOME_PENDING:
+            return None
+        if attempt["run_status"] == "completed" and attempt["run_conclusion"] == "success":
+            return "its run succeeded and its verdict is being bound"
+        if attempt["run_status"] != "completed" and publishing(loads(attempt["phases"], [])):
+            return "it is publishing its final oleans"
+        return None
+
+    def _evictable(self, attempt: dict[str, Any] | None, held: bool) -> str:
+        """Why an evicted head was not protected, for the `evicted` journal entry."""
+        if attempt is None:
+            return "no CI attempt"
+        if held:
+            return "promotion-refusal hold"
+        if attempt["outcome"] != OUTCOME_PENDING:
+            return f"CI {attempt['outcome']}"
+        if attempt["dispatch_state"] in ("prepared", "rejected"):
+            return f"dispatch {attempt['dispatch_state']}"
+        return f"run {attempt['run_status'] or 'not found'}"
+
+    def _eviction_observation(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> dict[str, Any]:
+        """The head's pending attempt after a fresh strict observation (`_observe_attempt(strict=True)`),
+        reloaded; raises when it cannot be read. A source-candidate run in progress also has its phases
+        read afresh, past `SOURCE_PHASES_INTERVAL_SECONDS`, and raises when that read fails."""
+        self.store.update("ci_attempts", {"id": attempt["id"]}, needs_observation=1)
+        row = self.store.row("ci_attempts", {"id": attempt["id"]}) or attempt
+        source = self._candidate_coordinator(attempt_id=attempt["id"]) is not None
+        if source:
+            for key in [key for key in self._source_phases_read if key[0] == attempt["id"]]:
+                del self._source_phases_read[key]
+        self._observe_attempt(head, row, now, strict=True)
+        row = self.store.row("ci_attempts", {"id": attempt["id"]}) or row
+        if source and row["outcome"] == OUTCOME_PENDING and row["run_status"] == "in_progress":
+            key = (row["id"], row["run_id"], row["run_attempt"])
+            if key not in self._source_phases_read or key in self._source_phases_unavailable:
+                raise ControllerError("phases-unavailable", f"source CI phases of run {row['run_id']} are unavailable")
+        return row
+
+    def _eviction(self, batch: dict[str, Any]) -> dict[str, Any] | None:
+        """The eviction marker of an open batch the emergency batch took the head from, else None."""
+        if batch["state"] != BATCH_OPEN:
+            return None
+        return self._state(f"emergency_evicted:{batch['id']}")
+
+    def _evicted_task_current(self, task: dict[str, Any], batch: dict[str, Any]) -> bool:
+        """A task the evicted batch had open as the head, still current while the batch waits, open
+        and sealed at the version it was evicted at: its owner may submit it and it stays claimable."""
+        marker = self._eviction(batch)
+        return bool(
+            marker
+            and batch["sealed"]
+            and task["state"] == TASK_OPEN
+            and task["id"] in marker["task_ids"]
+            and batch["version"] == marker["version"] == task["batch_version"]
+        )
+
+    def _retained_tasks(self, batch: dict[str, Any]) -> list[dict[str, Any]]:
+        """The evicted batch's open retained tasks: while there are any, nothing else is created for it."""
+        if self._eviction(batch) is None:
+            return []
+        return [
+            task
+            for task in self.store.rows("tasks", {"batch_id": batch["id"], "state": TASK_OPEN})
+            if self._evicted_task_current(task, batch)
+        ]
+
+    def _prune_evicted(self) -> None:
+        """Drop the eviction markers of batches that are no longer open (head again, landed, removed)."""
+        for key in self.store.query("SELECT key FROM settings WHERE key LIKE 'state:emergency_evicted:%'"):
+            batch = self.store.row("batches", {"id": int(key["key"].rsplit(":", 1)[1])})
+            if batch is None or batch["state"] != BATCH_OPEN:
+                self.store.execute("DELETE FROM settings WHERE key=?", (key["key"],))
 
     def _end_emergency(
         self,
@@ -4861,11 +5206,11 @@ class Controller:
         retry_at = max(max(now, self.clock()) + backoff, self._error_retry_at(error))
         self._set_state(f"cancel_intent:{attempt_id}", dict(intent, tries=tries, retry_at=retry_at))
 
-    def _write_cancel_intents(self, batch: dict[str, Any], reason: str, now: float) -> None:
-        """Record a cancel intent for every unsettled attempt of `batch`, at any version; a pending one
-        becomes `superseded`. Called inside the caller's transaction."""
+    def _write_cancel_intents(self, batch: dict[str, Any], reason: str, now: float, *, keep: int | None = None) -> None:
+        """Record a cancel intent for every unsettled attempt of `batch` other than `keep`, at any version;
+        a pending one becomes `superseded`. Called inside the caller's transaction."""
         for attempt in self.store.rows("ci_attempts", {"batch_id": batch["id"]}, order="id"):
-            if self._cancel_settled(attempt, now, looked_up=False):
+            if attempt["id"] == keep or self._cancel_settled(attempt, now, looked_up=False):
                 continue
             self._write_cancel_intent(attempt, reason, now)
             if attempt["outcome"] == OUTCOME_PENDING:
@@ -4911,6 +5256,18 @@ class Controller:
                 continue
             if not attempt["run_id"]:
                 if attempt["dispatch_state"] not in {"sending", "uncertain", "accepted", "legacy"}:
+                    continue
+                if any(
+                    later["id"] > attempt_id
+                    and later["head_sha"] == attempt["head_sha"]
+                    and later["base_sha"] == attempt["base_sha"]
+                    and later["dispatch_state"] in {"sending", "uncertain", "accepted", "legacy"}
+                    for later in self.store.rows("ci_attempts", {"batch_id": attempt["batch_id"]})
+                ):
+                    # A later dispatch of the same candidate was sent (a head that returned after an
+                    # eviction): a lookup now finds that newer run, which this intent must never take,
+                    # and pr-build.yml's concurrency group cancels the earlier run when the later starts.
+                    self._drop_cancel_intent(attempt_id)
                     continue
                 try:
                     if candidate_ci is not None:
@@ -5071,6 +5428,7 @@ class Controller:
         served = {self._emergency_input(batch)} if batch is not None else set()
         return {
             "enabled": bool(self.setting("emergency_enabled")),
+            "evict": bool(self.setting("emergency_evict")),
             "batch": active,
             "queued": [request(row) for row in self._flagged_inputs() if row["id"] not in served],
             "cancel_intents": [
@@ -5135,6 +5493,7 @@ class Controller:
                 sealed_at=batch["sealed_at"] if batch["sealed_at"] is not None else now,
             )
             self._count("heads_sealed")
+            self.store.execute("DELETE FROM settings WHERE key=?", (f"state:emergency_evicted:{batch['id']}",))
             self.store.journal(
                 now,
                 "sealed",
@@ -5364,7 +5723,8 @@ class Controller:
                 self._supersede_prepare(task["batch_id"], "batch-changed", now, own_base_only=True)
         if not self.setting("prepare_open_batches") or self._state("inference_hold"):
             return
-        for batch in self._staging_batches():
+        staging = self._staging_batches()
+        for index, batch in enumerate(staging):
             successor = self._open_batch()
             if (
                 self.setting("prepare_pre_rebased")
@@ -5374,6 +5734,16 @@ class Controller:
             ):
                 # Prepare this successor on its intended parent. Starting another
                 # own-base pass would serialize two full builds and rewrite repairs.
+                continue
+            if self._retained_tasks(batch):
+                continue  # its retained work as the evicted head owns the chain
+            if (
+                index > 0
+                and self._eviction(staging[index - 1]) is not None
+                and batch["pre_rebase_state"] in PRE_REBASE_USABLE
+            ):
+                # Behind an evicted batch: its pre-rebase onto that batch's tip is carried when the
+                # evicted batch returns; an own-base preparation would rewrite the chain under it.
                 continue
             if not self._prepare_due(batch, now):
                 continue
@@ -5663,6 +6033,9 @@ class Controller:
         if self._preserved_tasks(batch):
             self._note_reason(f"open batch {batch['id']} waits for claimed pre-rebase work")
             return
+        if self._retained_tasks(batch):
+            self._note_reason(f"open batch {batch['id']} waits for its retained work as the evicted head")
+            return
         head = self._head()
         if self._pre_rebase_blocked(head) is not None:
             return
@@ -5849,6 +6222,8 @@ class Controller:
             return "prepare_pre_rebased is off"
         if self._preserved_tasks(batch):
             return "waits for claimed pre-rebase work"
+        if self._retained_tasks(batch):
+            return "waits for its retained work as the evicted head"
         if not batch["sealed"] and len(self._members(batch["id"])) < max(1, int(self.setting("prepare_min_members"))):
             return "below prepare_min_members"
         if batch["pre_rebase_state"] not in PRE_REBASE_USABLE or not batch["pre_rebase_tip"]:
@@ -6565,8 +6940,14 @@ class Controller:
         )
         if run is None or run.status not in LIVE_RUN_STATUSES:
             return None
-        # A run the controller cancelled may still read as live for a moment; it is not re-adopted.
-        return None if run.run_id in self._cancelled_run_ids(head["id"]) else run
+        # A run the controller cancelled, or is still cancelling (an open cancel intent), may read as
+        # live; it is not re-adopted.
+        cancelling = {
+            str(a["run_id"])
+            for a in self.store.rows("ci_attempts", {"batch_id": head["id"]})
+            if a["run_id"] and self._cancelling(a)
+        }
+        return None if run.run_id in self._cancelled_run_ids(head["id"]) | cancelling else run
 
     def _readopt_live_run(self, head: dict[str, Any], now: float) -> bool:
         """Before any re-dispatch of a tip that was dispatched before: re-adopt a run for it that GitHub
@@ -6577,9 +6958,11 @@ class Controller:
         (lost, no-run, superseded). The newest attempt for the tip becomes pending again, bound to the
         live run, so the staging candidate branch named after the attempt stays the one CI verifies.
         Returns whether the dispatch must not happen this tick (re-adopted, or GitHub could not be asked).
+        An attempt with an open cancel intent is never re-adopted: the intent would later cancel the
+        re-adopted work (a head the emergency batch evicted, returning unchanged).
         """
         candidate_ci = self._candidate_coordinator(batch_id=head["id"])
-        attempts = self._tip_attempts(head)
+        attempts = [a for a in self._tip_attempts(head) if not self._cancelling(a)]
         if not attempts:
             return False
         try:
@@ -6677,6 +7060,10 @@ class Controller:
         if reader is None:
             raise ControllerError("no-read-run", "the GitHub port cannot read a run directly")
         return reader(self.repository, run_id, with_jobs=with_jobs)
+
+    def _cancelling(self, attempt: dict[str, Any]) -> bool:
+        """The attempt has an open cancel intent (`_settle_cancel_intents`)."""
+        return self._state(f"cancel_intent:{attempt['id']}") is not None
 
     def _cancelled_run_ids(self, batch_id: int) -> set[str]:
         """The runs of the batch's attempts that the controller cancelled itself."""
@@ -7194,13 +7581,17 @@ class Controller:
         A queued (or otherwise waiting) run is never lost. An in-progress run is lost only when its
         jobs have reported nothing for `lost_run_seconds` and a direct read of the run still says
         `in_progress` with an `updated_at` at least that old; short of that a long silence is a
-        `stall` reason line, never an infrastructure verdict.
+        `stall` reason line, never an infrastructure verdict. A run publishing its final oleans
+        (`publishing`) is never lost: a publisher that really died ends when GitHub fails its job.
         """
         threshold = int(self.setting("lost_run_seconds"))
         silence = now - values["last_progress_at"]
         if silence < threshold:
             return
         stall = f"stall: head {head['id']} run {run.run_id} is {run.status or 'unknown'} with no job update for {silence:.0f}s"
+        if publishing(loads(values.get("phases"), [])):
+            self._reasons.append(f"{stall}; it is publishing its final oleans, not treated as lost")
+            return
         if run.status != "in_progress":
             self._reasons.append(f"{stall}; a run GitHub reports {run.status or 'unknown'} is not lost")
             return
@@ -7702,10 +8093,13 @@ class Controller:
             return None
         if len(self._source_phases_read) >= 64:
             self._source_phases_read.clear()
+            self._source_phases_unavailable.clear()
         self._source_phases_read[key] = (now, run.status)
+        self._source_phases_unavailable.discard(key)
         try:
             return candidate_ci.progress(attempt["id"], run)
         except Exception as error:  # noqa: BLE001 - phases are optional context
+            self._source_phases_unavailable.add(key)
             self._reasons.append(
                 f"head {attempt['batch_id']}: source CI phases unavailable for run {run.run_id}: {error}"
             )

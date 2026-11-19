@@ -30,14 +30,19 @@ from tauceti_queue import (  # noqa: E402
 )
 from tauceti_queue.approval_poll import ApprovalPoller  # noqa: E402
 from tauceti_queue.controller import (  # noqa: E402
+    CANDIDATE_BUILD_STEP,
+    CANDIDATE_HANDOFF_STEP,
+    CANDIDATE_PUBLICATION_JOB,
     LOG_GRACE_SECONDS,
     MERGED_TITLE_PREFIX,
     Controller,
     ControllerError,
     TaskError,
+    publishing,
 )
-from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller  # noqa: E402
+from tauceti_queue.fakes import Resolution, ScriptedAgent, Status, make_controller, reopen_controller  # noqa: E402
 from tauceti_queue.loop import ReconciliationLoop  # noqa: E402
+from tauceti_queue.ports import CandidatePhase  # noqa: E402
 
 PROJECT = "TauCetiProject/TauCeti"
 
@@ -4145,6 +4150,431 @@ class EmergencyLane(QueueFixture):
         self.assertIsNone(self.controller._current_attempt(self.controller._emergency_batch()))
         self.controller.cancel_emergency(PROJECT, 101, "admin-worker", surface="test")
         self.assertEqual((self.github.runs[-1].status, self.github.runs[-1].conclusion), ("completed", "cancelled"))
+
+
+BUILD_STEP = "sandboxed-build: Build exact candidate under bwrap with workflow-pinned audits, offline"
+HANDOFF_STEP = "sandboxed-build: Hand the merge-group oleans to the isolated publisher"
+
+
+class EmergencyEviction(QueueFixture):
+    """Slice 2 of the emergency lane: the emergency batch takes the head from a running ordinary head,
+    unless that head is about to land or publishing its final oleans."""
+
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("emergency_enabled", True, "t")
+        self.controller.set_setting("emergency_evict", True, "t")
+
+    def emergency(self, number, actor="admin-worker"):
+        return self.controller.request_emergency(PROJECT, number, actor, surface="test")
+
+    def journal(self, kind):
+        return [e["detail"] for e in self.controller.store.journal_entries(kind)]
+
+    def batch(self, batch_id):
+        return self.controller.store.row("batches", {"id": batch_id})
+
+    def attempts(self, batch_id):
+        return self.controller.store.rows("ci_attempts", {"batch_id": batch_id}, order="id")
+
+    def running_head(self, *numbers):
+        """A head (101, or `numbers`) whose run is building, and an open batch (102, 103) behind it."""
+        for number in numbers or (101,):
+            self.approve(number, {f"F{number}.lean": f"{number}\n"})
+        self.tick()
+        head = self.head()
+        self.approve(102 if 102 not in numbers else 112, {"B.lean": "b\n"})
+        self.approve(103 if 103 not in numbers else 113, {"C.lean": "c\n"})
+        self.tick()
+        self.github.start_runs()
+        self.clock.advance(60)
+        self.github.progress_runs("sandboxed-build", "building")
+        return head, self.open_batch()
+
+    def run_of(self, batch_id):
+        return [run for run in self.github.runs if run.batch_id == str(batch_id)][-1]
+
+    def set_phases(self, run, *, built=True, publisher=None, conclusion="success"):
+        """The run's phases: the build step (concluded `success` when `built`), then a publisher that is
+        `queued` (waiting for a runner), `started`, or `completed` with `conclusion`."""
+        now = self.clock()
+        phases = [
+            CandidatePhase("sandboxed-build", now - 600, None, "in_progress"),
+            CandidatePhase(
+                BUILD_STEP, now - 600, now - 60 if built else None, "completed" if built else "in_progress",
+                "success" if built else "",
+            ),
+        ]  # fmt: skip
+        if publisher == "queued":
+            phases.append(CandidatePhase(f"{CANDIDATE_PUBLICATION_JOB} / publish", None, None, "queued"))
+        elif publisher == "started":
+            phases.append(CandidatePhase(HANDOFF_STEP, now - 30, now - 20, "completed", "success"))
+            phases.append(CandidatePhase(f"{CANDIDATE_PUBLICATION_JOB} / publish", now - 10, None, "in_progress"))
+        elif publisher == "completed":
+            phases.append(
+                CandidatePhase(f"{CANDIDATE_PUBLICATION_JOB} / publish", now - 10, now, "completed", conclusion)
+            )
+        run.status, run.updated_at, run.phases = "in_progress", now, phases
+
+    def land_all(self, rounds=6):
+        for _ in range(rounds):
+            self.run_ci()
+            self.tick(2)
+            if self.head() is None:
+                return
+
+    def test_publication_phases_are_pinned(self):
+        self.assertTrue(BUILD_STEP.split(": ", 1)[1].startswith(CANDIDATE_BUILD_STEP))
+        self.assertTrue(HANDOFF_STEP.split(": ", 1)[1].startswith(CANDIDATE_HANDOFF_STEP))
+        build = {"name": BUILD_STEP, "started_at": 1, "completed_at": 2, "status": "completed", "detail": "success"}
+        job = {"name": f"pr-build / {CANDIDATE_PUBLICATION_JOB} / publish", "started_at": 3, "status": "in_progress"}
+        queued = dict(job, started_at=None, status="queued")
+        failed = dict(job, completed_at=4, status="completed", detail="failure")
+        self.assertTrue(publishing([build, job]))
+        prefixed = dict(build, name=f"pr-build / {BUILD_STEP}")  # a stub caller of a reusable pr-build
+        self.assertTrue(publishing([prefixed, dict(job, name=f"pr-build / {HANDOFF_STEP}")]))
+        self.assertFalse(publishing([build, queued]), "a publisher waiting for a runner has not started")
+        self.assertFalse(publishing([build, failed]))
+        self.assertFalse(publishing([dict(build, detail="failure"), job]))
+        self.assertFalse(publishing([job]))
+
+    def test_evicts_a_building_head_and_cancels_its_run_then_the_head_returns_and_lands(self):
+        head, successor = self.running_head()
+        run = self.run_of(head["id"])
+        self.approve(104, {"D.lean": "d\n"})
+        self.emergency(104)
+        self.tick()
+        emergency = self.controller._emergency_batch()
+        self.assertEqual(self.head()["id"], emergency["id"])
+        evicted = self.batch(head["id"])
+        self.assertEqual((evicted["state"], evicted["sealed"], evicted["version"]), ("open", 1, head["version"]))
+        self.assertEqual(evicted["prepared_version"], head["version"])
+        self.assertEqual((run.status, run.conclusion), ("completed", "cancelled"))
+        [attempt] = self.attempts(head["id"])
+        self.assertEqual(attempt["outcome"], "superseded")
+        [entry] = self.journal("evicted")
+        self.assertEqual((entry["by"], entry["why"], entry["held"]), (emergency["id"], "run in_progress", False))
+        self.assertEqual(self.controller.status()["emergency"]["cancel_intents"], [])
+        self.land_all()
+        self.assertEqual([self.repo.file_at("main", f) for f in ("D.lean", "F101.lean")], ["d\n", "101\n"])
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "landed")
+        self.assertEqual(self.batch(head["id"])["state"], "landed")
+        self.assertIsNone(self.controller._state(f"emergency_evicted:{head['id']}"), "the marker is cleared")
+        fast_forwards = [c for c, _ in self.github.calls].count("fast_forward")
+        self.assertEqual(fast_forwards, 3, "every landing went through the queue")
+
+    def test_a_queued_publisher_is_evicted_but_a_started_one_waits_until_it_fails(self):
+        head, _ = self.running_head()
+        run = self.run_of(head["id"])
+        self.set_phases(run, publisher="started")
+        self.approve(104, {"D.lean": "d\n"})
+        self.emergency(104)
+        self.tick()
+        self.assertEqual(self.head()["id"], head["id"], "a started publisher is protected")
+        self.assertEqual(run.status, "in_progress")
+        self.assertIn("publishing its final oleans", self.journal("emergency-waits")[-1]["why"])
+        reads = len([c for c, _ in self.github.calls if c == "find_candidate_run"])
+        self.tick()
+        self.assertEqual(
+            len([c for c, _ in self.github.calls if c == "find_candidate_run"]), reads, "no read on every pass"
+        )
+        self.set_phases(run, publisher="completed", conclusion="failure")
+        self.clock.advance(self.controller.setting("polling_interval_seconds"))
+        self.tick()
+        self.assertEqual(self.head()["urgent"], 2, "a failed publication is no longer protected")
+        self.assertEqual(run.conclusion, "cancelled")
+        # A publisher still waiting for a runner has not started: evicted at once.
+        self.land_all()
+        self.approve(105, {"E.lean": "e\n"})
+        self.tick()
+        second = self.head()
+        self.github.start_runs()
+        self.set_phases(self.run_of(second["id"]), publisher="queued")
+        self.approve(106, {"G.lean": "g\n"})
+        self.emergency(106)
+        self.tick()
+        self.assertEqual(self.head()["urgent"], 2)
+        self.assertEqual(self.batch(second["id"])["state"], "open")
+
+    def test_a_pending_promotion_a_pass_and_a_successful_run_are_protected(self):
+        head, _ = self.running_head()
+        run = self.run_of(head["id"])
+        # P3: the run completed `success` and its verdicts are still being bound.
+        run.status, run.conclusion, run.completed_at = "completed", "success", self.clock()
+        self.approve(104, {"D.lean": "d\n"})
+        self.emergency(104)
+        self.tick()
+        self.assertEqual(self.head()["id"], head["id"])
+        self.assertIn("verdict is being bound", self.journal("emergency-waits")[-1]["why"])
+        # P1 and P2: it passed and its promotion is queued (and here keeps failing).
+        self.github.fail_next["fast_forward"] = 10
+        for context in ("build", "bump-guard", "scope"):
+            self.github.statuses[(run.head_sha, context)] = Status(
+                "success", "ok", run.to_candidate_run().html_url, self.clock(), run.run_id
+            )
+        self.clock.advance(self.controller.setting("polling_interval_seconds"))
+        self.tick()
+        self.assertEqual(self.head()["id"], head["id"])
+        self.assertEqual(self.attempts(head["id"])[-1]["outcome"], "pass")
+        self.assertTrue(self.controller.store.rows("outbox", {"kind": "promote", "state": "pending"}))
+        self.tick()
+        self.assertEqual(self.head()["id"], head["id"])
+        self.assertIn(self.journal("emergency-waits")[-1]["why"], (
+            f"head {head['id']} (its promotion is pending)", f"head {head['id']} (it passed and is about to land)",
+        ))  # fmt: skip
+        self.assertEqual(self.journal("evicted"), [])
+
+    def test_a_stale_pending_attempt_refreshed_as_a_failed_publication_is_evicted(self):
+        head, _ = self.running_head()
+        run = self.run_of(head["id"])
+        self.set_phases(run, publisher="started")
+        self.tick()  # observed publishing
+        self.set_phases(run, publisher="completed", conclusion="failure")
+        run.status, run.conclusion, run.completed_at = "completed", "failure", self.clock()
+        self.approve(104, {"D.lean": "d\n"})
+        self.emergency(104)
+        self.clock.advance(self.controller.setting("polling_interval_seconds"))
+        self.tick()
+        self.assertEqual(self.head()["urgent"], 2)
+        self.assertEqual(self.journal("evicted")[0]["why"], "run completed")
+
+    def test_strict_observation_failure_does_not_evict_and_a_prepared_attempt_is_not_sent(self):
+        head, _ = self.running_head()
+        self.approve(104, {"D.lean": "d\n"})
+        self.emergency(104)
+        self.github.fail_next["find_candidate_run"] = 1
+        self.tick()
+        self.assertEqual(self.head()["id"], head["id"])
+        self.assertIn("could not be read", self.journal("emergency-waits")[-1]["why"])
+        [attempt] = self.attempts(head["id"])
+        self.controller.store.update(
+            "ci_attempts", {"id": attempt["id"]}, dispatch_state="prepared", run_id=None, run_status=""
+        )
+        dispatches = len(self.github.dispatches)
+        self.tick()
+        self.assertEqual(self.head()["urgent"], 2)
+        self.assertEqual(self.journal("evicted")[0]["why"], "dispatch prepared")
+        mine = [d for d in self.github.dispatches[dispatches:] if d["client_payload"]["batch_id"] == str(head["id"])]
+        self.assertEqual(mine, [], "the eviction check never sends a prepared attempt")
+
+    def test_a_promotion_refusal_hold_is_evicted_and_the_head_returns_to_it(self):
+        head, _ = self.running_head()
+        [attempt] = self.attempts(head["id"])
+        hold = f"source-ci:promotion-hold:{attempt['id']}"
+        self.controller.store.set_setting(hold, {"kind": "PromotionRefused"})
+        self.controller._enqueue("promote", f"promote:{head['id']}:{head['version']}:{head['tip']}", {})
+        self.approve(104, {"D.lean": "d\n"})
+        self.emergency(104)
+        self.tick()
+        self.assertEqual(self.head()["urgent"], 2, "a hold is never protection, even with a promote entry")
+        kept = self.controller.store.row("ci_attempts", {"id": attempt["id"]})
+        self.assertEqual(kept["outcome"], "pending", "its attempt is kept")
+        self.assertIsNone(self.controller._state(f"cancel_intent:{attempt['id']}"))
+        self.assertTrue(self.journal("evicted")[0]["held"])
+        self.controller.cancel_emergency(PROJECT, 104, "admin-worker", surface="test")
+        self.tick()
+        self.assertEqual(self.head()["id"], head["id"], "E ending returns the evicted head at once")
+        self.assertEqual(self.controller._current_attempt(self.head())["id"], attempt["id"], "back to its hold")
+        self.assertIsNotNone(self.controller.store.get_setting(hold))
+
+    def test_a_silent_started_publisher_gets_no_lost_run_verdict(self):
+        self.controller.set_setting("emergency_evict", False, "t")
+        head, _ = self.running_head()
+        run = self.run_of(head["id"])
+        self.set_phases(run, publisher="started")
+        self.tick()
+        run.updated_at = self.clock()
+        self.clock.advance(self.controller.setting("lost_run_seconds") + 60)
+        reasons = self.tick()
+        self.assertEqual(self.attempts(head["id"])[-1]["outcome"], "pending")
+        self.assertTrue(any("publishing its final oleans, not treated as lost" in r for r in reasons), reasons)
+        self.assertEqual(run.status, "in_progress")
+
+    def test_crash_after_the_eviction_transaction_cancels_on_restart(self):
+        head, _ = self.running_head()
+        run = self.run_of(head["id"])
+        self.approve(104, {"D.lean": "d\n"})
+        self.emergency(104)
+        with patch.object(self.controller, "_settle_cancel_intents"):
+            self.tick()
+        self.assertEqual(self.head()["urgent"], 2)
+        self.assertEqual(run.status, "in_progress", "the crash came before the cancel")
+        restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
+        self.addCleanup(restarted.store.close)
+        restarted.recover()
+        restarted.tick()
+        self.assertEqual((run.status, run.conclusion), ("completed", "cancelled"))
+
+    def test_displacing_the_heads_own_pr_moves_ownership_only_with_the_swap(self):
+        head, successor = self.running_head(101, 102)
+        run = self.run_of(head["id"])
+        self.set_phases(run, publisher="started")
+        self.emergency(102)
+        self.tick()
+        self.assertIsNone(self.controller._emergency_batch(), "nothing is allocated while the head is protected")
+        row = self.controller.input_for(PROJECT, 102)
+        self.assertEqual((row["state"], row["batch_id"]), ("inserted", head["id"]))
+        self.set_phases(run)
+        self.clock.advance(self.controller.setting("polling_interval_seconds"))
+        self.tick()
+        emergency = self.head()
+        self.assertEqual((emergency["urgent"], [m["number"] for m in self.members(emergency)]), (2, [102]))
+        row = self.controller.input_for(PROJECT, 102)
+        self.assertEqual(row["batch_id"], emergency["id"])
+        self.assertEqual(json.loads(row["evidence"])["emergency"]["displaced"]["batch_id"], head["id"])
+        self.assertEqual(self.batch(head["id"])["state"], "open")
+        self.land_all()
+        self.assertEqual(
+            self.controller.input_for(PROJECT, 102)["landed_sha"], self.members(emergency)[0]["commit_sha"]
+        )
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "landed")
+        self.assertEqual(len(self.github.comments_for(102)), 1, "one landing comment")
+
+    def test_the_evicted_heads_retained_repair_is_adopted_and_e_keeps_its_head_slot(self):
+        self.controller.set_setting("repair_concurrency", 1, "t")
+        self.github.ci_policy = fail_members(101)
+        head, _ = self.running_head()
+        self.run_ci()
+        self.tick()
+        [repair] = self.controller.store.rows("tasks", {"batch_id": head["id"], "state": "open"})
+        retained = self.agent(
+            "retained",
+            script=lambda task: {f"{PROJECT}#101": Resolution({"F101.lean": "fixed\n"}, explanation="Fixed.")},
+        )
+        task = retained.claim(self.controller)
+        self.assertEqual(task.task_id, repair["id"])
+        self.github.ci_policy = fail_members(101, 104)
+        self.approve(104, {"D.lean": "d\n"})
+        self.emergency(104)
+        self.tick()
+        emergency = self.head()
+        self.assertEqual(emergency["urgent"], 2, "a source failure under repair is evicted")
+        self.assertEqual(self.journal("evicted")[0]["tasks"], [repair["id"]])
+        self.run_ci()
+        self.tick()
+        [head_task] = self.controller.store.rows("tasks", {"batch_id": emergency["id"], "state": "open"})
+        second = self.agent("second", login="second-admin").claim(self.controller)
+        self.assertIsNotNone(second, "E's repair is claimable beside the retained claim")
+        self.assertEqual(second.task_id, head_task["id"])
+        adoption = self.controller.submit_task(task.task_id, task.claim_token, retained.produce(task))
+        self.assertTrue(adoption.accepted, adoption)
+        evicted = self.batch(head["id"])
+        self.assertEqual((evicted["state"], evicted["prepared_version"]), ("open", evicted["version"]))
+        self.tick()
+        kinds = {t["kind"] for t in self.controller.store.rows("tasks", {"batch_id": head["id"], "state": "open"})}
+        self.assertNotIn("prepare", kinds, "own-base preparation is not repeated")
+
+    def test_an_unclaimed_retained_repair_is_background_work(self):
+        self.controller.set_setting("repair_concurrency", 2, "t")
+        self.controller.set_setting("prepare_min_members", 1, "t")
+        self.controller.set_setting("prepare_quiet_seconds", 0, "t")
+        self.github.ci_policy = fail_members(101)
+        head, _ = self.running_head()
+        self.run_ci()
+        self.tick()
+        [repair] = self.controller.store.rows("tasks", {"batch_id": head["id"], "state": "open"})
+        self.github.ci_policy = verdicts()
+        self.approve(104, {"D.lean": "d\n"})
+        self.emergency(104)
+        self.tick()
+        self.assertEqual(self.head()["urgent"], 2)
+        self.assertTrue(self.controller.store.rows("tasks", {"kind": "prepare", "state": "open"}))
+        task = self.agent().claim(self.controller)
+        self.assertEqual(task.task_id, repair["id"], "still claimable while its batch waits, ahead of preparation")
+        self.assertIsNone(
+            self.agent("other", login="second-admin").claim(self.controller), "it takes the one background slot"
+        )
+
+    def test_ending_the_emergency_batch_returns_the_head_without_readopting_a_run_being_cancelled(self):
+        head, _ = self.running_head()
+        old = self.run_of(head["id"])
+        self.approve(104, {"D.lean": "d\n"})
+        self.emergency(104)
+        with patch.object(self.controller, "_settle_cancel_intents"):
+            # The cancel intent stays unsettled (a crash, a lookup or cancel still being retried).
+            self.tick()
+            [attempt] = self.attempts(head["id"])
+            self.assertIsNotNone(self.controller._state(f"cancel_intent:{attempt['id']}"))
+            self.controller.cancel_emergency(PROJECT, 104, "admin-worker", surface="test")
+            self.tick()
+        self.assertEqual(self.head()["id"], head["id"], "E ending returns the evicted head at once")
+        self.assertEqual(len(self.attempts(head["id"])), 2, "a new attempt instead of readopting the old run")
+        self.assertEqual(self.journal("run-readopted"), [])
+        self.tick()
+        new = self.run_of(head["id"])
+        self.assertNotEqual(new.run_id, old.run_id)
+        self.assertEqual((old.status, old.conclusion), ("completed", "cancelled"))
+        self.assertNotEqual(new.conclusion, "cancelled", "the intent cancels only the old run")
+        self.land_all()
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "landed")
+
+    def test_an_old_intent_without_a_run_never_cancels_the_returning_heads_new_run(self):
+        head, _ = self.running_head()
+        self.approve(104, {"D.lean": "d\n"})
+        self.emergency(104)
+        with patch.object(self.controller, "_settle_cancel_intents"):
+            self.tick()
+            [attempt] = self.attempts(head["id"])
+            self.controller.store.update(
+                "ci_attempts", {"id": attempt["id"]}, run_id=None, run_status="", dispatch_state="uncertain"
+            )
+            self.controller.cancel_emergency(PROJECT, 104, "admin-worker", surface="test")
+            self.tick()
+        self.assertEqual(len(self.attempts(head["id"])), 2)
+        self.controller.store.update("ci_attempts", {"id": self.attempts(head["id"])[-1]["id"]}, run_id=None)
+        self.tick()
+        self.assertNotEqual(self.run_of(head["id"]).conclusion, "cancelled", "the new run is not taken")
+        self.assertIsNone(self.controller._state(f"cancel_intent:{attempt['id']}"))
+
+    def test_displacing_a_head_member_respects_the_sealing_barriers(self):
+        head, _ = self.running_head(101, 102)
+        self.controller._set_state("inference_hold", {"since": self.clock(), "last_error": "t"})
+        self.emergency(102)
+        self.tick()
+        self.assertEqual(self.head()["id"], head["id"])
+        self.assertIsNone(self.controller._emergency_batch())
+        self.assertIn("inference hold", self.journal("emergency-waits")[-1]["why"])
+
+    def test_zero_repair_concurrency_still_refuses_every_claim(self):
+        self.controller.set_setting("repair_concurrency", 0, "t")
+        self.github.ci_policy = fail_members(101)
+        self.running_head()
+        self.run_ci()
+        self.tick()
+        self.assertTrue(self.controller.store.rows("tasks", {"kind": "repair", "state": "open"}))
+        self.assertIsNone(self.agent().claim(self.controller))
+
+    def test_successor_claimed_pre_rebase_survives_eviction_and_is_carried_onto_the_returning_head(self):
+        self.controller.set_setting("repair_concurrency", 2, "t")
+        self.approve(101, {"Shared.lean": "line one\nline two changed by 101\nline three\n"})
+        self.tick()
+        head = self.head()
+        self.approve(102, {"Shared.lean": "line one\nline two changed by 102\nline three\n"})
+        self.tick()
+        successor = self.open_batch()
+        agent = self.agent(
+            script=lambda task: {
+                f"{PROJECT}#102": Resolution(
+                    {"Shared.lean": "line one\nline two changed by 101 and 102\nline three\n"}, explanation="Merged."
+                )
+            }
+        )
+        task = agent.claim(self.controller)
+        self.assertEqual((task.kind, task.onto), ("pre_rebase", head["tip"]))
+        self.github.start_runs()
+        self.approve(104, {"D.lean": "d\n"})
+        self.emergency(104)
+        self.tick()
+        self.assertEqual(self.head()["urgent"], 2)
+        self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["state"], "open")
+        adoption = self.controller.submit_task(task.task_id, task.claim_token, agent.produce(task))
+        self.assertTrue(adoption.accepted, adoption)
+        self.assertEqual(self.batch(successor["id"])["pre_rebase_onto"], head["tip"])
+        self.land_all()
+        self.assertEqual(
+            self.repo.file_at("main", "Shared.lean"), "line one\nline two changed by 101 and 102\nline three\n"
+        )
+        self.assertEqual(self.controller.input_for(PROJECT, 102)["state"], "landed")
 
 
 if __name__ == "__main__":

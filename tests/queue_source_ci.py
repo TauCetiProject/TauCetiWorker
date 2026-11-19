@@ -18,7 +18,7 @@ from tauceti_queue import monitoring
 from tauceti_queue import runtime as rt
 from tauceti_queue.ci_execution import CandidateObservation
 from tauceti_queue.ci_requests import RequestLedger
-from tauceti_queue.controller import LOG_GRACE_SECONDS, SOURCE_PHASES_INTERVAL_SECONDS, Controller
+from tauceti_queue.controller import LOG_GRACE_SECONDS, SOURCE_PHASES_INTERVAL_SECONDS, Controller, ControllerError
 from tauceti_queue.fakes import make_controller, run_git
 from tauceti_queue.github_adapter import RateLimited
 from tauceti_queue.ports import CandidatePhase, CandidateRun, DispatchNotAccepted, PromotionRefused
@@ -323,6 +323,42 @@ class SourceController(unittest.TestCase):
         self.assertEqual(current["phases"], "[]")
         self.assertTrue(any("source CI phases unavailable" in reason for reason in reasons), reasons)
         self.assertIsNone(self.controller.status()["head"]["ci"]["current_step"])
+
+    def test_eviction_reads_source_phases_afresh_and_needs_them(self):
+        attempt = self.start()
+        frozen = self.ledger.load(attempt["id"])
+        self.execution.add(frozen)
+        publishing = (
+            CandidatePhase("sandboxed-build", 100, None, "in_progress"),
+            CandidatePhase(
+                "sandboxed-build: Build exact candidate under bwrap, offline", 100, 200, "completed", "success"
+            ),
+            CandidatePhase("publish-merge-group-cache / publish", 210, None, "in_progress"),
+        )
+        phases = {"value": self.running_phases(2)}
+        reads = []
+
+        def progress(_frozen, run):
+            reads.append(run.run_id)
+            if phases["value"] is None:
+                raise OSError("rate limited")
+            return replace(run, phases=phases["value"])
+
+        self.execution.progress = progress
+        self.clock.advance(60)
+        self.controller.tick()
+        self.assertEqual(len(reads), 1)
+        head = self.store.rows("batches")[0]
+        phases["value"] = publishing
+        with self.controller._lock:
+            # Within SOURCE_PHASES_INTERVAL_SECONDS of the last read: the eviction check reads them again.
+            row = self.controller._eviction_observation(head, attempt, self.clock())
+            self.assertEqual(len(reads), 2)
+            self.assertEqual(self.controller._protection(head, row, observed=True), "it is publishing its final oleans")
+            phases["value"] = None
+            with self.assertRaises(ControllerError):
+                self.controller._eviction_observation(head, row, self.clock())
+        self.assertEqual(self.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "pending")
 
     def test_acknowledged_dispatch_without_evidence_resends_once_after_timeout(self):
         self.check_unknown_dispatch_recovery(lost=False)
