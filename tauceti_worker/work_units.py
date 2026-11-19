@@ -516,16 +516,23 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         return run_sources(w, opts, use_fleet_focus=use_fleet_focus)
     if "security-audit" in opts.only:
         from .activity import select
-        from .security_audit import run
+        from .security_audit import run, watch
 
         other_tasks = [task for task in opts.only if task != "security-audit"]
         if not other_tasks:
             select("security-audit")
-            return run(w.cfg, opts)  # No PR survey or general-purpose agent launcher.
+            try:
+                return run(w.cfg, opts)  # No PR survey or general-purpose agent launcher.
+            finally:
+                if not opts.dry_run:
+                    watch(w.cfg, min_commits=1)
         try:
             minimum = int(os.environ.get("TAUCETI_SECURITY_AUDIT_MIN_COMMITS", "20"))
         except ValueError:
             raise Die("TAUCETI_SECURITY_AUDIT_MIN_COMMITS must be a positive integer") from None
+        # Every round, including maintenance turns and failed audits: the cursor moves or the operator hears.
+        if not opts.dry_run:
+            watch(w.cfg, min_commits=minimum)
         # The audit and the maintenance tasks sharing this worker take turns: after a round that ran
         # the audit, the next round goes to maintenance, so a long audit backlog cannot starve bumps.
         # Any audit failure, even an unexpected one, also falls through to maintenance.

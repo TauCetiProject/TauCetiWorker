@@ -1218,6 +1218,20 @@ class MaintenanceScheduling(unittest.TestCase):
             self.assertEqual(wu.run_round(self.worker, self.opts), 0)
         maintenance.assert_not_called()
 
+    def test_watchdog_runs_on_audit_and_maintenance_turns_and_failures(self):
+        with (
+            patch.dict(os.environ, {"TAUCETI_SECURITY_AUDIT_MIN_COMMITS": "20"}),
+            patch.object(sa, "watch") as watch,
+            patch.object(sa, "run", side_effect=[0, Die("finding")]),
+            patch.object(wu, "mirror_creds", side_effect=RuntimeError("maintenance reached")),
+        ):
+            self.assertEqual(wu.run_round(self.worker, self.opts), 0)
+            for _ in range(2):  # The maintenance turn, then a failed audit falling through.
+                with self.assertRaisesRegex(RuntimeError, "maintenance reached"):
+                    wu.run_round(self.worker, self.opts)
+        self.assertEqual(watch.call_count, 3)
+        self.assertEqual(watch.call_args.kwargs, {"min_commits": 20})
+
     def test_audit_and_maintenance_take_turns(self):
         with (
             patch.object(sa, "run", return_value=0) as audit,

@@ -212,6 +212,18 @@ class Ordering(PoolFixture):
         self.assertGreaterEqual(len(blocked), 3)
         self.assertTrue(all("unsafe IO" in b["reason"] for b in blocked))
 
+    def test_every_pass_feeds_the_cursor_watchdog(self):
+        seen = []
+
+        def check(work, observe, *, min_commits):
+            seen.append(observe())
+
+        with patch.object(pool.audit_watchdog, "check", side_effect=check):
+            self.serve(lambda batch, attempt: self.verdict(batch))
+        self.assertTrue(seen)
+        self.assertEqual(seen[0], (self.shas[0], self.commits))
+        self.assertTrue(all(isinstance(c, str) and isinstance(n, int) for c, n in seen))
+
     def test_non_operational_failure_blocks_without_retry(self):
         def inspect(batch, attempt):
             if self.index(batch) == 0:

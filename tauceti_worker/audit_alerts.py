@@ -159,63 +159,80 @@ def content(value: dict, work: Path, marker: str) -> str:
     )
 
 
-def notify_block(work: Path, block: dict) -> None:
-    """Notification failure never clears a block or stops maintenance; retry after 15 minutes."""
+def deliver(work: Path, identity: dict, render) -> bool:
+    """Send one private DM per identity, durably deduplicated; True once it is known delivered.
+
+    `render(marker)` builds the message; the marker lets an ambiguous earlier POST be reconciled.
+    Raises on delivery failure after recording a 15-minute backoff; callers decide how to log.
+    """
     configured = os.environ.get("TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG")
     if not configured:
+        return False
+    config = json.loads(Path(configured).read_text())
+    key = hashlib.sha256(
+        json.dumps([config["site"], config["recipient_id"], identity], sort_keys=True).encode()
+    ).hexdigest()
+    marker = "tauceti-audit-" + key
+    path = work / "zulip-alerts.json"
+    state = json.loads(path.read_text()) if path.exists() else {}
+    previous = state.get(key, {})
+    if previous.get("message_id"):
+        return True
+    if previous.get("retry_at", 0) > time.time():
+        return False
+    state[key] = {"retry_at": time.time() + 900}
+    save(path, state)  # Back off even if reconciliation fails.
+    # A previous POST may have succeeded before its response or local receipt was lost.
+    # Reconcile only this bot's configured private conversation before re-sending.
+    if previous:
+        recent = request(
+            config,
+            "GET",
+            {
+                "narrow": json.dumps([{"operator": "dm", "operand": [config["recipient_id"]]}]),
+                "anchor": "newest",
+                "num_before": 100,
+                "num_after": 0,
+                "apply_markdown": "false",
+            },
+        )
+        found = next((m for m in recent["messages"] if marker in m["content"]), None)
+        if found:
+            state[key] = {"message_id": found["id"]}
+            save(path, state)
+            return True
+    result = request(
+        config,
+        "POST",
+        {"type": "direct", "to": json.dumps([config["recipient_id"]]), "content": render(marker)},
+    )
+    state[key] = {"message_id": result["id"]}
+    save(path, state)
+    log(f"security-audit: sent private Zulip alert {result['id']}")
+    return True
+
+
+ALERT_ERRORS = (OSError, ValueError, KeyError, TypeError, AttributeError)
+
+
+def delivery_pending(exc: BaseException) -> None:
+    # The cause, never the request (which carries the bot credential), so a persistent delivery
+    # failure such as TLS verification is visible in the log rather than retried blindly.
+    log(
+        f"security-audit: private Zulip alert delivery pending ({type(exc).__name__}: {str(exc)[:200]}); "
+        "retained block remains in force"
+    )
+
+
+def notify_block(work: Path, block: dict) -> None:
+    """Notification failure never clears a block or stops maintenance; retry after 15 minutes."""
+    if not os.environ.get("TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG"):
         return
     try:
         value = report(work, block)
         if not actionable(work, value):
             return  # A transient operational pause: no private alert before one hour.
-        config = json.loads(Path(configured).read_text())
         identity = {key: value[key] for key in ("kind", "from_sha", "to_sha")}
-        key = hashlib.sha256(
-            json.dumps([config["site"], config["recipient_id"], identity], sort_keys=True).encode()
-        ).hexdigest()
-        marker = "tauceti-audit-" + key
-        path = work / "zulip-alerts.json"
-        state = json.loads(path.read_text()) if path.exists() else {}
-        previous = state.get(key, {})
-        if previous.get("message_id") or previous.get("retry_at", 0) > time.time():
-            return
-        state[key] = {"retry_at": time.time() + 900}
-        save(path, state)  # Back off even if reconciliation fails.
-        # A previous POST may have succeeded before its response or local receipt was lost.
-        # Reconcile only this bot's configured private conversation before re-sending.
-        if previous:
-            recent = request(
-                config,
-                "GET",
-                {
-                    "narrow": json.dumps([{"operator": "dm", "operand": [config["recipient_id"]]}]),
-                    "anchor": "newest",
-                    "num_before": 100,
-                    "num_after": 0,
-                    "apply_markdown": "false",
-                },
-            )
-            found = next((m for m in recent["messages"] if marker in m["content"]), None)
-            if found:
-                state[key] = {"message_id": found["id"]}
-                save(path, state)
-                return
-        result = request(
-            config,
-            "POST",
-            {
-                "type": "direct",
-                "to": json.dumps([config["recipient_id"]]),
-                "content": content(value, work, marker),
-            },
-        )
-        state[key] = {"message_id": result["id"]}
-        save(path, state)
-        log(f"security-audit: sent private Zulip alert {result['id']}")
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
-        # The cause, never the request (which carries the bot credential), so a persistent delivery
-        # failure such as TLS verification is visible in the log rather than retried blindly.
-        log(
-            f"security-audit: private Zulip alert delivery pending ({type(exc).__name__}: {str(exc)[:200]}); "
-            "retained block remains in force"
-        )
+        deliver(work, identity, lambda marker: content(value, work, marker))
+    except ALERT_ERRORS as exc:
+        delivery_pending(exc)

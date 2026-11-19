@@ -309,6 +309,19 @@ receipt suppresses repeated alerts for the same blocked range and kind. Failed
 delivery is retried on a subsequent audit round after at least 15 minutes, checking
 the latest 100 messages in that private conversation for an earlier ambiguous delivery.
 Notification failure preserves the audit block and allows bump/progress work to continue.
+
+With alerts configured, one cursor watchdog guarantees that the cursor is advancing or the
+operator has a DM. Every audit round (including maintenance turns and failed audits), every
+pool pass and the standalone command below record the cursor in `security-audit/stall.json`.
+Once audit work is due at one cursor (at least the configured threshold pending, or an
+inspection already started there) and that cursor has not moved for an hour, an **Operational
+stall** DM is sent, then again daily while it stays held. An unobservable cursor (GitHub or
+git failures) counts as held, and the DM names the error. Run the command from a timer to
+cover a Worker or pool that is dead or busy for longer than an hour:
+
+```bash
+python3 -m tauceti_worker.security_audit watchdog --state /path/to/worker/state/security-audit
+```
 Without this setting, reporting remains local to the worker's evidence and logs.
 
 Codex Luna has the native persistent goal tools enabled, with a goal to inspect
