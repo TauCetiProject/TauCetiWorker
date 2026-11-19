@@ -110,7 +110,8 @@ Darwin host paths keep their original spelling because resolving `/tmp` or
 
 What the worker mounts must itself sit under an allowed path: its state and
 data directories, the Python environment it is installed in,
-`TAUCETI_GITHUB_SHARED_DIR` and a `TAUCETI_REVIEW_ENGINE_DIR` checkout. With
+`TAUCETI_GITHUB_SHARED_DIR`, `TAUCETI_SHARED_REPOSITORIES_DIR` and a
+`TAUCETI_REVIEW_ENGINE_DIR` checkout. With
 `TAUCETI_VERIFY_HELPER=1`, set `TAUCETI_VERIFY_CACHE_DIR` as well, because its
 default is under `/tmp`.
 

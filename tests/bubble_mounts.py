@@ -70,6 +70,18 @@ with patch.object(tc.agents.sys, "platform", "linux"):
         f"{link}:/opt/x:ro:extra",
     ):
         check(f"unsupported mount syntax is left alone: {spec}", tc.agents.resolved_mount(spec) == spec)
+    # Python 3.11/3.12 raise RuntimeError for a loop even with strict=False;
+    # newer pathlib versions may instead leave it for the mount runtime.
+    with patch.object(tc.agents.Path, "resolve", side_effect=RuntimeError("Symlink loop")):
+        try:
+            tc.agents.resolved_mount(f"{link}:/opt/cycle:ro")
+        except tc.Die as error:
+            check(
+                "a resolution failure has an explicit mount-source diagnostic",
+                "cannot resolve Bubble mount source" in str(error),
+            )
+        else:
+            check("a failed resolution is rejected", False)
 
 with (
     patch.object(tc.agents.sys, "platform", "darwin"),

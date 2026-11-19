@@ -2568,7 +2568,11 @@ def resolved_mount(spec: str) -> str:
         or (len(parts) == 3 and parts[2] not in ("ro", "rw"))
     ):
         return spec
-    return ":".join([str(Path(parts[0]).resolve()), *parts[1:]])
+    try:
+        source = str(Path(parts[0]).resolve())
+    except (OSError, RuntimeError) as error:
+        raise Die(f"cannot resolve Bubble mount source {parts[0]}: {error}") from None
+    return ":".join([source, *parts[1:]])
 
 
 def run_in_bubble(
@@ -2731,6 +2735,7 @@ def run_in_bubble(
     snapshot = os.environ.get("TAUCETI_CONF_SNAPSHOT")
     if snapshot:
         mount_flags += ["--mount", f"{snapshot}:/opt/project.toml:ro"]
+
     # Fork-PR write support (kim-em/bubble#320): grant the in-container agent git fetch/push to the
     # contributor's own fork on top of the base-scoped GitHub access, so it can push an authored branch
     # (roadmap) or a fix to a fork-headed PR. The base repo keeps its allowlist-write-graphql scope; the
