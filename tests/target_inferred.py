@@ -6,6 +6,7 @@ tick only in the look that made it, and that all of it is off by default. No for
 import importlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -284,6 +285,72 @@ class Reopen(Tmp):
         with patch("tauceti_worker.activity.current_round_id", return_value="0123456789abcdef"):
             work._reopen_reported((directory, item, needs))
         self.assertIn("by zero-one round 0123456789ab)", self.path.read_text())
+
+
+class AuthoringRound(Tmp):
+    """A roadmap round handed `zero-one`, whose need `tail-sigma` is an inferred tick."""
+
+    def setUp(self):
+        super().setUp()
+        self.path = self.tmp / "list" / "targets.md"
+        self.path.parent.mkdir()
+        self.path.write_text(LIST.replace("- [ ] `strong-law`", "- [~] `strong-law`"))
+        self.write = None
+        self.prompts = []
+        env = {
+            "TAUCETI_ROADMAP_TARGETS": str(self.path),
+            "TAUCETI_RUNTIME_STATUS": str(self.tmp / "status.json"),
+            "TAUCETI_RESPECT_CLAIMS": "false",
+            "TAUCETI_ROADMAP_SKIP": "",
+        }
+        for item in (
+            patch.dict(os.environ, env),
+            patch.object(work, "ensure_fork", return_value="alice/TauCeti"),
+            patch.object(work, "avoid_list", return_value="none"),
+            patch.object(
+                work, "fetch_ref", side_effect=lambda repo, dest: dest.mkdir(parents=True, exist_ok=True) or 1
+            ),
+            patch.object(work, "prepare_checkout", return_value=True),
+            patch.object(work, "claims_repo", return_value="org/claims"),
+            patch.object(work, "run_agent_host", side_effect=self.agent),
+            patch.object(work, "log"),
+            patch.object(t, "log"),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
+        cfg = SimpleNamespace(state=self.tmp / "state", wid="worker3", checkout=self.tmp / "checkout", logdir=self.tmp)
+        gh = SimpleNamespace(open_prs=lambda: [], merged_prs=lambda search, limit: [])
+        claims = SimpleNamespace(begin_target_work=lambda area, slug: 0)
+        self.w = SimpleNamespace(cfg=cfg, gh=gh, claims=claims)
+
+    def agent(self, cwd, prompt, *args, **kwargs):
+        self.prompts.append(prompt)
+        if self.write is not None:
+            found = re.search(r"to `([^`]*prerequisites\.txt)`", prompt)
+            Path(found.group(1)).write_text(self.write)
+        return 0
+
+    def author(self):
+        opts = SimpleNamespace(agent_name="Claude Code", work_model="claude", source=None)
+        work.do_roadmap(self.w, None, SimpleNamespace(reason="auto", pr=0, head=""), opts, bubble=False)
+        return self.prompts[-1]
+
+    def test_the_round_may_report_an_inferred_need_and_it_is_opened_again(self):
+        self.write = "tail-sigma\nborel\n"
+        with patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS_INFER": "1"}):
+            prompt = self.author()
+        self.assertIn("**Your target is assigned: `zero-one` in `Probability`.**", prompt)
+        self.assertIn("`tail-sigma` is marked `[x]` because the worker read the base branch's source", prompt)
+        listed = t.parse_targets(self.path.read_text())
+        self.assertEqual((listed.find("tail-sigma").status, listed.find("borel").status), ("open", "done"))
+        self.assertIn("by zero-one round", self.path.read_text())
+
+    def test_off_the_round_is_not_told_and_nothing_is_reopened(self):
+        self.write = None
+        prompt = self.author()
+        self.assertNotIn("inferred", prompt.split("Your target is assigned", 1)[1].split("```", 1)[0])
+        self.assertNotIn("prerequisites.txt", prompt)
+        self.assertEqual(t.parse_targets(self.path.read_text()).find("tail-sigma").status, "done")
 
 
 class Look(Tmp):

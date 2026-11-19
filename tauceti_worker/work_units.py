@@ -3394,5 +3394,9 @@ def _reopen_reported(report) -> None:
     directory, item, needs = report
     allowed = [dep.slug for dep in needs]
     slugs = reported(directory / "prerequisites.txt", allowed)
-    if slugs:
+    if not slugs:
+        return
+    try:
         reopen(slugs, allowed, f"{item.slug} round {(current_round_id() or str(int(time.time())))[:12]}")
+    except OSError as error:
+        log(f"target list: {', '.join(slugs)} not reopened ({error})")
