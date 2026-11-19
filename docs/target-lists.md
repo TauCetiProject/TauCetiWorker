@@ -111,6 +111,22 @@ reason, no model is started, and the loop backs off as after any round without
 progress. The same happens when pull requests cannot be read. Maintenance and
 review are unaffected by the list.
 
+### Open work when the list offers nothing
+
+With `--roadmap-targets-fallback`, `TAUCETI_ROADMAP_TARGETS_FALLBACK=1`, or
+`roadmap_targets_fallback = true` in `workers.toml`, a round the list offers
+nothing (the cases above: no eligible item, or every one tried is claimed or has
+landed) authors as a worker without a list would: an area of its own choosing
+(Fleet roadmap focus still does not apply),
+no assigned item and no author claim. Its pull request carries the ordinary
+agent-chosen marker, which counts toward an item only if it names that item's
+area and slug, as from any other worker. The round is admitted by the same rules
+as any authoring round, `max_open_prs` among them, and logs
+`→ ROADMAP open work (--roadmap-targets-fallback): <why>`. Every round asks the
+list first, so the next round the list offers an item is targeted again. A file
+that cannot be read or is not a target list, and pull requests that cannot be
+read, still author nothing. Off by default; without a list it does nothing.
+
 A roadmap round under a list costs, on each forge it reads, one listing of
 open pull requests, one search for recent landings, and one search per candidate
 tried, plus one claim push per candidate. The GitHub searches are shared
@@ -131,4 +147,4 @@ marker; in a Forgejo round its `gh pr create` goes through the source-bound
 
 While an authoring round runs, the worker's runtime status file carries
 `roadmap_target`, the item as `<Area>/<slug>`. The loop clears it between
-rounds.
+rounds. An open-work round leaves it empty and says why in `target`.
