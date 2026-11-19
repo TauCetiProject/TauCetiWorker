@@ -8,7 +8,9 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   `The runner has received a shutdown signal` (exit code 143), investigate memory pressure before
   calling it transient. A shutdown alone is not proof of OOM: a cancelled/superseded job or a reclaimed
   runner can produce it too. Diagnose the failing stage first; do not rebuild every changed file just
-  because a job was cancelled.
+  because a job was cancelled. Re-read the current head and its latest checks first: if a newer head
+  or replacement run superseded this failure, leave it alone; if the current checks are green, stop
+  without changes. A cancelled run alone does not justify an empty retry commit.
 - For a suspect file, read the failing job's actual runner class and memory allocation from its logs
   and configuration; do not assume every runner has 16 GB. Before measuring on a shared host, use a
   supported diagnostic runner that enforces a hard memory/swap cap and a timeout on the entire process
@@ -16,7 +18,8 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   `memory.max` and `memory.swap.max`). Choose a cap within the failing runner's budget and the host's
   available diagnostic allocation. A pressure-wait wrapper or a timeout on only the parent is not a
   hard process-tree bound. If no verified bounded runner is available, including on unsupported macOS
-  hosts, report local measurement unavailable and use dedicated CI capacity with explicit limits;
+  hosts, report local measurement unavailable; use dedicated CI capacity only if an existing bounded
+  diagnostic facility is available, without changing workflows or dispatching an unapproved job;
   do not run an unbounded suspect compile or assume `systemd-run` delegation is available.
   Once imports are built, run this command **inside that bounded runner**:
   `python3 -c 'import resource, subprocess, sys; subprocess.run(sys.argv[1:], check=True); print(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)' lake lean <path/to/File.lean>`
@@ -27,7 +30,18 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   signal alone proves neither OOM nor a transient failure. Leave headroom for parallel Lean tasks,
   linking and other job phases: a small per-file RSS does not prove the whole job fits. If a file
   exceeds or approaches the available budget, reduce its memory demand, for example by restructuring
-  a large `decide` so the kernel checks less at once.
+  a large `decide` so the kernel checks less at once. Restructure mathematics only for evidence of a
+  source demand exceeding the failing CI runner's budget, not merely local host pressure. These
+  bounds apply to additional diagnostic runs; they add no extra final-verification pass. An actual
+  repair still requires the normal local verification below and its resource-exhaustion stop/backoff.
+- If the cause remains undetermined and no safe diagnostic is available, do not manufacture a repair,
+  empty retry commit, closure or green result. Leave one concise evidence comment on this PR with the
+  failed run/head, observed runner allocation, available diagnostic results and what is unavailable.
+  First read existing comments: reuse equivalent evidence for the same head rather than posting it
+  again. Use `gh pr comment __PR__ --repo TauCetiProject/TauCeti --body-file <evidence-file>` and re-read
+  the PR to confirm it posted; if the command fails, exits 77 or says `NOT confirmed as posted`, stop
+  without retrying and report the evidence as unposted. Stop without pushing; this resource-blocked
+  exit is an exception to the push requirement below, not a successful repair or permission to close.
 - The `build` check includes source guards, `lake build --iofail`, shim checks,
   the audit driver (global duplicate declarations, then axioms), the module-system audit, the
   environment lint (`lint-env`) and the source style lint (`lint-style`). Find the stage that failed
@@ -60,7 +74,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
 __LOCAL_VERIFICATION__
 After the fix, run the shared final verification above once, with any additional lint modules. Fix failures and rerun only checks affected by further edits. Never push red.
 
-**Do this synchronously, in this one turn.** You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
+**Except for the explicit no-work/resource-blocked exits above, do this synchronously, in this one turn.** You are running non-interactively; nothing will resume you, so a build left running in the background is abandoned and the round ends with nothing committed or pushed. Do not yield, stop, or end your turn until you have committed and pushed (below). Pushing is the only thing that preserves your work.
 
 ## Submit
 - Commit the fix (message `<type>: <subject>`, imperative present; end the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
