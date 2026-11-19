@@ -224,6 +224,7 @@ class Service:
             canonical_branch=self.config.canonical_branch or None,
             mixed=mixed,
             revision_map_probe=module.revision_map_published,
+            live_progress=_live_progress,
         )
         self.controller.public_url = self.config.public_url
         self.controller.stuck_heads_report = str(self.config.ci_recovery_report)
@@ -356,6 +357,13 @@ class Service:
         if self._native_store_lock is not None:
             os.close(self._native_store_lock)
             self._native_store_lock = None
+
+
+def _live_progress(run_id: str, run_attempt: int) -> dict[str, Any] | None:
+    """The head run's public live build report, for the controller's stall report."""
+    from . import build_progress
+
+    return build_progress.lookup(run_id, run_attempt, fetch_json)
 
 
 def _install_signal_handlers(stop: rt.StopSignal) -> None:
