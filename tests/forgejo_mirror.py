@@ -340,6 +340,19 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(self.mirrored()["refs/forks/carol/heads/x"], self.fork_sha)
         self.assertEqual(self.health()["forks"], ["carol/TauCeti-work"])
 
+    def test_a_renamed_fork_is_followed(self):
+        self.assertEqual(self.run_mirror("--fork", "alice/TauCeti")[0], 0)
+        renamed = self.forge.repo("alice/TauCeti").rename(self.forge.root / "alice/Renamed.git")
+        self.assertTrue(renamed.exists())
+        argv = ["--repo", str(self.mirror), "fetch", "--base-url", str(self.forge.root), "--repository", "Org/TauCeti"]
+        original = mirror.discover_forks
+        mirror.discover_forks = lambda *args: ["alice/Renamed"]
+        self.addCleanup(setattr, mirror, "discover_forks", original)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(mirror.main(argv), 0)
+        self.assertEqual(self.health()["forks"], ["alice/Renamed"])
+        self.assertEqual(self.mirrored()["refs/forks/alice/heads/feature"], self.fork_sha)
+
     def test_fork_discovery_failure_keeps_known_forks(self):
         self.assertEqual(self.run_mirror("--fork", "alice")[0], 0)
         argv = ["--repo", str(self.mirror), "fetch", "--base-url", str(self.forge.root), "--repository", "Org/TauCeti"]

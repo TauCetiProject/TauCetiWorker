@@ -356,17 +356,26 @@ def run(args) -> int:
 
     name = args.repository.split("/", 1)[1]
     # A bare owner means a fork with the base repository's name.
-    owners = list(dict.fromkeys(f if "/" in f else f"{f}/{name}" for f in args.fork + health.get("forks", [])))
+    # Precedence for an owner: --fork, then the API's current answer, then what earlier runs found
+    # (a renamed fork is followed; one the API no longer lists stays mirrored).
+    discovered = []
     if args.discover_forks:
         try:
-            owners = list(dict.fromkeys(owners + discover_forks(base_url, args.repository, token_file)))
+            discovered = discover_forks(base_url, args.repository, token_file)
         except Exception as error:  # the API being down must not stop the git mirror
-            log("warning", "fork-discovery-failed", error=str(error)[:500], known=owners)
+            log("warning", "fork-discovery-failed", error=str(error)[:500], known=health.get("forks", []))
+    owners = list(
+        dict.fromkeys(f if "/" in f else f"{f}/{name}" for f in args.fork + discovered + health.get("forks", []))
+    )
+    by_owner: dict[str, str] = {}
+    for full_name in owners:
+        by_owner.setdefault(full_name.split("/", 1)[0], full_name)
+    owners = list(by_owner.values())
     sources = [Source("base", f"{base_url}/{args.repository}.git", "refs/")]
     for full_name in owners:
         owner = full_name.split("/", 1)[0]
-        if not valid_owner(owner) or any(source.live_prefix == f"{FORKS}{owner}/" for source in sources):
-            log("warning", "fork-skipped", fork=full_name, reason="invalid owner or a second fork of the same owner")
+        if not valid_owner(owner):
+            log("warning", "fork-skipped", fork=full_name, reason="owner is not a valid ref component")
             continue
         sources.append(Source(f"fork-{owner}", f"{base_url}/{full_name}.git", f"{FORKS}{owner}/"))
 
