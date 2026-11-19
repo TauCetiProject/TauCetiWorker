@@ -452,15 +452,15 @@ class AdmissionPoller:
                     {"repository": self.repo, "sha": sha, "context": detail.get("context")},
                 )
                 if (
-                    rows
+                    len(rows) == 1  # a head shared by PRs: one PR's seed proves nothing about another's evaluation
                     and cached is not None
                     and all(
                         r["generation"] == r["evaluated_generation"] and cached["seeded_at"] >= r["attempted_at"]
                         for r in rows
                     )
                 ):
-                    # The last completed evaluation of every PR at this head installed exactly this
-                    # state from its own read, and no delivery has changed it since.
+                    # The last completed evaluation of the only PR at this head installed exactly
+                    # this state from its own read, and no delivery has changed it since.
                     return
             if sha and self.controller.store.row("ci_attempts", {"head_sha": sha}):
                 return  # the service's candidate CI is output, not PR review evidence
