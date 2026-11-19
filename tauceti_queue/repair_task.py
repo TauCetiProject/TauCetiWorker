@@ -1472,17 +1472,17 @@ def warm_tree(worktree: Path, task: Task, parked_at: str | None, start_tip: str)
 
 
 def retire_worktree(cfg: RunnerConfig, task: Task, artifacts: dict | None) -> str:
-    """Park the task's tree as its batch's tree when its artifacts were prepared, else remove it."""
+    """Park the task's tree as its batch's tree when its artifacts were prepared, else remove it. A
+    cold tree (a failed fetch, its dependencies perhaps among them) is removed: a parked tree is warm."""
     from tauceti_queue import repair_cleanup
 
-    artifacts = artifacts or {}
     return repair_cleanup.retire(
         cfg.clone,
         cfg.root,
         task.batch_id,
         task.task_id,
         cfg.root / "worktrees" / f"task-{task.task_id}",
-        keep=bool(artifacts.get("available") or artifacts.get("cold")),
+        keep=bool((artifacts or {}).get("available")),
     )
 
 

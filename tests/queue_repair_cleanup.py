@@ -303,6 +303,15 @@ class Cleanup(unittest.TestCase):
         self.assertEqual(cleanup.retire(self.clone, self.worker, "", 3, third, keep=True), "removed")
         self.assertEqual(sorted(p.name for p in (self.worker / "worktrees").iterdir()), ["batch-9"])
 
+    def test_a_tree_is_never_moved_into_an_existing_parked_tree(self):
+        first, second = self.tree(1), self.tree(2)
+        cleanup.retire(self.clone, self.worker, "9", 1, first, keep=True)
+        parked = self.worker / "worktrees/batch-9"
+        with self.assertRaises(OSError):
+            cleanup._move(self.clone, second, parked)  # what a racing second publisher would attempt
+        self.assertTrue(second.is_dir())
+        self.assertEqual(sorted(p.name for p in parked.iterdir()), [".git"])
+
     def test_parked_trees_are_collected_when_their_batch_is_finished(self):
         for task_id, batch in ((1, "landed"), (2, "removed"), (3, "open")):
             cleanup.retire(self.clone, self.worker, str(task_id), task_id, self.tree(task_id, batch=batch), keep=True)

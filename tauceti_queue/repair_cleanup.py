@@ -44,6 +44,14 @@ def batch_tree(root: Path, batch_id: str | int) -> Path | None:
     return root / "worktrees" / f"batch-{batch_id}" if re.fullmatch(r"[1-9][0-9]*", batch_id) else None
 
 
+def _move(clone: Path, source: Path, destination: Path) -> None:
+    """Rename a worktree and repoint Git at it. ``rename`` fails when the destination exists, so two
+    movers can never nest one tree inside another, as ``git worktree move`` into a directory would."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    os.rename(source, destination)
+    repair.git(clone, "worktree", "repair", str(destination))
+
+
 def adopt(clone: Path, root: Path, batch_id: str | int, worktree: Path) -> str | None:
     """Move the batch's parked tree to the task's ``worktree``, keeping its ``.lake``.
 
@@ -55,8 +63,8 @@ def adopt(clone: Path, root: Path, batch_id: str | int, worktree: Path) -> str |
         return None
     try:
         head = repair.git(parked, "rev-parse", "HEAD").strip()
-        repair.git(clone, "worktree", "move", str(parked), str(worktree))
-    except RuntimeError as error:
+        _move(clone, parked, worktree)
+    except (OSError, RuntimeError) as error:
         print(f"[repair-cleanup] removing unusable batch tree {parked}: {error}", flush=True)
         repair.remove_worktree(clone, parked)
         return None
@@ -76,14 +84,15 @@ def retire(clone: Path, root: Path, batch_id: str | int, task_id: str | int, wor
 
     Only a tree whose artifacts were prepared is kept. When the batch already has a parked tree
     (another task of it ran meanwhile), this one is removed. Returns ``parked`` or ``removed``.
+    The record is written after the rename, so only the tree's owner writes it.
     """
     parked = batch_tree(root, batch_id) if keep else None
     if parked is not None and worktree.is_dir() and not worktree.is_symlink() and not parked.exists():
         try:
+            _move(clone, worktree, parked)
             record = root / BATCH_RECORDS / f"{parked.name}.json"
             record.parent.mkdir(parents=True, exist_ok=True)
             atomic_json(record, {"task_id": str(task_id)})
-            repair.git(clone, "worktree", "move", str(worktree), str(parked))
             return "parked"
         except (OSError, RuntimeError) as error:
             print(f"[repair-cleanup] could not park {worktree} as {parked}: {error}", flush=True)

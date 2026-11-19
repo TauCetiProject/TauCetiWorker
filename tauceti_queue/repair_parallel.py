@@ -862,24 +862,26 @@ def repair_groups(
         record["seconds"] = round(time.monotonic() - started, 1)
         _cleanup(worktree, groups, cfg.keep_worktree)
         return record
-    record["fold"] = fold_fixups(worktree, base, tip, groups)
-    record["groups"] = [group.summary() for group in groups]
-    folded_tip = record["fold"].get("tip")
-    failed_modules: list[str] = []
-    check_findings: list[dict] = []
-    if folded_tip:
-        report = repair.chain_report(cfg.clone, base, tip, folded_tip, task.member_keys, prior_base=task.base)
-        record["report"] = report
-        if not report["ok"]:
-            git(worktree, "checkout", "--quiet", "--force", "--detach", tip)
-            for group in groups:
-                if group.status == "folded":
-                    group.status, group.detail = "fixups_not_applied", "the folded chain did not validate"
-            record["groups"] = [group.summary() for group in groups]
-        elif not cancel.is_set():
-            lock_wait = time.monotonic()
-            with repair_tools.build_lock(worktree, log=lambda *a, **k: None):
-                record["lock_wait_seconds"] = round(time.monotonic() - lock_wait, 1)
+    lock_wait = time.monotonic()
+    # The fold rewrites the task worktree, so it waits for any build there, the streaming one included,
+    # and holds the lock through the verification build.
+    with repair_tools.build_lock(worktree, log=lambda *a, **k: None):
+        record["lock_wait_seconds"] = round(time.monotonic() - lock_wait, 1)
+        record["fold"] = fold_fixups(worktree, base, tip, groups)
+        record["groups"] = [group.summary() for group in groups]
+        folded_tip = record["fold"].get("tip")
+        failed_modules: list[str] = []
+        check_findings: list[dict] = []
+        if folded_tip:
+            report = repair.chain_report(cfg.clone, base, tip, folded_tip, task.member_keys, prior_base=task.base)
+            record["report"] = report
+            if not report["ok"]:
+                git(worktree, "checkout", "--quiet", "--force", "--detach", tip)
+                for group in groups:
+                    if group.status == "folded":
+                        group.status, group.detail = "fixups_not_applied", "the folded chain did not validate"
+                record["groups"] = [group.summary() for group in groups]
+            elif not cancel.is_set():
                 # CI's offline bwrap sandbox, as every build the worker runs (``repair_sandbox``).
                 build = repair.run_logged(
                     repair_sandbox.sandboxed_lake(
@@ -910,11 +912,11 @@ def repair_groups(
                     record["checks"] = {k: v for k, v in checks.items() if k != "diagnostics"}
                     check_findings = checks["diagnostics"]
                     repair_audit.append_errors(worktree / repair_tools.TOOLS_DIR, check_findings)
-            build.update(repair.parse_lake_build_log(Path(build["log"]).read_text(errors="replace")))
-            record["build"] = {k: v for k, v in build.items() if "load" not in k}
-            failed_modules = list(build["failed_modules"])
-            if build["rc"] != 0 and not failed_modules:
-                failed_modules = [path for group in groups if group.status == "folded" for path in group.paths]
+                build.update(repair.parse_lake_build_log(Path(build["log"]).read_text(errors="replace")))
+                record["build"] = {k: v for k, v in build.items() if "load" not in k}
+                failed_modules = list(build["failed_modules"])
+                if build["rc"] != 0 and not failed_modules:
+                    failed_modules = [path for group in groups if group.status == "folded" for path in group.paths]
     _cleanup(worktree, groups, cfg.keep_worktree)
     if cancel.is_set():
         record["status"] = "cancelled"
