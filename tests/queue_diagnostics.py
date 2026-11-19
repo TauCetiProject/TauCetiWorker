@@ -90,6 +90,18 @@ class ParseLog(unittest.TestCase):
         self.assertEqual(findings[0]["declaration"], "Foo.bar")
         self.assertEqual(findings[2]["path"], "TauCeti/E/F.lean")
 
+    def test_audit_collision_with_a_dependency_names_the_project_module(self):
+        # A Mathlib bump added a declaration the project already defines (batch 459, run 44442676966).
+        line = (
+            "2026-11-19T05:05:47.8653067Z audit-driver: import TauCeti.Topology.Algebra.Algebra.Unitization failed, "
+            "environment already contains 'Unitization.continuous_iff' from Mathlib.Analysis.Normed.Algebra.Unitization"
+        )
+        [finding] = d.parse_log([line])
+        self.assertEqual(kinds([finding]), [("audit", "TauCeti.Topology.Algebra.Algebra.Unitization")])
+        self.assertEqual(finding["path"], "TauCeti/Topology/Algebra/Algebra/Unitization.lean")
+        self.assertEqual(finding["declaration"], "Unitization.continuous_iff")
+        self.assertIn("Mathlib.Analysis.Normed.Algebra.Unitization", finding["message"])
+
     def test_environment_linter(self):
         payload = {
             "version": 1,

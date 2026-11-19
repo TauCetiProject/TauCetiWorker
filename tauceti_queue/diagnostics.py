@@ -10,7 +10,7 @@ defining module path):
 | log line | finding |
 | --- | --- |
 | `error: TauCeti/A/B.lean:12:3: error: ...` or `TauCeti/A/B.lean:12:3: error: ...` | `compiler` on `TauCeti.A.B` |
-| `audit-driver: import TauCeti.X failed, environment already contains '...' from TauCeti.Y` | `audit` (duplicate declaration) on both modules |
+| `audit-driver: import TauCeti.X failed, environment already contains '...' from M` | `audit` (duplicate declaration) on `TauCeti.X`, and on `M` when it is a project module |
 | `duplicate-declarations: name is declared in both M and N` | `audit` on the project modules |
 | `LINT-ENV-LOCATIONS {...}` (the environment linter's JSON findings) | `lint` on the defining path, `unknown` kept when the linter could not locate it |
 | `Some required targets logged failures:` followed by `- TauCeti.A.B` lines | `compiler` on each target, only when no located finding exists |
@@ -18,8 +18,10 @@ defining module path):
 | `MEMBER-POLICY-REJECTED {...}` (the source member review-size policy's JSON record of one member) | `policy` naming that member by its accepted head and source identity |
 
 Infrastructure findings come from the run and jobs rather than the log: a cancelled, timed out or
-startup-failed run, a lost runner (the job log says so), and a finalizer that failed to publish the
-`build` status. Logs are untrusted text: they are matched, never executed, and the read is bounded.
+startup-failed run, a lost runner (the job log says so), and a failed finalizer, which may not have
+published the `build` status (it also exits nonzero after posting a failed one, so the controller
+ignores this finding once the run's own `build` status is bound). Logs are untrusted text: they are
+matched, never executed, and the read is bounded.
 """
 
 from __future__ import annotations
@@ -34,14 +36,16 @@ PATH = r"TauCeti(?:/[A-Za-z0-9_\-]+)+\.lean"
 MODULE = r"TauCeti(?:\.[A-Za-z0-9_]+)+"
 SOURCE = re.compile(r"^(?:error: )?(" + PATH + r"):(\d+):(\d+):\s*(?:error:|error\b)")
 LAKE = re.compile(r"^error: (" + PATH + r"):(\d+):(\d+):")
+ANY_MODULE = r"[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*"
+# The second module is the earlier definition: a project module, or a dependency's (a Mathlib bump can
+# add a declaration a project module already defines). Findings name only the project modules.
 AUDIT = re.compile(
     r"^audit-driver: import ("
     + MODULE
     + r") failed, environment already contains '([^'\r\n]{1,512})' from ("
-    + MODULE
+    + ANY_MODULE
     + r")$"
 )
-ANY_MODULE = r"[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*"
 DUPLICATE = re.compile(
     r"^duplicate-declarations: (\S{1,1024}) is declared in both (" + ANY_MODULE + r") and (" + ANY_MODULE + r")$"
 )
@@ -113,6 +117,8 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
             continue
         if (audit := AUDIT.fullmatch(line)) and all(len(m) <= 512 for m in audit.groups()):
             for module in (audit.group(1), audit.group(3)):
+                if not module.startswith("TauCeti."):
+                    continue
                 located.setdefault(
                     ("audit", module, audit.group(2)),
                     _finding("audit", module, line, path=path_of(module), declaration=audit.group(2)),

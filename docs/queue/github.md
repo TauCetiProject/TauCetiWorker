@@ -122,7 +122,7 @@ and mapped to the controller's records, dicts with `kind`, `module`, `message` a
 | log line | kind |
 | --- | --- |
 | `TauCeti/A/B.lean:12:3: error: ...`, `error: TauCeti/A/B.lean:12:3: ...` | `compiler` on `TauCeti.A.B` |
-| `audit-driver: import TauCeti.X failed, environment already contains '...' from TauCeti.Y` | `audit` on both modules |
+| `audit-driver: import TauCeti.X failed, environment already contains '...' from M` | `audit` on `TauCeti.X`, and on `M` when it is a project module |
 | `duplicate-declarations: name is declared in both M and N` | `audit` on the project modules |
 | `LINT-ENV-LOCATIONS {...}` (the environment linter's JSON) | `lint` on the defining path, `unknown` kept |
 | `Some required targets logged failures:` then `- TauCeti.A.B` | `compiler` per target, only when nothing was located |
@@ -131,7 +131,10 @@ Infrastructure findings (`kind == "infrastructure"`, with a `reason`) come from 
 `cancelled`, `timed_out`, `startup_failure`, `action_required` or `stale` run, a cancelled or
 timed-out job, a failed `finalize-merge-group-build` job (the `build` status may be missing), a lost
 runner named in the log, an unavailable log, or a completed failure with no status published. The
-controller uses those alone for classification and hands the rest to the repair task unchanged.
+controller uses those alone for classification and hands the rest to the repair task unchanged. The
+finalizer exits nonzero after it posts a failed `build` status, so once that status is bound to the
+run the finalizer's own finding is ignored: a bound `build=failure` with no other infrastructure
+finding is a source failure, repaired from the parsed findings or, when none parse, from the status.
 
 ## Admission: how approvals arrive
 

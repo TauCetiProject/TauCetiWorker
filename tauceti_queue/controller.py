@@ -433,6 +433,17 @@ def publishing(phases: list[dict[str, Any]]) -> bool:
     return built and started
 
 
+def _finalizer_finding(finding: dict[str, Any]) -> bool:
+    """An infrastructure finding about the `finalize-merge-group-build` job: it failed, or it was
+    cancelled or timed out. Each says only that the `build` status may not have been published."""
+    if finding.get("kind") != "infrastructure":
+        return False
+    if finding.get("reason") == "finalizer_failed":
+        return True
+    job = str(finding.get("job") or "").rsplit(" / ", 1)[-1]
+    return job == "finalize-merge-group-build" and finding.get("reason") in ("cancelled", "timed_out")
+
+
 class ControllerError(Exception):
     """A caller error (unknown repository, unknown setting, bad value); carries a stable `code`."""
 
@@ -8213,17 +8224,7 @@ class Controller:
         status = statuses[BUILD_CONTEXT]
         if status is None or not bound[BUILD_CONTEXT]:
             # No status from the candidate's own completed run: never a verdict (scenario 19).
-            publication_failed = any(
-                d.get("kind") == "infrastructure"
-                and (
-                    d.get("reason") == "finalizer_failed"
-                    or (
-                        str(d.get("job") or "").rsplit(" / ", 1)[-1] == "finalize-merge-group-build"
-                        and d.get("reason") in ("cancelled", "timed_out")
-                    )
-                )
-                for d in run.diagnostics
-            )
+            publication_failed = any(_finalizer_finding(d) for d in run.diagnostics)
             if not publication_failed and now - values["run_completed_at"] < LOG_GRACE_SECONDS:
                 self._reasons.append(f"head {head['id']}: run {run.run_id} completed, waiting for build status")
                 self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
@@ -8289,7 +8290,12 @@ class Controller:
                 self.store.journal(now, "ci-pass", head["id"], attempt_id=attempt["id"], run_id=run.run_id)
         else:
             source = [d for d in run.diagnostics if d.get("kind") != "infrastructure"]
-            infrastructure = [d for d in run.diagnostics if d.get("kind") == "infrastructure"]
+            # The finalizer exits nonzero after it posts a failed `build` status, so a failed finalizer
+            # job only means "the status may be missing". This status is bound to the run, so it was
+            # published: the finalizer's finding is no evidence of infrastructure failure here.
+            infrastructure = [
+                d for d in run.diagnostics if d.get("kind") == "infrastructure" and not _finalizer_finding(d)
+            ]
             log_pending = (
                 not source
                 and infrastructure
