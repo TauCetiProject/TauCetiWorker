@@ -30,6 +30,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import stat
@@ -3902,6 +3903,73 @@ class WorkerAsTheQueueApp(Fixture):
         )
         helpers = config("--global", "--get-urlmatch", "credential.helper", "https://github.com", env=agent)
         self.assertTrue(helpers[-1].endswith(" auth git-credential"), helpers)
+
+    def assert_worktree_hooks_do_not_run(self, cfg_token):
+        """Hooks an agent leaves in its worktree, in the shared hooks directory or through the worktree's
+        own ``core.hooksPath``, run neither in the worker's ordinary git calls nor in its pushes."""
+        sh(self.content.clone, "config", "extensions.worktreeConfig", "true")
+        common = Path(sh(self.content.clone, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        unpinned = {k: v for k, v in os.environ.items() if not k.startswith("GIT_CONFIG_")}
+        for index, location in enumerate(("shared", "worktree config")):
+            with self.subTest(location=location):
+                worktree = self.root / f"agent-worktree-{index}"
+                sh(self.content.clone, "worktree", "add", "-q", "--detach", str(worktree), self.content.base)
+                hooks = common / "hooks"
+                if location == "worktree config":
+                    hooks = worktree / "agent-hooks"
+                    sh(worktree, "config", "--worktree", "core.hooksPath", str(hooks))
+                hooks.mkdir(exist_ok=True)
+                leaked = self.root / f"leaked-token-{index}"
+                for name in ("pre-push", "reference-transaction", "post-checkout", "fsmonitor"):
+                    hook = hooks / name
+                    hook.write_text(f'#!/bin/sh\necho "{name}: $GH_TOKEN" >> {shlex.quote(str(leaked))}\n')
+                    hook.chmod(0o755)
+                probe = ["git", "-C", str(worktree), "update-ref", f"refs/probe/{index}", self.content.tip]
+                subprocess.run(probe, env=unpinned, check=True)
+                sh(worktree, "config", "--worktree", "core.fsmonitor", str(hooks / "fsmonitor"))
+                self.assertTrue(leaked.exists(), "the hooks are live without the worker's pins")
+                leaked.unlink()
+                # The worker's ordinary calls inherit its environment.
+                sh(worktree, "checkout", "-q", "--detach", self.content.tip)
+                sh(worktree, "update-ref", f"refs/worker/{index}", self.content.tip)
+                sh(worktree, "status", "--porcelain")
+                task = types.SimpleNamespace(
+                    task_id=f"7{index}",
+                    repository=PROJECT,
+                    submission_ref=f"refs/tauceti-queue/submissions/7{index}/1",
+                    tip=self.content.tip,
+                )
+                cfg = self.config(token=cfg_token, clone=worktree)
+                with patch.object(repair_task, "require_task_execution"):
+                    self.assertEqual(repair_task.check_submission_access(cfg, task, self.root)["rc"], 0)
+                    record = repair_task.push_result(cfg, task, worktree, self.content.tip, self.root, None)
+                self.assertTrue(record["ok"], record)
+                self.assertEqual(sh(self.content.bare, "rev-parse", task.submission_ref), self.content.tip)
+                self.assertFalse(leaked.exists(), leaked.read_text() if leaked.exists() else "")
+                for name in ("pre-push", "reference-transaction", "post-checkout", "fsmonitor"):
+                    (hooks / name).unlink()
+
+    def test_hooks_in_the_agents_worktree_do_not_run_with_the_app_token(self):
+        self.app()
+        pins = patch.object(repair_task, "_app_git_config", ())
+        pins.start()
+        self.addCleanup(pins.stop)
+        environment = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull})
+        environment.start()
+        self.addCleanup(environment.stop)
+        repair_task.pin_app_credentials()
+        self.assertIsNone(repair_task.refresh_github_token())
+        self.assert_worktree_hooks_do_not_run(None)
+
+    def test_hooks_in_the_agents_worktree_do_not_run_with_the_worker_token(self):
+        environment = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_COUNT": "0"})
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("TAUCETI_QUEUE_GITHUB_APP", None)
+        repair_task.use_worker_token("worker-token")
+        repair_task.use_worker_token("worker-token")
+        self.assertEqual(os.environ["GIT_CONFIG_COUNT"], str(len(repair_task._NO_GIT_HOOKS)), "added once")
+        self.assert_worktree_hooks_do_not_run(TOKEN)
 
     def test_a_push_without_a_mintable_token_does_not_run(self):
         from tauceti_queue import github_app
