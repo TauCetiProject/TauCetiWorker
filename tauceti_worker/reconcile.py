@@ -679,44 +679,70 @@ def _spec(path: Path) -> str:
     return f":(literal){path.name}"
 
 
-def _change_id(path: Path, commit: str) -> str | None:
-    """What `commit` changed, as a stable identity: its diff against its parent, which must touch the
-    list alone, without the index and hunk-position lines a rebase can move. None otherwise."""
-    names = _git(path, "diff", "--name-only", f"{commit}~1", commit)
-    own = _git(path, "ls-files", "--full-name", "--", path.name).stdout.strip()
-    if names.returncode or names.stdout.strip() != own:
-        return None
-    diff = _git(path, "diff", f"{commit}~1", commit, "--", path.name).stdout.splitlines()
-    return "\n".join(line for line in diff if not line.startswith(("index ", "@@")))
+def _owed(path: Path) -> Path | None:
+    """Where the clone records an inference it owes a withdrawal (`_withdraw`), inside `.git`."""
+    found = _git(path, "rev-parse", "--git-path", f"tauceti-reconcile/{path.name}.owed")
+    return path.parent / found.stdout.strip() if found.returncode == 0 and found.stdout.strip() else None
 
 
 def _withdraw(path: Path, base: str, ours: str) -> bool:
-    """Commit, on whatever HEAD now is, the list as committed there with this look's edits taken
-    back (`_taken_back`), through a scratch index so nothing else the clone has staged is touched."""
+    """Commit, on whatever HEAD now is, the list as committed there with this look's edits undone
+    where they still stand (`_taken_back`), through a scratch index so nothing else the clone has
+    staged is touched; then undo them in the working file too. History is never rewritten, so a
+    commit another actor made meanwhile, to this list or another, stays."""
     shown = _git(path, "show", f"HEAD:./{path.name}")
     fixed = _taken_back(base, ours, "", shown.stdout) if shown.returncode == 0 else None
     if fixed is None:
         return False
-    if fixed == shown.stdout:
-        return True
-    entry = _git(path, "ls-files", "-s", "--full-name", "--", path.name).stdout.split()
-    if len(entry) < 4:
-        return False
-    with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / "list").write_text(fixed)
-        scratch = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
-        blob = _git(path, "hash-object", "-w", "--", str(Path(tmp) / "list")).stdout.strip()
-        head = _git(path, "rev-parse", "HEAD").stdout.strip()
-        steps = (
-            ("read-tree", head),
-            ("update-index", "--cacheinfo", f"{entry[0]},{blob},{entry[3]}"),
-        )
-        if not blob or any(_git(path, *step, env=scratch).returncode for step in steps):
+    if fixed != shown.stdout:
+        listed = _git(path, "ls-files", "-s", "-z", "--full-name", "--", _spec(path)).stdout.split("\0")[0]
+        meta, _, name = listed.partition("\t")
+        if not name or len(meta.split()) != 3:
             return False
-        tree = _git(path, "write-tree", env=scratch).stdout.strip()
-        message = f"Withdraw unpublished inference in {path.name}"
-        commit = _git(path, "commit-tree", tree, "-p", head, "-m", message).stdout.strip()
-        return bool(tree and commit) and _git(path, "update-ref", "HEAD", commit, head).returncode == 0
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "list").write_text(fixed)
+            scratch = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
+            blob = _git(path, "hash-object", "-w", "--", str(Path(tmp) / "list")).stdout.strip()
+            head = _git(path, "rev-parse", "HEAD").stdout.strip()
+            steps = (("read-tree", head), ("update-index", "--cacheinfo", f"{meta.split()[0]},{blob},{name}"))
+            if not blob or any(_git(path, *step, env=scratch).returncode for step in steps):
+                return False
+            tree = _git(path, "write-tree", env=scratch).stdout.strip()
+            message = f"Withdraw unpublished inference in {path.name}"
+            commit = _git(path, "commit-tree", tree, "-p", head, "-m", message).stdout.strip()
+            if not (tree and commit) or _git(path, "update-ref", "HEAD", commit, head).returncode:
+                return False
+    undone = _taken_back(base, ours, "", path.read_text())
+    if undone is None:
+        return False
+    _git(path, "reset", "-q", "HEAD", "--", _spec(path))
+    return _write(path, undone)
+
+
+def _owe(path: Path, base: str, ours: str) -> None:
+    """Record that this look's inference must be withdrawn before the list is pushed again, then try."""
+    marker = _owed(path)
+    if marker is not None:
+        with contextlib.suppress(OSError):
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            _replace_json(marker, {"base": base, "ours": ours})
+    _settle_owed(path)
+
+
+def _settle_owed(path: Path) -> bool:
+    """Make the withdrawal `_owe` recorded, if any; whether none is owed afterwards."""
+    marker = _owed(path)
+    if marker is None or not marker.exists():
+        return True
+    try:
+        owed = json.loads(marker.read_text())
+        done = _withdraw(path, owed["base"], owed["ours"])
+    except (OSError, ValueError, KeyError, TypeError):
+        done = False
+    if done:
+        marker.unlink(missing_ok=True)
+        log(f"reconcile: the unpublished inference in {path.name} was withdrawn; the next look asks again")
+    return done
 
 
 def _tracked(path: Path) -> bool:
@@ -732,11 +758,10 @@ def _upstream(path: Path) -> tuple[str, str] | None:
     return (found[0], found[1]) if len(found) == 2 and found[0] != "." else None
 
 
-def _sync(path: Path, *, keep: bool = False) -> None:
+def _sync(path: Path) -> None:
     """Fetch the branch the list's branch tracks and rebase local commits onto it. A clone with
     uncommitted changes to tracked files is left where it is; so is one whose rebase stops on a
-    conflict, after aborting it. With `keep`, every local commit is replayed, an emptied one
-    included, so the tip commit stays the tip."""
+    conflict, after aborting it."""
     upstream = _upstream(path)
     if upstream is None:
         return
@@ -745,28 +770,23 @@ def _sync(path: Path, *, keep: bool = False) -> None:
         log(f"reconcile: fetch from {upstream[0]} failed ({one_line(fetched.stderr)}); working from the local list")
     elif _git(path, "status", "--porcelain", "--untracked-files=no").stdout.strip():
         log(f"reconcile: {path.parent} has uncommitted changes; not rebasing it onto {upstream[0]}")
-    elif (
-        _git(
-            path, "rebase", "-q", *(("--reapply-cherry-picks", "--empty=keep") if keep else ()), "@{upstream}"
-        ).returncode
-        != 0
-    ):
+    elif _git(path, "rebase", "-q", "@{upstream}").returncode != 0:
         _git(path, "rebase", "--abort")
         log(f"reconcile: local commits in {path.parent} conflict with {upstream[0]}; rebase there by hand")
 
 
-def _push(path: Path, still=None) -> bool | None:
+def _push(path: Path, still=None) -> bool:
     """Push the list's branch to the branch it tracks when it is ahead, once more after a sync if
     the remote has moved; whether nothing is left unpushed. A commit that cannot be pushed stays
-    local and goes with a later call.
-
-    With `still`, HEAD is this look's own commit: the sync keeps it at the tip, a copy the rebase
-    emptied (the remote already has its edit) is dropped and None returned, and a commit whose
-    list, as committed after any hook, fails `still` is not pushed, before the first push as after
-    a sync."""
+    local and goes with a later call. Nothing is pushed while a withdrawal is owed (`_owed`) and
+    cannot be made. With `still`, a list whose committed text, after any hook or sync, fails it is
+    not pushed."""
     upstream = _upstream(path)
     if upstream is None:
         return True
+    if not _settle_owed(path):
+        log(f"reconcile: an inference in {path.name} is still owed a withdrawal; nothing pushed")
+        return False
     for attempt in (1, 2):
         # A failed comparison (the tracked branch not on the remote yet, say) is left to the push.
         ahead = _git(path, "rev-list", "--count", "@{upstream}..HEAD")
@@ -781,11 +801,7 @@ def _push(path: Path, still=None) -> bool | None:
             log(f"reconcile: pushed the target list to {upstream[0]}")
             return True
         if attempt == 1:
-            _sync(path, keep=still is not None)
-            if still is not None and _git(path, "diff", "--quiet", "HEAD~1", "HEAD").returncode == 0:
-                _git(path, "reset", "-q", "--soft", "HEAD~1")
-                log(f"reconcile: {upstream[0]} already has this look's edits; the rebased list is kept")
-                return None
+            _sync(path)
     log(f"reconcile: push to {upstream[0]} failed ({one_line(pushed.stderr)}); the commit stays local")
     return False
 
@@ -872,7 +888,8 @@ def publish(path: Path, base: str, ours: str, notes: list[str], *, still=None) -
     tracked list is committed, that path only, and pushed; when the commit fails this look's edit
     is taken back out of the file, so a later look makes it again. With `still`, nothing is written
     unless `still(the file as it now is)` holds, and a commit that is not pushed in this call, or
-    that a sync puts onto a file where `still` fails, is taken back."""
+    whose committed list fails `still`, is withdrawn by a commit on top (`_owe`); until that
+    withdrawal is made nothing is pushed."""
     tracked = _tracked(path)
     if tracked:
         _sync(path)
@@ -889,7 +906,6 @@ def publish(path: Path, base: str, ours: str, notes: list[str], *, still=None) -
     if tracked and merged != theirs:
         message = f"Reconcile {path.name}: {len(notes)} item(s)\n\n" + "\n".join(f"- {note}" for note in notes)
         committed = _git(path, "commit", "-q", "-m", message, "--", _spec(path))
-        made = _change_id(path, "HEAD") if committed.returncode == 0 else None
         if committed.returncode != 0:
             log(
                 f"reconcile: commit failed ({one_line(committed.stderr or committed.stdout)}); the edit waits for a later look"
@@ -905,34 +921,12 @@ def publish(path: Path, base: str, ours: str, notes: list[str], *, still=None) -
                 _write(path, undone)
             return None
     own = still if tracked and merged != theirs else None
-    pushed = _push(path, own) if tracked else True
-    if pushed is None:
-        return None
-    if not pushed and own is not None:
-        # An inferred tick is published in the look that made it or not at all: a later push could
-        # carry it onto a goal or item line it was never given. When HEAD is still this look's
-        # commit it is undone; when another commit has landed on it since (the lock is per list,
-        # not per clone), a commit withdrawing the edit goes on top instead. The file can also
-        # hold the operator's uncommitted edits, so only this look's edit is taken out of it.
-        if made is None or _change_id(path, "HEAD") != made:
-            withdrawn = _withdraw(path, base, ours)
-            undone = _taken_back(base, ours, "", path.read_text()) if withdrawn else None
-            if undone is None:
-                log(f"reconcile: the unpushed inference in {path.parent} could not be withdrawn; remove it by hand")
-            else:
-                _git(path, "reset", "-q", "HEAD", "--", path.name)
-                _write(path, undone)
-                log("reconcile: the inferred ticks were withdrawn on top of a later commit; the next look asks again")
+    if tracked and not _push(path, own):
+        if own is not None:
+            # An inferred tick is published in the look that made it or not at all: a later push
+            # could carry it onto a goal or item line it was never given.
+            _owe(path, base, ours)
             return None
-        parent = _git(path, "show", f"HEAD~1:./{path.name}")
-        undone = _taken_back(base, ours, parent.stdout if parent.returncode == 0 else "", path.read_text())
-        if undone is None or _git(path, "reset", "-q", "--soft", "HEAD~1").returncode != 0:
-            log(f"reconcile: the unpushed inference commit in {path.parent} could not be taken back; remove it by hand")
-        else:
-            _git(path, "reset", "-q", "HEAD", "--", path.name)
-            _write(path, undone)
-            log("reconcile: the inferred ticks were taken back; the next look asks again")
-        return None
     return merged
 
 

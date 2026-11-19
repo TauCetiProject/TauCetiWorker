@@ -595,10 +595,10 @@ class Publication(Tmp):
         self.assertIsNone(reconcile.publish(first, LIST, ticked, ["n"], still=still))
         self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", broadened)
         self.assertEqual(
-            (first.read_text(), git(first.parent, "rev-list", "--count", "@{upstream}..HEAD")), (broadened, "0")
+            (first.read_text(), git(first.parent, "show", "HEAD:targets.md") + "\n"), (broadened, broadened)
         )
 
-    def test_a_tick_that_cannot_be_pushed_is_taken_back_keeping_uncommitted_edits(self):
+    def test_a_tick_that_cannot_be_pushed_is_withdrawn_keeping_the_operators_edits(self):
         first = self.clone("first")
         by_hand = LIST.replace("a synthetic goal", "a hand-edited goal") + "- [ ] `more` — Layer 5, x (needs: none)\n"
         first.write_text(by_hand)
@@ -608,8 +608,8 @@ class Publication(Tmp):
         hook.chmod(0o755)
         self.assertIsNone(reconcile.publish(first, by_hand, ticked, ["n"], still=still))
         self.assertEqual(first.read_text(), by_hand)
-        self.assertEqual(git(first.parent, "rev-list", "--count", "@{upstream}..HEAD"), "0")
-        self.assertEqual(git(first.parent, "status", "--porcelain"), "M targets.md")
+        self.assertEqual(git(first.parent, "show", "HEAD:targets.md") + "\n", by_hand)
+        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
 
     def test_a_tick_line_a_formatting_hook_changed_is_still_taken_back(self):
         first, second = self.clone("first"), self.clone("second")
@@ -642,7 +642,7 @@ class Publication(Tmp):
         hook.chmod(0o755)
         self.assertIsNone(reconcile.publish(first, LIST, ticked, ["n"], still=still))
         self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", LIST)
-        self.assertEqual(git(first.parent, "rev-list", "--count", "@{upstream}..HEAD"), "0")
+        self.assertEqual(t.parse_targets(git(first.parent, "show", "HEAD:targets.md")).find("zero-one").status, "open")
         self.assertEqual(t.parse_targets(first.read_text()).find("zero-one").status, "open")
         self.assertIn("a rewritten goal", first.read_text())
 
@@ -664,6 +664,61 @@ class Publication(Tmp):
         self.assertEqual(t.parse_targets(committed).find("zero-one").status, "open")
         self.assertEqual(git(first.parent, "status", "--porcelain"), "")
 
+    def test_a_later_commit_to_the_same_list_survives_the_withdrawal(self):
+        first = self.clone("first")
+        _, still, ticked = self.ticked()
+        hook = first.parent / ".git" / "hooks" / "post-commit"
+        hook.write_text(
+            "#!/bin/sh\ngrep -q 'operator note' targets.md && exit 0\n"
+            "echo '> operator note' >> targets.md && git commit -q -m 'note' -- targets.md\n"
+            "git remote set-url --push origin /nonexistent/remote.git\n"
+        )
+        hook.chmod(0o755)
+        self.assertIsNone(reconcile.publish(first, LIST, ticked, ["n"], still=still))
+        self.assertIn("note", git(first.parent, "log", "--format=%s", "@{upstream}..HEAD").splitlines())
+        committed = git(first.parent, "show", "HEAD:targets.md")
+        self.assertIn("operator note", committed)
+        self.assertEqual(t.parse_targets(committed).find("zero-one").status, "open")
+        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
+
+    def test_a_list_named_with_a_space_is_withdrawn(self):
+        first = self.clone("first")
+        named = first.with_name("target list.md")
+        git(first.parent, "mv", "targets.md", named.name)
+        git(first.parent, "commit", "-q", "-m", "rename")
+        git(first.parent, "push", "-q", "origin", "HEAD:main")
+        listed = t.parse_targets(LIST)
+        item = listed.find("zero-one")
+        still = reconcile._unchanged(named, listed, [item])
+        ticked = t.rewrite_item(LIST, item, "done", add=(f"inferred: {TAIL}#a on 2026-01-02",))
+        hook = first.parent / ".git" / "hooks" / "post-commit"
+        hook.write_text(
+            "#!/bin/sh\n[ -f other-list.md ] && exit 0\n"
+            "echo other > other-list.md && git add other-list.md && git commit -q -m 'other list'\n"
+            "git remote set-url --push origin /nonexistent/remote.git\n"
+        )
+        hook.chmod(0o755)
+        self.assertIsNone(reconcile.publish(named, LIST, ticked, ["n"], still=still))
+        committed = git(first.parent, "show", "HEAD:target list.md")
+        self.assertEqual(t.parse_targets(committed).find("zero-one").status, "open")
+        self.assertFalse(reconcile._owed(named).exists())
+
+    def test_an_owed_withdrawal_blocks_every_push_until_it_is_made(self):
+        first = self.clone("first")
+        _, still, ticked = self.ticked()
+        hook = first.parent / ".git" / "hooks" / "post-commit"
+        hook.write_text("#!/bin/sh\ngit remote set-url --push origin /nonexistent/remote.git\n")
+        hook.chmod(0o755)
+        with patch.object(reconcile, "_withdraw", return_value=False):
+            self.assertIsNone(reconcile.publish(first, LIST, ticked, ["n"], still=still))
+            git(first.parent, "remote", "set-url", "--push", "origin", str(self.tmp / "remote.git"))
+            self.assertFalse(reconcile._push(first))
+        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", LIST)
+        self.assertTrue(reconcile._push(first))
+        remote = git(self.tmp / "remote.git", "show", "main:targets.md")
+        self.assertEqual(t.parse_targets(remote).find("zero-one").status, "open")
+        self.assertFalse(reconcile._owed(first).exists())
+
     def test_a_tick_another_host_already_published_leaves_the_rebased_clone_alone(self):
         first, second = self.clone("first"), self.clone("second")
         _, still, ticked = self.ticked()
@@ -674,7 +729,7 @@ class Publication(Tmp):
         hook = first.parent / ".git" / "hooks" / "post-commit"
         hook.write_text(f"#!/bin/sh\ngit -C {second.parent} push -q origin HEAD:main\n")
         hook.chmod(0o755)
-        self.assertIsNone(reconcile.publish(first, LIST, ticked, ["n"], still=still))
+        self.assertIsNotNone(reconcile.publish(first, LIST, ticked, ["n"], still=still))
         self.assertEqual(git(first.parent, "rev-parse", "HEAD"), git(self.tmp / "remote.git", "rev-parse", "main"))
         self.assertEqual(git(first.parent, "status", "--porcelain"), "")
 

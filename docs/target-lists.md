@@ -257,9 +257,11 @@ The date is the day of the look, in UTC. An inferred tick counts as done for
 seven days unless its line, the goal, its README or a file its leads are in
 changes. The tick is written only if the goal and the item's line are still as
 the agent was given them, and in a tracked list only if the look also pushes it,
-after any rebase, onto a list where they still are; otherwise the commit is
-undone, leaving any other edit it held uncommitted in the file, and the next
-look asks again.
+after any rebase, onto a list where they still are. Otherwise a commit
+withdrawing the tick goes on top of whatever the clone's branch then holds
+(history is never rewritten, so a commit someone else made meanwhile stays),
+the clone records the withdrawal as owed inside `.git` until it is made, and
+nothing is pushed from that clone while it is owed; the next look asks again.
 
 **Reopened by a dependent.** A roadmap round handed an item whose `needs:`
 include inferred ticks is told which they are, and that if one is missing or
