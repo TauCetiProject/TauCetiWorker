@@ -130,6 +130,7 @@ build and how long each phase took, and makes placement decisions from those mea
 | `~/.config/tauceti-queue/github-app.json`, `github-private-key.pem`, `github-webhook-secret` | the App credentials (GitHub App section) |
 | `~/.config/systemd/user/tauceti-queue.service` | the service unit, copied from `services/queue/` by the installer |
 | `~/.config/systemd/user/tauceti-queue-backup.{service,timer}` | the daily backup |
+| `~/.config/systemd/user/tauceti-queue-clone-maintenance.{service,timer}` | the hourly Git maintenance of the content clone |
 | `~/.config/systemd/user/tauceti-queue-repair.service`, `~/.config/tauceti-queue/repair-environment` | the repair worker unit and its environment file (Repair worker below), on the host that runs repair tasks |
 | `~/.local/state/tauceti-queue/queue.sqlite3` (+ `-wal`, `-shm`) | the database: approved inputs, batches, claims, CI attempts, pending side effects, settings |
 | `~/.local/state/tauceti-queue/backups/` | dated online backups |
@@ -836,6 +837,24 @@ Restore: stop the service, move the live `queue.sqlite3` (and its `-wal`/`-shm` 
 chosen backup to `queue.sqlite3`, start the service, and check `/status` shows the expected head and
 approved inputs. Pending GitHub side effects are replayed by their idempotency keys; a restored store
 that is older than GitHub reconciles on restart, which is the same path as recovery from a crash.
+
+## Clone maintenance
+
+The controller fetches, writes refs and builds chains in its content clone constantly, so the clone
+needs Git maintenance, and Git's automatic maintenance does not suit it: it ran detached from the
+controller's fetches inside the service, where a restart could kill it and leave
+`objects/maintenance.lock` behind, after which Git silently skipped every later run. By 19 November
+loose refs, loose objects and thousands of packs had made each fetch of a new PR head take 20 to
+30 s. The installer therefore sets `maintenance.auto false` in the clone and enables
+`tauceti-queue-clone-maintenance.timer`, which runs `services/queue/clone-maintenance.sh` hourly at
+the lowest CPU and I/O priority. The script runs only tasks that are safe beside a live user of the
+repository (`pack-refs`, `loose-objects`, `incremental-repack`, `commit-graph`), never `gc` or a
+prune of unreachable objects the queue may still reference. A maintenance lock older than six hours
+that no running Git maintenance holds is removed first. To run it by hand:
+
+```sh
+nice -n 19 ionice -c3 ~/TauCetiQueue/services/queue/clone-maintenance.sh
+```
 
 ## Verification after a deploy
 
