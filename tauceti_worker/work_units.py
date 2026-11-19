@@ -2370,7 +2370,7 @@ def _close_spent_pr(w, sv, c, *, stage="fix", explicit=False) -> int | None:
                     f"at head `{c.head}`. The branch is retained; a fresh attempt can address the "
                     "remaining findings using the current review rubric."
                 )
-            # A progress checkpoint published during the claim or the reads renews the budget.
+            # A budget renewed (progress checkpoint) or refunded during the claim or the reads cancels closure.
             if not _budget_spent(stage, w, c) or not _claim_held(w, c.pr):
                 return None
             from .activity import select

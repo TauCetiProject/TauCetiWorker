@@ -533,6 +533,23 @@ class GlobalMaintenance(unittest.TestCase):
                     self.assertIsNone(work._close_spent_pr(self.w, sv, c, stage="fix-ci"))
                 mutation.assert_not_called()
 
+    def test_spent_fix_ci_closure_rechecks_the_budget_after_claim_and_reads(self):
+        for during in ("claim", "live read"):
+            with self.subTest(during=during):
+                sv, c, live = self.ci_fixture()
+
+                def refund(*args):
+                    self.counter_values[f"ci-10-{HEAD[:12]}"] = 2
+                    return True
+
+                if during == "claim":
+                    self.w.claims.begin_branch_work.side_effect = refund
+                else:
+                    self.w.gh.pr_view = lambda *a, live=live, refund=refund: refund() and dict(live)
+                with patch.object(work, "gh_run") as mutation:
+                    self.assertIsNone(work._close_spent_pr(self.w, sv, c, stage="fix-ci"))
+                mutation.assert_not_called()
+
     def test_spent_fix_ci_dispatch_goes_to_closure(self):
         sv, c, _ = self.ci_fixture()
         with (
