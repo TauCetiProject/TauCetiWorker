@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real native review receipts and Git source joined to the existing GitHub queue.
+"""Real native scoreboards and Git source joined to the existing GitHub queue.
 
 GitHub execution/evidence is deterministic here. Forgejo uses the stock HTTPS
 server, native actor IDs, protected retention refs, and the actual Git transport.
@@ -30,7 +30,6 @@ from tauceti_queue.ci_requests import RequestLedger
 from tauceti_queue.config import Config
 from tauceti_queue.controller import Controller
 from tauceti_queue.fakes import make_controller, run_git
-from tauceti_queue.forgejo_source import ForgejoSourceAdapter
 from tauceti_queue.mixed_ci import MixedCandidateCI
 from tauceti_queue.mixed_landing import MainWriter
 from tauceti_queue.mixed_native import MixedNativeSource
@@ -40,7 +39,7 @@ from tauceti_queue.mixed_sources import AdmissionInputs, MixedSources, NativePol
 
 @unittest.skipUnless(os.environ.get("FORGEJO_BINARY"), "set FORGEJO_BINARY for disposable HTTPS mixed queue")
 class MixedNativeIntegration(unittest.TestCase):
-    def test_native_receipt_moderation_mixed_candidate_landing_and_sync(self):
+    def test_native_scoreboards_mixed_candidate_landing_and_sync(self):
         with source_fixture() as (root, admin, repository, row, tokens):
             initial, github, repo, clock = make_controller(root / "github")
             self.addCleanup(initial.store.close)
@@ -58,20 +57,12 @@ class MixedNativeIntegration(unittest.TestCase):
             contributor = Forgejo(repository.forge, token=tokens["contributor"])
             queue = Forgejo(repository.forge, token=tokens["queue"])
             admin.request("PUT", f"repos/{repository.name}/collaborators/queue", {"permission": "admin"})
-            reviewer_id, queue_id = reviewer.current_user()["id"], queue.current_user()["id"]
+            queue_id = queue.current_user()["id"]
             token_file = root / "queue-token"
             token_file.write_text(tokens["queue"])
             token_file.chmod(0o600)
-            profile = MixedProfile(
-                github_id,
-                native_id,
-                frozenset({reviewer_id}),
-                queue_id,
-                token_file,
-                {"fixture": "trusted native publishers", "authority_generation": "1" * 32},
-            )
+            profile = MixedProfile(github_id, native_id, queue_id, token_file, {"fixture": "mixed native"})
             native = MixedNativeSource(profile, cfg, repo.clone, client=queue, token=tokens["queue"], clock=clock)
-            native.configure_publisher_policy(initial.store)
             base = native.ref_sha(repository.name, "refs/heads/main")
             native.fetch_refs(repository.name, [base])
             run_git(repo.origin, "fetch", "-q", str(repo.clone), base)
@@ -156,25 +147,15 @@ class MixedNativeIntegration(unittest.TestCase):
                 "mode": "review",
             }
             body = "<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 " + json.dumps(meta) + "-->\nProof checked."
-            reviewer.post_comment(repository, number, body)
             self.assertFalse(native.admission_policy.evaluate(native.admission_snapshot(name, number))[0]["merge"])
-            publisher = ForgejoSourceAdapter(
-                native_id, reviewer, repo.clone, token=tokens["reviewer"], admission_policy=native.admission_policy
-            )
-            publisher.configure_publisher_policy(initial.store)
-            intent = publisher.prepare_publication(name, number, head, body, "mixed-native-review", sequence=1)
-            comment_id = publisher.publish(intent)
+            reviewer.post_comment(repository, number, body)
             self.assertTrue(native.admission_policy.evaluate(native.admission_snapshot(name, number))[0]["merge"])
-            contributor.edit_comment(
-                repository, int(comment_id), intent["body"].replace('"green"', '"blocking_request"')
-            )
+            # The newest completed scoreboard decides, whoever posted it, as on GitHub.
+            contributor.post_comment(repository, number, body.replace('"green"', '"blocking_request"'))
             self.assertFalse(
                 native.admission_policy.evaluate(native.admission_snapshot(name, number))[0]["review_safe"]
             )
-            restored = publisher.prepare_publication(
-                name, number, head, body, "mixed-native-review-restored", sequence=2
-            )
-            publisher.publish(restored)
+            reviewer.post_comment(repository, number, body + "\nRe-reviewed.")
             with patch("tauceti_worker.github_state.read", side_effect=AssertionError("shared state consulted")):
                 result = native_poll.run_once()
                 self.assertEqual(result["errors"], [])

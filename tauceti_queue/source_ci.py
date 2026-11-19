@@ -16,6 +16,14 @@ from .ports import DispatchNotAccepted, PromotionRefused
 from .store import loads
 
 
+class NoOwner(EvidenceUnavailable):
+    """A complete listing found no live or unreadable run and no run proves ownership."""
+
+
+class RunDeleted(EvidenceUnavailable):
+    """GitHub no longer has the owned run (404), so it can never report a result."""
+
+
 @dataclass(frozen=True)
 class SourceDispatch:
     frozen: object
@@ -76,15 +84,46 @@ class SourceCandidateCI:
     def observe(self, attempt_id):
         frozen = self.ledger.load(attempt_id)
         owner = self.ledger.owner_run(attempt_id)
+        unavailable = False
         if owner is None:
-            self._discover(frozen)
+            unavailable = self._discover(frozen)
             owner = self.ledger.owner_run(attempt_id)
         if owner is None:
-            # Even a complete empty listing is not proof that an acknowledged
-            # event cannot arrive later. Keep the single-send intent for explicit
-            # operator reconciliation instead of automatically retransmitting it.
-            raise EvidenceUnavailable("source dispatch has no verified owner; reconcile without resending")
-        return self.execution.observe(frozen, owner, owned=True)
+            # Only a complete listing with nothing live or unreadable may fail
+            # open (the controller resends after its dispatch timeout). Listing
+            # and API errors stay plain EvidenceUnavailable and keep waiting.
+            if unavailable:
+                raise EvidenceUnavailable("source dispatch ownership cannot be completely reconciled")
+            raise NoOwner("source dispatch has no verified owner")
+        try:
+            return self.execution.observe(frozen, owner, owned=True)
+        except EvidenceUnavailable:
+            if self._deleted(frozen, owner):
+                raise RunDeleted(f"owned run {owner} is no longer on GitHub") from None
+            raise
+
+    def progress(self, attempt_id, run):
+        """`run` with its GitHub job and step phases, or `None` when the execution cannot read them.
+
+        Only the ledger's owned run is read. Phases are display and stall context only.
+        """
+        progress = getattr(self.execution, "progress", None)
+        if progress is None or self.ledger.owner_run(attempt_id) != run.run_id:
+            return None
+        return progress(self.ledger.load(attempt_id), run)
+
+    def _deleted(self, frozen, run_id):
+        deleted = getattr(self.execution, "deleted", None)
+        return deleted is not None and deleted(frozen, run_id)
+
+    def _status(self, frozen, run_id):
+        """Current run status, or None when GitHub has deleted the run."""
+        try:
+            return self.execution.status(frozen, run_id)
+        except EvidenceUnavailable:
+            if self._deleted(frozen, run_id):
+                return None
+            raise
 
     def _discover(self, frozen):
         attempt = self.ledger.store.row("ci_attempts", {"id": frozen.attempt_id})
@@ -100,7 +139,11 @@ class SourceCandidateCI:
             self.ledger.record_owned_run(frozen.attempt_id, observation.run, observation.ownership, now=self.clock())
         return unavailable
 
-    def _owned(self, run_id):
+    def _ownership(self, run_id):
+        """The stored ownership row, its request snapshot row and its receipt for `run_id`.
+
+        Only `record_owned_run` writes these rows, after the trusted artifact reader verified the
+        proof, so they establish ownership without parsing the frozen request or its policy again."""
         binding = self.ledger.store.get_setting(self.ledger.binding_key)
         row = self.ledger.store.row("ci_request_runs", {"execution_id": binding["execution"]["id"], "run_id": run_id})
         if row is None:
@@ -108,15 +151,22 @@ class SourceCandidateCI:
         request = self.ledger.store.row("ci_requests", {"request_digest": row["request_digest"]})
         if request is None:
             raise ValueError("owned execution request snapshot is unavailable")
-        return self.ledger.load(request["attempt_id"]), loads(row["receipt_json"])
+        return binding, request, loads(row["receipt_json"])
+
+    def _owned(self, run_id):
+        _binding, request, proof = self._ownership(run_id)
+        return self.ledger.load(request["attempt_id"]), proof
 
     def read_run(self, run_id):
         frozen, _proof = self._owned(run_id)
         return self.execution.status(frozen, run_id)
 
     def cancel_run(self, run_id):
-        frozen, proof = self._owned(run_id)
-        return self.execution.cancel(frozen, run_id, proof=proof)
+        # A superseded attempt may have been frozen under a policy schema this service no longer
+        # parses; cancelling its run must not depend on reloading it (`_ownership`).
+        binding, request, proof = self._ownership(run_id)
+        execution = cc.RepositoryIdentity.parse(binding["execution"])
+        return self.execution.cancel(execution, run_id, request_digest=request["request_digest"], proof=proof)
 
     def live_attempt(self, attempts, *, discover_completed=False):
         for attempt in reversed(attempts):
@@ -127,21 +177,23 @@ class SourceCandidateCI:
             frozen = self.ledger.load(attempt["id"])
             known = self.ledger.owned_runs(attempt["id"])
             for row in known:
-                run = self.execution.status(frozen, row["run_id"])
-                if run.status in {"queued", "in_progress"}:
+                run = self._status(frozen, row["run_id"])
+                if run is not None and run.status in {"queued", "in_progress"}:
                     return attempt, run
             # Completed owned attempts need no historical full-repository scan
             # on every automatic retry. An explicit operator retry additionally
             # discovers late duplicates; background cleanup is a separate gate.
             if known and not discover_completed:
                 continue
-            if self._discover(frozen) or self.ledger.owner_run(attempt["id"]) is None:
+            # A complete listing with no owner and nothing live does not block
+            # a resend: nothing is running that a new dispatch would duplicate.
+            if self._discover(frozen):
                 raise EvidenceUnavailable("source dispatch ownership cannot be completely reconciled")
             # A duplicate event can produce several valid runs. A completed
             # selected owner does not authorize cancelling another live run.
             for row in self.ledger.owned_runs(attempt["id"]):
-                run = self.execution.status(frozen, row["run_id"])
-                if run.status in {"queued", "in_progress"}:
+                run = self._status(frozen, row["run_id"])
+                if run is not None and run.status in {"queued", "in_progress"}:
                     return attempt, run
         return None
 

@@ -1,6 +1,9 @@
 """Complete source pagination, resource waits and safe git diff reads for primary intake."""
 
+import base64
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -8,7 +11,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from queue_github_adapter import BASE, HEAD, TAUCETI, FakeTransport, client, pr_json
+from queue_github_adapter import BASE, HEAD, TAUCETI, Clock, FakeTransport, StaticTokens, client, pr_json
 
 from tauceti_queue import github_adapter as ga
 from tauceti_queue.admission import source_version
@@ -168,47 +171,184 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(clock.slept, [60])
         self.assertEqual(len(transport.calls), 2)
 
-    def test_background_paces_actual_quota_and_leaves_essential_requests_available(self):
+    def test_background_reads_run_at_full_speed_above_the_floor(self):
         transport = FakeTransport()
         transport.add(
             "GET",
             "https://api.github.com/background",
             200,
             {},
-            {"x-ratelimit-remaining": "10", "x-ratelimit-reset": "1800000100"},
+            {"x-ratelimit-remaining": "1001", "x-ratelimit-reset": "1800003600"},
         )
-        transport.add("GET", "https://api.github.com/essential", 200, {})
+        c, clock = client(transport)
+        with c.deferred_requests():
+            for _ in range(5):
+                c.get_json("background")
+        self.assertEqual(len(transport.calls), 5)
+        self.assertEqual(clock.slept, [])
+
+    def test_background_waits_for_reset_at_the_floor_and_essential_requests_continue(self):
+        transport = FakeTransport()
+        transport.add(
+            "GET",
+            "https://api.github.com/background",
+            200,
+            {},
+            {"x-ratelimit-remaining": "1000", "x-ratelimit-reset": "1800003600"},
+        )
+        transport.add(
+            "GET",
+            "https://api.github.com/essential",
+            200,
+            {},
+            {"x-ratelimit-remaining": "999", "x-ratelimit-reset": "1800003600"},
+        )
         c, clock = client(transport)
         with c.deferred_requests():
             c.get_json("background")
             with self.assertRaises(ga.RequestDeferred) as paused:
                 c.get_json("background")
-        self.assertEqual(paused.exception.retry_at, clock.now + 10)
+        self.assertEqual(paused.exception.retry_at, 1800003601)
         self.assertEqual(paused.exception.resource, "core:background")
         c.get_json("essential")
         with c.deferred_requests(urgent=True):
             c.get_json("essential")
         self.assertEqual(len(transport.calls), 3)
         self.assertEqual(clock.slept, [])
+        # After the reset background reads resume at full speed.
+        clock.now = paused.exception.retry_at
+        transport.add(
+            "GET",
+            "https://api.github.com/after",
+            200,
+            {},
+            {"x-ratelimit-remaining": "7149", "x-ratelimit-reset": "1800007200"},
+        )
+        with c.deferred_requests():
+            c.get_json("after")
+            c.get_json("after")
+        self.assertEqual(len(transport.calls), 5)
 
-    def test_graphql_background_pacing_uses_points_not_http_request_count(self):
+    def test_the_floor_is_a_setting(self):
+        transport = FakeTransport()
+        transport.add(
+            "GET",
+            "https://api.github.com/background",
+            200,
+            {},
+            {"x-ratelimit-remaining": "500", "x-ratelimit-reset": "1800003600"},
+        )
+        c, _ = client(transport)
+        c.background_floor = 100
+        with c.deferred_requests():
+            c.get_json("background")
+            c.get_json("background")
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_a_changed_floor_applies_to_the_next_read(self):
+        transport = FakeTransport()
+        transport.add(
+            "GET",
+            "https://api.github.com/background",
+            200,
+            {},
+            {"x-ratelimit-remaining": "500", "x-ratelimit-reset": "1800003600"},
+        )
+        c, _ = client(transport)
+        with c.deferred_requests():
+            c.get_json("background")
+            with self.assertRaises(ga.RequestDeferred):
+                c.get_json("background")
+            c.background_floor = 100
+            c.get_json("background")
+            c.background_floor = 1000
+            with self.assertRaises(ga.RequestDeferred):
+                c.get_json("background")
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_a_background_read_waiting_on_essential_work_sees_its_response(self):
+        essential_started, release = threading.Event(), threading.Event()
+
+        def transport(method, url, headers, body):
+            if url.endswith("/essential"):
+                essential_started.set()
+                release.wait(5)
+                return 200, {"x-ratelimit-remaining": "1000", "x-ratelimit-reset": "1800003600"}, b"{}"
+            return 200, {"x-ratelimit-remaining": "999", "x-ratelimit-reset": "1800003600"}, b"{}"
+
+        c, _ = client(transport)
+        thread = threading.Thread(target=lambda: c.get_json("essential"))
+        thread.start()
+        essential_started.wait(5)
+        outcome = {}
+
+        def background():
+            try:
+                with c.deferred_requests():
+                    c.get_json("background")
+                outcome["sent"] = True
+            except ga.RequestDeferred as error:
+                outcome["deferred"] = error.retry_at
+
+        waiting = threading.Thread(target=background)
+        waiting.start()
+        release.set()
+        thread.join(5)
+        waiting.join(5)
+        self.assertEqual(outcome, {"deferred": 1800003601})
+
+    def test_graphql_floor_uses_reported_points(self):
         transport = FakeTransport()
         transport.add(
             "POST",
             "https://api.github.com/graphql",
             200,
-            {"data": {"rateLimit": {"cost": 20, "remaining": 100, "resetAt": "2027-01-15T08:01:40Z"}}},
-            {"x-ratelimit-remaining": "100", "x-ratelimit-reset": "1800000100"},
+            {"data": {"rateLimit": {"cost": 20, "remaining": 990, "resetAt": "2027-01-15T08:01:40Z"}}},
+            {"x-ratelimit-remaining": "4000", "x-ratelimit-reset": "1800000100"},
         )
-        c, clock = client(transport)
+        c, _ = client(transport)
         with c.deferred_requests():
             c.graphql("query { rateLimit { cost remaining resetAt } }")
             with self.assertRaises(ga.RequestDeferred) as paused:
                 c.graphql("query { rateLimit { cost remaining resetAt } }")
-        self.assertEqual(paused.exception.retry_at, clock.now + 20)
+        self.assertEqual(paused.exception.resource, "graphql:background")
+        self.assertEqual(paused.exception.retry_at, ga._timestamp("2027-01-15T08:01:40Z") + 1)
         self.assertEqual(len(transport.calls), 1)
 
-    def test_paced_snapshot_advances_through_its_reads_instead_of_repeating_first_request(self):
+    def test_snapshot_reads_without_pauses_while_quota_is_plentiful(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = FakeRepo(directory)
+            base = repo.main_sha()
+            head = repo.commit_branch({"TauCeti/A.lean": "-- source\n"}, "head", push_to="refs/pull/42/head")
+            run_git(repo.clone, "fetch", "-q", str(repo.origin), head)
+            transport = FakeTransport()
+            raw = pr_json(head={"sha": head}, base={"ref": "main", "sha": base})
+
+            def headers(remaining, reset=1800000020):
+                return {"x-ratelimit-remaining": str(remaining), "x-ratelimit-reset": str(reset)}
+
+            url = f"https://api.github.com/repos/{TAUCETI}"
+            transport.add("GET", url + "/pulls/42", 200, raw, headers(4))
+            transport.add(
+                "GET",
+                url + f"/compare/{base}...{head}?per_page=1",
+                200,
+                {"merge_base_commit": {"sha": base}},
+                headers(3),
+            )
+            transport.add("GET", url + "/issues/42/comments?per_page=100&page=1", 200, [], headers(2))
+            transport.add("POST", "https://api.github.com/graphql", 200, fence_document(raw, build="FAILURE"))
+            c, clock = client(transport)
+            c.background_floor = 0
+            adapter = ga.GitHubAdapter(c, repo=TAUCETI, clone_dir=repo.clone)
+            with c.deferred_requests():
+                snapshot = adapter.admission_snapshot(TAUCETI, 42, generation=1)
+            self.assertEqual(snapshot.pull.head_sha, head)
+            self.assertEqual(snapshot.statuses["build"], "failure")
+            self.assertEqual(len(transport.calls), 4)
+            self.assertEqual(clock.slept, [])
+
+    def test_snapshot_deferred_at_the_floor_resumes_after_reset_without_repeating_reads(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = FakeRepo(directory)
             base = repo.main_sha()
@@ -239,10 +379,10 @@ class SourceTests(unittest.TestCase):
                         snapshot = adapter.admission_snapshot(TAUCETI, 42, generation=1)
                         break
                     except ga.RequestDeferred as pending:
-                        self.assertLess(pending.retry_at, 1800000040, "pacing must make source progress")
+                        self.assertLess(pending.retry_at, 1800000040, "the wait ends at the reset")
                         clock.now = pending.retry_at
             self.assertEqual(snapshot.pull.head_sha, head)
-            self.assertEqual(snapshot.statuses["build"], "failure", "CI must be read fresh after all pacing waits")
+            self.assertEqual(snapshot.statuses["build"], "failure", "CI must be read fresh after the wait")
             self.assertEqual(len(transport.calls), 4)
             self.assertEqual(clock.slept, [])
 
@@ -453,6 +593,462 @@ class SourceTests(unittest.TestCase):
             self.assertFalse(marker.exists(), "diff drivers supplied through repository config must not execute")
             pulls = adapter.list_open_pull_requests(TAUCETI, review_app_id=0, admission=True)
             self.assertEqual(source_version(snapshot.source(), "policy"), source_version(pulls[0].admission, "policy"))
+
+    def test_insertion_check_source_matches_the_evaluated_version(self):
+        """The check before insertion digests what evaluation digested, comments and bots included."""
+        with tempfile.TemporaryDirectory() as directory:
+            repo = FakeRepo(directory)
+            base = repo.main_sha()
+            head = repo.commit_branch({"TauCeti/A.lean": "-- a\n"}, "head", push_to="refs/pull/42/head")
+            run_git(repo.clone, "fetch", "-q", str(repo.origin), head)
+            ts = "2026-11-19T01:00:00Z"
+            board = "<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 {}-->"
+            recovery = f"Merge-queue recovery for head `{head}`"
+            rest = [
+                {"id": 1, "body": board, "created_at": ts, "updated_at": ts, "user": {"login": "reviewer"}},
+                {
+                    "id": 2,
+                    "body": recovery,
+                    "created_at": ts,
+                    "updated_at": ts,
+                    "user": {"login": "tau-ceti-bors[bot]"},
+                },
+            ]
+            graph = [
+                {"databaseId": 1, "body": board, "createdAt": ts, "updatedAt": ts, "author": {"login": "reviewer"}},
+                {
+                    "databaseId": 2,
+                    "body": recovery,
+                    "createdAt": ts,
+                    "updatedAt": ts,
+                    "author": {"login": "tau-ceti-bors", "__typename": "Bot"},
+                },
+            ]
+            transport = FakeTransport()
+            raw = pr_json(head={"sha": head}, base={"ref": "main", "sha": base}, comments=2)
+            url = f"https://api.github.com/repos/{TAUCETI}"
+            transport.add("GET", url + "/pulls/42", 200, raw)
+            transport.add(
+                "GET", url + f"/compare/{base}...{head}?per_page=1", 200, {"merge_base_commit": {"sha": base}}
+            )
+            transport.add("GET", url + "/issues/42/comments?per_page=100&page=1", 200, rest)
+            transport.add("POST", "https://api.github.com/graphql", 200, fence_document(raw))
+            document = fence_document(raw)
+            document["data"]["repository"]["pullRequest"]["comments"] = connection(graph)
+            transport.add("POST", "https://api.github.com/graphql", 200, document)
+            c, _ = client(transport)
+            adapter = ga.GitHubAdapter(c, repo=TAUCETI, clone_dir=repo.clone)
+            snapshot = adapter.admission_snapshot(TAUCETI, 42)
+            source = adapter.admission_insertion_source(TAUCETI, 42, head)
+            self.assertEqual(source_version(snapshot.source(), "p"), source_version(source, "p"))
+            # A scoreboard edited since evaluation changes the digest.
+            graph[0]["body"] += "\nedited"
+            graph[0]["updatedAt"] = "2026-11-19T02:00:00Z"
+            document = fence_document(raw)
+            document["data"]["repository"]["pullRequest"]["comments"] = connection(graph)
+            transport.add("POST", "https://api.github.com/graphql", 200, document)
+            changed = adapter.admission_insertion_source(TAUCETI, 42, head)
+            self.assertNotEqual(source_version(snapshot.source(), "p"), source_version(changed, "p"))
+
+    def test_deleted_authors_read_alike_in_both_apis(self):
+        node = {"databaseId": 7, "body": "b", "createdAt": "t", "updatedAt": "t", "url": "", "author": None}
+        self.assertEqual(ga._graphql_comment(node)["author"], "ghost")  # REST names a deleted user `ghost`
+
+    def test_a_paged_insertion_read_is_repeated_and_must_agree(self):
+        transport = FakeTransport()
+        c, _ = client(transport)
+        adapter = ga.GitHubAdapter(c, repo=TAUCETI)
+        reads = iter([({"body": "first"}, 2), ({"body": "edited meanwhile"}, 2), ({"body": "same"}, 2)])
+        adapter._insertion_source = lambda repo, number, head: next(reads)
+        with self.assertRaises(ga.GitHubError):
+            adapter.admission_insertion_source(TAUCETI, 42, HEAD)
+        reads = iter([({"body": "same"}, 2), ({"body": "same"}, 2)])
+        self.assertEqual(adapter.admission_insertion_source(TAUCETI, 42, HEAD), {"body": "same"})
+        reads = iter([({"body": "one page"}, 1)])
+        self.assertEqual(adapter.admission_insertion_source(TAUCETI, 42, HEAD), {"body": "one page"})
+
+
+class SingleReadTests(unittest.TestCase):
+    """`admission_evidence_mode = events`: one GraphQL read gives the full read's snapshot."""
+
+    TS = "2026-11-19T01:00:00Z"
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repo = FakeRepo(self.directory.name)
+        self.base = self.repo.main_sha()
+        self.head = self.repo.commit_branch({"TauCeti/A.lean": "-- a\n"}, "head", push_to="refs/pull/42/head")
+        run_git(self.repo.clone, "fetch", "-q", str(self.repo.origin), self.head)
+        self.board = "<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 {}-->"
+
+    def single(self, *, more_comments=False, labels=("ready-to-merge",)):
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "headRefOid": self.head,
+                        "headRefName": "feature",
+                        "baseRefOid": self.base,
+                        "baseRefName": "main",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "merged": False,
+                        "body": "body",
+                        "title": "feat: add",
+                        "updatedAt": self.TS,
+                        "headRepository": {"nameWithOwner": TAUCETI},
+                        "author": {"login": "alice", "databaseId": 7},
+                        "labels": connection([{"name": name} for name in labels]),
+                        "comments": {
+                            "totalCount": 1,
+                            **connection(
+                                [
+                                    {
+                                        "databaseId": 1,
+                                        "body": self.board,
+                                        "createdAt": self.TS,
+                                        "updatedAt": self.TS,
+                                        "author": {"login": "reviewer"},
+                                    }
+                                ],
+                                "next" if more_comments else None,
+                            ),
+                        },
+                        "commits": {
+                            "nodes": [
+                                {
+                                    "commit": {
+                                        "oid": self.head,
+                                        "status": {
+                                            "contexts": [
+                                                {"context": "build", "state": "SUCCESS"},
+                                                {"context": "scope", "state": "SUCCESS"},
+                                                {"context": "deploy", "state": "FAILURE"},
+                                            ]
+                                        },
+                                    }
+                                }
+                            ]
+                        },
+                    }
+                }
+            }
+        }
+
+    def full_read(self, transport):
+        raw = pr_json(
+            head={"sha": self.head, "ref": "feature", "repo": {"full_name": TAUCETI}},
+            base={"ref": "main", "sha": self.base},
+            comments=1,
+            updated_at=self.TS,
+        )
+        url = f"https://api.github.com/repos/{TAUCETI}"
+        rest = [
+            {"id": 1, "body": self.board, "created_at": self.TS, "updated_at": self.TS, "user": {"login": "reviewer"}}
+        ]
+        transport.add("GET", url + "/pulls/42", 200, raw)
+        transport.add(
+            "GET",
+            url + f"/compare/{self.base}...{self.head}?per_page=1",
+            200,
+            {"merge_base_commit": {"sha": self.base}},
+        )
+        transport.add("GET", url + "/issues/42/comments?per_page=100&page=1", 200, rest)
+        transport.add("POST", "https://api.github.com/graphql", 200, fence_document(raw))
+
+    def adapter(self, transport):
+        c, _ = client(transport)
+        c.background_floor = 0
+        return ga.GitHubAdapter(c, repo=TAUCETI, clone_dir=self.repo.clone)
+
+    def test_one_read_gives_what_the_full_read_gives(self):
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, self.single())
+        single = self.adapter(transport).admission_snapshot_single(TAUCETI, 42)
+        self.assertEqual(len(transport.calls), 1)
+        transport = FakeTransport()
+        self.full_read(transport)
+        full = self.adapter(transport).admission_snapshot(TAUCETI, 42)
+        self.assertEqual(source_version(single.source(), "p"), source_version(full.source(), "p"))
+        for field in ("head_sha", "base_sha", "base_ref", "state", "draft", "labels", "author_login", "head_ref"):
+            self.assertEqual(getattr(single.pull, field), getattr(full.pull, field), field)
+        self.assertEqual(
+            (single.merge_base_sha, single.paths, single.statuses), (full.merge_base_sha, full.paths, full.statuses)
+        )
+
+    def test_a_read_that_one_response_cannot_complete_takes_the_full_read(self):
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, self.single(more_comments=True))
+        self.full_read(transport)
+        adapter = self.adapter(transport)
+        snapshot = adapter.admission_snapshot_single(TAUCETI, 42)
+        self.assertEqual(snapshot.merge_base_sha, self.base)
+        self.assertEqual(adapter.snapshot_sources, {"single": 0, "full": 1})
+
+    def test_a_clone_that_cannot_vouch_for_the_merge_base_takes_the_full_read(self):
+        (Path(self.repo.clone) / ".git" / "shallow").write_text(self.base + "\n")
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, self.single())
+        self.full_read(transport)
+        adapter = self.adapter(transport)
+        adapter.admission_snapshot_single(TAUCETI, 42)
+        self.assertEqual(adapter.snapshot_sources, {"single": 0, "full": 1})
+        self.assertTrue(any("/compare/" in str(call) for call in transport.calls))
+
+    def test_an_app_author_reads_as_rest_names_it(self):
+        document = self.single()
+        document["data"]["repository"]["pullRequest"]["author"] = {"__typename": "Bot", "login": "tauceti-review-bot"}
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, document)
+        snapshot = self.adapter(transport).admission_snapshot_single(TAUCETI, 42)
+        self.assertEqual(snapshot.pull.author_login, "tauceti-review-bot[bot]")
+
+    def test_live_self_tested_reads_fence_the_update_time_too(self):
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, self.single(labels=("self-tested",)))
+        raw = pr_json(
+            head={"sha": self.head},
+            base={"ref": "main", "sha": self.base},
+            labels=[{"name": "self-tested"}],
+            comments=1,
+            updated_at="2026-11-19T01:05:00Z",  # a scoreboard edited during the live reads
+        )
+
+        def fence(raw):
+            document = fence_document(raw)
+            document["data"]["repository"]["pullRequest"]["labels"] = connection([{"name": "self-tested"}])
+            return document
+
+        transport.add("POST", "https://api.github.com/graphql", 200, fence(raw))
+        adapter = self.adapter(transport)
+        adapter.team_member_read = lambda path: {"state": "active"}
+        with self.assertRaises(ga.GitHubError):
+            adapter.admission_snapshot_single(TAUCETI, 42)
+        # The same fence at the same update time passes.
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, self.single(labels=("self-tested",)))
+        transport.add("POST", "https://api.github.com/graphql", 200, fence({**raw, "updated_at": self.TS}))
+        adapter = self.adapter(transport)
+        adapter.team_member_read = lambda path: {"state": "active"}
+        self.assertEqual(adapter.admission_snapshot_single(TAUCETI, 42).pull.head_sha, self.head)
+
+    def test_live_self_tested_reads_are_fenced_again(self):
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, self.single(labels=("self-tested",)))
+        raw = pr_json(head={"sha": self.head}, base={"ref": "main", "sha": self.base}, labels=[{"name": "self-tested"}])
+        moved = fence_document(raw)
+        moved["data"]["repository"]["pullRequest"]["labels"] = connection([{"name": "self-tested"}, {"name": "wip"}])
+        transport.add("POST", "https://api.github.com/graphql", 200, moved)
+        adapter = self.adapter(transport)
+        adapter.team_member_read = lambda path: {"state": "active"}
+        with self.assertRaises(ga.GitHubError):
+            adapter.admission_snapshot_single(TAUCETI, 42)
+
+
+class BumpGuardFloorTests(unittest.TestCase):
+    """PR #43422: a self-tested Mathlib bump's guard needs 19 reads, and restarts from its first."""
+
+    REPO = "TauCetiProject/TauCeti"
+
+    def setUp(self):
+        from unittest import mock
+
+        from tauceti_tools import self_tested
+
+        self.self_tested = self_tested
+        environment = mock.patch.dict("os.environ")
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name in ("SELF_TESTED_TEAM_TOKEN", "TAUCETI_TEAM_TOKEN", "TAUCETI_SELF_TESTED_TEAM", "TAUCETI_BASE_BRANCH"):
+            os.environ.pop(name, None)
+        self_tested._MEMBERS.clear()
+        guard = self_tested._bump_policy()
+
+        def run_guard(api, command, directory, env):
+            for upstream in ("a", "b", "c"):
+                api.request("GET", f"repos/leanprover-community/mathlib4/commits/{upstream}")
+            return subprocess.CompletedProcess(command, 0, "pins accepted", "")
+
+        patcher = mock.patch.object(guard, "run_mathlib_guard", run_guard)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def quota(self, clock, remaining):
+        state = {"remaining": remaining, "reset": clock.now + 600, "calls": []}
+
+        def transport(method, url, headers, body):
+            if clock.now >= state["reset"]:
+                state.update(remaining=7150, reset=clock.now + 3600)
+            state["remaining"] -= 1
+            path = url.removeprefix("https://api.github.com/")
+            state["calls"].append(path)
+            if "/issues/7/events" in path:
+                data = [{"id": 1, "event": "labeled", "label": {"name": "self-tested"}, "actor": {"login": "kim-em"}}]
+            elif "/teams/self-tested/memberships/" in path:
+                data = {"state": "active"}
+            elif path.endswith("/branches/main"):
+                data = {"commit": {"sha": "b" * 40}}
+            elif "/compare/" in path:
+                data = {"merge_base_commit": {"sha": "c" * 40}}
+            elif "/contents/" in path:
+                name = path.split("/contents/", 1)[1].split("?", 1)[0]
+                if name.startswith("lakefile"):
+                    return 404, self.headers(state), b"{}"
+                data = {"type": "file", "encoding": "base64", "content": base64.b64encode(b"{}").decode()}
+            else:
+                data = {"sha": path.rsplit("/", 1)[-1]}
+            return 200, self.headers(state), json.dumps(data).encode()
+
+        return transport, state
+
+    @staticmethod
+    def headers(state):
+        return {"x-ratelimit-remaining": str(state["remaining"]), "x-ratelimit-reset": str(int(state["reset"]))}
+
+    def pull(self):
+        return {
+            "number": 7,
+            "state": "open",
+            "labels": [{"name": "self-tested"}],
+            "base": {"ref": "main"},
+            "head": {"sha": "d" * 40, "ref": "bump-mathlib/2026-11-18", "repo": {"full_name": self.REPO}},
+            "user": {"login": "tauceti-review-bot[bot]"},
+        }
+
+    def evaluate(self, c, clock):
+        """Admission's loop: a deferred evaluation is retried from scratch at its retry time."""
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                with c.deferred_requests():
+                    return attempts, self.self_tested.eligible(
+                        self.pull(),
+                        self.REPO,
+                        paths=["lake-manifest.json", "lean-toolchain"],
+                        read=lambda path: c.get_json(path)[1],
+                    )
+            except ga.RequestDeferred as pending:
+                self.assertLessEqual(attempts, 3, "a deferred bump guard must finish after the reset")
+                clock.now = pending.retry_at
+
+    def test_bump_guard_completes_in_one_pass_while_quota_is_plentiful(self):
+        clock = Clock()
+        transport, state = self.quota(clock, 7000)
+        c = ga.GitHubClient(StaticTokens(), transport, clock=clock, sleep=clock.sleep)
+        attempts, verdict = self.evaluate(c, clock)
+        self.assertEqual((attempts, verdict), (1, True))
+        self.assertEqual(len(state["calls"]), 19)
+        self.assertEqual(clock.slept, [])
+
+    def test_bump_guard_near_the_floor_defers_cleanly_and_completes_after_reset(self):
+        clock = Clock()
+        transport, state = self.quota(clock, 1010)
+        c = ga.GitHubClient(StaticTokens(), transport, clock=clock, sleep=clock.sleep)
+        reset = state["reset"]
+        attempts, verdict = self.evaluate(c, clock)
+        self.assertEqual((attempts, verdict), (2, True))
+        # The first pass stopped at the floor, spending nothing below it. The restart after the
+        # reset ran the whole guard again; only the team membership came from the one-minute cache.
+        self.assertEqual(len(state["calls"]), 10 + 18)
+        self.assertEqual(clock.now, reset + 1)
+        self.assertEqual(clock.slept, [])
+
+
+class LocalMergeBaseTests(unittest.TestCase):
+    """`admission_local_merge_base`: the clone answers when it can vouch for the answer."""
+
+    def snapshot(self, *, local, shallow=False, resumed_local=False):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = FakeRepo(directory)
+            base = repo.main_sha()
+            head = repo.commit_branch({"TauCeti/A.lean": "-- source\n"}, "head", push_to="refs/pull/42/head")
+            run_git(repo.clone, "fetch", "-q", str(repo.origin), head)
+            if shallow:
+                (Path(repo.clone) / ".git" / "shallow").write_text(base + "\n")
+            transport = FakeTransport()
+            raw = pr_json(head={"sha": head}, base={"ref": "main", "sha": base})
+            url = f"https://api.github.com/repos/{TAUCETI}"
+            transport.add("GET", url + "/pulls/42", 200, raw)
+            transport.add(
+                "GET", url + f"/compare/{base}...{head}?per_page=1", 200, {"merge_base_commit": {"sha": base}}
+            )
+            transport.add("GET", url + "/issues/42/comments?per_page=100&page=1", 200, [])
+            transport.add("POST", "https://api.github.com/graphql", 200, fence_document(raw))
+            c, _clock = client(transport)
+            c.background_floor = 0
+            adapter = ga.GitHubAdapter(c, repo=TAUCETI, clone_dir=repo.clone)
+            adapter.local_merge_base = local
+            if resumed_local:
+                # A read that took its merge base locally, then waited while the setting went off.
+                pull = ga.PullRequest.from_json(raw)
+                adapter._admission_reads[(TAUCETI, 42)] = {
+                    "generation": 1,
+                    "pull": pull,
+                    "merge_base": head,
+                    "merge_base_source": "local",
+                }
+            with c.deferred_requests():
+                snapshot = adapter.admission_snapshot(TAUCETI, 42, generation=1)
+            compared = [call for call in transport.calls if "/compare/" in str(call)]
+            return snapshot, base, compared, adapter.merge_base_sources
+
+    def test_off_asks_compare(self):
+        snapshot, base, compared, sources = self.snapshot(local=False)
+        self.assertEqual(snapshot.merge_base_sha, base)
+        self.assertEqual(len(compared), 1)
+        self.assertEqual(sources, {"local": 0, "compare": 1})
+
+    def test_on_answers_from_the_clone_without_compare(self):
+        snapshot, base, compared, sources = self.snapshot(local=True)
+        self.assertEqual(snapshot.merge_base_sha, base)
+        self.assertEqual(snapshot.paths, ("TauCeti/A.lean",))
+        self.assertEqual(compared, [])
+        self.assertEqual(sources, {"local": 1, "compare": 0})
+
+    def test_turning_it_off_mid_read_asks_compare(self):
+        snapshot, base, compared, sources = self.snapshot(local=False, resumed_local=True)
+        self.assertEqual(snapshot.merge_base_sha, base)
+        self.assertEqual(len(compared), 1)
+
+    def test_a_shallow_clone_falls_back_to_compare(self):
+        snapshot, base, compared, sources = self.snapshot(local=True, shallow=True)
+        self.assertEqual(snapshot.merge_base_sha, base)
+        self.assertEqual(len(compared), 1)
+        self.assertEqual(sources, {"local": 0, "compare": 1})
+
+    def test_ambiguous_or_missing_merge_base_is_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_git(directory, "init", "-q")
+            run_git(directory, "config", "user.name", "t")
+            run_git(directory, "config", "user.email", "t@example.invalid")
+
+            def commit(message, *parents):
+                tree = run_git(directory, "write-tree")
+                args = [arg for parent in parents for arg in ("-p", parent)]
+                return run_git(directory, "commit-tree", tree, *args, "-m", message)
+
+            root = commit("root")
+            a, b = commit("a", root), commit("b", root)
+            # A criss-cross: two merges of a and b, so the merge base is not unique.
+            left, right = commit("left", a, b), commit("right", b, a)
+            transport = FakeTransport()
+            c, _clock = client(transport)
+            adapter = ga.GitHubAdapter(c, repo=TAUCETI, clone_dir=directory)
+            self.assertEqual(adapter._local_merge_base(a, b), root)
+            self.assertIsNone(adapter._local_merge_base(left, right))
+            self.assertIsNone(adapter._local_merge_base(a, "f" * 40))
+            # Grafts rewrite ancestry without making the clone shallow: the clone cannot vouch.
+            grafts = Path(directory) / ".git" / "info" / "grafts"
+            grafts.parent.mkdir(parents=True, exist_ok=True)
+            grafts.write_text(f"{a}\n")
+            self.assertIsNone(adapter._local_merge_base(a, b))
+            grafts.unlink()
+            # Replacement refs are ignored, as GitHub ignores them.
+            run_git(directory, "replace", "--graft", b)
+            self.assertEqual(adapter._local_merge_base(a, b), root)
+            self.assertEqual(transport.calls, [])
 
 
 if __name__ == "__main__":

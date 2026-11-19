@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import hashlib
+import hmac
 import json
 import os
 import pathlib
@@ -72,12 +74,14 @@ class AppCredentials:
     webhook_secret: bytes = dataclasses.field(repr=False)
 
     @classmethod
-    def load(cls, directory: pathlib.Path | str | None = None) -> AppCredentials:
+    def load(cls, directory: pathlib.Path | str | None = None, *, webhook: bool = True) -> AppCredentials:
+        """The App's credentials; `webhook=False` (a repair worker, which receives no deliveries)
+        neither needs nor reads the webhook secret."""
         root = config_dir(directory)
         meta_path = root / "github-app.json"
         key_path = root / "github-private-key.pem"
         secret_path = root / "github-webhook-secret"
-        for path in (meta_path, key_path, secret_path):
+        for path in (meta_path, key_path, *((secret_path,) if webhook else ())):
             if not path.is_file():
                 raise CredentialsError(f"missing credential file {path}")
         try:
@@ -97,12 +101,54 @@ class AppCredentials:
         pem = key_path.read_bytes()
         if b"PRIVATE KEY-----" not in pem:
             raise CredentialsError(f"{key_path} is not a PEM private key")
-        secret = secret_path.read_bytes().strip()
-        if not secret:
+        secret = secret_path.read_bytes().strip() if webhook else b""
+        if webhook and not secret:
             raise CredentialsError(f"{secret_path} is empty")
         return cls(
             app_id=app_id, slug=slug, installation_id=installation_id, private_key_pem=pem, webhook_secret=secret
         )
+
+
+# A co-located repair worker authenticates to the queue service with a short-lived bearer derived
+# from the App's private key (`local_worker_bearer`), since an installation token cannot answer the
+# `GET /user` the service resolves GitHub bearers with. Only a process that can read the private key
+# can make one, and such a process can already mint installation tokens that push to the content
+# repository, so the bearer grants nothing the key does not. The service accepts it for the worker
+# endpoints only, as the App's bot login; the admin endpoints keep requiring a human admin.
+LOCAL_WORKER_PREFIX = "tq-local-worker.v1."
+# How old (and how far in the future) a local-worker bearer's timestamp may be when it arrives.
+LOCAL_WORKER_MAX_AGE_SECONDS = 300
+LOCAL_WORKER_MAX_SKEW_SECONDS = 60
+
+
+def local_worker_login(credentials: AppCredentials) -> str:
+    """The login a local-worker bearer authenticates as: the App's bot account."""
+    return f"{credentials.slug}[bot]"
+
+
+def _local_worker_mac(credentials: AppCredentials, issued: int) -> str:
+    key = hmac.new(credentials.private_key_pem, b"tauceti-queue local worker bearer v1", hashlib.sha256).digest()
+    message = f"{credentials.app_id}:{credentials.installation_id}:{issued}".encode()
+    return hmac.new(key, message, hashlib.sha256).hexdigest()
+
+
+def local_worker_bearer(credentials: AppCredentials, now: float | None = None) -> str:
+    """A bearer for the queue service's worker endpoints, valid for `LOCAL_WORKER_MAX_AGE_SECONDS`."""
+    issued = int(now if now is not None else time.time())
+    return f"{LOCAL_WORKER_PREFIX}{issued}.{_local_worker_mac(credentials, issued)}"
+
+
+def verify_local_worker_bearer(credentials: AppCredentials, token: str, now: float) -> bool:
+    """Whether `token` is a current `local_worker_bearer` of these credentials."""
+    if not token.startswith(LOCAL_WORKER_PREFIX):
+        return False
+    issued_text, _, mac = token[len(LOCAL_WORKER_PREFIX) :].partition(".")
+    if re.fullmatch(r"[0-9]{1,12}", issued_text) is None:
+        return False
+    issued = int(issued_text)
+    if not now - LOCAL_WORKER_MAX_AGE_SECONDS <= issued <= now + LOCAL_WORKER_MAX_SKEW_SECONDS:
+        return False
+    return hmac.compare_digest(mac.encode(), _local_worker_mac(credentials, issued).encode())
 
 
 def load_execution_credentials(directory):
@@ -238,6 +284,12 @@ class InstallationTokenSource:
                 current = self._fetch()
                 self._current = current
             return current.value
+
+    def granted_permissions(self) -> dict[str, str]:
+        """The permissions GitHub granted the current installation token (minting one if needed)."""
+        self.token()
+        with self._lock:
+            return dict(self._current.permissions) if self._current is not None else {}
 
     def invalidate(self) -> None:
         """Drop the cached token, for example after GitHub answers 401 with it."""

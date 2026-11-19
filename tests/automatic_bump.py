@@ -88,7 +88,7 @@ for rollup, want in [
     ([{"context": "build", "state": "SUCCESS"}], False),
     ([{"context": "build", "state": "PENDING"}, {"context": "self-tested/1", "state": "SUCCESS"}], False),
 ]:
-    fresh = raw(statusCheckRollup=rollup, labels=[{"name": "self-tested"}])
+    fresh = raw(statusCheckRollup=rollup, labels=[] if want else [{"name": "self-tested"}])
     live = SimpleNamespace(gh=SimpleNamespace(pr_view=lambda *_args, f=fresh: f))
     assert w._still_actionable("bump", live, None, candidate) is want, rollup
 moved = SimpleNamespace(gh=SimpleNamespace(pr_view=lambda *_args: pending | {"headRefOid": "c" * 40}))

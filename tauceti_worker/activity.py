@@ -151,6 +151,7 @@ class Round:
             "AdmissionUnavailable",
             "DocumentationUnavailable",
             "ProgressPreparationUnavailable",
+            "BuildCacheWait",
             "GitHubUnavailable",
             "SharedStateUnavailable",
         ):
@@ -753,6 +754,10 @@ def _summary(db, now, column=None, identity=None):
             }
             for kind in kinds
         }
+        for kind, row in rounds[window].items():
+            # Only present when nonzero, so older readers and summaries keep their shape.
+            if closed := int(values.get("round:" + json.dumps([kind, "closed"]), 0)):
+                row["closed"] = closed
 
     def minimum(table, field, extra=""):
         predicate = where + (" AND " if where else " WHERE ") + field + " IS NOT NULL"
