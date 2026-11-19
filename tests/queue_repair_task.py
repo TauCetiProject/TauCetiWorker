@@ -3837,8 +3837,11 @@ class WorkerAsTheQueueApp(Fixture):
         self.addCleanup(environment.stop)
         repair_task.pin_app_credentials()
 
+        # Outside any repository: a CI checkout's own config carries actions/checkout's extraHeader.
         def config(*args):
-            result = subprocess.run(["git", "config", *args], capture_output=True, text=True, check=False)
+            result = subprocess.run(
+                ["git", "config", *args], cwd=self.root, capture_output=True, text=True, check=False
+            )
             return result.stdout.splitlines()
 
         self.assertEqual(config("--get-all", "user.name"), ["Kept"], "the user's own config still applies")
@@ -3848,6 +3851,7 @@ class WorkerAsTheQueueApp(Fixture):
         filled = subprocess.run(
             ["git", "credential", "fill"],
             input="protocol=https\nhost=github.com\n\n",
+            cwd=self.root,
             capture_output=True,
             text=True,
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false"},
