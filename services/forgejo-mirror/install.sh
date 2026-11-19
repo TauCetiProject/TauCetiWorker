@@ -3,8 +3,9 @@
 #
 # Installs exactly what origin/main of TauCetiWorker contains, whatever copy of this script is run:
 # it fetches the shared clone at $TAUCETI_FORGEJO_MIRROR_CHECKOUT (default ~/TauCetiForgejoMirror,
-# cloned when absent; its working tree is never touched), copies forgejo_mirror.py and the two
-# units from origin/main, reloads systemd and enables the timer. Rerunning it is an update.
+# cloned when absent; its working tree is never touched), copies forgejo_mirror.py,
+# forgejo_restore.py and the two units from origin/main, reloads systemd and enables the timer.
+# Rerunning it is an update.
 #
 # Usage: services/forgejo-mirror/install.sh [--no-start]
 #
@@ -24,7 +25,7 @@ START=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-start) START=0; shift ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown argument $1" >&2; exit 1 ;;
   esac
 done
@@ -60,6 +61,7 @@ install_from_main() { # path-in-repo destination mode
   mv -f "$tmp" "$2"
 }
 install_from_main services/forgejo-mirror/forgejo_mirror.py "$DATA/bin/forgejo_mirror.py" 0755
+install_from_main services/forgejo-mirror/forgejo_restore.py "$DATA/bin/forgejo_restore.py" 0755
 for unit in "${UNITS[@]}"; do
   install_from_main "services/forgejo-mirror/$unit" "$UNIT_DIR/$unit" 0644
 done

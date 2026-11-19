@@ -91,3 +91,6 @@ That restores and moves refs but does not delete refs created since; the next ti
 again and applies the usual checks.
 
 To stop the mirror: `systemctl --user disable --now tauceti-forgejo-mirror.timer`.
+
+To push the refs back to Forgejo after a loss, follow [the restore runbook](../../docs/forgejo-restore.md)
+(`forgejo_restore.py`, installed next to the mirror script).
